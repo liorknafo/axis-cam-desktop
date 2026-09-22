@@ -89,6 +89,9 @@ impl App {
                 95 => "72-selected-stock-help".into(),
                 96 => "73-selected-cycle-help".into(),
                 97 => "74-selected-spindle-help".into(),
+                98 => "75-program-blocked".into(),
+                99 => "76-program-ready".into(),
+                100 => "77-back-to-machining".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -566,6 +569,40 @@ impl App {
             89 => vec![Message::StockDetail(crate::stock_surface::Detail::Draft)],
             90 => vec![Message::Scrub(0.)],
             91..=97 => vec![],
+            98 => {
+                self.help_animating = false;
+                self.invalidate_post();
+                vec![Message::Page(Page::Post)]
+            }
+            99 => {
+                use crate::model::Strategy;
+                self.doc.number_tools();
+                self.doc.setups.truncate(1);
+                self.doc.setups[0].machine = Machine::new(3);
+                self.doc.setups[0]
+                    .operations
+                    .retain(|o| matches!(o.strategy, Strategy::Face | Strategy::Pocket));
+                self.doc.active = self.doc.setups[0].id.clone();
+                self.doc.sync_stock_sources();
+                self.invalidate_post();
+                vec![Message::Page(Page::Post)]
+            }
+            100 => {
+                let job = self.post.as_ref().expect("smoke post result");
+                assert!(
+                    job.ready(),
+                    "{:?}",
+                    job.setups
+                        .iter()
+                        .filter_map(|s| s.result.as_ref().err())
+                        .collect::<Vec<_>>()
+                );
+                vec![
+                    Message::Page(Page::Work),
+                    Message::SelectOp(0),
+                    Message::Generate,
+                ]
+            }
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());

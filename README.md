@@ -2,7 +2,7 @@
 
 A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.14. It carries the web prototype's Manufacture-style layout into a native application, with local persistence, editable operation parameters and a 3D model viewport. There is no embedded browser.
 
-**This version does not produce executable G-code.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Collision checking and production CAM remain pending. The example project’s other paths and its planner are demonstrations. OpenAI is not connected, as requested for the prototype phase.
+**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Fixture, clamp and machine-body collisions are not checked, and production CAM remains pending. The example project's other paths and its planner are demonstrations. OpenAI is not connected, as requested for the prototype phase.
 
 ![Native workspace](docs/workspace.png)
 
@@ -48,7 +48,7 @@ The script writes `dist/AXIS CAM Studio.app`. An optional first argument overrid
 | Simulation | Six imported strategies with cumulative stock across operations/setups, adaptive octree surface meshing, background detail updates, pause/replay/scrub; separate example motion |
 | Operation audit | Generate all checks every enabled operation across every setup, reports generated paths and actionable failures, skips suppressed operations |
 | Saving | Automatic local workspace saving; explicit JSON project save/open; complete machine, setup, tool and operation data |
-| Export | Markdown setup sheet and comments-only `.nc` outline |
+| Export | LinuxCNC 3-axis `.ngc` per setup (checked and replayed) and a Markdown setup sheet |
 
 ### Operation strategies
 
@@ -231,7 +231,7 @@ Stock is rendered as a lightly shaded transparent amber box. Solid visible edges
 
 ![Relative stock with top and right offsets](docs/relative-stock.png)
 
-Older saved projects whose relative mode contained only overall dimensions reopen as **Fixed size box**, preserving those dimensions. Select Relative size box to use the new per-side offsets. Stock inherited from previous setups remains an intended dependency; removal and transfer of remaining material are not simulated.
+Older saved projects whose relative mode contained only overall dimensions reopen as **Fixed size box**, preserving those dimensions. Select Relative size box to use the new per-side offsets. Later setups start from the material left by earlier enabled operations and setups, including after flips.
 
 **STEP:** Open CASCADE reads surfaces/solids and assemblies; the helper tessellates at 0.05 mm linear deflection and 0.3 rad angular deflection. Assembly placements and unit conversion are applied. The original file stays intact. Exact CAD topology, colors, PMI and automatic machining feature recognition are not exposed to the app yet. Facing and Pocket selection use connected planar regions of the tessellated mesh. Wire-only models, failed translations, or faces that cannot be tessellated are rejected with a readable error. Conversion runs outside the GUI and times out after two minutes.
 
@@ -242,6 +242,16 @@ Limits: 50 MB source file, 100 MB expanded 3MF XML, 200,000 displayed triangles,
 ### Tooltips and animated help
 
 Hold the pointer over a button, field label/input, dropdown or toggle for about **0.6 seconds**. Command cards explain the action; field cards explain meaning, units and practical consequences. Relevant cards show a five-second looping native canvas illustration: facing, pocket clearing, drilling, finishing, rotary/indexed motion, tool tilt, clearance planes, pass spacing, layer depth or cutter dimensions. No GIF download or network connection is needed. Illustrations explain concepts; they are not computed toolpaths and do not depend on the current parameter value. Animation updates run at approximately 30 fps while an animated help target is hovered.
+
+## LinuxCNC G-code export
+
+Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance. Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
+
+- Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (Stock top center, Stock top front-left or Model origin).
+- Machine profile → Controller step → Postprocessor: tool table (`T# M6` + `G43 H#`) or touch off each tool (one program per tool run: touch the first tool off at the work zero with AXIS Touch Off, not Tool Touch Off, note the Z of a fixed reference such as a vise jaw, and touch each later tool off on that reference; AXIS cannot touch off while a program is paused), safe retract (`G53 G0 Z0` or the setup clearance plane), path blending (`G64 P`, or `G61` at 0), spindle start dwell and the Air output (M7/M8). Setups keep a machine snapshot, so assign the profile again after editing it.
+- Tools have a number (T#) in the tool library. Older libraries are numbered 1, 2, 3… once when opened.
+- Not checked: fixtures, clamps and the machine body. LinuxCNC's own soft limits check absolute position. Preview each program in LinuxCNC and air-cut first.
+- Headless: `axis-cam --export-gcode <project.json> <folder>` runs the same checks and writes the same files.
 
 ## Persistence
 
@@ -269,7 +279,7 @@ cargo run --locked -- --smoke-test ./smoke-output
 cargo run --release --locked -- --smoke-test ./help-output --help-only
 ```
 
-The explicit smoke-test mode uses an isolated workspace, exercises seventy-four screens plus twenty-four camera-motion samples through Iced's renderer and closes itself. The motion samples check that the model remains present across orbit, pan and zoom changes, with stock both shown and hidden. It does not modify the normal workspace. Simulation tests verify continuous motion, parameter-derived spacing/depth/time, stock removal against known volume, rapid moves removing nothing, swept cutter footprint, rewind/incremental consistency, rotated setups, rejected configurations the Play/pause/replay/invalidation lifecycle, both-way continuation at odd/even row counts and varied angles, one-way returns, reduced return time, unchanged final stock, and saved/legacy direction preferences. Imported Facing checks cover real visible-surface picking after setup transforms, planar grouping, selection persistence, replacement and stale-mesh handling, and sample isolation. Unit tests also cover complete tile pixel/gutter preservation below the upload threshold, stable orbit scale, blank startup and project recovery, the first import/machine/setup/tool flow, removal of the last setup, independent stock offsets, rotated and translated stock, stock transparency and occlusion, legacy stock migration, configuration validation, snapshots and dependencies, AI apply/undo, preview invalidation, import parsers, persistence, picking and comments-only NC output.
+The explicit smoke-test mode uses an isolated workspace, exercises seventy-seven screens plus twenty-four camera-motion samples through Iced's renderer and closes itself. The motion samples check that the model remains present across orbit, pan and zoom changes, with stock both shown and hidden. It does not modify the normal workspace. Simulation tests verify continuous motion, parameter-derived spacing/depth/time, stock removal against known volume, rapid moves removing nothing, swept cutter footprint, rewind/incremental consistency, rotated setups, rejected configurations the Play/pause/replay/invalidation lifecycle, both-way continuation at odd/even row counts and varied angles, one-way returns, reduced return time, unchanged final stock, and saved/legacy direction preferences. Imported Facing checks cover real visible-surface picking after setup transforms, planar grouping, selection persistence, replacement and stale-mesh handling, and sample isolation. Unit tests also cover complete tile pixel/gutter preservation below the upload threshold, stable orbit scale, blank startup and project recovery, the first import/machine/setup/tool flow, removal of the last setup, independent stock offsets, rotated and translated stock, stock transparency and occlusion, legacy stock migration, configuration validation, snapshots and dependencies, AI apply/undo, preview invalidation, import parsers, persistence, picking and comments-only NC output.
 
 ## Code map
 
@@ -299,7 +309,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises seventy-four 
 1. Keep exact CAD topology in the application, extend imported geometry selection beyond tessellated patches, and implement exact stock/fixture placement.
 2. Extend the six bounded operation previews into a production 3-axis CAM engine with exact boundaries, robust linking, additional strategies, rest-aware path optimization and fixture collision checks.
 3. Implement rotary and 5-axis kinematics, limit checking, singularity handling and machine simulation.
-4. Add controller-specific postprocessors and validate them against known machine configurations.
+4. Add more postprocessors (GRBL, Fanuc…), arcs and canned cycles, each with the same replay verification, and validate them on known machines.
 5. Connect OpenAI planning to a typed, validated planning interface. Retain the review/apply workflow and use OS credential storage or a backend for secrets.
 
 The current parameter checks are UI configuration checks, not machine safety or manufacturability verification. Several stock, fixture, compensation and collision-preference fields currently record intent only. The example AI brief is a placeholder; structured coverage and priority controls drive the local plan. The native JSON schema is separate from the earlier web prototype schema.

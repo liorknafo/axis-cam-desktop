@@ -1,13 +1,22 @@
-# Validation — 22 September 2026
+# Validation — 23 September 2026
 
-This evidence covers the native Rust/Iced prototype's imports, bounded CAM previews, cumulative stock, adaptive stock surfaces and application workflows. It does not establish production machining, collision verification, executable G-code or machine kinematics. Windows and Linux have not been verified.
+This evidence covers the native Rust/Iced prototype's imports, bounded CAM previews, cumulative stock, adaptive stock surfaces and application workflows. It does not establish production machining, collision verification, production G-code beyond the checked LinuxCNC 3-axis subset or machine kinematics. Windows and Linux have not been verified.
 
 ## Automated checks
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **119 passed, 0 failed** (19.27 seconds in the final full run).
+- `cargo test --locked`: **153 passed, 0 failed** (20.87 seconds in the final full run).
 - Release build and renderer smoke: passed on Apple Silicon macOS 26.5.2, Rust 1.97.1.
-- Renderer smoke completed **74 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
+- Renderer smoke completed **77 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
+
+## LinuxCNC post
+
+- Golden program for a small Facing job; post settings (tool table/touch-off, retract, G61/G64, dwell, Air) change the output as specified.
+- All six implemented strategies post as one program and replay exactly: every position within 0.0006 mm, feeds within 0.05 mm/min, and tool, H offset, spindle, coolant and work offset active on every move.
+- Corrupted programs are rejected: a moved coordinate, a missing F, the wrong tool, an arc and a dropped line.
+- Flipped setups produce separate G54/G55 programs.
+- Refusals: other controllers, 4/5-axis, travel, duplicate tool numbers, selected-point origin, non-LinuxCNC offsets, Air without an output, upstream failures, a setup without enabled operations and the example project.
+- Rapid-safety rule tested for accepted retracts and peck re-entry, and for refused unproven descents, sideways rapids, holder depth, feed, rpm and travel (including inch profiles).
 
 ## Continuous stock and adaptive meshing
 
