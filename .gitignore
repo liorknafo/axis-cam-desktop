@@ -1,0 +1,4 @@
+/target/
+/dist/
+/smoke-output/
+.DS_Store

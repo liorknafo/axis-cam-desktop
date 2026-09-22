@@ -1,0 +1,8 @@
+AXIS CAM Studio uses Fidget, fidget-core and fidget-mesh 0.4.3,
+Copyright Fidget contributors, under the Mozilla Public License 2.0.
+These dependencies are unmodified. Corresponding source is available at:
+https://github.com/mkeeter/fidget/tree/v0.4.3
+https://crates.io/crates/fidget/0.4.3
+https://crates.io/crates/fidget-core/0.4.3
+https://crates.io/crates/fidget-mesh/0.4.3
+The license text accompanies this notice as fidget-MPL-2.0.txt.
