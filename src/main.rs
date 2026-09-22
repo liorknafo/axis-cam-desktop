@@ -4,6 +4,7 @@ mod choice_help;
 mod help;
 mod mesh;
 mod model;
+mod ngc;
 mod pocket;
 mod rest;
 mod simulation;
