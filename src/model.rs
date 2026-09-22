@@ -1173,30 +1173,6 @@ impl Document {
         }
         setups
     }
-    pub fn preview_nc(&self) -> String {
-        let mut s="(AXIS CAM STUDIO - UI PROTOTYPE)\n(COMMENTS ONLY - NO EXECUTABLE MACHINE MOTION)\n(No toolpaths, collision checks or postprocessor have been calculated)\n".to_string();
-        for setup in &self.setups {
-            s += &format!(
-                "\n(SETUP: {} | {} | {})\n(ORIENTATION X={} Y={} Z={} degrees)\n",
-                safe(setup.name()),
-                safe(setup.machine.name()),
-                safe(get(&setup.p, "offset")),
-                safe(get(&setup.p, "rx")),
-                safe(get(&setup.p, "ry")),
-                safe(get(&setup.p, "rz"))
-            );
-            for o in setup.operations.iter().filter(|o| o.enabled) {
-                s += &format!(
-                    "(OP: {} | {} | RPM={} | Feed={} mm/min)\n",
-                    safe(o.name()),
-                    o.strategy.name(),
-                    safe(get(&o.p, "rpm")),
-                    safe(get(&o.p, "feed"))
-                );
-            }
-        }
-        s
-    }
     pub fn setup_sheet(&self, mesh: Option<&crate::mesh::Mesh>) -> String {
         let mut s = format!(
             "# {}\n\nNative UI prototype — sample planning data, not machining instructions.\n\nMaterial: {}\n",
@@ -1232,17 +1208,6 @@ impl Document {
         }
         s
     }
-}
-fn safe(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c == '(' || c == ')' || c == '\n' || c == '\r' {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
 }
 fn label(k: &str) -> String {
     k.replace('_', " ")
@@ -1372,22 +1337,6 @@ mod tests {
         assert_eq!(get(&s[2].p, "stock_source"), s[1].id);
         assert_eq!(get(&s[2].p, "offset"), "G56");
         assert_ne!(s[1].operations[0].id, s[0].operations[0].id)
-    }
-    #[test]
-    fn nc_export_is_comments_only() {
-        let mut d = Document::sample();
-        d.setup_mut()
-            .p
-            .insert("name".into(), "bad)\nG0 X1\n(".into());
-        assert!(
-            d.preview_nc()
-                .lines()
-                .filter(|l| !l.is_empty())
-                .all(|l| l.starts_with('(')
-                    && l.ends_with(')')
-                    && l.matches('(').count() == 1
-                    && l.matches(')').count() == 1)
-        )
     }
     #[test]
     fn invalid_numeric_input_not_hidden() {

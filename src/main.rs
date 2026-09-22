@@ -119,6 +119,9 @@ pub enum Message {
     UndoPlan,
     Exported(PathBuf),
     ExportError(String),
+    PostChecked(u64, std::sync::Arc<post::JobPost>),
+    ExportGcode,
+    GcodeExported(Result<(PathBuf, usize), String>),
     ConfirmDeleteSetup(bool),
     Close(iced::window::Id),
     Captured(iced::window::Screenshot),
@@ -137,6 +140,9 @@ pub struct App {
     pub tab: String,
     pub status: String,
     pub audit_report: Vec<(String, bool, String)>,
+    pub post: Option<std::sync::Arc<post::JobPost>>,
+    pub post_busy: bool,
+    post_epoch: u64,
     pub machine_draft: Machine,
     pub wizard_step: usize,
     pub tool_draft: Tool,
@@ -249,6 +255,9 @@ impl App {
             tab: "Tool".into(),
             status,
             audit_report: vec![],
+            post: None,
+            post_busy: false,
+            post_epoch: 0,
             camera: viewport::Camera::default(),
             sample_mesh: mesh::sample(),
             imported_mesh,
@@ -328,6 +337,7 @@ impl App {
         self.project_dirty = self.project_path.is_none();
         self.page = Page::Work;
         self.audit_report.clear();
+        self.invalidate_post();
         self.dirty = true;
         self.last_edit = Instant::now();
         self.camera = viewport::Camera::default();
@@ -411,6 +421,7 @@ impl App {
             self.doc.sync_stock_sources();
         }
         self.audit_report.clear();
+        self.invalidate_post();
         self.dirty = true;
         self.project_dirty = true;
         self.last_edit = Instant::now();
@@ -564,6 +575,36 @@ impl App {
             },
         )
     }
+    fn invalidate_post(&mut self) {
+        self.post = None;
+        self.post_epoch = self.post_epoch.wrapping_add(1);
+    }
+    /// Check and emit the whole job while the NC program page is open.
+    fn refresh_post(&mut self) -> Task<Message> {
+        if self.page != Page::Post || self.post.is_some() || self.post_busy {
+            return Task::none();
+        }
+        let doc = self.doc.clone();
+        let mesh = self.part_mesh().cloned();
+        let run = move || match mesh {
+            Some(mesh) => post::post_job(&doc, &mesh),
+            None => post::JobPost::blocked("Load the imported part before posting."),
+        };
+        if self.smoke_dir.is_some() {
+            self.post = Some(std::sync::Arc::new(run()));
+            return Task::none();
+        }
+        let epoch = self.post_epoch;
+        self.post_busy = true;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(run).await.unwrap_or_else(|e| {
+                    post::JobPost::blocked(&format!("Postprocessor failed: {e}"))
+                })
+            },
+            move |job| Message::PostChecked(epoch, std::sync::Arc::new(job)),
+        )
+    }
     fn stop_selection(&mut self) {
         self.selected = None;
         self.picking = false;
@@ -668,6 +709,7 @@ impl App {
                 self.page = p;
                 self.picking = false;
                 self.playing = false;
+                return self.refresh_post();
             }
             Message::SelectSetup(i) => {
                 if let Some(s) = self.doc.setups.get(i) {
@@ -1080,6 +1122,7 @@ impl App {
             Message::EditMachine(id) => {
                 if let Some(m) = self.doc.machines.iter().find(|m| m.id == id) {
                     self.machine_draft = m.clone();
+                    self.machine_draft.fill_post_defaults();
                     self.wizard_step = 0;
                     self.page = Page::Wizard;
                 }
@@ -1115,11 +1158,15 @@ impl App {
                 }
             }
             Message::NewTool => {
-                self.tool_draft = Tool::new("New tool", "Flat end mill", "6");
+                let mut tool = Tool::new("New tool", "Flat end mill", "6");
+                tool.p
+                    .insert("number".into(), self.doc.next_tool_number().to_string());
+                self.tool_draft = tool;
                 self.page = Page::Tools
             }
             Message::SaveTool => {
-                let issues = self.tool_draft.issues();
+                let mut issues = self.tool_draft.issues();
+                issues.extend(self.doc.tool_number_issues(&self.tool_draft));
                 if issues.is_empty() {
                     if let Some(t) = self
                         .doc
@@ -1302,6 +1349,7 @@ impl App {
                 match result {
                     Ok(mesh) => {
                         self.imported_mesh = Some(mesh);
+                        self.invalidate_post();
                         self.status = "Saved model geometry restored.".into();
                         // Migrate legacy imported projects that stored sample
                         // feature IDs through the old viewport toggle.
@@ -1354,22 +1402,13 @@ impl App {
             Message::Saved(None) => {
                 self.save_busy = false;
             }
-            Message::Export(kind) => {
-                let data = if kind == "sheet" {
-                    self.doc.setup_sheet(self.part_mesh())
-                } else {
-                    self.doc.preview_nc()
-                };
-                let filename = if kind == "sheet" {
-                    "axis-setup-sheet.md"
-                } else {
-                    "axis-preview.nc"
-                };
+            Message::Export(_) => {
+                let data = self.doc.setup_sheet(self.part_mesh());
                 return Task::perform(
                     async move {
                         let file = rfd::AsyncFileDialog::new()
-                            .set_title("Export prototype document")
-                            .set_file_name(filename)
+                            .set_title("Export setup sheet")
+                            .set_file_name("axis-setup-sheet.md")
                             .save_file()
                             .await?;
                         let p = file.path().to_path_buf();
@@ -1541,7 +1580,7 @@ impl App {
                 if self.dirty && now.duration_since(self.last_edit) > Duration::from_millis(700) {
                     self.persist()
                 }
-                return self.refresh_stock_surface();
+                return Task::batch([self.refresh_stock_surface(), self.refresh_post()]);
             }
             Message::AiCoverage(v) => {
                 self.ai_coverage = v;
@@ -1594,6 +1633,47 @@ impl App {
             }
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
+            Message::PostChecked(epoch, job) => {
+                self.post_busy = false;
+                if epoch == self.post_epoch {
+                    self.post = Some(job);
+                } else {
+                    return self.refresh_post();
+                }
+            }
+            Message::ExportGcode => {
+                let Some(mesh) = self.part_mesh().cloned() else {
+                    self.status = "Load the imported part before exporting G-code.".into();
+                    return Task::none();
+                };
+                let doc = self.doc.clone();
+                return Task::perform(
+                    async move {
+                        let folder = rfd::AsyncFileDialog::new()
+                            .set_title("Choose a folder for the LinuxCNC programs")
+                            .pick_folder()
+                            .await?
+                            .path()
+                            .to_path_buf();
+                        Some(
+                            tokio::task::spawn_blocking(move || {
+                                post::write_job(&post::post_job(&doc, &mesh), &folder)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Export worker failed: {e}"))),
+                        )
+                    },
+                    |r| r.map_or(Message::Noop, Message::GcodeExported),
+                );
+            }
+            Message::GcodeExported(Ok((folder, count))) => {
+                self.status = format!(
+                    "Exported {count} LinuxCNC program{} to {}. Preview each in LinuxCNC and air-cut before cutting.",
+                    if count == 1 { "" } else { "s" },
+                    folder.display()
+                )
+            }
+            Message::GcodeExported(Err(e)) => self.status = format!("G-code export failed: {e}"),
         }
         Task::none()
     }

@@ -315,7 +315,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let foot = container(
         row![
             text(&app.status).size(11).width(Fill),
-            text("mm  |  Bounded mesh previews · no NC postprocessor")
+            text("mm  |  Bounded mesh previews · LinuxCNC 3-axis post")
                 .size(10)
                 .color(MUTED)
         ]
@@ -1954,10 +1954,21 @@ fn wizard(app: &App) -> Element<'_, Message> {
             }
         }
         3 => {
-            form=form.push(choice(p,"controller","Controller / intended postprocessor",&["LinuxCNC","GRBL","Mach3 / Mach4","Fanuc","Haas","Siemens","Heidenhain","Custom"],t)).push(choice(p,"tool_change","Tool change",&["Manual","Automatic"],t)).push(choice(p,"tcp","Tool center point control",&["No","Yes"],t)).push(note("This records the intended controller. Controller-specific postprocessors and TCP kinematics must be implemented and verified before machine output is possible."));
+            form=form.push(choice(p,"controller","Controller / intended postprocessor",&["LinuxCNC","GRBL","Mach3 / Mach4","Fanuc","Haas","Siemens","Heidenhain","Custom"],t)).push(choice(p,"tool_change","Tool change",&["Manual","Automatic"],t)).push(choice(p,"tcp","Tool center point control",&["No","Yes"],t)).push(note("LinuxCNC has a 3-axis postprocessor. Other controllers are saved for planning; exporting G-code for them is refused."));
+            if get(p, "controller") == "LinuxCNC" {
+                form = form
+                    .push(bold("Postprocessor", 15))
+                    .push(choice_value(p, post_setting(p, "post_tool_length"), "post_tool_length", "Tool length", &POST_TOOL_LENGTH, t))
+                    .push(choice_value(p, post_setting(p, "post_retract"), "post_retract", "Safe retract", &POST_RETRACT, t))
+                    .push(field(p, "post_blend", "Path blending tolerance · mm", t))
+                    .push(field(p, "post_dwell", "Spindle start dwell · s", t))
+                    .push(choice_value(p, post_setting(p, "post_air"), "post_air", "Air blast output", &POST_AIR, t))
+                    .push(warnings(post_setting_issues(p)))
+                    .push(note("Setups keep a snapshot of the machine. After saving, use Assign to setup so existing setups use these settings."));
+            }
         }
         _ => {
-            form=form.push(bold(m.name(),18)).push(muted(format!("{}-axis · {} · {}",m.axes(),get(p,"mode"),get(p,"controller")))).push(muted(format!("Travel: {} × {} × {} {}",get(p,"x"),get(p,"y"),get(p,"z"),get(p,"units")))).push(muted(format!("Spindle: {} rpm · Feed: {} {}/min",get(p,"rpm"),get(p,"feed"),get(p,"units")))).push(warnings(m.issues())).push(note("Save this profile to your local library. Assign it to a setup to capture this version of its settings."));
+            form=form.push(bold(m.name(),18)).push(muted(format!("{}-axis · {} · {}",m.axes(),get(p,"mode"),get(p,"controller")))).push(muted(format!("Travel: {} × {} × {} {}",get(p,"x"),get(p,"y"),get(p,"z"),get(p,"units")))).push(muted(format!("Spindle: {} rpm · Feed: {} {}/min",get(p,"rpm"),get(p,"feed"),get(p,"units")))).push(muted(format!("Post: {} · {} · G64 P{} · dwell {} s", post_setting(p, "post_tool_length"), post_setting(p, "post_retract"), post_setting(p, "post_blend"), post_setting(p, "post_dwell")))).push(warnings(m.issues())).push(note("Save this profile to your local library. Assign it to a setup to capture this version of its settings."));
         }
     }
     let mut actions = row![
@@ -2020,7 +2031,8 @@ fn tools(app: &App) -> Element<'_, Message> {
         list = list.push(
             btn(
                 format!(
-                    "{}\n{} · Ø{} mm",
+                    "T{} · {}\n{} · Ø{} mm",
+                    get(&t.p, "number"),
                     t.name(),
                     get(&t.p, "type"),
                     get(&t.p, "diameter")
@@ -2053,6 +2065,7 @@ fn tools(app: &App) -> Element<'_, Message> {
     ]
     .spacing(14);
     for (k, l) in [
+        ("number", "Tool number · T"),
         ("diameter", "Diameter · mm"),
         ("flutes", "Flutes"),
         ("length", "Flute length · mm"),
@@ -2061,7 +2074,9 @@ fn tools(app: &App) -> Element<'_, Message> {
     ] {
         form = form.push(field(p, k, l, t));
     }
-    form = form.push(warnings(app.tool_draft.issues())).push(
+    let mut tool_issues = app.tool_draft.issues();
+    tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
+    form = form.push(warnings(tool_issues)).push(
         row![
             primary("Save tool", Message::SaveTool),
             btn(
@@ -2149,51 +2164,82 @@ fn ai(app: &App) -> Element<'_, Message> {
     .into()
 }
 fn post(app: &App) -> Element<'_, Message> {
-    let issues = app.job_issues();
-    let mut summary=column![bold("Program review",20),note("This export contains comments only. Executable G-code, collision checking and controller postprocessing are not implemented. The Facing stock preview is approximate and is not machining verification."),bold("Included setups",14)].spacing(14);
-    for s in &app.doc.setups {
-        summary = summary.push(
-            column![
-                bold(format!("{} · {}", get(&s.p, "offset"), s.name()), 13),
-                muted(format!(
-                    "{} · {} enabled operations",
-                    s.machine.name(),
-                    s.operations.iter().filter(|o| o.enabled).count()
-                ))
-            ]
-            .spacing(4),
-        );
+    let mut summary = column![
+        bold("Program review", 20),
+        note("LinuxCNC 3-axis output, one .ngc program per setup. Export repeats every check, replays each program against the simulated moves and writes nothing if any setup fails. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."),
+    ]
+    .spacing(14);
+    let mut code = column![].spacing(18);
+    match &app.post {
+        None => {
+            summary = summary.push(muted(if app.post_busy {
+                "Checking every setup and replaying its program…"
+            } else {
+                "Checks run when this page opens."
+            }))
+        }
+        Some(job) => {
+            if !job.errors.is_empty() {
+                summary = summary.push(warnings(job.errors.clone()));
+            }
+            for s in &job.setups {
+                match &s.result {
+                    Ok(programs) => {
+                        for program in programs {
+                            summary = summary.push(
+                                column![
+                                    bold(format!("✓  {}", program.file_name), 13),
+                                    muted(format!(
+                                        "{} lines · {} · {}",
+                                        program.lines,
+                                        program.tools.join(", "),
+                                        program.operations.join(" → ")
+                                    ))
+                                ]
+                                .spacing(4),
+                            );
+                            code = code.push(
+                                text(crate::post::preview(&program.text, 120))
+                                    .font(Font::MONOSPACE)
+                                    .size(12)
+                                    .color(Color::from_rgb8(183, 211, 221)),
+                            );
+                        }
+                    }
+                    Err(problems) => {
+                        summary = summary
+                            .push(bold(format!("!  {}", s.name), 13))
+                            .push(warnings(problems.clone()));
+                    }
+                }
+            }
+        }
     }
+    summary = if app.post.as_ref().is_some_and(|job| job.ready()) {
+        summary.push(primary("Export LinuxCNC G-code…", Message::ExportGcode).width(Fill))
+    } else {
+        summary.push(muted("Export becomes available when every setup passes."))
+    };
     summary = summary
-        .push(warnings(issues))
-        .push(primary("Export comments-only .nc", Message::Export("nc")).width(Fill))
         .push(btn("Export setup sheet (.md)", Message::Export("sheet"), false).width(Fill))
         .push(btn("Save complete project (.json)", Message::SaveProject, false).width(Fill));
-    let code = container(
-        scrollable(
-            text(app.doc.preview_nc())
-                .font(Font::MONOSPACE)
-                .size(12)
-                .color(Color::from_rgb8(183, 211, 221)),
-        )
-        .height(Fill),
-    )
-    .padding(22)
-    .width(Fill)
-    .height(Fill)
-    .style(|_| container::Style {
-        background: Some(Color::from_rgb8(29, 43, 55).into()),
-        border: Border {
-            radius: 5.into(),
+    let code = container(scrollable(code).height(Fill))
+        .padding(22)
+        .width(Fill)
+        .height(Fill)
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb8(29, 43, 55).into()),
+            border: Border {
+                radius: 5.into(),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    });
+        });
     container(
         column![
             page_header(
                 "NC program",
-                "Review setups and export a non-executable program outline."
+                "Check each setup, then export LinuxCNC G-code."
             ),
             row![
                 container(scrollable(summary))
@@ -2214,7 +2260,7 @@ fn post(app: &App) -> Element<'_, Message> {
 }
 
 fn operation_audit(app: &App) -> Element<'_, Message> {
-    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. No operation currently produces executable G-code or verifies machine/fixture collisions. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),btn("Back to machining",Message::Page(Page::Work),false)].spacing(12)].spacing(14).max_width(1020);
+    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance. Fixture and machine collisions are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),btn("Back to machining",Message::Page(Page::Work),false)].spacing(12)].spacing(14).max_width(1020);
     for (name, ok, detail) in &app.audit_report {
         c = c.push(
             container(
@@ -2248,7 +2294,7 @@ fn operation_audit(app: &App) -> Element<'_, Message> {
             .style(panel_style),
         );
     }
-    c=c.push(note("Remaining 3D stock carries through all enabled operations and setups, including flips. Rest-aware toolpath optimization, tool/holder collision checks, machine kinematics and controller postprocessing remain unavailable. Unavailable strategies stay visible for planning, but cannot be added as imported-part machining operations."));
+    c=c.push(note("Remaining 3D stock carries through all enabled operations and setups, including flips. Fully cleared top layers are skipped automatically. Leftover-region rest machining, fixture and machine collision checks, multi-axis kinematics and controllers other than LinuxCNC remain unavailable. Unavailable strategies stay visible for planning, but cannot be added as imported-part machining operations."));
     container(scrollable(c))
         .padding(24)
         .width(Fill)

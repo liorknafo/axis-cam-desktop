@@ -1243,4 +1243,26 @@ mod tests {
         assert!(a.operation().unwrap().strategy.tabs().contains(&"Cycle"));
         assert!(a.op_issues().is_empty())
     }
+    #[test]
+    fn program_page_rechecks_after_edits_and_ignores_stale_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (doc, mesh) = crate::post::fixture::job();
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.update(Message::Page(Page::Post));
+        assert!(a.post.as_ref().is_some_and(|j| j.ready()));
+        let _ = a.view();
+        let stale = a.post_epoch;
+        let _ = a.update(Message::Edit(Target::Setup, "offset", "G92".into()));
+        assert!(a.post.is_none() && a.post_epoch != stale);
+        let _ = a.update(Message::PostChecked(
+            stale,
+            std::sync::Arc::new(crate::post::JobPost::default()),
+        ));
+        assert!(a.post.as_ref().is_none_or(|j| !j.setups.is_empty()));
+        let _ = a.update(Message::NewTool);
+        assert_eq!(a.tool_draft.number(), Some(4));
+    }
 }
