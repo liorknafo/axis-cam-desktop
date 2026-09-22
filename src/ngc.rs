@@ -169,7 +169,11 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         for (letter, value) in words(&code).map_err(|e| fail(&e))? {
             let slot = match letter {
                 'G' => {
-                    g.push((value * 10.).round() as i64);
+                    let tenths = value * 10.;
+                    if (tenths - tenths.round()).abs() > 1e-6 {
+                        return Err(fail("malformed G code"));
+                    }
+                    g.push(tenths.round() as i64);
                     continue;
                 }
                 'M' => {
@@ -438,6 +442,9 @@ mod tests {
             "G0 X1 ; note",
             "g0 x1",
             "G53 Z0",
+            "G21.04",
+            "G59.15",
+            "G0.5 X1",
         ] {
             assert!(replay(&format!("{preamble}{bad}\nM2\n")).is_err(), "{bad}");
         }
