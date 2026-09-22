@@ -134,9 +134,14 @@ pub enum Block {
     Stop,
     /// G53 G0 Z0, or G0 Z to the setup clearance plane.
     Retract,
+    /// Begin an operation: its comment, and when `change`, T# M6 then G43 H# or MSG + M0.
     Start {
         op: usize,
         change: bool,
+    },
+    /// (Re)issue the spindle (S M3/M4) and coolant for an operation.
+    Run {
+        op: usize,
         spindle: bool,
         coolant: bool,
     },
@@ -177,9 +182,13 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         if change {
             out.extend([Block::Stop, Block::Retract]);
         }
-        out.push(Block::Start {
+        out.push(Block::Start { op: k, change });
+        if change {
+            // The new tool's tip (after G43 or a manual touch-off) goes to a safe height first.
+            out.push(Block::Retract);
+        }
+        out.push(Block::Run {
             op: k,
-            change,
             spindle,
             coolant,
         });
@@ -352,7 +361,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         coord(e.min[2] - d[2]),
         coord(e.max[2] - d[2])
     ));
-    w.line("(Not checked: fixtures, clamps and the machine body. Preview in LinuxCNC and air-cut first.)");
+    w.line("(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)");
     w.line("G17 G21 G40 G49 G80 G90 G94");
     w.line(if settings.blend > 0. {
         format!("G64 P{:.3}", settings.blend)
@@ -360,6 +369,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         "G61".into()
     });
     w.line(offset);
+    if settings.tool_table && !settings.machine_home {
+        // The first clearance retract must position the loaded tool's tip, not the gauge line.
+        w.line("G43");
+    }
     let clearance = coord(clearance_plane(blocks) - d[2]);
     let mut position: [Option<String>; 3] = [None, None, None];
     let mut motion: Option<Kind> = None;
@@ -388,12 +401,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                 }
                 motion = Some(Kind::Rapid);
             }
-            Block::Start {
-                op,
-                change,
-                spindle,
-                coolant: set,
-            } => {
+            Block::Start { op, change } => {
                 let s = &ops[*op];
                 w.note(&format!(
                     "Operation {}/{}: {} - T{}",
@@ -414,6 +422,13 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                         w.line("M0");
                     }
                 }
+            }
+            Block::Run {
+                op,
+                spindle,
+                coolant: set,
+            } => {
+                let s = &ops[*op];
                 if *spindle {
                     w.line(format!(
                         "S{:.0} {}",
@@ -733,7 +748,7 @@ mod tests {
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
 (Operation 1: Face top - Facing - T1 - S8000)
 (Extents: X-15.000 to 15.000 Y-15.000 to -15.000 Z-1.000 to 15.000 mm)
-(Not checked: fixtures, clamps and the machine body. Preview in LinuxCNC and air-cut first.)
+(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)
 G17 G21 G40 G49 G80 G90 G94
 G64 P0.010
 G54
@@ -741,6 +756,7 @@ G53 G0 Z0
 (Operation 1/1: Face top - T1)
 T1 M6
 G43 H1
+G53 G0 Z0
 S8000 M3
 M8
 G4 P2.000
@@ -767,10 +783,24 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
-        assert!(text.contains("T1 M6\n(MSG, Touch off Z for T1 Flat end mill - D10, then press Cycle Start)\nM0\nS8000 M3\n"));
+        assert!(text.contains(
+            "T1 M6\n(MSG, Touch off Z for T1 Flat end mill - D10, then press Cycle Start)\nM0\nG0 Z15.000\nS8000 M3\n"
+        ));
         assert!(!text.contains("G43") && !text.contains("G53") && !text.contains("G4 P"));
         assert!(text.contains("\nG61\n"));
-        assert_eq!(text.matches("G0 Z15.000").count(), 4, "{text}");
+        assert_eq!(text.matches("G0 Z15.000").count(), 5, "{text}");
+    }
+    #[test]
+    fn clearance_retracts_use_the_loaded_tool_length() {
+        let mut m = Machine::new(3);
+        m.p.insert("post_retract".into(), POST_RETRACT[1].into());
+        let (text, _, _) = program(m);
+        assert!(
+            text.contains(
+                "\nG54\nG43\nG0 Z15.000\n(Operation 1/1: Face top - T1)\nT1 M6\nG43 H1\nG0 Z15.000\nS8000 M3\n"
+            ),
+            "{text}"
+        );
     }
     #[test]
     fn datum_follows_the_setup_origin() {

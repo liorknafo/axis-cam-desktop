@@ -289,10 +289,12 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         state.absolute |= has(900);
         state.per_minute |= has(940);
         if has(430) {
-            let v = h
-                .filter(|v| *v >= 0. && v.fract() == 0.)
-                .ok_or_else(|| fail("G43 needs a whole-number H"))?;
-            state.length = Some(v as u32);
+            // A bare G43 uses the loaded tool, as LinuxCNC does.
+            state.length = match h {
+                None => state.tool,
+                Some(v) if v >= 0. && v.fract() == 0. => Some(v as u32),
+                Some(_) => return Err(fail("G43 needs a whole-number H")),
+            };
         }
         if has(490) {
             state.length = None;
@@ -426,6 +428,11 @@ mod tests {
         assert_eq!(r.messages, vec!["Touch off Z for T2".to_string()]);
     }
     #[test]
+    fn bare_g43_uses_the_loaded_tool() {
+        let r = replay("G17 G21 G40 G49 G80 G90 G94\nG54\nT2 M6\nG43\nG0 Z5\nM2\n").unwrap();
+        assert_eq!(r.steps[0].state.length, Some(2));
+    }
+    #[test]
     fn rejects_anything_the_post_does_not_emit() {
         let preamble = "G17 G21 G40 G49 G80 G90 G94\nG54\n";
         for bad in [
@@ -437,7 +444,7 @@ mod tests {
             "G0 X1 X2",
             "X1",
             "M6",
-            "G43",
+            "G43 H1.5",
             "M98 P1",
             "G0 X1 ; note",
             "g0 x1",
