@@ -196,6 +196,7 @@ impl Builder {
                 to,
                 motion,
                 cutting_pass: cut,
+                feed: rate,
                 start: self.plan.duration,
                 end,
             });
@@ -643,6 +644,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                     to: b.pos,
                     motion: Motion::Dwell,
                     cutting_pass: false,
+                    feed: 0.,
                     start: b.plan.duration,
                     end,
                 });

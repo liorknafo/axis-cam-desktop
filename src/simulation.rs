@@ -19,6 +19,8 @@ pub struct Move {
     pub to: [f32; 3],
     pub motion: Motion,
     pub cutting_pass: bool,
+    /// Programmed rate (mm/min) that timed this move; 0 for dwells.
+    pub feed: f32,
     pub start: f32,
     pub end: f32,
 }
@@ -343,6 +345,7 @@ pub fn generate(
                 to,
                 motion,
                 cutting_pass,
+                feed: rate,
                 start: plan.duration,
                 end,
             });
@@ -1429,5 +1432,38 @@ mod cumulative_tests {
             changed.volume.as_ref().unwrap().occupied,
             stepped.volume.as_ref().unwrap().occupied
         );
+    }
+    #[test]
+    fn every_move_records_the_rate_its_timing_uses() {
+        let (doc, mesh) = fixture();
+        let mut plans = 0;
+        sequence(&doc, &mesh, None, |_, _, result| {
+            let plan = result.unwrap().plan;
+            plans += 1;
+            for m in &plan.moves {
+                let distance = (0..3)
+                    .map(|i| (m.to[i] - m.from[i]).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                if m.motion == Motion::Dwell {
+                    assert_eq!(m.feed, 0.);
+                } else {
+                    assert!(m.feed > 0.);
+                    assert!(
+                        ((m.end - m.start) - distance / m.feed * 60.).abs() < 0.01,
+                        "{m:?}"
+                    );
+                }
+            }
+            if plan.strategy == Strategy::Face {
+                assert!(
+                    plan.moves
+                        .iter()
+                        .filter(|m| m.motion == Motion::Feed)
+                        .all(|m| m.feed == 1000. || m.feed == 250.)
+                );
+            }
+        });
+        assert_eq!(plans, 3);
     }
 }

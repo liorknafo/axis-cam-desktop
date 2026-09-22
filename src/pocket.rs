@@ -81,6 +81,7 @@ fn push(
             to,
             motion,
             cutting_pass: cutting,
+            feed: rate,
             start: plan.duration,
             end,
         });
