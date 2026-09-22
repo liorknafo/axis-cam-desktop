@@ -549,8 +549,8 @@ mod tests {
     fn choice_help_keeps_implemented_and_saved_preferences_distinct() {
         let p = Fields::new();
         let rest = selected("rest", "Rest machining", "Yes", Target::Operation, &p);
-        assert!(rest.body.contains("inherits earlier cuts"));
-        assert!(rest.body.contains("path generation is not implemented"));
+        assert!(rest.body.contains("Fully cleared top layers are skipped automatically"));
+        assert!(rest.body.contains("does not yet isolate leftover islands or corners"));
         let five = selected(
             "mode",
             "Capability",
