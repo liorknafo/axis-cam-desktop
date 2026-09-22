@@ -15,6 +15,17 @@ pub enum Blend {
     Tolerance(f64),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Length {
+    /// No G43/G49 seen yet: whatever the controller had before this program.
+    Unknown,
+    /// G49
+    Off,
+    /// Bare G43 before any M6: the loaded tool, whose number is unknown.
+    Loaded,
+    /// G43 H#, or bare G43 after T# M6
+    Tool(u32),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
     Rapid,
     Feed,
@@ -32,7 +43,7 @@ pub struct State {
     pub offset: Option<String>,
     pub selected: Option<u32>,
     pub tool: Option<u32>,
-    pub length: Option<u32>,
+    pub length: Length,
     pub touched_off: bool,
     pub spindle: Spindle,
     pub rpm: f64,
@@ -53,7 +64,7 @@ impl Default for State {
             offset: None,
             selected: None,
             tool: None,
-            length: None,
+            length: Length::Unknown,
             touched_off: false,
             spindle: Spindle::Off,
             rpm: 0.,
@@ -244,6 +255,8 @@ pub fn replay(text: &str) -> Result<Replay, String> {
                     .ok_or_else(|| fail("M6 without a selected tool"))?,
             );
             state.touched_off = false;
+            // LinuxCNC stops the spindle for a tool change.
+            state.spindle = Spindle::Off;
         }
         if m.contains(&3) || m.contains(&4) {
             if state.rpm <= 0. {
@@ -291,13 +304,13 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         if has(430) {
             // A bare G43 uses the loaded tool, as LinuxCNC does.
             state.length = match h {
-                None => state.tool,
-                Some(v) if v >= 0. && v.fract() == 0. => Some(v as u32),
+                None => state.tool.map_or(Length::Loaded, Length::Tool),
+                Some(v) if v >= 0. && v.fract() == 0. => Length::Tool(v as u32),
                 Some(_) => return Err(fail("G43 needs a whole-number H")),
             };
         }
         if has(490) {
-            state.length = None;
+            state.length = Length::Off;
         }
         if let Some(code) = g.iter().find(|c| (540..=593).contains(*c)) {
             state.offset = Some(match code {
@@ -386,13 +399,25 @@ fn near(a: Option<f64>, b: f64) -> bool {
     a.is_some_and(|a| (a - b).abs() <= TOL)
 }
 /// State that must be active whenever an operation moves.
-fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Result<(), String> {
-    let st = &s.state;
+/// The spindle runs in the operation's direction at its rounded speed.
+fn spinning(st: &State, op: &OpState) -> bool {
     let spindle = if op.clockwise {
         Spindle::Cw
     } else {
         Spindle::Ccw
     };
+    st.spindle == spindle && (st.rpm - f64::from(op.rpm.round())).abs() <= 0.5
+}
+/// The tool and length offset are the operation's (tool table), or none at all (touch-off).
+fn tool_ok(st: &State, op: &OpState, settings: &PostSettings) -> bool {
+    if settings.tool_table {
+        st.tool == Some(op.tool) && st.length == Length::Tool(op.tool)
+    } else {
+        st.tool.is_none() && st.length == Length::Off
+    }
+}
+fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Result<(), String> {
+    let st = &s.state;
     let blend = match st.blend {
         Blend::Exact => settings.blend == 0.,
         Blend::Tolerance(p) => settings.blend > 0. && (p - f64::from(settings.blend)).abs() <= TOL,
@@ -400,11 +425,11 @@ fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Resu
     };
     let problem = if settings.tool_table && st.tool != Some(op.tool) {
         format!("T{} is not loaded", op.tool)
-    } else if settings.tool_table && st.length != Some(op.tool) {
+    } else if settings.tool_table && st.length != Length::Tool(op.tool) {
         format!("G43 H{} is not active", op.tool)
-    } else if !settings.tool_table && (st.tool.is_some() || st.length.is_some()) {
-        "a touch-off program must not change tools or apply G43".into()
-    } else if st.spindle != spindle || (st.rpm - f64::from(op.rpm.round())).abs() > 0.5 {
+    } else if !settings.tool_table && !tool_ok(st, op, settings) {
+        "a touch-off program must not change tools or use a length offset".into()
+    } else if !spinning(st, op) {
         format!(
             "the spindle is not running {} at S{:.0}",
             if op.clockwise { "M3" } else { "M4" },
@@ -440,9 +465,12 @@ pub fn verify(
     let steps = &r.steps;
     let mut i = 0;
     let mut at: [Option<f64>; 3] = [None; 3];
+    // The operation of the most recent Start: its tool is the one loaded.
+    let mut current: Option<usize> = None;
     for block in blocks {
         match block {
-            Block::Stop | Block::Start { .. } | Block::Run { .. } | Block::End => {}
+            Block::Stop | Block::Run { .. } | Block::End => {}
+            Block::Start { op, .. } => current = Some(*op),
             Block::Retract => {
                 let s = take(steps, &mut i, "a safe retract")?;
                 let ok = s.kind == StepKind::Rapid
@@ -453,6 +481,25 @@ pub fn verify(
                     };
                 if !ok {
                     return Err(format!("line {}: expected the safe retract", s.line));
+                }
+                // A G53 retract ignores the length offset; a clearance retract moves the tip.
+                let st = &s.state;
+                let length = if !settings.tool_table {
+                    st.tool.is_none() && st.length == Length::Off
+                } else if settings.machine_home {
+                    true
+                } else {
+                    match current {
+                        // The bare G43 after the offset line applies the tool already loaded.
+                        None => st.length == Length::Loaded,
+                        Some(c) => tool_ok(st, &ops[c], settings),
+                    }
+                };
+                if !length {
+                    return Err(format!(
+                        "line {}: the safe retract runs with the wrong tool length offset",
+                        s.line
+                    ));
                 }
                 if s.machine {
                     at[2] = None;
@@ -465,6 +512,12 @@ pub fn verify(
                 if s.kind != StepKind::Dwell || (s.seconds - f64::from(*seconds)).abs() > TOL {
                     return Err(format!(
                         "line {}: expected a {seconds:.3} s spindle dwell",
+                        s.line
+                    ));
+                }
+                if !current.is_some_and(|c| spinning(&s.state, &ops[c])) {
+                    return Err(format!(
+                        "line {}: the spindle dwell runs before the spindle starts",
                         s.line
                     ));
                 }
@@ -586,7 +639,10 @@ mod tests {
         assert_eq!(cut.from, [Some(1.), Some(2.), Some(-1.)]);
         assert_eq!(cut.to, [Some(4.), Some(2.), Some(-1.)]);
         assert_eq!(cut.state.feed, 1000.);
-        assert_eq!((cut.state.tool, cut.state.length), (Some(3), Some(3)));
+        assert_eq!(
+            (cut.state.tool, cut.state.length),
+            (Some(3), Length::Tool(3))
+        );
         assert_eq!(
             (cut.state.spindle, cut.state.rpm, cut.state.flood),
             (Spindle::Cw, 8000., true)
@@ -605,7 +661,7 @@ mod tests {
         let r = replay(text).unwrap();
         let cut = r.steps.last().unwrap();
         assert!(cut.state.touched_off);
-        assert_eq!(cut.state.length, None);
+        assert_eq!(cut.state.length, Length::Off);
         assert_eq!(cut.state.spindle, Spindle::Ccw);
         assert_eq!(cut.state.blend, Blend::Exact);
         assert_eq!(cut.state.offset.as_deref(), Some("G59.1"));
@@ -614,7 +670,26 @@ mod tests {
     #[test]
     fn bare_g43_uses_the_loaded_tool() {
         let r = replay("G17 G21 G40 G49 G80 G90 G94\nG54\nT2 M6\nG43\nG0 Z5\nM2\n").unwrap();
-        assert_eq!(r.steps[0].state.length, Some(2));
+        assert_eq!(r.steps[0].state.length, Length::Tool(2));
+    }
+    #[test]
+    fn length_state_distinguishes_unknown_off_and_loaded_and_m6_stops_the_spindle() {
+        let pre = "G17 G21 G40 G80 G90 G94\nG54\n";
+        let r = replay(&format!(
+            "{pre}G0 Z5\nG49\nG0 Z6\nG43\nG0 Z7\nS100 M3\nT1 M6\nG43 H1\nG0 Z8\nM2\n"
+        ))
+        .unwrap();
+        let lengths: Vec<_> = r.steps.iter().map(|s| s.state.length).collect();
+        assert_eq!(
+            lengths,
+            vec![
+                Length::Unknown,
+                Length::Off,
+                Length::Loaded,
+                Length::Tool(1)
+            ]
+        );
+        assert_eq!(r.steps[3].state.spindle, Spindle::Off);
     }
     #[test]
     fn rejects_anything_the_post_does_not_emit() {

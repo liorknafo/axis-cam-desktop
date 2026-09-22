@@ -317,9 +317,16 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         setup.machine.name(),
         setup.machine.version
     ));
+    // Later touch-off programs keep program 1's X/Y; the stock top may already be cut.
+    let later = h.part.is_some_and(|(i, _)| i > 1);
     w.note(&format!(
-        "Work zero: {}. Touch off X0 Y0 Z0 there.",
-        get(&setup.p, "origin")
+        "Work zero: {}. {}",
+        get(&setup.p, "origin"),
+        if later {
+            "X0 Y0 are unchanged from program 1."
+        } else {
+            "Touch off X0 Y0 Z0 there."
+        }
     ));
     let size = h.stock.dimensions();
     w.note(&format!(
@@ -371,10 +378,19 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     w.line("(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)");
     if !settings.tool_table {
         // AXIS cannot touch off while a program is paused; G49 below would cancel a Tool Touch Off.
-        w.note(&format!(
-            "Load T{} {} and use AXIS Touch Off, not Tool Touch Off, to set Z0 at the work zero before starting this program.",
-            ops[0].tool, ops[0].tool_name
-        ));
+        // Earlier programs cut away the Z0 surface, so later tools use a fixed reference.
+        let (t, name) = (ops[0].tool, &ops[0].tool_name);
+        if h.part.is_none_or(|(i, _)| i == 1) {
+            w.note(&format!(
+                "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero."
+            ));
+            w.note("Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.");
+        } else {
+            w.note(&format!(
+                "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
+            ));
+            w.note("Do not touch off on the stock: earlier programs have cut it.");
+        }
     }
     w.line("G17 G21 G40 G49 G80 G90 G94");
     w.line(if settings.blend > 0. {
@@ -675,6 +691,14 @@ pub(crate) fn prepare(
     let (Some(settings), Some(zero), true) = (settings, zero, errors.is_empty()) else {
         return Err(errors);
     };
+    // One work zero for the whole setup, even when touch-off mode splits it into programs.
+    let stock = simulations[0].plan.stock;
+    if simulations.iter().any(|s| s.plan.stock != stock) {
+        return Err(vec![
+            "Operations in this setup report different stock boxes, so the work zero is ambiguous."
+                .into(),
+        ]);
+    }
     // Touch-off mode: one program per run of the same tool, touched off before it starts.
     let mut groups: Vec<std::ops::Range<usize>> = vec![];
     for k in 0..ops.len() {
@@ -1091,7 +1115,8 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
-        assert!(text.contains("(Load T1 Flat end mill - D10 and use AXIS Touch Off, not Tool Touch Off, to set Z0 at the work zero before starting this program.)\nG17 G21"), "{text}");
+        assert!(text.contains("(Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.)\nG17 G21"), "{text}");
+        assert!(text.contains("(Load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero.)"), "{text}");
         assert!(
             text.contains("(Operation 1/1: Face top - T1)\nG0 Z15.000\nS8000 M3\n"),
             "{text}"
@@ -1342,9 +1367,20 @@ M2
                 .contains("(Program 2 of 4 for this setup, one per tool)")
         );
         assert!(
+            programs[0]
+                .text
+                .contains("note the Z of a fixed reference surface")
+        );
+        assert!(
             programs[1]
                 .text
-                .contains("(Load T3 Drill 4 and use AXIS Touch Off")
+                .contains("(Load T3 Drill 4, then use AXIS Touch Off")
+        );
+        assert!(programs[1].text.contains("Do not touch off on the stock"));
+        assert!(
+            programs[1]
+                .text
+                .contains("X0 Y0 are unchanged from program 1")
         );
     }
     #[test]
@@ -1445,6 +1481,66 @@ M2
                 .contains("Nothing was written")
         );
         assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn different_stock_boxes_are_refused_across_touch_off_programs() {
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let mut results: Vec<Vec<(usize, Result<crate::simulation::Simulation, String>)>> =
+            vec![vec![]; doc.setups.len()];
+        crate::simulation::sequence(&doc, &mesh, None, |s, o, r| results[s].push((o, r)));
+        assert!(prepare(&doc, &mesh, 0, &results[0]).is_ok());
+        // Drilling is alone in program 2 of 4, so only a setup-wide check can see this.
+        results[0][3].1.as_mut().unwrap().plan.stock.min[0] -= 1.;
+        let problems = prepare(&doc, &mesh, 0, &results[0]).err().unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("different stock boxes")),
+            "{problems:?}"
+        );
+    }
+    #[test]
+    fn verify_checks_length_offset_at_retracts_and_spindle_at_dwells() {
+        let run = |m: Machine, edit: &dyn Fn(&str) -> String| {
+            let (text, blocks, settings) = program(m);
+            let ops = vec![fixture::facing_op()];
+            assert_ne!(edit(&text), text);
+            (
+                crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54"),
+                crate::ngc::verify(&edit(&text), &blocks, &ops, [0., 0., 10.], &settings, "G54"),
+            )
+        };
+        let clearance = || {
+            let mut m = Machine::new(3);
+            m.p.insert("post_retract".into(), POST_RETRACT[1].into());
+            m
+        };
+        let touch_off = || {
+            let mut m = Machine::new(3);
+            m.p.insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+            m
+        };
+        for (machine, edit) in [
+            (
+                clearance(),
+                &(|t: &str| t.replace("G43 H1\nG0 Z15.000\n", "G0 Z15.000\nG43 H1\n"))
+                    as &dyn Fn(&str) -> String,
+            ),
+            (clearance(), &|t: &str| t.replacen("G54\nG43\n", "G54\n", 1)),
+            (Machine::new(3), &|t: &str| {
+                t.replace("S8000 M3\nM8\nG4 P2.000\n", "G4 P2.000\nS8000 M3\nM8\n")
+            }),
+            (touch_off(), &|t: &str| {
+                t.replacen("G40 G49 G80", "G40 G80", 1)
+            }),
+            (touch_off(), &|t: &str| t.replacen("G54\n", "G54\nG43\n", 1)),
+        ] {
+            let (clean, edited) = run(machine, edit);
+            assert_eq!(clean, Ok(()));
+            assert!(edited.is_err());
+        }
     }
     #[test]
     fn headless_export_matches_the_ui_path() {
