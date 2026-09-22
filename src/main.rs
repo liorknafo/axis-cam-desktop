@@ -7,6 +7,7 @@ mod model;
 mod ngc;
 mod pocket;
 mod post;
+mod post_check;
 mod rest;
 mod simulation;
 mod smoke;
