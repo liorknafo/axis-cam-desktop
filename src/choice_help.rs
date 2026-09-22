@@ -149,16 +149,37 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Use the entered overall X, Y and Z stock dimensions. The preview centers it in X/Y with its bottom at Z=0. The box can be smaller than the part, which is reported. Relative offsets are retained for switching back."
         }
         ("origin", "Stock top center") => {
-            "Record the intended datum at the center of the stock's top face. Use the same datum when probing the machine. Exact origin-to-machine mapping and NC output remain pending."
+            "Program zero is the center of the stock's top face: the LinuxCNC program puts X0 Y0 at the stock center and Z0 on its top. Touch off the work offset there."
         }
         ("origin", "Stock top front-left") => {
-            "Record the intended datum at the stock's top corner on −X and −Y in setup coordinates. This is independent of camera orientation. Exact machine-coordinate mapping remains pending."
+            "Program zero is the stock's top corner on −X and −Y in setup coordinates, independent of camera orientation. Touch off X0 Y0 Z0 on that corner."
         }
         ("origin", "Model origin") => {
-            "Record the source model origin as the intended work datum. Check that it is practical to locate on the machine. The preview's placement controls are separate from a future postprocessor's datum mapping."
+            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. Check that the point can be located on the machine before choosing it."
         }
         ("origin", "Selected point (planned)") => {
-            "Arbitrary datum-point picking is planned. This saved choice does not yet let you select a point or create a machine coordinate transform."
+            "Picking an arbitrary work zero is planned. G-code export is refused while this is selected."
+        }
+        ("post_tool_length", "Tool table (G43 H#)") => {
+            "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first."
+        }
+        ("post_tool_length", "Touch off each tool (one program per tool)") => {
+            "Write one program per run of the same tool, with no tool change or G43 inside. Touch the first tool off at the work zero with AXIS Touch Off (not Tool Touch Off) and note the Z of a fixed reference such as a vise jaw; touch each later tool off on that reference. LinuxCNC's AXIS cannot touch off while a program is paused, so tool changes are not placed inside a program."
+        }
+        ("post_retract", "Machine Z home (G53 G0 Z0)") => {
+            "Retract to machine Z0 with G53 before tool changes and at the end. On a standard LinuxCNC mill Z0 is the top of travel; confirm this on your machine."
+        }
+        ("post_retract", "Setup clearance plane") => {
+            "Retract with G0 Z to the setup's highest clearance height, in work coordinates. Use it when machine Z0 is not the top of travel. There may be less room to change tools."
+        }
+        ("post_air", "M7") => {
+            "Operations set to Air turn on M7, the mist output. Choose this when the air blast is wired to mist."
+        }
+        ("post_air", "M8") => {
+            "Operations set to Air turn on M8, the flood output. Choose this when the air blast is wired to flood."
+        }
+        ("post_air", "Not available") => {
+            "This machine has no air blast output. Export is refused for operations set to Air."
         }
         ("fixture", "Low profile clamps") => {
             "Record clamps holding the part against a support. Plan access around clamp locations; fixture solids and collisions are not modeled."
@@ -369,10 +390,11 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
     if body.is_empty() {
         body = match key {
             "offset" => format!(
-                "Use {value} as this setup's saved work-coordinate register. Match the probed origin on the machine. The prototype does not emit work-offset motion commands."
+                "Use {value} as this setup's work offset. The LinuxCNC program selects it before any motion; touch it off at the setup's work zero."
             ),
+            "controller" if value == "LinuxCNC" => "LinuxCNC has a 3-axis postprocessor. Export checks every setup and replays each program against the simulated moves before writing it.".to_string(),
             "controller" => format!(
-                "Save {value} as the intended controller family. No matching postprocessor is active yet, so this choice does not produce executable machine code."
+                "Save {value} as the intended controller family for planning. Only LinuxCNC output is implemented, so G-code export is refused for this machine."
             ),
             "arrangement" => format!(
                 "Save the {value} rotary layout. {} A rotates about X, B about Y, and C about Z. This records the machine configuration; inverse kinematics are not implemented.",
@@ -587,5 +609,59 @@ mod tests {
         );
         assert!(fixed.body.contains("overall X, Y and Z"));
         assert!(fixed.diagram.is_none());
+    }
+    #[test]
+    fn post_settings_have_choice_specific_help() {
+        let p = Fields::new();
+        let cards: Vec<_> = [
+            ("post_tool_length", "Tool table (G43 H#)"),
+            (
+                "post_tool_length",
+                "Touch off each tool (one program per tool)",
+            ),
+            ("post_retract", "Machine Z home (G53 G0 Z0)"),
+            ("post_retract", "Setup clearance plane"),
+            ("post_air", "M7"),
+            ("post_air", "M8"),
+            ("post_air", "Not available"),
+        ]
+        .iter()
+        .map(|(k, v)| selected(k, "Post", v, Target::Machine, &p))
+        .collect();
+        for (i, a) in cards.iter().enumerate() {
+            assert!(!a.body.starts_with("Current saved value"));
+            for b in &cards[i + 1..] {
+                assert_ne!(a.body, b.body);
+            }
+        }
+        assert!(
+            selected("controller", "Controller", "LinuxCNC", Target::Machine, &p)
+                .body
+                .contains("3-axis postprocessor")
+        );
+        assert!(
+            selected("controller", "Controller", "GRBL", Target::Machine, &p)
+                .body
+                .contains("refused")
+        );
+        for origin in ["Stock top center", "Stock top front-left", "Model origin"] {
+            assert!(
+                !selected("origin", "Origin", origin, Target::Setup, &p)
+                    .body
+                    .contains("pending")
+            );
+        }
+        assert!(
+            !crate::help::field_help("number", "Tool number", Target::Tool)
+                .body
+                .starts_with("Saved parameter")
+        );
+        for key in ["post_blend", "post_dwell"] {
+            assert!(
+                !crate::help::field_help(key, "Post", Target::Machine)
+                    .body
+                    .starts_with("Saved parameter")
+            );
+        }
     }
 }

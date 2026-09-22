@@ -211,7 +211,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Return to the part viewport, setup browser and operation editor. Your current edits remain in the workspace."
         }
         Page(crate::Page::Post) => {
-            "Review setup order and configuration issues. Export a setup sheet or comments-only NC preview. This prototype does not output machine motion commands."
+            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance; fixtures and the machine body are not checked."
         }
         Page(crate::Page::Wizard) | NewMachine => {
             "Create a reusable machine profile in five steps: identity, travel, kinematics, controller and review."
@@ -257,7 +257,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Select geometry on the current part. Click a surface to toggle it, drag to orbit, and click Finish picking when done. Imported Facing/Pocket selections are connected planar mesh regions, not exact CAD faces."
         }
         Generate => {
-            "Generate the selected supported imported-part operation with sampled stock removal. The example project uses illustrative paths. No collision checking or executable G-code is available."
+            "Generate the selected supported imported-part operation with sampled stock removal. The example project uses illustrative paths. G-code export is on the NC program page."
         }
         GenerateAll => {
             "Generate and check every enabled operation in every setup. The report lists successful previews and specific failures; disabled operations are skipped. Remaining stock carries through earlier operations and setups. Failed upstream operations block downstream stock; playback remains one operation at a time."
@@ -331,8 +331,8 @@ pub fn command(m: &Message, label: String) -> Help {
         Export("sheet") => {
             "Save a Markdown setup sheet with machine, workholding, repositioning instructions and operation parameters."
         }
-        Export(_) => {
-            "Export a comments-only .nc file for reviewing the job. It contains no cutting moves and cannot machine the part."
+        ExportGcode => {
+            "Choose a folder and write one LinuxCNC .ngc program per setup. Every check and the replay run again first; nothing is written if any setup fails."
         }
         Camera("ISO") => {
             "Reset to an isometric view that shows the top and two sides. Drag to orbit, right-drag to pan, and scroll to zoom."
@@ -630,8 +630,32 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Work coordinate register for this setup, G54–G59. Its origin must correspond to the origin probed on the real machine.",
             Some(Orientation),
         ),
+        (Target::Tool, "number") => (
+            "Tool number written as T# and, with a tool table, G43 H#. It must match the entry in LinuxCNC's tool table. Each library tool needs a unique number from 1 to 9999.",
+            None,
+        ),
+        (_, "post_tool_length") => (
+            "How programs apply tool length: from LinuxCNC's tool table with T# M6 and G43 H#, or one program per tool that you touch off before running it.",
+            None,
+        ),
+        (_, "post_retract") => (
+            "Where the tool goes before a tool change and at the end: machine Z0 with G53, or the setup's highest clearance height.",
+            None,
+        ),
+        (_, "post_blend") => (
+            "Path blending tolerance for LinuxCNC's trajectory planner. A positive value writes G64 P with this tolerance in mm, so corners may round by up to that much at speed. 0 writes G61 exact path.",
+            None,
+        ),
+        (_, "post_dwell") => (
+            "Seconds to wait after starting or changing the spindle before the first move. Use it when the spindle has no at-speed feedback. 0 writes no dwell.",
+            None,
+        ),
+        (_, "post_air") => (
+            "LinuxCNC output used for operations set to Air: M7 (mist) or M8 (flood), whichever is wired to the air blast.",
+            None,
+        ),
         (_, "origin") => (
-            "Reference point used as the setup's coordinate zero. Choose a point you can reproduce when locating the stock; arbitrary point selection is planned.",
+            "Work zero for this setup's G-code. Choose a point you can reproduce when touching off the stock; arbitrary point selection is planned.",
             Some(Orientation),
         ),
         (_, "stock_type") => (
@@ -715,7 +739,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (_, "controller") => (
-            "Controller family and intended postprocessor. This setting is saved; controller-specific executable G-code output is not implemented yet.",
+            "Controller family. LinuxCNC has a 3-axis postprocessor; other controllers are saved for planning and cannot export G-code yet.",
             None,
         ),
         (_, "tool_change") => (
