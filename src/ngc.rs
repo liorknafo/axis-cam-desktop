@@ -373,6 +373,190 @@ pub fn replay(text: &str) -> Result<Replay, String> {
     Ok(out)
 }
 
+use crate::post::{Block, Kind, OpState, PostSettings};
+const TOL: f64 = 0.0006;
+fn take<'a>(steps: &'a [Step], i: &mut usize, what: &str) -> Result<&'a Step, String> {
+    let s = steps
+        .get(*i)
+        .ok_or_else(|| format!("the program ends before {what}"))?;
+    *i += 1;
+    Ok(s)
+}
+fn near(a: Option<f64>, b: f64) -> bool {
+    a.is_some_and(|a| (a - b).abs() <= TOL)
+}
+/// State that must be active whenever an operation moves.
+fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Result<(), String> {
+    let st = &s.state;
+    let spindle = if op.clockwise {
+        Spindle::Cw
+    } else {
+        Spindle::Ccw
+    };
+    let blend = match st.blend {
+        Blend::Exact => settings.blend == 0.,
+        Blend::Tolerance(p) => settings.blend > 0. && (p - f64::from(settings.blend)).abs() <= TOL,
+        Blend::Unset => false,
+    };
+    let problem = if settings.tool_table && st.tool != Some(op.tool) {
+        format!("T{} is not loaded", op.tool)
+    } else if settings.tool_table && st.length != Some(op.tool) {
+        format!("G43 H{} is not active", op.tool)
+    } else if !settings.tool_table && (st.tool.is_some() || st.length.is_some()) {
+        "a touch-off program must not change tools or apply G43".into()
+    } else if st.spindle != spindle || (st.rpm - f64::from(op.rpm.round())).abs() > 0.5 {
+        format!(
+            "the spindle is not running {} at S{:.0}",
+            if op.clockwise { "M3" } else { "M4" },
+            op.rpm
+        )
+    } else if (st.mist, st.flood) != op.coolant {
+        "the coolant state is wrong".into()
+    } else if st.offset.as_deref() != Some(offset) {
+        format!("{offset} is not active")
+    } else if !blend {
+        "the path blending mode is wrong".into()
+    } else {
+        return Ok(());
+    };
+    Err(format!("line {}: {problem} for {}", s.line, op.name))
+}
+/// Replay `text` and require exactly the motion in `blocks` (plan coordinates).
+pub fn verify(
+    text: &str,
+    blocks: &[Block],
+    ops: &[OpState],
+    datum: [f32; 3],
+    settings: &PostSettings,
+    offset: &str,
+) -> Result<(), String> {
+    let r = replay(text)?;
+    if !r.ended {
+        return Err("the program has no M2 end".into());
+    }
+    let d = datum.map(f64::from);
+    let work = |p: [f32; 3]| -> [f64; 3] { std::array::from_fn(|k| f64::from(p[k]) - d[k]) };
+    let clearance = f64::from(crate::post::clearance_plane(blocks)) - d[2];
+    let steps = &r.steps;
+    let mut i = 0;
+    let mut at: [Option<f64>; 3] = [None; 3];
+    for block in blocks {
+        match block {
+            Block::Stop | Block::Start { .. } | Block::Run { .. } | Block::End => {}
+            Block::Retract => {
+                let s = take(steps, &mut i, "a safe retract")?;
+                let ok = s.kind == StepKind::Rapid
+                    && if settings.machine_home {
+                        s.machine && s.to == [None, None, Some(0.)]
+                    } else {
+                        !s.machine && near(s.to[2], clearance) && s.to[..2] == s.from[..2]
+                    };
+                if !ok {
+                    return Err(format!("line {}: expected the safe retract", s.line));
+                }
+                if s.machine {
+                    at[2] = None;
+                } else {
+                    at = s.to;
+                }
+            }
+            Block::Wait { seconds } => {
+                let s = take(steps, &mut i, "the spindle dwell")?;
+                if s.kind != StepKind::Dwell || (s.seconds - f64::from(*seconds)).abs() > TOL {
+                    return Err(format!(
+                        "line {}: expected a {seconds:.3} s spindle dwell",
+                        s.line
+                    ));
+                }
+            }
+            Block::Approach { op, xy } => {
+                let s = take(steps, &mut i, "the approach")?;
+                let w = work([xy[0], xy[1], 0.]);
+                if s.machine
+                    || s.kind != StepKind::Rapid
+                    || !near(s.to[0], w[0])
+                    || !near(s.to[1], w[1])
+                    || s.to[2] != s.from[2]
+                {
+                    return Err(format!(
+                        "line {}: expected the rapid approach in X/Y",
+                        s.line
+                    ));
+                }
+                active(s, &ops[*op], settings, offset)?;
+                at = s.to;
+            }
+            Block::Descend { op, xy, z } => {
+                let s = take(steps, &mut i, "the descent")?;
+                let w = work([xy[0], xy[1], *z]);
+                if s.machine
+                    || s.kind != StepKind::Rapid
+                    || (0..3).any(|k| !near(s.to[k], w[k]))
+                    || s.to[..2] != s.from[..2]
+                {
+                    return Err(format!(
+                        "line {}: expected the rapid descent to the first point",
+                        s.line
+                    ));
+                }
+                active(s, &ops[*op], settings, offset)?;
+                at = s.to;
+            }
+            Block::Move {
+                op,
+                kind: Kind::Dwell,
+                seconds,
+                ..
+            } => {
+                let s = take(steps, &mut i, "a dwell")?;
+                if s.kind != StepKind::Dwell || (s.seconds - f64::from(*seconds)).abs() > TOL {
+                    return Err(format!("line {}: expected a {seconds:.3} s dwell", s.line));
+                }
+                active(s, &ops[*op], settings, offset)?;
+            }
+            Block::Move {
+                op, kind, to, feed, ..
+            } => {
+                let w = work(*to);
+                let expected = if *kind == Kind::Rapid {
+                    StepKind::Rapid
+                } else {
+                    StepKind::Feed
+                };
+                let found = steps.get(i).filter(|s| {
+                    !s.machine && s.kind == expected && (0..3).all(|k| near(s.to[k], w[k]))
+                });
+                if let Some(s) = found {
+                    i += 1;
+                    if expected == StepKind::Feed && (s.state.feed - f64::from(*feed)).abs() > 0.051
+                    {
+                        return Err(format!(
+                            "line {}: F{:.1} does not match the simulated {feed:.1} mm/min",
+                            s.line, s.state.feed
+                        ));
+                    }
+                    active(s, &ops[*op], settings, offset)?;
+                    at = s.to;
+                } else if !(0..3).all(|k| near(at[k], w[k])) {
+                    // Only a move shorter than the output resolution may be absent.
+                    let line = steps.get(i).map_or(0, |s| s.line);
+                    return Err(format!(
+                        "line {line}: expected a {kind:?} move to X{:.3} Y{:.3} Z{:.3}",
+                        w[0], w[1], w[2]
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(s) = steps.get(i) {
+        return Err(format!("line {}: unexpected extra motion", s.line));
+    }
+    if r.end_state.spindle != Spindle::Off || r.end_state.mist || r.end_state.flood {
+        return Err("the spindle or coolant is still on at M2".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

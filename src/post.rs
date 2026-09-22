@@ -4,7 +4,7 @@
 use crate::{
     mesh::{Bounds, Mesh},
     model::*,
-    simulation::{Motion, Plan},
+    simulation::{Motion, Plan, Simulation},
     stock::Placement,
 };
 
@@ -134,7 +134,7 @@ pub enum Block {
     Stop,
     /// G53 G0 Z0, or G0 Z to the setup clearance plane.
     Retract,
-    /// Begin an operation: its comment, and when `change`, T# M6 then G43 H# or MSG + M0.
+    /// Begin an operation: its comment, and when `change` in tool-table mode, T# M6 then G43 H#.
     Start {
         op: usize,
         change: bool,
@@ -369,6 +369,13 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         coord(e.max[2] - d[2])
     ));
     w.line("(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)");
+    if !settings.tool_table {
+        // AXIS cannot touch off while a program is paused; G49 below would cancel a Tool Touch Off.
+        w.note(&format!(
+            "Load T{} {} and use AXIS Touch Off, not Tool Touch Off, to set Z0 at the work zero before starting this program.",
+            ops[0].tool, ops[0].tool_name
+        ));
+    }
     w.line("G17 G21 G40 G49 G80 G90 G94");
     w.line(if settings.blend > 0. {
         format!("G64 P{:.3}", settings.blend)
@@ -420,12 +427,6 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                 if *change && settings.tool_table {
                     w.line(format!("T{} M6", s.tool));
                     w.line(format!("G43 H{}", s.tool));
-                } else if *change {
-                    // AXIS cannot touch off while a program is paused, so each tool gets its own program.
-                    w.note(&format!(
-                        "Load T{} {} and touch off Z at the work zero before starting this program.",
-                        s.tool, s.tool_name
-                    ));
                 }
             }
             Block::Run {
@@ -510,6 +511,307 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         }
     }
     w.0
+}
+#[derive(Debug, Clone)]
+pub struct Program {
+    pub file_name: String,
+    pub text: String,
+    pub lines: usize,
+    pub tools: Vec<String>,
+    pub operations: Vec<String>,
+}
+#[derive(Debug, Clone)]
+pub struct SetupPost {
+    pub setup: usize,
+    pub name: String,
+    /// One program per setup, or one per tool run in touch-off mode.
+    pub result: Result<Vec<Program>, Vec<String>>,
+}
+#[derive(Debug, Clone, Default)]
+pub struct JobPost {
+    pub errors: Vec<String>,
+    pub setups: Vec<SetupPost>,
+}
+impl JobPost {
+    pub fn blocked(message: &str) -> Self {
+        Self {
+            errors: vec![message.into()],
+            setups: vec![],
+        }
+    }
+    pub fn ready(&self) -> bool {
+        self.errors.is_empty()
+            && !self.setups.is_empty()
+            && self.setups.iter().all(|s| s.result.is_ok())
+    }
+}
+pub fn file_name(doc: &Document, index: usize, part: Option<(usize, usize, u32)>) -> String {
+    let clean = |s: &str| -> String {
+        let s: String = s
+            .chars()
+            .map(|c| {
+                if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        s.trim().chars().take(60).collect()
+    };
+    let setup = &doc.setups[index];
+    let job = clean(&doc.title);
+    let base = format!(
+        "{} - {} {} ({})",
+        if job.is_empty() {
+            "AXIS job".into()
+        } else {
+            job
+        },
+        index + 1,
+        clean(setup.name()),
+        clean(get(&setup.p, "offset"))
+    );
+    match part {
+        Some((i, count, tool)) => format!("{base} - {i} of {count} T{tool}.ngc"),
+        None => format!("{base}.ngc"),
+    }
+}
+fn op_state(
+    doc: &Document,
+    op: &Operation,
+    plan: &Plan,
+    settings: Option<&PostSettings>,
+) -> Result<OpState, Vec<String>> {
+    let Some(tool) = doc.tools.iter().find(|t| t.id == op.tool) else {
+        return Err(vec![format!("{}: choose a saved tool.", op.name())]);
+    };
+    let mut e: Vec<String> = doc
+        .tool_number_issues(tool)
+        .into_iter()
+        .map(|x| format!("{}: {x}", op.name()))
+        .collect();
+    let coolant = match get(&op.p, "coolant") {
+        "Flood" => Some((false, true)),
+        "Mist" => Some((true, false)),
+        "Off" => Some((false, false)),
+        "Air" => settings.and_then(|s| s.air),
+        _ => None,
+    };
+    if coolant.is_none() {
+        e.push(format!(
+            "{}: coolant \"{}\" has no LinuxCNC output on this machine.",
+            op.name(),
+            get(&op.p, "coolant")
+        ));
+    }
+    if !e.is_empty() {
+        return Err(e);
+    }
+    Ok(OpState {
+        name: op.name().into(),
+        strategy: op.strategy.name(),
+        tool: tool.number().unwrap(),
+        tool_id: tool.id.clone(),
+        tool_name: tool.name().into(),
+        diameter: plan.radius * 2.,
+        stickout: plan.tool_length,
+        rpm: num(&op.p, "rpm").unwrap_or(0.),
+        clockwise: plan.spindle_clockwise,
+        coolant: coolant.unwrap(),
+    })
+}
+pub(crate) struct Prepared {
+    pub file_name: String,
+    pub text: String,
+    pub blocks: Vec<Block>,
+    pub ops: Vec<OpState>,
+    pub datum: [f32; 3],
+    pub settings: PostSettings,
+    pub offset: String,
+}
+/// Check and emit one setup from its `sequence` results (enabled operations only):
+/// one program, or one per run of the same tool in touch-off mode.
+pub(crate) fn prepare(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+) -> Result<Vec<Prepared>, Vec<String>> {
+    let setup = &doc.setups[si];
+    let offset = get(&setup.p, "offset").to_string();
+    let mut errors = vec![];
+    let settings = PostSettings::from_machine(&setup.machine)
+        .map_err(|e| errors.extend(e))
+        .ok();
+    if !OFFSETS.contains(&offset.as_str()) {
+        errors.push(format!(
+            "Work offset \"{offset}\" is not a LinuxCNC register (G54-G59.3)."
+        ));
+    }
+    if sims.is_empty() {
+        errors.push("This setup has no enabled operations. Add one or remove the setup.".into());
+    }
+    let mut ops = vec![];
+    let mut simulations = vec![];
+    for (oi, result) in sims {
+        let op = &setup.operations[*oi];
+        match result {
+            Err(e) => errors.push(format!("{}: {e}", op.name())),
+            Ok(sim) => match op_state(doc, op, &sim.plan, settings.as_ref()) {
+                Ok(state) => {
+                    ops.push(state);
+                    simulations.push(sim);
+                }
+                Err(e) => errors.extend(e),
+            },
+        }
+    }
+    let zero = simulations.first().and_then(|sim| {
+        datum(setup, sim.plan.stock, mesh)
+            .map_err(|e| errors.push(e))
+            .ok()
+    });
+    let (Some(settings), Some(zero), true) = (settings, zero, errors.is_empty()) else {
+        return Err(errors);
+    };
+    // Touch-off mode: one program per run of the same tool, touched off before it starts.
+    let mut groups: Vec<std::ops::Range<usize>> = vec![];
+    for k in 0..ops.len() {
+        match groups.last_mut() {
+            Some(g) if settings.tool_table || ops[g.start].tool_id == ops[k].tool_id => {
+                g.end = k + 1
+            }
+            _ => groups.push(k..k + 1),
+        }
+    }
+    let count = groups.len();
+    let mut out = vec![];
+    for (i, g) in groups.into_iter().enumerate() {
+        let group_ops = &ops[g.clone()];
+        let group_sims = &simulations[g];
+        let plans: Vec<&Plan> = group_sims.iter().map(|s| &s.plan).collect();
+        let blocks = blocks(group_ops, &plans, &settings);
+        let problems =
+            crate::post_check::check_setup(setup, group_ops, group_sims, &blocks, &settings, zero);
+        if !problems.is_empty() {
+            return Err(problems);
+        }
+        let part = (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool));
+        let header = Header {
+            job: &doc.title,
+            setup,
+            number: si + 1,
+            part: part.map(|(i, count, _)| (i, count)),
+            stock: plans[0].stock,
+            datum: zero,
+            disabled: setup
+                .operations
+                .iter()
+                .filter(|o| !o.enabled)
+                .map(|o| o.name().to_string())
+                .collect(),
+        };
+        let text = emit(&header, group_ops, &blocks, &settings);
+        out.push(Prepared {
+            file_name: file_name(doc, si, part),
+            text,
+            blocks,
+            ops: group_ops.to_vec(),
+            datum: zero,
+            settings,
+            offset: offset.clone(),
+        });
+    }
+    Ok(out)
+}
+pub fn post_job(doc: &Document, mesh: &Mesh) -> JobPost {
+    if doc.file.is_none() {
+        return JobPost::blocked(
+            "Import a part before posting. The example project's paths are illustrative and cannot be machined.",
+        );
+    }
+    if doc.setups.is_empty() {
+        return JobPost::blocked("Create a machining setup.");
+    }
+    let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> = vec![vec![]; doc.setups.len()];
+    crate::simulation::sequence(doc, mesh, None, |si, oi, r| results[si].push((oi, r)));
+    let setups = (0..doc.setups.len())
+        .map(|si| {
+            let result = prepare(doc, mesh, si, &results[si]).and_then(|parts| {
+                parts
+                    .into_iter()
+                    .map(|p| {
+                        crate::ngc::verify(
+                            &p.text,
+                            &p.blocks,
+                            &p.ops,
+                            p.datum,
+                            &p.settings,
+                            &p.offset,
+                        )
+                        .map_err(|e| {
+                            vec![format!(
+                                "{}: round-trip verification failed: {e}",
+                                p.file_name
+                            )]
+                        })?;
+                        let mut tools: Vec<String> = vec![];
+                        for op in &p.ops {
+                            let tool = format!("T{} {}", op.tool, op.tool_name);
+                            if !tools.contains(&tool) {
+                                tools.push(tool);
+                            }
+                        }
+                        Ok(Program {
+                            file_name: p.file_name,
+                            lines: p.text.lines().count(),
+                            operations: p.ops.iter().map(|o| o.name.clone()).collect(),
+                            tools,
+                            text: p.text,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            SetupPost {
+                setup: si,
+                name: doc.setups[si].name().to_string(),
+                result,
+            }
+        })
+        .collect();
+    JobPost {
+        errors: vec![],
+        setups,
+    }
+}
+/// Write every program, or nothing when any setup failed.
+pub fn write_job(
+    job: &JobPost,
+    folder: &std::path::Path,
+) -> Result<(std::path::PathBuf, usize), String> {
+    if !job.ready() {
+        let reason = job
+            .errors
+            .first()
+            .cloned()
+            .or_else(|| {
+                job.setups.iter().find_map(|s| {
+                    s.result
+                        .as_ref()
+                        .err()
+                        .and_then(|e| e.first().map(|x| format!("{}: {x}", s.name)))
+                })
+            })
+            .unwrap_or_else(|| "No programs were produced.".into());
+        return Err(format!("Nothing was written. {reason}"));
+    }
+    let mut count = 0;
+    for program in job.setups.iter().flat_map(|s| s.result.as_ref().unwrap()) {
+        crate::storage::write_atomic(&folder.join(&program.file_name), program.text.as_bytes())?;
+        count += 1;
+    }
+    Ok((folder.to_path_buf(), count))
 }
 
 #[cfg(test)]
@@ -789,10 +1091,9 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
+        assert!(text.contains("(Load T1 Flat end mill - D10 and use AXIS Touch Off, not Tool Touch Off, to set Z0 at the work zero before starting this program.)\nG17 G21"), "{text}");
         assert!(
-            text.contains(
-                "(Load T1 Flat end mill - D10 and touch off Z at the work zero before starting this program.)\nG0 Z15.000\nS8000 M3\n"
-            ),
+            text.contains("(Operation 1/1: Face top - T1)\nG0 Z15.000\nS8000 M3\n"),
             "{text}"
         );
         assert!(!text.contains("M6") && !text.contains("\nM0\n") && !text.contains("G43"));
@@ -898,5 +1199,266 @@ M2
                 assert_eq!(to, from);
             }
         }
+    }
+    fn errors(job: &JobPost) -> Vec<String> {
+        job.errors
+            .iter()
+            .cloned()
+            .chain(
+                job.setups
+                    .iter()
+                    .filter_map(|s| s.result.as_ref().err())
+                    .flatten()
+                    .cloned(),
+            )
+            .collect()
+    }
+    fn prepared(doc: &Document, mesh: &Mesh, si: usize) -> Prepared {
+        let mut results: Vec<Vec<(usize, Result<crate::simulation::Simulation, String>)>> =
+            vec![vec![]; doc.setups.len()];
+        crate::simulation::sequence(doc, mesh, None, |s, o, r| results[s].push((o, r)));
+        prepare(doc, mesh, si, &results[si]).unwrap().remove(0)
+    }
+    #[test]
+    fn all_six_strategies_post_and_replay_exactly() {
+        let (doc, mesh) = fixture::job();
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let programs = job.setups[0].result.as_ref().unwrap();
+        assert_eq!(programs.len(), 1);
+        let program = &programs[0];
+        assert_eq!(program.file_name, "Fixture block - 1 Top (G54).ngc");
+        for needle in ["T1 M6", "T3 M6", "T2 M6", "\nG54\n", "G43 H3", "\nM2\n"] {
+            assert!(program.text.contains(needle), "{needle}");
+        }
+        assert_eq!(program.operations.len(), 6);
+        assert!(program.lines > 1000);
+    }
+    #[test]
+    fn corrupted_programs_fail_verification() {
+        let (doc, mesh) = fixture::job();
+        let p = prepared(&doc, &mesh, 0);
+        let check = |text: &str| {
+            crate::ngc::verify(text, &p.blocks, &p.ops, p.datum, &p.settings, &p.offset)
+        };
+        assert_eq!(check(&p.text), Ok(()));
+        let lines: Vec<&str> = p.text.lines().collect();
+        let first_feed = lines.iter().position(|l| l.starts_with("G1 ")).unwrap();
+        let with = |i: usize, replacement: &str| {
+            let mut l = lines.clone();
+            l[i] = replacement;
+            l.join("\n") + "\n"
+        };
+        assert!(check(&with(first_feed, "G1 Z-50.000 F250.0")).is_err());
+        assert!(
+            check(&with(
+                first_feed,
+                lines[first_feed].split(" F").next().unwrap()
+            ))
+            .is_err()
+        );
+        assert!(check(&p.text.replace("T3 M6", "T4 M6")).is_err());
+        assert!(check(&p.text.replacen("G54\n", "G54\nG2 X0 Y0\n", 1)).is_err());
+        let cut = lines
+            .iter()
+            .rposition(|l| l.starts_with('X') || l.starts_with('Y'))
+            .unwrap();
+        let mut dropped = lines.clone();
+        dropped.remove(cut);
+        assert!(check(&(dropped.join("\n") + "\n")).is_err());
+    }
+    #[test]
+    fn golden_programs_verify_in_every_mode() {
+        for (key, value) in [
+            ("post_tool_length", POST_TOOL_LENGTH[0]),
+            ("post_tool_length", POST_TOOL_LENGTH[1]),
+            ("post_retract", POST_RETRACT[1]),
+            ("post_blend", "0"),
+            ("post_dwell", "0"),
+        ] {
+            let mut m = Machine::new(3);
+            m.p.insert(key.into(), value.into());
+            let (text, blocks, settings) = program(m);
+            let ops = vec![fixture::facing_op()];
+            assert_eq!(
+                crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54"),
+                Ok(()),
+                "{key}"
+            );
+        }
+    }
+    #[test]
+    fn a_flipped_setup_gets_its_own_program_and_offset() {
+        let (doc, mesh) = fixture::flipped_job();
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let names: Vec<_> = job
+            .setups
+            .iter()
+            .map(|s| s.result.as_ref().unwrap()[0].file_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Fixture block - 1 Top (G54).ngc",
+                "Fixture block - 2 Flipped (G55).ngc"
+            ]
+        );
+        let second = &job.setups[1].result.as_ref().unwrap()[0].text;
+        assert!(second.contains("\nG55\n") && !second.contains("\nG54\n"));
+        assert!(second.contains("Part rotation X180"));
+    }
+    #[test]
+    fn touch_off_mode_writes_one_program_per_tool_run() {
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let programs = job.setups[0].result.as_ref().unwrap();
+        let names: Vec<_> = programs.iter().map(|p| p.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Fixture block - 1 Top (G54) - 1 of 4 T1.ngc",
+                "Fixture block - 1 Top (G54) - 2 of 4 T3.ngc",
+                "Fixture block - 1 Top (G54) - 3 of 4 T2.ngc",
+                "Fixture block - 1 Top (G54) - 4 of 4 T1.ngc",
+            ]
+        );
+        assert_eq!(programs[0].operations.len(), 3);
+        for p in programs {
+            assert!(
+                !p.text.contains("M6")
+                    && !p.text.contains("G43")
+                    && p.text.contains("use AXIS Touch Off")
+            );
+        }
+        assert!(
+            programs[1]
+                .text
+                .contains("(Program 2 of 4 for this setup, one per tool)")
+        );
+        assert!(
+            programs[1]
+                .text
+                .contains("(Load T3 Drill 4 and use AXIS Touch Off")
+        );
+    }
+    #[test]
+    fn unsafe_or_unsupported_jobs_are_refused_with_reasons() {
+        let refused = |edit: &dyn Fn(&mut Document), needle: &str| {
+            let (mut doc, mesh) = fixture::job();
+            edit(&mut doc);
+            let job = post_job(&doc, &mesh);
+            assert!(!job.ready());
+            assert!(
+                errors(&job).iter().any(|e| e.contains(needle)),
+                "{needle}: {:?}",
+                errors(&job)
+            );
+        };
+        refused(
+            &|d| {
+                d.setups[0]
+                    .machine
+                    .p
+                    .insert("controller".into(), "GRBL".into());
+            },
+            "Only the LinuxCNC",
+        );
+        refused(&|d| d.setups[0].machine = Machine::new(4), "3-axis");
+        refused(
+            &|d| {
+                d.setups[0].machine.p.insert("x".into(), "50".into());
+            },
+            "travel",
+        );
+        refused(
+            &|d| {
+                d.tools[1].p.insert("number".into(), "1".into());
+            },
+            "also used",
+        );
+        refused(
+            &|d| {
+                d.setups[0]
+                    .p
+                    .insert("origin".into(), "Selected point (planned)".into());
+            },
+            "Selected-point",
+        );
+        refused(
+            &|d| {
+                d.setups[0].p.insert("offset".into(), "G92".into());
+            },
+            "G54-G59.3",
+        );
+        refused(
+            &|d| {
+                d.setups[0]
+                    .machine
+                    .p
+                    .insert("post_air".into(), "Not available".into());
+                d.setups[0].operations[0]
+                    .p
+                    .insert("coolant".into(), "Air".into());
+            },
+            "coolant",
+        );
+        refused(
+            &|d| d.setups[0].operations[1].surfaces = None,
+            "Cannot inherit",
+        );
+        refused(
+            &|d| {
+                d.setups[0]
+                    .operations
+                    .iter_mut()
+                    .for_each(|o| o.enabled = false)
+            },
+            "no enabled operations",
+        );
+        let sample = post_job(&Document::sample(), &crate::mesh::sample());
+        assert!(!sample.ready() && sample.errors[0].contains("Import a part"));
+    }
+    #[test]
+    fn write_job_writes_every_program_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = fixture::flipped_job();
+        let (folder, count) = write_job(&post_job(&doc, &mesh), dir.path()).unwrap();
+        assert_eq!((folder.as_path(), count), (dir.path(), 2));
+        let written =
+            std::fs::read_to_string(dir.path().join("Fixture block - 2 Flipped (G55).ngc"))
+                .unwrap();
+        assert!(written.ends_with("M2\n"));
+        let empty = tempfile::tempdir().unwrap();
+        let (mut bad, mesh) = fixture::flipped_job();
+        bad.setups[1]
+            .p
+            .insert("origin".into(), "Selected point (planned)".into());
+        assert!(
+            write_job(&post_job(&bad, &mesh), empty.path())
+                .unwrap_err()
+                .contains("Nothing was written")
+        );
+        assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn headless_export_matches_the_ui_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, _) = fixture::job();
+        let project = dir.path().join("job.axis.json");
+        crate::storage::save(&project, &doc).unwrap();
+        let out = dir.path().join("out");
+        let message = crate::export_gcode(
+            Some(&project.to_string_lossy().into_owned()),
+            Some(&out.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert!(message.starts_with("Wrote 1 LinuxCNC program"));
+        assert!(out.join("Fixture block - 1 Top (G54).ngc").exists());
     }
 }

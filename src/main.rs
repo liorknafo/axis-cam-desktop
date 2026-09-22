@@ -1644,7 +1644,52 @@ fn sanitize_name(s: &str) -> String {
         n
     }
 }
+/// Headless export of a saved project with the same checks and files as the UI.
+fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<String, String> {
+    let (Some(project), Some(folder)) = (project, folder) else {
+        return Err("Usage: axis-cam --export-gcode <project.json> <output folder>".into());
+    };
+    let mut doc = storage::load(std::path::Path::new(project))?;
+    doc.sync_stock_sources();
+    let file = doc
+        .file
+        .clone()
+        .ok_or("The project has no imported part.")?;
+    let mesh = mesh::load(std::path::Path::new(&file.path))?;
+    let job = post::post_job(&doc, &mesh);
+    for e in &job.errors {
+        eprintln!("! {e}");
+    }
+    for setup in &job.setups {
+        match &setup.result {
+            Ok(programs) => programs
+                .iter()
+                .for_each(|p| println!("✓ {} ({} lines)", p.file_name, p.lines)),
+            Err(problems) => problems
+                .iter()
+                .for_each(|e| eprintln!("! {}: {e}", setup.name)),
+        }
+    }
+    let (path, count) = post::write_job(&job, std::path::Path::new(folder))?;
+    Ok(format!(
+        "Wrote {count} LinuxCNC program(s) to {}",
+        path.display()
+    ))
+}
 fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--export-gcode") {
+        match export_gcode(args.get(2), args.get(3)) {
+            Ok(message) => {
+                println!("{message}");
+                std::process::exit(0)
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1)
+            }
+        }
+    }
     iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))
         .theme(Theme::custom(
