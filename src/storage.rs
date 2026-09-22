@@ -40,6 +40,7 @@ pub fn load(path: &Path) -> Result<Document, String> {
             }
         }
     }
+    d.number_tools();
     d.validate_structure()?;
     Ok(d)
 }
@@ -145,5 +146,18 @@ mod tests {
         save(&p, &Document::default()).unwrap();
         let doc = load(&p).unwrap();
         assert!(!doc.sample_model && doc.setups.is_empty());
+    }
+    #[test]
+    fn loading_numbers_legacy_tools_once() {
+        let p = std::env::temp_dir().join(format!("axis-{}.json", uuid::Uuid::new_v4()));
+        let mut d = Document::sample();
+        for t in &mut d.tools {
+            t.p.remove("number");
+        }
+        save(&p, &d).unwrap();
+        let loaded = load(&p).unwrap();
+        let numbers: Vec<_> = loaded.tools.iter().map(|t| t.number()).collect();
+        assert_eq!(numbers, vec![Some(1), Some(2), Some(3)]);
+        fs::remove_file(p).unwrap();
     }
 }

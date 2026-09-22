@@ -208,6 +208,11 @@ impl Machine {
             ("direction2", "Positive"),
             ("tool_change", "Manual"),
             ("tcp", "No"),
+            ("post_tool_length", "Tool table (G43 H#)"),
+            ("post_retract", "Machine Z home (G53 G0 Z0)"),
+            ("post_blend", "0.01"),
+            ("post_dwell", "2"),
+            ("post_air", "M7"),
         ]);
         p.insert("axes".into(), axes.to_string());
         if axes > 3 {
@@ -277,6 +282,14 @@ impl Machine {
         }
         e
     }
+    pub fn fill_post_defaults(&mut self) {
+        for key in POST_KEYS {
+            if !self.p.contains_key(key) {
+                let value = post_setting(&self.p, key).to_string();
+                self.p.insert(key.into(), value);
+            }
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
@@ -316,6 +329,14 @@ impl Tool {
             e.push("Stickout must be at least the flute length.".into())
         }
         e
+    }
+    /// Controller tool number (T#), when it is a whole number 1–9999.
+    pub fn number(&self) -> Option<u32> {
+        get(&self.p, "number")
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=TOOL_NUMBER_MAX).contains(n))
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +416,55 @@ pub fn facing_setting_issues(p: &Fields) -> Vec<String> {
             .then(|| format!("Choose a valid {} setting.", key.replace('_', " ")))
     })
     .collect()
+}
+pub const TOOL_NUMBER_MAX: u32 = 9999;
+pub const POST_TOOL_LENGTH: [&str; 2] = ["Tool table (G43 H#)", "Touch off each tool (M0)"];
+pub const POST_RETRACT: [&str; 2] = ["Machine Z home (G53 G0 Z0)", "Setup clearance plane"];
+pub const POST_AIR: [&str; 3] = ["M7", "M8", "Not available"];
+pub const POST_KEYS: [&str; 5] = [
+    "post_tool_length",
+    "post_retract",
+    "post_blend",
+    "post_dwell",
+    "post_air",
+];
+/// Machines saved before the postprocessor settings use these defaults.
+pub fn post_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
+    p.get(key).map(String::as_str).unwrap_or(match key {
+        "post_tool_length" => POST_TOOL_LENGTH[0],
+        "post_retract" => POST_RETRACT[0],
+        "post_blend" => "0.01",
+        "post_dwell" => "2",
+        "post_air" => POST_AIR[0],
+        _ => "",
+    })
+}
+/// Export-only checks; they are deliberately not part of `Machine::issues`.
+pub fn post_setting_issues(p: &Fields) -> Vec<String> {
+    let mut e = vec![];
+    for (key, values) in [
+        ("post_tool_length", &POST_TOOL_LENGTH[..]),
+        ("post_retract", &POST_RETRACT[..]),
+        ("post_air", &POST_AIR[..]),
+    ] {
+        if !values.contains(&post_setting(p, key)) {
+            e.push(format!("Choose a valid {} setting.", label(key)));
+        }
+    }
+    let value = |k: &str| {
+        post_setting(p, k)
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+    };
+    if !value("post_blend").is_some_and(|v| (0. ..=1.).contains(&v)) {
+        e.push("Path blending tolerance must be between 0 and 1 mm.".into());
+    }
+    if !value("post_dwell").is_some_and(|v| (0. ..=60.).contains(&v)) {
+        e.push("Spindle start dwell must be between 0 and 60 seconds.".into());
+    }
+    e
 }
 impl Operation {
     pub fn new(s: Strategy, tool: String) -> Self {
@@ -824,7 +894,7 @@ impl Document {
             Operation::new(Strategy::Contour, tools[0].id.clone()),
             Operation::new(Strategy::Drill, tools[2].id.clone()),
         ];
-        Self {
+        let mut doc = Self {
             schema: 1,
             sample_model: true,
             title: "Bearing housing".into(),
@@ -834,7 +904,9 @@ impl Document {
             machines,
             tools,
             setups: vec![s],
-        }
+        };
+        doc.number_tools();
+        doc
     }
 }
 impl Document {
@@ -865,6 +937,42 @@ impl Document {
             .map(|i| format!("G{i}"))
             .find(|v| !self.setups.iter().any(|s| get(&s.p, "offset") == v))
             .unwrap_or_default()
+    }
+    pub fn next_tool_number(&self) -> u32 {
+        (1..=TOOL_NUMBER_MAX)
+            .find(|n| !self.tools.iter().any(|t| t.number() == Some(*n)))
+            .unwrap_or(TOOL_NUMBER_MAX)
+    }
+    /// Number tools saved before tool numbers existed. Entered values are kept.
+    pub fn number_tools(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.tools.len() {
+            if get(&self.tools[i].p, "number").trim().is_empty() {
+                let n = self.next_tool_number();
+                self.tools[i].p.insert("number".into(), n.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+    pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
+        let Some(n) = tool.number() else {
+            return vec![format!(
+                "{}: enter a tool number from 1 to {TOOL_NUMBER_MAX}.",
+                tool.name()
+            )];
+        };
+        self.tools
+            .iter()
+            .filter(|t| t.id != tool.id && t.number() == Some(n))
+            .map(|t| {
+                format!(
+                    "{}: tool number T{n} is also used by {}.",
+                    tool.name(),
+                    t.name()
+                )
+            })
+            .collect()
     }
     pub fn validate_structure(&self) -> Result<(), String> {
         if self.schema != 1 {
@@ -1285,5 +1393,56 @@ mod tests {
             .p
             .insert("feed".into(), "NaN".into());
         assert!(!d.issues().is_empty())
+    }
+    #[test]
+    fn tool_numbers_migrate_once_and_flag_duplicates() {
+        let mut d = Document::sample();
+        let numbers = |d: &Document| d.tools.iter().map(|t| t.number()).collect::<Vec<_>>();
+        assert_eq!(numbers(&d), vec![Some(1), Some(2), Some(3)]);
+        for t in &mut d.tools {
+            t.p.remove("number");
+        }
+        d.tools[1].p.insert("number".into(), "1".into());
+        assert!(d.number_tools());
+        assert_eq!(numbers(&d), vec![Some(2), Some(1), Some(3)]);
+        assert!(!d.number_tools());
+        d.tools[2].p.insert("number".into(), "2".into());
+        assert!(
+            d.tool_number_issues(&d.tools[2])
+                .iter()
+                .any(|e| e.contains("T2"))
+        );
+        d.tools[2].p.insert("number".into(), "0".into());
+        assert!(!d.tool_number_issues(&d.tools[2]).is_empty());
+        assert!(!d.number_tools());
+        assert_eq!(d.next_tool_number(), 3);
+    }
+    #[test]
+    fn legacy_machines_use_post_defaults_and_bad_values_are_reported() {
+        let mut m = Machine::new(3);
+        assert!(post_setting_issues(&m.p).is_empty());
+        for k in POST_KEYS {
+            m.p.remove(k);
+        }
+        assert_eq!(
+            post_setting(&m.p, "post_tool_length"),
+            "Tool table (G43 H#)"
+        );
+        assert_eq!(
+            post_setting(&m.p, "post_retract"),
+            "Machine Z home (G53 G0 Z0)"
+        );
+        assert_eq!(post_setting(&m.p, "post_blend"), "0.01");
+        assert!(post_setting_issues(&m.p).is_empty());
+        m.fill_post_defaults();
+        assert_eq!(get(&m.p, "post_dwell"), "2");
+        m.p.insert("post_blend".into(), "-1".into());
+        m.p.insert("post_dwell".into(), "90".into());
+        m.p.insert("post_air".into(), "M50".into());
+        assert_eq!(post_setting_issues(&m.p).len(), 3);
+        assert!(
+            m.issues().is_empty(),
+            "post settings never block simulation"
+        );
     }
 }
