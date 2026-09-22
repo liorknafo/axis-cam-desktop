@@ -969,7 +969,7 @@ impl App {
                         Ok(sim) => {
                             let plan = &sim.plan;
                             self.status = format!(
-                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; no collision verification or G-code.",
+                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; fixture and machine collisions are not checked. Export G-code from the NC program page.",
                                 plan.strategy.name(),
                                 plan.levels,
                                 plan.duration / 60.,

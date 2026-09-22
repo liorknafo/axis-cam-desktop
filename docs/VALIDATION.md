@@ -65,7 +65,7 @@ Six imported-mesh strategies have bounded generators: Facing, Pocket, inside/out
 - Imported geometry selection stays attached to the real mesh and its fingerprint. Tests cover planar grouping, occlusion, placement, stale selection, replacement and isolation from sample geometry.
 - Complete triangle rendering and 512-pixel image tiles with filtering gutters avoid the earlier async image-upload holes. Tests reconstruct the raster byte-for-byte and verify upload-size bounds. All 24 motion samples contain the model. Camera movement leaves fit scale/target stable.
 - Stock offsets, transparency, fixed/relative mode, rotation/translation, invalid parameters and legacy migration are covered. Hover descriptions and animated concept cards use the shared native renderer.
-- Blank startup, explicit example loading, import before setup, first machine/tool/setup, last setup removal, project archive/recovery, atomic persistence, independent profiles, tool deletion protection, AI example apply/undo and comments-only NC export remain covered.
+- Blank startup, explicit example loading, import before setup, first machine/tool/setup, last setup removal, project archive/recovery, atomic persistence, independent profiles, tool deletion protection, AI example apply/undo and setup-sheet export remain covered.
 
 ## Selected-option help
 
