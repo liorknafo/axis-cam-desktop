@@ -2953,7 +2953,7 @@ Audit closing note (~2247): replace `Rest-aware toolpath optimization, tool/hold
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `151 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
+Expected: `152 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
 
 - [ ] **Step 7: Commit**
 
@@ -3104,7 +3104,7 @@ Expected: `clean`
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `152 passed; 0 failed`.
+Expected: `153 passed; 0 failed`.
 
 - [ ] **Step 6: Commit**
 
@@ -3193,7 +3193,7 @@ Run:
 ```bash
 cargo fmt --check && cargo test --locked --quiet 2>&1 | tail -2 && cargo build --release --locked 2>&1 | tail -1
 ```
-Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 152) and `Finished`.
+Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 153) and `Finished`.
 
 - [ ] **Step 5: Update `docs/VALIDATION.md`**
 
