@@ -18,7 +18,7 @@
 - Output: mm only (`G21`), `G0`/`G1`/`G4` only, coordinates `{:.3}`, feeds `{:.1}`, dwell `P{:.3}`, blend `G64 P{:.3}` or `G61`.
 - Offsets accepted: `G54` `G55` `G56` `G57` `G58` `G59` `G59.1` `G59.2` `G59.3`.
 - File names: `<job> - <n> <setup name> (<offset>).ngc`, ASCII hyphen.
-- Post settings keys and defaults: `post_tool_length` = `Tool table (G43 H#)` | `Touch off each tool (M0)`; `post_retract` = `Machine Z home (G53 G0 Z0)` | `Setup clearance plane`; `post_blend` = `0.01` (0–1 mm); `post_dwell` = `2` (0–60 s); `post_air` = `M7` | `M8` | `Not available`.
+- Post settings keys and defaults: `post_tool_length` = `Tool table (G43 H#)` | `Touch off each tool (one program per tool)`; `post_retract` = `Machine Z home (G53 G0 Z0)` | `Setup clearance plane`; `post_blend` = `0.01` (0–1 mm); `post_dwell` = `2` (0–60 s); `post_air` = `M7` | `M8` | `Not available`.
 - Tool numbers: whole numbers 1–9999, key `number`.
 - Style: match the surrounding code, including compact functions, the `get`/`num` helpers, few comments and user-facing sentences in plain language. Never claim fixture, clamp or machine-body collision checking.
 - Every task ends with `cargo fmt` and `cargo test --locked --quiet` passing (dead-code warnings are allowed until Task 8 wires everything up).
@@ -296,7 +296,7 @@ Expected: compile errors (`number`, `POST_KEYS` … not found).
 After `facing_setting_issues` add:
 ```rust
 pub const TOOL_NUMBER_MAX: u32 = 9999;
-pub const POST_TOOL_LENGTH: [&str; 2] = ["Tool table (G43 H#)", "Touch off each tool (M0)"];
+pub const POST_TOOL_LENGTH: [&str; 2] = ["Tool table (G43 H#)", "Touch off each tool (one program per tool)"];
 pub const POST_RETRACT: [&str; 2] = ["Machine Z home (G53 G0 Z0)", "Setup clearance plane"];
 pub const POST_AIR: [&str; 3] = ["M7", "M8", "Not available"];
 pub const POST_KEYS: [&str; 5] = [
@@ -924,7 +924,7 @@ cargo fmt && git add -A && git commit -qm "Add a strict LinuxCNC reader for expo
   - `pub enum Block { Stop, Retract, Start { op: usize, change: bool }, Run { op: usize, spindle: bool, coolant: bool }, Wait { seconds: f32 }, Approach { op: usize, xy: [f32; 2] }, Descend { op: usize, xy: [f32; 2], z: f32 }, Move { op: usize, kind: Kind, from: [f32; 3], to: [f32; 3], feed: f32, seconds: f32 }, End }`
   - `pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<Block>`
   - `pub fn clearance_plane(blocks: &[Block]) -> f32`, `pub fn extents(blocks: &[Block]) -> Bounds` (plan coordinates)
-  - `pub struct Header<'a> { pub job: &'a str, pub setup: &'a Setup, pub number: usize, pub stock: Bounds, pub datum: [f32; 3], pub disabled: Vec<String> }`
+  - `pub struct Header<'a> { pub job: &'a str, pub setup: &'a Setup, pub number: usize, pub part: Option<(usize, usize)>, pub stock: Bounds, pub datum: [f32; 3], pub disabled: Vec<String> }`
   - `pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettings) -> String`
   - `#[cfg(test)] pub(crate) mod fixture { pub fn plan(start, moves) -> Plan; pub fn facing_op() -> OpState; pub fn job() -> (Document, Mesh); pub fn flipped_job() -> (Document, Mesh) }`
 
@@ -1150,6 +1150,7 @@ mod tests {
             job: "Golden",
             setup: &setup,
             number: 1,
+            part: None,
             stock: plan.stock,
             datum: [0., 0., 10.],
             disabled: vec![],
@@ -1200,8 +1201,9 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
-        assert!(text.contains("T1 M6\n(MSG, Touch off Z for T1 Flat end mill - D10, then press Cycle Start)\nM0\nG0 Z15.000\nS8000 M3\n"));
-        assert!(!text.contains("G43") && !text.contains("G53") && !text.contains("G4 P"));
+        assert!(text.contains("(Load T1 Flat end mill - D10 and touch off Z at the work zero before starting this program.)\nG0 Z15.000\nS8000 M3\n"), "{text}");
+        assert!(!text.contains("M6") && !text.contains("\nM0\n") && !text.contains("G43"));
+        assert!(!text.contains("G53") && !text.contains("G4 P"));
         assert!(text.contains("\nG61\n"));
         assert_eq!(text.matches("G0 Z15.000").count(), 5, "{text}");
     }
@@ -1527,6 +1529,8 @@ pub struct Header<'a> {
     pub job: &'a str,
     pub setup: &'a Setup,
     pub number: usize,
+    /// (program, count) when touch-off mode splits a setup into one program per tool run.
+    pub part: Option<(usize, usize)>,
     pub stock: Bounds,
     pub datum: [f32; 3],
     pub disabled: Vec<String>,
@@ -1547,6 +1551,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     let mut w = Writer(String::new());
     w.line("(AXIS CAM Studio - LinuxCNC 3-axis program)");
     w.note(&format!("Job: {} - Setup {}: {} - {offset}", h.job, h.number, setup.name()));
+    if let Some((i, count)) = h.part {
+        w.note(&format!("Program {i} of {count} for this setup, one per tool"));
+    }
     w.note(&format!("Machine: {} v{}", setup.machine.name(), setup.machine.version));
     w.note(&format!("Work zero: {}. Touch off X0 Y0 Z0 there.", get(&setup.p, "origin")));
     let size = h.stock.dimensions();
@@ -1628,14 +1635,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             Block::Start { op, change } => {
                 let s = &ops[*op];
                 w.note(&format!("Operation {}/{}: {} - T{}", op + 1, ops.len(), s.name, s.tool));
-                if *change {
+                if *change && settings.tool_table {
                     w.line(format!("T{} M6", s.tool));
-                    if settings.tool_table {
-                        w.line(format!("G43 H{}", s.tool));
-                    } else {
-                        w.note(&format!("MSG, Touch off Z for T{} {}, then press Cycle Start", s.tool, s.tool_name));
-                        w.line("M0");
-                    }
+                    w.line(format!("G43 H{}", s.tool));
+                } else if *change {
+                    // AXIS cannot touch off while a program is paused, so each tool gets its own program.
+                    w.note(&format!("Load T{} {} and touch off Z at the work zero before starting this program.", s.tool, s.tool_name));
                 }
             }
             Block::Run { op, spindle, coolant: set } => {
@@ -1963,8 +1968,8 @@ cargo fmt && git add -A && git commit -qm "Check limits, travel, rapids and hold
 - Consumes: `ngc::replay`, `post_check::check_setup`, `simulation::sequence`.
 - Produces:
   - `ngc::verify(text: &str, blocks: &[post::Block], ops: &[post::OpState], datum: [f32; 3], settings: &post::PostSettings, offset: &str) -> Result<(), String>`
-  - `post::Program { pub text: String, pub lines: usize, pub tools: Vec<String>, pub operations: Vec<String> }`
-  - `post::SetupPost { pub setup: usize, pub name: String, pub file_name: String, pub result: Result<Program, Vec<String>> }`
+  - `post::Program { pub file_name: String, pub text: String, pub lines: usize, pub tools: Vec<String>, pub operations: Vec<String> }`
+  - `post::SetupPost { pub setup: usize, pub name: String, pub result: Result<Vec<Program>, Vec<String>> }` (one program per setup; one per tool run in touch-off mode)
   - `post::JobPost { pub errors: Vec<String>, pub setups: Vec<SetupPost> }` with `ready(&self) -> bool` and `blocked(message: &str) -> Self`
   - `post::post_job(doc: &Document, mesh: &Mesh) -> JobPost`
   - `post::write_job(job: &JobPost, folder: &Path) -> Result<(PathBuf, usize), String>`
@@ -1983,15 +1988,17 @@ cargo fmt && git add -A && git commit -qm "Check limits, travel, rapids and hold
         let mut results: Vec<Vec<(usize, Result<crate::simulation::Simulation, String>)>> =
             vec![vec![]; doc.setups.len()];
         crate::simulation::sequence(doc, mesh, None, |s, o, r| results[s].push((o, r)));
-        prepare(doc, mesh, si, &results[si]).unwrap()
+        prepare(doc, mesh, si, &results[si]).unwrap().remove(0)
     }
     #[test]
     fn all_six_strategies_post_and_replay_exactly() {
         let (doc, mesh) = fixture::job();
         let job = post_job(&doc, &mesh);
         assert!(job.ready(), "{:?}", errors(&job));
-        let program = job.setups[0].result.as_ref().unwrap();
-        assert_eq!(job.setups[0].file_name, "Fixture block - 1 Top (G54).ngc");
+        let programs = job.setups[0].result.as_ref().unwrap();
+        assert_eq!(programs.len(), 1);
+        let program = &programs[0];
+        assert_eq!(program.file_name, "Fixture block - 1 Top (G54).ngc");
         for needle in ["T1 M6", "T3 M6", "T2 M6", "\nG54\n", "G43 H3", "\nM2\n"] {
             assert!(program.text.contains(needle), "{needle}");
         }
@@ -2041,11 +2048,40 @@ cargo fmt && git add -A && git commit -qm "Check limits, travel, rapids and hold
         let (doc, mesh) = fixture::flipped_job();
         let job = post_job(&doc, &mesh);
         assert!(job.ready(), "{:?}", errors(&job));
-        let names: Vec<_> = job.setups.iter().map(|s| s.file_name.as_str()).collect();
+        let names: Vec<_> = job
+            .setups
+            .iter()
+            .map(|s| s.result.as_ref().unwrap()[0].file_name.as_str())
+            .collect();
         assert_eq!(names, vec!["Fixture block - 1 Top (G54).ngc", "Fixture block - 2 Flipped (G55).ngc"]);
-        let second = &job.setups[1].result.as_ref().unwrap().text;
+        let second = &job.setups[1].result.as_ref().unwrap()[0].text;
         assert!(second.contains("\nG55\n") && !second.contains("\nG54\n"));
         assert!(second.contains("Part rotation X180"));
+    }
+    #[test]
+    fn touch_off_mode_writes_one_program_per_tool_run() {
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let programs = job.setups[0].result.as_ref().unwrap();
+        let names: Vec<_> = programs.iter().map(|p| p.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Fixture block - 1 Top (G54) - 1 of 4 T1.ngc",
+                "Fixture block - 1 Top (G54) - 2 of 4 T3.ngc",
+                "Fixture block - 1 Top (G54) - 3 of 4 T2.ngc",
+                "Fixture block - 1 Top (G54) - 4 of 4 T1.ngc",
+            ]
+        );
+        assert_eq!(programs[0].operations.len(), 3);
+        for p in programs {
+            assert!(!p.text.contains("M6") && !p.text.contains("G43") && p.text.contains("touch off Z"));
+        }
     }
     #[test]
     fn unsafe_or_unsupported_jobs_are_refused_with_reasons() {
@@ -2114,12 +2150,12 @@ fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Resu
         Blend::Tolerance(p) => settings.blend > 0. && (p - f64::from(settings.blend)).abs() <= TOL,
         Blend::Unset => false,
     };
-    let problem = if st.tool != Some(op.tool) {
+    let problem = if settings.tool_table && st.tool != Some(op.tool) {
         format!("T{} is not loaded", op.tool)
     } else if settings.tool_table && st.length != Some(op.tool) {
         format!("G43 H{} is not active", op.tool)
-    } else if !settings.tool_table && (!st.touched_off || st.length.is_some()) {
-        "the tool was not touched off after M6".into()
+    } else if !settings.tool_table && (st.tool.is_some() || st.length.is_some()) {
+        "a touch-off program must not change tools or apply G43".into()
     } else if st.spindle != spindle || (st.rpm - f64::from(op.rpm.round())).abs() > 0.5 {
         format!("the spindle is not running {} at S{:.0}", if op.clockwise { "M3" } else { "M4" }, op.rpm)
     } else if (st.mist, st.flood) != op.coolant {
@@ -2239,6 +2275,7 @@ pub fn verify(
 ```rust
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub file_name: String,
     pub text: String,
     pub lines: usize,
     pub tools: Vec<String>,
@@ -2248,8 +2285,8 @@ pub struct Program {
 pub struct SetupPost {
     pub setup: usize,
     pub name: String,
-    pub file_name: String,
-    pub result: Result<Program, Vec<String>>,
+    /// One program per setup, or one per tool run in touch-off mode.
+    pub result: Result<Vec<Program>, Vec<String>>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct JobPost {
@@ -2267,7 +2304,7 @@ impl JobPost {
         self.errors.is_empty() && !self.setups.is_empty() && self.setups.iter().all(|s| s.result.is_ok())
     }
 }
-pub fn file_name(doc: &Document, index: usize) -> String {
+pub fn file_name(doc: &Document, index: usize, part: Option<(usize, usize, u32)>) -> String {
     let clean = |s: &str| -> String {
         let s: String = s
             .chars()
@@ -2277,13 +2314,17 @@ pub fn file_name(doc: &Document, index: usize) -> String {
     };
     let setup = &doc.setups[index];
     let job = clean(&doc.title);
-    format!(
-        "{} - {} {} ({}).ngc",
+    let base = format!(
+        "{} - {} {} ({})",
         if job.is_empty() { "AXIS job".into() } else { job },
         index + 1,
         clean(setup.name()),
         clean(get(&setup.p, "offset"))
-    )
+    );
+    match part {
+        Some((i, count, tool)) => format!("{base} - {i} of {count} T{tool}.ngc"),
+        None => format!("{base}.ngc"),
+    }
 }
 fn op_state(doc: &Document, op: &Operation, plan: &Plan, settings: Option<&PostSettings>) -> Result<OpState, Vec<String>> {
     let Some(tool) = doc.tools.iter().find(|t| t.id == op.tool) else {
@@ -2325,6 +2366,7 @@ fn op_state(doc: &Document, op: &Operation, plan: &Plan, settings: Option<&PostS
     })
 }
 pub(crate) struct Prepared {
+    pub file_name: String,
     pub text: String,
     pub blocks: Vec<Block>,
     pub ops: Vec<OpState>,
@@ -2332,13 +2374,14 @@ pub(crate) struct Prepared {
     pub settings: PostSettings,
     pub offset: String,
 }
-/// Check and emit one setup from its `sequence` results (enabled operations only).
+/// Check and emit one setup from its `sequence` results (enabled operations only):
+/// one program, or one per run of the same tool in touch-off mode.
 pub(crate) fn prepare(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
-) -> Result<Prepared, Vec<String>> {
+) -> Result<Vec<Prepared>, Vec<String>> {
     let setup = &doc.setups[si];
     let offset = get(&setup.p, "offset").to_string();
     let mut errors = vec![];
@@ -2372,27 +2415,52 @@ pub(crate) fn prepare(
     let (Some(settings), Some(zero), true) = (settings, zero, errors.is_empty()) else {
         return Err(errors);
     };
-    let plans: Vec<&Plan> = simulations.iter().map(|s| &s.plan).collect();
-    let blocks = blocks(&ops, &plans, &settings);
-    let problems = crate::post_check::check_setup(setup, &ops, &simulations, &blocks, &settings, zero);
-    if !problems.is_empty() {
-        return Err(problems);
+    // Touch-off mode: one program per run of the same tool, touched off before it starts.
+    let mut groups: Vec<std::ops::Range<usize>> = vec![];
+    for k in 0..ops.len() {
+        match groups.last_mut() {
+            Some(g) if settings.tool_table || ops[g.start].tool_id == ops[k].tool_id => g.end = k + 1,
+            _ => groups.push(k..k + 1),
+        }
     }
-    let header = Header {
-        job: &doc.title,
-        setup,
-        number: si + 1,
-        stock: plans[0].stock,
-        datum: zero,
-        disabled: setup
-            .operations
-            .iter()
-            .filter(|o| !o.enabled)
-            .map(|o| o.name().to_string())
-            .collect(),
-    };
-    let text = emit(&header, &ops, &blocks, &settings);
-    Ok(Prepared { text, blocks, ops, datum: zero, settings, offset })
+    let count = groups.len();
+    let mut out = vec![];
+    for (i, g) in groups.into_iter().enumerate() {
+        let group_ops = &ops[g.clone()];
+        let group_sims = &simulations[g];
+        let plans: Vec<&Plan> = group_sims.iter().map(|s| &s.plan).collect();
+        let blocks = blocks(group_ops, &plans, &settings);
+        let problems = crate::post_check::check_setup(setup, group_ops, group_sims, &blocks, &settings, zero);
+        if !problems.is_empty() {
+            return Err(problems);
+        }
+        let part = (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool));
+        let header = Header {
+            job: &doc.title,
+            setup,
+            number: si + 1,
+            part: part.map(|(i, count, _)| (i, count)),
+            stock: plans[0].stock,
+            datum: zero,
+            disabled: setup
+                .operations
+                .iter()
+                .filter(|o| !o.enabled)
+                .map(|o| o.name().to_string())
+                .collect(),
+        };
+        let text = emit(&header, group_ops, &blocks, &settings);
+        out.push(Prepared {
+            file_name: file_name(doc, si, part),
+            text,
+            blocks,
+            ops: group_ops.to_vec(),
+            datum: zero,
+            settings,
+            offset: offset.clone(),
+        });
+    }
+    Ok(out)
 }
 pub fn post_job(doc: &Document, mesh: &Mesh) -> JobPost {
     if doc.file.is_none() {
@@ -2405,27 +2473,32 @@ pub fn post_job(doc: &Document, mesh: &Mesh) -> JobPost {
     crate::simulation::sequence(doc, mesh, None, |si, oi, r| results[si].push((oi, r)));
     let setups = (0..doc.setups.len())
         .map(|si| {
-            let result = prepare(doc, mesh, si, &results[si]).and_then(|p| {
-                crate::ngc::verify(&p.text, &p.blocks, &p.ops, p.datum, &p.settings, &p.offset)
-                    .map_err(|e| vec![format!("Round-trip verification failed: {e}")])?;
-                let mut tools: Vec<String> = vec![];
-                for op in &p.ops {
-                    let tool = format!("T{} {}", op.tool, op.tool_name);
-                    if !tools.contains(&tool) {
-                        tools.push(tool);
-                    }
-                }
-                Ok(Program {
-                    lines: p.text.lines().count(),
-                    operations: p.ops.iter().map(|o| o.name.clone()).collect(),
-                    tools,
-                    text: p.text,
-                })
+            let result = prepare(doc, mesh, si, &results[si]).and_then(|parts| {
+                parts
+                    .into_iter()
+                    .map(|p| {
+                        crate::ngc::verify(&p.text, &p.blocks, &p.ops, p.datum, &p.settings, &p.offset)
+                            .map_err(|e| vec![format!("{}: round-trip verification failed: {e}", p.file_name)])?;
+                        let mut tools: Vec<String> = vec![];
+                        for op in &p.ops {
+                            let tool = format!("T{} {}", op.tool, op.tool_name);
+                            if !tools.contains(&tool) {
+                                tools.push(tool);
+                            }
+                        }
+                        Ok(Program {
+                            file_name: p.file_name,
+                            lines: p.text.lines().count(),
+                            operations: p.ops.iter().map(|o| o.name.clone()).collect(),
+                            tools,
+                            text: p.text,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
             });
             SetupPost {
                 setup: si,
                 name: doc.setups[si].name().to_string(),
-                file_name: file_name(doc, si),
                 result,
             }
         })
@@ -2447,11 +2520,12 @@ pub fn write_job(job: &JobPost, folder: &std::path::Path) -> Result<(std::path::
             .unwrap_or_else(|| "No programs were produced.".into());
         return Err(format!("Nothing was written. {reason}"));
     }
-    for s in &job.setups {
-        let text = &s.result.as_ref().unwrap().text;
-        crate::storage::write_atomic(&folder.join(&s.file_name), text.as_bytes())?;
+    let mut count = 0;
+    for program in job.setups.iter().flat_map(|s| s.result.as_ref().unwrap()) {
+        crate::storage::write_atomic(&folder.join(&program.file_name), program.text.as_bytes())?;
+        count += 1;
     }
-    Ok((folder.to_path_buf(), job.setups.len()))
+    Ok((folder.to_path_buf(), count))
 }
 ```
 
@@ -2490,7 +2564,9 @@ fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<Str
     }
     for setup in &job.setups {
         match &setup.result {
-            Ok(p) => println!("✓ {} ({} lines)", setup.file_name, p.lines),
+            Ok(programs) => programs
+                .iter()
+                .for_each(|p| println!("✓ {} ({} lines)", p.file_name, p.lines)),
             Err(problems) => problems.iter().for_each(|e| eprintln!("! {}: {e}", setup.name)),
         }
     }
@@ -2520,7 +2596,7 @@ Add a test in `src/post.rs` `mod tests`:
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `146 passed; 0 failed`. If `all_six_strategies_post_and_replay_exactly` reports a check problem, read the message. A real generator defect (for example a rapid into unproven material) must be reported to the user; do not weaken `post_check`. A verifier or emitter mismatch should be fixed in `post.rs`/`ngc.rs`.
+Expected: `147 passed; 0 failed`. If `all_six_strategies_post_and_replay_exactly` reports a check problem, read the message. A real generator defect (for example a rapid into unproven material) must be reported to the user; do not weaken `post_check`. A verifier or emitter mismatch should be fixed in `post.rs`/`ngc.rs`.
 
 - [ ] **Step 7: Commit**
 
@@ -2740,29 +2816,31 @@ fn post(app: &App) -> Element<'_, Message> {
             }
             for s in &job.setups {
                 match &s.result {
-                    Ok(program) => {
-                        summary = summary.push(
-                            column![
-                                bold(format!("✓  {}", s.file_name), 13),
-                                muted(format!(
-                                    "{} lines · {} · {}",
-                                    program.lines,
-                                    program.tools.join(", "),
-                                    program.operations.join(" → ")
-                                ))
-                            ]
-                            .spacing(4),
-                        );
-                        code = code.push(
-                            text(crate::post::preview(&program.text, 120))
-                                .font(Font::MONOSPACE)
-                                .size(12)
-                                .color(Color::from_rgb8(183, 211, 221)),
-                        );
+                    Ok(programs) => {
+                        for program in programs {
+                            summary = summary.push(
+                                column![
+                                    bold(format!("✓  {}", program.file_name), 13),
+                                    muted(format!(
+                                        "{} lines · {} · {}",
+                                        program.lines,
+                                        program.tools.join(", "),
+                                        program.operations.join(" → ")
+                                    ))
+                                ]
+                                .spacing(4),
+                            );
+                            code = code.push(
+                                text(crate::post::preview(&program.text, 120))
+                                    .font(Font::MONOSPACE)
+                                    .size(12)
+                                    .color(Color::from_rgb8(183, 211, 221)),
+                            );
+                        }
                     }
                     Err(problems) => {
                         summary = summary
-                            .push(bold(format!("!  {}", s.file_name), 13))
+                            .push(bold(format!("!  {}", s.name), 13))
                             .push(warnings(problems.clone()));
                     }
                 }
@@ -2854,7 +2932,7 @@ Audit closing note (~2247): replace `Rest-aware toolpath optimization, tool/hold
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `146 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
+Expected: `147 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
 
 - [ ] **Step 7: Commit**
 
@@ -2878,7 +2956,7 @@ cargo fmt && git add -A && git commit -qm "Program page runs the LinuxCNC post; 
         let p = Fields::new();
         let cards: Vec<_> = [
             ("post_tool_length", "Tool table (G43 H#)"),
-            ("post_tool_length", "Touch off each tool (M0)"),
+            ("post_tool_length", "Touch off each tool (one program per tool)"),
             ("post_retract", "Machine Z home (G53 G0 Z0)"),
             ("post_retract", "Setup clearance plane"),
             ("post_air", "M7"),
@@ -2933,8 +3011,8 @@ Add these arms to the same match:
         ("post_tool_length", "Tool table (G43 H#)") => {
             "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first."
         }
-        ("post_tool_length", "Touch off each tool (M0)") => {
-            "Write T# M6, show a message and pause with M0 after each tool change. Touch off Z for the new tool, then press Cycle Start. No G43 length offset is written."
+        ("post_tool_length", "Touch off each tool (one program per tool)") => {
+            "Write one program per run of the same tool, with no tool change or G43 inside. Before each program, load its tool and touch off Z at the work zero. LinuxCNC's AXIS cannot touch off while a program is paused, so tool changes are not placed inside a program."
         }
         ("post_retract", "Machine Z home (G53 G0 Z0)") => {
             "Retract to machine Z0 with G53 before tool changes and at the end. On a standard LinuxCNC mill Z0 is the top of travel; confirm this on your machine."
@@ -2969,7 +3047,7 @@ In the `if body.is_empty() { body = match key { .. } }` block, replace the `"off
             None,
         ),
         (_, "post_tool_length") => (
-            "How the program applies tool length after each tool change: from LinuxCNC's tool table with G43 H#, or by pausing so you can touch off Z by hand.",
+            "How programs apply tool length: from LinuxCNC's tool table with T# M6 and G43 H#, or one program per tool that you touch off before running it.",
             None,
         ),
         (_, "post_retract") => (
@@ -3005,7 +3083,7 @@ Expected: `clean`
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `147 passed; 0 failed`.
+Expected: `148 passed; 0 failed`.
 
 - [ ] **Step 6: Commit**
 
@@ -3077,10 +3155,10 @@ Expected: the process exits 0, and the count is `101` (77 named screens plus 24 
 ```markdown
 ## LinuxCNC G-code export
 
-Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance. Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup, or nothing if any setup fails.
+Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance. Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
 
 - Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (Stock top center, Stock top front-left or Model origin).
-- Machine profile → Controller step → Postprocessor: tool table (`T# M6` + `G43 H#`) or touch off each tool (`M0`), safe retract (`G53 G0 Z0` or the setup clearance plane), path blending (`G64 P`, or `G61` at 0), spindle start dwell and the Air output (M7/M8). Setups keep a machine snapshot, so assign the profile again after editing it.
+- Machine profile → Controller step → Postprocessor: tool table (`T# M6` + `G43 H#`) or touch off each tool (one program per tool run, touched off before each; AXIS cannot touch off while a program is paused), safe retract (`G53 G0 Z0` or the setup clearance plane), path blending (`G64 P`, or `G61` at 0), spindle start dwell and the Air output (M7/M8). Setups keep a machine snapshot, so assign the profile again after editing it.
 - Tools have a number (T#) in the tool library. Older libraries are numbered 1, 2, 3… once when opened.
 - Not checked: fixtures, clamps and the machine body. LinuxCNC's own soft limits check absolute position. Preview each program in LinuxCNC and air-cut first.
 - Headless: `axis-cam --export-gcode <project.json> <folder>` runs the same checks and writes the same files.
@@ -3094,7 +3172,7 @@ Run:
 ```bash
 cargo fmt --check && cargo test --locked --quiet 2>&1 | tail -2 && cargo build --release --locked 2>&1 | tail -1
 ```
-Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 147) and `Finished`.
+Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 148) and `Finished`.
 
 - [ ] **Step 5: Update `docs/VALIDATION.md`**
 

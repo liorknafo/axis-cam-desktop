@@ -21,7 +21,7 @@ Rejected alternatives: an intent-based emitter with arcs and canned cycles, beca
 
 ## 1. Output files
 
-- One `.ngc` program per setup, written to a folder the user picks. The file name is `<job> - <n> <setup name> (<offset>).ngc` (ASCII hyphen), with characters that are illegal in file names replaced. Files are written atomically (temporary file + rename). Existing files with the same name are replaced.
+- One `.ngc` program per setup (in touch-off mode, one per run of the same tool; see §4), written to a folder the user picks. The file name is `<job> - <n> <setup name> (<offset>).ngc` (ASCII hyphen), with characters that are illegal in file names replaced. Files are written atomically (temporary file + rename). Existing files with the same name are replaced.
 - All or nothing: if any setup fails a check or verification, no file is written. The UI lists the reasons.
 - Enabled operations are emitted in browser order. A disabled operation is skipped and noted in a comment.
 - All output uses mm (`G21`), absolute coordinates (`G90`), the XY plane (`G17`) and feed per minute (`G94`). Numbers have 3 decimal places, and feeds have 1.
@@ -67,7 +67,7 @@ G43                   (tool table + clearance-plane retract only: the loaded too
 <safe retract>
 (Operation 1/2: Facing - T1)
 T1 M6
-G43 H1                (tool-table mode)  |  (MSG, ...) + M0 (touch-off mode)
+G43 H1                (tool-table mode; touch-off programs have no T/M6/G43, only a load-and-touch-off comment)
 <safe retract>        (again, so the new tool's tip is at a safe height before any XY move)
 S8000 M3              (M4 when the plan is counter-clockwise)
 M8                    (coolant, per operation)
@@ -94,13 +94,15 @@ Shown in the machine wizard's controller step when the controller is LinuxCNC. T
 
 | Key | Choices / value | Default |
 | --- | --- | --- |
-| `post_tool_length` | `Tool table (G43 H#)`, `Touch off each tool (M0)` | Tool table |
+| `post_tool_length` | `Tool table (G43 H#)`, `Touch off each tool (one program per tool)` | Tool table |
 | `post_retract` | `Machine Z home (G53 G0 Z0)`, `Setup clearance plane` | Machine Z home |
 | `post_blend` | tolerance in mm, 0–1 (0 → `G61`) | `0.01` |
 | `post_dwell` | spindle start dwell in seconds, 0–60 | `2` |
 | `post_air` | `M7`, `M8`, `Not available` | `M7` |
 
 Existing fields become enforced limits: travel `x`/`y`/`z`, maximum `rpm` and maximum `feed`. Inch profiles are converted with ×25.4 for these checks. Output stays in mm.
+
+Touch-off mode writes one program per run of consecutive operations using the same tool, named `… - <i> of <k> T<t>.ngc`. Each starts with a comment to load that tool and touch off Z at the work zero before starting. There is no tool change, `G43` or `M0` inside, because LinuxCNC's AXIS cannot touch off while a program is paused.
 
 Coolant mapping: Flood → `M8`, Mist → `M7`, Air → `post_air` (refuses if Not available), Off → none.
 
@@ -141,8 +143,8 @@ The verifier maps the plans for each setup to work coordinates, adds the connect
 - dwell within 0.001 s
 
 Before every feed move it also checks that:
-- the tool is the operation's tool number
-- `G43 H` equals the tool number (tool-table mode) or an `M0` followed that tool's `M6` (touch-off mode)
+- tool-table mode: the tool is the operation's tool number and `G43 H` equals it
+- touch-off mode: no tool change and no length offset are active
 - the spindle is on in the plan's direction at the operation's rpm
 - coolant matches the operation
 
