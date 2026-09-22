@@ -135,8 +135,8 @@ pub fn check_setup(
                 feed,
                 ..
             } => {
-                if *kind == Kind::Feed && *feed > max_feed + 0.001 {
-                    problems.add(Some(*op), "feed", format!("{}: F{feed:.1} exceeds the machine's {max_feed:.1} mm/min maximum feed.", ops[*op].name));
+                if *kind == Kind::Feed && !(*feed > 0. && *feed <= max_feed + 0.001) {
+                    problems.add(Some(*op), "feed", format!("{}: F{feed:.1} is outside the machine's 0-{max_feed:.1} mm/min feed range.", ops[*op].name));
                 }
                 (*op, *from, *to, *kind == Kind::Rapid)
             }
@@ -301,6 +301,29 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("25.400 mm"))
         );
+    }
+    #[test]
+    fn zero_or_invalid_feeds_are_refused() {
+        for bad in [0., f32::NAN] {
+            let moves = [
+                (Motion::Rapid, [-15., -15., 11.], 6000.),
+                (Motion::Feed, [-15., -15., 9.], 250.),
+                (Motion::Feed, [15., -15., 9.], 1000.),
+                (Motion::Rapid, [15., -15., 25.], 6000.),
+            ];
+            let mut plan = fixture::plan([-15., -15., 25.], &moves);
+            plan.moves[2].feed = bad;
+            let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
+            let op = fixture::facing_op();
+            let blocks = blocks(&[op.clone()], &[&plan], &settings);
+            let setup = Setup::new(Machine::new(3), "G54");
+            let sim = Simulation::new(plan);
+            let problems = check_setup(&setup, &[op], &[&sim], &blocks, &settings, [0., 0., 10.]);
+            assert!(
+                problems.iter().any(|p| p.contains("feed range")),
+                "{bad}: {problems:?}"
+            );
+        }
     }
     #[test]
     fn touch_off_programs_must_use_one_tool() {
