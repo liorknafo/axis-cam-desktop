@@ -63,10 +63,12 @@ Body:
 G17 G21 G40 G49 G80 G90 G94
 G64 P0.010            (or G61 when blending tolerance is 0)
 G54                   (setup offset register)
-(OP 1/2: Facing - Face - T1 Flat end mill D10)
+G43                   (tool table + clearance-plane retract only: the loaded tool's length for the first retract)
 <safe retract>
+(Operation 1/2: Facing - T1)
 T1 M6
 G43 H1                (tool-table mode)  |  (MSG, ...) + M0 (touch-off mode)
+<safe retract>        (again, so the new tool's tip is at a safe height before any XY move)
 S8000 M3              (M4 when the plan is counter-clockwise)
 M8                    (coolant, per operation)
 G4 P2.000             (spindle dwell, omitted when 0)
@@ -79,7 +81,7 @@ M5
 M2
 ```
 
-- Tool change: the safe retract, `M5` and `M9` are emitted before each tool change. A tool change happens only when the operation's tool differs from the active tool. Spindle speed/direction and coolant are re-emitted only when they change between operations.
+- Tool change: `M9`, `M5` and the safe retract are emitted before each tool change, and the safe retract is repeated after `G43 H#` or the touch-off `M0`. Otherwise a longer tool, or a tool left at the stock after touching off, would move sideways at a low height. In tool-table mode with the clearance-plane retract, a bare `G43` before the first retract makes that retract position the loaded tool's tip rather than the spindle gauge line. A tool change happens only when the operation's tool differs from the active tool. Spindle speed/direction and coolant are re-emitted only when they change between operations.
 - After a tool change, the first plan point is reached by first rapiding in XY at the retracted height and then rapiding in Z. Consecutive operations with the same tool connect directly, because every plan starts and ends at its own clearance plane. The connecting move from one operation's last point to the next operation's first point is emitted as `G0`. If the two points are at different heights, the move is split so the tool climbs first and descends last. This connecting move is checked like any other rapid.
 - Only words that change are emitted (modal X/Y/Z/F). A `G1` always has an active `F`.
 - Safe retract: `G53 G0 Z0` (Machine Z home) or `G0 Z<clearance>` (Setup clearance plane, the highest clearance of the setup's operations in work coordinates).

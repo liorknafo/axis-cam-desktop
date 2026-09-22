@@ -516,7 +516,7 @@ mod tests {
             "G0 X1 X2",
             "X1",
             "M6",
-            "G43",
+            "G43 H1.5",
             "M98 P1",
             "G0 X1 ; note",
             "g0 x1",
@@ -813,10 +813,12 @@ pub fn replay(text: &str) -> Result<Replay, String> {
         state.absolute |= has(900);
         state.per_minute |= has(940);
         if has(430) {
-            let v = h
-                .filter(|v| *v >= 0. && v.fract() == 0.)
-                .ok_or_else(|| fail("G43 needs a whole-number H"))?;
-            state.length = Some(v as u32);
+            // A bare G43 uses the loaded tool, as LinuxCNC does.
+            state.length = match h {
+                None => state.tool,
+                Some(v) if v >= 0. && v.fract() == 0. => Some(v as u32),
+                Some(_) => return Err(fail("G43 needs a whole-number H")),
+            };
         }
         if has(490) {
             state.length = None;
@@ -919,7 +921,7 @@ cargo fmt && git add -A && git commit -qm "Add a strict LinuxCNC reader for expo
   - `pub fn coord(v: f32) -> String`, `pub fn comment(s: &str) -> String`, `pub fn preview(text: &str, lines: usize) -> String`
   - `pub struct OpState { pub name: String, pub strategy: &'static str, pub tool: u32, pub tool_id: String, pub tool_name: String, pub diameter: f32, pub stickout: f32, pub rpm: f32, pub clockwise: bool, pub coolant: (bool, bool) }`
   - `pub enum Kind { Rapid, Feed, Dwell }`
-  - `pub enum Block { Stop, Retract, Start { op: usize, change: bool, spindle: bool, coolant: bool }, Wait { seconds: f32 }, Approach { op: usize, xy: [f32; 2] }, Descend { op: usize, xy: [f32; 2], z: f32 }, Move { op: usize, kind: Kind, from: [f32; 3], to: [f32; 3], feed: f32, seconds: f32 }, End }`
+  - `pub enum Block { Stop, Retract, Start { op: usize, change: bool }, Run { op: usize, spindle: bool, coolant: bool }, Wait { seconds: f32 }, Approach { op: usize, xy: [f32; 2] }, Descend { op: usize, xy: [f32; 2], z: f32 }, Move { op: usize, kind: Kind, from: [f32; 3], to: [f32; 3], feed: f32, seconds: f32 }, End }`
   - `pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<Block>`
   - `pub fn clearance_plane(blocks: &[Block]) -> f32`, `pub fn extents(blocks: &[Block]) -> Bounds` (plan coordinates)
   - `pub struct Header<'a> { pub job: &'a str, pub setup: &'a Setup, pub number: usize, pub stock: Bounds, pub datum: [f32; 3], pub disabled: Vec<String> }`
@@ -1163,7 +1165,7 @@ mod tests {
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
 (Operation 1: Face top - Facing - T1 - S8000)
 (Extents: X-15.000 to 15.000 Y-15.000 to -15.000 Z-1.000 to 15.000 mm)
-(Not checked: fixtures, clamps and the machine body. Preview in LinuxCNC and air-cut first.)
+(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)
 G17 G21 G40 G49 G80 G90 G94
 G64 P0.010
 G54
@@ -1171,6 +1173,7 @@ G53 G0 Z0
 (Operation 1/1: Face top - T1)
 T1 M6
 G43 H1
+G53 G0 Z0
 S8000 M3
 M8
 G4 P2.000
@@ -1197,10 +1200,20 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
-        assert!(text.contains("T1 M6\n(MSG, Touch off Z for T1 Flat end mill - D10, then press Cycle Start)\nM0\nS8000 M3\n"));
+        assert!(text.contains("T1 M6\n(MSG, Touch off Z for T1 Flat end mill - D10, then press Cycle Start)\nM0\nG0 Z15.000\nS8000 M3\n"));
         assert!(!text.contains("G43") && !text.contains("G53") && !text.contains("G4 P"));
         assert!(text.contains("\nG61\n"));
-        assert_eq!(text.matches("G0 Z15.000").count(), 4, "{text}");
+        assert_eq!(text.matches("G0 Z15.000").count(), 5, "{text}");
+    }
+    #[test]
+    fn clearance_retracts_use_the_loaded_tool_length() {
+        let mut m = Machine::new(3);
+        m.p.insert("post_retract".into(), POST_RETRACT[1].into());
+        let (text, _, _) = program(m);
+        assert!(
+            text.contains("\nG54\nG43\nG0 Z15.000\n(Operation 1/1: Face top - T1)\nT1 M6\nG43 H1\nG0 Z15.000\nS8000 M3\n"),
+            "{text}"
+        );
     }
     #[test]
     fn datum_follows_the_setup_origin() {
@@ -1415,7 +1428,10 @@ pub enum Block {
     Stop,
     /// G53 G0 Z0, or G0 Z to the setup clearance plane.
     Retract,
-    Start { op: usize, change: bool, spindle: bool, coolant: bool },
+    /// Begin an operation: its comment, and when `change`, T# M6 then G43 H# or MSG + M0.
+    Start { op: usize, change: bool },
+    /// (Re)issue the spindle (S M3/M4) and coolant for an operation.
+    Run { op: usize, spindle: bool, coolant: bool },
     /// Spindle acceleration dwell from the machine settings.
     Wait { seconds: f32 },
     /// Rapid in X/Y at the retract height after a tool change.
@@ -1437,7 +1453,12 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         if change {
             out.extend([Block::Stop, Block::Retract]);
         }
-        out.push(Block::Start { op: k, change, spindle, coolant });
+        out.push(Block::Start { op: k, change });
+        if change {
+            // The new tool's tip (after G43 or a manual touch-off) goes to a safe height first.
+            out.push(Block::Retract);
+        }
+        out.push(Block::Run { op: k, spindle, coolant });
         if spindle && settings.dwell > 0. {
             out.push(Block::Wait { seconds: settings.dwell });
         }
@@ -1568,10 +1589,14 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         coord(e.min[2] - d[2]),
         coord(e.max[2] - d[2])
     ));
-    w.line("(Not checked: fixtures, clamps and the machine body. Preview in LinuxCNC and air-cut first.)");
+    w.line("(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)");
     w.line("G17 G21 G40 G49 G80 G90 G94");
     w.line(if settings.blend > 0. { format!("G64 P{:.3}", settings.blend) } else { "G61".into() });
     w.line(offset);
+    if settings.tool_table && !settings.machine_home {
+        // The first clearance retract must position the loaded tool's tip, not the gauge line.
+        w.line("G43");
+    }
     let clearance = coord(clearance_plane(blocks) - d[2]);
     let mut position: [Option<String>; 3] = [None, None, None];
     let mut motion: Option<Kind> = None;
@@ -1600,7 +1625,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                 }
                 motion = Some(Kind::Rapid);
             }
-            Block::Start { op, change, spindle, coolant: set } => {
+            Block::Start { op, change } => {
                 let s = &ops[*op];
                 w.note(&format!("Operation {}/{}: {} - T{}", op + 1, ops.len(), s.name, s.tool));
                 if *change {
@@ -1612,6 +1637,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                         w.line("M0");
                     }
                 }
+            }
+            Block::Run { op, spindle, coolant: set } => {
+                let s = &ops[*op];
                 if *spindle {
                     w.line(format!("S{:.0} {}", s.rpm, if s.clockwise { "M3" } else { "M4" }));
                     spindle_on = true;
@@ -1681,7 +1709,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `133 passed; 0 failed`. If `golden_facing_program` fails, print both strings and fix the emitter until the golden text matches. Do not edit `GOLDEN` unless the spec requires it.
+Expected: `135 passed; 0 failed` (including one new `ngc` test from the Task 5 fix round). If `golden_facing_program` fails, print both strings and fix the emitter until the golden text matches. Do not edit `GOLDEN` unless the spec requires it.
 
 - [ ] **Step 5: Commit**
 
@@ -1914,7 +1942,7 @@ pub fn check_setup(
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `137 passed; 0 failed`.
+Expected: `139 passed; 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2126,7 +2154,7 @@ pub fn verify(
     let mut at: [Option<f64>; 3] = [None; 3];
     for block in blocks {
         match block {
-            Block::Stop | Block::Start { .. } | Block::End => {}
+            Block::Stop | Block::Start { .. } | Block::Run { .. } | Block::End => {}
             Block::Retract => {
                 let s = take(steps, &mut i, "a safe retract")?;
                 let ok = s.kind == StepKind::Rapid
@@ -2492,7 +2520,7 @@ Add a test in `src/post.rs` `mod tests`:
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `144 passed; 0 failed`. If `all_six_strategies_post_and_replay_exactly` reports a check problem, read the message. A real generator defect (for example a rapid into unproven material) must be reported to the user; do not weaken `post_check`. A verifier or emitter mismatch should be fixed in `post.rs`/`ngc.rs`.
+Expected: `146 passed; 0 failed`. If `all_six_strategies_post_and_replay_exactly` reports a check problem, read the message. A real generator defect (for example a rapid into unproven material) must be reported to the user; do not weaken `post_check`. A verifier or emitter mismatch should be fixed in `post.rs`/`ngc.rs`.
 
 - [ ] **Step 7: Commit**
 
@@ -2826,7 +2854,7 @@ Audit closing note (~2247): replace `Rest-aware toolpath optimization, tool/hold
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `144 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
+Expected: `146 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
 
 - [ ] **Step 7: Commit**
 
@@ -2977,7 +3005,7 @@ Expected: `clean`
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `145 passed; 0 failed`.
+Expected: `147 passed; 0 failed`.
 
 - [ ] **Step 6: Commit**
 
@@ -3066,7 +3094,7 @@ Run:
 ```bash
 cargo fmt --check && cargo test --locked --quiet 2>&1 | tail -2 && cargo build --release --locked 2>&1 | tail -1
 ```
-Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 145) and `Finished`.
+Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 147) and `Finished`.
 
 - [ ] **Step 5: Update `docs/VALIDATION.md`**
 
