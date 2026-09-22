@@ -46,6 +46,8 @@ pub struct Mesh {
     pub triangles: usize,
     pub sampled: bool,
     pub units: &'static str,
+    /// Display-space position of the source file's (0,0,0).
+    pub origin: [f32; 3],
     rotated_bounds: RefCell<Option<([f32; 3], Bounds)>>,
 }
 impl Mesh {
@@ -216,6 +218,11 @@ pub(crate) fn normalize(tris: Vec<[[f32; 3]; 3]>) -> Result<Mesh, String> {
         return Err("Mesh has invalid or zero dimensions.".into());
     }
     let scale = 140. / extent;
+    let origin = [
+        -(min[0] + dimensions[0] / 2.) * scale,
+        -(min[1] + dimensions[1] / 2.) * scale,
+        -min[2] * scale + 4.,
+    ];
     if tris.len() > 200_000 {
         return Err("Preview exceeds 200,000 triangles. Export a coarser mesh.".into());
     }
@@ -252,6 +259,7 @@ pub(crate) fn normalize(tris: Vec<[[f32; 3]; 3]>) -> Result<Mesh, String> {
         triangles: tris.len(),
         sampled: false,
         units: "source units",
+        origin,
         rotated_bounds: RefCell::new(None),
     })
 }
@@ -285,6 +293,7 @@ pub fn sample() -> Mesh {
         triangles: 0,
         sampled: false,
         units: "mm",
+        origin: [0., 0., 0.],
         rotated_bounds: RefCell::new(None),
     }
 }
@@ -485,5 +494,26 @@ mod tests {
         let bad = dir.path().join("bad.step");
         std::fs::write(&bad, "this is not STEP").unwrap();
         assert!(load(&bad).is_err());
+    }
+    #[test]
+    fn normalize_remembers_the_source_origin() {
+        let mesh = normalize(vec![[[10., 20., 30.], [20., 20., 30.], [10., 40., 35.]]]).unwrap();
+        let s = mesh.display_scale();
+        let expected = [-15. * s, -30. * s, -30. * s + 4.];
+        for k in 0..3 {
+            assert!(
+                (mesh.origin[k] - expected[k]).abs() < 1e-3,
+                "{:?}",
+                mesh.origin
+            );
+        }
+        let sources = [[10., 20., 30.], [20., 20., 30.], [10., 40., 35.]];
+        for p in &mesh.faces[0].points {
+            assert!(
+                sources
+                    .iter()
+                    .any(|q| (0..3).all(|k| (p[k] - (mesh.origin[k] + q[k] * s)).abs() < 1e-3))
+            );
+        }
     }
 }
