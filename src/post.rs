@@ -280,6 +280,8 @@ pub struct Header<'a> {
     pub job: &'a str,
     pub setup: &'a Setup,
     pub number: usize,
+    /// (program, count) when touch-off mode splits a setup into one program per tool run.
+    pub part: Option<(usize, usize)>,
     pub stock: Bounds,
     pub datum: [f32; 3],
     pub disabled: Vec<String>,
@@ -305,6 +307,11 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         h.number,
         setup.name()
     ));
+    if let Some((i, count)) = h.part {
+        w.note(&format!(
+            "Program {i} of {count} for this setup, one per tool"
+        ));
+    }
     w.note(&format!(
         "Machine: {} v{}",
         setup.machine.name(),
@@ -410,17 +417,15 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                     s.name,
                     s.tool
                 ));
-                if *change {
+                if *change && settings.tool_table {
                     w.line(format!("T{} M6", s.tool));
-                    if settings.tool_table {
-                        w.line(format!("G43 H{}", s.tool));
-                    } else {
-                        w.note(&format!(
-                            "MSG, Touch off Z for T{} {}, then press Cycle Start",
-                            s.tool, s.tool_name
-                        ));
-                        w.line("M0");
-                    }
+                    w.line(format!("G43 H{}", s.tool));
+                } else if *change {
+                    // AXIS cannot touch off while a program is paused, so each tool gets its own program.
+                    w.note(&format!(
+                        "Load T{} {} and touch off Z at the work zero before starting this program.",
+                        s.tool, s.tool_name
+                    ));
                 }
             }
             Block::Run {
@@ -733,6 +738,7 @@ mod tests {
             job: "Golden",
             setup: &setup,
             number: 1,
+            part: None,
             stock: plan.stock,
             datum: [0., 0., 10.],
             disabled: vec![],
@@ -783,10 +789,14 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
-        assert!(text.contains(
-            "T1 M6\n(MSG, Touch off Z for T1 Flat end mill - D10, then press Cycle Start)\nM0\nG0 Z15.000\nS8000 M3\n"
-        ));
-        assert!(!text.contains("G43") && !text.contains("G53") && !text.contains("G4 P"));
+        assert!(
+            text.contains(
+                "(Load T1 Flat end mill - D10 and touch off Z at the work zero before starting this program.)\nG0 Z15.000\nS8000 M3\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("M6") && !text.contains("\nM0\n") && !text.contains("G43"));
+        assert!(!text.contains("G53") && !text.contains("G4 P"));
         assert!(text.contains("\nG61\n"));
         assert_eq!(text.matches("G0 Z15.000").count(), 5, "{text}");
     }

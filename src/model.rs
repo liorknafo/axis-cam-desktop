@@ -418,7 +418,10 @@ pub fn facing_setting_issues(p: &Fields) -> Vec<String> {
     .collect()
 }
 pub const TOOL_NUMBER_MAX: u32 = 9999;
-pub const POST_TOOL_LENGTH: [&str; 2] = ["Tool table (G43 H#)", "Touch off each tool (M0)"];
+pub const POST_TOOL_LENGTH: [&str; 2] = [
+    "Tool table (G43 H#)",
+    "Touch off each tool (one program per tool)",
+];
 pub const POST_RETRACT: [&str; 2] = ["Machine Z home (G53 G0 Z0)", "Setup clearance plane"];
 pub const POST_AIR: [&str; 3] = ["M7", "M8", "Not available"];
 pub const POST_KEYS: [&str; 5] = [
