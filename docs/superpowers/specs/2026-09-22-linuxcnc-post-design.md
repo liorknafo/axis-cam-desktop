@@ -102,7 +102,7 @@ Shown in the machine wizard's controller step when the controller is LinuxCNC. T
 
 Existing fields become enforced limits: travel `x`/`y`/`z`, maximum `rpm` and maximum `feed`. Inch profiles are converted with ×25.4 for these checks. Output stays in mm.
 
-Touch-off mode writes one program per run of consecutive operations using the same tool, named `… - <i> of <k> T<t>.ngc`. Each starts with a comment to load that tool and touch off Z at the work zero before starting. There is no tool change, `G43` or `M0` inside, because LinuxCNC's AXIS cannot touch off while a program is paused.
+Touch-off mode writes one program per run of consecutive operations using the same tool, named `… - <i> of <k> T<t>.ngc`. Each header says which tool to load. Program 1 is touched off at the work zero with AXIS Touch Off, not Tool Touch Off, and the operator notes the Z of a fixed reference surface such as a vise jaw. Later programs are touched off on that reference, because earlier programs have cut the Z0 surface. There is no tool change, `G43` or `M0` inside, because LinuxCNC's AXIS cannot touch off while a program is paused.
 
 Coolant mapping: Flood → `M8`, Mist → `M7`, Air → `post_air` (refuses if Not available), Off → none.
 
