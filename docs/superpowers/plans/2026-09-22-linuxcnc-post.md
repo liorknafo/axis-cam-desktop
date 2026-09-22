@@ -2080,8 +2080,10 @@ cargo fmt && git add -A && git commit -qm "Check limits, travel, rapids and hold
         );
         assert_eq!(programs[0].operations.len(), 3);
         for p in programs {
-            assert!(!p.text.contains("M6") && !p.text.contains("G43") && p.text.contains("touch off Z"));
+            assert!(!p.text.contains("M6") && !p.text.contains("G43") && p.text.contains("use AXIS Touch Off"));
         }
+        assert!(programs[1].text.contains("(Program 2 of 4 for this setup, one per tool)"));
+        assert!(programs[1].text.contains("(Load T3 Drill 4 and use AXIS Touch Off"));
     }
     #[test]
     fn unsafe_or_unsupported_jobs_are_refused_with_reasons() {
@@ -2127,6 +2129,25 @@ cargo fmt && git add -A && git commit -qm "Check limits, travel, rapids and hold
 
 Run: `cargo test --locked --quiet post:: 2>&1 | tail -5`
 Expected: compile errors (`post_job`, `prepare`, `write_job` … not found).
+
+- [ ] **Step 2b: Move the touch-off instruction into the header (controller ruling carried from the Task 5 review)**
+
+In `src/post.rs` `emit`, delete the touch-off `else if *change { … }` branch from the `Block::Start` arm (keep the tool-table `T# M6` / `G43 H#` branch). In the header, directly after the `(Not checked: …)` line and before `G17 G21 …`, add:
+```rust
+    if !settings.tool_table {
+        // AXIS cannot touch off while a program is paused; G49 below would cancel a Tool Touch Off.
+        w.note(&format!(
+            "Load T{} {} and use AXIS Touch Off, not Tool Touch Off, to set Z0 at the work zero before starting this program.",
+            ops[0].tool, ops[0].tool_name
+        ));
+    }
+```
+In the Task 5 test `machine_settings_change_tool_length_retract_blend_and_dwell`, replace the note assertion with:
+```rust
+        assert!(text.contains("(Load T1 Flat end mill - D10 and use AXIS Touch Off, not Tool Touch Off, to set Z0 at the work zero before starting this program.)\nG17 G21"), "{text}");
+        assert!(text.contains("(Operation 1/1: Face top - T1)\nG0 Z15.000\nS8000 M3\n"), "{text}");
+```
+Final header order: … Extents, Not checked, touch-off note (touch-off mode only), then `G17 G21 …`.
 
 - [ ] **Step 3: Implement `ngc::verify`** (append above the test module in `src/ngc.rs`)
 
@@ -2596,7 +2617,7 @@ Add a test in `src/post.rs` `mod tests`:
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `148 passed; 0 failed`. If `all_six_strategies_post_and_replay_exactly` reports a check problem, read the message. A real generator defect (for example a rapid into unproven material) must be reported to the user; do not weaken `post_check`. A verifier or emitter mismatch should be fixed in `post.rs`/`ngc.rs`.
+Expected: `149 passed; 0 failed`. If `all_six_strategies_post_and_replay_exactly` reports a check problem, read the message. A real generator defect (for example a rapid into unproven material) must be reported to the user; do not weaken `post_check`. A verifier or emitter mismatch should be fixed in `post.rs`/`ngc.rs`.
 
 - [ ] **Step 7: Commit**
 
@@ -2932,7 +2953,7 @@ Audit closing note (~2247): replace `Rest-aware toolpath optimization, tool/hold
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `148 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
+Expected: `149 passed; 0 failed`. The new test is added and `nc_export_is_comments_only` is removed. There are no warnings about unused `post`/`ngc` items.
 
 - [ ] **Step 7: Commit**
 
@@ -3012,7 +3033,7 @@ Add these arms to the same match:
             "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first."
         }
         ("post_tool_length", "Touch off each tool (one program per tool)") => {
-            "Write one program per run of the same tool, with no tool change or G43 inside. Before each program, load its tool and touch off Z at the work zero. LinuxCNC's AXIS cannot touch off while a program is paused, so tool changes are not placed inside a program."
+            "Write one program per run of the same tool, with no tool change or G43 inside. Before each program, load its tool and use AXIS Touch Off (not Tool Touch Off) to set Z0 at the work zero. LinuxCNC's AXIS cannot touch off while a program is paused, so tool changes are not placed inside a program."
         }
         ("post_retract", "Machine Z home (G53 G0 Z0)") => {
             "Retract to machine Z0 with G53 before tool changes and at the end. On a standard LinuxCNC mill Z0 is the top of travel; confirm this on your machine."
@@ -3083,7 +3104,7 @@ Expected: `clean`
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `149 passed; 0 failed`.
+Expected: `150 passed; 0 failed`.
 
 - [ ] **Step 6: Commit**
 
@@ -3158,7 +3179,7 @@ Expected: the process exits 0, and the count is `101` (77 named screens plus 24 
 Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance. Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
 
 - Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (Stock top center, Stock top front-left or Model origin).
-- Machine profile → Controller step → Postprocessor: tool table (`T# M6` + `G43 H#`) or touch off each tool (one program per tool run, touched off before each; AXIS cannot touch off while a program is paused), safe retract (`G53 G0 Z0` or the setup clearance plane), path blending (`G64 P`, or `G61` at 0), spindle start dwell and the Air output (M7/M8). Setups keep a machine snapshot, so assign the profile again after editing it.
+- Machine profile → Controller step → Postprocessor: tool table (`T# M6` + `G43 H#`) or touch off each tool (one program per tool run; before each, load the tool and use AXIS Touch Off, not Tool Touch Off, to set Z0 — AXIS cannot touch off while a program is paused), safe retract (`G53 G0 Z0` or the setup clearance plane), path blending (`G64 P`, or `G61` at 0), spindle start dwell and the Air output (M7/M8). Setups keep a machine snapshot, so assign the profile again after editing it.
 - Tools have a number (T#) in the tool library. Older libraries are numbered 1, 2, 3… once when opened.
 - Not checked: fixtures, clamps and the machine body. LinuxCNC's own soft limits check absolute position. Preview each program in LinuxCNC and air-cut first.
 - Headless: `axis-cam --export-gcode <project.json> <folder>` runs the same checks and writes the same files.
@@ -3172,7 +3193,7 @@ Run:
 ```bash
 cargo fmt --check && cargo test --locked --quiet 2>&1 | tail -2 && cargo build --release --locked 2>&1 | tail -1
 ```
-Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 149) and `Finished`.
+Expected: no fmt output, `test result: ok. N passed; 0 failed` (N = 150) and `Finished`.
 
 - [ ] **Step 5: Update `docs/VALIDATION.md`**
 
