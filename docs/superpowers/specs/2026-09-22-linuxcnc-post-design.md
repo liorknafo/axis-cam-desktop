@@ -81,10 +81,10 @@ M5
 M2
 ```
 
-- Tool change: `M9`, `M5` and the safe retract are emitted before each tool change, and the safe retract is repeated after `G43 H#` or the touch-off `M0`. Otherwise a longer tool, or a tool left at the stock after touching off, would move sideways at a low height. In tool-table mode with the clearance-plane retract, a bare `G43` before the first retract makes that retract position the loaded tool's tip rather than the spindle gauge line. A tool change happens only when the operation's tool differs from the active tool. Spindle speed/direction and coolant are re-emitted only when they change between operations.
+- Tool change: `M9`, `M5` and the safe retract are emitted before each tool change, and the safe retract is repeated after `T# M6` + `G43 H#`. Otherwise a longer tool, or a tool left at the stock after touching off, would move sideways at a low height. In tool-table mode with the clearance-plane retract, a bare `G43` before the first retract makes that retract position the loaded tool's tip rather than the spindle gauge line. A tool change happens only when the operation's tool differs from the active tool. Spindle speed/direction and coolant are re-emitted only when they change between operations.
 - After a tool change, the first plan point is reached by first rapiding in XY at the retracted height and then rapiding in Z. Consecutive operations with the same tool connect directly, because every plan starts and ends at its own clearance plane. The connecting move from one operation's last point to the next operation's first point is emitted as `G0`. If the two points are at different heights, the move is split so the tool climbs first and descends last. This connecting move is checked like any other rapid.
 - Only words that change are emitted (modal X/Y/Z/F). A `G1` always has an active `F`.
-- Safe retract: `G53 G0 Z0` (Machine Z home) or `G0 Z<clearance>` (Setup clearance plane, the highest clearance of the setup's operations in work coordinates).
+- Safe retract: `G53 G0 Z0` (Machine Z home) or `G0 Z<clearance>` (Setup clearance plane: the highest tool-tip Z of the program's motion, in work coordinates).
 
 ## 4. Configuration
 
