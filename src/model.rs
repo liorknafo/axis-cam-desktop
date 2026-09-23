@@ -461,8 +461,8 @@ pub fn post_setting_issues(p: &Fields) -> Vec<String> {
             .ok()
             .filter(|v| v.is_finite())
     };
-    if !value("post_blend").is_some_and(|v| (0. ..=1.).contains(&v)) {
-        e.push("Path blending tolerance must be between 0 and 1 mm.".into());
+    if !value("post_blend").is_some_and(|v| v == 0. || (0.001..=1.).contains(&v)) {
+        e.push("Path blending tolerance must be 0 or between 0.001 and 1 mm.".into());
     }
     if !value("post_dwell").is_some_and(|v| (0. ..=60.).contains(&v)) {
         e.push("Spindle start dwell must be between 0 and 60 seconds.".into());
@@ -1392,6 +1392,15 @@ mod tests {
         m.p.insert("post_dwell".into(), "90".into());
         m.p.insert("post_air".into(), "M50".into());
         assert_eq!(post_setting_issues(&m.p).len(), 3);
+        m.p.insert("post_air".into(), POST_AIR[0].into());
+        m.p.insert("post_dwell".into(), "2".into());
+        m.p.insert("post_blend".into(), "0.0004".into());
+        assert_eq!(
+            post_setting_issues(&m.p),
+            vec!["Path blending tolerance must be 0 or between 0.001 and 1 mm.".to_string()]
+        );
+        m.p.insert("post_blend".into(), "0.001".into());
+        assert!(post_setting_issues(&m.p).is_empty());
         assert!(
             m.issues().is_empty(),
             "post settings never block simulation"

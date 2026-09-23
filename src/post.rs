@@ -179,7 +179,8 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         let spindle = change
             || previous.is_some_and(|p| ops[p].rpm != op.rpm || ops[p].clockwise != op.clockwise);
         let coolant = change || previous.is_some_and(|p| ops[p].coolant != op.coolant);
-        if change {
+        // With a tool table and clearance-plane retracts, the first G0 Z needs the new tool's G43 H.
+        if change && !(k == 0 && settings.tool_table && !settings.machine_home) {
             out.extend([Block::Stop, Block::Retract]);
         }
         out.push(Block::Start { op: k, change });
@@ -320,7 +321,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     // Later touch-off programs keep program 1's X/Y; the stock top may already be cut.
     let later = h.part.is_some_and(|(i, _)| i > 1);
     w.note(&format!(
-        "Work zero: {}. {}",
+        "Work zero: {} in {offset}. {}",
         get(&setup.p, "origin"),
         if later {
             "X0 Y0 are unchanged from program 1."
@@ -376,6 +377,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         coord(e.max[2] - d[2])
     ));
     w.line("(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)");
+    if settings.tool_table && !settings.machine_home {
+        w.note("Start with the spindle raised clear of the part and fixtures: the first tool change happens at the current height.");
+    }
     if !settings.tool_table {
         // AXIS cannot touch off while a program is paused; G49 below would cancel a Tool Touch Off.
         // Earlier programs cut away the Z0 surface, so later tools use a fixed reference.
@@ -391,6 +395,8 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             ));
             w.note("Do not touch off on the stock: earlier programs have cut it.");
         }
+        // A G43 left active from an earlier program would offset the touch-off.
+        w.note("Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.");
     }
     w.line("G17 G21 G40 G49 G80 G90 G94");
     w.line(if settings.blend > 0. {
@@ -399,10 +405,6 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         "G61".into()
     });
     w.line(offset);
-    if settings.tool_table && !settings.machine_home {
-        // The first clearance retract must position the loaded tool's tip, not the gauge line.
-        w.line("G43");
-    }
     let clearance = coord(clearance_plane(blocks) - d[2]);
     let mut position: [Option<String>; 3] = [None, None, None];
     let mut motion: Option<Kind> = None;
@@ -593,7 +595,7 @@ pub fn file_name(doc: &Document, index: usize, part: Option<(usize, usize, u32)>
         None => format!("{base}.ngc"),
     }
 }
-fn op_state(
+pub(crate) fn op_state(
     doc: &Document,
     op: &Operation,
     plan: &Plan,
@@ -636,6 +638,36 @@ fn op_state(
         clockwise: plan.spindle_clockwise,
         coolant: coolant.unwrap(),
     })
+}
+/// Stock faces a stock-based work zero needs (the top, and the sides that place X0 Y0)
+/// with no sample point left outside every earlier cut box.
+fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str> {
+    let mut faces = vec![
+        ("top face", 2, s.max[2] - 0.01),
+        ("-X side", 0, s.min[0] + 0.01),
+    ];
+    if center {
+        faces.push(("+X side", 0, s.max[0] - 0.01));
+    }
+    faces.push(("-Y side", 1, s.min[1] + 0.01));
+    if center {
+        faces.push(("+Y side", 1, s.max[1] - 0.01));
+    }
+    let at = |k: usize, n: usize| s.min[k] + (s.max[k] - s.min[k]) * (0.01 + 0.98 * n as f32 / 6.);
+    faces
+        .into_iter()
+        .filter(|&(_, k, plane)| {
+            let (i, j) = ((k + 1) % 3, (k + 2) % 3);
+            !(0..49).any(|n| {
+                let mut p = [plane; 3];
+                (p[i], p[j]) = (at(i, n % 7), at(j, n / 7));
+                // A small guard keeps float error in the frame transforms on the safe side.
+                cuts.iter()
+                    .all(|b| (0..3).any(|a| p[a] < b.min[a] - 0.001 || p[a] > b.max[a] + 0.001))
+            })
+        })
+        .map(|f| f.0)
+        .collect()
 }
 pub(crate) struct Prepared {
     pub file_name: String,
@@ -698,6 +730,26 @@ pub(crate) fn prepare(
             "Operations in this setup report different stock boxes, so the work zero is ambiguous."
                 .into(),
         ]);
+    }
+    let origin = get(&setup.p, "origin");
+    if let (true, Some(volume), Some(frame)) = (
+        origin == "Stock top center" || origin == "Stock top front-left",
+        &simulations[0].initial_volume,
+        simulations[0].frame,
+    ) {
+        let cuts = crate::rest::cut_boxes(volume, frame);
+        let cut = stock_faces_cut(stock, &cuts, origin == "Stock top center");
+        if let Some((last, rest)) = cut.split_last() {
+            let list = if rest.is_empty() {
+                last.to_string()
+            } else {
+                format!("{} and {last}", rest.join(", "))
+            };
+            return Err(vec![format!(
+                "{}: earlier setups have cut the stock's {list}, so the {origin} work zero is no longer on the stock. Choose Model origin for this setup.",
+                setup.name()
+            )]);
+        }
     }
     // Touch-off mode: one program per run of the same tool, touched off before it starts.
     let mut groups: Vec<std::ops::Range<usize>> = vec![];
@@ -1074,7 +1126,7 @@ mod tests {
     const GOLDEN: &str = "(AXIS CAM Studio - LinuxCNC 3-axis program)
 (Job: Golden - Setup 1: Top side - G54)
 (Machine: Workshop Mill v1)
-(Work zero: Stock top center. Touch off X0 Y0 Z0 there.)
+(Work zero: Stock top center in G54. Touch off X0 Y0 Z0 there.)
 (Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
 (Fixture: Low profile clamps)
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
@@ -1115,7 +1167,7 @@ M2
         m.p.insert("post_blend".into(), "0".into());
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
-        assert!(text.contains("(Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.)\nG17 G21"), "{text}");
+        assert!(text.contains("(Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.)\n(Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.)\nG17 G21"), "{text}");
         assert!(text.contains("(Load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero.)"), "{text}");
         assert!(
             text.contains("(Operation 1/1: Face top - T1)\nG0 Z15.000\nS8000 M3\n"),
@@ -1127,15 +1179,26 @@ M2
         assert_eq!(text.matches("G0 Z15.000").count(), 5, "{text}");
     }
     #[test]
-    fn clearance_retracts_use_the_loaded_tool_length() {
+    fn clearance_mode_changes_the_tool_before_the_first_retract() {
         let mut m = Machine::new(3);
         m.p.insert("post_retract".into(), POST_RETRACT[1].into());
-        let (text, _, _) = program(m);
+        let (text, blocks, settings) = program(m);
         assert!(
             text.contains(
-                "\nG54\nG43\nG0 Z15.000\n(Operation 1/1: Face top - T1)\nT1 M6\nG43 H1\nG0 Z15.000\nS8000 M3\n"
+                "\nG54\n(Operation 1/1: Face top - T1)\nT1 M6\nG43 H1\nG0 Z15.000\nS8000 M3\n"
             ),
             "{text}"
+        );
+        assert!(text.contains("(Start with the spindle raised clear of the part and fixtures: the first tool change happens at the current height.)\nG17 G21"), "{text}");
+        assert!(!text.contains("\nG43\n"), "{text}");
+        let early = [vec![Block::Retract], blocks].concat();
+        let text = text.replacen("G54\n", "G54\nG0 Z15.000\n", 1);
+        let ops = [fixture::facing_op()];
+        let result = crate::ngc::verify(&text, &early, &ops, [0., 0., 10.], &settings, "G54");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("no retract is expected before the first tool change")
         );
     }
     #[test]
@@ -1334,6 +1397,39 @@ M2
         assert!(second.contains("Part rotation X180"));
     }
     #[test]
+    fn stock_datums_are_refused_when_earlier_setups_cut_their_faces() {
+        let (mut doc, mesh) = fixture::job();
+        let ops = doc.setups[0].operations.clone();
+        doc.setups[0].operations.truncate(1);
+        let mut turned = Setup::new(Machine::new(3), "G55");
+        turned.p.insert("name".into(), "Turned".into());
+        turned.p.insert("rz".into(), "180".into());
+        for op in &ops[..2] {
+            let mut op = op.clone();
+            op.id = id();
+            turned.operations.push(op);
+        }
+        doc.setups.push(turned);
+        doc.sync_stock_sources();
+        for origin in ["Stock top center", "Stock top front-left"] {
+            doc.setups[1].p.insert("origin".into(), origin.into());
+            let job = post_job(&doc, &mesh);
+            assert!(!job.ready());
+            assert!(
+                errors(&job)
+                    .iter()
+                    .any(|e| e.contains("top face") && e.contains("Model origin")),
+                "{:?}",
+                errors(&job)
+            );
+        }
+        doc.setups[1]
+            .p
+            .insert("origin".into(), "Model origin".into());
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+    }
+    #[test]
     fn touch_off_mode_writes_one_program_per_tool_run() {
         let (mut doc, mesh) = fixture::job();
         doc.setups[0]
@@ -1359,6 +1455,7 @@ M2
                 !p.text.contains("M6")
                     && !p.text.contains("G43")
                     && p.text.contains("use AXIS Touch Off")
+                    && p.text.contains("Run G49 in MDI before touching off")
             );
         }
         assert!(
@@ -1528,7 +1625,9 @@ M2
                 &(|t: &str| t.replace("G43 H1\nG0 Z15.000\n", "G0 Z15.000\nG43 H1\n"))
                     as &dyn Fn(&str) -> String,
             ),
-            (clearance(), &|t: &str| t.replacen("G54\nG43\n", "G54\n", 1)),
+            (clearance(), &|t: &str| {
+                t.replacen("G54\n", "G54\nG0 Z15.000\n", 1)
+            }),
             (Machine::new(3), &|t: &str| {
                 t.replace("S8000 M3\nM8\nG4 P2.000\n", "G4 P2.000\nS8000 M3\nM8\n")
             }),
@@ -1541,6 +1640,16 @@ M2
             assert_eq!(clean, Ok(()));
             assert!(edited.is_err());
         }
+    }
+    #[test]
+    fn a_blend_that_prints_as_g64_p0_fails_verification() {
+        let (text, blocks, mut settings) = program(Machine::new(3));
+        settings.blend = 0.0004;
+        let text = text.replace("G64 P0.010", &format!("G64 P{:.3}", settings.blend));
+        assert!(text.contains("\nG64 P0.000\n"));
+        let ops = vec![fixture::facing_op()];
+        let result = crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54");
+        assert!(result.unwrap_err().contains("blending"));
     }
     #[test]
     fn headless_export_matches_the_ui_path() {

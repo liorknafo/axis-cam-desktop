@@ -49,6 +49,23 @@ fn transformed(b: Bounds, from: Frame, to: Frame) -> Bounds {
     }
     out
 }
+/// Box, in `current`, around each earlier cut of any cutter shape: material can
+/// only have been removed inside these boxes.
+pub fn cut_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
+    volume
+        .cuts
+        .iter()
+        .map(|c| {
+            let b = Bounds {
+                min: std::array::from_fn(|k| c.a[k].min(c.b[k]) - c.radius),
+                max: std::array::from_fn(|k| {
+                    c.a[k].max(c.b[k]) + c.radius + if k == 2 { c.flute } else { 0. }
+                }),
+            };
+            transformed(b, c.frame, current)
+        })
+        .collect()
+}
 impl RestStock {
     pub fn new(volume: &Volume, current: Frame) -> Self {
         let cuts = volume

@@ -164,7 +164,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first."
         }
         ("post_tool_length", "Touch off each tool (one program per tool)") => {
-            "Write one program per run of the same tool, with no tool change or G43 inside. Touch the first tool off at the work zero with AXIS Touch Off (not Tool Touch Off) and note the Z of a fixed reference such as a vise jaw; touch each later tool off on that reference. LinuxCNC's AXIS cannot touch off while a program is paused, so tool changes are not placed inside a program."
+            "Write one program per run of the same tool, with no tool change or G43 inside. Touch the first tool off at the work zero with AXIS Touch Off (not Tool Touch Off) and note the Z of a fixed reference such as a vise jaw; touch each later tool off on that reference. LinuxCNC's AXIS cannot touch off while a program is paused, so tool changes are not placed inside a program. Run G49 in MDI before touching off."
         }
         ("post_retract", "Machine Z home (G53 G0 Z0)") => {
             "Retract to machine Z0 with G53 before tool changes and at the end. On a standard LinuxCNC mill Z0 is the top of travel; confirm this on your machine."

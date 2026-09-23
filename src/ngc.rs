@@ -420,7 +420,10 @@ fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Resu
     let st = &s.state;
     let blend = match st.blend {
         Blend::Exact => settings.blend == 0.,
-        Blend::Tolerance(p) => settings.blend > 0. && (p - f64::from(settings.blend)).abs() <= TOL,
+        // G64 P0 would blend without limit.
+        Blend::Tolerance(p) => {
+            settings.blend > 0. && p >= 0.0005 && (p - f64::from(settings.blend)).abs() <= TOL
+        }
         Blend::Unset => false,
     };
     let problem = if settings.tool_table && st.tool != Some(op.tool) {
@@ -490,8 +493,13 @@ pub fn verify(
                     true
                 } else {
                     match current {
-                        // The bare G43 after the offset line applies the tool already loaded.
-                        None => st.length == Length::Loaded,
+                        // The first tool change and its G43 H come before any clearance retract.
+                        None => {
+                            return Err(format!(
+                                "line {}: no retract is expected before the first tool change",
+                                s.line
+                            ));
+                        }
                         Some(c) => tool_ok(st, &ops[c], settings),
                     }
                 };

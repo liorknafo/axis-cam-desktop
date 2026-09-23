@@ -199,7 +199,7 @@ mod tests {
     use super::*;
     use crate::{
         post::{OpState, PostSettings, blocks, fixture},
-        simulation::Motion,
+        simulation::{Motion, Move, Plan},
     };
     fn check(machine: Machine, op: OpState, moves: &[(Motion, [f32; 3], f32)]) -> Vec<String> {
         let plan = fixture::plan([-15., -15., 25.], moves);
@@ -349,6 +349,116 @@ mod tests {
         let problems = check_setup(&setup, &ops, &[&sa, &sb], &blocks, &settings, [0., 0., 10.]);
         assert!(
             problems.iter().any(|p| p.contains("single tool")),
+            "{problems:?}"
+        );
+    }
+    #[test]
+    fn rest_stock_proof_accepts_rapids_into_faced_material_only() {
+        let (doc, mesh) = fixture::job();
+        let mut sims = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| sims.push(r.unwrap()));
+        let setup = &doc.setups[0];
+        let settings = PostSettings::from_machine(&setup.machine).unwrap();
+        let ops: Vec<OpState> = sims
+            .iter()
+            .zip(&setup.operations)
+            .map(|(s, op)| crate::post::op_state(&doc, op, &s.plan, Some(&settings)).unwrap())
+            .collect();
+        let zero = crate::post::datum(setup, sims[0].plan.stock, &mesh).unwrap();
+        let top = sims[0].plan.stock.max[2];
+        // Parallel (T2) follows a tool change, so only the rest-stock proof can accept a rapid.
+        let problems = |depth: f32, x: f32, y: f32| {
+            let mut sims = sims.clone();
+            let plan = &mut sims[4].plan;
+            let p0 = plan.moves[0].to;
+            let hi = [x + zero[0], y + zero[1], p0[2]];
+            let lo = [hi[0], hi[1], top - depth];
+            let rapid = |from, to| Move {
+                from,
+                to,
+                motion: Motion::Rapid,
+                cutting_pass: false,
+                feed: 0.,
+                start: 0.,
+                end: 0.,
+            };
+            plan.moves.splice(
+                1..1,
+                [rapid(p0, hi), rapid(hi, lo), rapid(lo, hi), rapid(hi, p0)],
+            );
+            let plans: Vec<&Plan> = sims.iter().map(|s| &s.plan).collect();
+            let blocks = blocks(&ops, &plans, &settings);
+            let refs: Vec<&Simulation> = sims.iter().collect();
+            check_setup(setup, &ops, &refs, &blocks, &settings, zero)
+        };
+        let refused = |p: &[String]| p.iter().any(|p| p.contains("not proven removed"));
+        // Facing removed 4 mm; the stock box is X-62 to 62, Y-42 to 42 from the work zero.
+        assert_eq!(problems(4., -55., -35.), Vec::<String>::new());
+        assert!(refused(&problems(4.2, -55., -35.)));
+        // A column that overlaps the faced corner is proven; one wholly outside the stock is not.
+        assert_eq!(problems(3., -61.5, -41.5), Vec::<String>::new());
+        assert!(refused(&problems(3., -66., -46.)));
+    }
+    #[test]
+    fn visited_positions_reset_at_a_tool_change() {
+        let a = fixture::plan(
+            [-15., -15., 25.],
+            &[
+                (Motion::Rapid, [-15., -15., 11.], 6000.),
+                (Motion::Feed, [-15., -15., 4.], 100.),
+                (Motion::Rapid, [-15., -15., 25.], 6000.),
+            ],
+        );
+        let b = fixture::plan(
+            [-15., -15., 25.],
+            &[
+                (Motion::Rapid, [-15., -15., 4.1], 6000.),
+                (Motion::Feed, [-15., -15., 2.], 100.),
+                (Motion::Rapid, [-15., -15., 25.], 6000.),
+            ],
+        );
+        let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
+        let setup = Setup::new(Machine::new(3), "G54");
+        let (sa, sb) = (Simulation::new(a.clone()), Simulation::new(b.clone()));
+        let problems = |second: OpState| {
+            let ops = [fixture::facing_op(), second];
+            let blocks = blocks(&ops, &[&a, &b], &settings);
+            check_setup(&setup, &ops, &[&sa, &sb], &blocks, &settings, [0., 0., 10.])
+        };
+        assert_eq!(problems(fixture::facing_op()), Vec::<String>::new());
+        let other = OpState {
+            tool_id: "t2".into(),
+            tool: 2,
+            ..fixture::facing_op()
+        };
+        let problems = problems(other);
+        assert!(
+            problems.iter().any(|p| p.contains("not proven removed")),
+            "{problems:?}"
+        );
+    }
+    #[test]
+    fn descend_below_the_stock_top_is_refused() {
+        let plan = fixture::plan(
+            [-15., -15., 5.],
+            &[
+                (Motion::Feed, [-15., -15., 4.], 100.),
+                (Motion::Rapid, [-15., -15., 25.], 6000.),
+            ],
+        );
+        let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
+        let op = fixture::facing_op();
+        let blocks = blocks(&[op.clone()], &[&plan], &settings);
+        assert!(blocks.contains(&Block::Descend {
+            op: 0,
+            xy: [-15., -15.],
+            z: 5.
+        }));
+        let setup = Setup::new(Machine::new(3), "G54");
+        let sim = Simulation::new(plan);
+        let problems = check_setup(&setup, &[op], &[&sim], &blocks, &settings, [0., 0., 10.]);
+        assert!(
+            problems.iter().any(|p| p.contains("not proven removed")),
             "{problems:?}"
         );
     }
