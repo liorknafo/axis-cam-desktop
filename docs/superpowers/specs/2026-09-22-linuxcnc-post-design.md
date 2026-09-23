@@ -42,7 +42,7 @@ The datum is determined by the setup's `origin` field:
 | Model origin | The source file's (0,0,0) passed through the setup's placement |
 | Selected point (planned) | Refuses export |
 
-- "The setup's stock box" is `Plan.stock` for that setup. When the stock is inherited, this is the remaining material's box in this setup's frame. Every plan in one setup must report the same stock box; if one differs, the post refuses.
+- "The setup's stock box" is `Plan.stock` for that setup. For a later setup this is the original stock box moved into the setup's frame; it does not shrink as material is removed. A stock-based origin is therefore refused when earlier setups' cuts cover every sampled point of a face the datum needs (the top face; −X/−Y for front-left; all four sides for center), with a message suggesting Model origin. Every plan in one setup must report the same stock box; if one differs, the post refuses.
 - Model origin requires `Mesh` to remember the display-space location of the source (0,0,0). `mesh::normalize` currently discards it by centering, so the mesh gains an `origin: [f32; 3]` field computed there. The sample mesh sets it to its own display origin.
 
 ## 3. Program layout
@@ -63,8 +63,7 @@ Body:
 G17 G21 G40 G49 G80 G90 G94
 G64 P0.010            (or G61 when blending tolerance is 0)
 G54                   (setup offset register)
-G43                   (tool table + clearance-plane retract only: the loaded tool's length for the first retract)
-<safe retract>
+<safe retract>        (omitted before the first tool change in tool-table + clearance-plane mode)
 (Operation 1/2: Facing - T1)
 T1 M6
 G43 H1                (tool-table mode; touch-off programs have no T/M6/G43, only a load-and-touch-off comment)
@@ -81,7 +80,7 @@ M5
 M2
 ```
 
-- Tool change: `M9`, `M5` and the safe retract are emitted before each tool change, and the safe retract is repeated after `T# M6` + `G43 H#`. Otherwise a longer tool, or a tool left at the stock after touching off, would move sideways at a low height. In tool-table mode with the clearance-plane retract, a bare `G43` before the first retract makes that retract position the loaded tool's tip rather than the spindle gauge line. A tool change happens only when the operation's tool differs from the active tool. Spindle speed/direction and coolant are re-emitted only when they change between operations.
+- Tool change: `M9`, `M5` and the safe retract are emitted before each tool change, and the safe retract is repeated after `T# M6` + `G43 H#`. Otherwise a longer tool, or a tool left at the stock after touching off, would move sideways at a low height. In tool-table mode with the clearance-plane retract there is no retract before the first `T# M6` + `G43 H#`: at program start LinuxCNC's idea of the loaded tool (T0 after a restart) cannot be trusted, so the header tells the operator to start with the spindle raised clear. A tool change happens only when the operation's tool differs from the active tool. Spindle speed/direction and coolant are re-emitted only when they change between operations.
 - After a tool change, the first plan point is reached by first rapiding in XY at the retracted height and then rapiding in Z. Consecutive operations with the same tool connect directly, because every plan starts and ends at its own clearance plane. The connecting move from one operation's last point to the next operation's first point is emitted as `G0`. If the two points are at different heights, the move is split so the tool climbs first and descends last. This connecting move is checked like any other rapid.
 - Only words that change are emitted (modal X/Y/Z/F). A `G1` always has an active `F`.
 - Safe retract: `G53 G0 Z0` (Machine Z home) or `G0 Z<clearance>` (Setup clearance plane: the highest tool-tip Z of the program's motion, in work coordinates).
@@ -96,7 +95,7 @@ Shown in the machine wizard's controller step when the controller is LinuxCNC. T
 | --- | --- | --- |
 | `post_tool_length` | `Tool table (G43 H#)`, `Touch off each tool (one program per tool)` | Tool table |
 | `post_retract` | `Machine Z home (G53 G0 Z0)`, `Setup clearance plane` | Machine Z home |
-| `post_blend` | tolerance in mm, 0–1 (0 → `G61`) | `0.01` |
+| `post_blend` | tolerance in mm: 0 (→ `G61`) or 0.001–1 | `0.01` |
 | `post_dwell` | spindle start dwell in seconds, 0–60 | `2` |
 | `post_air` | `M7`, `M8`, `Not available` | `M7` |
 
