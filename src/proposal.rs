@@ -165,11 +165,12 @@ fn format_character(c: char) -> bool {
         | '\u{2066}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0001}'
         | '\u{e0020}'..='\u{e007f}')
 }
-/// One line of plain text: control and format characters removed, whitespace
-/// collapsed, at most `limit` characters.
+/// One line of plain text: whitespace turned into spaces, other control and
+/// format characters removed, whitespace collapsed, at most `limit` characters.
 pub(crate) fn clip(text: &str, limit: usize) -> String {
     let plain: String = text
         .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !c.is_control() && !format_character(*c))
         .collect();
     plain
@@ -220,13 +221,42 @@ fn operation(
     if tool.is_none() {
         wrong.push(format!("T{} is not in the tool library.", p.tool));
     }
-    if !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
+    for (field, value) in [
+        ("rpm", Some(p.rpm)),
+        ("feed", Some(p.feed)),
+        ("stepdown", p.stepdown),
+        ("stepover_percent", p.stepover_percent),
+        ("radial_allowance", p.radial_allowance),
+        ("axial_allowance", p.axial_allowance),
+        ("bottom_offset", p.bottom_offset),
+        ("ramp_angle", p.ramp_angle),
+        ("surface_stepover", p.surface_stepover),
+        ("tolerance", p.tolerance),
+        ("peck", p.peck),
+        ("breakthrough", p.breakthrough),
+        ("hole_diameter", p.hole_diameter),
+    ] {
+        if value.is_some_and(|v| !v.is_finite()) {
+            wrong.push(format!("{field} is not a finite number."));
+        }
+    }
+    // Negative stock to leave or bottom offset would cut below the model.
+    for (field, value) in [
+        ("radial_allowance", p.radial_allowance),
+        ("axial_allowance", p.axial_allowance),
+        ("bottom_offset", p.bottom_offset),
+    ] {
+        if value.is_some_and(|v| v < 0. && v.is_finite()) {
+            wrong.push(format!("{field} cannot be negative."));
+        }
+    }
+    if p.rpm.is_finite() && !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
         wrong.push(format!(
             "rpm {} is outside 100-{} for this machine.",
             p.rpm, report.machine.max_rpm
         ));
     }
-    if !(p.feed >= 1. && p.feed <= report.machine.max_feed) {
+    if p.feed.is_finite() && !(p.feed >= 1. && p.feed <= report.machine.max_feed) {
         wrong.push(format!(
             "feed {} is outside 1-{} mm/min for this machine.",
             p.feed, report.machine.max_feed
@@ -319,7 +349,7 @@ fn operation(
         }
         let cap = num(&tool.p, "diameter").unwrap_or(0.) * 0.5 + 1.;
         let breakthrough = p.breakthrough.unwrap_or(1.);
-        if !(breakthrough >= 0. && breakthrough <= cap + 0.0001) {
+        if breakthrough.is_finite() && !(breakthrough >= 0. && breakthrough <= cap + 0.0001) {
             wrong.push(format!(
                 "breakthrough {breakthrough} mm is outside 0-{} mm for this drill (half its diameter plus 1 mm).",
                 (cap * 100.).round() / 100.
@@ -1195,5 +1225,61 @@ pub(crate) mod tests {
             get(&doc.setups[0].p, "name")
         );
         assert_eq!(get(&built.setups[1].p, "name"), "Setup 2");
+    }
+    #[test]
+    fn numbers_must_be_finite() {
+        let (doc, mesh, report) = block();
+        // JSON numbers beyond f32 parse to infinity.
+        let mut value = serde_json::to_value(good(&report)).unwrap();
+        value["setups"][0]["operations"][0]["peck"] = json!(1e39);
+        value["setups"][0]["operations"][3]["hole_diameter"] = json!(-1e39);
+        let proposal = parse(&value.to_string()).unwrap();
+        assert_eq!(proposal.setups[0].operations[0].peck, Some(f32::INFINITY));
+        assert_eq!(
+            messages(build(&doc, &mesh, &report, &proposal)),
+            vec![
+                "1/Some(1): peck is not a finite number.",
+                "1/Some(4): hole_diameter is not a finite number."
+            ]
+        );
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[0].rpm = f32::NAN;
+        proposal.setups[0].operations[1].feed = f32::INFINITY;
+        proposal.setups[0].operations[1].stepdown = Some(f32::NEG_INFINITY);
+        assert_eq!(
+            messages(build(&doc, &mesh, &report, &proposal)),
+            vec![
+                "1/Some(1): rpm is not a finite number.",
+                "1/Some(2): feed is not a finite number.",
+                "1/Some(2): stepdown is not a finite number."
+            ]
+        );
+    }
+    #[test]
+    fn allowances_and_the_bottom_offset_cannot_be_negative() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[1].radial_allowance = Some(-0.1);
+        proposal.setups[0].operations[1].axial_allowance = Some(-0.1);
+        proposal.setups[0].operations[2].bottom_offset = Some(-3.9);
+        assert_eq!(
+            messages(build(&doc, &mesh, &report, &proposal)),
+            vec![
+                "1/Some(2): radial_allowance cannot be negative.",
+                "1/Some(2): axial_allowance cannot be negative.",
+                "1/Some(3): bottom_offset cannot be negative."
+            ]
+        );
+        for op in &mut proposal.setups[0].operations[1..3] {
+            op.radial_allowance = Some(0.);
+            op.axial_allowance = Some(0.);
+            op.bottom_offset = Some(0.);
+        }
+        assert!(build(&doc, &mesh, &report, &proposal).is_ok());
+    }
+    #[test]
+    fn whitespace_in_model_text_becomes_a_space() {
+        assert_eq!(clip("a\nb", 60), "a b");
+        assert_eq!(clip("a\tb\r\nc\u{85}d\u{2028}e", 60), "a b c d e");
     }
 }

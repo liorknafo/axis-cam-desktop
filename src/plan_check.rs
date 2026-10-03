@@ -6,9 +6,9 @@ use crate::{
     analysis::{self, Index, PartReport},
     cam::Geometry,
     mesh::Mesh,
-    model::{Document, Strategy, num},
+    model::Document,
     proposal::{self, Problem, Proposal},
-    simulation::{Motion, Plan},
+    simulation::{Motion, Plan, Simulation},
     volume::Volume,
 };
 use serde::Serialize;
@@ -85,7 +85,7 @@ impl PartGrid {
                 {
                     continue;
                 }
-                let (Ok(spans) | Err(spans)) = analysis::column(&index, xy);
+                let spans = analysis::solid(&index, xy, geometry.bounds.max[2]);
                 for z in 0..stock.n[2] {
                     let height = stock.point([x, y, z], 0.5)[2];
                     if spans.iter().any(|(a, b)| height > *a && height < *b) {
@@ -149,8 +149,8 @@ fn volume_text(mm3: f32) -> String {
 }
 /// Along every move (tips sampled every 1 mm of XY travel): the most part
 /// material directly above the tool tip and where, and the lowest tip height.
-/// `index` is in the plan's setup frame.
-fn tool_axis(plan: &Plan, index: &Index) -> (f32, [f32; 3], f32) {
+/// `index` is in the plan's setup frame and `top` is the model's top there.
+fn tool_axis(plan: &Plan, index: &Index, top: f32) -> (f32, [f32; 3], f32) {
     let (mut worst, mut at, mut lowest) = (0f32, [0f32; 3], f32::INFINITY);
     for m in plan.moves.iter().filter(|m| m.motion != Motion::Dwell) {
         lowest = lowest.min(m.from[2]).min(m.to[2]);
@@ -160,7 +160,7 @@ fn tool_axis(plan: &Plan, index: &Index) -> (f32, [f32; 3], f32) {
             let t = i as f32 / steps as f32;
             let p: [f32; 3] = std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t);
             // The same tiny offset as the part grid keeps the ray off mesh edges.
-            let (Ok(spans) | Err(spans)) = analysis::column(index, [p[0] + 1e-4, p[1] + 1e-4]);
+            let spans = analysis::solid(index, [p[0] + 1e-4, p[1] + 1e-4], top);
             let above = spans
                 .iter()
                 .filter(|(_, hi)| *hi > p[2])
@@ -172,6 +172,41 @@ fn tool_axis(plan: &Plan, index: &Index) -> (f32, [f32; 3], f32) {
         }
     }
     (worst, at, lowest)
+}
+/// The tool axis problems of one generated operation in setup `si` (from 0):
+/// more than 0.1 mm of part above the tool tip, whatever the strategy, and
+/// moves below the floor. The floor is the stock's bottom in setup 1; later
+/// setups rest on the part, whose underside may be all that is left there.
+fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> Vec<String> {
+    let b = geometry.bounds;
+    let (worst, at, lowest) = tool_axis(plan, index, b.max[2]);
+    let mut problems = vec![];
+    if worst > 0.1 {
+        problems.push(format!(
+            "The tool's centre line passes through {worst:.2} mm of the part at X {:.1}, Y {:.1}, {:.1} mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there.",
+            at[0] - b.min[0],
+            at[1] - b.min[1],
+            b.max[2] - at[2]
+        ));
+    }
+    let floor = if si == 0 {
+        plan.stock.min[2]
+    } else {
+        plan.stock.min[2].max(b.min[2])
+    };
+    let below = floor - lowest;
+    if below > 0.001 {
+        problems.push(if si == 0 {
+            format!(
+                "The tool goes {below:.2} mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough."
+            )
+        } else {
+            format!(
+                "The tool goes {below:.2} mm below the part's underside in this setup. Earlier setups may have removed the stock there, and the part rests on it. Reduce the depth or the breakthrough."
+            )
+        });
+    }
+    problems
 }
 fn percent(part: f32, whole: f32) -> f32 {
     if whole <= 0. {
@@ -368,44 +403,24 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
     let mut operations = vec![];
     let mut problems = vec![];
     let mut gouges = vec![];
+    // Kept for the export stage, so the job is not simulated twice.
+    let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> =
+        vec![vec![]; built.setups.len()];
     crate::simulation::sequence_with(
         built,
         mesh,
         None,
-        |si, oi, result| match result {
-            Ok(sim) => {
-                let op = &built.setups[si].operations[oi];
-                operations.push(OpResult {
-                    setup: si + 1,
-                    operation: oi + 1,
-                    name: op.name().to_string(),
-                    minutes: (sim.plan.duration / 6.).round() / 10.,
-                });
-                let (worst, at, lowest) = tool_axis(&sim.plan, &indexes[si]);
-                let tolerance = match op.strategy {
-                    Strategy::Parallel => num(&op.p, "tolerance").unwrap_or(0.).max(0.),
-                    _ => 0.,
-                };
-                let b = geometries[si].bounds;
-                let below = sim.plan.stock.min[2] - lowest;
-                for (found, message) in [
-                    (
-                        worst > 0.1 + tolerance,
-                        format!(
-                            "The tool's centre line passes through {worst:.2} mm of the part at X {:.1}, Y {:.1}, {:.1} mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there.",
-                            at[0] - b.min[0],
-                            at[1] - b.min[1],
-                            b.max[2] - at[2]
-                        ),
-                    ),
-                    (
-                        below > 0.001,
-                        format!(
-                            "The tool goes {below:.2} mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough."
-                        ),
-                    ),
-                ] {
-                    if found {
+        |si, oi, result| {
+            match &result {
+                Ok(sim) => {
+                    let op = &built.setups[si].operations[oi];
+                    operations.push(OpResult {
+                        setup: si + 1,
+                        operation: oi + 1,
+                        name: op.name().to_string(),
+                        minutes: (sim.plan.duration / 6.).round() / 10.,
+                    });
+                    for message in axis_problems(&sim.plan, &geometries[si], &indexes[si], si) {
                         axis.push(Problem {
                             setup: si + 1,
                             operation: Some(oi + 1),
@@ -414,13 +429,14 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
                         });
                     }
                 }
+                Err(message) => problems.push(Problem {
+                    setup: si + 1,
+                    operation: Some(oi + 1),
+                    stage: "generation",
+                    message: message.clone(),
+                }),
             }
-            Err(message) => problems.push(Problem {
-                setup: si + 1,
-                operation: Some(oi + 1),
-                stage: "generation",
-                message,
-            }),
+            results[si].push((oi, result));
         },
         |si, oi, stock| {
             let part = part.get_or_insert_with(|| PartGrid::new(stock, &geometries[0]));
@@ -451,7 +467,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
     out.operations = operations;
     out.problems = problems;
     if out.problems.is_empty() {
-        let job = crate::post::post_job(built, mesh);
+        let job = crate::post::post_simulated(built, mesh, &results);
         let mut export: Vec<Problem> = job
             .errors
             .iter()
@@ -861,10 +877,8 @@ mod tests {
         let (check, _) = check(&doc, &mesh, &report, &plan);
         let found = stages(&check);
         assert_eq!(check.operations.len(), 8, "{found:?}");
-        assert!(
-            found.iter().all(|m| !m.contains("centre line")),
-            "{found:?}"
-        );
+        // Parallel lifts its path by its tolerance; the 0.1 mm limit holds for it too.
+        assert!(check.passed && found.is_empty(), "{found:?}");
     }
     #[test]
     fn coarse_gouges_count_every_operation_together() {
@@ -929,6 +943,154 @@ mod tests {
                 .iter()
                 .any(|m| m.starts_with("export 1/None: Pocket by planner: coolant")),
             "{found:?}"
+        );
+    }
+    /// The -Z orientation's top plane: the part's original underside.
+    fn underside(report: &PartReport) -> Vec<usize> {
+        report.orientations[1]
+            .planes
+            .iter()
+            .find(|p| p.kind == "top")
+            .unwrap()
+            .surfaces
+            .clone()
+    }
+    #[test]
+    fn in_a_later_setup_the_floor_is_the_parts_underside() {
+        let (doc, mesh, report) = block();
+        // Setup 1's Face removed the stock that the flipped setup's stock box
+        // still puts below the part.
+        let plan = |breakthrough: f32| {
+            let mut plan = good(&report);
+            let mut drill = op("Drill", 3, underside(&report));
+            drill.through = Some(true);
+            drill.hole_diameter = Some(6.6);
+            drill.breakthrough = Some(breakthrough);
+            plan.setups[1].operations.push(drill);
+            plan
+        };
+        let (refused, job) = check(&doc, &mesh, &report, &plan(3.));
+        assert!(job.is_none());
+        assert_eq!(
+            stages(&refused),
+            vec![
+                "gouge 2/Some(3): The tool goes 3.00 mm below the part's underside in this setup. Earlier setups may have removed the stock there, and the part rests on it. Reduce the depth or the breakthrough."
+            ]
+        );
+        let (flush, _) = check(&doc, &mesh, &report, &plan(0.));
+        assert!(flush.passed, "{:?}", stages(&flush));
+    }
+    #[test]
+    fn a_negative_bottom_offset_is_refused_before_generation() {
+        let (doc, mesh, report) = block();
+        let mut plan = good(&report);
+        let mut contour = op("Contour", 1, vec![]);
+        contour.bottom_offset = Some(-3.9);
+        plan.setups[1].operations.push(contour);
+        let (check, job) = check(&doc, &mesh, &report, &plan);
+        assert!(job.is_none());
+        assert_eq!(
+            stages(&check),
+            vec!["structure 2/Some(3): bottom_offset cannot be negative."]
+        );
+    }
+    fn quad(t: &mut Vec<[[f32; 3]; 3]>, p: [[f32; 3]; 4]) {
+        t.push([p[0], p[1], p[2]]);
+        t.push([p[0], p[2], p[3]]);
+    }
+    /// A 120 × 80 × 40 box whose top face lacks a `hole` × `hole` square in the
+    /// middle; closed when `hole` is 0.
+    fn holed_box(hole: f32) -> Mesh {
+        let (x, y, z) = (120f32, 80f32, 40f32);
+        let (a0, a1) = ((x - hole) / 2., (x + hole) / 2.);
+        let (b0, b1) = ((y - hole) / 2., (y + hole) / 2.);
+        let mut t = vec![];
+        if hole > 0. {
+            quad(&mut t, [[0., 0., z], [x, 0., z], [a1, b0, z], [a0, b0, z]]);
+            quad(&mut t, [[x, 0., z], [x, y, z], [a1, b1, z], [a1, b0, z]]);
+            quad(&mut t, [[x, y, z], [0., y, z], [a0, b1, z], [a1, b1, z]]);
+            quad(&mut t, [[0., y, z], [0., 0., z], [a0, b0, z], [a0, b1, z]]);
+        } else {
+            quad(&mut t, [[0., 0., z], [x, 0., z], [x, y, z], [0., y, z]]);
+        }
+        quad(&mut t, [[0., 0., 0.], [0., y, 0.], [x, y, 0.], [x, 0., 0.]]);
+        quad(&mut t, [[0., 0., 0.], [x, 0., 0.], [x, 0., z], [0., 0., z]]);
+        quad(&mut t, [[x, y, 0.], [0., y, 0.], [0., y, z], [x, y, z]]);
+        quad(&mut t, [[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
+        quad(&mut t, [[x, 0., 0.], [x, y, 0.], [x, y, z], [x, 0., z]]);
+        crate::mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn a_column_where_the_mesh_is_open_counts_as_solid() {
+        let (doc, _, _) = block();
+        let face_and_waterline = |report: &PartReport| Proposal {
+            summary: String::new(),
+            setups: vec![proposal::ProposedSetup {
+                orientation: "+Z".into(),
+                name: "Top".into(),
+                origin: "Stock top center".into(),
+                workholding: String::new(),
+                operations: vec![
+                    op(
+                        "Face",
+                        1,
+                        report.orientations[0]
+                            .planes
+                            .iter()
+                            .find(|p| p.kind == "top")
+                            .unwrap()
+                            .surfaces
+                            .clone(),
+                    ),
+                    op("Waterline", 1, vec![]),
+                ],
+            }],
+            unmachined: vec![],
+            warnings: vec![],
+        };
+        // The reviewers' case: the missing patch is under 2% of the test rays,
+        // so the report accepts the part, and the Waterline cuts into the patch.
+        let open = holed_box(12.);
+        let report = analysis::report(&doc, &open).unwrap();
+        let (check, job) = check(&doc, &open, &report, &face_and_waterline(&report));
+        let found = stages(&check);
+        assert!(!check.passed && job.is_none(), "{found:?}");
+        assert!(
+            found.iter().any(|m| m.starts_with("gouge 1/Some(2): ")),
+            "{found:?}"
+        );
+        let closed = holed_box(0.);
+        let report = analysis::report(&doc, &closed).unwrap();
+        let (check, _) = super::check(&doc, &closed, &report, &face_and_waterline(&report));
+        assert!(check.passed, "{:?}", stages(&check));
+    }
+    #[test]
+    fn the_tool_axis_allows_0_1_mm_for_every_strategy() {
+        let (doc, mesh) = crate::post::fixture::job();
+        let geometry = Geometry::new(&doc.setups[0], &mesh);
+        let index = Index::new(&geometry);
+        let b = geometry.bounds;
+        // A finishing pass along solid material beside the pocket.
+        let (x, y) = (b.max[0] - 15., (b.min[1] + b.max[1]) / 2.);
+        let pass = |depth: f32| {
+            let z = b.max[2] - depth;
+            let mut plan = crate::post::fixture::plan(
+                [x, y - 2., z + 5.],
+                &[
+                    (Motion::Feed, [x, y - 2., z], 500.),
+                    (Motion::Feed, [x, y + 2., z], 500.),
+                ],
+            );
+            plan.strategy = crate::model::Strategy::Parallel;
+            plan.stock.min[2] = b.min[2] - 3.;
+            axis_problems(&plan, &geometry, &index, 0)
+        };
+        assert!(pass(0.09).is_empty());
+        assert_eq!(
+            pass(0.2),
+            vec![
+                "The tool's centre line passes through 0.20 mm of the part at X 105.0, Y 38.0, 0.2 mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there."
+            ]
         );
     }
 }

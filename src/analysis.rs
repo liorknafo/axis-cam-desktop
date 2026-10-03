@@ -196,19 +196,23 @@ impl<'a> Index<'a> {
             .max_by(f32::total_cmp)
     }
 }
-/// Solid spans of the part along the vertical line through `xy`, lowest first:
-/// `Ok` when the crossings are consistent, `Err` with the parity fallback when not.
-pub(crate) fn column(index: &Index, xy: [f32; 2]) -> Result<Vec<(f32, f32)>, Vec<(f32, f32)>> {
-    // Crossings of the vertical ray: height, and whether the face points up.
+/// Crossings of the vertical line through `xy` with the surface, lowest
+/// first: height, and whether the face points up.
+fn crossings(index: &Index, xy: [f32; 2]) -> Vec<(f32, bool)> {
     let mut hits: Vec<(f32, bool)> = index
         .near(xy)
         .filter_map(|t| Some((cam::plane_height(&t.p, xy)?, normal(&t.p)[2] > 0.)))
         .collect();
     hits.sort_by(|a, b| a.0.total_cmp(&b.0));
     hits.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-4 && a.1 == b.1);
+    hits
+}
+/// Solid spans from `hits`, lowest first, or `None` when the face directions
+/// are inconsistent.
+fn spans(hits: &[(f32, bool)]) -> Option<Vec<(f32, f32)>> {
     let mut spans = vec![];
     let (mut depth, mut start, mut consistent) = (0i32, 0f32, true);
-    for (z, up) in &hits {
+    for (z, up) in hits {
         if !*up {
             if depth == 0 {
                 start = *z;
@@ -222,15 +226,37 @@ pub(crate) fn column(index: &Index, xy: [f32; 2]) -> Result<Vec<(f32, f32)>, Vec
             consistent &= depth >= 0;
         }
     }
-    if consistent && depth == 0 {
-        Ok(spans)
-    } else {
-        // Inconsistent face directions: fall back to crossing parity.
-        Err(hits.chunks_exact(2).map(|c| (c[0].0, c[1].0)).collect())
+    (consistent && depth == 0).then_some(spans)
+}
+/// The column at `xy` and, while it is inconsistent, at four points 0.002 mm
+/// away: `Ok` with the first consistent spans, `Err` with the lowest crossing
+/// when all five are inconsistent.
+fn retried(index: &Index, xy: [f32; 2]) -> Result<Vec<(f32, f32)>, f32> {
+    let mut lowest = f32::INFINITY;
+    for d in [
+        [0., 0.],
+        [0.002, 0.],
+        [-0.002, 0.],
+        [0., 0.002],
+        [0., -0.002],
+    ] {
+        let hits = crossings(index, [xy[0] + d[0], xy[1] + d[1]]);
+        match spans(&hits) {
+            Some(spans) => return Ok(spans),
+            None => lowest = hits.iter().map(|h| h.0).fold(lowest, f32::min),
+        }
     }
+    Err(lowest)
+}
+/// Solid spans along the vertical line through `xy`, erring towards solid: an
+/// inconsistent column is retried at four nearby offsets, and if it stays
+/// inconsistent it counts as solid from its lowest crossing up to `top`.
+pub(crate) fn solid(index: &Index, xy: [f32; 2], top: f32) -> Vec<(f32, f32)> {
+    retried(index, xy).unwrap_or_else(|lowest| vec![(lowest, top.max(lowest))])
 }
 /// Share of a 48 × 48 grid of vertical rays over the model that cross its
-/// surface inconsistently; rays that hit nothing are not counted.
+/// surface inconsistently at all five positions `retried` tries; rays that
+/// hit nothing are not counted. A model no ray hits counts as inconsistent.
 fn inconsistent_share(geometry: &Geometry) -> f32 {
     let index = Index::new(geometry);
     let b = geometry.bounds;
@@ -238,14 +264,14 @@ fn inconsistent_share(geometry: &Geometry) -> f32 {
     for i in 0..48 * 48 {
         let xy = [i % 48, i / 48].map(|n| (n as f32 + 0.5) / 48.);
         let xy = [0, 1].map(|k| b.min[k] + (b.max[k] - b.min[k]) * xy[k] + 1e-4);
-        match column(&index, xy) {
+        match retried(&index, xy) {
             Ok(spans) if spans.is_empty() => {}
             Ok(_) => hit += 1,
             Err(_) => (hit, bad) = (hit + 1, bad + 1),
         }
     }
     if hit == 0 {
-        0.
+        1.
     } else {
         bad as f32 / hit as f32
     }
@@ -741,17 +767,20 @@ mod tests {
         assert!(limited.truncated);
         assert!(plane(&limited, 0.).holes.is_empty());
     }
-    fn box_mesh(open_top: bool) -> Mesh {
+    /// A 40 × 30 × 20 box, with or without its top and bottom faces.
+    fn box_mesh(top: bool, bottom: bool) -> Mesh {
         let mut t = vec![];
         let mut quad = |p: [[f32; 3]; 4]| {
             t.push([p[0], p[1], p[2]]);
             t.push([p[0], p[2], p[3]]);
         };
         let (x, y, z) = (40., 30., 20.);
-        if !open_top {
+        if top {
             quad([[0., 0., z], [x, 0., z], [x, y, z], [0., y, z]]);
         }
-        quad([[0., 0., 0.], [0., y, 0.], [x, y, 0.], [x, 0., 0.]]);
+        if bottom {
+            quad([[0., 0., 0.], [0., y, 0.], [x, y, 0.], [x, 0., 0.]]);
+        }
         quad([[0., 0., 0.], [x, 0., 0.], [x, 0., z], [0., 0., z]]);
         quad([[x, y, 0.], [0., y, 0.], [0., y, z], [x, y, z]]);
         quad([[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
@@ -762,10 +791,14 @@ mod tests {
     fn the_part_must_be_a_closed_solid() {
         let (doc, mesh) = block();
         assert!(report(&doc, &mesh).is_ok());
-        assert!(report(&doc, &box_mesh(false)).is_ok());
         assert_eq!(
-            report(&doc, &box_mesh(true)).unwrap_err(),
-            "The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model."
+            inconsistent_share(&Geometry::new(&doc.setups[0], &mesh)),
+            0.
         );
+        assert!(report(&doc, &box_mesh(true, true)).is_ok());
+        let open = "The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model.";
+        assert_eq!(report(&doc, &box_mesh(false, true)).unwrap_err(), open);
+        // Walls alone: no test ray crosses the part at all.
+        assert_eq!(report(&doc, &box_mesh(false, false)).unwrap_err(), open);
     }
 }

@@ -807,20 +807,39 @@ pub(crate) fn prepare(
     }
     Ok(out)
 }
-pub fn post_job(doc: &Document, mesh: &Mesh) -> JobPost {
+/// Why a job cannot be posted at all, before anything is simulated.
+fn unpostable(doc: &Document) -> Option<JobPost> {
     if doc.file.is_none() {
-        return JobPost::blocked(
+        return Some(JobPost::blocked(
             "Import a part before posting. The example project's paths are illustrative and cannot be machined.",
-        );
+        ));
     }
     if doc.setups.is_empty() {
-        return JobPost::blocked("Create a machining setup.");
+        return Some(JobPost::blocked("Create a machining setup."));
+    }
+    None
+}
+pub fn post_job(doc: &Document, mesh: &Mesh) -> JobPost {
+    if let Some(blocked) = unpostable(doc) {
+        return blocked;
     }
     let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> = vec![vec![]; doc.setups.len()];
     crate::simulation::sequence(doc, mesh, None, |si, oi, r| results[si].push((oi, r)));
+    post_simulated(doc, mesh, &results)
+}
+/// `post_job` for simulations that have already been run, one list per setup.
+pub(crate) fn post_simulated(
+    doc: &Document,
+    mesh: &Mesh,
+    results: &[Vec<(usize, Result<Simulation, String>)>],
+) -> JobPost {
+    if let Some(blocked) = unpostable(doc) {
+        return blocked;
+    }
     let setups = (0..doc.setups.len())
         .map(|si| {
-            let result = prepare(doc, mesh, si, &results[si]).and_then(|parts| {
+            let sims = results.get(si).map_or(&[][..], Vec::as_slice);
+            let result = prepare(doc, mesh, si, sims).and_then(|parts| {
                 parts
                     .into_iter()
                     .map(|p| {
@@ -1724,5 +1743,30 @@ M2
         .unwrap();
         assert!(message.starts_with("Wrote 1 LinuxCNC program"));
         assert!(out.join("Fixture block - 1 Top (G54).ngc").exists());
+    }
+    #[test]
+    fn posting_simulations_already_run_matches_post_job() {
+        let (doc, mesh) = fixture::job();
+        let direct = post_job(&doc, &mesh);
+        let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> =
+            vec![vec![]; doc.setups.len()];
+        crate::simulation::sequence(&doc, &mesh, None, |si, oi, r| results[si].push((oi, r)));
+        let split = post_simulated(&doc, &mesh, &results);
+        let texts = |job: &JobPost| -> Vec<Result<Vec<String>, Vec<String>>> {
+            job.setups
+                .iter()
+                .map(|s| {
+                    s.result
+                        .as_ref()
+                        .map(|p| p.iter().map(|p| p.text.clone()).collect())
+                        .map_err(Clone::clone)
+                })
+                .collect()
+        };
+        assert!(direct.ready());
+        assert_eq!(split.ready(), direct.ready());
+        assert_eq!(split.errors, direct.errors);
+        assert_eq!(texts(&split), texts(&direct));
+        assert!(texts(&direct)[0].as_ref().unwrap()[0].contains("G54"));
     }
 }
