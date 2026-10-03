@@ -843,6 +843,8 @@ The AI planner page has a **ChatGPT account** panel. **Continue with ChatGPT** o
 - **Check connection** sends one tiny request to the selected model. **Sign out** deletes the saved sign-in and asks OpenAI to revoke it.
 - After rebuilding the app from source, macOS may ask once to allow the new build to read its Keychain item.
 
+If you sign in without allowing plan usage, the panel says so; sign out and sign in again to allow it.
+
 In this version the account panel is the only part that talks to OpenAI. The planner below it is still the local example.
 ```
 
@@ -886,7 +888,7 @@ Expected: no matches (UI code never touches tokens).
 
 - [ ] **Step 5: VALIDATION**
 
-Update the test count in `docs/VALIDATION.md` to the Step 4 result and the smoke count to 79 static screens plus 24 motion samples (also in README's smoke sentence: `seventy-nine screens`). Add:
+Update the test count in `docs/VALIDATION.md` to the Step 4 result and the smoke count to 80 static screens plus 24 motion samples (also in README's smoke sentence: `eighty screens`). Add:
 
 ```markdown
 ## Sign in with ChatGPT
