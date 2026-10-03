@@ -5,9 +5,18 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 ## Automated checks
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **153 passed, 0 failed** (20.87 seconds in the final full run).
+- `cargo test --locked`: **247 passed, 0 failed, 1 ignored** (23.62 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
 - Release build and renderer smoke: passed on Apple Silicon macOS 26.5.2, Rust 1.97.1.
-- Renderer smoke completed **77 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
+- Renderer smoke completed **80 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
+
+## Sign in with ChatGPT
+
+- Verified against a loopback stand-in for OpenAI's servers; no test contacts OpenAI or the Keychain.
+- First sign-in registers the app, exchanges the code with PKCE and validates the ID token (RS256 signature, issuer, audience, expiry, nonce). Wrong state, denial, timeout and each invalid token are refused.
+- Tokens refresh before expiry and once after a 401, one refresh at a time, saved before use; fatal refresh errors and sign-out clear the saved sign-in.
+- Streamed replies require completion; failures, refusals, early ends and each plan-usage error map to a clear state. Unsupported structured output falls back to plain JSON once.
+- Tokens never appear in settings, Debug output or UI code.
+- Live check with the user's account (3 October 2026): the first attempt was rejected because the installation ID was not in `urn:uuid:` form. After matching OpenAI's reference kit (ID format, `/auth/callback`, client ID and `azp` checks), registration and browser approval succeeded.
 
 ## LinuxCNC post
 

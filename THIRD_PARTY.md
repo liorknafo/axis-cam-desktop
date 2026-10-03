@@ -18,3 +18,7 @@ The CAD helper's source is `native/step_preview.cpp`. Rebuild it and the app wit
 Format implementation references: [3MF core specification](https://github.com/3MFConsortium/spec_core), [3MF Production extension](https://github.com/3MFConsortium/spec_production), and [Open CASCADE](https://dev.opencascade.org/).
 
 Stock surface meshing uses unmodified Fidget, fidget-core and fidget-mesh 0.4.3 under MPL-2.0. Their corresponding source is available at [Fidget v0.4.3](https://github.com/mkeeter/fidget/tree/v0.4.3), or the crates.io archives for those exact locked versions. Rebuild with Cargo to replace these libraries. The license and source notice are distributed in `licenses/fidget-MPL-2.0.txt` and `licenses/fidget-NOTICE.txt`, and copied to the app's `Contents/Resources/Licenses` directory.
+
+HTTPS and token validation use rustls, reqwest and jsonwebtoken with the AWS-LC cryptographic library (aws-lc-rs, aws-lc-sys), statically linked. AWS-LC is distributed under the ISC, Apache-2.0 and OpenSSL licenses; its license text is in `licenses/aws-lc-LICENSE.txt` and is copied to the app's `Contents/Resources/Licenses` directory. Keychain access uses security-framework (MIT or Apache-2.0).
+
+"ChatGPT" and "OpenAI" are trademarks of OpenAI. This app signs in with ChatGPT through OpenAI's documented flow for locally run apps; it is not affiliated with or endorsed by OpenAI and bundles no OpenAI logos.

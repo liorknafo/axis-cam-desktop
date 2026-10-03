@@ -2,7 +2,7 @@
 
 A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.14. It carries the web prototype's Manufacture-style layout into a native application, with local persistence, editable operation parameters and a 3D model viewport. There is no embedded browser.
 
-**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Fixture, clamp and machine-body collisions are not checked, and production CAM remains pending. The example project's other paths and its planner are demonstrations. OpenAI is not connected, as requested for the prototype phase.
+**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Fixture, clamp and machine-body collisions are not checked, and production CAM remains pending. The example project's other paths and its planner are demonstrations. The AI planner page can sign in with a ChatGPT account, but the planner itself is not yet connected to OpenAI.
 
 ![Native workspace](docs/workspace.png)
 
@@ -17,7 +17,7 @@ brew install opencascade
 cargo run --release --locked
 ```
 
-The build was tested with Rust 1.97.1 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. Set `OCCT_PREFIX` to a custom installation prefix if needed. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script requires it. Windows and Linux builds have not been verified and may need platform-specific helper build/link changes.
+The build was tested with Rust 1.97.1 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. The HTTPS client builds aws-lc, which needs a C compiler and CMake. Set `OCCT_PREFIX` to a custom installation prefix if needed. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script requires it. Windows and Linux builds have not been verified and may need platform-specific helper build/link changes.
 
 Create a macOS bundle:
 
@@ -253,6 +253,21 @@ Open **NC program**. Checks run in the background for every setup: generation, c
 - Not checked: fixtures, clamps and the machine body. LinuxCNC's own soft limits check absolute position. Preview each program in LinuxCNC and air-cut first.
 - Headless: `axis-cam --export-gcode <project.json> <folder>` runs the same checks and writes the same files.
 
+## Sign in with ChatGPT
+
+The AI planner page has a **ChatGPT account** panel. **Continue with ChatGPT** opens your browser; after you approve, the app can send planning requests on your ChatGPT plan. No API key is used.
+
+- OpenAI shares your name, email and profile picture with the app. The app cannot read your ChatGPT conversations.
+- The app registers itself with OpenAI on the first sign-in. It identifies this installation by a random ID in `settings.json`; the ID says nothing about you.
+- Requests count against your ChatGPT plan, up to a weekly per-app cap you set at [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage). The panel's **Manage usage** opens that page.
+- The sign-in is stored in the macOS Keychain (item `AXIS CAM Studio`). It is never written to project files. Non-secret settings (the chosen model, this installation's ID) are in `settings.json` beside the workspace file. On other platforms the sign-in is an owner-only file in the same folder; those platforms are unverified.
+- **Check connection** sends one tiny request to the selected model. **Sign out** deletes the saved sign-in and asks OpenAI to revoke it.
+- After rebuilding the app from source, macOS may ask once to allow the new build to read its Keychain item.
+
+If you sign in without allowing plan usage, the panel says so; sign out and sign in again to allow it.
+
+In this version the account panel is the only part that talks to OpenAI. The planner below it is still the local example.
+
 ## Persistence
 
 On macOS, automatic state lives at:
@@ -265,7 +280,7 @@ Other platforms use the OS local application data directory. Writes use a tempor
 
 Older project files without an explicit sample-model flag retain their sample housing when they contain setups and no imported file. Newly saved blank projects stay blank after reopening.
 
-Projects contain the **source file path and metadata**, not an embedded copy of the imported mesh. Keep the original mesh file accessible when reopening a project. No API keys are stored, no API requests are made, and the app has no telemetry.
+Projects contain the **source file path and metadata**, not an embedded copy of the imported mesh. Keep the original mesh file accessible when reopening a project. No API keys are stored and the app has no telemetry. The only network requests are those of the ChatGPT account panel (see above).
 
 The `examples` directory includes a sample AXIS project, an OBJ cube, matching four-setup STEP and 3MF parts, an inch-unit STEP block and a placed/rotated STEP assembly.
 
@@ -279,7 +294,7 @@ cargo run --locked -- --smoke-test ./smoke-output
 cargo run --release --locked -- --smoke-test ./help-output --help-only
 ```
 
-The explicit smoke-test mode uses an isolated workspace, exercises seventy-seven screens plus twenty-four camera-motion samples through Iced's renderer and closes itself. The motion samples check that the model remains present across orbit, pan and zoom changes, with stock both shown and hidden. It does not modify the normal workspace. Simulation tests verify continuous motion, parameter-derived spacing/depth/time, stock removal against known volume, rapid moves removing nothing, swept cutter footprint, rewind/incremental consistency, rotated setups, rejected configurations the Play/pause/replay/invalidation lifecycle, both-way continuation at odd/even row counts and varied angles, one-way returns, reduced return time, unchanged final stock, and saved/legacy direction preferences. Imported Facing checks cover real visible-surface picking after setup transforms, planar grouping, selection persistence, replacement and stale-mesh handling, and sample isolation. Unit tests also cover complete tile pixel/gutter preservation below the upload threshold, stable orbit scale, blank startup and project recovery, the first import/machine/setup/tool flow, removal of the last setup, independent stock offsets, rotated and translated stock, stock transparency and occlusion, legacy stock migration, configuration validation, snapshots and dependencies, AI apply/undo, preview invalidation, import parsers, persistence, picking and the LinuxCNC program page (blocked and ready).
+The explicit smoke-test mode uses an isolated workspace, exercises eighty screens plus twenty-four camera-motion samples through Iced's renderer and closes itself. The motion samples check that the model remains present across orbit, pan and zoom changes, with stock both shown and hidden. It does not modify the normal workspace. Simulation tests verify continuous motion, parameter-derived spacing/depth/time, stock removal against known volume, rapid moves removing nothing, swept cutter footprint, rewind/incremental consistency, rotated setups, rejected configurations the Play/pause/replay/invalidation lifecycle, both-way continuation at odd/even row counts and varied angles, one-way returns, reduced return time, unchanged final stock, and saved/legacy direction preferences. Imported Facing checks cover real visible-surface picking after setup transforms, planar grouping, selection persistence, replacement and stale-mesh handling, and sample isolation. Unit tests also cover complete tile pixel/gutter preservation below the upload threshold, stable orbit scale, blank startup and project recovery, the first import/machine/setup/tool flow, removal of the last setup, independent stock offsets, rotated and translated stock, stock transparency and occlusion, legacy stock migration, configuration validation, snapshots and dependencies, AI apply/undo, preview invalidation, import parsers, persistence, picking and the LinuxCNC program page (blocked and ready).
 
 ## Code map
 
@@ -301,6 +316,11 @@ The explicit smoke-test mode uses an isolated workspace, exercises seventy-seven
 - `src/volume.rs`: persistent cutter history, setup-frame transforms and approximate removal-volume grid.
 - `src/stock_surface.rs`: continuous cutter implicit fields, adaptive octree meshing and detail levels.
 - `src/stock.rs`: part placement, six-sided stock offsets, resolved bounds and stock report text.
+- `src/oauth.rs`: Sign in with ChatGPT: PKCE, loopback redirect, ID token validation, refresh, revoke.
+- `src/session.rs`: session and its Keychain or file store.
+- `src/settings.rs`: non-secret app settings.
+- `src/openai.rs`: Responses API client on the ChatGPT plan.
+- `src/fake_openai.rs`: test-only loopback stand-in for OpenAI.
 - `src/smoke.rs`: renderer smoke workflow and application action tests.
 - `assets/op-*.svg`: the eleven original operation icons from the web prototype.
 
