@@ -8,6 +8,7 @@ mod mesh;
 mod model;
 mod ngc;
 mod oauth;
+mod openai;
 mod pocket;
 mod post;
 mod post_check;
