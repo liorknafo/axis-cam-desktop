@@ -10,6 +10,7 @@ mod model;
 mod ngc;
 mod oauth;
 mod openai;
+mod plan_check;
 mod pocket;
 mod post;
 mod post_check;
@@ -2131,6 +2132,57 @@ fn sanitize_name(s: &str) -> String {
         n
     }
 }
+/// A saved project and its imported part, ready for planning.
+fn planning_project(project: &str) -> Result<(Document, mesh::Mesh), String> {
+    let mut doc = storage::load(std::path::Path::new(project))?;
+    doc.sync_stock_sources();
+    let file = doc
+        .file
+        .clone()
+        .ok_or("The project has no imported part.")?;
+    let mesh = mesh::load(std::path::Path::new(&file.path))?;
+    if let Some(unmet) = analysis::preconditions(&doc, Some(&mesh))
+        .into_iter()
+        .find(|p| !p.ok)
+    {
+        return Err(format!("{}: {}", unmet.label, unmet.hint));
+    }
+    Ok((doc, mesh))
+}
+/// The part report the planner sends to the model, as JSON.
+fn part_report(project: Option<&String>) -> Result<String, String> {
+    let project = project.ok_or("Usage: axis-cam --part-report <project.json>")?;
+    let (doc, mesh) = planning_project(project)?;
+    serde_json::to_string_pretty(&analysis::report(&doc, &mesh)?).map_err(|e| e.to_string())
+}
+/// Checks a proposal file against a saved project with every planner check.
+/// Prints the report as JSON; `Err` when the plan does not pass.
+fn check_plan(project: Option<&String>, proposal: Option<&String>) -> Result<String, String> {
+    let (Some(project), Some(proposal)) = (project, proposal) else {
+        return Err("Usage: axis-cam --check-plan <project.json> <proposal.json>".into());
+    };
+    let (doc, mesh) = planning_project(project)?;
+    let report = analysis::report(&doc, &mesh)?;
+    let text = std::fs::read_to_string(proposal).map_err(|e| format!("{proposal}: {e}"))?;
+    let proposal = proposal::parse(&text)?;
+    let (check, _) = plan_check::check(&doc, &mesh, &report, &proposal);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?
+    );
+    if check.passed {
+        Ok(format!(
+            "The plan passes every check: {} operations, {} min.",
+            check.operations.len(),
+            check.total_minutes
+        ))
+    } else {
+        Err(format!(
+            "The plan does not pass: {} problem(s).",
+            check.problems.len()
+        ))
+    }
+}
 /// Headless export of a saved project with the same checks and files as the UI.
 fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<String, String> {
     let (Some(project), Some(folder)) = (project, folder) else {
@@ -2165,8 +2217,17 @@ fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<Str
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--export-gcode") {
-        match export_gcode(args.get(2), args.get(3)) {
+    let command = match args.get(1).map(String::as_str) {
+        Some("--export-gcode") => Some(export_gcode(args.get(2), args.get(3))),
+        Some("--check-plan") => Some(check_plan(args.get(2), args.get(3))),
+        Some("--part-report") => Some(part_report(args.get(2))),
+        Some("--proposal-schema") => {
+            Some(serde_json::to_string_pretty(&proposal::schema()).map_err(|e| e.to_string()))
+        }
+        _ => None,
+    };
+    if let Some(result) = command {
+        match result {
             Ok(message) => {
                 println!("{message}");
                 std::process::exit(0)

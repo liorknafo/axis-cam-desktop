@@ -621,7 +621,17 @@ pub fn sequence(
     doc: &crate::model::Document,
     mesh: &Mesh,
     stop: Option<(usize, usize)>,
+    visit: impl FnMut(usize, usize, Result<Simulation, String>),
+) {
+    sequence_with(doc, mesh, stop, visit, |_, _, _| {})
+}
+/// `sequence`, also reporting the stock left after each completed operation.
+pub fn sequence_with(
+    doc: &crate::model::Document,
+    mesh: &Mesh,
+    stop: Option<(usize, usize)>,
     mut visit: impl FnMut(usize, usize, Result<Simulation, String>),
+    mut after: impl FnMut(usize, usize, &crate::volume::Volume),
 ) {
     use crate::volume::{Frame, Volume};
     let mut volume: Option<Volume> = None;
@@ -680,6 +690,9 @@ pub fn sequence(
                 Ok(sim) if stop != Some((si, oi)) => {
                     let mut finished = sim.clone();
                     finished.seek(1.);
+                    if let Some(v) = &finished.volume {
+                        after(si, oi, v);
+                    }
                     volume = finished.volume;
                     grid = Some((frame, finished.stock));
                     preceding += 1;
