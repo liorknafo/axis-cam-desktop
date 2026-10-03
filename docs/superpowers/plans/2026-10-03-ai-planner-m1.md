@@ -266,6 +266,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
         let _ = a.update(Message::SignOut);
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Signed out.");
+        // Signing in again waits until the old sign-in has been deleted.
+        assert!(a.account_busy);
+        let _ = a.update(Message::SignIn);
+        assert_eq!(a.account, crate::Account::SignedOut);
+        let failed = "Signed out on this computer. Could not reach OpenAI.".to_string();
+        let _ = a.update(Message::SignedOut(Err(failed.clone())));
+        assert!(!a.account_busy);
+        assert_eq!(a.account_note, failed);
+        let _ = a.update(Message::SignIn);
+        assert_eq!(a.account, crate::Account::SigningIn);
     }
     #[test]
     fn the_saved_session_is_adopted_when_the_planner_page_restores_it() {
@@ -448,7 +458,7 @@ Add these arms to `update` next to `Message::GcodeExported(..)`:
             Message::AccountRestored(Ok(None)) => {}
             Message::AccountRestored(Err(e)) => self.account_note = e,
             Message::SignIn => {
-                if self.account == Account::SigningIn {
+                if self.account == Account::SigningIn || self.account_busy {
                     return Task::none();
                 }
                 self.account = Account::SigningIn;
@@ -456,7 +466,7 @@ Add these arms to `update` next to `Message::GcodeExported(..)`:
                 let (endpoints, settings) = (self.endpoints.clone(), self.settings.clone());
                 let (task, handle) = Task::perform(
                     async move {
-                        let http = reqwest::Client::new();
+                        let http = oauth::http_client(Duration::from_secs(60));
                         let limit = Duration::from_secs(300);
                         oauth::sign_in(&http, &endpoints, &settings, None, limit, oauth::open_browser)
                             .await
@@ -538,7 +548,9 @@ Add these arms to `update` next to `Message::GcodeExported(..)`:
             Message::SignOut => {
                 let client = self.client.take();
                 self.account = Account::SignedOut;
-                self.account_busy = false;
+                // Sign-in stays disabled until the old sign-in is deleted, so
+                // a late delete cannot remove a newer one.
+                self.account_busy = client.is_some();
                 self.usage_limit = false;
                 self.models.clear();
                 self.account_note = "Signed out.".into();
@@ -549,9 +561,10 @@ Add these arms to `update` next to `Message::GcodeExported(..)`:
                     );
                 }
             }
-            Message::SignedOut(Ok(())) => {}
+            Message::SignedOut(Ok(())) => self.account_busy = false,
             Message::SignedOut(Err(e)) => {
-                self.account_note = format!("Signed out on this computer. {e}")
+                self.account_busy = false;
+                self.account_note = e;
             }
             Message::PlanNoticeDismissed => {
                 self.settings.plan_notice_shown = true;
@@ -567,7 +580,7 @@ Add these arms to `update` next to `Message::GcodeExported(..)`:
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --locked --quiet 2>&1 | tail -3`
-Expected: `189 passed; 0 failed; 1 ignored`.
+Expected: 4 more tests than before this task pass (the Tasks 1–3 review added tests, so use the current total: run the suite before starting and add 4); `0 failed; 1 ignored`.
 
 - [ ] **Step 5: Commit**
 
@@ -639,6 +652,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
     let manage = || Message::OpenUrl(crate::openai::USAGE_URL);
     let mut c = column![bold("ChatGPT account", 18)].spacing(12);
     match &app.account {
+        Account::SignedOut if app.account_busy => c = c.push(muted("Signing out…")),
         Account::SignedOut => {
             c = c
                 .push(muted("Sign in to plan with your ChatGPT plan. AXIS CAM Studio receives your name, email and profile picture. Planning requests count against your ChatGPT plan."))
@@ -764,7 +778,7 @@ cargo run --release --locked -- --smoke-test '/Users/liorknafo/Documents/Codex/2
 ls '/Users/liorknafo/Documents/Codex/2026-09-21/i-x20/work/account-smoke' | grep -c png
 ```
 
-Expected: `190 passed; 0 failed; 1 ignored`; the smoke exits 0 with `103` PNGs. Open `08-ai.png` (signed out: the Continue with ChatGPT button), `78-chatgpt-notice.png` and `79-chatgpt-signed-in.png` with the Read tool and confirm the text is readable and nothing overlaps. Describe each in the report. The smoke run uses its own folder and never signs in.
+Expected: one more test than before this task; `0 failed; 1 ignored`; the smoke exits 0 with `103` PNGs. Open `08-ai.png` (signed out: the Continue with ChatGPT button), `78-chatgpt-notice.png` and `79-chatgpt-signed-in.png` with the Read tool and confirm the text is readable and nothing overlaps. Describe each in the report. The smoke run uses its own folder and never signs in.
 
 - [ ] **Step 6: Commit**
 
@@ -831,7 +845,7 @@ git rm -r -q docs/superpowers/plans/2026-10-03-ai-planner-m1
 cargo fmt --check && cargo test --locked --quiet 2>&1 | tail -2 && cargo build --release --locked 2>&1 | grep -E "^warning: unused|never used|never read|never constructed|Finished"
 ```
 
-Expected: no fmt output; `190 passed; 0 failed; 1 ignored`; `Finished` with no dead-code warnings (the only warning allowed is the existing `block v0.1.6` future-compatibility note). If a new item is unused, report it; do not add `#[allow]`.
+Expected: no fmt output; the same total as after Task 5 with `0 failed; 1 ignored`; `Finished` with no dead-code warnings (the only warning allowed is the existing `block v0.1.6` future-compatibility note). If a new item is unused, report it; do not add `#[allow]`.
 
 ```bash
 grep -rn "access_token\|refresh_token" src/ui.rs src/help.rs src/smoke.rs | grep -v "^src/smoke.rs.*sample" | head
