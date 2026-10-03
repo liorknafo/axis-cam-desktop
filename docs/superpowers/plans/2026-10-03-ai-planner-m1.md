@@ -595,10 +595,31 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task 5: Account panel, help and smoke screens
 
 **Files:**
-- Modify: `src/ui.rs` (`ai` page, new `account_panel`), `src/help.rs` (`command`), `src/smoke.rs` (names 101–102, steps 101–102)
+- Modify: `src/ui.rs` (`ai` page, new `account_panel`), `src/help.rs` (`command`), `src/smoke.rs` (names 101–102, steps 101–102, tests), `src/main.rs` (two guards carried over from the Task 4 review, `saving_sign_in`)
 
 **Interfaces:**
 - Consumes: `App { account, settings, models, account_note, account_busy, sign_out_pending, usage_limit }`, the Task 4 messages (including `LoadModels`, added in the Task 4 review), `openai::USAGE_URL`.
+
+- [ ] **Step 0: Close the save-step window (carried over from the Task 4 review)**
+
+Sign-in has two steps: the abortable browser step (`account == SigningIn` with a sign-in handle) and the save step (`account == SigningIn` with no handle). Two messages are still accepted during the save step and must not be. Test-first, in `src/smoke.rs` `mod tests` (use the existing helpers that deliver `SignedIn(Ok(..))` to enter the save step):
+
+- `SignOut` during the save step returns no task and changes nothing; a following `SessionSaved(Ok(..))` signs in as usual.
+- `SignedIn(Ok(..))` during the save step is treated like any late result: it returns one task (the best-effort revoke) and changes nothing (the client ID in settings stays the first one); the first save's `SessionSaved(Ok(..))` still signs in. `SignedIn(Err(..))` during the save step changes nothing.
+
+Then in `src/main.rs`:
+
+```rust
+    /// The second sign-in step: the browser part is done and the session is being saved.
+    pub fn saving_sign_in(&self) -> bool {
+        self.account == Account::SigningIn && self.sign_in.is_none()
+    }
+```
+
+- At the top of the `Message::SignOut` arm: `if self.saving_sign_in() { return Task::none(); }`.
+- The `Message::SignedIn(..)` arms accept a result only in the browser step (`self.account == Account::SigningIn && self.sign_in.is_some()`); in every other state `Ok` is revoked as a late result and `Err` is ignored. Existing tests that enter the save step by sending `SignedIn(Ok(..))` right after `SignIn` keep working, because `SignIn` sets the handle.
+
+Run: `cargo test --locked --quiet 2>&1 | tail -3` and note the total (2 more than before this task).
 
 - [ ] **Step 1: Write the failing test** (append inside `mod tests` in `src/help.rs`; if the file has no test module, add `#[cfg(test)] mod tests { use super::*; … }` at the end)
 
@@ -661,6 +682,9 @@ fn account_panel(app: &App) -> Element<'_, Message> {
             c = c
                 .push(muted("Sign in to plan with your ChatGPT plan. AXIS CAM Studio receives your name, email and profile picture. Planning requests count against your ChatGPT plan."))
                 .push(primary("Continue with ChatGPT", Message::SignIn).width(Fill));
+        }
+        Account::SigningIn if app.saving_sign_in() => {
+            c = c.push(muted("Finishing sign-in…"));
         }
         Account::SigningIn => {
             c = c
@@ -785,12 +809,12 @@ cargo run --release --locked -- --smoke-test '/Users/liorknafo/Documents/Codex/2
 ls '/Users/liorknafo/Documents/Codex/2026-09-21/i-x20/work/account-smoke' | grep -c png
 ```
 
-Expected: one more test than before this task; `0 failed; 1 ignored`; the smoke exits 0 with `103` PNGs. Open `08-ai.png` (signed out: the Continue with ChatGPT button), `78-chatgpt-notice.png` and `79-chatgpt-signed-in.png` with the Read tool and confirm the text is readable and nothing overlaps. Describe each in the report. The smoke run uses its own folder and never signs in.
+Expected: three more tests than before this task (two from Step 0, one help test); `0 failed; 1 ignored`; the smoke exits 0 with `103` PNGs. Open `08-ai.png` (signed out: the Continue with ChatGPT button), `78-chatgpt-notice.png` and `79-chatgpt-signed-in.png` with the Read tool and confirm the text is readable and nothing overlaps. Describe each in the report. The smoke run uses its own folder and never signs in.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt && git add src/ui.rs src/help.rs src/smoke.rs && git commit -q -m "ChatGPT account panel on the planner page
+cargo fmt && git add src/ui.rs src/help.rs src/smoke.rs src/main.rs && git commit -q -m "ChatGPT account panel on the planner page
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
