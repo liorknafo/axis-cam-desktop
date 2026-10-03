@@ -5,7 +5,7 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 ## Automated checks
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **295 passed, 0 failed, 1 ignored** (29.6 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
+- `cargo test --locked`: **303 passed, 0 failed, 1 ignored** (23.9 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
 - Release build and renderer smoke: passed on Apple Silicon macOS 26.5.2, Rust 1.97.1.
 - Renderer smoke completed **80 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
 
@@ -36,7 +36,10 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 - Job building: setup 1 keeps its name and work zero (the plan's are ignored), fixture and stock; later setups share its machine, get the next free work offset (G55) and the orientation's rotation, and inherit stock. The option combinations the generators require are fixed by the app, surface IDs are deduplicated, and control and format characters are removed from names and notes.
 - Reference problems (an unknown tool, a wrong tool type, surfaces from another orientation or plane, a cutter that does not fit a floor, speed and feed limits, too many operations, a drill marked as going through a blind hole, an oversized breakthrough) are each reported with their place: the setup and operation where one applies, the setup or the whole plan otherwise.
 - A hand-written two-setup plan passes all stages with its six operations timed, and a built job survives saving and reopening. A reference problem stops before generation, a job the app cannot save stops at structure, and a generation failure and an export refusal are each reported at their own stage. A failing plan returns no job.
-- Tool axis: a Ø1 mm drill sent 25 mm past the bottom of the Ø6 × 8 mm blind hole is refused with its setup and operation, and the same case is refused in a second setup without flagging the first. A Ø4 mm drill with a 15 mm breakthrough, which goes 12 mm below the stock, is refused too. The good plan and a plan with Parallel and Waterline finishing added raise no tool axis problem.
+- Tool axis: a Ø1 mm drill sent 25 mm past the bottom of the Ø6 × 8 mm blind hole is refused with its setup and operation, and the same case is refused in a second setup without flagging the first. A Ø4 mm drill with a 15 mm breakthrough, which goes 12 mm below the stock, is refused too. The good plan and a plan with Parallel and Waterline finishing added raise no problem; the 0.1 mm limit is the same for every strategy.
+- Later setups: in the flipped setup, a Ø4 mm drill through the Ø6.6 holes with a 3 mm breakthrough is refused for going 3 mm below the part's underside, although the flipped stock box reaches 4 mm lower (setup 1's Face removed that stock); with no breakthrough the plan passes.
+- Open meshes: a 120 × 80 × 40 mm box whose top lacks a 12 × 12 mm patch (under 2% of the test rays, so the report accepts it) is refused at the gouge stage when a Waterline cuts 38 mm into the patch, by both the tool axis and the coarse check; the closed box passes. The example block has no inconsistent ray, and a mesh no test ray hits is refused as not closed.
+- Proposal numbers: a negative `bottom_offset` (an outside Contour 3.9 mm below the model in the flipped setup) is refused at the structure stage, as are negative allowances and numbers that are not finite (a JSON 1e39).
 - Coarse gouge: a synthetic cut into the part (a 10 mm cutter plunged 8 mm into solid material beside the pocket) is detected, and the good plan removes no cell well inside the part. The rule that flags an operation counts removed cells cumulatively over all operations and needs three in total.
 - Coverage: the exposed share rises as operations are added, planes the report lists are not counted again among the sides, and leftover stock is split into above, around, inside the part's bounding box and below. The finished good plan leaves none above or below.
 
