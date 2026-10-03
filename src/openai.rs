@@ -36,6 +36,7 @@ impl ApiError {
         }
     }
 }
+/// `status` is 0 for an `error` or `response.failed` event in a stream.
 fn api_error(status: u16, body: &Value) -> ApiError {
     let error = &body["error"];
     let code = error["code"]
@@ -55,6 +56,9 @@ fn api_error(status: u16, body: &Value) -> ApiError {
         }
         _ if status == 401 => {
             ApiError::SignedOut("Your ChatGPT sign-in was rejected. Sign in again.".into())
+        }
+        _ if message.is_empty() && status == 0 => {
+            ApiError::Other("OpenAI reported an error.".into())
         }
         _ if message.is_empty() => ApiError::Other(format!("OpenAI returned HTTP {status}.")),
         _ => ApiError::Other(message),
@@ -111,26 +115,61 @@ pub struct Reply {
     /// Whether the API enforced the schema.
     pub structured: bool,
 }
+/// The most the parser buffers while waiting for an event to end.
+const MAX_SSE_BUFFER: usize = 16 * 1024 * 1024;
+/// The JSON of one event's `data:` lines, if any.
+fn sse_event(block: &[u8]) -> Option<Value> {
+    let data: Vec<&str> = std::str::from_utf8(block)
+        .unwrap_or("")
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect();
+    serde_json::from_str(&data.join("\n")).ok()
+}
 /// Splits a server-sent-event byte stream into the JSON of each `data:` event.
 #[derive(Default)]
-pub struct SseParser(Vec<u8>);
+pub struct SseParser {
+    buffer: Vec<u8>,
+    /// How much of `buffer` has already been searched for an event end.
+    scanned: usize,
+    too_large: bool,
+}
 impl SseParser {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Value> {
-        self.0.extend(chunk.iter().filter(|b| **b != b'\r'));
-        let mut events = vec![];
-        while let Some(end) = self.0.windows(2).position(|w| w == b"\n\n") {
-            let block: Vec<u8> = self.0.drain(..end + 2).collect();
-            let data: Vec<&str> = std::str::from_utf8(&block)
-                .unwrap_or("")
-                .lines()
-                .filter_map(|l| l.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect();
-            if let Ok(value) = serde_json::from_str::<Value>(&data.join("\n")) {
-                events.push(value);
-            }
+        if self.too_large {
+            return vec![];
         }
+        self.buffer.extend(chunk.iter().filter(|b| **b != b'\r'));
+        if self.buffer.len() > MAX_SSE_BUFFER {
+            self.too_large = true;
+            self.buffer = Vec::new();
+            self.scanned = 0;
+            return vec![];
+        }
+        let mut events = vec![];
+        let mut start = 0;
+        // Only new bytes are searched; the last scanned byte is searched again
+        // because a blank line can straddle two chunks.
+        let mut from = self.scanned.saturating_sub(1);
+        while let Some(i) = self.buffer[from..].windows(2).position(|w| w == b"\n\n") {
+            let end = from + i + 2;
+            events.extend(sse_event(&self.buffer[start..end]));
+            start = end;
+            from = end;
+        }
+        self.buffer.drain(..start);
+        self.scanned = self.buffer.len();
         events
+    }
+    /// The last event when the stream ended without its blank line. `Err`
+    /// once the reply has outgrown the buffer.
+    pub fn finish(&mut self) -> Result<Option<Value>, ApiError> {
+        if self.too_large {
+            return Err(ApiError::Other("The reply was too large.".into()));
+        }
+        self.scanned = 0;
+        Ok(sse_event(&std::mem::take(&mut self.buffer)))
     }
 }
 /// Folds response events into the reply text or the first error.
@@ -200,12 +239,29 @@ impl Accumulator {
         Ok(self.text)
     }
 }
+/// Runs a store call on the blocking pool: the Keychain can wait on a prompt.
+async fn off_executor(
+    store: &Arc<dyn SessionStore>,
+    call: impl FnOnce(&dyn SessionStore) -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || call(store.as_ref()))
+        .await
+        .unwrap_or_else(|_| Err("the session store stopped unexpectedly".into()))
+}
+async fn store_save(store: &Arc<dyn SessionStore>, session: &Session) -> Result<(), String> {
+    let session = session.clone();
+    off_executor(store, move |store| store.save(&session)).await
+}
+async fn store_clear(store: &Arc<dyn SessionStore>) -> Result<(), String> {
+    off_executor(store, |store| store.clear()).await
+}
 pub struct Client {
     http: reqwest::Client,
     endpoints: Endpoints,
     client_id: String,
     store: Arc<dyn SessionStore>,
-    session: tokio::sync::Mutex<Option<Session>>,
+    session: Arc<tokio::sync::Mutex<Option<Session>>>,
     /// Base delay between retries.
     backoff: Duration,
 }
@@ -217,55 +273,71 @@ impl Client {
         session: Session,
     ) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_secs(300))
-                .build()
-                .expect("HTTP client"),
+            http: oauth::http_client(Duration::from_secs(300)),
             endpoints,
             client_id,
             store,
-            session: tokio::sync::Mutex::new(Some(session)),
+            session: Arc::new(tokio::sync::Mutex::new(Some(session))),
             backoff: Duration::from_secs(1),
         }
     }
     /// A usable access token. Refreshes when it is close to expiry or when
     /// `rejected` is the token the API just refused. One refresh runs at a
     /// time, and the rotated tokens are saved before they are used.
+    ///
+    /// The refresh runs on its own task that owns the session lock, so it
+    /// finishes, saves and updates the session even if this caller is
+    /// dropped after OpenAI has accepted (and spent) the old refresh token.
     async fn token(&self, rejected: Option<&str>) -> Result<String, ApiError> {
-        let mut guard = self.session.lock().await;
-        let current = guard
+        let mut session = self.session.clone().lock_owned().await;
+        let current = (*session)
             .clone()
             .ok_or_else(|| ApiError::SignedOut("Sign in with ChatGPT to continue.".into()))?;
         let stale = rejected == Some(current.access_token.as_str());
         if !stale && !current.expires_within(300, now()) {
             return Ok(current.access_token);
         }
-        for attempt in 1..=3 {
-            match oauth::refresh(&self.http, &self.endpoints, &self.client_id, &current).await {
-                Ok(new) => {
-                    self.store.save(&new).map_err(|e| {
-                        ApiError::Other(format!("Could not save the ChatGPT sign-in: {e}"))
-                    })?;
-                    let token = new.access_token.clone();
-                    *guard = Some(new);
-                    return Ok(token);
+        let http = self.http.clone();
+        let endpoints = self.endpoints.clone();
+        let client_id = self.client_id.clone();
+        let store = self.store.clone();
+        let backoff = self.backoff;
+        let refresh = async move {
+            for attempt in 1..=3 {
+                match oauth::refresh(&http, &endpoints, &client_id, &current).await {
+                    Ok(new) => {
+                        // The old refresh token is spent now. If the store
+                        // refuses twice, keep the new set in memory anyway.
+                        if store_save(&store, &new).await.is_err() {
+                            let _ = store_save(&store, &new).await;
+                        }
+                        let token = new.access_token.clone();
+                        *session = Some(new);
+                        return Ok(token);
+                    }
+                    Err(AuthError::Fatal(message)) => {
+                        let _ = store_clear(&store).await;
+                        *session = None;
+                        return Err(ApiError::SignedOut(message));
+                    }
+                    Err(AuthError::Retry(message)) if attempt == 3 => {
+                        return Err(ApiError::Unavailable(message));
+                    }
+                    Err(AuthError::Retry(_)) => tokio::time::sleep(backoff * attempt).await,
                 }
-                Err(AuthError::Fatal(message)) => {
-                    let _ = self.store.clear();
-                    *guard = None;
-                    return Err(ApiError::SignedOut(message));
-                }
-                Err(AuthError::Retry(message)) if attempt == 3 => {
-                    return Err(ApiError::Unavailable(message));
-                }
-                Err(AuthError::Retry(_)) => tokio::time::sleep(self.backoff * attempt).await,
             }
-        }
-        unreachable!("the loop returns on its third attempt")
+            unreachable!("the loop returns on its third attempt")
+        };
+        tokio::spawn(refresh).await.unwrap_or_else(|_| {
+            Err(ApiError::Other(
+                "The sign-in refresh was interrupted.".into(),
+            ))
+        })
     }
     /// Sends with the bearer token: one forced refresh after a 401, and up to
-    /// three tries on network or server errors.
+    /// three tries when OpenAI could not be reached or answered with a server
+    /// error. A request that may have reached OpenAI without an answer is not
+    /// repeated, so it is never billed twice.
     async fn send(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -282,7 +354,12 @@ impl Client {
                 }
                 Ok(r) if r.status().is_server_error() => "OpenAI is unavailable; try again.",
                 Ok(r) => return Ok(r),
-                Err(_) => "Could not reach OpenAI.",
+                Err(e) if e.is_connect() => "Could not reach OpenAI.",
+                Err(_) => {
+                    return Err(ApiError::Unavailable(
+                        "OpenAI did not answer. The request was not repeated.".into(),
+                    ));
+                }
             };
             tries += 1;
             if tries == 3 {
@@ -291,14 +368,20 @@ impl Client {
             tokio::time::sleep(self.backoff * tries).await;
         }
     }
+    /// Forgets a session OpenAI no longer accepts. The lock is taken first,
+    /// so a refresh in flight cannot save its tokens after the clear.
+    async fn forget(&self) {
+        let mut session = self.session.lock().await;
+        let _ = store_clear(&self.store).await;
+        *session = None;
+    }
     /// Maps an error response and forgets the session when it is no longer valid.
     async fn failure(&self, response: reqwest::Response) -> ApiError {
         let status = response.status().as_u16();
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
         let error = api_error(status, &body);
         if matches!(error, ApiError::SignedOut(_)) {
-            let _ = self.store.clear();
-            *self.session.lock().await = None;
+            self.forget().await;
         }
         error
     }
@@ -348,8 +431,18 @@ impl Client {
             for event in parser.push(&chunk) {
                 reply.apply(&event);
             }
+            if parser.too_large {
+                break;
+            }
         }
-        reply.finish().map(|text| Reply { text, structured })
+        if let Some(event) = parser.finish()? {
+            reply.apply(&event);
+        }
+        let text = reply.finish();
+        if matches!(text, Err(ApiError::SignedOut(_))) {
+            self.forget().await;
+        }
+        text.map(|text| Reply { text, structured })
     }
     /// One tiny request that proves plan tokens, streaming and replies work.
     pub async fn check(&self, model: &str) -> Result<String, ApiError> {
@@ -380,12 +473,14 @@ impl Client {
             ))),
         }
     }
-    /// Revokes the refresh token and clears the local session. `Err` means
-    /// the local session is cleared but OpenAI did not confirm the revocation.
+    /// Clears the saved and in-memory session and revokes the refresh token.
+    /// Both are always attempted; `Err` is the sentence to show the user.
     pub async fn sign_out(&self) -> Result<(), String> {
-        let session = self.session.lock().await.take();
-        self.store.clear()?;
-        match session {
+        let (session, cleared) = {
+            let mut session = self.session.lock().await;
+            (session.take(), store_clear(&self.store).await)
+        };
+        let revoked = match &session {
             Some(s) => {
                 oauth::revoke(
                     &self.http,
@@ -396,6 +491,19 @@ impl Client {
                 .await
             }
             None => Ok(()),
+        };
+        match (cleared, revoked) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(revoke)) => Err(format!("Signed out on this computer. {revoke}")),
+            (Err(clear), revoked) => {
+                let mut message = format!(
+                    "The saved sign-in could not be deleted ({clear}). Delete the \"AXIS CAM Studio\" item in Keychain Access."
+                );
+                if revoked.is_err() {
+                    message.push_str(" OpenAI did not confirm the sign-out either.");
+                }
+                Err(message)
+            }
         }
     }
 }
@@ -407,7 +515,7 @@ mod tests {
         fake_openai::{Fake, Req, Resp},
         session::{FileStore, sample},
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn request() -> Request {
         Request {
@@ -417,17 +525,50 @@ mod tests {
             schema: json!({"type": "object"}),
         }
     }
+    /// A file store that can be told to fail, like a Keychain that refuses.
+    struct TestStore {
+        file: FileStore,
+        /// How many of the next saves fail.
+        failing_saves: AtomicUsize,
+        saves: AtomicUsize,
+        failing_clear: AtomicBool,
+    }
+    impl SessionStore for TestStore {
+        fn load(&self) -> Result<Option<Session>, String> {
+            self.file.load()
+        }
+        fn save(&self, session: &Session) -> Result<(), String> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            let failing = self.failing_saves.load(Ordering::SeqCst);
+            if failing > 0 {
+                self.failing_saves.store(failing - 1, Ordering::SeqCst);
+                return Err("Keychain: save denied".into());
+            }
+            self.file.save(session)
+        }
+        fn clear(&self) -> Result<(), String> {
+            if self.failing_clear.load(Ordering::SeqCst) {
+                return Err("Keychain: delete denied".into());
+            }
+            self.file.clear()
+        }
+    }
     struct Rig {
         client: Client,
-        store: Arc<FileStore>,
+        store: Arc<TestStore>,
         fake: Fake,
         _dir: tempfile::TempDir,
     }
     async fn rig(session: Session, handler: impl Fn(&Req) -> Resp + Send + Sync + 'static) -> Rig {
         let fake = Fake::start(handler).await;
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FileStore(dir.path().join("session.json")));
-        store.save(&session).unwrap();
+        let store = Arc::new(TestStore {
+            file: FileStore(dir.path().join("session.json")),
+            failing_saves: AtomicUsize::new(0),
+            saves: AtomicUsize::new(0),
+            failing_clear: AtomicBool::new(false),
+        });
+        store.file.save(&session).unwrap();
         let mut client = Client::new(
             Endpoints::local(&fake.base),
             "oaiapp_1".into(),
@@ -710,6 +851,15 @@ mod tests {
             "{\"a\":1}"
         );
     }
+    #[tokio::test]
+    async fn a_final_event_without_a_blank_line_completes_the_reply() {
+        let r = rig(sample(), |_| Resp {
+            body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.completed\"}".into(),
+            ..Resp::sse(&[])
+        })
+        .await;
+        assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
+    }
     #[test]
     fn sse_events_survive_any_chunking_and_crlf() {
         let stream = "event: a\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"é1\"}\r\n\r\n: comment\n\ndata: [DONE]\n\ndata: {\"type\":\"response.completed\"}\n\n";
@@ -723,7 +873,49 @@ mod tests {
             assert_eq!(events.len(), 2, "chunk size {size}");
             assert_eq!(events[0]["delta"], "é1");
             assert_eq!(events[1]["type"], "response.completed");
+            assert_eq!(parser.finish(), Ok(None), "chunk size {size}");
         }
+        // The last event may end without the blank line.
+        for ending in ["", "\n", "\r\n"] {
+            let stream = format!(
+                "data: {{\"type\":\"response.created\"}}\r\n\r\ndata: {{\"type\":\"response.completed\"}}{ending}"
+            );
+            for size in [1, 2, 3, 7, 1000] {
+                let mut parser = SseParser::default();
+                let mut events: Vec<Value> = stream
+                    .as_bytes()
+                    .chunks(size)
+                    .flat_map(|c| parser.push(c))
+                    .collect();
+                assert_eq!(events.len(), 1, "chunk size {size}, ending {ending:?}");
+                events.extend(parser.finish().unwrap());
+                assert_eq!(events.len(), 2, "chunk size {size}, ending {ending:?}");
+                assert_eq!(events[1]["type"], "response.completed");
+                assert_eq!(parser.finish(), Ok(None));
+            }
+        }
+    }
+    #[test]
+    fn sse_parser_refuses_to_buffer_more_than_16_mb() {
+        let mut parser = SseParser::default();
+        assert_eq!(
+            parser
+                .push(b"data: {\"type\":\"response.created\"}\n\n")
+                .len(),
+            1
+        );
+        // A huge event: 16 MiB is still buffered; more is refused, even when
+        // the extra bytes carry the blank line that would end it.
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..256 {
+            assert!(parser.push(&chunk).is_empty());
+        }
+        assert!(parser.push(b"x\n\n").is_empty());
+        assert_eq!(
+            parser.finish(),
+            Err(ApiError::Other("The reply was too large.".into()))
+        );
+        assert!(parser.push(b"data: {}\n\n").is_empty());
     }
     #[tokio::test]
     async fn models_lists_only_selectable_ids() {
@@ -772,14 +964,220 @@ mod tests {
             r.client.respond(&request()).await,
             Err(ApiError::SignedOut(_))
         ));
+        // Signing out again has nothing to revoke.
+        r.client.sign_out().await.unwrap();
+        assert_eq!(r.fake.seen("/revoke").len(), 1);
         let r = rig(sample(), |_| Resp::json(500, json!({}))).await;
-        assert!(
-            r.client
-                .sign_out()
-                .await
-                .unwrap_err()
-                .contains("not confirm")
+        assert_eq!(
+            r.client.sign_out().await.unwrap_err(),
+            "Signed out on this computer. OpenAI did not confirm the sign-out (HTTP 500)."
         );
         assert_eq!(r.store.load().unwrap(), None);
+    }
+    #[tokio::test]
+    async fn sign_out_still_revokes_when_the_saved_sign_in_cannot_be_deleted() {
+        let r = rig(sample(), |_| Resp::json(200, json!({}))).await;
+        r.store.failing_clear.store(true, Ordering::SeqCst);
+        assert_eq!(
+            r.client.sign_out().await.unwrap_err(),
+            "The saved sign-in could not be deleted (Keychain: delete denied). Delete the \"AXIS CAM Studio\" item in Keychain Access."
+        );
+        let revoked = r.fake.seen("/revoke");
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].field("token"), "refresh-1");
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::SignedOut(_))
+        ));
+        let r = rig(sample(), |_| Resp::json(500, json!({}))).await;
+        r.store.failing_clear.store(true, Ordering::SeqCst);
+        assert_eq!(
+            r.client.sign_out().await.unwrap_err(),
+            "The saved sign-in could not be deleted (Keychain: delete denied). Delete the \"AXIS CAM Studio\" item in Keychain Access. OpenAI did not confirm the sign-out either."
+        );
+        assert_eq!(r.fake.seen("/revoke").len(), 1);
+    }
+    /// Polls `done` every 10 ms; false if it still fails after two seconds.
+    async fn until(done: impl Fn() -> bool) -> bool {
+        for _ in 0..200 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+    #[tokio::test]
+    async fn a_cancelled_request_still_keeps_the_rotated_tokens() {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        // Like OpenAI, the fake accepts a refresh token only once.
+        let used = AtomicBool::new(false);
+        let r = rig(soon, move |req| match req.path.as_str() {
+            "/token"
+                if req.field("refresh_token") == "refresh-1"
+                    && !used.swap(true, Ordering::SeqCst) =>
+            {
+                Resp {
+                    delay_ms: 400,
+                    ..rotated()
+                }
+            }
+            "/token" => Resp::json(400, json!({"error": "refresh_token_reused"})),
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        let request = request();
+        let mut first = Box::pin(r.client.respond(&request));
+        tokio::select! {
+            _ = &mut first => panic!("the request finished before the refresh was answered"),
+            received = until(|| !r.fake.seen("/token").is_empty()) => assert!(received),
+        }
+        // OpenAI has the refresh request but has not answered: cancel.
+        drop(first);
+        assert!(
+            until(|| {
+                r.store
+                    .load()
+                    .unwrap()
+                    .is_some_and(|s| s.refresh_token == "refresh-2")
+            })
+            .await,
+            "the rotated refresh token was not saved"
+        );
+        r.client.respond(&request).await.unwrap();
+        let sent = r.fake.seen("/v1/responses");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].auth, "Bearer access-2");
+        assert_eq!(r.fake.seen("/token").len(), 1);
+    }
+    #[tokio::test]
+    async fn rotated_tokens_stay_in_memory_when_they_cannot_be_saved() {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        let handler = |req: &Req| match req.path.as_str() {
+            "/token" => rotated(),
+            _ => Resp::answer("{}"),
+        };
+        // The first save fails and the retry saves them.
+        let r = rig(soon.clone(), handler).await;
+        r.store.failing_saves.store(1, Ordering::SeqCst);
+        r.client.respond(&request()).await.unwrap();
+        assert_eq!(r.store.saves.load(Ordering::SeqCst), 2);
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-2");
+        // Every save fails: the new tokens are still used, from memory.
+        let r = rig(soon, handler).await;
+        r.store.failing_saves.store(usize::MAX, Ordering::SeqCst);
+        r.client.respond(&request()).await.unwrap();
+        r.client.respond(&request()).await.unwrap();
+        assert_eq!(r.store.saves.load(Ordering::SeqCst), 2);
+        let sent = r.fake.seen("/v1/responses");
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|s| s.auth == "Bearer access-2"));
+        assert_eq!(r.fake.seen("/token").len(), 1);
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-1");
+    }
+    /// A store whose `clear` blocks its thread until the test releases it.
+    struct GatedStore {
+        started: AtomicBool,
+        go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl SessionStore for GatedStore {
+        fn load(&self) -> Result<Option<Session>, String> {
+            Ok(None)
+        }
+        fn save(&self, _: &Session) -> Result<(), String> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<(), String> {
+            self.started.store(true, Ordering::SeqCst);
+            self.go
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| "the async executor was blocked".to_string())
+        }
+    }
+    #[tokio::test]
+    async fn store_calls_run_off_the_async_executor() {
+        // A single-threaded runtime: a store call made on the executor thread
+        // would keep `release` from ever running.
+        let fake = Fake::start(|_| Resp::json(200, json!({}))).await;
+        let (go, wait) = std::sync::mpsc::channel();
+        let store = Arc::new(GatedStore {
+            started: AtomicBool::new(false),
+            go: std::sync::Mutex::new(wait),
+        });
+        let client = Client::new(
+            Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store.clone(),
+            sample(),
+        );
+        let release = async {
+            while !store.started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            go.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(client.sign_out(), release);
+        assert_eq!(result, Ok(()));
+    }
+    #[tokio::test]
+    async fn a_streamed_invalid_user_error_clears_the_session() {
+        for event in [
+            json!({"type": "response.failed", "response": {"error": {"code": "subscription_sharing_invalid_user", "message": "gone"}}}),
+            json!({"type": "error", "code": "subscription_sharing_invalid_user", "message": "gone"}),
+        ] {
+            let r = rig(sample(), move |_| Resp::sse(std::slice::from_ref(&event))).await;
+            assert!(matches!(
+                r.client.respond(&request()).await,
+                Err(ApiError::SignedOut(_))
+            ));
+            assert_eq!(r.store.load().unwrap(), None);
+            assert!(matches!(
+                r.client.models().await,
+                Err(ApiError::SignedOut(_))
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn stream_errors_without_details_say_openai_reported_an_error() {
+        for event in [
+            json!({"type": "error"}),
+            json!({"type": "error", "error": {}}),
+            json!({"type": "response.failed", "response": {}}),
+        ] {
+            let r = rig(sample(), move |_| Resp::sse(std::slice::from_ref(&event))).await;
+            assert_eq!(
+                r.client.respond(&request()).await.unwrap_err(),
+                ApiError::Other("OpenAI reported an error.".into())
+            );
+        }
+    }
+    #[tokio::test]
+    async fn requests_are_not_repeated_after_an_unanswered_send() {
+        let r = rig(sample(), |_| Resp::hangup()).await;
+        assert_eq!(
+            r.client.respond(&request()).await.unwrap_err(),
+            ApiError::Unavailable("OpenAI did not answer. The request was not repeated.".into())
+        );
+        assert_eq!(r.fake.seen("/v1/responses").len(), 1);
+        // Nothing listens on port 9: connect errors are retried, then reported.
+        let mut client = Client::new(
+            Endpoints::local("http://127.0.0.1:9"),
+            "oaiapp_1".into(),
+            r.store.clone(),
+            sample(),
+        );
+        client.backoff = Duration::ZERO;
+        assert_eq!(
+            client.models().await.unwrap_err(),
+            ApiError::Unavailable("Could not reach OpenAI.".into())
+        );
     }
 }

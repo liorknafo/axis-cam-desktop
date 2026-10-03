@@ -34,6 +34,12 @@ pub struct Resp {
     pub status: u16,
     pub content_type: &'static str,
     pub body: String,
+    /// Wait this long after recording the request before answering.
+    pub delay_ms: u64,
+    /// Close the connection without answering.
+    pub hangup: bool,
+    /// A `location` header, for redirects.
+    pub location: Option<String>,
 }
 impl Resp {
     pub fn json(status: u16, value: Value) -> Self {
@@ -41,12 +47,31 @@ impl Resp {
             status,
             content_type: "application/json",
             body: value.to_string(),
+            delay_ms: 0,
+            hangup: false,
+            location: None,
+        }
+    }
+    /// Reads the request, then hangs up without sending a response.
+    pub fn hangup() -> Self {
+        Self {
+            hangup: true,
+            ..Self::json(200, json!({}))
+        }
+    }
+    pub fn redirect(location: &str) -> Self {
+        Self {
+            location: Some(location.into()),
+            ..Self::json(302, json!({}))
         }
     }
     pub fn sse(events: &[Value]) -> Self {
         Self {
             status: 200,
             content_type: "text/event-stream",
+            delay_ms: 0,
+            hangup: false,
+            location: None,
             body: events
                 .iter()
                 .map(|e| {
@@ -85,21 +110,40 @@ impl Fake {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(vec![]));
         let log = requests.clone();
+        let handler = Arc::new(handler);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let Some(request) = read(&mut socket).await else {
-                    continue;
-                };
-                let response = handler(&request);
-                log.lock().unwrap().push(request);
-                let head = format!(
-                    "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    response.status,
-                    response.content_type,
-                    response.body.len()
-                );
-                let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(response.body.as_bytes()).await;
+                let handler = handler.clone();
+                let log = log.clone();
+                // Each connection on its own task, so a delayed answer does
+                // not hold up other requests.
+                tokio::spawn(async move {
+                    let Some(request) = read(&mut socket).await else {
+                        return;
+                    };
+                    let response = handler(&request);
+                    log.lock().unwrap().push(request);
+                    if response.delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(response.delay_ms))
+                            .await;
+                    }
+                    if response.hangup {
+                        return;
+                    }
+                    let location = response
+                        .location
+                        .as_ref()
+                        .map(|l| format!("location: {l}\r\n"))
+                        .unwrap_or_default();
+                    let head = format!(
+                        "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n{location}connection: close\r\n\r\n",
+                        response.status,
+                        response.content_type,
+                        response.body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(response.body.as_bytes()).await;
+                });
             }
         });
         Self { base, requests }
@@ -160,6 +204,11 @@ pub fn jwks() -> Value {
 pub fn id_token(claims: Value) -> String {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-key".into());
+    id_token_with(header, claims)
+}
+/// An ID token signed with the test key under any header (for example one
+/// without `kid`).
+pub fn id_token_with(header: jsonwebtoken::Header, claims: Value) -> String {
     let key = jsonwebtoken::EncodingKey::from_rsa_pem(KEY.as_bytes()).unwrap();
     jsonwebtoken::encode(&header, &claims, &key).unwrap()
 }

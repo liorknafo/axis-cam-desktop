@@ -8,13 +8,25 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const SCOPE: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const FIRST_CLIENT: &str = "dynamic_agent_client";
 const APP_NAME: &str = "AXIS CAM Studio";
+/// Token-endpoint error codes after which the refresh token can never work.
+const FATAL_REFRESH_CODES: [&str; 5] = [
+    "invalid_grant",
+    "token_expired",
+    "refresh_token_expired",
+    "refresh_token_reused",
+    "invalid_client",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Endpoints {
@@ -56,6 +68,17 @@ pub enum AuthError {
     Fatal(String),
     Retry(String),
 }
+/// The HTTP client for sign-in and API calls: it never follows redirects (so
+/// tokens and codes only go where they were sent) and gives up after
+/// `timeout` in total.
+pub fn http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(timeout)
+        .build()
+        .expect("HTTP client")
+}
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -69,8 +92,9 @@ pub fn challenge(verifier: &str) -> String {
     b64(&Sha256::digest(verifier.as_bytes()))
 }
 /// Fresh per-attempt values. The verifier and nonce never leave this process
-/// except as their challenge and inside the validated ID token.
-#[derive(Debug, Clone)]
+/// except as their challenge and inside the validated ID token, so there is
+/// deliberately no `Debug`.
+#[derive(Clone)]
 pub struct Attempt {
     pub state: String,
     pub nonce: String,
@@ -117,11 +141,19 @@ pub fn authorize_url(
     }
     url.into()
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Callback {
     pub code: String,
     /// Issued at first registration.
     pub client_id: Option<String>,
+}
+impl fmt::Debug for Callback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Callback")
+            .field("code", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .finish()
+    }
 }
 /// `None` when the request is not this attempt's callback (another path or a
 /// different `state`); such requests are answered 404 and ignored.
@@ -154,6 +186,8 @@ pub fn parse_callback(target: &str, state: &str) -> Option<Result<Callback, Stri
         None => Err("The sign-in response had no authorization code.".into()),
     })
 }
+/// Where the first matching callback delivers its result.
+type Winner = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<Callback, String>>>>>;
 /// One-shot loopback listener for the browser redirect.
 pub struct Listener {
     listener: tokio::net::TcpListener,
@@ -170,23 +204,22 @@ impl Listener {
     pub fn redirect_uri(&self) -> String {
         format!("http://127.0.0.1:{}/callback", self.port)
     }
+    /// Waits for this attempt's callback. Each connection is answered on its
+    /// own task, so idle or slow connections cannot hold up the real one.
     pub async fn wait(self, state: &str, limit: Duration) -> Result<Callback, String> {
+        let (sender, mut answer) = tokio::sync::oneshot::channel();
+        let winner: Winner = Arc::new(Mutex::new(Some(sender)));
+        let state: Arc<str> = state.into();
         let serve = async {
             loop {
-                let (mut socket, _) = self.listener.accept().await.map_err(|e| e.to_string())?;
-                let Some(target) = request_target(&mut socket).await else {
-                    continue;
-                };
-                match parse_callback(&target, state) {
-                    None => page(&mut socket, "404 Not Found", "Not found.").await,
-                    Some(result) => {
-                        let text = if result.is_ok() {
-                            "Signed in. You can return to AXIS CAM Studio."
-                        } else {
-                            "Sign-in was not completed. You can return to AXIS CAM Studio."
-                        };
-                        page(&mut socket, "200 OK", text).await;
-                        return result;
+                tokio::select! {
+                    accepted = self.listener.accept() => {
+                        let (socket, _) = accepted.map_err(|e| e.to_string())?;
+                        tokio::spawn(answer_connection(socket, state.clone(), winner.clone()));
+                    }
+                    result = &mut answer => {
+                        return result
+                            .unwrap_or_else(|_| Err("Sign-in was interrupted. Try again.".into()));
                     }
                 }
             }
@@ -194,6 +227,30 @@ impl Listener {
         tokio::time::timeout(limit, serve)
             .await
             .unwrap_or_else(|_| Err("Sign-in timed out. Try again.".into()))
+    }
+}
+/// Answers one loopback connection. The first matching callback wins; every
+/// other request gets 404.
+async fn answer_connection(mut socket: tokio::net::TcpStream, state: Arc<str>, winner: Winner) {
+    let Some(target) = request_target(&mut socket).await else {
+        return;
+    };
+    let result = parse_callback(&target, &state);
+    let sender = match result {
+        Some(_) => winner.lock().ok().and_then(|mut slot| slot.take()),
+        None => None,
+    };
+    match (result, sender) {
+        (Some(result), Some(sender)) => {
+            let text = if result.is_ok() {
+                "You can return to AXIS CAM Studio to finish signing in."
+            } else {
+                "Sign-in was not completed. You can return to AXIS CAM Studio."
+            };
+            page(&mut socket, "200 OK", text).await;
+            let _ = sender.send(result);
+        }
+        _ => page(&mut socket, "404 Not Found", "Not found.").await,
     }
 }
 async fn request_target(socket: &mut tokio::net::TcpStream) -> Option<String> {
@@ -232,8 +289,15 @@ struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     id_token: Option<String>,
-    expires_in: u64,
+    /// Seconds: an integer, a float or missing.
+    expires_in: Option<f64>,
     scope: Option<String>,
+}
+impl TokenResponse {
+    fn expires_at(&self) -> u64 {
+        // `as` saturates: a negative lifetime becomes 0, a huge one u64::MAX.
+        now().saturating_add(self.expires_in.map_or(3600, |seconds| seconds as u64))
+    }
 }
 #[derive(Debug, Deserialize)]
 struct IdClaims {
@@ -376,10 +440,10 @@ pub async fn exchange(
     let identity = validate_id_token(http, e, &id_token, client_id, &attempt.nonce).await?;
     Ok(Session {
         scope: granted_scope(&tokens),
+        expires_at: tokens.expires_at(),
         access_token: tokens.access_token,
         refresh_token,
         id_token,
-        expires_at: now() + tokens.expires_in,
         subject: identity.subject,
         email: identity.email,
         name: identity.name,
@@ -404,17 +468,21 @@ pub async fn refresh(
     )
     .await
     .map_err(AuthError::Retry)?;
-    if status >= 500 {
+    if status != 200 {
+        let code = error_code(&body);
+        if FATAL_REFRESH_CODES.contains(&code.as_str()) {
+            return Err(AuthError::Fatal(format!(
+                "Your ChatGPT sign-in is no longer valid ({code}). Sign in again."
+            )));
+        }
         return Err(AuthError::Retry("OpenAI is unavailable; try again.".into()));
     }
-    if status != 200 {
-        return Err(AuthError::Fatal(format!(
-            "Your ChatGPT sign-in is no longer valid ({}). Sign in again.",
-            error_code(&body)
-        )));
-    }
-    let tokens: TokenResponse = serde_json::from_value(body)
-        .map_err(|_| AuthError::Retry("OpenAI returned an unreadable sign-in response.".into()))?;
+    // OpenAI has already rotated the refresh token, so trying again would
+    // only reuse the old one.
+    let tokens: TokenResponse = serde_json::from_value(body).map_err(|_| {
+        AuthError::Fatal("OpenAI returned an unreadable sign-in response. Sign in again.".into())
+    })?;
+    let expires_at = tokens.expires_at();
     Ok(Session {
         scope: match granted_scope(&tokens) {
             scope if scope.is_empty() => session.scope.clone(),
@@ -425,7 +493,7 @@ pub async fn refresh(
             .refresh_token
             .unwrap_or_else(|| session.refresh_token.clone()),
         id_token: tokens.id_token.unwrap_or_else(|| session.id_token.clone()),
-        expires_at: now() + tokens.expires_in,
+        expires_at,
         ..session.clone()
     })
 }
@@ -463,11 +531,18 @@ pub fn open_browser(url: &str) -> Result<(), String> {
     } else {
         std::process::Command::new("xdg-open")
     };
-    command
-        .arg(url)
+    command.arg(url);
+    launch(command).map(|_| ())
+}
+/// Starts `command` and waits for it on a short-lived thread, so the child is
+/// reaped instead of lingering as a zombie.
+fn launch(
+    mut command: std::process::Command,
+) -> Result<std::thread::JoinHandle<Option<std::process::ExitStatus>>, String> {
+    let mut child = command
         .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Could not open the browser: {e}"))
+        .map_err(|e| format!("Could not open the browser: {e}"))?;
+    Ok(std::thread::spawn(move || child.wait().ok()))
 }
 /// The whole sign-in: listen, send the user to the browser, wait for the
 /// redirect, exchange the code and validate the ID token. Returns the session
@@ -495,7 +570,7 @@ pub async fn sign_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_openai::{Fake, Req, Resp, claims, id_token, jwks, tokens};
+    use crate::fake_openai::{Fake, Req, Resp, claims, id_token, id_token_with, jwks, tokens};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -896,6 +971,202 @@ mod tests {
             refresh(&http, &unreachable, "oaiapp_1", &old).await,
             Err(AuthError::Retry(_))
         ));
+    }
+    #[tokio::test]
+    async fn refresh_retries_other_failures_and_is_fatal_on_an_unreadable_success() {
+        let fake = Fake::start(|r: &Req| match r.field("refresh_token").as_str() {
+            "busy" => Resp::json(429, json!({"error": {"code": "rate_limit_exceeded"}})),
+            "forbidden" => Resp::json(403, json!({})),
+            "float" => Resp::json(200, json!({"access_token": "a", "expires_in": 1799.5})),
+            "missing" => Resp::json(200, json!({"access_token": "a"})),
+            _ => Resp::json(200, json!({"refresh_token": "rotated-but-unreadable"})),
+        })
+        .await;
+        let e = Endpoints::local(&fake.base);
+        let http = reqwest::Client::new();
+        let with = |token: &str| Session {
+            refresh_token: token.into(),
+            ..crate::session::sample()
+        };
+        for retry in ["busy", "forbidden"] {
+            assert!(
+                matches!(
+                    refresh(&http, &e, "oaiapp_1", &with(retry)).await,
+                    Err(AuthError::Retry(_))
+                ),
+                "{retry}"
+            );
+        }
+        let before = now();
+        let float = refresh(&http, &e, "oaiapp_1", &with("float"))
+            .await
+            .unwrap();
+        let missing = refresh(&http, &e, "oaiapp_1", &with("missing"))
+            .await
+            .unwrap();
+        let after = now();
+        assert!((before + 1799..=after + 1799).contains(&float.expires_at));
+        assert!((before + 3600..=after + 3600).contains(&missing.expires_at));
+        assert_eq!(missing.refresh_token, "missing");
+        assert_eq!(
+            refresh(&http, &e, "oaiapp_1", &with("unreadable")).await,
+            Err(AuthError::Fatal(
+                "OpenAI returned an unreadable sign-in response. Sign in again.".into()
+            ))
+        );
+    }
+    #[tokio::test]
+    async fn idle_connections_do_not_hold_up_the_callback() {
+        let listener = Listener::bind().await.unwrap();
+        let callback = listener.redirect_uri();
+        let address = callback
+            .trim_start_matches("http://")
+            .trim_end_matches("/callback")
+            .to_string();
+        let mut idle = vec![];
+        for _ in 0..3 {
+            idle.push(tokio::net::TcpStream::connect(&address).await.unwrap());
+        }
+        let started = std::time::Instant::now();
+        let browser = tokio::spawn(reqwest::get(format!("{callback}?code=c&state=s")));
+        let result = listener.wait("s", Duration::from_secs(3)).await;
+        assert_eq!(result.map(|c| c.code), Ok("c".to_string()));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(browser.await.unwrap().unwrap().status(), 200);
+        drop(idle);
+    }
+    #[tokio::test]
+    async fn the_browser_page_does_not_claim_the_sign_in_is_finished() {
+        let listener = Listener::bind().await.unwrap();
+        let browser = tokio::spawn(reqwest::get(format!(
+            "{}?code=c&state=s",
+            listener.redirect_uri()
+        )));
+        listener.wait("s", Duration::from_secs(5)).await.unwrap();
+        let page = browser.await.unwrap().unwrap().text().await.unwrap();
+        assert!(
+            page.contains("You can return to AXIS CAM Studio to finish signing in."),
+            "{page}"
+        );
+        let listener = Listener::bind().await.unwrap();
+        let browser = tokio::spawn(reqwest::get(format!(
+            "{}?error=access_denied&state=s",
+            listener.redirect_uri()
+        )));
+        assert!(listener.wait("s", Duration::from_secs(5)).await.is_err());
+        let page = browser.await.unwrap().unwrap().text().await.unwrap();
+        assert!(
+            page.contains("Sign-in was not completed. You can return to AXIS CAM Studio."),
+            "{page}"
+        );
+    }
+    #[test]
+    fn debug_output_hides_the_authorization_code_and_pkce_values() {
+        let callback = Callback {
+            code: "secret-code".into(),
+            client_id: Some("oaiapp_9".into()),
+        };
+        let text = format!("{callback:?}");
+        assert!(!text.contains("secret-code"), "{text}");
+        assert!(
+            text.contains("code: \"<redacted>\"") && text.contains("oaiapp_9"),
+            "{text}"
+        );
+        // `Attempt` holds the PKCE verifier and nonce, so it has no Debug at all.
+        struct Probe<T>(std::marker::PhantomData<T>);
+        trait NoDebug {
+            const DEBUG: bool = false;
+        }
+        impl<T> NoDebug for Probe<T> {}
+        impl<T: std::fmt::Debug> Probe<T> {
+            const DEBUG: bool = true;
+        }
+        assert!(Probe::<Callback>::DEBUG, "the probe detects Debug");
+        assert!(!Probe::<Attempt>::DEBUG, "Attempt must not implement Debug");
+    }
+    #[tokio::test]
+    async fn id_tokens_need_rs256_and_may_omit_kid_with_a_single_key() {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("test-key".into());
+        let shared_secret = jsonwebtoken::encode(
+            &header,
+            &claims("oaiapp_1", "n"),
+            &jsonwebtoken::EncodingKey::from_secret(b"any shared secret"),
+        )
+        .unwrap();
+        let without_kid = id_token_with(
+            jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            claims("oaiapp_1", "n"),
+        );
+        assert!(
+            jsonwebtoken::decode_header(&without_kid)
+                .unwrap()
+                .kid
+                .is_none()
+        );
+        let fake = Fake::start(
+            move |r: &Req| match (r.path.as_str(), r.field("code").as_str()) {
+                ("/jwks", _) => Resp::json(200, jwks()),
+                (_, "hs256") => Resp::json(200, tokens("a", "r", &shared_secret, SCOPE)),
+                _ => Resp::json(200, tokens("a", "r", &without_kid, SCOPE)),
+            },
+        )
+        .await;
+        assert_eq!(jwks()["keys"].as_array().unwrap().len(), 1);
+        let attempt = Attempt {
+            state: "s".into(),
+            nonce: "n".into(),
+            verifier: "v".into(),
+            redirect_uri: "http://127.0.0.1:1/callback".into(),
+        };
+        let http = reqwest::Client::new();
+        let e = Endpoints::local(&fake.base);
+        let rejected = exchange(&http, &e, "oaiapp_1", "hs256", &attempt).await;
+        assert!(rejected.unwrap_err().contains("not valid"));
+        let session = exchange(&http, &e, "oaiapp_1", "unkeyed", &attempt)
+            .await
+            .unwrap();
+        assert_eq!(session.subject, "user-1");
+    }
+    #[tokio::test]
+    async fn the_http_client_never_follows_redirects_and_times_out() {
+        let fake = Fake::start(|r: &Req| match r.path.as_str() {
+            "/start" => Resp::redirect("/elsewhere"),
+            "/slow" => Resp {
+                delay_ms: 1000,
+                ..Resp::json(200, json!({}))
+            },
+            _ => Resp::json(200, json!({})),
+        })
+        .await;
+        let http = http_client(Duration::from_millis(200));
+        let response = http
+            .get(format!("{}/start", fake.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        assert!(fake.seen("/elsewhere").is_empty());
+        let slow = http.get(format!("{}/slow", fake.base)).send().await;
+        assert!(slow.unwrap_err().is_timeout());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn launched_commands_are_reaped() {
+        // `true` stands in for the browser opener; no browser is opened.
+        let reaper = launch(std::process::Command::new("true")).unwrap();
+        assert!(
+            reaper
+                .join()
+                .unwrap()
+                .is_some_and(|status| status.success())
+        );
+        let missing = launch(std::process::Command::new("/nonexistent/axis-cam-opener"));
+        assert!(missing.unwrap_err().contains("Could not open the browser"));
     }
     #[tokio::test]
     async fn revoke_sends_the_refresh_token_and_reports_failure() {
