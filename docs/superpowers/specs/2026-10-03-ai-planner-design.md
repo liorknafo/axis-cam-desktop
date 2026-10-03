@@ -58,11 +58,11 @@ Sign-in steps:
    - `client_id`: `dynamic_agent_client` on first registration, otherwise the saved issued client ID
    - `agent_name_hint`: `AXIS CAM Studio` (first registration only)
    - `ext_agent_host_id`: the installation's stable host ID
-   - `id_token_hint`: the retained ID token, when re-authorizing
+   - `id_token_hint`: the retained ID token, when re-authorizing. Supported by the URL builder; M1 never has one to send, because sign-out deletes the tokens and re-authorizing while signed in is not offered.
    - `response_type=code`, `redirect_uri`, `state`, `nonce`, `code_challenge`, `code_challenge_method=S256`
    - `scope`: `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`
    - `resource`: `https://api.openai.com/v1`
-4. Wait up to 5 minutes for one request to `/callback`. Any other path gets 404. The user can cancel. The callback must carry the same `state`; otherwise sign-in fails. An `error` parameter (for example `access_denied`) ends sign-in with a plain message. The response page says the user can return to the app.
+4. Wait up to 5 minutes for the callback. A request to any other path, or one whose `state` does not match, gets 404 and is ignored, so a stray local request cannot end the sign-in. The user can cancel. An `error` parameter (for example `access_denied`) with the right `state` ends sign-in with a plain message. The response page says the user can return to the app.
 5. Save the `client_id` returned by the callback (first registration).
 6. POST the token endpoint (form-encoded): `grant_type=authorization_code`, `client_id`, `code`, `code_verifier`, `redirect_uri`, `resource`. There is no client secret.
 7. Validate the ID token: RS256 signature against the JWKS, `iss` = `https://auth.openai.com`, `aud` = the issued client ID, not expired, `nonce` matches.
@@ -100,7 +100,7 @@ Error handling:
 
 Required by OpenAI's guidelines; exact strings are copied from the guidelines page at implementation time:
 
-- Signed out: a **Continue with ChatGPT** button. It uses the official button asset from OpenAI's devkit if its license permits use in this noncommercial personal app; the asset is recorded in `THIRD_PARTY.md` and is not relicensed. Otherwise the button is text-only. The app never draws its own imitation of the logo.
+- Signed out: a text-only **Continue with ChatGPT** button. OpenAI's devkit license grants no rights to its logos or branded assets, so none is bundled, and the app never draws its own imitation.
 - A sentence under the button states what is shared (name, email, profile picture) and that planning requests count against the ChatGPT plan.
 - First sign-in only: a notice titled **You're using your ChatGPT plan**, dismissed with **Got it**.
 - Signed in: the account name and email, the label **Using ChatGPT plan** with a **Manage usage** link, a model picker, **Check connection** and **Sign out**.
