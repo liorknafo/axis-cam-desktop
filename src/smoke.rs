@@ -92,6 +92,8 @@ impl App {
                 98 => "75-program-blocked".into(),
                 99 => "76-program-ready".into(),
                 100 => "77-back-to-machining".into(),
+                101 => "78-chatgpt-notice".into(),
+                102 => "79-chatgpt-signed-in".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -603,6 +605,18 @@ impl App {
                     Message::Generate,
                 ]
             }
+            101 => {
+                self.account = crate::Account::SignedIn {
+                    name: "Lior".into(),
+                    email: "lior@example.com".into(),
+                    granted: true,
+                };
+                self.models = vec!["gpt-6.1-sol".into(), "gpt-6-luna".into()];
+                self.settings.model = "gpt-6.1-sol".into();
+                self.settings.plan_notice_shown = false;
+                vec![Message::Page(Page::Ai)]
+            }
+            102 => vec![Message::PlanNoticeDismissed],
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());
@@ -1761,6 +1775,65 @@ mod tests {
             crate::Account::SignedIn { granted: true, .. }
         ));
         assert!(a.client.is_some());
+    }
+    #[test]
+    fn signing_out_during_the_save_step_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let session = crate::session::sample();
+        let result = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let _ = a.update(result);
+        assert!(a.saving_sign_in());
+        let before = snapshot(&a);
+        // The save cannot be aborted, so there is nothing to sign out of yet.
+        assert_eq!(a.update(Message::SignOut).units(), 0);
+        assert_eq!(snapshot(&a), before);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        assert!(a.saving_sign_in() && !a.sign_out_pending);
+        // The save finishes and the session is adopted as usual.
+        let _ = a.update(Message::SessionSaved(Ok(session)));
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        assert!(a.client.is_some() && !a.sign_out_pending);
+    }
+    #[test]
+    fn a_second_sign_in_result_during_the_save_step_is_revoked_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let session = crate::session::sample();
+        let first = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let _ = a.update(first);
+        assert!(a.saving_sign_in());
+        let before = snapshot(&a);
+        let other = crate::session::Session {
+            name: "Other".into(),
+            refresh_token: "refresh-other".into(),
+            ..crate::session::sample()
+        };
+        // The only task is the revoke of the unused session.
+        let late = Message::SignedIn(Ok((other, "oaiapp_other".into())));
+        assert_eq!(a.update(late).units(), 1);
+        assert_eq!(snapshot(&a), before);
+        assert_eq!(a.settings.client_id, "oaiapp_1");
+        let saved = crate::settings::load(&dir.path().join("settings.json"));
+        assert_eq!(saved.client_id, "oaiapp_1");
+        assert!(a.saving_sign_in());
+        // A late failure neither ends the save step nor shows a message.
+        let late = Message::SignedIn(Err("The browser sign-in failed.".into()));
+        assert_eq!(a.update(late).units(), 0);
+        assert_eq!(snapshot(&a), before);
+        assert!(a.saving_sign_in());
+        // The first save still signs in.
+        let _ = a.update(Message::SessionSaved(Ok(session)));
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        assert_eq!(a.settings.client_id, "oaiapp_1");
     }
     #[test]
     fn a_save_result_is_ignored_unless_the_save_step_is_running() {

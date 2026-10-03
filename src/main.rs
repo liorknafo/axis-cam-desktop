@@ -484,6 +484,10 @@ impl App {
             None
         }
     }
+    /// The second sign-in step: the browser part is done and the session is being saved.
+    pub fn saving_sign_in(&self) -> bool {
+        self.account == Account::SigningIn && self.sign_in.is_none()
+    }
     pub fn is_sample(&self) -> bool {
         self.doc.sample_model && self.doc.file.is_none()
     }
@@ -1896,9 +1900,12 @@ impl App {
                     self.account_note = "Sign-in cancelled.".into();
                 }
             }
-            // A sign-in nobody is waiting for any more: its refresh token
-            // was never saved, so revoke it instead of leaving it valid.
-            Message::SignedIn(Ok((session, client_id))) if self.account != Account::SigningIn => {
+            // A sign-in nobody is waiting for any more, or a second result
+            // while the first is being saved: its refresh token was never
+            // saved, so revoke it instead of leaving it valid.
+            Message::SignedIn(Ok((session, client_id)))
+                if self.account != Account::SigningIn || self.saving_sign_in() =>
+            {
                 let endpoints = self.endpoints.clone();
                 return Task::perform(
                     async move {
@@ -1907,7 +1914,8 @@ impl App {
                     |()| Message::Noop,
                 );
             }
-            Message::SignedIn(Err(_)) if self.account != Account::SigningIn => {}
+            Message::SignedIn(Err(_))
+                if self.account != Account::SigningIn || self.saving_sign_in() => {}
             // The browser step is done. Saving is a step of its own that
             // cannot be cancelled, so a cancel can never land in the middle
             // of it; the account shows nothing until it reports.
@@ -2010,7 +2018,8 @@ impl App {
                 self.account_error(e);
             }
             Message::SignOut => {
-                if self.sign_out_pending {
+                // The save step cannot be aborted; signing out waits for it.
+                if self.saving_sign_in() || self.sign_out_pending {
                     return Task::none();
                 }
                 if let Some(handle) = self.sign_in.take() {

@@ -2089,6 +2089,94 @@ fn tools(app: &App) -> Element<'_, Message> {
     );
     container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),container(scrollable(form)).padding(24).width(Fill).height(Fill).style(panel_style)].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
 }
+fn account_panel(app: &App) -> Element<'_, Message> {
+    use crate::Account;
+    let manage = || Message::OpenUrl(crate::openai::USAGE_URL);
+    let mut c = column![bold("ChatGPT account", 18)].spacing(12);
+    match &app.account {
+        Account::SignedOut if app.sign_out_pending => c = c.push(muted("Signing out…")),
+        Account::SignedOut => {
+            c = c
+                .push(muted("Sign in to plan with your ChatGPT plan. AXIS CAM Studio receives your name, email and profile picture. Planning requests count against your ChatGPT plan."))
+                .push(primary("Continue with ChatGPT", Message::SignIn).width(Fill));
+        }
+        Account::SigningIn if app.saving_sign_in() => {
+            c = c.push(muted("Finishing sign-in…"));
+        }
+        Account::SigningIn => {
+            c = c
+                .push(muted("Waiting for sign-in in your browser…"))
+                .push(btn("Cancel", Message::SignInCancel, false));
+        }
+        Account::SignedIn { .. } if !app.settings.plan_notice_shown => {
+            c = c.push(
+                container(
+                    column![
+                        bold("You're using your ChatGPT plan", 15),
+                        text("Eligible AI requests in this app use your ChatGPT plan. Manage usage in your ChatGPT settings.").size(12),
+                        primary("Got it", Message::PlanNoticeDismissed)
+                    ]
+                    .spacing(10),
+                )
+                .padding(14)
+                .width(Fill)
+                .style(panel_style),
+            );
+        }
+        Account::SignedIn {
+            name,
+            email,
+            granted,
+        } => {
+            let title = if name.is_empty() { email } else { name };
+            c = c
+                .push(column![bold(title.as_str(), 14), muted(email.clone())].spacing(3))
+                .push(
+                    row![
+                        muted("Using ChatGPT plan"),
+                        btn("Manage usage", manage(), false)
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            if *granted && app.models.is_empty() {
+                c = c.push(btn("Load models", Message::LoadModels, false).width(Fill));
+            }
+            if *granted && !app.models.is_empty() {
+                let check = if app.account_busy {
+                    "Checking…"
+                } else {
+                    "Check connection"
+                };
+                c = c
+                    .push(
+                        column![
+                            muted("Model"),
+                            pick_list(
+                                app.models.clone(),
+                                Some(app.settings.model.clone()),
+                                Message::PickModel
+                            )
+                            .width(Fill)
+                            .padding([7, 9])
+                            .text_size(13)
+                        ]
+                        .spacing(5),
+                    )
+                    .push(btn(check, Message::CheckConnection, false).width(Fill));
+            }
+            c = c.push(btn("Sign out", Message::SignOut, false).width(Fill));
+        }
+    }
+    if app.usage_limit {
+        c = c
+            .push(bold("Usage limit reached", 13))
+            .push(primary("Manage usage", manage()).width(Fill));
+    } else if !app.account_note.is_empty() {
+        c = c.push(note(app.account_note.clone()));
+    }
+    c.into()
+}
 fn ai(app: &App) -> Element<'_, Message> {
     let controls=column![bold("Planning brief",18),help::wrap(text_input("Describe the intended machining job",&app.ai_brief).on_input(Message::AiBrief).padding(12).size(13),Help::text("Planning brief", "Describe the result you want. The brief is saved but does not influence the current example planner; OpenAI planning will be connected later."),widget::tooltip::Position::Right),muted("Example coverage"),help::wrap(pick_list(vec!["Top only".to_string(),"Top and bottom".into(),"Top, bottom and side".into()],Some(app.ai_coverage.clone()),Message::AiCoverage).width(Fill).padding(9).text_size(13),crate::choice_help::selected("ai_coverage","Example coverage",&app.ai_coverage,Target::Setup,&Fields::new()),widget::tooltip::Position::Right),muted("Priority"),help::wrap(pick_list(vec!["Balanced".to_string(),"Surface finish".into(),"Fewer tool changes".into()],Some(app.ai_priority.clone()),Message::AiPriority).width(Fill).padding(9).text_size(13),crate::choice_help::selected("ai_priority","Planning priority",&app.ai_priority,Target::Setup,&Fields::new()),widget::tooltip::Position::Right),note("This is a deterministic example planner for the sample housing. Coverage and priority drive the example; the brief is a UI placeholder. No OpenAI API is connected and no files leave this app."),primary("Create example plan",Message::Plan).width(Fill),btn("Undo last applied plan",Message::UndoPlan,false).width(Fill)].spacing(14);
     let mut review = column![
@@ -2144,10 +2232,16 @@ fn ai(app: &App) -> Element<'_, Message> {
         column![
             page_header(
                 "AI machining planner",
-                "A reviewable planning workflow, ready for a future OpenAI integration."
+                "Sign in with ChatGPT. The planner below is still the local example for the sample housing."
             ),
             row![
-                container(scrollable(controls))
+                container(scrollable(
+                    column![account_panel(app), rule::horizontal(1), controls]
+                        .spacing(18)
+                        // The scrollbar is drawn over the content: keep it off the
+                        // right edge of full-width buttons, boxes and lists.
+                        .padding(iced::Padding::ZERO.right(14))
+                ))
                     .padding(22)
                     .width(370)
                     .height(Fill)

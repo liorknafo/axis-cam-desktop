@@ -390,6 +390,21 @@ pub fn command(m: &Message, label: String) -> Help {
                 },
             );
         }
+        SignIn => {
+            "Open your browser to sign in with ChatGPT. AXIS CAM Studio receives your name, email and profile picture. Planning requests then count against your ChatGPT plan."
+        }
+        SignInCancel => "Stop waiting for the browser sign-in. Nothing is saved.",
+        SignOut => {
+            "Sign out of ChatGPT on this computer and ask OpenAI to revoke this app's access. The saved sign-in is deleted."
+        }
+        CheckConnection => {
+            "Send one tiny request to the selected model to confirm that your ChatGPT plan works with this app. It uses a very small amount of your plan's usage."
+        }
+        LoadModels => "Ask OpenAI again which models your ChatGPT plan can use in this app.",
+        PlanNoticeDismissed => "Close this notice. It is shown once.",
+        OpenUrl(_) => {
+            "Open your ChatGPT usage settings in the browser, where you can see and limit how much of your plan this app may use."
+        }
         _ => "Change this setting in the current workspace.",
     };
     let h = Help::text(label, description);
@@ -1483,4 +1498,35 @@ pub fn gallery<'a>(kind: u8) -> Element<'a, Message> {
         .padding(20)
         .center(Length::Fill)
         .into()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_commands_have_specific_help() {
+        let generic = command(&Message::Noop, "x".into()).body;
+        for message in [
+            Message::SignIn,
+            Message::SignInCancel,
+            Message::SignOut,
+            Message::CheckConnection,
+            Message::LoadModels,
+            Message::PlanNoticeDismissed,
+            Message::OpenUrl(crate::openai::USAGE_URL),
+        ] {
+            let help = command(&message, "x".into());
+            assert_ne!(help.body, generic, "{message:?}");
+        }
+        assert!(
+            command(&Message::SignIn, "x".into())
+                .body
+                .contains("name, email and profile picture")
+        );
+        assert!(
+            command(&Message::CheckConnection, "x".into())
+                .body
+                .contains("ChatGPT plan")
+        );
+    }
 }
