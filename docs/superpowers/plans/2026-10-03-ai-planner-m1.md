@@ -598,7 +598,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `src/ui.rs` (`ai` page, new `account_panel`), `src/help.rs` (`command`), `src/smoke.rs` (names 101–102, steps 101–102)
 
 **Interfaces:**
-- Consumes: `App { account, settings, models, account_note, account_busy, usage_limit }`, the Task 4 messages, `openai::USAGE_URL`.
+- Consumes: `App { account, settings, models, account_note, account_busy, sign_out_pending, usage_limit }`, the Task 4 messages (including `LoadModels`, added in the Task 4 review), `openai::USAGE_URL`.
 
 - [ ] **Step 1: Write the failing test** (append inside `mod tests` in `src/help.rs`; if the file has no test module, add `#[cfg(test)] mod tests { use super::*; … }` at the end)
 
@@ -611,6 +611,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
             Message::SignInCancel,
             Message::SignOut,
             Message::CheckConnection,
+            Message::LoadModels,
             Message::PlanNoticeDismissed,
             Message::OpenUrl(crate::openai::USAGE_URL),
         ] {
@@ -638,6 +639,9 @@ Expected: FAIL (the generic "Change this setting…" text).
         CheckConnection => {
             "Send one tiny request to the selected model to confirm that your ChatGPT plan works with this app. It uses a very small amount of your plan's usage."
         }
+        LoadModels => {
+            "Ask OpenAI again which models your ChatGPT plan can use in this app."
+        }
         PlanNoticeDismissed => "Close this notice. It is shown once.",
         OpenUrl(_) => {
             "Open your ChatGPT usage settings in the browser, where you can see and limit how much of your plan this app may use."
@@ -652,7 +656,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
     let manage = || Message::OpenUrl(crate::openai::USAGE_URL);
     let mut c = column![bold("ChatGPT account", 18)].spacing(12);
     match &app.account {
-        Account::SignedOut if app.account_busy => c = c.push(muted("Signing out…")),
+        Account::SignedOut if app.sign_out_pending => c = c.push(muted("Signing out…")),
         Account::SignedOut => {
             c = c
                 .push(muted("Sign in to plan with your ChatGPT plan. AXIS CAM Studio receives your name, email and profile picture. Planning requests count against your ChatGPT plan."))
@@ -694,6 +698,9 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                     .spacing(8)
                     .align_y(Alignment::Center),
                 );
+            if *granted && app.models.is_empty() {
+                c = c.push(btn("Load models", Message::LoadModels, false).width(Fill));
+            }
             if *granted && !app.models.is_empty() {
                 let check = if app.account_busy {
                     "Checking…"
