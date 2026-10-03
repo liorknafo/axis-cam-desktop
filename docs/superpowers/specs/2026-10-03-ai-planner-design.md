@@ -158,7 +158,8 @@ A deterministic summary of the part, built from the loaded mesh. All lengths are
   - **Pocket floors**: visible planes below the top and above the model bottom, with depth and the largest flat cutter diameter that fits (found by shrinking the floor outline until it vanishes).
   - **Holes** in each visible plane, from the existing hole detector: centre, diameter, opening diameter, depth, and whether it goes through.
   - **Freeform area**: the visible area that is neither horizontal nor vertical, which only surface finishing can follow.
-- Limits to keep the report bounded: at most 40 planes and 100 holes per orientation, faces under 1 mm² dropped, with a `truncated` flag when anything is cut.
+- Limits to keep the report bounded: at most 40 planes and 100 holes per orientation, faces under 1 mm² dropped, with a `truncated` flag when anything is cut. A plane's holes are listed completely or not at all: when a plane has more hole candidates than remain under the limit, its holes are not searched or listed and `truncated` is set, so the work is bounded too.
+- The part must be a closed solid. The report is refused, before any model request, when more than 2% of a grid of vertical test rays cross the surface inconsistently, because the plan checks cannot tell inside from outside on such a mesh.
 
 ### Proposal (`proposal.rs`) — the model's output
 
@@ -195,31 +196,34 @@ warnings: [string]
 
 Building a job from a proposal:
 
-- Setup 1 is a copy of the user's setup 1 (machine, stock, origin, fixture, offset), with its operations replaced. The proposal's `origin` applies to later setups only.
+- Setup 1 is a copy of the user's setup 1 (name, machine, stock, origin, fixture, offset), with its operations replaced. The proposal's `origin` and `name` apply to later setups only.
 - Later setups get the same machine snapshot, the next free work offset (at most six setups), the orientation's rotation, the proposed name and origin, the workholding text as notes, and inherited stock.
-- Each operation starts from the app's defaults for its strategy. Non-null proposal values replace defaults. Combinations the generators require are fixed by the app, not the model: Pocket uses the selected floor with the tool inside; outside Contour, Parallel and Waterline use the model silhouette; compensation is in computer; spindle clockwise; climb milling.
-- Names are limited to 60 characters. Free text from the model is only ever displayed or written as sanitized comments.
+- Each operation starts from the app's defaults for its strategy. Non-null proposal values replace defaults, with one exception: a null `radial_allowance`, `axial_allowance` or `bottom_offset` means 0, so one operation machines to size unless the proposal leaves stock. A nullable field that is missing is read as null. Combinations the generators require are fixed by the app, not the model: Pocket uses the selected floor with the tool inside; outside Contour, Parallel and Waterline use the model silhouette; compensation is in computer; spindle clockwise; climb milling.
+- Names are limited to 60 characters and notes to 500. Control and format characters (including bidirectional overrides) are removed. Free text from the model is only ever displayed or written as sanitized comments.
+- Limits on a proposal: at most 12 operations per setup and 40 in total; at most 500 surface IDs per operation, deduplicated; rpm from 100 to the machine maximum; feed from 1 mm/min to the machine maximum.
+- Drilling: `through` may be true only when every hole the operation selects (the plane's holes, narrowed by `hole_diameter`) is a through hole in the report. `breakthrough` may be at most half the drill diameter plus 1 mm.
 
 ### Plan check (`plan_check.rs`)
 
 Run in this order; later stages run only if earlier ones pass.
 
-1. **Structure.** Setup 1's orientation is first; orientations are unique; every tool number exists; tool type suits the strategy; every surface ID belongs to that orientation's report and suits the strategy; rpm and feed are positive and within machine limits. Each problem names its setup and operation.
+1. **Structure.** Setup 1's orientation is first; orientations are unique; every tool number exists; tool type suits the strategy; every surface ID belongs to that orientation's report and suits the strategy; rpm, feed and the limits above hold. The built job must pass the same structure validation as a saved project, so an applied plan can always be saved and reopened. Each problem names its setup and operation.
 2. **Generation.** `simulation::sequence` on the built job. Every enabled operation must generate, with inherited stock.
 3. **Export checks.** `post::post_job` must be ready: limits, travel, rapids into material, holder clearance, work zeros, round-trip replay.
-4. **Gouge check (coarse).** The part is voxelized on the stock grid (vertical ray parity per column). A part cell more than one cell below the part surface that the stock simulation has removed is a gouge. Three or more such cells fail the check, attributed to the operation after which they first appear, with their bounding box. This detects cuts deeper than about one grid cell (the grid has up to 96 cells on the stock's longest side); finer accuracy relies on the generators' own guarantees. The preview says "no gouging detected (coarse check)".
-5. **Coverage (report, not pass/fail).**
-   - Covered surfaces: for each surface, sample its triangles' centroids, step 1.5 cells outward along the outward normal, and test whether stock remains there. Surfaces more than half covered are listed with ID, area and covered share.
+4. **Tool axis check (exact).** For every move of every operation, in its setup's frame, the tool's centre line from the tip upward must not pass through the part: positions are sampled every 1 mm along the move and tested against the mesh with a vertical ray. More than 0.1 mm of part material above the tip (plus the operation's own tolerance for Parallel) fails the check, as does any move below the bottom of the stock box. This catches a tool of any size that goes deeper than the surface under its centre, such as a drill sent past a blind hole's bottom. It does not see a cutter's edge cutting a wall beside its centre; the generators' own rules and the coarse check cover that.
+5. **Gouge check (coarse).** The part is voxelized on the stock grid (vertical ray parity per column). A part cell more than one cell below the part surface that the stock simulation has removed is a gouge. The check fails once three or more such cells exist in total, attributed to each operation that adds to them, with their bounding box. This detects cuts deeper than about one grid cell (the grid has up to 96 cells on the stock's longest side) by cutters wide enough to cover a cell centre; walls and floors thinner than about three cells have no such cells. The preview says "no gouging detected (coarse check)".
+6. **Coverage (report, not pass/fail).**
+   - Covered surfaces: for each surface, sample its triangles' centroids, step 1.5 cells outward along the outward normal, and test whether stock remains there. Report planes more than half covered are listed with IDs, area and covered share. The remaining surface (walls and freeform, not the report's planes) is summed by the direction it faces and listed when more than 10% of it is covered.
    - Exposed share: uncovered area divided by total area.
    - Leftover stock volume outside the part, split into: above the part, around the silhouette, inside the part's bounding box, below the part.
    - All coverage numbers are approximate and labelled so.
-6. **Totals.** Estimated machining time per operation and in total.
+7. **Totals.** Estimated machining time per operation and in total.
 
-The result is a `CheckReport`: pass or fail, problems grouped by setup and operation, the coverage numbers and the totals. It is shown to the user and, in M3, sent to the model.
+The result is a `CheckReport`: pass or fail, problems grouped by setup and operation, the coverage numbers and the totals. It is shown to the user and, in M3, sent to the model. The built job is returned only when the plan passes.
 
 ### Command line (M2)
 
-`axis-cam --check-plan <project.json> <proposal.json>` loads the project and its model, builds the job from the proposal, runs the check and prints the report. Exit code 0 means pass.
+`axis-cam --check-plan <project.json> <proposal.json>` loads the project and its model, builds the job from the proposal, runs the check and prints the report as JSON on standard output (the one-line summary goes to standard error). Exit code 0 means the plan passes, 1 that it does not, 2 that the check could not run (usage, unreadable files, unmet preconditions). `--part-report <project.json>` and `--proposal-schema` print JSON and use exit code 2 for errors.
 
 ### Testing (M2)
 
@@ -229,7 +233,8 @@ The result is a `CheckReport`: pass or fail, problems grouped by setup and opera
 - Building: defaults, overrides, fixed combinations, setup 1 preserved, later setups created with offsets G55 onward.
 - A hand-written good plan for the example block passes all stages (face, pocket, contour, drill; flipped facing).
 - Each structural error; a generation failure; an export refusal (for example a stock-based work zero on a cut face); each reported with its setup and operation.
-- Gouge: a synthetic cut into the part is detected and attributed; a clean job reports none.
+- Gouge: a synthetic cut into the part is detected and attributed; a clean job reports none. Tool axis: a drill sent 25 mm past a blind hole's bottom with a 1 mm drill, and a drill sent below the stock, are each refused end to end; the good plan and a plan with Parallel and Waterline finishing report nothing.
+- A passing plan's job survives saving and reopening. Duplicate surface IDs, too many operations, a spindle speed under 100 rpm, `through` on a blind hole and an oversized breakthrough are each refused. An open mesh is refused by the report.
 - Coverage: before machining the top is covered; after facing it is exposed; leftover categories sum to the total.
 - The command exits 0 for the good plan and non-zero with the report for a bad one.
 
