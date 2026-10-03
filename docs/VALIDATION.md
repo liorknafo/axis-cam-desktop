@@ -5,7 +5,7 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 ## Automated checks
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **259 passed, 0 failed, 1 ignored** (20.3 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
+- `cargo test --locked`: **295 passed, 0 failed, 1 ignored** (29.6 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
 - Release build and renderer smoke: passed on Apple Silicon macOS 26.5.2, Rust 1.97.1.
 - Renderer smoke completed **80 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
 
@@ -28,6 +28,17 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 - Rapid-safety rule tested for accepted retracts and peck re-entry, and for refused unproven descents, sideways rapids, holder depth, feed, rpm and travel (including inch profiles).
 - A rapid that descends wholly beside the stock box is accepted (a region shares no area with the box only when it lies beside it on X or Y), while a descent over the stock is still proven only as deep as earlier cuts removed it. Face, then an outside Contour on stock with no front margin, posts.
 - A Stock top center or Stock top front-left work zero is refused when the stock was defined in an orientation that is not square to the setup (30° about Z), and accepted again with Model origin. Frames at 0°, 180°, -90° and 90°/90° are square; 30° and 45° are not. Flipped (180°) setups still post.
+
+## Planner analysis and checks (no AI)
+
+- Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above, and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.
+- Proposals: the schema is strict at every level (every field required, nothing extra) and lists exactly the fields of the Rust types. The parser rejects unknown fields and a missing non-nullable field.
+- Job building: setup 1 keeps its name and work zero (the plan's are ignored), fixture and stock; later setups share its machine, get the next free work offset (G55) and the orientation's rotation, and inherit stock. The option combinations the generators require are fixed by the app, surface IDs are deduplicated, and control and format characters are removed from names and notes.
+- Reference problems (an unknown tool, a wrong tool type, surfaces from another orientation or plane, a cutter that does not fit a floor, speed and feed limits, too many operations, a drill marked as going through a blind hole, an oversized breakthrough) are each reported with their place: the setup and operation where one applies, the setup or the whole plan otherwise.
+- A hand-written two-setup plan passes all stages with its six operations timed, and a built job survives saving and reopening. A reference problem stops before generation, a job the app cannot save stops at structure, and a generation failure and an export refusal are each reported at their own stage. A failing plan returns no job.
+- Tool axis: a Ø1 mm drill sent 25 mm past the bottom of the Ø6 × 8 mm blind hole is refused with its setup and operation, and the same case is refused in a second setup without flagging the first. A Ø4 mm drill with a 15 mm breakthrough, which goes 12 mm below the stock, is refused too. The good plan and a plan with Parallel and Waterline finishing added raise no tool axis problem.
+- Coarse gouge: a synthetic cut into the part (a 10 mm cutter plunged 8 mm into solid material beside the pocket) is detected, and the good plan removes no cell well inside the part. The rule that flags an operation counts removed cells cumulatively over all operations and needs three in total.
+- Coverage: the exposed share rises as operations are added, planes the report lists are not counted again among the sides, and leftover stock is split into above, around, inside the part's bounding box and below. The finished good plan leaves none above or below.
 
 ## Continuous stock and adaptive meshing
 

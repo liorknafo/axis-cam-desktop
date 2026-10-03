@@ -270,6 +270,28 @@ If you sign in without allowing plan usage, the panel says so; sign out and sign
 
 In this version the account panel is the only part that talks to OpenAI. The planner below it is still the local example.
 
+## Planner checks without AI
+
+Three command-line tools show what the AI planner will see and how its plans are judged. `--part-report` and `--check-plan` need a saved project with an imported part that is a closed solid (its original file must still be where the project expects it), a 3-axis LinuxCNC machine and stock on setup 1 with rotations that are multiples of 90°, a material, and a tool library with at least one tool and unique tool numbers.
+
+- `axis-cam --part-report <project.json>` prints the part report: for each of six orientations (the part axis that points up), the horizontal faces visible from above with their surface IDs, pocket floors with depth and the largest flat cutter that fits, and holes with diameter, depth and whether they go through.
+- `axis-cam --proposal-schema` prints the JSON schema of a plan: setups with an orientation and a work zero, and operations with a strategy, a tool number, surface IDs and cutting parameters.
+- `axis-cam --check-plan <project.json> <plan.json>` builds the job a plan describes, checks it and prints the report as JSON, with a one-line summary on standard error. Exit code 0 means the plan passes, 1 that it does not, 2 that the check could not run (wrong arguments, an unreadable project or plan, or a requirement above that is not met). The other two commands print JSON alone and exit with 0, or with 2 when they cannot run.
+
+A plan is checked in stages:
+
+1. **References and limits.** Orientations must exist, be used once and start with setup 1's. Tools must exist and suit the strategy. Surface IDs must belong to that orientation and suit the strategy: Facing takes the top plane, Pocket and inside Contour one floor that the cutter fits, Drilling one plane with holes, and the other strategies none. Spindle speed is 100 rpm to the machine maximum and feed is 1 mm/min to the machine maximum. A plan has at most 6 setups, 12 operations per setup and 40 in total. A drill marked as going through must select only holes that go through the part (`hole_diameter` narrows the selection), and its breakthrough must be at most half the drill diameter plus 1 mm. The built job must be one the app can save and reopen.
+2. **Generation.** Every operation must generate, with the stock left by the ones before it.
+3. **Export.** All LinuxCNC export checks must pass.
+4. **Tool axis.** Measured against the part's mesh rather than the stock grid. For every move, sampled about every millimetre of horizontal travel, the tool's centre line above the tip must not pass through more than 0.1 mm of the part (plus the operation's tolerance, for Parallel), and no move may take the tip below the bottom of the stock. This catches a tool of any size that goes deeper than the surface under its centre, such as a drill sent past the bottom of a blind hole. It does not see a cutter's edge cutting a wall beside its centre.
+5. **Gouging (coarse).** Cells well inside the part that the stock simulation removed, on the simulation's grid (up to 96 cells on the longest side). The check fails once three or more such cells have been removed in all, and names each operation that removes some. It finds cuts deeper than about one cell by cutters wide enough to cover a cell centre; walls and floors thinner than about three cells are not covered by it.
+
+A problem in stage 1 stops the later stages, and a generation failure skips stage 3. Stages 4 and 5 run on every operation that generated, whatever stage 3 says, so one report lists every known problem. Each problem names its setup and operation where it has them and carries its stage: structure, generation, export, or gouge (used by both the tool axis and the coarse gouge check).
+
+For the operations that generated, the report then gives coverage: how much of the part's surface is exposed, which faces are still covered, and how much stock remains above the part, around it, inside its bounding box (in pockets and holes) and below it. It also gives the estimated machining time per operation and in total. Coverage does not see stock thinner than about 1.5 cells. Coverage and the coarse gouge check are approximate. The generators' own rules, the export checks and the tool axis check are more precise, but none of them is a full collision check. Fixtures, clamps and the machine body are not checked.
+
+Setup 1 stays as you configured it (name, machine, stock, work zero, fixture); the plan's own name and work zero for its first setup are ignored. A plan replaces setup 1's operations and any later setups the project had, and adds its own later setups.
+
 ## Persistence
 
 On macOS, automatic state lives at:
@@ -318,6 +340,9 @@ The explicit smoke-test mode uses an isolated workspace, exercises eighty screen
 - `src/volume.rs`: persistent cutter history, setup-frame transforms and approximate removal-volume grid.
 - `src/stock_surface.rs`: continuous cutter implicit fields, adaptive octree meshing and detail levels.
 - `src/stock.rs`: part placement, six-sided stock offsets, resolved bounds and stock report text.
+- `src/analysis.rs`: part report (planes, pocket floors and holes for each of six orientations), orientation helpers and the planning preconditions.
+- `src/proposal.rs`: plan format and JSON schema, reference checks and building a job from a plan.
+- `src/plan_check.rs`: plan stages (structure, generation, export, tool axis, coarse gouge) and coverage.
 - `src/oauth.rs`: Sign in with ChatGPT: PKCE, loopback redirect, ID token validation, refresh, revoke.
 - `src/session.rs`: session and its Keychain or file store.
 - `src/settings.rs`: non-secret app settings.
