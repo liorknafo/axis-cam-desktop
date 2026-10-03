@@ -9,6 +9,8 @@ mod pocket;
 mod post;
 mod post_check;
 mod rest;
+mod session;
+mod settings;
 mod simulation;
 mod smoke;
 mod step;
