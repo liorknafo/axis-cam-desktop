@@ -13,6 +13,7 @@ mod openai;
 mod pocket;
 mod post;
 mod post_check;
+mod proposal;
 mod rest;
 mod session;
 mod settings;
