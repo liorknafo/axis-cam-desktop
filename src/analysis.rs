@@ -196,6 +196,60 @@ impl<'a> Index<'a> {
             .max_by(f32::total_cmp)
     }
 }
+/// Solid spans of the part along the vertical line through `xy`, lowest first:
+/// `Ok` when the crossings are consistent, `Err` with the parity fallback when not.
+pub(crate) fn column(index: &Index, xy: [f32; 2]) -> Result<Vec<(f32, f32)>, Vec<(f32, f32)>> {
+    // Crossings of the vertical ray: height, and whether the face points up.
+    let mut hits: Vec<(f32, bool)> = index
+        .near(xy)
+        .filter_map(|t| Some((cam::plane_height(&t.p, xy)?, normal(&t.p)[2] > 0.)))
+        .collect();
+    hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+    hits.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-4 && a.1 == b.1);
+    let mut spans = vec![];
+    let (mut depth, mut start, mut consistent) = (0i32, 0f32, true);
+    for (z, up) in &hits {
+        if !*up {
+            if depth == 0 {
+                start = *z;
+            }
+            depth += 1;
+        } else {
+            depth -= 1;
+            if depth == 0 {
+                spans.push((start, *z));
+            }
+            consistent &= depth >= 0;
+        }
+    }
+    if consistent && depth == 0 {
+        Ok(spans)
+    } else {
+        // Inconsistent face directions: fall back to crossing parity.
+        Err(hits.chunks_exact(2).map(|c| (c[0].0, c[1].0)).collect())
+    }
+}
+/// Share of a 48 × 48 grid of vertical rays over the model that cross its
+/// surface inconsistently; rays that hit nothing are not counted.
+fn inconsistent_share(geometry: &Geometry) -> f32 {
+    let index = Index::new(geometry);
+    let b = geometry.bounds;
+    let (mut hit, mut bad) = (0, 0);
+    for i in 0..48 * 48 {
+        let xy = [i % 48, i / 48].map(|n| (n as f32 + 0.5) / 48.);
+        let xy = [0, 1].map(|k| b.min[k] + (b.max[k] - b.min[k]) * xy[k] + 1e-4);
+        match column(&index, xy) {
+            Ok(spans) if spans.is_empty() => {}
+            Ok(_) => hit += 1,
+            Err(_) => (hit, bad) = (hit + 1, bad + 1),
+        }
+    }
+    if hit == 0 {
+        0.
+    } else {
+        bad as f32 / hit as f32
+    }
+}
 /// Unnormalized normal; its length is twice the triangle's area.
 pub(crate) fn normal(p: &[[f32; 3]; 3]) -> [f32; 3] {
     let a: [f32; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
@@ -248,6 +302,7 @@ fn orientation(
     stock: &Volume,
     mesh: &Mesh,
     up: &'static str,
+    max_holes: usize,
 ) -> Option<OrientationReport> {
     let setup = oriented(setup1, up)?;
     let geometry = Geometry::new(&setup, mesh);
@@ -325,7 +380,7 @@ fn orientation(
     planes.sort_by(|a, b| b.area.total_cmp(&a.area));
     let mut truncated = planes.len() > MAX_PLANES;
     planes.truncate(MAX_PLANES);
-    let mut holes_left = MAX_HOLES;
+    let mut holes_left = max_holes;
     for plane in &mut planes {
         if plane.depth_below_top < 0.01 {
             plane.kind = "top";
@@ -339,23 +394,27 @@ fn orientation(
             mesh_fingerprint: mesh.fingerprint.clone(),
             ids: plane.surfaces.clone(),
         });
-        let holes = cam::holes(&setup, &probe, mesh).unwrap_or_default();
-        truncated |= holes.len() > holes_left;
-        plane.holes = holes
-            .iter()
-            .take(holes_left)
-            .map(|h| HoleReport {
-                center: [
-                    r2(h.center[0] - model.min[0]),
-                    r2(h.center[1] - model.min[1]),
-                ],
-                diameter: r2(h.diameter),
-                opening_diameter: r2(h.opening),
-                depth: r2(h.top - h.bottom),
-                through: h.bottom <= model.min[2] + 0.01,
-            })
-            .collect();
-        holes_left -= plane.holes.len();
+        // A plane's holes are listed completely or not at all, and planes
+        // with too many openings are not searched.
+        if cam::hole_candidates(&setup, &probe, mesh) > holes_left {
+            truncated = true;
+        } else {
+            plane.holes = cam::holes(&setup, &probe, mesh)
+                .unwrap_or_default()
+                .iter()
+                .map(|h| HoleReport {
+                    center: [
+                        r2(h.center[0] - model.min[0]),
+                        r2(h.center[1] - model.min[1]),
+                    ],
+                    diameter: r2(h.diameter),
+                    opening_diameter: r2(h.opening),
+                    depth: r2(h.top - h.bottom),
+                    through: h.bottom <= model.min[2] + 0.01,
+                })
+                .collect();
+            holes_left = holes_left.saturating_sub(plane.holes.len());
+        }
         plane.depth_below_top = r2(plane.depth_below_top);
         plane.area = r2(plane.area);
         plane.bbox = [
@@ -443,6 +502,9 @@ pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
         .ok_or("Setup 1 must be square to the part: use rotations that are multiples of 90°.")?;
     let stock = crate::stock::resolve(setup1, Some(mesh))?.stock;
     let stock = Volume::new(stock, Frame::new(setup1, mesh));
+    if inconsistent_share(&Geometry::new(setup1, mesh)) > 0.02 {
+        return Err("The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model.".into());
+    }
     let mut order: Vec<&'static str> = vec![first];
     order.extend(
         ORIENTATIONS
@@ -481,7 +543,7 @@ pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
             .collect(),
         orientations: order
             .into_iter()
-            .filter_map(|up| orientation(setup1, &stock, mesh, up))
+            .filter_map(|up| orientation(setup1, &stock, mesh, up, MAX_HOLES))
             .collect(),
     })
 }
@@ -665,5 +727,45 @@ mod tests {
                 && json.contains("\"max_cutter_diameter\"")
         );
         assert!(json.len() < 20_000, "{}", json.len());
+    }
+    #[test]
+    fn a_plane_with_more_hole_candidates_than_the_limit_lists_none() {
+        let (doc, mesh) = block();
+        let setup1 = &doc.setups[0];
+        let stock = crate::stock::resolve(setup1, Some(&mesh)).unwrap().stock;
+        let stock = Volume::new(stock, Frame::new(setup1, &mesh));
+        let full = orientation(setup1, &stock, &mesh, "+Z", MAX_HOLES).unwrap();
+        assert_eq!(plane(&full, 0.).holes.len(), 5);
+        assert!(!full.truncated);
+        let limited = orientation(setup1, &stock, &mesh, "+Z", 3).unwrap();
+        assert!(limited.truncated);
+        assert!(plane(&limited, 0.).holes.is_empty());
+    }
+    fn box_mesh(open_top: bool) -> Mesh {
+        let mut t = vec![];
+        let mut quad = |p: [[f32; 3]; 4]| {
+            t.push([p[0], p[1], p[2]]);
+            t.push([p[0], p[2], p[3]]);
+        };
+        let (x, y, z) = (40., 30., 20.);
+        if !open_top {
+            quad([[0., 0., z], [x, 0., z], [x, y, z], [0., y, z]]);
+        }
+        quad([[0., 0., 0.], [0., y, 0.], [x, y, 0.], [x, 0., 0.]]);
+        quad([[0., 0., 0.], [x, 0., 0.], [x, 0., z], [0., 0., z]]);
+        quad([[x, y, 0.], [0., y, 0.], [0., y, z], [x, y, z]]);
+        quad([[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
+        quad([[x, 0., 0.], [x, y, 0.], [x, y, z], [x, 0., z]]);
+        crate::mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn the_part_must_be_a_closed_solid() {
+        let (doc, mesh) = block();
+        assert!(report(&doc, &mesh).is_ok());
+        assert!(report(&doc, &box_mesh(false)).is_ok());
+        assert_eq!(
+            report(&doc, &box_mesh(true)).unwrap_err(),
+            "The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model."
+        );
     }
 }

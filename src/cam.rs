@@ -490,6 +490,20 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
         Ok(holes)
     }
 }
+/// How many hole openings `holes` would examine for this selection (0 on any error).
+pub(crate) fn hole_candidates(setup: &Setup, op: &Operation, mesh: &Mesh) -> usize {
+    let g = Geometry::new(setup, mesh);
+    if g.selected(op).is_empty() {
+        return 0;
+    }
+    g.silhouette(true, op).map_or(0, |region| {
+        let loops: Vec<Polygon> = region.into();
+        loops
+            .iter()
+            .filter(|p| area(p) < 0. && p.len() >= 8)
+            .count()
+    })
+}
 fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;
     if get(&tool.p, "type") != "Drill" {

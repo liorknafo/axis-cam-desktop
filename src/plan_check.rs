@@ -3,7 +3,7 @@
 //! coverage numbers come from the coarse stock grid and are approximate.
 use crate::{
     analysis::{self, Index, PartReport},
-    cam::{self, Geometry},
+    cam::Geometry,
     mesh::Mesh,
     model::Document,
     proposal::{self, Problem, Proposal},
@@ -81,35 +81,7 @@ impl PartGrid {
                 {
                     continue;
                 }
-                // Crossings of the vertical ray: height, and whether the face points up.
-                let mut hits: Vec<(f32, bool)> = index
-                    .near(xy)
-                    .filter_map(|t| {
-                        Some((cam::plane_height(&t.p, xy)?, analysis::normal(&t.p)[2] > 0.))
-                    })
-                    .collect();
-                hits.sort_by(|a, b| a.0.total_cmp(&b.0));
-                hits.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-4 && a.1 == b.1);
-                let mut spans = vec![];
-                let (mut depth, mut start, mut consistent) = (0i32, 0f32, true);
-                for (z, up) in &hits {
-                    if !*up {
-                        if depth == 0 {
-                            start = *z;
-                        }
-                        depth += 1;
-                    } else {
-                        depth -= 1;
-                        if depth == 0 {
-                            spans.push((start, *z));
-                        }
-                        consistent &= depth >= 0;
-                    }
-                }
-                if !consistent || depth != 0 {
-                    // Inconsistent face directions: fall back to crossing parity.
-                    spans = hits.chunks_exact(2).map(|c| (c[0].0, c[1].0)).collect();
-                }
+                let (Ok(spans) | Err(spans)) = analysis::column(&index, xy);
                 for z in 0..stock.n[2] {
                     let height = stock.point([x, y, z], 0.5)[2];
                     if spans.iter().any(|(a, b)| height > *a && height < *b) {

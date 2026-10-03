@@ -28,6 +28,9 @@ const CYCLES: [&str; 4] = [
 ];
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 const MAX_SETUPS: usize = 6;
+pub const MAX_SETUP_OPERATIONS: usize = 12;
+pub const MAX_OPERATIONS: usize = 40;
+const MAX_SURFACES: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,8 +158,22 @@ pub fn parse(text: &str) -> Result<Proposal, String> {
     serde_json::from_str(text.trim())
         .map_err(|e| format!("The proposal is not valid JSON for the schema: {e}"))
 }
-fn clip(text: &str, limit: usize) -> String {
-    text.split_whitespace()
+/// Invisible characters that can reorder or hide text (Unicode category Cf).
+fn format_character(c: char) -> bool {
+    matches!(c, '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}' | '\u{180e}'
+        | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0001}'
+        | '\u{e0020}'..='\u{e007f}')
+}
+/// One line of plain text: control and format characters removed, whitespace
+/// collapsed, at most `limit` characters.
+pub(crate) fn clip(text: &str, limit: usize) -> String {
+    let plain: String = text
+        .chars()
+        .filter(|c| !c.is_control() && !format_character(*c))
+        .collect();
+    plain
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
@@ -180,6 +197,15 @@ fn operation(
     fingerprint: &str,
 ) -> Result<Operation, Vec<String>> {
     let mut wrong = vec![];
+    if p.surfaces.len() > MAX_SURFACES {
+        wrong.push(format!(
+            "The surfaces list has {} IDs; at most {MAX_SURFACES} are allowed.",
+            p.surfaces.len()
+        ));
+    }
+    let mut ids = p.surfaces.clone();
+    ids.sort_unstable();
+    ids.dedup();
     let strategy = STRATEGIES
         .iter()
         .find(|(name, _)| *name == p.strategy)
@@ -194,13 +220,13 @@ fn operation(
     if tool.is_none() {
         wrong.push(format!("T{} is not in the tool library.", p.tool));
     }
-    if !(p.rpm > 0. && p.rpm <= report.machine.max_rpm) {
+    if !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
         wrong.push(format!(
-            "rpm {} is outside 1-{} for this machine.",
+            "rpm {} is outside 100-{} for this machine.",
             p.rpm, report.machine.max_rpm
         ));
     }
-    if !(p.feed > 0. && p.feed <= report.machine.max_feed) {
+    if !(p.feed >= 1. && p.feed <= report.machine.max_feed) {
         wrong.push(format!(
             "feed {} is outside 1-{} mm/min for this machine.",
             p.feed, report.machine.max_feed
@@ -243,7 +269,7 @@ fn operation(
             p.tool, p.strategy
         ));
     }
-    let plane = plane_of(orientation, &p.surfaces);
+    let plane = plane_of(orientation, &ids);
     let floor = strategy == Strategy::Pocket || (strategy == Strategy::Contour && inside);
     match strategy {
         Strategy::Face if !plane.is_some_and(|pl| pl.kind == "top") => wrong.push(format!(
@@ -271,21 +297,48 @@ fn operation(
             }
         },
         Strategy::Face | Strategy::Drill => {}
-        _ if !p.surfaces.is_empty() => wrong.push(format!(
+        _ if !ids.is_empty() => wrong.push(format!(
             "{} works on the whole model; its surfaces list must be empty.",
             p.strategy
         )),
         _ => {}
+    }
+    if strategy == Strategy::Drill && p.through == Some(true) {
+        // The holes the generator will drill: the plane's, narrowed by diameter.
+        let filter = p.hole_diameter.filter(|d| *d > 0.);
+        if let Some(blind) = plane
+            .iter()
+            .flat_map(|pl| &pl.holes)
+            .filter(|h| filter.is_none_or(|d| (h.diameter - d).abs() <= 0.11))
+            .find(|h| !h.through)
+        {
+            wrong.push(format!(
+                "through is true, but the selection includes a blind hole (diameter {} mm, depth {} mm). Set through to false, or use hole_diameter to select only through holes.",
+                blind.diameter, blind.depth
+            ));
+        }
+        let cap = num(&tool.p, "diameter").unwrap_or(0.) * 0.5 + 1.;
+        let breakthrough = p.breakthrough.unwrap_or(1.);
+        if !(breakthrough >= 0. && breakthrough <= cap + 0.0001) {
+            wrong.push(format!(
+                "breakthrough {breakthrough} mm is outside 0-{} mm for this drill (half its diameter plus 1 mm).",
+                (cap * 100.).round() / 100.
+            ));
+        }
+    }
+    let selection = (!ids.is_empty()).then(|| Selection {
+        mesh_fingerprint: fingerprint.into(),
+        ids,
+    });
+    if selection.as_ref().is_some_and(|s| !s.valid_structure()) {
+        wrong.push("The surfaces list is not valid for this model.".into());
     }
     if !wrong.is_empty() {
         return Err(wrong);
     }
     let mut op = Operation::new(strategy, tool.id.clone());
     op.geometry.clear();
-    op.surfaces = (!p.surfaces.is_empty()).then(|| Selection {
-        mesh_fingerprint: fingerprint.into(),
-        ids: p.surfaces.clone(),
-    });
+    op.surfaces = selection;
     let mut set = |key: &str, value: String| {
         op.p.insert(key.into(), value);
     };
@@ -405,6 +458,12 @@ pub fn build(
             proposal.setups.len()
         ));
     }
+    let total: usize = proposal.setups.iter().map(|s| s.operations.len()).sum();
+    if total > MAX_OPERATIONS {
+        whole(format!(
+            "The proposal has {total} operations; at most {MAX_OPERATIONS} are allowed."
+        ));
+    }
     let first = report.orientations.first().map(|o| o.up);
     if proposal
         .setups
@@ -458,6 +517,15 @@ pub fn build(
         if proposed.operations.is_empty() {
             wrong(None, "The setup has no operations.".into());
         }
+        if proposed.operations.len() > MAX_SETUP_OPERATIONS {
+            wrong(
+                None,
+                format!(
+                    "The setup has {} operations; at most {MAX_SETUP_OPERATIONS} are allowed.",
+                    proposed.operations.len()
+                ),
+            );
+        }
         let mut setup = if si == 0 {
             setup1.clone()
         } else {
@@ -479,7 +547,7 @@ pub fn build(
                 .insert("notes".into(), clip(&proposed.workholding, 500));
             setup
         };
-        if si > 0 || !clip(&proposed.name, 60).is_empty() {
+        if si > 0 {
             let name = clip(&proposed.name, 60);
             setup.p.insert(
                 "name".into(),
@@ -491,7 +559,12 @@ pub fn build(
             );
         }
         setup.operations.clear();
-        for (oi, op) in proposed.operations.iter().enumerate() {
+        for (oi, op) in proposed
+            .operations
+            .iter()
+            .take(MAX_SETUP_OPERATIONS)
+            .enumerate()
+        {
             match operation(op, orientation, report, &doc.tools, &mesh.fingerprint) {
                 Ok(op) => setup.operations.push(op),
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
@@ -726,6 +799,7 @@ pub(crate) mod tests {
             ops[1].name = "  A very long name ".repeat(10);
             ops[3].through = Some(true);
             ops[3].breakthrough = Some(1.5);
+            ops[3].hole_diameter = Some(6.6);
             let mut walls = op("Contour", 1, ids(&report, "+Z", 12.));
             walls.contour_mode = Some("inside_floor".into());
             ops.push(walls);
@@ -778,13 +852,15 @@ pub(crate) mod tests {
                 p(3, "cycle"),
                 p(3, "peck"),
                 p(3, "through"),
-                p(3, "breakthrough")
+                p(3, "breakthrough"),
+                p(3, "hole_diameter")
             ),
             (
                 "Deep drilling".into(),
                 "3".into(),
                 "Yes".into(),
-                "1.5".into()
+                "1.5".into(),
+                "6.6".into()
             )
         );
         assert_eq!(
@@ -868,7 +944,7 @@ pub(crate) mod tests {
         );
         refused(
             &|p| p.setups[0].operations[0].rpm = 20000.,
-            "rpm 20000 is outside 1-12000",
+            "rpm 20000 is outside 100-12000",
         );
         refused(
             &|p| p.setups[0].operations[0].feed = 0.,
@@ -924,5 +1000,200 @@ pub(crate) mod tests {
         let mut none = doc.clone();
         none.setups.clear();
         assert!(build(&none, &mesh, &report, &good(&report)).is_err());
+    }
+    #[test]
+    fn duplicate_surface_ids_are_merged_and_the_job_saves_and_reopens() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        let face = &mut proposal.setups[0].operations[0];
+        face.surfaces.reverse();
+        face.surfaces.push(face.surfaces[0]);
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        let mut ids = ids(&report, "+Z", 0.);
+        ids.sort();
+        assert_eq!(
+            built.setups[0].operations[0].surfaces.as_ref().unwrap().ids,
+            ids
+        );
+        assert!(built.validate_structure().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.axis.json");
+        crate::storage::save(&path, &built).unwrap();
+        let reopened = crate::storage::load(&path).unwrap();
+        assert_eq!(reopened.setups.len(), 2);
+        assert_eq!(
+            reopened.setups[0].operations[0]
+                .surfaces
+                .as_ref()
+                .unwrap()
+                .ids,
+            ids
+        );
+    }
+    #[test]
+    fn surface_lists_the_selection_rules_reject_are_refused() {
+        let (doc, mesh, mut report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[0].surfaces = (0..501).collect();
+        assert!(
+            messages(build(&doc, &mesh, &report, &proposal))
+                .iter()
+                .any(|m| m.starts_with("1/Some(1): ") && m.contains("501 IDs; at most 500")),
+        );
+        // An ID the saved project's selection rules reject, even if a report lists it.
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[0].surfaces.push(250_000);
+        report.orientations[0]
+            .planes
+            .iter_mut()
+            .find(|p| p.kind == "top")
+            .unwrap()
+            .surfaces
+            .push(250_000);
+        assert_eq!(
+            messages(build(&doc, &mesh, &report, &proposal)),
+            vec!["1/Some(1): The surfaces list is not valid for this model."]
+        );
+    }
+    #[test]
+    fn through_drilling_needs_through_holes_and_a_bounded_breakthrough() {
+        let (doc, mesh, report) = block();
+        let drill = |edit: &dyn Fn(&mut ProposedOp)| {
+            let mut proposal = good(&report);
+            edit(&mut proposal.setups[0].operations[3]);
+            build(&doc, &mesh, &report, &proposal)
+        };
+        // The top plane has a blind Ø6 × 8 hole among four through holes.
+        assert_eq!(
+            messages(drill(&|d| d.through = Some(true))),
+            vec![
+                "1/Some(4): through is true, but the selection includes a blind hole (diameter 6 mm, depth 8 mm). Set through to false, or use hole_diameter to select only through holes."
+            ]
+        );
+        assert!(
+            messages(drill(&|d| {
+                d.through = Some(true);
+                d.hole_diameter = Some(6.);
+            }))[0]
+                .contains("blind hole")
+        );
+        let built = drill(&|d| {
+            d.through = Some(true);
+            d.hole_diameter = Some(6.6);
+        })
+        .unwrap();
+        assert_eq!(get(&built.setups[0].operations[3].p, "through"), "Yes");
+        // T3 is Ø4: breakthrough up to 3 mm; null means the default of 1.
+        for (breakthrough, ok) in [
+            (None, true),
+            (Some(3.), true),
+            (Some(3.5), false),
+            (Some(-0.5), false),
+        ] {
+            let result = drill(&|d| {
+                d.through = Some(true);
+                d.hole_diameter = Some(6.6);
+                d.breakthrough = breakthrough;
+            });
+            assert_eq!(result.is_ok(), ok, "{breakthrough:?}");
+            if !ok {
+                assert_eq!(
+                    messages(result),
+                    vec![format!(
+                        "1/Some(4): breakthrough {} mm is outside 0-3 mm for this drill (half its diameter plus 1 mm).",
+                        breakthrough.unwrap()
+                    )]
+                );
+            }
+        }
+        // Without through, breakthrough is not used.
+        assert!(drill(&|d| d.breakthrough = Some(30.)).is_ok());
+    }
+    #[test]
+    fn speeds_and_feeds_have_floors() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[0].rpm = 50.;
+        proposal.setups[0].operations[1].feed = 0.5;
+        assert_eq!(
+            messages(build(&doc, &mesh, &report, &proposal)),
+            vec![
+                "1/Some(1): rpm 50 is outside 100-12000 for this machine.",
+                "1/Some(2): feed 0.5 is outside 1-5000 mm/min for this machine."
+            ]
+        );
+        proposal.setups[0].operations[0].rpm = 100.;
+        proposal.setups[0].operations[1].feed = 1.;
+        assert!(build(&doc, &mesh, &report, &proposal).is_ok());
+    }
+    #[test]
+    fn operation_counts_are_limited_per_setup_and_in_total() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        let face = proposal.setups[0].operations[0].clone();
+        proposal.setups[0]
+            .operations
+            .resize(MAX_SETUP_OPERATIONS + 1, face.clone());
+        let found = messages(build(&doc, &mesh, &report, &proposal));
+        assert_eq!(
+            found,
+            vec!["1/None: The setup has 13 operations; at most 12 are allowed."]
+        );
+        let mut proposal = good(&report);
+        for up in ["+X", "-X"] {
+            let mut setup = proposal.setups[1].clone();
+            setup.orientation = up.into();
+            proposal.setups.push(setup);
+        }
+        for (setup, n) in proposal.setups.iter_mut().zip([12, 12, 12, 5]) {
+            setup.operations.resize(n, face.clone());
+        }
+        let found = messages(build(&doc, &mesh, &report, &proposal));
+        assert!(
+            found.contains(
+                &"0/None: The proposal has 41 operations; at most 40 are allowed.".to_string()
+            ),
+            "{found:?}"
+        );
+        assert!(found.iter().all(|m| !m.contains("operations; at most 12")));
+    }
+    #[test]
+    fn names_and_notes_lose_control_and_format_characters() {
+        assert_eq!(
+            clip(
+                "a\u{0}b\u{1b}[2J\u{202e}c \u{200b}d\u{feff}  e\u{e0041}",
+                60
+            ),
+            "ab[2Jc d e"
+        );
+        assert_eq!(
+            clip(
+                "\u{ad}\u{600}\u{61c}\u{6dd}\u{70f}\u{180e}\u{2060}\u{2066}\u{206f}\u{fff9}\u{e0001}x",
+                60
+            ),
+            "x"
+        );
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[1].name = "Under)\u{0}\u{1b}[2J\u{202e}side (G0 Z-50".into();
+        proposal.setups[1].workholding = "Vise\u{7}  on\u{2028}the walls\u{200f}.".into();
+        proposal.setups[0].operations[0].name = "\u{202d}Face\u{9d} top".into();
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        assert_eq!(get(&built.setups[1].p, "name"), "Under)[2Jside (G0 Z-50");
+        assert_eq!(get(&built.setups[1].p, "notes"), "Vise on the walls.");
+        assert_eq!(get(&built.setups[0].operations[0].p, "name"), "Face top");
+    }
+    #[test]
+    fn setup_one_keeps_the_users_name() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[0].name = "Planner top".into();
+        proposal.setups[1].name = String::new();
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        assert_eq!(
+            get(&built.setups[0].p, "name"),
+            get(&doc.setups[0].p, "name")
+        );
+        assert_eq!(get(&built.setups[1].p, "name"), "Setup 2");
     }
 }
