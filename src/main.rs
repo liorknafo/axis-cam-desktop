@@ -63,6 +63,8 @@ pub enum Account {
     },
 }
 const NO_MODELS: &str = "Your ChatGPT plan lists no models for this app.";
+const NOT_GRANTED: &str =
+    "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.";
 #[derive(Debug, Clone)]
 pub enum Message {
     NewProject,
@@ -723,7 +725,7 @@ impl App {
         ));
         self.client = Some(client);
         if !granted {
-            self.account_note = "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.".into();
+            self.account_note = NOT_GRANTED.into();
             return Task::none();
         }
         self.account_note.clear();
@@ -2001,8 +2003,8 @@ impl App {
                 if self.account_busy || self.settings.model.is_empty() {
                     return Task::none();
                 }
+                // The panel says "Checking the connection…" itself while busy.
                 self.account_busy = true;
-                self.account_note = "Checking the connection…".into();
                 let (model, epoch) = (self.settings.model.clone(), self.account_epoch);
                 return Task::perform(async move { client.check(&model).await }, move |result| {
                     Message::ConnectionChecked(epoch, result)
@@ -2034,7 +2036,8 @@ impl App {
                 self.account_busy = false;
                 self.usage_limit = false;
                 self.models.clear();
-                self.account_note = "Signed out.".into();
+                // The panel says "Signing out…" by itself until the delete ends.
+                self.account_note.clear();
                 if let Some(client) = client {
                     return Task::perform(
                         async move { client.sign_out().await },
@@ -2042,7 +2045,10 @@ impl App {
                     );
                 }
             }
-            Message::SignedOut(Ok(())) => self.sign_out_pending = false,
+            Message::SignedOut(Ok(())) => {
+                self.sign_out_pending = false;
+                self.account_note = "Signed out.".into();
+            }
             Message::SignedOut(Err(e)) => {
                 self.sign_out_pending = false;
                 self.account_note = e;

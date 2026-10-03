@@ -2093,12 +2093,17 @@ fn account_panel(app: &App) -> Element<'_, Message> {
     use crate::Account;
     let manage = || Message::OpenUrl(crate::openai::USAGE_URL);
     let mut c = column![bold("ChatGPT account", 18)].spacing(12);
+    // Without plan usage the note says what to do next, so it sits above
+    // Sign out; everywhere else the note closes the panel.
+    let note_above = matches!(app.account, Account::SignedIn { granted: false, .. })
+        && !app.usage_limit
+        && !app.account_note.is_empty();
     match &app.account {
         Account::SignedOut if app.sign_out_pending => c = c.push(muted("Signing out…")),
         Account::SignedOut => {
             c = c
-                .push(muted("Sign in to plan with your ChatGPT plan. AXIS CAM Studio receives your name, email and profile picture. Planning requests count against your ChatGPT plan."))
-                .push(primary("Continue with ChatGPT", Message::SignIn).width(Fill));
+                .push(primary("Continue with ChatGPT", Message::SignIn).width(Fill))
+                .push(muted("Sign in to plan with your ChatGPT plan. AXIS CAM Studio receives your name, email and profile picture. Planning requests count against your ChatGPT plan."));
         }
         Account::SigningIn if app.saving_sign_in() => {
             c = c.push(muted("Finishing sign-in…"));
@@ -2108,30 +2113,35 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                 .push(muted("Waiting for sign-in in your browser…"))
                 .push(btn("Cancel", Message::SignInCancel, false));
         }
-        Account::SignedIn { .. } if !app.settings.plan_notice_shown => {
-            c = c.push(
-                container(
-                    column![
-                        bold("You're using your ChatGPT plan", 15),
-                        text("Eligible AI requests in this app use your ChatGPT plan. Manage usage in your ChatGPT settings.").size(12),
-                        primary("Got it", Message::PlanNoticeDismissed)
-                    ]
-                    .spacing(10),
-                )
-                .padding(14)
-                .width(Fill)
-                .style(panel_style),
-            );
-        }
         Account::SignedIn {
             name,
             email,
             granted,
         } => {
+            // The once-only notice is for a session that really uses the plan.
+            if *granted && !app.settings.plan_notice_shown {
+                c = c.push(
+                    container(
+                        column![
+                            bold("You're using your ChatGPT plan", 15),
+                            text("Eligible AI requests in this app use your ChatGPT plan. Manage usage in your ChatGPT settings.").size(12),
+                            primary("Got it", Message::PlanNoticeDismissed)
+                        ]
+                        .spacing(10),
+                    )
+                    .padding(14)
+                    .width(Fill)
+                    .style(panel_style),
+                );
+            }
             let title = if name.is_empty() { email } else { name };
-            c = c
-                .push(column![bold(title.as_str(), 14), muted(email.clone())].spacing(3))
-                .push(
+            let mut who = column![bold(title.as_str(), 14)].spacing(3);
+            if !name.is_empty() {
+                who = who.push(muted(email.clone()));
+            }
+            c = c.push(who);
+            if *granted {
+                c = c.push(
                     row![
                         muted("Using ChatGPT plan"),
                         btn("Manage usage", manage(), false)
@@ -2139,17 +2149,10 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                     .spacing(8)
                     .align_y(Alignment::Center),
                 );
-            if *granted && app.models.is_empty() {
-                c = c.push(btn("Load models", Message::LoadModels, false).width(Fill));
-            }
-            if *granted && !app.models.is_empty() {
-                let check = if app.account_busy {
-                    "Checking…"
+                if app.models.is_empty() {
+                    c = c.push(btn("Load models", Message::LoadModels, false).width(Fill));
                 } else {
-                    "Check connection"
-                };
-                c = c
-                    .push(
+                    c = c.push(
                         column![
                             muted("Model"),
                             pick_list(
@@ -2162,8 +2165,16 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                             .text_size(13)
                         ]
                         .spacing(5),
-                    )
-                    .push(btn(check, Message::CheckConnection, false).width(Fill));
+                    );
+                    c = if app.account_busy {
+                        c.push(muted("Checking the connection…"))
+                    } else {
+                        c.push(btn("Check connection", Message::CheckConnection, false).width(Fill))
+                    };
+                }
+            }
+            if note_above {
+                c = c.push(note(app.account_note.clone()));
             }
             c = c.push(btn("Sign out", Message::SignOut, false).width(Fill));
         }
@@ -2172,7 +2183,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
         c = c
             .push(bold("Usage limit reached", 13))
             .push(primary("Manage usage", manage()).width(Fill));
-    } else if !app.account_note.is_empty() {
+    } else if !note_above && !app.account_note.is_empty() {
         c = c.push(note(app.account_note.clone()));
     }
     c.into()

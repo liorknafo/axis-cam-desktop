@@ -94,6 +94,7 @@ impl App {
                 100 => "77-back-to-machining".into(),
                 101 => "78-chatgpt-notice".into(),
                 102 => "79-chatgpt-signed-in".into(),
+                103 => "80-chatgpt-not-granted".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -617,6 +618,17 @@ impl App {
                 vec![Message::Page(Page::Ai)]
             }
             102 => vec![Message::PlanNoticeDismissed],
+            103 => {
+                self.account = crate::Account::SignedIn {
+                    name: "Lior".into(),
+                    email: "lior@example.com".into(),
+                    granted: false,
+                };
+                self.account_note = crate::NOT_GRANTED.into();
+                // The once-only notice must stay hidden without plan usage.
+                self.settings.plan_notice_shown = false;
+                vec![]
+            }
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());
@@ -1444,7 +1456,8 @@ mod tests {
         assert!(a.models.is_empty());
         let _ = a.update(Message::SignOut);
         assert_eq!(a.account, crate::Account::SignedOut);
-        assert_eq!(a.account_note, "Signed out.");
+        // The panel says "Signing out…" while the old sign-in is deleted.
+        assert!(a.account_note.is_empty());
         // Signing in again waits until the old sign-in has been deleted.
         assert!(a.sign_out_pending && !a.account_busy);
         let _ = a.update(Message::SignIn);
@@ -1501,7 +1514,7 @@ mod tests {
         assert!(a.account_busy);
         let _ = a.update(Message::SignOut);
         assert!(a.account_epoch != old);
-        assert_eq!(a.account_note, "Signed out.");
+        assert!(a.account_note.is_empty());
         assert!(!a.account_busy && !a.usage_limit);
         let late = [
             Message::ConnectionChecked(old, Err(ApiError::UsageLimit)),
@@ -1514,7 +1527,7 @@ mod tests {
         for message in late {
             assert_eq!(a.update(message).units(), 0);
             assert_eq!(a.account, crate::Account::SignedOut);
-            assert_eq!(a.account_note, "Signed out.");
+            assert!(a.account_note.is_empty());
             assert!(!a.account_busy && !a.usage_limit && a.models.is_empty());
             assert!(a.sign_out_pending);
         }
@@ -1578,7 +1591,7 @@ mod tests {
         let late = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
         assert_eq!(a.update(late).units(), 1, "revoked, not adopted");
         assert_eq!(a.account, crate::Account::SignedOut);
-        assert_eq!(a.account_note, "Signed out.");
+        assert!(a.account_note.is_empty());
         assert!(a.settings.client_id.is_empty() && a.client.is_none());
     }
     #[test]
@@ -1775,6 +1788,96 @@ mod tests {
             crate::Account::SignedIn { granted: true, .. }
         ));
         assert!(a.client.is_some());
+    }
+    #[test]
+    fn the_sign_out_note_says_nothing_while_waiting_and_confirms_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        a.account_note = "An earlier note.".into();
+        // The panel shows "Signing out…" by itself while the delete runs.
+        assert_eq!(a.update(Message::SignOut).units(), 1);
+        assert!(a.sign_out_pending && a.account_note.is_empty());
+        let _ = a.update(Message::SignedOut(Ok(())));
+        assert!(!a.sign_out_pending);
+        assert_eq!(a.account_note, "Signed out.");
+        // A failed delete says why instead.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let _ = a.update(Message::SignOut);
+        assert!(a.account_note.is_empty());
+        let failed = "Signed out on this computer. Could not reach OpenAI.".to_string();
+        let _ = a.update(Message::SignedOut(Err(failed.clone())));
+        assert!(!a.sign_out_pending);
+        assert_eq!(a.account_note, failed);
+    }
+    #[test]
+    fn a_connection_check_marks_the_account_busy_and_leaves_the_note_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let epoch = a.account_epoch;
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec!["gpt-6.1-sol".into()])));
+        a.account_note = "An earlier note.".into();
+        // The panel shows "Checking the connection…" itself; the note does not repeat it.
+        assert_eq!(a.update(Message::CheckConnection).units(), 1);
+        assert!(a.account_busy);
+        assert_eq!(a.account_note, "An earlier note.");
+        // A second press while the check runs does nothing.
+        assert_eq!(a.update(Message::CheckConnection).units(), 0);
+        let _ = a.update(Message::ConnectionChecked(
+            epoch,
+            Ok("Connection works.".into()),
+        ));
+        assert!(!a.account_busy);
+        assert_eq!(a.account_note, "Connection works.");
+    }
+    #[test]
+    fn the_planner_page_builds_in_every_account_state() {
+        use crate::openai::ApiError;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.page = Page::Ai;
+        let _ = a.view(); // signed out
+        let _ = a.update(Message::SignIn);
+        let _ = a.view(); // browser step
+        let result = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        let _ = a.update(result);
+        assert!(a.saving_sign_in());
+        let _ = a.view(); // save step
+        let _ = a.update(Message::SessionSaved(Ok(crate::session::sample())));
+        assert!(!a.settings.plan_notice_shown);
+        let epoch = a.account_epoch;
+        let _ = a.view(); // granted, models not loaded yet, notice showing
+        let listed = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".to_string()];
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(listed)));
+        let _ = a.view(); // granted with the notice and the model list
+        let _ = a.update(Message::PlanNoticeDismissed);
+        let _ = a.view(); // granted after the notice
+        let _ = a.update(Message::CheckConnection);
+        assert!(a.account_busy);
+        let _ = a.view(); // checking
+        let _ = a.update(Message::ConnectionChecked(epoch, Err(ApiError::UsageLimit)));
+        assert!(a.usage_limit);
+        let _ = a.view(); // usage limit
+        a.account = crate::Account::SignedIn {
+            name: String::new(),
+            email: "lior@example.com".into(),
+            granted: true,
+        };
+        let _ = a.view(); // no name: the email is the title
+        let _ = a.update(Message::SignOut);
+        assert!(a.sign_out_pending);
+        let _ = a.view(); // signing out
+        let _ = a.update(Message::SignedOut(Ok(())));
+        let _ = a.view(); // signed out again, with the note
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = fresh_app(&dir);
+        b.page = Page::Ai;
+        sign_in_with(&mut b, &dir, without_plan_usage());
+        assert!(matches!(
+            b.account,
+            crate::Account::SignedIn { granted: false, .. }
+        ));
+        let _ = b.view(); // plan usage not granted
     }
     #[test]
     fn signing_out_during_the_save_step_changes_nothing() {

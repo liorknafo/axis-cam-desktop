@@ -403,7 +403,7 @@ pub fn command(m: &Message, label: String) -> Help {
         LoadModels => "Ask OpenAI again which models your ChatGPT plan can use in this app.",
         PlanNoticeDismissed => "Close this notice. It is shown once.",
         OpenUrl(_) => {
-            "Open your ChatGPT usage settings in the browser, where you can see and limit how much of your plan this app may use."
+            "Open your ChatGPT usage settings in the browser, where you can see and manage how much of your plan this app uses."
         }
         _ => "Change this setting in the current workspace.",
     };
