@@ -763,11 +763,14 @@ mod tests {
         }
     }
     fn app() -> App {
-        let mut a = App::new();
+        // Root the app in its own folder, not the real workspace folder:
+        // settings and the saved sign-in live beside the workspace file.
+        let dir = std::env::temp_dir().join(format!("axis-test-{}", id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = App::from_workspace(dir.join("workspace.json"), None);
         a.doc = Document::sample();
         a.selected = Some(0);
         a.page = Page::Work;
-        a.state_path = std::env::temp_dir().join(format!("axis-test-{}.json", id()));
         a
     }
     fn imported_app() -> App {
@@ -1301,5 +1304,118 @@ mod tests {
         assert!(a.post.as_ref().is_none_or(|j| !j.setups.is_empty()));
         let _ = a.update(Message::NewTool);
         assert_eq!(a.tool_draft.number(), Some(4));
+    }
+    fn signed_in_app(dir: &tempfile::TempDir) -> App {
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let session = crate::session::sample();
+        let _ = a.update(Message::SignedIn(Ok((session, "oaiapp_1".into()))));
+        a
+    }
+    #[test]
+    fn signing_in_saves_the_client_and_session_but_never_tokens_in_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = signed_in_app(&dir);
+        assert_eq!(
+            a.account,
+            crate::Account::SignedIn {
+                name: "Lior".into(),
+                email: "lior@example.com".into(),
+                granted: true
+            }
+        );
+        let settings = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(settings.contains("oaiapp_1"));
+        assert!(!settings.contains("access-1") && !settings.contains("refresh-1"));
+        let saved = std::fs::read_to_string(dir.path().join("chatgpt-session.json")).unwrap();
+        assert!(saved.contains("refresh-1"));
+        let reopened = App::from_workspace(dir.path().join("workspace.json"), None);
+        assert_eq!(reopened.settings.client_id, "oaiapp_1");
+        assert_eq!(reopened.account, crate::Account::SignedOut);
+    }
+    #[test]
+    fn account_messages_drive_the_panel_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let _ = a.update(Message::SignIn);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        let _ = a.update(Message::SignInCancel);
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert_eq!(a.account_note, "Sign-in cancelled.");
+        let _ = a.update(Message::SignedIn(Err(
+            "Sign-in timed out. Try again.".into()
+        )));
+        assert_eq!(a.account_note, "Sign-in timed out. Try again.");
+        let mut a = signed_in_app(&dir);
+        let listed = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".to_string()];
+        let _ = a.update(Message::ModelsLoaded(Ok(listed)));
+        assert_eq!(a.settings.model, "gpt-6.1-sol");
+        let _ = a.update(Message::PickModel("gpt-6-luna".into()));
+        let _ = a.update(Message::PickModel("not-listed".into()));
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        let _ = a.update(Message::ModelsLoaded(Ok(vec!["gpt-6-luna".into()])));
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        let _ = a.update(Message::CheckConnection);
+        assert!(a.account_busy);
+        let limit = crate::openai::ApiError::UsageLimit;
+        let _ = a.update(Message::ConnectionChecked(Err(limit)));
+        assert!(a.usage_limit && !a.account_busy);
+        assert!(a.account_note.contains("Usage limit reached"));
+        let _ = a.update(Message::ConnectionChecked(Ok("Connection works.".into())));
+        assert!(!a.usage_limit);
+        assert_eq!(a.account_note, "Connection works.");
+        assert!(!a.settings.plan_notice_shown);
+        let _ = a.update(Message::PlanNoticeDismissed);
+        assert!(crate::settings::load(&dir.path().join("settings.json")).plan_notice_shown);
+        let gone = crate::openai::ApiError::SignedOut("Sign in again.".into());
+        let _ = a.update(Message::ModelsLoaded(Err(gone)));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert!(a.models.is_empty());
+        assert_eq!(a.account_note, "Sign in again.");
+    }
+    #[test]
+    fn a_session_without_plan_usage_is_signed_in_but_not_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let session = crate::session::Session {
+            scope: "openid profile email".into(),
+            ..crate::session::sample()
+        };
+        let _ = a.update(Message::SignedIn(Ok((session, "oaiapp_1".into()))));
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: false, .. }
+        ));
+        assert!(a.account_note.contains("not granted"));
+        assert!(a.models.is_empty());
+        let _ = a.update(Message::SignOut);
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert_eq!(a.account_note, "Signed out.");
+        // Signing in again waits until the old sign-in has been deleted.
+        assert!(a.account_busy);
+        let _ = a.update(Message::SignIn);
+        assert_eq!(a.account, crate::Account::SignedOut);
+        let failed = "Signed out on this computer. Could not reach OpenAI.".to_string();
+        let _ = a.update(Message::SignedOut(Err(failed.clone())));
+        assert!(!a.account_busy);
+        assert_eq!(a.account_note, failed);
+        let _ = a.update(Message::SignIn);
+        assert_eq!(a.account, crate::Account::SigningIn);
+    }
+    #[test]
+    fn the_saved_session_is_adopted_when_the_planner_page_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = signed_in_app(&dir);
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let _ = a.update(Message::Page(Page::Ai));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        // Unit tests do not run tasks; deliver the restore result directly.
+        let saved = crate::session::default_store(dir.path(), true).load();
+        let _ = a.update(Message::AccountRestored(saved));
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        let _ = a.update(Message::AccountRestored(Err("Keychain: denied".into())));
+        assert_eq!(a.account_note, "Keychain: denied");
     }
 }
