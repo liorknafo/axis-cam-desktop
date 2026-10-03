@@ -623,29 +623,31 @@ pub async fn sign_in(
     let session = exchange(http, e, &client_id, &callback.code, &attempt).await?;
     Ok((session, client_id))
 }
-/// `sign_in`, then saves the new session through `store` on the blocking
-/// pool (the Keychain can wait on a prompt). If it cannot be saved, the new
-/// refresh token is revoked at once, so no sign-in exists that the app has
-/// lost; the revoke is best-effort because the save failure is what the user
-/// needs to hear about.
-pub async fn sign_in_and_save(
-    http: &reqwest::Client,
-    e: &Endpoints,
-    settings: &Settings,
+/// Revokes a refresh token nobody will use, without waiting on the outcome
+/// mattering: the user has nothing to do about a failed revoke.
+pub async fn revoke_unused(e: &Endpoints, client_id: &str, refresh_token: &str) {
+    let http = http_client(Duration::from_secs(30));
+    let _ = revoke(&http, e, client_id, refresh_token).await;
+}
+/// The second step of signing in, which must not be cancelled half way: saves
+/// the new session through `store` on the blocking pool (the Keychain can wait
+/// on a prompt). If it cannot be saved, the new refresh token is revoked at
+/// once, so no sign-in exists that the app has lost.
+pub async fn save_session(
     store: Arc<dyn SessionStore>,
-    limit: Duration,
-    open: impl FnOnce(&str) -> Result<(), String>,
-) -> Result<(Session, String), String> {
-    let (session, client_id) = sign_in(http, e, settings, None, limit, open).await?;
+    e: Endpoints,
+    client_id: String,
+    session: Session,
+) -> Result<Session, String> {
     let to_save = session.clone();
     let saved = tokio::task::spawn_blocking(move || store.save(&to_save))
         .await
         .unwrap_or_else(|_| Err("the session store stopped unexpectedly".into()));
     if let Err(error) = saved {
-        let _ = revoke(http, e, &client_id, &session.refresh_token).await;
+        revoke_unused(&e, &client_id, &session.refresh_token).await;
         return Err(format!("Could not save the ChatGPT sign-in: {error}"));
     }
-    Ok((session, client_id))
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -850,46 +852,41 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn the_new_sign_in_is_saved_off_the_async_thread_before_it_is_reported() {
-        let id_claims = Arc::new(Mutex::new(json!({})));
-        let fake = server(id_claims.clone()).await;
+    async fn the_new_session_is_saved_off_the_async_thread() {
+        let fake = Fake::start(|_| Resp::json(200, json!({}))).await;
         let store = Arc::new(RecordingStore {
             fail: false,
             saved: Mutex::new(vec![]),
         });
-        let (session, client_id) = sign_in_and_save(
-            &reqwest::Client::new(),
-            &Endpoints::local(&fake.base),
-            &settings("oaiapp_saved"),
+        let session = crate::session::sample();
+        let saved = save_session(
             store.clone(),
-            Duration::from_secs(5),
-            browser("", id_claims, "oaiapp_saved"),
+            Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            session.clone(),
         )
         .await
         .unwrap();
-        assert_eq!(client_id, "oaiapp_saved");
-        let saved = store.saved.lock().unwrap();
-        assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].0, session);
+        assert_eq!(saved, session);
+        let writes = store.saved.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, session);
         // The test runs on one thread; the save must not.
-        assert_ne!(saved[0].1, std::thread::current().id());
+        assert_ne!(writes[0].1, std::thread::current().id());
         assert!(fake.seen("/revoke").is_empty());
     }
     #[tokio::test]
-    async fn a_sign_in_that_cannot_be_saved_is_revoked_and_reported() {
-        let id_claims = Arc::new(Mutex::new(json!({})));
-        let fake = server(id_claims.clone()).await;
+    async fn a_session_that_cannot_be_saved_is_revoked_and_reported() {
+        let fake = Fake::start(|_| Resp::json(200, json!({}))).await;
         let store = Arc::new(RecordingStore {
             fail: true,
             saved: Mutex::new(vec![]),
         });
-        let error = sign_in_and_save(
-            &reqwest::Client::new(),
-            &Endpoints::local(&fake.base),
-            &settings("oaiapp_saved"),
+        let error = save_session(
             store.clone(),
-            Duration::from_secs(5),
-            browser("", id_claims, "oaiapp_saved"),
+            Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            crate::session::sample(),
         )
         .await
         .unwrap_err();
@@ -901,7 +898,7 @@ mod tests {
         let revoked = fake.seen("/revoke");
         assert_eq!(revoked.len(), 1);
         assert_eq!(revoked[0].field("token"), "refresh-1");
-        assert_eq!(revoked[0].field("client_id"), "oaiapp_saved");
+        assert_eq!(revoked[0].field("client_id"), "oaiapp_1");
         assert_eq!(revoked[0].field("token_type_hint"), "refresh_token");
     }
     #[tokio::test]

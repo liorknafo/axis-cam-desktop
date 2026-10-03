@@ -144,6 +144,8 @@ pub enum Message {
     SignIn,
     SignInCancel,
     SignedIn(Result<(session::Session, String), String>),
+    /// The result of saving a finished sign-in; see `oauth::save_session`.
+    SessionSaved(Result<session::Session, String>),
     SignOut,
     SignedOut(Result<(), String>),
     /// The first value is the `account_epoch` of the client that asked.
@@ -183,6 +185,9 @@ pub struct App {
     pub account_note: String,
     /// A connection check is running.
     pub account_busy: bool,
+    /// Why the new sign-in's client ID could not be remembered, until the
+    /// sign-in is finished and can say so.
+    settings_failure: Option<String>,
     /// The saved sign-in is still being deleted; signing in waits for it.
     pub sign_out_pending: bool,
     /// Changes whenever the client does, so results of an earlier client's
@@ -329,6 +334,7 @@ impl App {
             account: Account::SignedOut,
             account_note: String::new(),
             account_busy: false,
+            settings_failure: None,
             sign_out_pending: false,
             account_epoch: 0,
             usage_limit: false,
@@ -1858,16 +1864,15 @@ impl App {
                 self.account = Account::SigningIn;
                 self.account_note.clear();
                 let (endpoints, settings) = (self.endpoints.clone(), self.settings.clone());
-                let store = self.store.clone();
                 let (task, handle) = Task::perform(
                     async move {
                         let http = oauth::http_client(Duration::from_secs(60));
                         let limit = Duration::from_secs(300);
-                        oauth::sign_in_and_save(
+                        oauth::sign_in(
                             &http,
                             &endpoints,
                             &settings,
-                            store,
+                            None,
                             limit,
                             oauth::open_browser,
                         )
@@ -1880,30 +1885,70 @@ impl App {
                 return task;
             }
             Message::SignInCancel => {
-                if let Some(handle) = self.sign_in.take() {
-                    handle.abort();
-                }
+                // Only the browser step can be cancelled. Once the sign-in
+                // is being saved there is no handle, and the save finishes.
+                let Some(handle) = self.sign_in.take() else {
+                    return Task::none();
+                };
+                handle.abort();
                 if self.account == Account::SigningIn {
                     self.account = Account::SignedOut;
                     self.account_note = "Sign-in cancelled.".into();
                 }
             }
-            // Only a sign-in that is still waiting can be finished.
-            Message::SignedIn(_) if self.account != Account::SigningIn => {}
+            // A sign-in nobody is waiting for any more: its refresh token
+            // was never saved, so revoke it instead of leaving it valid.
+            Message::SignedIn(Ok((session, client_id))) if self.account != Account::SigningIn => {
+                let endpoints = self.endpoints.clone();
+                return Task::perform(
+                    async move {
+                        oauth::revoke_unused(&endpoints, &client_id, &session.refresh_token).await
+                    },
+                    |()| Message::Noop,
+                );
+            }
+            Message::SignedIn(Err(_)) if self.account != Account::SigningIn => {}
+            // The browser step is done. Saving is a step of its own that
+            // cannot be cancelled, so a cancel can never land in the middle
+            // of it; the account shows nothing until it reports.
             Message::SignedIn(Ok((session, client_id))) => {
                 self.sign_in = None;
-                self.settings.client_id = client_id;
-                // The session itself was saved by the sign-in task.
-                let saved = self.write_settings();
-                let task = self.adopt_session(session);
-                if let Err(e) = saved {
-                    self.account_note =
-                        format!("Signed in for this session, but settings could not be saved: {e}");
-                }
-                return task;
+                self.settings.client_id = client_id.clone();
+                self.settings_failure = self.write_settings().err();
+                return Task::perform(
+                    oauth::save_session(
+                        self.store.clone(),
+                        self.endpoints.clone(),
+                        client_id,
+                        session,
+                    ),
+                    Message::SessionSaved,
+                );
             }
             Message::SignedIn(Err(e)) => {
                 self.sign_in = None;
+                self.account = Account::SignedOut;
+                self.account_note = e;
+            }
+            // Only the save step of a sign-in can report a save.
+            Message::SessionSaved(_)
+                if self.account != Account::SigningIn || self.sign_in.is_some() => {}
+            Message::SessionSaved(Ok(session)) => {
+                let settings_failure = self.settings_failure.take();
+                let task = self.adopt_session(session);
+                if let Some(e) = settings_failure {
+                    let sentence =
+                        format!("Signed in for this session, but settings could not be saved: {e}");
+                    self.account_note = if self.account_note.is_empty() {
+                        sentence
+                    } else {
+                        format!("{} {sentence}", self.account_note)
+                    };
+                }
+                return task;
+            }
+            Message::SessionSaved(Err(e)) => {
+                self.settings_failure = None;
                 self.account = Account::SignedOut;
                 self.account_note = e;
             }

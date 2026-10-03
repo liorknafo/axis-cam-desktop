@@ -1308,14 +1308,38 @@ mod tests {
     fn fresh_app(dir: &tempfile::TempDir) -> App {
         App::from_workspace(dir.path().join("workspace.json"), None)
     }
-    /// Plays a finished sign-in. The sign-in task saves the session before it
-    /// reports back, and unit tests do not run tasks, so the save happens here.
+    /// Plays a whole sign-in: the browser result, then the save step's result.
+    /// The save step writes the session before it reports, and unit tests do
+    /// not run tasks, so the write happens here.
     fn sign_in_with(a: &mut App, dir: &tempfile::TempDir, session: crate::session::Session) {
         crate::session::default_store(dir.path(), true)
             .save(&session)
             .unwrap();
         let _ = a.update(Message::SignIn);
-        let _ = a.update(Message::SignedIn(Ok((session, "oaiapp_1".into()))));
+        let _ = a.update(Message::SignedIn(Ok((session.clone(), "oaiapp_1".into()))));
+        let _ = a.update(Message::SessionSaved(Ok(session)));
+    }
+    /// What a message that must be ignored may not change.
+    fn snapshot(
+        a: &App,
+    ) -> (
+        crate::Account,
+        Option<usize>,
+        Vec<String>,
+        String,
+        String,
+        u64,
+    ) {
+        (
+            a.account.clone(),
+            a.client
+                .as_ref()
+                .map(|c| std::sync::Arc::as_ptr(c) as usize),
+            a.models.clone(),
+            a.settings.model.clone(),
+            a.account_note.clone(),
+            a.account_epoch,
+        )
     }
     fn signed_in_app(dir: &tempfile::TempDir) -> App {
         let mut a = fresh_app(dir);
@@ -1515,16 +1539,15 @@ mod tests {
         let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
         let _ = a.update(Message::SignInCancel);
-        let _ = a.update(Message::SignedIn(Ok((
-            crate::session::sample(),
-            "oaiapp_1".into(),
-        ))));
+        // The result is not used, but its refresh token is revoked: one task.
+        let late = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        assert_eq!(a.update(late).units(), 1);
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Sign-in cancelled.");
         assert!(a.settings.client_id.is_empty() && a.models.is_empty());
-        let _ = a.update(Message::SignedIn(Err(
-            "Sign-in timed out. Try again.".into()
-        )));
+        assert!(a.client.is_none());
+        let late = Message::SignedIn(Err("Sign-in timed out. Try again.".into()));
+        assert_eq!(a.update(late).units(), 0);
         assert_eq!(a.account_note, "Sign-in cancelled.");
     }
     #[test]
@@ -1538,10 +1561,8 @@ mod tests {
         assert!(handle.is_aborted() && a.sign_in.is_none());
         assert_eq!(a.account, crate::Account::SignedOut);
         assert!(!a.sign_out_pending, "there was no client to sign out");
-        let _ = a.update(Message::SignedIn(Ok((
-            crate::session::sample(),
-            "oaiapp_1".into(),
-        ))));
+        let late = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        assert_eq!(a.update(late).units(), 1, "revoked, not adopted");
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Signed out.");
         assert!(a.settings.client_id.is_empty() && a.client.is_none());
@@ -1680,6 +1701,143 @@ mod tests {
             "{}",
             a.account_note
         );
+    }
+    #[test]
+    fn a_finished_sign_in_is_saved_in_its_own_step_before_the_account_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let session = crate::session::sample();
+        let result = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        // The save step is the one returned task; the account waits for it.
+        assert_eq!(a.update(result).units(), 1);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        assert!(a.sign_in.is_none() && a.client.is_none());
+        let saved = crate::settings::load(&dir.path().join("settings.json"));
+        assert_eq!(saved.client_id, "oaiapp_1");
+        // Its result shows the account and starts loading the models.
+        assert_eq!(a.update(Message::SessionSaved(Ok(session))).units(), 1);
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        assert!(a.client.is_some() && a.account_note.is_empty());
+    }
+    #[test]
+    fn a_session_that_could_not_be_saved_returns_to_signed_out_with_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let result = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        let _ = a.update(result);
+        let failed = "Could not save the ChatGPT sign-in: Keychain: save denied".to_string();
+        assert_eq!(
+            a.update(Message::SessionSaved(Err(failed.clone()))).units(),
+            0
+        );
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert_eq!(a.account_note, failed);
+        assert!(a.client.is_none() && a.models.is_empty());
+        // The user can try again.
+        assert_eq!(a.update(Message::SignIn).units(), 1);
+        assert_eq!(a.account, crate::Account::SigningIn);
+    }
+    #[test]
+    fn cancelling_during_the_save_step_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let session = crate::session::sample();
+        let result = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let _ = a.update(result);
+        // The save cannot be aborted, so there is nothing to cancel.
+        assert_eq!(a.update(Message::SignInCancel).units(), 0);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        assert!(a.account_note.is_empty());
+        // The save finishes and the session is adopted.
+        let _ = a.update(Message::SessionSaved(Ok(session)));
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        assert!(a.client.is_some());
+    }
+    #[test]
+    fn a_save_result_is_ignored_unless_the_save_step_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let _ = a.update(Message::SignOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        let signed_out = snapshot(&a);
+        let late = Message::SessionSaved(Ok(crate::session::sample()));
+        assert_eq!(a.update(late).units(), 0);
+        let late = Message::SessionSaved(Err("Could not save it.".into()));
+        assert_eq!(a.update(late).units(), 0);
+        assert_eq!(snapshot(&a), signed_out);
+        assert!(a.client.is_none() && !a.sign_out_pending);
+        // While the browser step is still running there is nothing to save yet.
+        let _ = a.update(Message::SignIn);
+        let late = Message::SessionSaved(Ok(crate::session::sample()));
+        assert_eq!(a.update(late).units(), 0);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        assert!(a.client.is_none() && a.sign_in.is_some());
+        let late = Message::SessionSaved(Err("Could not save it.".into()));
+        assert_eq!(a.update(late).units(), 0);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        assert!(a.account_note.is_empty());
+    }
+    #[test]
+    fn signing_in_again_while_signed_in_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let epoch = a.account_epoch;
+        let listed = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".to_string()];
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(listed)));
+        let _ = a.update(Message::PickModel("gpt-6-luna".into()));
+        let before = snapshot(&a);
+        assert_eq!(a.update(Message::SignIn).units(), 0);
+        assert_eq!(snapshot(&a), before);
+        assert!(a.sign_in.is_none());
+    }
+    #[test]
+    fn a_sign_in_result_while_signed_in_is_revoked_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let epoch = a.account_epoch;
+        let listed = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".to_string()];
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(listed)));
+        let before = snapshot(&a);
+        let other = crate::session::Session {
+            name: "Other".into(),
+            refresh_token: "refresh-other".into(),
+            ..crate::session::sample()
+        };
+        // The only task is the revoke of the unused session.
+        let late = Message::SignedIn(Ok((other.clone(), "oaiapp_other".into())));
+        assert_eq!(a.update(late).units(), 1);
+        assert_eq!(snapshot(&a), before);
+        assert_eq!(a.settings.client_id, "oaiapp_1");
+        let saved = crate::settings::load(&dir.path().join("settings.json"));
+        assert_eq!(saved.client_id, "oaiapp_1");
+        assert_eq!(a.update(Message::SessionSaved(Ok(other))).units(), 0);
+        assert_eq!(snapshot(&a), before);
+    }
+    #[test]
+    fn both_the_missing_plan_usage_and_the_unsaved_settings_are_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("settings.json")).unwrap();
+        let mut a = fresh_app(&dir);
+        sign_in_with(&mut a, &dir, without_plan_usage());
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: false, .. }
+        ));
+        let note = a.account_note.as_str();
+        let first = note.find("not granted").expect(note);
+        let second = note
+            .find("Signed in for this session, but settings could not be saved: ")
+            .expect(note);
+        assert!(first < second, "{note}");
     }
     #[test]
     #[should_panic(expected = "tests must use an isolated workspace")]
