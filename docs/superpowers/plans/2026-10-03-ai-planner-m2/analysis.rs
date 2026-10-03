@@ -89,7 +89,8 @@ pub struct HoleReport {
     pub through: bool,
 }
 fn r2(v: f32) -> f32 {
-    (v * 100.).round() / 100.
+    // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
+    (v * 100.).round() / 100. + 0.
 }
 /// The part axis that points up in this setup, when the setup is square to
 /// the part (every rotation a multiple of 90°).
@@ -534,6 +535,7 @@ mod tests {
         assert!(counterbores.max_cutter_diameter.unwrap() < 2.3);
         assert!(top.freeform_area > 100.);
         assert!(!top.truncated);
+        assert!(!serde_json::to_string(&report).unwrap().contains("-0.0"));
     }
     #[test]
     fn each_orientation_lists_only_what_is_visible_from_above() {
