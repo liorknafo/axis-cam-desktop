@@ -52,20 +52,20 @@ Endpoints (from `https://auth.openai.com/.well-known/openid-configuration`):
 
 Sign-in steps:
 
-1. Bind a listener on `127.0.0.1` with an ephemeral port. The redirect URI is `http://127.0.0.1:<port>/callback`.
+1. Bind a listener on `127.0.0.1` with an ephemeral port. The redirect URI is `http://127.0.0.1:<port>/auth/callback`, the path OpenAI's reference kit uses.
 2. Generate fresh `state`, `nonce` and a PKCE verifier (32 random bytes each, base64url). The challenge is base64url(SHA-256(verifier)) without padding.
 3. Open the system browser at the authorize URL with these parameters:
    - `client_id`: `dynamic_agent_client` on first registration, otherwise the saved issued client ID
    - `agent_name_hint`: `AXIS CAM Studio` (first registration only)
-   - `ext_agent_host_id`: the installation's stable host ID
+   - `ext_agent_host_id`: the installation's stable host ID, in the form `urn:uuid:<lowercase version-4 UUID>`. OpenAI rejects other forms (found in the first live test)
    - `id_token_hint`: the retained ID token, when re-authorizing. Supported by the URL builder; M1 never has one to send, because sign-out deletes the tokens and re-authorizing while signed in is not offered.
    - `response_type=code`, `redirect_uri`, `state`, `nonce`, `code_challenge`, `code_challenge_method=S256`
    - `scope`: `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`
    - `resource`: `https://api.openai.com/v1`
 4. Wait up to 5 minutes for the callback. A request to any other path, or one whose `state` does not match, gets 404 and is ignored, so a stray local request cannot end the sign-in. The user can cancel. An `error` parameter (for example `access_denied`) with the right `state` ends sign-in with a plain message. The response page says the user can return to the app.
-5. Save the `client_id` returned by the callback (first registration).
+5. Save the `client_id` returned by the callback (first registration). It must be 1–200 characters of letters, digits, `_` or `-`, and not `dynamic_agent_client`.
 6. POST the token endpoint (form-encoded): `grant_type=authorization_code`, `client_id`, `code`, `code_verifier`, `redirect_uri`, `resource`. There is no client secret.
-7. Validate the ID token: RS256 signature against the JWKS, `iss` = `https://auth.openai.com`, `aud` = the issued client ID, not expired, `nonce` matches.
+7. Validate the ID token: RS256 signature against the JWKS, `iss` = `https://auth.openai.com`, `aud` = the issued client ID, not expired, `nonce` matches, and `azp` equals the client ID when present.
 8. If the granted `scope` lacks `chatgpt.tokens.use.direct`, the session is kept but marked "plan usage not granted", and the planner stays unavailable with that reason.
 
 Refresh: access tokens last 1 hour and refresh tokens 30 days, rotating on each use. The client refreshes when less than 5 minutes remain, or once after a 401. Refreshes are single-flight (one mutex per session). The refresh and its save run to completion even if the request that needed them is cancelled. The new token set is persisted before it is used; if saving fails twice, it is kept in memory for this run. `invalid_grant`, `token_expired`, `refresh_token_expired`, `refresh_token_reused` and `invalid_client` clear the tokens and return the app to signed-out with a message, as does any other OAuth error code on a 400 or 401 that is not a transient one. Connect errors, 5xx, 408, 429 and code-less errors are retried with bounded backoff. Requests to the sign-in endpoints time out after 30 seconds and do not follow redirects.
@@ -75,7 +75,7 @@ Sign-out: POST the revoke endpoint with `token=<refresh token>`, `token_type_hin
 ### Storage
 
 - **Tokens** (access, refresh, ID token, expiry, scope, name, email, subject): one macOS Keychain item, service `AXIS CAM Studio`, account `chatgpt-session`. On other platforms: a file in the app data folder with owner-only permissions, written atomically. Tokens never go into project files, the workspace file, logs or status text. The session type's `Debug` output redacts them.
-- **Non-secret settings**: `settings.json` in the app data folder: host ID (a random UUID created once), issued client ID, chosen model, and whether the first-sign-in notice was shown. Smoke and test runs use their isolated folder.
+- **Non-secret settings**: `settings.json` in the app data folder: host ID (`urn:uuid:` plus a random UUID, created once; a bare UUID saved by an earlier build is prefixed), issued client ID, chosen model, and whether the first-sign-in notice was shown. Smoke and test runs use their isolated folder.
 
 ### API client
 
