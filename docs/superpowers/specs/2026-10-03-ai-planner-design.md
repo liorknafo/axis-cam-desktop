@@ -246,7 +246,7 @@ The result is a `CheckReport`: pass or fail, problems grouped by setup and opera
 
 A `Backend` trait with one method (messages and schema in, text out) has two implementations: the OpenAI client, and a scripted one for tests.
 
-1. Build the part report.
+1. Build the part report, on a background thread.
 2. Request 1: instructions plus the report. The instructions cover:
    - the role and the output schema
    - the six strategies with the exact rules their generators enforce (for example: Facing only on the highest plane with a flat end mill or face mill; Pocket on a recessed flat floor with a flat end mill that fits, stepover at most 50%, depth within stickout; Drill with a drill no wider than the hole; depths within tool reach)
@@ -254,8 +254,8 @@ A `Backend` trait with one method (messages and schema in, text out) has two imp
    - feeds and speeds within machine limits and conservative for the material
 3. Parse and validate the proposal locally. A parse failure counts as a failed attempt and is reported back.
 4. Build the job and run the plan check in a background thread.
-5. If the check fails, or it passes but covered surfaces are neither machined nor listed in `unmachined`, send the check report and ask for the full corrected proposal.
-6. At most **4 model requests per click**. The result is the passing proposal with the highest exposed share. If none passes, the planner reports failure with the last problems and offers to try again. Nothing can be applied in that case.
+5. If the check fails, send the check report and ask for the full corrected proposal. If it passes but report planes or other surface are still covered by stock, ask once per run for those to be machined or listed in `unmachined`.
+6. At most **4 model requests per click**. The result is the passing proposal with the highest exposed share. Once a proposal has passed, a later request that fails, cannot be parsed or does not pass ends the run with the plan already in hand. If none passes, the planner reports failure with the last problems and offers to try again. Nothing can be applied in that case.
 
 Progress is shown live: analyzing, asking the model (n of 4), checking, repairing. The user can cancel at any time.
 
@@ -265,17 +265,20 @@ The part report (dimensions and feature list), the tool library entries listed a
 
 ### Preview and apply (AI planner page)
 
-- Left: the account panel, the preconditions checklist, **Plan**, progress and **Cancel**.
+- Left: the account panel, the preconditions checklist and what is sent to OpenAI.
+- Right, before a run: the steps the planner takes and **Plan this job**, shown when the checklist is met. During a run: the current stage and **Cancel**.
 - Right, after a run:
   - the summary, and a card per setup with its operations (tool, key parameters, time)
-  - check results: all operations generate; export checks pass; no gouging detected (coarse check)
+  - check results: all operations generate; export checks pass; no tool centre line cuts into the part and nothing goes below the stock; no gouging detected on the stock grid (coarse check)
   - coverage: exposed share, covered surfaces, leftover stock by region
   - what could not be machined, with reasons; warnings; total time
   - a 3D view of the stock after the whole plan, which the user can orbit
   - **Apply plan** and **Discard**
 - The preview states how many existing operations and setups Apply will replace.
 - **Apply** replaces the job's setups with the planned ones, keeps the previous job for **Undo**, and opens the machining page. The job is then an ordinary editable job; export is on the NC program page.
-- Model text is displayed as plain text only.
+- Model text is displayed as plain text only, with control and format characters removed.
+- A preview and a running plan describe the job as it was when Plan was clicked. Any edit to the job, opening another project, or (for a running plan) signing out cancels the run and discards the preview.
+- The planner needs a model. When OpenAI's model list is empty or cannot be loaded, the saved model is kept, or `gpt-6.1-sol` is used when none is saved, and the account panel says so. **Check connection** shows whether that model answers; **Load models** tries the list again.
 
 ### Removed
 
