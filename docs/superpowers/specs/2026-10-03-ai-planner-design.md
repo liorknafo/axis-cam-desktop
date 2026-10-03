@@ -205,7 +205,7 @@ Building a job from a proposal:
 
 ### Plan check (`plan_check.rs`)
 
-Run in this order; later stages run only if earlier ones pass.
+Run in this order. A structure problem stops everything. A generation failure stops the export stage. The tool axis check and the coarse gouge check run for every operation that generated, whatever the export stage says, so one round of feedback carries every known problem.
 
 1. **Structure.** Setup 1's orientation is first; orientations are unique; every tool number exists; tool type suits the strategy; every surface ID belongs to that orientation's report and suits the strategy; rpm, feed and the limits above hold. The built job must pass the same structure validation as a saved project, so an applied plan can always be saved and reopened. Each problem names its setup and operation.
 2. **Generation.** `simulation::sequence` on the built job. Every enabled operation must generate, with inherited stock.
