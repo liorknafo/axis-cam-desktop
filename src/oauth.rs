@@ -23,8 +23,11 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const APP_NAME: &str = "AXIS CAM Studio";
 /// Per-request limit for the token, revoke and signing-key endpoints. A
 /// refresh holds the session lock, so a stalled endpoint must not hold it for
-/// the client's whole 300 s timeout.
+/// as long as the API client waits for a reply.
 const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a request waits without receiving any data. A long reply
+/// keeps streaming, so only a stalled connection runs into this.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Token-endpoint error codes after which the refresh token can never work.
 const FATAL_REFRESH_CODES: [&str; 5] = [
     "invalid_grant",
@@ -82,12 +85,17 @@ pub enum AuthError {
     Retry(String),
 }
 /// The HTTP client for sign-in and API calls: it never follows redirects (so
-/// tokens and codes only go where they were sent) and gives up after
-/// `timeout` in total.
+/// tokens and codes only go where they were sent) and gives up after two
+/// minutes without data, or after `timeout` in total.
 pub fn http_client(timeout: Duration) -> reqwest::Client {
+    http_client_with(IDLE_TIMEOUT, timeout)
+}
+/// [`http_client`] with its own limit for the time without data.
+pub(crate) fn http_client_with(idle: Duration, timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
+        .read_timeout(idle)
         .timeout(timeout)
         .build()
         .expect("HTTP client")
@@ -1445,6 +1453,32 @@ mod tests {
         assert!(fake.seen("/elsewhere").is_empty());
         let slow = http.get(format!("{}/slow", fake.base)).send().await;
         assert!(slow.unwrap_err().is_timeout());
+    }
+    #[tokio::test]
+    async fn the_http_client_gives_up_when_no_data_arrives() {
+        let fake = Fake::start(|r: &Req| match r.path.as_str() {
+            // Answers only after a long silence.
+            "/late" => Resp {
+                delay_ms: 5_000,
+                ..Resp::json(200, json!({}))
+            },
+            // Starts its answer, then goes quiet.
+            _ => Resp {
+                cut_after_ms: Some(5_000),
+                ..Resp::json(200, json!({}))
+            },
+        })
+        .await;
+        // Far from the total limit: only the silence can end these requests.
+        let http = http_client_with(Duration::from_millis(500), Duration::from_secs(30));
+        let late = http.get(format!("{}/late", fake.base)).send().await;
+        assert!(late.unwrap_err().is_timeout());
+        let stalled = http
+            .get(format!("{}/stalled", fake.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(stalled.bytes().await.unwrap_err().is_timeout());
     }
     #[cfg(unix)]
     #[test]

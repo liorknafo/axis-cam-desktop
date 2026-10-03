@@ -1474,8 +1474,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _ = signed_in_app(&dir);
         let mut a = fresh_app(&dir);
+        assert!(!a.restoring);
         let _ = a.update(Message::Page(Page::Ai));
         assert_eq!(a.account, crate::Account::SignedOut);
+        assert!(a.restoring);
         // Unit tests do not run tasks; deliver the restore result directly.
         let saved = crate::session::default_store(dir.path(), true).load();
         let _ = a.update(Message::AccountRestored(saved));
@@ -1483,8 +1485,50 @@ mod tests {
             a.account,
             crate::Account::SignedIn { granted: true, .. }
         ));
+        assert!(!a.restoring);
+        // A read that fails says why and leaves the account signed out.
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::Page(Page::Ai));
         let _ = a.update(Message::AccountRestored(Err("Keychain: denied".into())));
+        assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Keychain: denied");
+        assert!(!a.restoring);
+    }
+    #[test]
+    fn a_restore_result_is_ignored_when_no_restore_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        // Signed out, and signed in: neither is waiting for a saved sign-in.
+        for mut a in [fresh_app(&dir), signed_in_app(&dir)] {
+            let before = snapshot(&a);
+            for result in [
+                Ok(Some(crate::session::sample())),
+                Ok(None),
+                Err("Keychain: denied".to_string()),
+            ] {
+                assert_eq!(a.update(Message::AccountRestored(result)).units(), 0);
+                assert_eq!(snapshot(&a), before);
+                assert!(!a.restoring);
+            }
+        }
+    }
+    #[test]
+    fn signing_in_waits_until_the_saved_sign_in_has_been_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = signed_in_app(&dir);
+        for result in [Ok(None), Err("Keychain: denied".to_string())] {
+            let mut a = fresh_app(&dir);
+            assert_eq!(a.update(Message::Page(Page::Ai)).units(), 1);
+            assert!(a.restoring);
+            let before = snapshot(&a);
+            assert_eq!(a.update(Message::SignIn).units(), 0);
+            assert_eq!(snapshot(&a), before);
+            assert!(a.restoring && a.sign_in.is_none());
+            // The read found nothing, or failed: now the user can sign in.
+            let _ = a.update(Message::AccountRestored(result));
+            assert!(!a.restoring);
+            assert_eq!(a.update(Message::SignIn).units(), 1);
+            assert_eq!(a.account, crate::Account::SigningIn);
+        }
     }
     #[test]
     fn a_second_sign_out_keeps_the_gate_and_sign_in_waits_for_it() {
@@ -1619,11 +1663,22 @@ mod tests {
         let restored = Message::AccountRestored(Ok(Some(other.clone())));
         assert_eq!(a.update(restored).units(), 0);
         assert!(a.client.is_none() && a.account == crate::Account::SigningIn);
-        // From signed-out it is adopted.
+        // Nor once the account is signed out again: no read is pending, so
+        // an old session does not come back.
         let _ = a.update(Message::SignInCancel);
+        let restored = Message::AccountRestored(Ok(Some(other.clone())));
+        assert_eq!(a.update(restored).units(), 0);
+        assert!(a.client.is_none() && a.account == crate::Account::SignedOut);
+        assert_eq!(a.account_note, "Sign-in cancelled.");
+        // Even a pending read only fills an empty account.
+        let mut a = signed_in_app(&dir);
+        let before = snapshot(&a);
+        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 1);
+        assert!(a.restoring);
         let restored = Message::AccountRestored(Ok(Some(other)));
-        assert_eq!(a.update(restored).units(), 1);
-        assert!(matches!(&a.account, crate::Account::SignedIn { name, .. } if name == "Other"));
+        assert_eq!(a.update(restored).units(), 0);
+        assert_eq!(snapshot(&a), before);
+        assert!(!a.restoring);
     }
     #[test]
     fn the_planner_page_restores_only_once() {
@@ -1641,7 +1696,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = fresh_app(&dir);
         assert_eq!(a.update(Message::Page(Page::Ai)).units(), 0);
+        assert!(!a.restoring, "nothing is being read");
         sign_in_with(&mut a, &dir, crate::session::sample());
+        assert!(matches!(a.account, crate::Account::SignedIn { .. }));
         let _ = a.update(Message::SignOut);
         let _ = a.update(Message::SignedOut(Ok(())));
         let _ = a.update(Message::Page(Page::Home));
@@ -1878,6 +1935,12 @@ mod tests {
             crate::Account::SignedIn { granted: false, .. }
         ));
         let _ = b.view(); // plan usage not granted
+        // `b` left a client ID behind, so the planner page of a new app
+        // looks for its saved sign-in.
+        let mut c = fresh_app(&dir);
+        let _ = c.update(Message::Page(Page::Ai));
+        assert!(c.restoring && c.account == crate::Account::SignedOut);
+        let _ = c.view(); // looking for a saved sign-in
     }
     #[test]
     fn signing_out_during_the_save_step_changes_nothing() {

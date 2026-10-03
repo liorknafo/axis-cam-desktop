@@ -2100,6 +2100,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
         && !app.account_note.is_empty();
     match &app.account {
         Account::SignedOut if app.sign_out_pending => c = c.push(muted("Signing out…")),
+        Account::SignedOut if app.restoring => c = c.push(muted("Looking for a saved sign-in…")),
         Account::SignedOut => {
             c = c
                 .push(primary("Continue with ChatGPT", Message::SignIn).width(Fill))

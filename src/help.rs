@@ -395,7 +395,7 @@ pub fn command(m: &Message, label: String) -> Help {
         }
         SignInCancel => "Stop waiting for the browser sign-in. Nothing is saved.",
         SignOut => {
-            "Sign out of ChatGPT on this computer and ask OpenAI to revoke this app's access. The saved sign-in is deleted."
+            "Sign out of ChatGPT on this computer and ask OpenAI to revoke this sign-in. The saved sign-in is deleted."
         }
         CheckConnection => {
             "Send one tiny request to the selected model to confirm that your ChatGPT plan works with this app. It uses a very small amount of your plan's usage."
@@ -1527,6 +1527,10 @@ mod tests {
             command(&Message::CheckConnection, "x".into())
                 .body
                 .contains("ChatGPT plan")
+        );
+        assert_eq!(
+            command(&Message::SignOut, "x".into()).body,
+            "Sign out of ChatGPT on this computer and ask OpenAI to revoke this sign-in. The saved sign-in is deleted."
         );
     }
 }

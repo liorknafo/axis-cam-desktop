@@ -8,6 +8,11 @@ use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
 pub const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
+/// The most one request may take in total: a planning reply can stream for
+/// minutes. A connection that goes quiet is given up much sooner; see
+/// [`oauth::http_client`].
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const TIMED_OUT: &str = "OpenAI did not answer in time.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
@@ -243,10 +248,10 @@ impl Accumulator {
     }
 }
 /// Runs a store call on the blocking pool: the Keychain can wait on a prompt.
-async fn off_executor(
+async fn off_executor<T: Send + 'static>(
     store: &Arc<dyn SessionStore>,
-    call: impl FnOnce(&dyn SessionStore) -> Result<(), String> + Send + 'static,
-) -> Result<(), String> {
+    call: impl FnOnce(&dyn SessionStore) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     let store = store.clone();
     tokio::task::spawn_blocking(move || call(store.as_ref()))
         .await
@@ -258,6 +263,9 @@ async fn store_save(store: &Arc<dyn SessionStore>, session: &Session) -> Result<
 }
 async fn store_clear(store: &Arc<dyn SessionStore>) -> Result<(), String> {
     off_executor(store, |store| store.clear()).await
+}
+async fn store_load(store: &Arc<dyn SessionStore>) -> Result<Option<Session>, String> {
+    off_executor(store, |store| store.load()).await
 }
 pub struct Client {
     http: reqwest::Client,
@@ -276,7 +284,7 @@ impl Client {
         session: Session,
     ) -> Self {
         Self {
-            http: oauth::http_client(Duration::from_secs(300)),
+            http: oauth::http_client(REQUEST_TIMEOUT),
             endpoints,
             client_id,
             store,
@@ -291,6 +299,12 @@ impl Client {
     /// The refresh runs on its own task that owns the session lock, so it
     /// finishes, saves and updates the session even if this caller is
     /// dropped after OpenAI has accepted (and spent) the old refresh token.
+    ///
+    /// When OpenAI rejects the refresh token for good, another running copy
+    /// of the app may have spent it and saved its new tokens. Those are then
+    /// used from here on (the next call refreshes them if they are close to
+    /// expiry). Only a saved sign-in with the rejected refresh token is
+    /// deleted; one that cannot be read is left alone.
     async fn token(&self, rejected: Option<&str>) -> Result<String, ApiError> {
         let mut session = self.session.clone().lock_owned().await;
         let current = (*session)
@@ -319,7 +333,18 @@ impl Client {
                         return Ok(token);
                     }
                     Err(AuthError::Fatal(message)) => {
-                        let _ = store_clear(&store).await;
+                        match store_load(&store).await {
+                            Ok(Some(saved)) if saved.refresh_token != current.refresh_token => {
+                                let token = saved.access_token.clone();
+                                *session = Some(saved);
+                                return Ok(token);
+                            }
+                            Ok(_) => {
+                                let _ = store_clear(&store).await;
+                            }
+                            // Unreadable: it may be a newer sign-in.
+                            Err(_) => {}
+                        }
                         *session = None;
                         return Err(ApiError::SignedOut(message));
                     }
@@ -358,6 +383,7 @@ impl Client {
                 Ok(r) if r.status().is_server_error() => "OpenAI is unavailable; try again.",
                 Ok(r) => return Ok(r),
                 Err(e) if e.is_connect() => "Could not reach OpenAI.",
+                Err(e) if e.is_timeout() => return Err(ApiError::Unavailable(TIMED_OUT.into())),
                 Err(_) => {
                     return Err(ApiError::Unavailable(
                         "OpenAI did not answer. The request was not repeated.".into(),
@@ -433,9 +459,18 @@ impl Client {
         let mut reply = Accumulator::default();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| {
-                ApiError::Unavailable("The connection to OpenAI was interrupted.".into())
-            })?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                // The reply is already complete: a connection that fails
+                // now has lost nothing.
+                Err(_) if reply.done => break,
+                Err(e) if e.is_timeout() => return Err(ApiError::Unavailable(TIMED_OUT.into())),
+                Err(_) => {
+                    return Err(ApiError::Unavailable(
+                        "The connection to OpenAI was interrupted.".into(),
+                    ));
+                }
+            };
             for event in parser.push(&chunk) {
                 reply.apply(&event);
             }
@@ -505,7 +540,7 @@ impl Client {
             (Ok(()), Err(revoke)) => Err(format!("Signed out on this computer. {revoke}")),
             (Err(clear), revoked) => {
                 let mut message = format!(
-                    "The saved sign-in could not be deleted ({clear}). Delete the \"AXIS CAM Studio\" item in Keychain Access."
+                    "The saved sign-in could not be deleted ({clear}). On macOS, delete the \"AXIS CAM Studio\" item in Keychain Access."
                 );
                 if revoked.is_err() {
                     message.push_str(" OpenAI did not confirm the sign-out either.");
@@ -540,9 +575,13 @@ mod tests {
         failing_saves: AtomicUsize,
         saves: AtomicUsize,
         failing_clear: AtomicBool,
+        failing_load: AtomicBool,
     }
     impl SessionStore for TestStore {
         fn load(&self) -> Result<Option<Session>, String> {
+            if self.failing_load.load(Ordering::SeqCst) {
+                return Err("Keychain: read denied".into());
+            }
             self.file.load()
         }
         fn save(&self, session: &Session) -> Result<(), String> {
@@ -575,6 +614,7 @@ mod tests {
             failing_saves: AtomicUsize::new(0),
             saves: AtomicUsize::new(0),
             failing_clear: AtomicBool::new(false),
+            failing_load: AtomicBool::new(false),
         });
         store.file.save(&session).unwrap();
         let mut client = Client::new(
@@ -733,6 +773,66 @@ mod tests {
         assert_eq!(r.store.load().unwrap(), None);
         assert!(r.fake.seen("/v1/responses").is_empty());
     }
+    /// A session that needs a refresh, and an OpenAI that rejects its
+    /// refresh token as already used.
+    async fn rejected_refresh() -> Rig {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        rig(soon, |req| match req.path.as_str() {
+            "/token" => Resp::json(400, json!({"error": "refresh_token_reused"})),
+            "/v1/models" => Resp::json(200, json!({"data": []})),
+            _ => Resp::answer("{}"),
+        })
+        .await
+    }
+    #[tokio::test]
+    async fn a_fatal_refresh_uses_a_newer_saved_sign_in_instead_of_deleting_it() {
+        let r = rejected_refresh().await;
+        // Another running copy of the app has refreshed and saved its tokens.
+        let newer = Session {
+            access_token: "access-2".into(),
+            refresh_token: "refresh-2".into(),
+            ..sample()
+        };
+        r.store.file.save(&newer).unwrap();
+        r.client.respond(&request()).await.unwrap();
+        assert_eq!(r.fake.seen("/v1/responses")[0].auth, "Bearer access-2");
+        assert_eq!(r.store.load().unwrap(), Some(newer));
+        // The client goes on with the saved session; nothing is refreshed again.
+        r.client.models().await.unwrap();
+        assert_eq!(r.fake.seen("/v1/models")[0].auth, "Bearer access-2");
+        let refreshes = r.fake.seen("/token");
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].field("refresh_token"), "refresh-1");
+    }
+    #[tokio::test]
+    async fn a_fatal_refresh_signs_out_when_no_newer_sign_in_can_be_read() {
+        // Nothing is saved at all.
+        let r = rejected_refresh().await;
+        r.store.file.clear().unwrap();
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::SignedOut(_))
+        ));
+        assert_eq!(r.store.load().unwrap(), None);
+        // The saved sign-in cannot be read: it may be a newer one, so it is
+        // not deleted, but this client's session is gone.
+        let r = rejected_refresh().await;
+        r.store.failing_load.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::SignedOut(_))
+        ));
+        r.store.failing_load.store(false, Ordering::SeqCst);
+        assert!(r.store.load().unwrap().is_some());
+        assert!(matches!(
+            r.client.models().await,
+            Err(ApiError::SignedOut(_))
+        ));
+        assert!(r.fake.seen("/v1/models").is_empty() && r.fake.seen("/v1/responses").is_empty());
+    }
     #[tokio::test]
     async fn server_errors_are_retried_then_reported() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -868,6 +968,65 @@ mod tests {
         .await;
         assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
     }
+    /// An HTTP client that waits only half a second for data, far below its
+    /// total limit, in place of the two minutes the app allows.
+    fn impatient() -> reqwest::Client {
+        oauth::http_client_with(Duration::from_millis(500), Duration::from_secs(30))
+    }
+    #[tokio::test]
+    async fn a_reply_that_completed_before_the_connection_failed_is_kept() {
+        // The connection drops after `response.completed`, before the
+        // response has properly ended.
+        let r = rig(sample(), |_| Resp {
+            cut_after_ms: Some(0),
+            ..Resp::answer("{\"ok\":true}")
+        })
+        .await;
+        assert_eq!(
+            r.client.respond(&request()).await.unwrap().text,
+            "{\"ok\":true}"
+        );
+        // The connection stalls there instead: the wait ends, the reply stays.
+        let mut r = rig(sample(), |_| Resp {
+            cut_after_ms: Some(5_000),
+            ..Resp::answer("{}")
+        })
+        .await;
+        r.client.http = impatient();
+        assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
+        assert_eq!(r.fake.seen("/v1/responses").len(), 1);
+        // A reply that was cut off before it completed is still an error.
+        let r = rig(sample(), |_| Resp {
+            cut_after_ms: Some(0),
+            ..Resp::sse(&[json!({"type": "response.output_text.delta", "delta": "{"})])
+        })
+        .await;
+        assert_eq!(
+            r.client.respond(&request()).await.unwrap_err(),
+            ApiError::Unavailable("The connection to OpenAI was interrupted.".into())
+        );
+    }
+    #[tokio::test]
+    async fn a_stalled_request_or_reply_says_openai_did_not_answer_in_time() {
+        let in_time = ApiError::Unavailable("OpenAI did not answer in time.".into());
+        // The reply starts and then goes quiet.
+        let mut r = rig(sample(), |_| Resp {
+            cut_after_ms: Some(5_000),
+            ..Resp::sse(&[json!({"type": "response.output_text.delta", "delta": "{"})])
+        })
+        .await;
+        r.client.http = impatient();
+        assert_eq!(r.client.respond(&request()).await.unwrap_err(), in_time);
+        // No answer at all. The request reached OpenAI, so it is not repeated.
+        let mut r = rig(sample(), |_| Resp {
+            delay_ms: 5_000,
+            ..Resp::answer("{}")
+        })
+        .await;
+        r.client.http = impatient();
+        assert_eq!(r.client.respond(&request()).await.unwrap_err(), in_time);
+        assert_eq!(r.fake.seen("/v1/responses").len(), 1);
+    }
     #[test]
     fn sse_events_survive_any_chunking_and_crlf() {
         let stream = "event: a\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"é1\"}\r\n\r\n: comment\n\ndata: [DONE]\n\ndata: {\"type\":\"response.completed\"}\n\n";
@@ -988,7 +1147,7 @@ mod tests {
         r.store.failing_clear.store(true, Ordering::SeqCst);
         assert_eq!(
             r.client.sign_out().await.unwrap_err(),
-            "The saved sign-in could not be deleted (Keychain: delete denied). Delete the \"AXIS CAM Studio\" item in Keychain Access."
+            "The saved sign-in could not be deleted (Keychain: delete denied). On macOS, delete the \"AXIS CAM Studio\" item in Keychain Access."
         );
         let revoked = r.fake.seen("/revoke");
         assert_eq!(revoked.len(), 1);
@@ -1001,7 +1160,7 @@ mod tests {
         r.store.failing_clear.store(true, Ordering::SeqCst);
         assert_eq!(
             r.client.sign_out().await.unwrap_err(),
-            "The saved sign-in could not be deleted (Keychain: delete denied). Delete the \"AXIS CAM Studio\" item in Keychain Access. OpenAI did not confirm the sign-out either."
+            "The saved sign-in could not be deleted (Keychain: delete denied). On macOS, delete the \"AXIS CAM Studio\" item in Keychain Access. OpenAI did not confirm the sign-out either."
         );
         assert_eq!(r.fake.seen("/revoke").len(), 1);
     }

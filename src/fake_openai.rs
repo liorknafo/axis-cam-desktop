@@ -40,6 +40,9 @@ pub struct Resp {
     pub hangup: bool,
     /// A `location` header, for redirects.
     pub location: Option<String>,
+    /// Promise more body than is sent, keep the connection open this long
+    /// and then drop it: a reply that stalls or, with 0, is cut off.
+    pub cut_after_ms: Option<u64>,
 }
 impl Resp {
     pub fn json(status: u16, value: Value) -> Self {
@@ -50,6 +53,7 @@ impl Resp {
             delay_ms: 0,
             hangup: false,
             location: None,
+            cut_after_ms: None,
         }
     }
     /// Reads the request, then hangs up without sending a response.
@@ -72,6 +76,7 @@ impl Resp {
             delay_ms: 0,
             hangup: false,
             location: None,
+            cut_after_ms: None,
             body: events
                 .iter()
                 .map(|e| {
@@ -139,10 +144,13 @@ impl Fake {
                         "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n{location}connection: close\r\n\r\n",
                         response.status,
                         response.content_type,
-                        response.body.len()
+                        response.body.len() + usize::from(response.cut_after_ms.is_some())
                     );
                     let _ = socket.write_all(head.as_bytes()).await;
                     let _ = socket.write_all(response.body.as_bytes()).await;
+                    if let Some(ms) = response.cut_after_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                 });
             }
         });

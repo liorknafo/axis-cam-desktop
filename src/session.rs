@@ -90,19 +90,28 @@ impl SessionStore for FileStore {
         }
     }
 }
+/// One Keychain item of the service "AXIS CAM Studio".
 #[cfg(target_os = "macos")]
-pub struct KeychainStore;
+pub struct KeychainStore {
+    /// The item's account name.
+    pub account: &'static str,
+}
 #[cfg(target_os = "macos")]
 impl KeychainStore {
     const SERVICE: &str = "AXIS CAM Studio";
-    const ACCOUNT: &str = "chatgpt-session";
     /// errSecItemNotFound
     const NOT_FOUND: i32 = -25300;
+    /// The item that holds the user's sign-in.
+    pub fn saved_sign_in() -> Self {
+        Self {
+            account: "chatgpt-session",
+        }
+    }
 }
 #[cfg(target_os = "macos")]
 impl SessionStore for KeychainStore {
     fn load(&self) -> Result<Option<Session>, String> {
-        match security_framework::passwords::get_generic_password(Self::SERVICE, Self::ACCOUNT) {
+        match security_framework::passwords::get_generic_password(Self::SERVICE, self.account) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|e| format!("The saved sign-in is unreadable: {e}")),
@@ -112,11 +121,11 @@ impl SessionStore for KeychainStore {
     }
     fn save(&self, session: &Session) -> Result<(), String> {
         let data = serde_json::to_vec(session).map_err(|e| e.to_string())?;
-        security_framework::passwords::set_generic_password(Self::SERVICE, Self::ACCOUNT, &data)
+        security_framework::passwords::set_generic_password(Self::SERVICE, self.account, &data)
             .map_err(|e| format!("Keychain: {e}"))
     }
     fn clear(&self) -> Result<(), String> {
-        match security_framework::passwords::delete_generic_password(Self::SERVICE, Self::ACCOUNT) {
+        match security_framework::passwords::delete_generic_password(Self::SERVICE, self.account) {
             Err(e) if e.code() != Self::NOT_FOUND => Err(format!("Keychain: {e}")),
             _ => Ok(()),
         }
@@ -127,7 +136,7 @@ impl SessionStore for KeychainStore {
 pub fn default_store(data_dir: &Path, isolated: bool) -> Arc<dyn SessionStore> {
     #[cfg(target_os = "macos")]
     if !isolated {
-        return Arc::new(KeychainStore);
+        return Arc::new(KeychainStore::saved_sign_in());
     }
     let _ = isolated;
     Arc::new(FileStore(data_dir.join("chatgpt-session.json")))
@@ -188,18 +197,31 @@ mod tests {
         std::fs::write(dir.path().join("chatgpt-session.json"), b"{").unwrap();
         assert!(store.load().is_err());
     }
+    /// The item of the ignored test below, never the user's saved sign-in.
+    #[cfg(target_os = "macos")]
+    const TEST_ITEM: KeychainStore = KeychainStore {
+        account: "chatgpt-session-test",
+    };
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_keychain_test_item_is_not_the_saved_sign_in() {
+        // Nothing here touches the Keychain: only the item names are compared.
+        assert_eq!(KeychainStore::saved_sign_in().account, "chatgpt-session");
+        assert_ne!(TEST_ITEM.account, KeychainStore::saved_sign_in().account);
+    }
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes to the login Keychain; run with --ignored"]
     fn keychain_store_roundtrips() {
-        let store = KeychainStore;
-        let before = store.load().unwrap();
+        let store = TEST_ITEM;
         let session = sample();
-        store.save(&session).unwrap();
-        assert_eq!(store.load().unwrap(), Some(session));
-        match before {
-            Some(saved) => store.save(&saved).unwrap(),
-            None => store.clear().unwrap(),
-        }
+        let saved = store.save(&session);
+        let loaded = store.load();
+        // The test item is deleted whatever the checks below find.
+        let cleared = store.clear();
+        saved.unwrap();
+        assert_eq!(loaded.unwrap(), Some(session));
+        cleared.unwrap();
+        assert_eq!(store.load().unwrap(), None);
     }
 }

@@ -192,6 +192,9 @@ pub struct App {
     settings_failure: Option<String>,
     /// The saved sign-in is still being deleted; signing in waits for it.
     pub sign_out_pending: bool,
+    /// The saved sign-in is still being read; signing in waits for it, and
+    /// only this read's result may fill the account.
+    pub restoring: bool,
     /// Changes whenever the client does, so results of an earlier client's
     /// requests can be told apart and ignored.
     account_epoch: u64,
@@ -338,6 +341,7 @@ impl App {
             account_busy: false,
             settings_failure: None,
             sign_out_pending: false,
+            restoring: false,
             account_epoch: 0,
             usage_limit: false,
             models: vec![],
@@ -761,11 +765,14 @@ impl App {
     /// Keychain may ask for permission, so this never runs at launch. The
     /// first visit uses it up, whether or not there was anything to read:
     /// signing in and out later never reads the saved session behind it.
+    /// The read can take as long as that permission dialog stays open, so
+    /// `restoring` keeps the user from signing in until it has reported.
     fn restore_account(&mut self) -> Task<Message> {
         if std::mem::replace(&mut self.account_restored, true) || self.settings.client_id.is_empty()
         {
             return Task::none();
         }
+        self.restoring = true;
         let store = self.store.clone();
         Task::perform(
             async move {
@@ -1850,21 +1857,31 @@ impl App {
                 )
             }
             Message::GcodeExported(Err(e)) => self.status = format!("G-code export failed: {e}"),
-            Message::AccountRestored(Ok(Some(session))) => {
-                // A saved session only fills an empty account: not one that
-                // is signing in, signed in, or still deleting the old sign-in.
-                if self.account != Account::SignedOut
-                    || self.client.is_some()
-                    || self.sign_out_pending
-                {
-                    return Task::none();
+            // Only the read that is pending can report a saved sign-in. A
+            // result nobody is waiting for changes nothing, so a session the
+            // user has signed out of since cannot come back.
+            Message::AccountRestored(_) if !self.restoring => {}
+            Message::AccountRestored(result) => {
+                self.restoring = false;
+                match result {
+                    // A saved session only fills an empty account: not one
+                    // that is signing in, signed in, or still deleting the
+                    // old sign-in.
+                    Ok(Some(session))
+                        if self.account == Account::SignedOut
+                            && self.client.is_none()
+                            && !self.sign_out_pending =>
+                    {
+                        return self.adopt_session(session);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.account_note = e,
                 }
-                return self.adopt_session(session);
             }
-            Message::AccountRestored(Ok(None)) => {}
-            Message::AccountRestored(Err(e)) => self.account_note = e,
             Message::SignIn => {
-                if self.account != Account::SignedOut || self.sign_out_pending {
+                // Signing in waits for the saved sign-in to be read and for
+                // an old one to be deleted.
+                if self.account != Account::SignedOut || self.sign_out_pending || self.restoring {
                     return Task::none();
                 }
                 self.account = Account::SigningIn;
