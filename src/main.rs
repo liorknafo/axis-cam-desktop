@@ -2150,15 +2150,25 @@ fn planning_project(project: &str) -> Result<(Document, mesh::Mesh), String> {
     Ok((doc, mesh))
 }
 /// The part report the planner sends to the model, as JSON.
-fn part_report(project: Option<&String>) -> Result<String, String> {
-    let project = project.ok_or("Usage: axis-cam --part-report <project.json>")?;
+fn part_report(args: &[String]) -> Result<String, String> {
+    let [project] = args else {
+        return Err("Usage: axis-cam --part-report <project.json>".into());
+    };
     let (doc, mesh) = planning_project(project)?;
     serde_json::to_string_pretty(&analysis::report(&doc, &mesh)?).map_err(|e| e.to_string())
 }
+/// The JSON Schema a proposal must follow.
+fn proposal_schema(args: &[String]) -> Result<String, String> {
+    if !args.is_empty() {
+        return Err("Usage: axis-cam --proposal-schema".into());
+    }
+    serde_json::to_string_pretty(&proposal::schema()).map_err(|e| e.to_string())
+}
 /// Checks a proposal file against a saved project with every planner check.
-/// Prints the report as JSON; `Err` when the plan does not pass.
-fn check_plan(project: Option<&String>, proposal: Option<&String>) -> Result<String, String> {
-    let (Some(project), Some(proposal)) = (project, proposal) else {
+/// Returns the JSON report, a one-line summary and whether the plan passed;
+/// `Err` when the check could not run.
+fn check_plan(args: &[String]) -> Result<(String, String, bool), String> {
+    let [project, proposal] = args else {
         return Err("Usage: axis-cam --check-plan <project.json> <proposal.json>".into());
     };
     let (doc, mesh) = planning_project(project)?;
@@ -2166,21 +2176,29 @@ fn check_plan(project: Option<&String>, proposal: Option<&String>) -> Result<Str
     let text = std::fs::read_to_string(proposal).map_err(|e| format!("{proposal}: {e}"))?;
     let proposal = proposal::parse(&text)?;
     let (check, _) = plan_check::check(&doc, &mesh, &report, &proposal);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?
-    );
-    if check.passed {
-        Ok(format!(
+    let json = serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?;
+    let summary = if check.passed {
+        format!(
             "The plan passes every check: {} operations, {} min.",
             check.operations.len(),
             check.total_minutes
-        ))
+        )
     } else {
-        Err(format!(
+        format!(
             "The plan does not pass: {} problem(s).",
             check.problems.len()
-        ))
+        )
+    };
+    Ok((json, summary, check.passed))
+}
+/// Exit code of a planning command: 0 when it succeeded (for `--check-plan`,
+/// when the plan passes), 1 when the plan does not pass, 2 when the command
+/// could not run.
+fn exit_code(outcome: &Result<bool, String>) -> i32 {
+    match outcome {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => 2,
     }
 }
 /// Headless export of a saved project with the same checks and files as the UI.
@@ -2217,17 +2235,8 @@ fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<Str
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
-    let command = match args.get(1).map(String::as_str) {
-        Some("--export-gcode") => Some(export_gcode(args.get(2), args.get(3))),
-        Some("--check-plan") => Some(check_plan(args.get(2), args.get(3))),
-        Some("--part-report") => Some(part_report(args.get(2))),
-        Some("--proposal-schema") => {
-            Some(serde_json::to_string_pretty(&proposal::schema()).map_err(|e| e.to_string()))
-        }
-        _ => None,
-    };
-    if let Some(result) = command {
-        match result {
+    if args.get(1).map(String::as_str) == Some("--export-gcode") {
+        match export_gcode(args.get(2), args.get(3)) {
             Ok(message) => {
                 println!("{message}");
                 std::process::exit(0)
@@ -2237,6 +2246,31 @@ fn main() -> iced::Result {
                 std::process::exit(1)
             }
         }
+    }
+    // Planning commands: JSON alone on standard output, everything else on
+    // standard error.
+    let rest = args.get(2..).unwrap_or_default();
+    let json = |result: Result<String, String>| {
+        result.map(|json| {
+            println!("{json}");
+            true
+        })
+    };
+    let outcome = match args.get(1).map(String::as_str) {
+        Some("--check-plan") => Some(check_plan(rest).map(|(json, summary, passed)| {
+            println!("{json}");
+            eprintln!("{summary}");
+            passed
+        })),
+        Some("--part-report") => Some(json(part_report(rest))),
+        Some("--proposal-schema") => Some(json(proposal_schema(rest))),
+        _ => None,
+    };
+    if let Some(outcome) = outcome {
+        if let Err(message) = &outcome {
+            eprintln!("{message}");
+        }
+        std::process::exit(exit_code(&outcome))
     }
     iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))

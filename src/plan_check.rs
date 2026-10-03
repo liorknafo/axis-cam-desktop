@@ -681,35 +681,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("job.axis.json");
         crate::storage::save(&project, &doc).unwrap();
-        let write = |name: &str, proposal: &Proposal| {
+        let write = |name: &str, text: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, serde_json::to_string(proposal).unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
             path.to_string_lossy().into_owned()
         };
         let project = project.to_string_lossy().into_owned();
-        let good_file = write("good.json", &good(&report));
-        let passed = crate::check_plan(Some(&project), Some(&good_file)).unwrap();
-        assert!(passed.starts_with("The plan passes every check: 6 operations"));
+        let good_file = write("good.json", &serde_json::to_string(&good(&report)).unwrap());
+        let (json, summary, passed) =
+            crate::check_plan(&[project.clone(), good_file.clone()]).unwrap();
+        assert!(passed && summary.starts_with("The plan passes every check: 6 operations"));
+        let printed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(printed["passed"], true);
+        assert_eq!(crate::exit_code(&Ok(passed)), 0);
         let mut bad = good(&report);
         bad.setups[0].operations[0].tool = 9;
-        let bad_file = write("bad.json", &bad);
+        let bad_file = write("bad.json", &serde_json::to_string(&bad).unwrap());
+        let (json, summary, passed) = crate::check_plan(&[project.clone(), bad_file]).unwrap();
+        assert!(!passed && summary.contains("1 problem"));
+        assert!(json.contains("T9 is not in the tool library"));
+        assert_eq!(crate::exit_code(&Ok(passed)), 1);
+        // The check could not run: usage, unreadable or invalid files.
+        let not_json = write("notes.txt", "Here is the plan: {}");
+        let missing = dir
+            .path()
+            .join("missing.json")
+            .to_string_lossy()
+            .into_owned();
+        for args in [
+            vec![project.clone()],
+            vec![project.clone(), good_file.clone(), "extra".into()],
+            vec![project.clone(), not_json],
+            vec![missing.clone(), good_file.clone()],
+        ] {
+            let result = crate::check_plan(&args);
+            assert_eq!(crate::exit_code(&result.map(|r| r.2)), 2, "{args:?}");
+        }
         assert!(
-            crate::check_plan(Some(&project), Some(&bad_file))
-                .unwrap_err()
-                .contains("1 problem")
-        );
-        assert!(
-            crate::check_plan(Some(&project), None)
+            crate::check_plan(&[project.clone()])
                 .unwrap_err()
                 .starts_with("Usage")
         );
-        let printed = crate::part_report(Some(&project)).unwrap();
+        let printed = crate::part_report(std::slice::from_ref(&project)).unwrap();
         let printed: serde_json::Value = serde_json::from_str(&printed).unwrap();
         assert_eq!(printed["orientations"][0]["up"], "+Z");
+        assert!(
+            crate::part_report(&[project.clone(), "extra".into()])
+                .unwrap_err()
+                .starts_with("Usage")
+        );
+        assert!(crate::part_report(&[missing]).is_err());
+        let schema: serde_json::Value =
+            serde_json::from_str(&crate::proposal_schema(&[]).unwrap()).unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            crate::proposal_schema(&["extra".into()])
+                .unwrap_err()
+                .starts_with("Usage")
+        );
         doc.material.clear();
         crate::storage::save(std::path::Path::new(&project), &doc).unwrap();
         assert!(
-            crate::check_plan(Some(&project), Some(&good_file))
+            crate::check_plan(&[project, good_file])
                 .unwrap_err()
                 .starts_with("Material")
         );
