@@ -75,6 +75,7 @@ Sign-out: POST the revoke endpoint with `token=<refresh token>`, `token_type_hin
 ### Storage
 
 - **Tokens** (access, refresh, ID token, expiry, scope, name, email, subject): one macOS Keychain item, service `AXIS CAM Studio`, account `chatgpt-session`. On other platforms: a file in the app data folder with owner-only permissions, written atomically. Tokens never go into project files, the workspace file, logs or status text. The session type's `Debug` output redacts them.
+- The saved sign-in is read the first time the planner page opens, because macOS may ask for Keychain permission. Until that read finishes, signing in is disabled, and a result that arrives when no read is pending is ignored. If a refresh is rejected but the store holds a newer sign-in (another running copy of the app refreshed it), the newer one is used instead of being deleted.
 - **Non-secret settings**: `settings.json` in the app data folder: host ID (`urn:uuid:` plus a random UUID, created once; a bare UUID saved by an earlier build is prefixed), issued client ID, chosen model, and whether the first-sign-in notice was shown. Smoke and test runs use their isolated folder.
 
 ### API client
@@ -83,7 +84,7 @@ Sign-out: POST the revoke endpoint with `token=<refresh token>`, `token_type_hin
 - `POST /v1/responses` with `model`, `input` (a system message and user messages), `store: false`, `stream: true`, and `text.format = { type: "json_schema", name, schema, strict: true }`.
 - Server-sent events: accumulate `response.output_text.delta` (`delta`). The request succeeds only on `response.completed`. `response.failed`, `response.incomplete`, `error`, a refusal, or a stream that ends early are errors. Unknown event types are ignored.
 - If the API answers `subscription_sharing_unsupported_capability`, the client retries once without `text.format`, with the schema restated in the instructions. Output is always parsed and validated locally, so both paths give the same guarantees.
-- Timeouts: 15 s to connect, 5 minutes per request. A request can be cancelled.
+- Timeouts: 15 s to connect, 2 minutes without any data, 15 minutes per request (planning replies can take minutes). A reply that completed before the connection dropped is kept. A request can be cancelled.
 
 Error handling:
 
