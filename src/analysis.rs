@@ -197,13 +197,19 @@ impl<'a> Index<'a> {
     }
 }
 /// Crossings of the vertical line through `xy` with the surface, lowest
-/// first: height, and whether the face points up.
+/// first: height, and whether the face points up. Crossings within 0.0001 mm
+/// of the one below them are at one height, and there those facing down come
+/// first, whatever the triangle order, so a pair facing both ways errs
+/// towards solid.
 fn crossings(index: &Index, xy: [f32; 2]) -> Vec<(f32, bool)> {
     let mut hits: Vec<(f32, bool)> = index
         .near(xy)
         .filter_map(|t| Some((cam::plane_height(&t.p, xy)?, normal(&t.p)[2] > 0.)))
         .collect();
     hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for run in hits.chunk_by_mut(|a, b| b.0 - a.0 < 1e-4) {
+        run.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.total_cmp(&b.0)));
+    }
     hits.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-4 && a.1 == b.1);
     hits
 }
@@ -302,59 +308,122 @@ fn inconsistent_share(geometry: &Geometry) -> f32 {
         bad as f32 / hit as f32
     }
 }
-/// Vertices this close are one vertex, and a vertex this close to an open
-/// edge, and farther than this from both its ends, splits it (mm).
-const WELD: f64 = 0.001;
-/// Copies of one vertex spread over no more than this (mm).
-const SPREAD: f64 = 0.01;
 /// Coordinates beyond this are not checked (mm).
 const FAR: f64 = 1_000_000.;
-/// The part's triangles in mm, in the mesh's own frame: whether a surface is
-/// closed does not depend on where setup 1 puts it.
-fn mm_triangles(mesh: &Mesh) -> Vec<[[f64; 3]; 3]> {
+/// The part's triangles in mm, in the mesh's own frame (whether a surface is
+/// closed does not depend on where setup 1 puts it), and the largest absolute
+/// coordinate the part had in its file (mm).
+fn mm_triangles(mesh: &Mesh) -> (Vec<[[f64; 3]; 3]>, f64) {
     let scale = f64::from(mesh.display_scale());
-    mesh.faces
+    let origin = mesh.origin.map(f64::from);
+    let mut largest = 0f64;
+    let triangles = mesh
+        .faces
         .iter()
         .filter(|f| f.points.len() == 3)
-        .map(|f| std::array::from_fn(|i| f.points[i].map(|v| f64::from(v) / scale)))
-        .collect()
+        .map(|f| {
+            std::array::from_fn(|i| {
+                let p = f.points[i].map(f64::from);
+                for k in 0..3 {
+                    largest = largest.max(((p[k] - origin[k]) / scale).abs());
+                }
+                p.map(|v| v / scale)
+            })
+        })
+        .collect();
+    (triangles, largest)
 }
-/// The number of open edges of `triangles` (mm); a closed surface has none.
-/// Vertices within `WELD` of each other are one vertex (see `weld`),
-/// zero-area triangles are ignored, and a triangle written more than once, in
-/// either winding, counts once. An edge used by an odd number of triangles is
-/// open. Each open edge is then split at every end of another open edge
-/// within `WELD` of it, away from its own ends, as at a T-junction, and the
-/// pieces are counted with the open edges they now match: those used an odd
-/// number of times are the open edges left. Coordinates beyond `FAR` or not
-/// finite make every edge open.
-pub(crate) fn open_edges(triangles: &[[[f64; 3]; 3]]) -> usize {
-    if triangles
-        .iter()
-        .flatten()
-        .flatten()
-        .any(|v| !(v.abs() <= FAR))
-    {
-        return 3 * triangles.len();
+/// What the closed-surface test finds.
+#[derive(Debug, PartialEq)]
+struct Closure {
+    open_edges: usize,
+    encloses_volume: bool,
+}
+/// How far apart two points may be and still be one point after float
+/// rounding, in a part whose coordinates reach `largest` mm: 8 f32 steps at
+/// that coordinate, and at least 0.000001 mm.
+fn tolerance(largest: f64) -> f64 {
+    let f = largest as f32;
+    (8. * f64::from(f32::from_bits(f.to_bits() + 1) - f)).max(1e-6)
+}
+/// The closed-surface test on `triangles` (mm), whose coordinates reached
+/// `largest` mm in the part's file. The tolerance comes from the largest
+/// absolute coordinate in either frame (see `tolerance`). Points within it of
+/// each other are one vertex (see `weld`), zero-area triangles are ignored,
+/// and a triangle written more than once with the same winding counts once;
+/// with opposite windings both count, and their edges cancel. An edge used by
+/// an odd number of triangles is open. Each open edge is then split at every
+/// end of an open edge that lies within the tolerance of it and farther than
+/// that from both its ends, as at a T-junction, and the pieces used an odd
+/// number of times are the open edges left. The enclosed volume is about zero
+/// when it is under 1e-9 of the bounding box's, as for a sheet written with
+/// both windings. Coordinates beyond `FAR` or not finite make every edge open.
+fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
+    let mut largest = largest;
+    for v in triangles.iter().flatten().flatten() {
+        if !(v.abs() <= FAR) {
+            largest = f64::INFINITY;
+            break;
+        }
+        largest = largest.max(v.abs());
     }
-    let (corners, points) = weld(triangles);
+    if !(largest <= FAR) {
+        return Closure {
+            open_edges: 3 * triangles.len(),
+            encloses_volume: false,
+        };
+    }
+    let tol = tolerance(largest);
+    let (corners, points) = weld(triangles, tol);
     let mut faces: Vec<[u32; 3]> = triangles
         .iter()
         .zip(corners)
-        .filter_map(|(t, mut ids)| {
+        .filter_map(|(t, ids)| {
             let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
-            ids.sort_unstable();
-            (dot(n, n) >= 1e-18 && ids[0] != ids[1] && ids[1] != ids[2]).then_some(ids)
+            let longest = (0..3)
+                .map(|k| dot(sub(t[(k + 1) % 3], t[k]), sub(t[(k + 1) % 3], t[k])))
+                .fold(0., f64::max);
+            // Zero area: corners welded together, or flat to f64 rounding.
+            let zero = ids[0] == ids[1]
+                || ids[1] == ids[2]
+                || ids[0] == ids[2]
+                || dot(n, n) <= 1e-24 * longest * longest;
+            // Written from its smallest id, a triangle with the same winding
+            // is always the same triple.
+            let k = (0..3).min_by_key(|k| ids[*k]).unwrap_or(0);
+            (!zero).then_some([ids[k], ids[(k + 1) % 3], ids[(k + 2) % 3]])
         })
         .collect();
     faces.sort_unstable();
     faces.dedup();
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for p in triangles.iter().flatten() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    // Measured from the box's centre, which keeps the rounding small.
+    let centre: [f64; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) / 2.);
+    let volume: f64 = faces
+        .iter()
+        .map(|f| {
+            let [a, b, c] = f.map(|i| sub(points[i as usize], centre));
+            dot(a, cross(b, c))
+        })
+        .sum::<f64>()
+        / 6.;
+    let encloses_volume = volume.abs() > 1e-9 * (0..3).map(|k| hi[k] - lo[k]).product::<f64>();
     let open = odd(faces
         .iter()
-        .flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[0], f[2])])
+        .flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])])
+        .map(|(a, b)| (a.min(b), a.max(b)))
         .collect());
     if open.is_empty() {
-        return 0;
+        return Closure {
+            open_edges: 0,
+            encloses_volume,
+        };
     }
     // Only the ends of open edges can split one.
     let mut ends: Vec<u32> = open.iter().flat_map(|e| [e.0, e.1]).collect();
@@ -366,16 +435,16 @@ pub(crate) fn open_edges(triangles: &[[[f64; 3]; 3]]) -> usize {
         let (pa, pb) = (points[a as usize], points[b as usize]);
         let d = sub(pb, pa);
         cuts.clear();
-        tree.near(pa, pb, |v| {
+        tree.near(pa, pb, tol, |v| {
             let p = points[v as usize];
             let t = (dot(sub(p, pa), d) / dot(d, d)).clamp(0., 1.);
             let off = sub(p, std::array::from_fn(|k| pa[k] + d[k] * t));
-            let far = |q: [f64; 3]| dot(sub(p, q), sub(p, q)) > WELD * WELD;
-            if dot(off, off) <= WELD * WELD && far(pa) && far(pb) {
+            let far = |q: [f64; 3]| dot(sub(p, q), sub(p, q)) > tol * tol;
+            if dot(off, off) <= tol * tol && far(pa) && far(pb) {
                 cuts.push((t, v));
             }
         });
-        cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cuts.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         let mut from = a;
         for &(_, v) in &cuts {
             pieces.push((from.min(v), from.max(v)));
@@ -383,7 +452,10 @@ pub(crate) fn open_edges(triangles: &[[[f64; 3]; 3]]) -> usize {
         }
         pieces.push((from.min(b), from.max(b)));
     }
-    odd(pieces).len()
+    Closure {
+        open_edges: odd(pieces).len(),
+        encloses_volume,
+    }
 }
 /// The edges that occur an odd number of times in `edges`.
 fn odd(mut edges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
@@ -395,17 +467,13 @@ fn odd(mut edges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
         .collect()
 }
 /// Welded vertex ids of the corners of `triangles`, and a position for each
-/// (one of its copies). Copies within `WELD` of each other are one vertex,
-/// and so are chains of such copies, unless a chain spreads over more than
-/// `SPREAD`: that is a row of distinct vertices too close to weld, such as a
-/// finely divided rim, and only its bit-identical copies are one vertex.
-/// Copies are grouped in cells small enough that all copies in one are within
-/// `WELD` of each other, so a cluster of copies costs no more than its few
-/// cells, and a cell is compared only with the cells near it, found through
-/// blocks of 8 × 8 × 8 cells.
-fn weld(triangles: &[[[f64; 3]; 3]]) -> (Vec<[u32; 3]>, Vec<[f64; 3]>) {
+/// (its first copy). Copies within `tol` of each other are one vertex, and so
+/// are chains of such copies. Bit-identical copies are found first. The rest
+/// are grouped in cells `tol` / √3 across, so all copies in one cell are
+/// within `tol` of each other and need no comparison, and each cell is
+/// compared only with the cells up to two cells away.
+fn weld(triangles: &[[[f64; 3]; 3]], tol: f64) -> (Vec<[u32; 3]>, Vec<[f64; 3]>) {
     use std::collections::HashMap;
-    // Distinct positions first: most copies of a vertex are bit-identical.
     let mut seen: HashMap<[u64; 3], u32> = HashMap::new();
     let mut points: Vec<[f64; 3]> = vec![];
     let corners: Vec<[u32; 3]> = triangles
@@ -419,33 +487,18 @@ fn weld(triangles: &[[[f64; 3]; 3]]) -> (Vec<[u32; 3]>, Vec<[f64; 3]>) {
             })
         })
         .collect();
-    let side = WELD / 1.7321;
-    let cell = |p: [f64; 3]| p.map(|v| (v / side).floor() as i64);
-    let block = |c: [i64; 3]| c.map(|v| v.div_euclid(8));
-    let mut order: Vec<(u32, [i64; 3])> = (0..points.len())
-        .map(|i| (i as u32, cell(points[i])))
+    let side = tol / 1.7321;
+    let mut order: Vec<([i64; 3], u32)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.map(|v| (v / side).floor() as i64), i as u32))
         .collect();
-    order.sort_unstable_by_key(|(i, c)| (block(*c), *c, *i));
-    // Each cell's copies (a range of `order`) and their box.
-    type Cell = ([i64; 3], std::ops::Range<usize>, [f64; 3], [f64; 3]);
-    let mut cells: Vec<Cell> = vec![];
-    for run in order.chunk_by(|a, b| a.1 == b.1) {
+    order.sort_unstable();
+    // Each cell's key and its copies (a range of `order`).
+    let mut cells: Vec<([i64; 3], std::ops::Range<usize>)> = vec![];
+    for run in order.chunk_by(|a, b| a.0 == b.0) {
         let start = cells.last().map_or(0, |c| c.1.end);
-        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-        for (i, _) in run {
-            let p = points[*i as usize];
-            for k in 0..3 {
-                lo[k] = lo[k].min(p[k]);
-                hi[k] = hi[k].max(p[k]);
-            }
-        }
-        cells.push((run[0].1, start..start + run.len(), lo, hi));
-    }
-    let mut blocks: HashMap<[i64; 3], std::ops::Range<usize>> = HashMap::new();
-    let mut start = 0;
-    for run in cells.chunk_by(|a, b| block(a.0) == block(b.0)) {
-        blocks.insert(block(run[0].0), start..start + run.len());
-        start += run.len();
+        cells.push((run[0].0, start..start + run.len()));
     }
     fn root(parent: &mut [u32], mut i: u32) -> u32 {
         while parent[i as usize] != i {
@@ -456,70 +509,49 @@ fn weld(triangles: &[[[f64; 3]; 3]]) -> (Vec<[u32; 3]>, Vec<[f64; 3]>) {
     }
     let mut parent: Vec<u32> = (0..cells.len() as u32).collect();
     let near = |p: u32, q: u32| {
-        let (p, q) = (points[p as usize], points[q as usize]);
-        dot(sub(p, q), sub(p, q)) <= WELD * WELD
+        let d = sub(points[p as usize], points[q as usize]);
+        dot(d, d) <= tol * tol
     };
-    for (c, (_, own, lo, hi)) in cells.iter().enumerate() {
-        let from = block(cell(lo.map(|v| v - WELD)));
-        let to = block(cell(hi.map(|v| v + WELD)));
-        for x in from[0]..=to[0] {
-            for y in from[1]..=to[1] {
-                for z in from[2]..=to[2] {
-                    let Some(range) = blocks.get(&[x, y, z]) else {
-                        continue;
-                    };
-                    for (d, (_, other, olo, ohi)) in cells[range.clone()]
+    // Each pair of cells up to two apart once, the later one in key order:
+    // for each X and Y step, the cells with Z up to two either way (only
+    // above, when X and Y are the same). The keys are sorted, so each step's
+    // cursor only moves forward.
+    let steps: Vec<[i64; 2]> = (0..=2)
+        .flat_map(|x| (-2..=2).map(move |y| [x, y]))
+        .filter(|s| *s >= [0, 0])
+        .collect();
+    let mut cursors = vec![0; steps.len()];
+    for c in 0..cells.len() {
+        let key = cells[c].0;
+        for (step, cursor) in steps.iter().zip(&mut cursors) {
+            let below = if *step == [0, 0] { 1 } else { -2 };
+            let lo = [key[0] + step[0], key[1] + step[1], key[2] + below];
+            let hi = [lo[0], lo[1], key[2] + 2];
+            while *cursor < cells.len() && cells[*cursor].0 < lo {
+                *cursor += 1;
+            }
+            for d in (*cursor..cells.len()).take_while(|d| cells[*d].0 <= hi) {
+                let (a, b) = (root(&mut parent, c as u32), root(&mut parent, d as u32));
+                if a != b
+                    && order[cells[c].1.clone()]
                         .iter()
-                        .enumerate()
-                        .map(|(k, cell)| (range.start + k, cell))
-                        .filter(|(d, _)| *d > c)
-                    {
-                        let gap: f64 = (0..3)
-                            .map(|k| (olo[k] - hi[k]).max(lo[k] - ohi[k]).max(0.).powi(2))
-                            .sum();
-                        if gap > WELD * WELD {
-                            continue;
-                        }
-                        let (a, b) = (root(&mut parent, c as u32), root(&mut parent, d as u32));
-                        if a != b
-                            && order[own.clone()].iter().any(|(p, _)| {
-                                order[other.clone()].iter().any(|(q, _)| near(*p, *q))
-                            })
-                        {
-                            parent[a.max(b) as usize] = a.min(b);
-                        }
-                    }
+                        .any(|(_, p)| order[cells[d].1.clone()].iter().any(|(_, q)| near(*p, *q)))
+                {
+                    parent[a.max(b) as usize] = a.min(b);
                 }
             }
         }
     }
-    let mut roots = vec![0usize; points.len()];
-    for (c, (_, range, _, _)) in cells.iter().enumerate() {
-        let r = root(&mut parent, c as u32) as usize;
-        for (i, _) in &order[range.clone()] {
-            roots[*i as usize] = r;
-        }
-    }
-    // How far each vertex's copies spread.
-    let (mut lo, mut hi) = (
-        vec![[f64::INFINITY; 3]; cells.len()],
-        vec![[f64::NEG_INFINITY; 3]; cells.len()],
-    );
-    for (p, r) in points.iter().zip(&roots) {
-        for k in 0..3 {
-            lo[*r][k] = lo[*r][k].min(p[k]);
-            hi[*r][k] = hi[*r][k].max(p[k]);
+    let mut cell_of = vec![0u32; points.len()];
+    for (c, (_, range)) in cells.iter().enumerate() {
+        for (_, i) in &order[range.clone()] {
+            cell_of[*i as usize] = c as u32;
         }
     }
     // Ids in order of first use, each placed at its first copy.
     let (mut id_of_root, mut ids, mut welded) = (vec![u32::MAX; cells.len()], vec![], vec![]);
-    for (p, r) in points.iter().zip(roots) {
-        let spread = sub(hi[r], lo[r]);
-        if dot(spread, spread) > SPREAD * SPREAD {
-            ids.push(welded.len() as u32);
-            welded.push(*p);
-            continue;
-        }
+    for (p, c) in points.iter().zip(cell_of) {
+        let r = root(&mut parent, c) as usize;
         if id_of_root[r] == u32::MAX {
             id_of_root[r] = welded.len() as u32;
             welded.push(*p);
@@ -579,13 +611,13 @@ impl<'a> Tree<'a> {
         }
         node
     }
-    /// Calls `visit` with every point within `WELD` of the segment from `a`
+    /// Calls `visit` with every point within `reach` of the segment from `a`
     /// to `b`, and with some others near it.
-    fn near(&self, a: [f64; 3], b: [f64; 3], mut visit: impl FnMut(u32)) {
+    fn near(&self, a: [f64; 3], b: [f64; 3], reach: f64, mut visit: impl FnMut(u32)) {
         let mut stack = vec![0];
         while let Some(n) = stack.pop() {
             let (lo, hi, range, children) = &self.nodes[n];
-            if !meets(a, b, lo.map(|v| v - WELD), hi.map(|v| v + WELD)) {
+            if !meets(a, b, lo.map(|v| v - reach), hi.map(|v| v + reach)) {
                 continue;
             }
             match children {
@@ -883,20 +915,30 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
     Ok((setup1, first, Volume::new(stock, Frame::new(setup1, mesh))))
 }
 /// The whole report, or the first reason planning cannot start. The part must
-/// be a closed surface: no open edges, and vertical rays (in setup 1's frame)
-/// that cross it consistently.
+/// be a closed solid: no open edges, an enclosed volume, and vertical rays (in
+/// setup 1's frame) that cross it consistently.
 pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
     let (setup1, first, stock) = basics(doc, mesh)?;
-    let open = open_edges(&mm_triangles(mesh));
-    if open > 0 {
+    closed_solid(setup1, mesh)?;
+    Ok(describe(doc, mesh, setup1, first, &stock))
+}
+/// `Ok` when the part is a closed solid, otherwise why it is not.
+fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
+    let (triangles, largest) = mm_triangles(mesh);
+    let found = closure(&triangles, largest);
+    if found.open_edges > 0 {
         return Err(format!(
-            "The part is not a closed solid ({open} open edges), so the planner cannot check its plans against it. Repair or re-export the model."
+            "The part is not a closed solid ({} open edges), so the planner cannot check its plans against it. Repair or re-export the model.",
+            found.open_edges
         ));
+    }
+    if !found.encloses_volume {
+        return Err("The part encloses no volume, so the planner cannot check its plans against it. Repair or re-export the model.".into());
     }
     if inconsistent_share(&Geometry::new(setup1, mesh)) > 0.02 {
         return Err("The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model.".into());
     }
-    Ok(describe(doc, mesh, setup1, first, &stock))
+    Ok(())
 }
 /// The report without the closed-surface checks, so tests can run the plan
 /// checks on open meshes.
@@ -1372,17 +1414,15 @@ pub(crate) mod tests {
             })
             .collect()
     }
-    /// Open edges of `t`.
+    /// Open edges of `t`, taken as mm.
     fn count(t: &[Tri]) -> usize {
-        open_edges(
-            &t.iter()
-                .map(|p| p.map(|q| q.map(f64::from)))
-                .collect::<Vec<_>>(),
-        )
+        let t: Vec<_> = t.iter().map(|p| p.map(|q| q.map(f64::from))).collect();
+        closure(&t, 0.).open_edges
     }
     /// Open edges of `mesh`.
     fn edges(mesh: &Mesh) -> usize {
-        open_edges(&mm_triangles(mesh))
+        let (t, largest) = mm_triangles(mesh);
+        closure(&t, largest).open_edges
     }
     fn not_closed(n: usize) -> String {
         format!(
@@ -1390,36 +1430,142 @@ pub(crate) mod tests {
         )
     }
     const NOT_SOLID: &str = "The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model.";
+    const NO_VOLUME: &str = "The part encloses no volume, so the planner cannot check its plans against it. Repair or re-export the model.";
+    /// `t` turned `angles` degrees about X and then Y, scaled by `scale` and
+    /// moved by `offset`, computed exactly and rounded once to f32, as an
+    /// exporter writes it.
+    fn placed(t: &[Tri], angles: [f64; 2], scale: f64, offset: [f64; 3]) -> Vec<Tri> {
+        let [(sx, cx), (sy, cy)] = angles.map(|a| a.to_radians().sin_cos());
+        let m = [
+            [cy, sy * sx, sy * cx],
+            [0., cx, -sx],
+            [-sy, cy * sx, cy * cx],
+        ];
+        t.iter()
+            .map(|p| {
+                p.map(|q| {
+                    std::array::from_fn(|i| {
+                        ((0..3).map(|k| m[i][k] * f64::from(q[k])).sum::<f64>() * scale + offset[i])
+                            as f32
+                    })
+                })
+            })
+            .collect()
+    }
+    /// A point on a circle of radius `r` around the Z axis, at the `i`-th of
+    /// `n` steps and height `z`.
+    fn rim(r: f32, n: usize, i: usize, z: f32) -> [f32; 3] {
+        let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+        [
+            (f64::from(r) * a.cos()) as f32,
+            (f64::from(r) * a.sin()) as f32,
+            z,
+        ]
+    }
+    /// A cylinder of radius `r` and height `h` with `n` segments whose caps
+    /// are fans from rim vertex 0, as CAD often writes a disc.
+    fn rim_fan_cylinder(r: f32, n: usize, h: f32) -> Vec<Tri> {
+        let mut t = vec![];
+        for i in 0..n {
+            let (a0, a1, b0, b1) = (
+                rim(r, n, i, 0.),
+                rim(r, n, i + 1, 0.),
+                rim(r, n, i, h),
+                rim(r, n, i + 1, h),
+            );
+            t.push([a0, a1, b1]);
+            t.push([a0, b1, b0]);
+        }
+        for k in 1..n - 1 {
+            t.push([rim(r, n, 0, h), rim(r, n, k, h), rim(r, n, k + 1, h)]);
+            t.push([rim(r, n, 0, 0.), rim(r, n, k + 1, 0.), rim(r, n, k, 0.)]);
+        }
+        t
+    }
+    /// A 5 mm tall cylinder of radius `r` with `n` segments whose caps are
+    /// fans around their centres, with every other top spoke split into
+    /// `pieces` by a fan from the rim: T-junctions along the spokes.
+    fn split_spokes(r: f32, n: usize, pieces: usize) -> Vec<Tri> {
+        let centre = [0f32, 0., 5.];
+        let mut t = vec![];
+        for i in 0..n {
+            let (a0, a1, b0, b1) = (
+                rim(r, n, i, 0.),
+                rim(r, n, i + 1, 0.),
+                rim(r, n, i, 5.),
+                rim(r, n, i + 1, 5.),
+            );
+            t.push([a0, a1, b1]);
+            t.push([a0, b1, b0]);
+            t.push([[0., 0., 0.], a1, a0]);
+            if i % 2 == 1 {
+                t.push([centre, b0, b1]);
+                continue;
+            }
+            let at = |s: usize| -> [f32; 3] {
+                let f = s as f32 / pieces as f32;
+                std::array::from_fn(|k| centre[k] + (b0[k] - centre[k]) * f)
+            };
+            for s in 0..pieces {
+                t.push([at(s), at(s + 1), b1]);
+            }
+        }
+        t
+    }
+    /// An outward-facing box from `lo` to `hi`.
+    fn cuboid(lo: [f32; 3], hi: [f32; 3]) -> Vec<Tri> {
+        box_triangles(true, true)
+            .iter()
+            .map(|p| p.map(|q| std::array::from_fn(|k| if q[k] > 0. { hi[k] } else { lo[k] })))
+            .collect()
+    }
+    /// `t` with every triangle's winding reversed.
+    fn reversed(t: &[Tri]) -> Vec<Tri> {
+        t.iter().map(|p| [p[0], p[2], p[1]]).collect()
+    }
     #[test]
-    fn open_edges_are_the_edges_welding_and_splitting_leave_unmatched() {
+    fn open_edges_are_the_edges_left_once_float_rounding_is_absorbed() {
         let (o, a, b, c) = ([0., 0., 0.], [10., 0., 0.], [0., 10., 0.], [0., 0., 10.]);
         let tetrahedron = |moved: [f32; 3]| vec![[moved, b, a], [o, a, c], [o, c, b], [a, b, c]];
         assert_eq!(count(&tetrahedron(o)), 0);
         assert_eq!(count(&[[o, a, b]]), 3);
-        // Copies of a vertex up to 0.001 mm apart are one vertex.
-        for off in [0.00005, 0.0005, 0.00099] {
+        // The tolerance here is 8 f32 steps at 10 mm, 0.0000076 mm: copies of
+        // a vertex that close are one vertex.
+        for off in [0.000001, 0.000005] {
             assert_eq!(count(&tetrahedron([0., 0., -off])), 0, "{off}");
         }
-        // 0.01 mm apart: four open edges.
-        assert_eq!(count(&tetrahedron([0., 0., -0.01])), 4);
-        // A zero-area triangle, a duplicated triangle and a copy with its
-        // winding reversed change nothing.
+        // Copies farther apart are distinct vertices: four open edges.
+        for off in [0.00001, 0.00005, 0.0005, 0.00099, 0.01] {
+            assert_eq!(count(&tetrahedron([0., 0., -off])), 4, "{off}");
+        }
+        // A zero-area triangle and a triangle written again with the same
+        // winding, from another corner, change nothing.
         let mut t = tetrahedron(o);
-        t.extend([[o, [5., 0., 0.], a], [o, a, c], [o, c, a]]);
+        t.extend([[o, [5., 0., 0.], a], [o, a, c], [a, c, o]]);
         assert_eq!(count(&t), 0);
-        // A triangle written with both windings is one open triangle.
-        assert_eq!(count(&[[o, a, b], [o, b, a]]), 3);
-        // A T-junction: the long edge is split at the vertex in its middle.
-        let m = [5., 5., 0.];
+        // A copy with the opposite winding stays: with it, the triangle's
+        // edges are used three times.
+        let mut t = tetrahedron(o);
+        t.push([o, c, a]);
+        assert_eq!(count(&t), 3);
+        // A triangle written with both windings has no open edge (the volume
+        // rule refuses it).
+        assert_eq!(count(&[[o, a, b], [o, b, a]]), 0);
+        // A T-junction: the long edge is split at the vertex in its middle,
+        // also when that vertex is within the tolerance of the edge.
         let flat = |top: Vec<Tri>| {
             let mut t = top;
             t.extend([[o, b, c], [o, c, a], [a, c, b]]);
             t
         };
-        assert_eq!(count(&flat(vec![[o, a, m], [o, m, b]])), 0);
-        // Moved 0.01 mm off the long edge, the vertex does not split it.
-        let off = [5.007, 5.007, 0.];
-        assert_eq!(count(&flat(vec![[o, a, off], [o, off, b]])), 3);
+        for m in [[5., 5., 0.], [5.000003, 5.000003, 0.]] {
+            assert_eq!(count(&flat(vec![[o, a, m], [o, m, b]])), 0, "{m:?}");
+        }
+        // Moved 0.00003 or 0.01 mm off the long edge, the vertex does not
+        // split it.
+        for m in [[5.00002, 5.00002, 0.], [5.007, 5.007, 0.]] {
+            assert_eq!(count(&flat(vec![[o, a, m], [o, m, b]])), 3, "{m:?}");
+        }
         // Coordinates beyond 1 000 000 mm or not finite: every edge is open.
         let far: Vec<Tri> = tetrahedron(o)
             .iter()
@@ -1472,6 +1618,13 @@ pub(crate) mod tests {
         let cup = crate::mesh::normalize(t).unwrap();
         assert_eq!(edges(&cup), n);
         assert_eq!(report(&doc, &cup).unwrap_err(), not_closed(n));
+        // A UV sphere whose vertex copies are up to 0.0002 mm apart, far more
+        // than float rounding at 30 mm: the copies are distinct vertices.
+        let soup =
+            crate::mesh::normalize(jittered(&sphere_triangles(96, 48, 30.), 0.0001)).unwrap();
+        let n = edges(&soup);
+        assert!(n > 10_000, "{n}");
+        assert_eq!(report(&doc, &soup).unwrap_err(), not_closed(n));
         // The +X wall re-triangulated with a vertex in the middle of its top
         // edge, which the top face does not have: a T-junction.
         let (x, y, z) = (40., 30., 20.);
@@ -1492,8 +1645,8 @@ pub(crate) mod tests {
             ("T-junction example block", t_junctions(&mesh)),
             ("example block with a triangle written twice", twice),
             (
-                "UV sphere with vertex copies up to 0.0002 mm apart",
-                crate::mesh::normalize(jittered(&sphere_triangles(96, 48, 30.), 0.0001)).unwrap(),
+                "UV sphere with vertex copies up to 0.00001 mm apart",
+                crate::mesh::normalize(jittered(&sphere_triangles(96, 48, 30.), 0.000005)).unwrap(),
             ),
             (
                 "fan-capped T-junction cylinder",
@@ -1540,6 +1693,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn the_example_models_are_closed_surfaces() {
+        let (doc, _) = block();
         let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
         for file in [
             "four-setup-block.3mf",
@@ -1553,23 +1707,24 @@ pub(crate) mod tests {
             }
             let mesh = crate::mesh::load(&examples.join(file)).unwrap();
             assert_eq!(edges(&mesh), 0, "{file}");
+            assert_eq!(closed_solid(&doc.setups[0], &mesh), Ok(()), "{file}");
         }
+    }
+    /// The solid spans through the middle of the model in `setup`'s frame,
+    /// from the model's bottom, in mm.
+    fn column(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 2]> {
+        let geometry = Geometry::new(setup, mesh);
+        let index = Index::new(&geometry);
+        let b = geometry.bounds;
+        let centre = [0, 1].map(|k| (b.min[k] + b.max[k]) / 2. + 1e-4);
+        solid(&index, centre, b.max[2])
+            .iter()
+            .map(|(lo, hi)| [lo - b.min[2], hi - b.min[2]].map(|v| (v * 1000.).round() / 1000.))
+            .collect()
     }
     #[test]
     fn an_inconsistent_column_is_solid_where_its_crossings_say_so() {
         let (doc, _) = block();
-        let column = |setup: &Setup, mesh: &Mesh| {
-            let geometry = Geometry::new(setup, mesh);
-            let index = Index::new(&geometry);
-            let b = geometry.bounds;
-            let centre = [0, 1].map(|k| (b.min[k] + b.max[k]) / 2. + 1e-4);
-            let spans = solid(&index, centre, b.max[2]);
-            // From the model's bottom, in mm.
-            spans
-                .iter()
-                .map(|(lo, hi)| [lo - b.min[2], hi - b.min[2]].map(|v| (v * 1000.).round() / 1000.))
-                .collect::<Vec<_>>()
-        };
         let top = &doc.setups[0];
         // Only the top crossing (the underside square is missing): it faces
         // up, so the column is solid from the model's bottom up to it.
@@ -1584,6 +1739,131 @@ pub(crate) mod tests {
         // Consistent columns are unchanged.
         assert_eq!(column(&flipped, &pocket_box(0.)), vec![[0., 34.]]);
         assert_eq!(column(top, &holed(0., 0.)), vec![[0., 40.]]);
+    }
+    #[test]
+    fn sound_small_and_far_parts_with_t_junctions_are_closed() {
+        let (doc, mesh) = block();
+        let src = source(&mesh, [0.; 3]);
+        let lower = cuboid([0.; 3], [40., 30., 20.]);
+        // The same box on top shares the lower one's top triangles, in the
+        // opposite winding; the mirrored box beside it shares its +X wall.
+        let mut stacked = lower.clone();
+        stacked.extend(cuboid([0., 0., 20.], [40., 30., 40.]));
+        let mut beside = lower.clone();
+        beside.extend(reversed(
+            &lower
+                .iter()
+                .map(|p| p.map(|q| [80. - q[0], q[1], q[2]]))
+                .collect::<Vec<_>>(),
+        ));
+        let mut cases: Vec<(String, Vec<Tri>)> = vec![
+            (
+                "4 mm, 256-segment cylinder with rim-fanned caps, every other triangle split".into(),
+                split(&rim_fan_cylinder(2., 256, 3.), 2, 2),
+            ),
+            (
+                "1 mm, 128-segment cylinder with rim-fanned caps, every other triangle split".into(),
+                split(&rim_fan_cylinder(0.5, 128, 3.), 2, 2),
+            ),
+            (
+                "fan-capped cylinder, 1 024 segments, every other top spoke split into 100".into(),
+                split_spokes(5., 1024, 100),
+            ),
+            (
+                "example block turned 30/30 degrees at (412.3, -287.6, 95.1) mm, every 10th longest edge split into 120".into(),
+                placed(&split(&src, 10, 120), [30., 30.], 1., [412.3, -287.6, 95.1]),
+            ),
+            ("two boxes stacked, sharing a face".into(), stacked),
+            ("two boxes side by side, sharing a face".into(), beside),
+        ];
+        for length in [10., 15., 6., 4.7] {
+            cases.push((
+                format!("example block {length} mm long with T-junctions"),
+                split(&placed(&src, [0.; 2], length / 120., [0.; 3]), 3, 2),
+            ));
+        }
+        // Small parts with T-junctions, rounded where their files put them,
+        // away from the origin: the tolerance follows the file's coordinates.
+        cases.push((
+            "1 mm cylinder with T-junctions, turned 30/30 degrees at (40, -20, 10) mm".into(),
+            placed(
+                &split(&rim_fan_cylinder(0.5, 128, 3.), 3, 2),
+                [30., 30.],
+                1.,
+                [40., -20., 10.],
+            ),
+        ));
+        cases.push((
+            "example block 10 mm long with T-junctions at (412.3, -287.6, 95.1) mm".into(),
+            placed(
+                &split(&placed(&src, [0.; 2], 10. / 120., [0.; 3]), 3, 2),
+                [0.; 2],
+                1.,
+                [412.3, -287.6, 95.1],
+            ),
+        ));
+        for (name, t) in cases {
+            let m = crate::mesh::normalize(t).unwrap();
+            assert_eq!(edges(&m), 0, "{name}");
+            assert_eq!(closed_solid(&doc.setups[0], &m), Ok(()), "{name}");
+        }
+    }
+    #[test]
+    fn a_part_that_encloses_no_volume_is_refused() {
+        let (doc, _) = block();
+        let one = vec![[[0., 0., 0.], [10., 0., 5.], [0., 10., 5.]]];
+        let single = crate::mesh::normalize([one.clone(), reversed(&one)].concat()).unwrap();
+        assert_eq!(edges(&single), 0);
+        assert_eq!(report(&doc, &single).unwrap_err(), NO_VOLUME);
+        // The upper half of a UV sphere and a flat 10 x 10 grid, each written
+        // with both windings.
+        let cap: Vec<Tri> = sphere_triangles(48, 24, 30.)
+            .into_iter()
+            .filter(|p| p.iter().all(|q| q[2] > -0.001))
+            .collect();
+        let mut grid = vec![];
+        for i in 0..10 {
+            for j in 0..10 {
+                let (x, y) = (i as f32, j as f32);
+                quad(
+                    &mut grid,
+                    [
+                        [x, y, 0.],
+                        [x + 1., y, 0.],
+                        [x + 1., y + 1., 0.],
+                        [x, y + 1., 0.],
+                    ],
+                );
+            }
+        }
+        for (name, sheet) in [("hemisphere", cap), ("flat grid", grid)] {
+            let both = crate::mesh::normalize([sheet.clone(), reversed(&sheet)].concat()).unwrap();
+            assert_eq!(edges(&both), 0, "{name}");
+            assert_eq!(
+                closed_solid(&doc.setups[0], &both).unwrap_err(),
+                NO_VOLUME,
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn coincident_faces_facing_both_ways_read_the_same_in_either_order() {
+        let (doc, _) = block();
+        let setup1 = &doc.setups[0];
+        // The reviewer's case: a 20 x 20 x 20 void (an inward box) whose top
+        // lies on the block's top face, listed before or after the block.
+        let outer = cuboid([0.; 3], [120., 80., 40.]);
+        let void = reversed(&cuboid([50., 30., 20.], [70., 50., 40.]));
+        let first = crate::mesh::normalize([void.clone(), outer.clone()].concat()).unwrap();
+        let last = crate::mesh::normalize([outer, void].concat()).unwrap();
+        let share = |m: &Mesh| inconsistent_share(&Geometry::new(setup1, m));
+        assert_eq!(share(&first), share(&last));
+        assert_eq!(column(setup1, &first), column(setup1, &last));
+        assert_eq!(closed_solid(setup1, &first), closed_solid(setup1, &last));
+        // A crossing facing down comes first: the void reads as empty under a
+        // lid of no thickness, and the part is accepted.
+        assert_eq!(column(setup1, &first), vec![[0., 20.], [40., 40.]]);
+        assert_eq!(closed_solid(setup1, &first), Ok(()));
     }
     #[test]
     fn the_part_must_be_a_closed_solid() {
