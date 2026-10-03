@@ -183,7 +183,8 @@ fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> 
     let mut problems = vec![];
     if worst > 0.1 {
         problems.push(format!(
-            "The tool's centre line passes through {worst:.2} mm of the part at X {:.1}, Y {:.1}, {:.1} mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there.",
+            "The tool's centre line passes through {} mm of the part at X {:.1}, Y {:.1}, {:.1} mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there.",
+            mm(worst),
             at[0] - b.min[0],
             at[1] - b.min[1],
             b.max[2] - at[2]
@@ -198,15 +199,26 @@ fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> 
     if below > 0.001 {
         problems.push(if si == 0 {
             format!(
-                "The tool goes {below:.2} mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough."
+                "The tool goes {} mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough.",
+                mm(below)
             )
         } else {
             format!(
-                "The tool goes {below:.2} mm below the part's underside in this setup. Earlier setups may have removed the stock there, and the part rests on it. Reduce the depth or the breakthrough."
+                "The tool goes {} mm below the part's underside in this setup. Earlier setups may have removed the stock there, and the part rests on it. Reduce the depth or the breakthrough.",
+                mm(below)
             )
         });
     }
     problems
+}
+/// A distance in mm for messages: three decimals under 0.01 mm, so a few
+/// thousandths never print as 0.00, otherwise two.
+fn mm(v: f32) -> String {
+    if v < 0.01 {
+        format!("{v:.3}")
+    } else {
+        format!("{v:.2}")
+    }
 }
 fn percent(part: f32, whole: f32) -> f32 {
     if whole <= 0. {
@@ -959,26 +971,46 @@ mod tests {
     fn in_a_later_setup_the_floor_is_the_parts_underside() {
         let (doc, mesh, report) = block();
         // Setup 1's Face removed the stock that the flipped setup's stock box
-        // still puts below the part.
-        let plan = |breakthrough: f32| {
-            let mut plan = good(&report);
-            let mut drill = op("Drill", 3, underside(&report));
-            drill.through = Some(true);
-            drill.hole_diameter = Some(6.6);
-            drill.breakthrough = Some(breakthrough);
-            plan.setups[1].operations.push(drill);
-            plan
+        // still puts below the part. A plan cannot drill through in a later
+        // setup, so the drill is made a through drill after building.
+        let mut plan = good(&report);
+        let mut drill = op("Drill", 3, underside(&report));
+        drill.hole_diameter = Some(6.6);
+        plan.setups[1].operations.push(drill);
+        let job = proposal::build(&doc, &mesh, &report, &plan).unwrap();
+        let through = |breakthrough: &str| {
+            let mut job = job.clone();
+            drill_through(&mut job.setups[1].operations[2], "6.6", breakthrough);
+            check_built(&job, &mesh, &report)
         };
-        let (refused, job) = check(&doc, &mesh, &report, &plan(3.));
-        assert!(job.is_none());
         assert_eq!(
-            stages(&refused),
+            stages(&through("3")),
             vec![
                 "gouge 2/Some(3): The tool goes 3.00 mm below the part's underside in this setup. Earlier setups may have removed the stock there, and the part rests on it. Reduce the depth or the breakthrough."
             ]
         );
-        let (flush, _) = check(&doc, &mesh, &report, &plan(0.));
+        let flush = through("0");
         assert!(flush.passed, "{:?}", stages(&flush));
+    }
+    #[test]
+    fn later_setups_cannot_drill_through() {
+        let (doc, mesh, report) = block();
+        let mut plan = good(&report);
+        let mut drill = op("Drill", 3, underside(&report));
+        drill.through = Some(true);
+        drill.hole_diameter = Some(6.6);
+        plan.setups[1].operations.push(drill);
+        let (refused, job) = check(&doc, &mesh, &report, &plan);
+        assert!(job.is_none());
+        assert_eq!(
+            stages(&refused),
+            vec![
+                "structure 2/Some(3): through is true, but in setup 2 the part rests on the face where the drill would exit, so it cannot break through. Drill through holes in setup 1, or set through to false and list the unfinished exit in unmachined."
+            ]
+        );
+        plan.setups[1].operations[2].through = Some(false);
+        let (passed, job) = check(&doc, &mesh, &report, &plan);
+        assert!(passed.passed && job.is_some(), "{:?}", stages(&passed));
     }
     #[test]
     fn a_negative_bottom_offset_is_refused_before_generation() {
@@ -994,64 +1026,62 @@ mod tests {
             vec!["structure 2/Some(3): bottom_offset cannot be negative."]
         );
     }
-    fn quad(t: &mut Vec<[[f32; 3]; 3]>, p: [[f32; 3]; 4]) {
-        t.push([p[0], p[1], p[2]]);
-        t.push([p[0], p[2], p[3]]);
-    }
-    /// A 120 × 80 × 40 box whose top face lacks a `hole` × `hole` square in the
-    /// middle; closed when `hole` is 0.
-    fn holed_box(hole: f32) -> Mesh {
-        let (x, y, z) = (120f32, 80f32, 40f32);
-        let (a0, a1) = ((x - hole) / 2., (x + hole) / 2.);
-        let (b0, b1) = ((y - hole) / 2., (y + hole) / 2.);
-        let mut t = vec![];
-        if hole > 0. {
-            quad(&mut t, [[0., 0., z], [x, 0., z], [a1, b0, z], [a0, b0, z]]);
-            quad(&mut t, [[x, 0., z], [x, y, z], [a1, b1, z], [a1, b0, z]]);
-            quad(&mut t, [[x, y, z], [0., y, z], [a0, b1, z], [a1, b1, z]]);
-            quad(&mut t, [[0., y, z], [0., 0., z], [a0, b0, z], [a0, b1, z]]);
-        } else {
-            quad(&mut t, [[0., 0., z], [x, 0., z], [x, y, z], [0., y, z]]);
+    /// A plan with one setup per orientation in `setups`, in order.
+    fn plan_of(setups: Vec<(&str, Vec<proposal::ProposedOp>)>) -> Proposal {
+        Proposal {
+            summary: String::new(),
+            setups: setups
+                .into_iter()
+                .enumerate()
+                .map(|(i, (up, operations))| proposal::ProposedSetup {
+                    orientation: up.into(),
+                    name: format!("Setup {}", i + 1),
+                    origin: if i == 0 {
+                        "Stock top center"
+                    } else {
+                        "Model origin"
+                    }
+                    .into(),
+                    workholding: String::new(),
+                    operations,
+                })
+                .collect(),
+            unmachined: vec![],
+            warnings: vec![],
         }
-        quad(&mut t, [[0., 0., 0.], [0., y, 0.], [x, y, 0.], [x, 0., 0.]]);
-        quad(&mut t, [[0., 0., 0.], [x, 0., 0.], [x, 0., z], [0., 0., z]]);
-        quad(&mut t, [[x, y, 0.], [0., y, 0.], [0., y, z], [x, y, z]]);
-        quad(&mut t, [[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
-        quad(&mut t, [[x, 0., 0.], [x, y, 0.], [x, y, z], [x, 0., z]]);
-        crate::mesh::normalize(t).unwrap()
+    }
+    /// The surfaces of an orientation's top plane, or of its first floor.
+    fn plane(report: &PartReport, up: &str, kind: &str) -> Vec<usize> {
+        report
+            .orientations
+            .iter()
+            .find(|o| o.up == up)
+            .unwrap()
+            .planes
+            .iter()
+            .find(|p| p.kind == kind)
+            .unwrap()
+            .surfaces
+            .clone()
     }
     #[test]
     fn a_column_where_the_mesh_is_open_counts_as_solid() {
         let (doc, _, _) = block();
-        let face_and_waterline = |report: &PartReport| Proposal {
-            summary: String::new(),
-            setups: vec![proposal::ProposedSetup {
-                orientation: "+Z".into(),
-                name: "Top".into(),
-                origin: "Stock top center".into(),
-                workholding: String::new(),
-                operations: vec![
-                    op(
-                        "Face",
-                        1,
-                        report.orientations[0]
-                            .planes
-                            .iter()
-                            .find(|p| p.kind == "top")
-                            .unwrap()
-                            .surfaces
-                            .clone(),
-                    ),
+        let face_and_waterline = |report: &PartReport| {
+            plan_of(vec![(
+                "+Z",
+                vec![
+                    op("Face", 1, plane(report, "+Z", "top")),
                     op("Waterline", 1, vec![]),
                 ],
-            }],
-            unmachined: vec![],
-            warnings: vec![],
+            )])
         };
-        // The reviewers' case: the missing patch is under 2% of the test rays,
-        // so the report accepts the part, and the Waterline cuts into the patch.
-        let open = holed_box(12.);
-        let report = analysis::report(&doc, &open).unwrap();
+        // The reviewers' case: a 12 × 12 square missing from the top. The
+        // report refuses the part for its open edges; behind it, the checks
+        // still catch the Waterline cutting into the square.
+        let open = analysis::tests::holed(12., 0.);
+        assert!(analysis::report(&doc, &open).is_err());
+        let report = analysis::report_unchecked(&doc, &open).unwrap();
         let (check, job) = check(&doc, &open, &report, &face_and_waterline(&report));
         let found = stages(&check);
         assert!(!check.passed && job.is_none(), "{found:?}");
@@ -1059,10 +1089,94 @@ mod tests {
             found.iter().any(|m| m.starts_with("gouge 1/Some(2): ")),
             "{found:?}"
         );
-        let closed = holed_box(0.);
+        let closed = analysis::tests::holed(0., 0.);
         let report = analysis::report(&doc, &closed).unwrap();
         let (check, _) = super::check(&doc, &closed, &report, &face_and_waterline(&report));
         assert!(check.passed, "{:?}", stages(&check));
+    }
+    #[test]
+    fn a_plunge_where_the_underside_is_open_is_refused() {
+        let (doc, _) = crate::post::fixture::job();
+        // A 12 × 12 square missing from the underside: the column through it
+        // crosses only the top face. The report refuses the part for its open
+        // edges; the tool axis check is the second line of defence.
+        let open = analysis::tests::holed(0., 12.);
+        assert!(analysis::report(&doc, &open).is_err());
+        let geometry = Geometry::new(&doc.setups[0], &open);
+        let index = Index::new(&geometry);
+        let b = geometry.bounds;
+        let (x, y) = ((b.min[0] + b.max[0]) / 2., (b.min[1] + b.max[1]) / 2.);
+        let z = b.max[2] - 10.;
+        let mut plan = crate::post::fixture::plan(
+            [x, y, b.max[2] + 5.],
+            &[
+                (Motion::Feed, [x, y, z], 300.),
+                (Motion::Feed, [x + 3., y, z], 300.),
+            ],
+        );
+        plan.stock.min[2] = b.min[2] - 3.;
+        assert_eq!(
+            axis_problems(&plan, &geometry, &index, 0),
+            vec![
+                "The tool's centre line passes through 10.00 mm of the part at X 60.0, Y 40.0, 10.0 mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there."
+            ]
+        );
+    }
+    #[test]
+    fn a_pocket_under_an_open_top_square_passes_the_part_checks() {
+        let (doc, _) = crate::post::fixture::job();
+        // A pocket open from below with a 12 × 12 square missing from the top
+        // face above it. The report refuses the part for its open edges; the
+        // checks behind it must still accept this sound plan.
+        let mesh = analysis::tests::pocket_box(12.);
+        assert!(analysis::report(&doc, &mesh).is_err());
+        let report = analysis::report_unchecked(&doc, &mesh).unwrap();
+        let plan = plan_of(vec![
+            ("+Z", vec![op("Face", 1, plane(&report, "+Z", "top"))]),
+            (
+                "-Z",
+                vec![
+                    op("Face", 1, plane(&report, "-Z", "top")),
+                    op("Pocket", 1, plane(&report, "-Z", "floor")),
+                ],
+            ),
+        ]);
+        let (check, job) = check(&doc, &mesh, &report, &plan);
+        assert!(check.passed && job.is_some(), "{:?}", stages(&check));
+    }
+    #[test]
+    fn distances_under_0_01_mm_print_three_decimals() {
+        let (doc, mesh) = crate::post::fixture::job();
+        let geometry = Geometry::new(&doc.setups[0], &mesh);
+        let index = Index::new(&geometry);
+        let b = geometry.bounds;
+        // A plunge beside the part, to just below the floor.
+        let (x, y) = (b.min[0] - 8., b.min[1] - 8.);
+        let plunge = |to: f32, si: usize| {
+            let mut plan = crate::post::fixture::plan(
+                [x, y, b.max[2] + 5.],
+                &[(Motion::Feed, [x, y, to], 300.)],
+            );
+            plan.stock.min[2] = b.min[2] - 3.;
+            axis_problems(&plan, &geometry, &index, si)
+        };
+        assert_eq!(
+            plunge(b.min[2] - 3.003, 0),
+            vec![
+                "The tool goes 0.003 mm below the bottom of the stock, where the vise or table is. Reduce the depth or the breakthrough."
+            ]
+        );
+        assert_eq!(
+            plunge(b.min[2] - 0.004, 1),
+            vec![
+                "The tool goes 0.004 mm below the part's underside in this setup. Earlier setups may have removed the stock there, and the part rests on it. Reduce the depth or the breakthrough."
+            ]
+        );
+        assert!(plunge(b.min[2] - 3.02, 0)[0].starts_with("The tool goes 0.02 mm below"));
+        assert_eq!(
+            (mm(0.0099), mm(0.01), mm(1.5)),
+            ("0.010".into(), "0.01".into(), "1.50".into())
+        );
     }
     #[test]
     fn the_tool_axis_allows_0_1_mm_for_every_strategy() {

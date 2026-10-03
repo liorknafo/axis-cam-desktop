@@ -188,10 +188,11 @@ fn plane_of<'a>(orientation: &'a OrientationReport, surfaces: &[usize]) -> Optio
         .iter()
         .find(|p| !surfaces.is_empty() && surfaces.iter().all(|id| p.surfaces.contains(id)))
 }
-/// Checks an operation's references and builds it. Returns what is wrong
-/// instead when the tool, surfaces or choices do not fit the strategy.
+/// Checks an operation of setup `si` (from 0) and builds it. Returns what is
+/// wrong instead when the tool, surfaces or choices do not fit the strategy.
 fn operation(
     p: &ProposedOp,
+    si: usize,
     orientation: &OrientationReport,
     report: &PartReport,
     tools: &[Tool],
@@ -333,7 +334,13 @@ fn operation(
         )),
         _ => {}
     }
-    if strategy == Strategy::Drill && p.through == Some(true) {
+    if strategy == Strategy::Drill && p.through == Some(true) && si > 0 {
+        // Later setups may not go below the part's underside (plan check).
+        wrong.push(format!(
+            "through is true, but in setup {} the part rests on the face where the drill would exit, so it cannot break through. Drill through holes in setup 1, or set through to false and list the unfinished exit in unmachined.",
+            si + 1
+        ));
+    } else if strategy == Strategy::Drill && p.through == Some(true) {
         // The holes the generator will drill: the plane's, narrowed by diameter.
         let filter = p.hole_diameter.filter(|d| *d > 0.);
         if let Some(blind) = plane
@@ -595,7 +602,7 @@ pub fn build(
             .take(MAX_SETUP_OPERATIONS)
             .enumerate()
         {
-            match operation(op, orientation, report, &doc.tools, &mesh.fingerprint) {
+            match operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint) {
                 Ok(op) => setup.operations.push(op),
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
             }
