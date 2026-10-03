@@ -1,10 +1,13 @@
 mod cam;
 mod choice_diagram;
 mod choice_help;
+#[cfg(test)]
+mod fake_openai;
 mod help;
 mod mesh;
 mod model;
 mod ngc;
+mod oauth;
 mod pocket;
 mod post;
 mod post_check;
