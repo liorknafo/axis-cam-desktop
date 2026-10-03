@@ -46,7 +46,7 @@ pub struct ProposedSetup {
     pub workholding: String,
     pub operations: Vec<ProposedOp>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedOp {
     pub strategy: String,
