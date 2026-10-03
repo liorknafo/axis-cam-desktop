@@ -136,6 +136,9 @@ pub struct SseParser {
     too_large: bool,
 }
 impl SseParser {
+    /// The events completed by `chunk`. Call [`SseParser::finish`] when the
+    /// stream ends: it reports a reply that was too large and returns a final
+    /// event that had no trailing blank line.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Value> {
         if self.too_large {
             return vec![];
@@ -369,11 +372,13 @@ impl Client {
         }
     }
     /// Forgets a session OpenAI no longer accepts. The lock is taken first,
-    /// so a refresh in flight cannot save its tokens after the clear.
+    /// so a refresh in flight cannot save its tokens after the clear, and the
+    /// memory is cleared before the store, so a cancelled caller cannot leave
+    /// the rejected session in use.
     async fn forget(&self) {
         let mut session = self.session.lock().await;
-        let _ = store_clear(&self.store).await;
         *session = None;
+        let _ = store_clear(&self.store).await;
     }
     /// Maps an error response and forgets the session when it is no longer valid.
     async fn failure(&self, response: reqwest::Response) -> ApiError {
@@ -1126,6 +1131,36 @@ mod tests {
         };
         let (result, ()) = tokio::join!(client.sign_out(), release);
         assert_eq!(result, Ok(()));
+    }
+    #[tokio::test]
+    async fn a_cancelled_request_still_forgets_a_rejected_session() {
+        let fake = Fake::start(|req: &Req| match req.path.as_str() {
+            "/token" => rotated(),
+            _ => Resp::error(401, "subscription_sharing_invalid_user"),
+        })
+        .await;
+        let (go, wait) = std::sync::mpsc::channel();
+        let store = Arc::new(GatedStore {
+            started: AtomicBool::new(false),
+            go: std::sync::Mutex::new(wait),
+        });
+        let client = Client::new(
+            Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store.clone(),
+            sample(),
+        );
+        let request = request();
+        let mut call = Box::pin(client.respond(&request));
+        tokio::select! {
+            _ = &mut call => panic!("the request finished while the store was still clearing"),
+            started = until(|| store.started.load(Ordering::SeqCst)) => assert!(started),
+        }
+        // OpenAI rejected the session and its clear is under way: cancel.
+        drop(call);
+        go.send(()).unwrap();
+        assert!(matches!(client.models().await, Err(ApiError::SignedOut(_))));
+        assert!(fake.seen("/v1/models").is_empty());
     }
     #[tokio::test]
     async fn a_streamed_invalid_user_error_clears_the_session() {

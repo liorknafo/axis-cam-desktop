@@ -19,6 +19,10 @@ pub const SCOPE: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const FIRST_CLIENT: &str = "dynamic_agent_client";
 const APP_NAME: &str = "AXIS CAM Studio";
+/// Per-request limit for the token, revoke and signing-key endpoints. A
+/// refresh holds the session lock, so a stalled endpoint must not hold it for
+/// the client's whole 300 s timeout.
+const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Token-endpoint error codes after which the refresh token can never work.
 const FATAL_REFRESH_CODES: [&str; 5] = [
     "invalid_grant",
@@ -26,6 +30,13 @@ const FATAL_REFRESH_CODES: [&str; 5] = [
     "refresh_token_expired",
     "refresh_token_reused",
     "invalid_client",
+];
+/// Error codes that only mean "not now", even on a 400 or 401.
+const TRANSIENT_REFRESH_CODES: [&str; 4] = [
+    "temporarily_unavailable",
+    "server_error",
+    "slow_down",
+    "rate_limit_exceeded",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,10 +224,14 @@ impl Listener {
         let serve = async {
             loop {
                 tokio::select! {
-                    accepted = self.listener.accept() => {
-                        let (socket, _) = accepted.map_err(|e| e.to_string())?;
-                        tokio::spawn(answer_connection(socket, state.clone(), winner.clone()));
-                    }
+                    accepted = self.listener.accept() => match accepted {
+                        Ok((socket, _)) => {
+                            tokio::spawn(answer_connection(socket, state.clone(), winner.clone()));
+                        }
+                        // For example, out of file descriptors for a moment.
+                        // Only the limit or a matching callback ends the wait.
+                        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    },
                     result = &mut answer => {
                         return result
                             .unwrap_or_else(|_| Err("Sign-in was interrupted. Try again.".into()));
@@ -230,7 +245,8 @@ impl Listener {
     }
 }
 /// Answers one loopback connection. The first matching callback wins; every
-/// other request gets 404.
+/// other request gets 404. A callback that arrives after the wait has ended
+/// gets the failure page, because nothing will finish that sign-in.
 async fn answer_connection(mut socket: tokio::net::TcpStream, state: Arc<str>, winner: Winner) {
     let Some(target) = request_target(&mut socket).await else {
         return;
@@ -242,13 +258,14 @@ async fn answer_connection(mut socket: tokio::net::TcpStream, state: Arc<str>, w
     };
     match (result, sender) {
         (Some(result), Some(sender)) => {
-            let text = if result.is_ok() {
+            let succeeded = result.is_ok();
+            let delivered = sender.send(result).is_ok();
+            let text = if succeeded && delivered {
                 "You can return to AXIS CAM Studio to finish signing in."
             } else {
                 "Sign-in was not completed. You can return to AXIS CAM Studio."
             };
             page(&mut socket, "200 OK", text).await;
-            let _ = sender.send(result);
         }
         _ => page(&mut socket, "404 Not Found", "Not found.").await,
     }
@@ -306,15 +323,16 @@ struct IdClaims {
     email: Option<String>,
     name: Option<String>,
 }
-/// The OAuth error code of a token-endpoint error body, in either common shape.
-fn error_code(body: &Value) -> String {
+/// The OAuth error code of a token-endpoint error body, in either common
+/// shape; `None` when the body carries no code.
+fn error_code(body: &Value) -> Option<String> {
     let error = &body["error"];
     error
         .as_str()
         .or(error["code"].as_str())
         .or(error["type"].as_str())
-        .unwrap_or("unknown_error")
-        .to_string()
+        .filter(|code| !code.is_empty())
+        .map(str::to_string)
 }
 /// Granted scopes: the token response's `scope`, else the access token's claim.
 fn granted_scope(tokens: &TokenResponse) -> String {
@@ -346,10 +364,12 @@ async fn post_form(
     http: &reqwest::Client,
     url: &str,
     form: &[(&str, &str)],
+    timeout: Duration,
 ) -> Result<(u16, Value), String> {
     let response = http
         .post(url)
         .form(form)
+        .timeout(timeout)
         .send()
         .await
         .map_err(|_| "Could not reach OpenAI.".to_string())?;
@@ -373,6 +393,7 @@ async fn validate_id_token(
     let header = jsonwebtoken::decode_header(id_token).map_err(|_| "The ID token is malformed.")?;
     let jwks: JwkSet = http
         .get(&e.jwks)
+        .timeout(ENDPOINT_TIMEOUT)
         .send()
         .await
         .map_err(|_| "Could not reach OpenAI.".to_string())?
@@ -419,12 +440,13 @@ pub async fn exchange(
             ("redirect_uri", &attempt.redirect_uri),
             ("resource", &e.api),
         ],
+        ENDPOINT_TIMEOUT,
     )
     .await?;
     if status != 200 {
         return Err(format!(
             "OpenAI rejected the sign-in ({}).",
-            error_code(&body)
+            error_code(&body).as_deref().unwrap_or("unknown_error")
         ));
     }
     let tokens: TokenResponse = serde_json::from_value(body)
@@ -456,6 +478,15 @@ pub async fn refresh(
     client_id: &str,
     session: &Session,
 ) -> Result<Session, AuthError> {
+    refresh_with(http, e, client_id, session, ENDPOINT_TIMEOUT).await
+}
+async fn refresh_with(
+    http: &reqwest::Client,
+    e: &Endpoints,
+    client_id: &str,
+    session: &Session,
+    timeout: Duration,
+) -> Result<Session, AuthError> {
     let (status, body) = post_form(
         http,
         &e.token,
@@ -465,17 +496,12 @@ pub async fn refresh(
             ("refresh_token", &session.refresh_token),
             ("resource", &e.api),
         ],
+        timeout,
     )
     .await
     .map_err(AuthError::Retry)?;
     if status != 200 {
-        let code = error_code(&body);
-        if FATAL_REFRESH_CODES.contains(&code.as_str()) {
-            return Err(AuthError::Fatal(format!(
-                "Your ChatGPT sign-in is no longer valid ({code}). Sign in again."
-            )));
-        }
-        return Err(AuthError::Retry("OpenAI is unavailable; try again.".into()));
+        return Err(refresh_failure(status, error_code(&body)));
     }
     // OpenAI has already rotated the refresh token, so trying again would
     // only reuse the old one.
@@ -497,6 +523,23 @@ pub async fn refresh(
         ..session.clone()
     })
 }
+/// A refresh that failed with `status`. The listed codes are fatal at any
+/// status; a 400 or 401 naming any other lasting OAuth error is fatal too.
+/// Everything else (5xx, 408, 429, no code, a transient code) may be retried.
+fn refresh_failure(status: u16, code: Option<String>) -> AuthError {
+    match code {
+        Some(code)
+            if FATAL_REFRESH_CODES.contains(&code.as_str())
+                || (matches!(status, 400 | 401)
+                    && !TRANSIENT_REFRESH_CODES.contains(&code.as_str())) =>
+        {
+            AuthError::Fatal(format!(
+                "Your ChatGPT sign-in is no longer valid ({code}). Sign in again."
+            ))
+        }
+        _ => AuthError::Retry("OpenAI is unavailable; try again.".into()),
+    }
+}
 pub async fn revoke(
     http: &reqwest::Client,
     e: &Endpoints,
@@ -511,6 +554,7 @@ pub async fn revoke(
             ("token_type_hint", "refresh_token"),
             ("client_id", client_id),
         ],
+        ENDPOINT_TIMEOUT,
     )
     .await?;
     if status == 200 {
@@ -1167,6 +1211,125 @@ mod tests {
         );
         let missing = launch(std::process::Command::new("/nonexistent/axis-cam-opener"));
         assert!(missing.unwrap_err().contains("Could not open the browser"));
+    }
+    #[tokio::test]
+    async fn refresh_is_fatal_on_lasting_oauth_errors_and_retries_transient_ones() {
+        let fake = Fake::start(|r: &Req| {
+            if r.field("grant_type") == "authorization_code" {
+                return Resp::json(400, json!({}));
+            }
+            match r.field("refresh_token").as_str() {
+                "invalid_request" => Resp::json(
+                    400,
+                    json!({"error": "invalid_request", "error_description": "bad"}),
+                ),
+                "invalidated" => {
+                    Resp::json(401, json!({"error": {"code": "refresh_token_invalidated"}}))
+                }
+                "no_code" => Resp::json(400, json!({"error_description": "something"})),
+                "html" => Resp {
+                    content_type: "text/html",
+                    body: "<html><body>Bad Request</body></html>".into(),
+                    ..Resp::json(400, json!({}))
+                },
+                "transient" => Resp::json(400, json!({"error": "temporarily_unavailable"})),
+                _ => Resp::json(403, json!({"error": "invalid_grant"})),
+            }
+        })
+        .await;
+        let e = Endpoints::local(&fake.base);
+        let http = reqwest::Client::new();
+        let with = |token: &str| Session {
+            refresh_token: token.into(),
+            ..crate::session::sample()
+        };
+        for (token, code) in [
+            ("invalid_request", "invalid_request"),
+            ("invalidated", "refresh_token_invalidated"),
+            ("forbidden_grant", "invalid_grant"),
+        ] {
+            assert_eq!(
+                refresh(&http, &e, "oaiapp_1", &with(token)).await,
+                Err(AuthError::Fatal(format!(
+                    "Your ChatGPT sign-in is no longer valid ({code}). Sign in again."
+                ))),
+                "{token}"
+            );
+        }
+        for token in ["no_code", "html", "transient"] {
+            assert!(
+                matches!(
+                    refresh(&http, &e, "oaiapp_1", &with(token)).await,
+                    Err(AuthError::Retry(_))
+                ),
+                "{token}"
+            );
+        }
+        // The code exchange still names a missing code as before.
+        let attempt = Attempt {
+            state: "s".into(),
+            nonce: "n".into(),
+            verifier: "v".into(),
+            redirect_uri: "http://127.0.0.1:1/callback".into(),
+        };
+        assert_eq!(
+            exchange(&http, &e, "oaiapp_1", "c", &attempt)
+                .await
+                .unwrap_err(),
+            "OpenAI rejected the sign-in (unknown_error)."
+        );
+    }
+    #[tokio::test]
+    async fn a_stalled_token_endpoint_fails_as_retry_in_bounded_time() {
+        assert_eq!(ENDPOINT_TIMEOUT, Duration::from_secs(30));
+        let fake = Fake::start(|_| Resp {
+            delay_ms: 1000,
+            ..Resp::json(200, json!({"access_token": "a"}))
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let result = refresh_with(
+            &reqwest::Client::new(),
+            &Endpoints::local(&fake.base),
+            "oaiapp_1",
+            &crate::session::sample(),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(matches!(result, Err(AuthError::Retry(_))), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(fake.seen("/token").len(), 1);
+    }
+    #[tokio::test]
+    async fn a_callback_after_the_wait_ended_gets_the_failure_page() {
+        let listener = Listener::bind().await.unwrap();
+        let address = listener
+            .redirect_uri()
+            .trim_start_matches("http://")
+            .trim_end_matches("/callback")
+            .to_string();
+        // Connected before the wait starts, so the listener accepts it at once.
+        let mut late = tokio::net::TcpStream::connect(&address).await.unwrap();
+        assert_eq!(
+            listener
+                .wait("s", Duration::from_millis(200))
+                .await
+                .unwrap_err(),
+            "Sign-in timed out. Try again."
+        );
+        late.write_all(b"GET /callback?code=c&state=s HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut page = String::new();
+        late.read_to_string(&mut page).await.unwrap();
+        assert!(
+            page.contains("Sign-in was not completed. You can return to AXIS CAM Studio."),
+            "{page}"
+        );
     }
     #[tokio::test]
     async fn revoke_sends_the_refresh_token_and_reports_failure() {
