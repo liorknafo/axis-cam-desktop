@@ -1305,11 +1305,28 @@ mod tests {
         let _ = a.update(Message::NewTool);
         assert_eq!(a.tool_draft.number(), Some(4));
     }
-    fn signed_in_app(dir: &tempfile::TempDir) -> App {
-        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
-        let session = crate::session::sample();
+    fn fresh_app(dir: &tempfile::TempDir) -> App {
+        App::from_workspace(dir.path().join("workspace.json"), None)
+    }
+    /// Plays a finished sign-in. The sign-in task saves the session before it
+    /// reports back, and unit tests do not run tasks, so the save happens here.
+    fn sign_in_with(a: &mut App, dir: &tempfile::TempDir, session: crate::session::Session) {
+        crate::session::default_store(dir.path(), true)
+            .save(&session)
+            .unwrap();
+        let _ = a.update(Message::SignIn);
         let _ = a.update(Message::SignedIn(Ok((session, "oaiapp_1".into()))));
+    }
+    fn signed_in_app(dir: &tempfile::TempDir) -> App {
+        let mut a = fresh_app(dir);
+        sign_in_with(&mut a, dir, crate::session::sample());
         a
+    }
+    fn without_plan_usage() -> crate::session::Session {
+        crate::session::Session {
+            scope: "openid profile email".into(),
+            ..crate::session::sample()
+        }
     }
     #[test]
     fn signing_in_saves_the_client_and_session_but_never_tokens_in_settings() {
@@ -1335,39 +1352,43 @@ mod tests {
     #[test]
     fn account_messages_drive_the_panel_state() {
         let dir = tempfile::tempdir().unwrap();
-        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
         assert_eq!(a.account, crate::Account::SigningIn);
         let _ = a.update(Message::SignInCancel);
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Sign-in cancelled.");
+        let _ = a.update(Message::SignIn);
         let _ = a.update(Message::SignedIn(Err(
             "Sign-in timed out. Try again.".into()
         )));
+        assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Sign-in timed out. Try again.");
         let mut a = signed_in_app(&dir);
+        let epoch = a.account_epoch;
         let listed = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".to_string()];
-        let _ = a.update(Message::ModelsLoaded(Ok(listed)));
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(listed)));
         assert_eq!(a.settings.model, "gpt-6.1-sol");
         let _ = a.update(Message::PickModel("gpt-6-luna".into()));
         let _ = a.update(Message::PickModel("not-listed".into()));
         assert_eq!(a.settings.model, "gpt-6-luna");
-        let _ = a.update(Message::ModelsLoaded(Ok(vec!["gpt-6-luna".into()])));
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec!["gpt-6-luna".into()])));
         assert_eq!(a.settings.model, "gpt-6-luna");
         let _ = a.update(Message::CheckConnection);
         assert!(a.account_busy);
         let limit = crate::openai::ApiError::UsageLimit;
-        let _ = a.update(Message::ConnectionChecked(Err(limit)));
+        let _ = a.update(Message::ConnectionChecked(epoch, Err(limit)));
         assert!(a.usage_limit && !a.account_busy);
         assert!(a.account_note.contains("Usage limit reached"));
-        let _ = a.update(Message::ConnectionChecked(Ok("Connection works.".into())));
+        let ok = Ok("Connection works.".into());
+        let _ = a.update(Message::ConnectionChecked(epoch, ok));
         assert!(!a.usage_limit);
         assert_eq!(a.account_note, "Connection works.");
         assert!(!a.settings.plan_notice_shown);
         let _ = a.update(Message::PlanNoticeDismissed);
         assert!(crate::settings::load(&dir.path().join("settings.json")).plan_notice_shown);
         let gone = crate::openai::ApiError::SignedOut("Sign in again.".into());
-        let _ = a.update(Message::ModelsLoaded(Err(gone)));
+        let _ = a.update(Message::ModelsLoaded(epoch, Err(gone)));
         assert_eq!(a.account, crate::Account::SignedOut);
         assert!(a.models.is_empty());
         assert_eq!(a.account_note, "Sign in again.");
@@ -1375,12 +1396,8 @@ mod tests {
     #[test]
     fn a_session_without_plan_usage_is_signed_in_but_not_granted() {
         let dir = tempfile::tempdir().unwrap();
-        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
-        let session = crate::session::Session {
-            scope: "openid profile email".into(),
-            ..crate::session::sample()
-        };
-        let _ = a.update(Message::SignedIn(Ok((session, "oaiapp_1".into()))));
+        let mut a = fresh_app(&dir);
+        sign_in_with(&mut a, &dir, without_plan_usage());
         assert!(matches!(
             a.account,
             crate::Account::SignedIn { granted: false, .. }
@@ -1391,12 +1408,12 @@ mod tests {
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Signed out.");
         // Signing in again waits until the old sign-in has been deleted.
-        assert!(a.account_busy);
+        assert!(a.sign_out_pending && !a.account_busy);
         let _ = a.update(Message::SignIn);
         assert_eq!(a.account, crate::Account::SignedOut);
         let failed = "Signed out on this computer. Could not reach OpenAI.".to_string();
         let _ = a.update(Message::SignedOut(Err(failed.clone())));
-        assert!(!a.account_busy);
+        assert!(!a.sign_out_pending && !a.account_busy);
         assert_eq!(a.account_note, failed);
         let _ = a.update(Message::SignIn);
         assert_eq!(a.account, crate::Account::SigningIn);
@@ -1405,7 +1422,7 @@ mod tests {
     fn the_saved_session_is_adopted_when_the_planner_page_restores_it() {
         let dir = tempfile::tempdir().unwrap();
         let _ = signed_in_app(&dir);
-        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mut a = fresh_app(&dir);
         let _ = a.update(Message::Page(Page::Ai));
         assert_eq!(a.account, crate::Account::SignedOut);
         // Unit tests do not run tasks; deliver the restore result directly.
@@ -1417,5 +1434,256 @@ mod tests {
         ));
         let _ = a.update(Message::AccountRestored(Err("Keychain: denied".into())));
         assert_eq!(a.account_note, "Keychain: denied");
+    }
+    #[test]
+    fn a_second_sign_out_keeps_the_gate_and_sign_in_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        assert_eq!(a.update(Message::SignOut).units(), 1);
+        assert!(a.sign_out_pending && !a.account_busy);
+        assert_eq!(a.update(Message::SignOut).units(), 0);
+        assert!(a.sign_out_pending);
+        assert_eq!(a.update(Message::SignIn).units(), 0);
+        assert_eq!(a.account, crate::Account::SignedOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        assert!(!a.sign_out_pending);
+        assert_eq!(a.update(Message::SignIn).units(), 1);
+        assert_eq!(a.account, crate::Account::SigningIn);
+        // Signing in is only possible from signed-out.
+        assert_eq!(a.update(Message::SignIn).units(), 0);
+    }
+    #[test]
+    fn late_results_from_a_signed_out_client_change_nothing() {
+        use crate::openai::ApiError;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let old = a.account_epoch;
+        let _ = a.update(Message::ModelsLoaded(old, Ok(vec!["gpt-6.1-sol".into()])));
+        let _ = a.update(Message::CheckConnection);
+        assert!(a.account_busy);
+        let _ = a.update(Message::SignOut);
+        assert!(a.account_epoch != old);
+        assert_eq!(a.account_note, "Signed out.");
+        assert!(!a.account_busy && !a.usage_limit);
+        let late = [
+            Message::ConnectionChecked(old, Err(ApiError::UsageLimit)),
+            Message::ConnectionChecked(old, Ok("Connection works.".into())),
+            Message::ConnectionChecked(old, Err(ApiError::Unavailable("Offline.".into()))),
+            Message::ModelsLoaded(old, Ok(vec!["gpt-6-luna".into()])),
+            Message::ModelsLoaded(old, Err(ApiError::UsageLimit)),
+            Message::ModelsLoaded(old, Err(ApiError::SignedOut("Gone.".into()))),
+        ];
+        for message in late {
+            assert_eq!(a.update(message).units(), 0);
+            assert_eq!(a.account, crate::Account::SignedOut);
+            assert_eq!(a.account_note, "Signed out.");
+            assert!(!a.account_busy && !a.usage_limit && a.models.is_empty());
+            assert!(a.sign_out_pending);
+        }
+        assert_eq!(a.settings.model, "gpt-6.1-sol");
+    }
+    #[test]
+    fn late_results_from_an_old_client_do_not_touch_a_new_sign_in() {
+        use crate::openai::ApiError;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let old = a.account_epoch;
+        let _ = a.update(Message::SignOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        let new = a.account_epoch;
+        assert!(new != old);
+        let _ = a.update(Message::ModelsLoaded(new, Ok(vec!["gpt-6-luna".into()])));
+        let signed_in = a.account.clone();
+        let gone = ApiError::SignedOut("Old sign-in gone.".into());
+        let _ = a.update(Message::ModelsLoaded(old, Err(gone)));
+        assert_eq!(a.account, signed_in);
+        assert_eq!(a.models, vec!["gpt-6-luna".to_string()]);
+        assert!(a.account_note.is_empty());
+        let _ = a.update(Message::ModelsLoaded(old, Ok(vec!["gpt-6.1-sol".into()])));
+        assert_eq!(a.models, vec!["gpt-6-luna".to_string()]);
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        // The new client still works with its own results.
+        let gone = ApiError::SignedOut("Now gone.".into());
+        let _ = a.update(Message::ModelsLoaded(new, Err(gone)));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert!(a.account_epoch != new);
+    }
+    #[test]
+    fn a_cancelled_sign_in_ignores_a_late_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let _ = a.update(Message::SignInCancel);
+        let _ = a.update(Message::SignedIn(Ok((
+            crate::session::sample(),
+            "oaiapp_1".into(),
+        ))));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert_eq!(a.account_note, "Sign-in cancelled.");
+        assert!(a.settings.client_id.is_empty() && a.models.is_empty());
+        let _ = a.update(Message::SignedIn(Err(
+            "Sign-in timed out. Try again.".into()
+        )));
+        assert_eq!(a.account_note, "Sign-in cancelled.");
+    }
+    #[test]
+    fn signing_out_while_signing_in_stops_the_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let handle = a.sign_in.clone().expect("the sign-in is running");
+        assert!(!handle.is_aborted());
+        let _ = a.update(Message::SignOut);
+        assert!(handle.is_aborted() && a.sign_in.is_none());
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert!(!a.sign_out_pending, "there was no client to sign out");
+        let _ = a.update(Message::SignedIn(Ok((
+            crate::session::sample(),
+            "oaiapp_1".into(),
+        ))));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert_eq!(a.account_note, "Signed out.");
+        assert!(a.settings.client_id.is_empty() && a.client.is_none());
+    }
+    #[test]
+    fn a_restored_session_cannot_replace_a_current_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let account = a.account.clone();
+        let client = a.client.clone().unwrap();
+        let other = crate::session::Session {
+            name: "Other".into(),
+            ..crate::session::sample()
+        };
+        let restored = Message::AccountRestored(Ok(Some(other.clone())));
+        assert_eq!(a.update(restored).units(), 0);
+        assert_eq!(a.account, account);
+        assert!(std::sync::Arc::ptr_eq(a.client.as_ref().unwrap(), &client));
+        // Not while a sign-out is still deleting the old sign-in, nor while
+        // a new sign-in is running.
+        let _ = a.update(Message::SignOut);
+        let restored = Message::AccountRestored(Ok(Some(other.clone())));
+        assert_eq!(a.update(restored).units(), 0);
+        assert!(a.client.is_none() && a.account == crate::Account::SignedOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        let _ = a.update(Message::SignIn);
+        let restored = Message::AccountRestored(Ok(Some(other.clone())));
+        assert_eq!(a.update(restored).units(), 0);
+        assert!(a.client.is_none() && a.account == crate::Account::SigningIn);
+        // From signed-out it is adopted.
+        let _ = a.update(Message::SignInCancel);
+        let restored = Message::AccountRestored(Ok(Some(other)));
+        assert_eq!(a.update(restored).units(), 1);
+        assert!(matches!(&a.account, crate::Account::SignedIn { name, .. } if name == "Other"));
+    }
+    #[test]
+    fn the_planner_page_restores_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = signed_in_app(&dir);
+        let mut a = fresh_app(&dir);
+        assert_eq!(a.update(Message::Page(Page::Home)).units(), 0);
+        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 1);
+        let saved = crate::session::default_store(dir.path(), true).load();
+        let _ = a.update(Message::AccountRestored(saved));
+        let _ = a.update(Message::Page(Page::Home));
+        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 0);
+        // A visit before any sign-in uses up the restore too, so signing in
+        // and out afterwards never reads the saved session behind it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 0);
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        let _ = a.update(Message::SignOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        let _ = a.update(Message::Page(Page::Home));
+        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 0);
+    }
+    #[test]
+    fn checking_the_connection_needs_granted_plan_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.settings.model = "gpt-6.1-sol".into();
+        assert_eq!(a.update(Message::CheckConnection).units(), 0);
+        sign_in_with(&mut a, &dir, without_plan_usage());
+        let note = a.account_note.clone();
+        assert!(a.client.is_some());
+        assert_eq!(a.update(Message::CheckConnection).units(), 0);
+        assert!(!a.account_busy);
+        assert_eq!(a.account_note, note);
+        // Granted: the check starts, and a second one waits for it.
+        let _ = a.update(Message::SignOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        assert_eq!(a.update(Message::CheckConnection).units(), 1);
+        assert!(a.account_busy);
+        assert_eq!(a.update(Message::CheckConnection).units(), 0);
+    }
+    #[test]
+    fn an_empty_model_list_keeps_the_saved_model_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let epoch = a.account_epoch;
+        let both = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".to_string()];
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(both.clone())));
+        let _ = a.update(Message::PickModel("gpt-6-luna".into()));
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec![])));
+        assert!(a.models.is_empty());
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        assert_eq!(
+            crate::settings::load(&dir.path().join("settings.json")).model,
+            "gpt-6-luna"
+        );
+        assert_eq!(
+            a.account_note,
+            "Your ChatGPT plan lists no models for this app."
+        );
+        // The panel offers Load models; a new list replaces the note.
+        assert_eq!(a.update(Message::LoadModels).units(), 1);
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(both.clone())));
+        assert_eq!(a.models, both);
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        assert!(a.account_note.is_empty());
+    }
+    #[test]
+    fn loading_models_needs_a_granted_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        assert_eq!(a.update(Message::LoadModels).units(), 0);
+        let _ = a.update(Message::SignIn);
+        assert_eq!(a.update(Message::LoadModels).units(), 0);
+        let _ = a.update(Message::SignInCancel);
+        sign_in_with(&mut a, &dir, without_plan_usage());
+        assert_eq!(a.update(Message::LoadModels).units(), 0);
+        let _ = a.update(Message::SignOut);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        assert_eq!(a.update(Message::LoadModels).units(), 1);
+        let _ = a.update(Message::SignOut);
+        assert_eq!(a.update(Message::LoadModels).units(), 0);
+    }
+    #[test]
+    fn unsaved_settings_do_not_stop_a_sign_in_and_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder where the settings file belongs makes every save fail.
+        std::fs::create_dir(dir.path().join("settings.json")).unwrap();
+        let mut a = fresh_app(&dir);
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        assert!(a.client.is_some());
+        assert!(
+            a.account_note
+                .starts_with("Signed in for this session, but settings could not be saved: "),
+            "{}",
+            a.account_note
+        );
+    }
+    #[test]
+    #[should_panic(expected = "tests must use an isolated workspace")]
+    fn tests_cannot_open_the_real_workspace() {
+        let _ = App::from_workspace(crate::storage::state_path(), None);
     }
 }

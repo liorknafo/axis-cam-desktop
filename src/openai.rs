@@ -374,11 +374,14 @@ impl Client {
     /// Forgets a session OpenAI no longer accepts. The lock is taken first,
     /// so a refresh in flight cannot save its tokens after the clear, and the
     /// memory is cleared before the store, so a cancelled caller cannot leave
-    /// the rejected session in use.
+    /// the rejected session in use. A client that no longer holds a session
+    /// (it signed out, or another call already forgot it) leaves the store
+    /// alone: whatever is saved there now belongs to a newer sign-in.
     async fn forget(&self) {
         let mut session = self.session.lock().await;
-        *session = None;
-        let _ = store_clear(&self.store).await;
+        if session.take().is_some() {
+            let _ = store_clear(&self.store).await;
+        }
     }
     /// Maps an error response and forgets the session when it is no longer valid.
     async fn failure(&self, response: reqwest::Response) -> ApiError {
@@ -479,24 +482,24 @@ impl Client {
         }
     }
     /// Clears the saved and in-memory session and revokes the refresh token.
-    /// Both are always attempted; `Err` is the sentence to show the user.
+    /// Both are always attempted; `Err` is the sentence to show the user. A
+    /// client without a session has nothing to clear or revoke, and does not
+    /// touch the store, which may now hold a newer sign-in.
     pub async fn sign_out(&self) -> Result<(), String> {
         let (session, cleared) = {
             let mut session = self.session.lock().await;
-            (session.take(), store_clear(&self.store).await)
+            let Some(taken) = session.take() else {
+                return Ok(());
+            };
+            (taken, store_clear(&self.store).await)
         };
-        let revoked = match &session {
-            Some(s) => {
-                oauth::revoke(
-                    &self.http,
-                    &self.endpoints,
-                    &self.client_id,
-                    &s.refresh_token,
-                )
-                .await
-            }
-            None => Ok(()),
-        };
+        let revoked = oauth::revoke(
+            &self.http,
+            &self.endpoints,
+            &self.client_id,
+            &session.refresh_token,
+        )
+        .await;
         match (cleared, revoked) {
             (Ok(()), Ok(())) => Ok(()),
             (Ok(()), Err(revoke)) => Err(format!("Signed out on this computer. {revoke}")),
@@ -1000,6 +1003,36 @@ mod tests {
             r.client.sign_out().await.unwrap_err(),
             "The saved sign-in could not be deleted (Keychain: delete denied). Delete the \"AXIS CAM Studio\" item in Keychain Access. OpenAI did not confirm the sign-out either."
         );
+        assert_eq!(r.fake.seen("/revoke").len(), 1);
+    }
+    #[tokio::test]
+    async fn a_retired_client_leaves_a_newer_saved_sign_in_alone() {
+        let r = rig(sample(), |req| match req.path.as_str() {
+            "/v1/models" => Resp {
+                delay_ms: 500,
+                ..Resp::error(403, "subscription_sharing_invalid_user")
+            },
+            _ => Resp::json(200, json!({})),
+        })
+        .await;
+        let newer = Session {
+            refresh_token: "refresh-new".into(),
+            ..sample()
+        };
+        // The request is still in flight when the user signs out and signs in
+        // again; OpenAI then rejects the old session.
+        let late = r.client.models();
+        let meanwhile = async {
+            assert!(until(|| !r.fake.seen("/v1/models").is_empty()).await);
+            r.client.sign_out().await.unwrap();
+            r.store.save(&newer).unwrap();
+        };
+        let (result, ()) = tokio::join!(late, meanwhile);
+        assert!(matches!(result, Err(ApiError::SignedOut(_))));
+        assert_eq!(r.store.load().unwrap(), Some(newer.clone()));
+        // A client without a session has nothing to delete or revoke.
+        r.client.sign_out().await.unwrap();
+        assert_eq!(r.store.load().unwrap(), Some(newer));
         assert_eq!(r.fake.seen("/revoke").len(), 1);
     }
     /// Polls `done` every 10 ms; false if it still fails after two seconds.

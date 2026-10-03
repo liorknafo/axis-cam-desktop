@@ -62,6 +62,7 @@ pub enum Account {
         granted: bool,
     },
 }
+const NO_MODELS: &str = "Your ChatGPT plan lists no models for this app.";
 #[derive(Debug, Clone)]
 pub enum Message {
     NewProject,
@@ -145,10 +146,13 @@ pub enum Message {
     SignedIn(Result<(session::Session, String), String>),
     SignOut,
     SignedOut(Result<(), String>),
-    ModelsLoaded(Result<Vec<String>, openai::ApiError>),
+    /// The first value is the `account_epoch` of the client that asked.
+    ModelsLoaded(u64, Result<Vec<String>, openai::ApiError>),
+    LoadModels,
     PickModel(String),
     CheckConnection,
-    ConnectionChecked(Result<String, openai::ApiError>),
+    /// The first value is the `account_epoch` of the client that asked.
+    ConnectionChecked(u64, Result<String, openai::ApiError>),
     PlanNoticeDismissed,
     OpenUrl(&'static str),
     ConfirmDeleteSetup(bool),
@@ -177,7 +181,13 @@ pub struct App {
     pub account: Account,
     /// Latest sign-in or connection message for the account panel.
     pub account_note: String,
+    /// A connection check is running.
     pub account_busy: bool,
+    /// The saved sign-in is still being deleted; signing in waits for it.
+    pub sign_out_pending: bool,
+    /// Changes whenever the client does, so results of an earlier client's
+    /// requests can be told apart and ignored.
+    account_epoch: u64,
     pub usage_limit: bool,
     pub models: Vec<String>,
     pub(crate) endpoints: oauth::Endpoints,
@@ -233,6 +243,12 @@ impl App {
         Self::from_workspace(state_path, smoke_dir)
     }
     fn from_workspace(mut state_path: PathBuf, smoke_dir: Option<PathBuf>) -> Self {
+        #[cfg(test)]
+        assert_ne!(
+            state_path,
+            storage::state_path(),
+            "tests must use an isolated workspace"
+        );
         // Tests and smoke runs keep sign-in data beside their own workspace,
         // never in the real settings file or the Keychain.
         let isolated = smoke_dir.is_some() || state_path != storage::state_path();
@@ -313,6 +329,8 @@ impl App {
             account: Account::SignedOut,
             account_note: String::new(),
             account_busy: false,
+            sign_out_pending: false,
+            account_epoch: 0,
             usage_limit: false,
             models: vec![],
             endpoints: oauth::Endpoints::openai(),
@@ -667,8 +685,11 @@ impl App {
             move |job| Message::PostChecked(epoch, std::sync::Arc::new(job)),
         )
     }
+    fn write_settings(&self) -> Result<(), String> {
+        settings::save(&self.settings_path, &self.settings)
+    }
     fn save_settings(&mut self) {
-        if let Err(e) = settings::save(&self.settings_path, &self.settings) {
+        if let Err(e) = self.write_settings() {
             self.account_note = format!("Could not save settings: {e}");
         }
     }
@@ -681,19 +702,36 @@ impl App {
             granted,
         };
         self.usage_limit = false;
+        // A new client: results still on their way belong to the old one.
+        self.account_epoch = self.account_epoch.wrapping_add(1);
+        self.account_busy = false;
         let client = std::sync::Arc::new(openai::Client::new(
             self.endpoints.clone(),
             self.settings.client_id.clone(),
             self.store.clone(),
             session,
         ));
-        self.client = Some(client.clone());
+        self.client = Some(client);
         if !granted {
             self.account_note = "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.".into();
             return Task::none();
         }
         self.account_note.clear();
-        Task::perform(async move { client.models().await }, Message::ModelsLoaded)
+        self.load_models()
+    }
+    /// Ask which models the signed-in plan allows. The answer carries the
+    /// epoch of the client that asked.
+    fn load_models(&self) -> Task<Message> {
+        let Account::SignedIn { granted: true, .. } = &self.account else {
+            return Task::none();
+        };
+        let Some(client) = self.client.clone() else {
+            return Task::none();
+        };
+        let epoch = self.account_epoch;
+        Task::perform(async move { client.models().await }, move |result| {
+            Message::ModelsLoaded(epoch, result)
+        })
     }
     fn account_error(&mut self, error: openai::ApiError) {
         self.usage_limit = error == openai::ApiError::UsageLimit;
@@ -701,16 +739,21 @@ impl App {
             self.account = Account::SignedOut;
             self.client = None;
             self.models.clear();
+            // Any check still running belonged to the client that is gone.
+            self.account_epoch = self.account_epoch.wrapping_add(1);
+            self.account_busy = false;
         }
         self.account_note = error.message();
     }
     /// Read the saved session the first time the planner page opens. The
-    /// Keychain may ask for permission, so this never runs at launch.
+    /// Keychain may ask for permission, so this never runs at launch. The
+    /// first visit uses it up, whether or not there was anything to read:
+    /// signing in and out later never reads the saved session behind it.
     fn restore_account(&mut self) -> Task<Message> {
-        if self.account_restored || self.settings.client_id.is_empty() {
+        if std::mem::replace(&mut self.account_restored, true) || self.settings.client_id.is_empty()
+        {
             return Task::none();
         }
-        self.account_restored = true;
         let store = self.store.clone();
         Task::perform(
             async move {
@@ -1795,25 +1838,36 @@ impl App {
                 )
             }
             Message::GcodeExported(Err(e)) => self.status = format!("G-code export failed: {e}"),
-            Message::AccountRestored(Ok(Some(session))) => return self.adopt_session(session),
+            Message::AccountRestored(Ok(Some(session))) => {
+                // A saved session only fills an empty account: not one that
+                // is signing in, signed in, or still deleting the old sign-in.
+                if self.account != Account::SignedOut
+                    || self.client.is_some()
+                    || self.sign_out_pending
+                {
+                    return Task::none();
+                }
+                return self.adopt_session(session);
+            }
             Message::AccountRestored(Ok(None)) => {}
             Message::AccountRestored(Err(e)) => self.account_note = e,
             Message::SignIn => {
-                if self.account == Account::SigningIn || self.account_busy {
+                if self.account != Account::SignedOut || self.sign_out_pending {
                     return Task::none();
                 }
                 self.account = Account::SigningIn;
                 self.account_note.clear();
                 let (endpoints, settings) = (self.endpoints.clone(), self.settings.clone());
+                let store = self.store.clone();
                 let (task, handle) = Task::perform(
                     async move {
                         let http = oauth::http_client(Duration::from_secs(60));
                         let limit = Duration::from_secs(300);
-                        oauth::sign_in(
+                        oauth::sign_in_and_save(
                             &http,
                             &endpoints,
                             &settings,
-                            None,
+                            store,
                             limit,
                             oauth::open_browser,
                         )
@@ -1834,39 +1888,50 @@ impl App {
                     self.account_note = "Sign-in cancelled.".into();
                 }
             }
+            // Only a sign-in that is still waiting can be finished.
+            Message::SignedIn(_) if self.account != Account::SigningIn => {}
             Message::SignedIn(Ok((session, client_id))) => {
                 self.sign_in = None;
                 self.settings.client_id = client_id;
-                self.save_settings();
-                if let Err(e) = self.store.save(&session) {
-                    self.account = Account::SignedOut;
-                    self.account_note = format!("Could not save the ChatGPT sign-in: {e}");
-                    return Task::none();
+                // The session itself was saved by the sign-in task.
+                let saved = self.write_settings();
+                let task = self.adopt_session(session);
+                if let Err(e) = saved {
+                    self.account_note =
+                        format!("Signed in for this session, but settings could not be saved: {e}");
                 }
-                return self.adopt_session(session);
+                return task;
             }
             Message::SignedIn(Err(e)) => {
                 self.sign_in = None;
                 self.account = Account::SignedOut;
                 self.account_note = e;
             }
-            Message::ModelsLoaded(Ok(models)) => {
+            // Results of an earlier client's requests change nothing.
+            Message::ModelsLoaded(epoch, _) | Message::ConnectionChecked(epoch, _)
+                if epoch != self.account_epoch => {}
+            Message::ModelsLoaded(_, Ok(models)) => {
                 self.models = models;
-                if !self.models.contains(&self.settings.model) {
-                    self.settings.model = self
-                        .models
-                        .iter()
-                        .find(|m| *m == "gpt-6.1-sol")
-                        .or(self.models.first())
-                        .cloned()
-                        .unwrap_or_default();
-                    self.save_settings();
+                if self.models.is_empty() {
+                    self.account_note = NO_MODELS.into();
+                } else {
+                    if self.account_note == NO_MODELS {
+                        self.account_note.clear();
+                    }
+                    if !self.models.contains(&self.settings.model) {
+                        self.settings.model = self
+                            .models
+                            .iter()
+                            .find(|m| *m == "gpt-6.1-sol")
+                            .or(self.models.first())
+                            .cloned()
+                            .unwrap_or_default();
+                        self.save_settings();
+                    }
                 }
             }
-            Message::ModelsLoaded(Err(e)) | Message::ConnectionChecked(Err(e)) => {
-                self.account_busy = false;
-                self.account_error(e);
-            }
+            Message::ModelsLoaded(_, Err(e)) => self.account_error(e),
+            Message::LoadModels => return self.load_models(),
             Message::PickModel(model) => {
                 if self.models.contains(&model) {
                     self.settings.model = model;
@@ -1874,6 +1939,9 @@ impl App {
                 }
             }
             Message::CheckConnection => {
+                let Account::SignedIn { granted: true, .. } = &self.account else {
+                    return Task::none();
+                };
                 let Some(client) = self.client.clone() else {
                     return Task::none();
                 };
@@ -1882,23 +1950,34 @@ impl App {
                 }
                 self.account_busy = true;
                 self.account_note = "Checking the connection…".into();
-                let model = self.settings.model.clone();
-                return Task::perform(
-                    async move { client.check(&model).await },
-                    Message::ConnectionChecked,
-                );
+                let (model, epoch) = (self.settings.model.clone(), self.account_epoch);
+                return Task::perform(async move { client.check(&model).await }, move |result| {
+                    Message::ConnectionChecked(epoch, result)
+                });
             }
-            Message::ConnectionChecked(Ok(message)) => {
+            Message::ConnectionChecked(_, Ok(message)) => {
                 self.account_busy = false;
                 self.usage_limit = false;
                 self.account_note = message;
             }
+            Message::ConnectionChecked(_, Err(e)) => {
+                self.account_busy = false;
+                self.account_error(e);
+            }
             Message::SignOut => {
+                if self.sign_out_pending {
+                    return Task::none();
+                }
+                if let Some(handle) = self.sign_in.take() {
+                    handle.abort();
+                }
                 let client = self.client.take();
                 self.account = Account::SignedOut;
                 // Sign-in stays disabled until the old sign-in is deleted, so
                 // a late delete cannot remove a newer one.
-                self.account_busy = client.is_some();
+                self.sign_out_pending = client.is_some();
+                self.account_epoch = self.account_epoch.wrapping_add(1);
+                self.account_busy = false;
                 self.usage_limit = false;
                 self.models.clear();
                 self.account_note = "Signed out.".into();
@@ -1909,9 +1988,9 @@ impl App {
                     );
                 }
             }
-            Message::SignedOut(Ok(())) => self.account_busy = false,
+            Message::SignedOut(Ok(())) => self.sign_out_pending = false,
             Message::SignedOut(Err(e)) => {
-                self.account_busy = false;
+                self.sign_out_pending = false;
                 self.account_note = e;
             }
             Message::PlanNoticeDismissed => {
