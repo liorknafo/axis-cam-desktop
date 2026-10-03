@@ -18,6 +18,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub const SCOPE: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const FIRST_CLIENT: &str = "dynamic_agent_client";
+/// The loopback path OpenAI redirects the browser to.
+const CALLBACK_PATH: &str = "/auth/callback";
 const APP_NAME: &str = "AXIS CAM Studio";
 /// Per-request limit for the token, revoke and signing-key endpoints. A
 /// refresh holds the session lock, so a stalled endpoint must not hold it for
@@ -170,7 +172,7 @@ impl fmt::Debug for Callback {
 /// different `state`); such requests are answered 404 and ignored.
 pub fn parse_callback(target: &str, state: &str) -> Option<Result<Callback, String>> {
     let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
-    if url.path() != "/callback" {
+    if url.path() != CALLBACK_PATH {
         return None;
     }
     let value = |key: &str| {
@@ -197,6 +199,15 @@ pub fn parse_callback(target: &str, state: &str) -> Option<Result<Callback, Stri
         None => Err("The sign-in response had no authorization code.".into()),
     })
 }
+/// A client ID OpenAI issued at registration: 1 to 200 characters of
+/// `A-Z a-z 0-9 _ -`. The placeholder used to ask for one is never an answer.
+fn valid_client_id(id: &str) -> bool {
+    (1..=200).contains(&id.len())
+        && id != FIRST_CLIENT
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
 /// Where the first matching callback delivers its result.
 type Winner = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<Callback, String>>>>>;
 /// One-shot loopback listener for the browser redirect.
@@ -213,7 +224,7 @@ impl Listener {
         Ok(Self { listener, port })
     }
     pub fn redirect_uri(&self) -> String {
-        format!("http://127.0.0.1:{}/callback", self.port)
+        format!("http://127.0.0.1:{}{CALLBACK_PATH}", self.port)
     }
     /// Waits for this attempt's callback. Each connection is answered on its
     /// own task, so idle or slow connections cannot hold up the real one.
@@ -320,6 +331,8 @@ impl TokenResponse {
 struct IdClaims {
     sub: String,
     nonce: Option<String>,
+    /// The app the token was issued to, when OpenAI says so.
+    azp: Option<String>,
     email: Option<String>,
     name: Option<String>,
 }
@@ -428,6 +441,9 @@ async fn validate_id_token(
         .claims;
     if claims.nonce.as_deref() != Some(nonce) {
         return Err("The ID token does not belong to this sign-in attempt.".into());
+    }
+    if claims.azp.as_deref().is_some_and(|azp| azp != client_id) {
+        return Err("The ID token was issued to a different app.".into());
     }
     Ok(Identity {
         subject: claims.sub,
@@ -616,10 +632,13 @@ pub async fn sign_in(
     let attempt = Attempt::new(listener.redirect_uri());
     open(&authorize_url(e, settings, &attempt, id_token_hint))?;
     let callback = listener.wait(&attempt.state, limit).await?;
-    let client_id = callback
-        .client_id
-        .or_else(|| Some(settings.client_id.clone()).filter(|id| !id.is_empty()))
-        .ok_or("OpenAI did not register this app. Try again.")?;
+    let client_id = match callback.client_id {
+        Some(id) if valid_client_id(&id) => id,
+        Some(_) => return Err("OpenAI returned an invalid client ID.".into()),
+        None => Some(settings.client_id.clone())
+            .filter(|id| !id.is_empty())
+            .ok_or("OpenAI did not register this app. Try again.")?,
+    };
     let session = exchange(http, e, &client_id, &callback.code, &attempt).await?;
     Ok((session, client_id))
 }
@@ -709,7 +728,7 @@ mod tests {
     #[test]
     fn authorize_url_registers_first_then_reuses_the_issued_client() {
         let e = Endpoints::openai();
-        let attempt = Attempt::new("http://127.0.0.1:5555/callback".into());
+        let attempt = Attempt::new("http://127.0.0.1:5555/auth/callback".into());
         let first = authorize_url(&e, &settings(""), &attempt, Some("old-id-token"));
         assert!(first.starts_with("https://auth.openai.com/api/accounts/authorize?"));
         assert_eq!(query(&first, "client_id"), "dynamic_agent_client");
@@ -719,7 +738,7 @@ mod tests {
         assert_eq!(query(&first, "response_type"), "code");
         assert_eq!(
             query(&first, "redirect_uri"),
-            "http://127.0.0.1:5555/callback"
+            "http://127.0.0.1:5555/auth/callback"
         );
         assert_eq!(query(&first, "scope"), SCOPE);
         assert_eq!(query(&first, "resource"), "https://api.openai.com/v1");
@@ -750,29 +769,63 @@ mod tests {
     #[test]
     fn callbacks_for_other_paths_or_states_are_ignored() {
         assert_eq!(parse_callback("/favicon.ico", "s"), None);
-        assert_eq!(parse_callback("/callback?code=c&state=other", "s"), None);
-        assert_eq!(parse_callback("/callback?code=c", "s"), None);
+        assert_eq!(parse_callback("/callback?code=c&state=s", "s"), None);
+        assert_eq!(parse_callback("/auth/callback/?code=c&state=s", "s"), None);
+        assert_eq!(parse_callback("/auth/callbackx?code=c&state=s", "s"), None);
         assert_eq!(
-            parse_callback("/callback?code=c&state=s&client_id=oaiapp_9", "s"),
+            parse_callback("/auth/callback?code=c&state=other", "s"),
+            None
+        );
+        assert_eq!(parse_callback("/auth/callback?code=c", "s"), None);
+        assert_eq!(
+            parse_callback("/auth/callback?code=c&state=s&client_id=oaiapp_9", "s"),
             Some(Ok(Callback {
                 code: "c".into(),
                 client_id: Some("oaiapp_9".into())
             }))
         );
         assert_eq!(
-            parse_callback("/callback?code=c&state=s", "s"),
+            parse_callback("/auth/callback?code=c&state=s", "s"),
             Some(Ok(Callback {
                 code: "c".into(),
                 client_id: None
             }))
         );
         assert!(
-            parse_callback("/callback?error=access_denied&state=s", "s")
+            parse_callback("/auth/callback?error=access_denied&state=s", "s")
                 .unwrap()
                 .unwrap_err()
                 .contains("cancelled")
         );
-        assert!(parse_callback("/callback?state=s", "s").unwrap().is_err());
+        assert!(
+            parse_callback("/auth/callback?state=s", "s")
+                .unwrap()
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn the_redirect_uri_is_the_loopback_auth_callback() {
+        let listener = Listener::bind().await.unwrap();
+        let uri = listener.redirect_uri();
+        let url = reqwest::Url::parse(&uri).unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/auth/callback");
+        assert_eq!(url.query(), None);
+        assert_eq!(
+            uri,
+            format!("http://127.0.0.1:{}/auth/callback", url.port().unwrap())
+        );
+    }
+    #[tokio::test]
+    async fn the_old_callback_path_is_answered_404_and_does_not_end_the_wait() {
+        let listener = Listener::bind().await.unwrap();
+        let uri = listener.redirect_uri();
+        let old = uri.replace("/auth/callback", "/callback");
+        let browser = tokio::spawn(reqwest::get(format!("{old}?code=c&state=s")));
+        let result = listener.wait("s", Duration::from_millis(400)).await;
+        assert_eq!(result.unwrap_err(), "Sign-in timed out. Try again.");
+        assert_eq!(browser.await.unwrap().unwrap().status(), 404);
     }
     #[tokio::test]
     async fn first_sign_in_registers_exchanges_and_validates() {
@@ -809,7 +862,7 @@ mod tests {
         assert_eq!(token.field("client_id"), "oaiapp_new");
         assert_eq!(token.field("code"), "code-1");
         assert_eq!(token.field("resource"), e.api);
-        assert!(token.field("redirect_uri").ends_with("/callback"));
+        assert!(token.field("redirect_uri").ends_with("/auth/callback"));
         assert_eq!(token.field("code_verifier").len(), 43);
         assert_eq!(token.field("client_secret"), "");
     }
@@ -1021,7 +1074,7 @@ mod tests {
             state: "s".into(),
             nonce: "n".into(),
             verifier: "v".into(),
-            redirect_uri: "http://127.0.0.1:1/callback".into(),
+            redirect_uri: "http://127.0.0.1:1/auth/callback".into(),
         };
         let forged = exchange(
             &reqwest::Client::new(),
@@ -1032,6 +1085,90 @@ mod tests {
         )
         .await;
         assert!(forged.unwrap_err().contains("not valid"));
+    }
+    #[tokio::test]
+    async fn an_invalid_returned_client_id_fails_before_any_token_request() {
+        for saved in ["", "oaiapp_saved"] {
+            for extra in [
+                "&client_id=dynamic_agent_client",
+                "&client_id=bad%20id",
+                "&client_id=a.b",
+                "&client_id=%C3%A9",
+            ] {
+                let id_claims = Arc::new(Mutex::new(json!({})));
+                let fake = server(id_claims.clone()).await;
+                let result = sign_in(
+                    &reqwest::Client::new(),
+                    &Endpoints::local(&fake.base),
+                    &settings(saved),
+                    None,
+                    Duration::from_secs(5),
+                    browser(extra, id_claims, "oaiapp_new"),
+                )
+                .await;
+                assert_eq!(
+                    result.unwrap_err(),
+                    "OpenAI returned an invalid client ID.",
+                    "{saved:?} {extra}"
+                );
+                assert!(fake.seen("/token").is_empty(), "{saved:?} {extra}");
+            }
+        }
+    }
+    #[test]
+    fn a_client_id_is_one_to_200_safe_characters_and_never_the_first_client() {
+        for ok in ["a", "oaiapp_123", "A-b_9", &"x".repeat(200)] {
+            assert!(valid_client_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "dynamic_agent_client",
+            "bad id",
+            "bad%20id",
+            "a.b",
+            "a/b",
+            "é",
+            "id\n",
+            &"x".repeat(201),
+        ] {
+            assert!(!valid_client_id(bad), "{bad:?}");
+        }
+    }
+    #[tokio::test]
+    async fn an_azp_claim_must_name_the_client_when_present() {
+        let sign_in_with_azp = |azp: Option<&'static str>| async move {
+            let id_claims = Arc::new(Mutex::new(json!({})));
+            let fake = server(id_claims.clone()).await;
+            let seen = id_claims.clone();
+            sign_in(
+                &reqwest::Client::new(),
+                &Endpoints::local(&fake.base),
+                &settings("oaiapp_1"),
+                None,
+                Duration::from_secs(5),
+                move |url: &str| {
+                    let mut c = claims("oaiapp_1", &query(url, "nonce"));
+                    if let Some(azp) = azp {
+                        c["azp"] = json!(azp);
+                    }
+                    *seen.lock().unwrap() = c;
+                    let callback = format!(
+                        "{}?code=c&state={}",
+                        query(url, "redirect_uri"),
+                        query(url, "state")
+                    );
+                    tokio::spawn(async move { reqwest::get(callback).await });
+                    Ok(())
+                },
+            )
+            .await
+        };
+        assert_eq!(
+            sign_in_with_azp(Some("another-app")).await.unwrap_err(),
+            "The ID token was issued to a different app."
+        );
+        assert!(sign_in_with_azp(Some("oaiapp_1")).await.is_ok());
+        assert!(sign_in_with_azp(None).await.is_ok());
     }
     #[tokio::test]
     async fn scope_without_plan_usage_is_kept_but_not_granted() {
@@ -1052,7 +1189,7 @@ mod tests {
             state: "s".into(),
             nonce: "n".into(),
             verifier: "v".into(),
-            redirect_uri: "http://127.0.0.1:1/callback".into(),
+            redirect_uri: "http://127.0.0.1:1/auth/callback".into(),
         };
         let session = exchange(
             &reqwest::Client::new(),
@@ -1176,7 +1313,7 @@ mod tests {
         let callback = listener.redirect_uri();
         let address = callback
             .trim_start_matches("http://")
-            .trim_end_matches("/callback")
+            .trim_end_matches("/auth/callback")
             .to_string();
         let mut idle = vec![];
         for _ in 0..3 {
@@ -1276,7 +1413,7 @@ mod tests {
             state: "s".into(),
             nonce: "n".into(),
             verifier: "v".into(),
-            redirect_uri: "http://127.0.0.1:1/callback".into(),
+            redirect_uri: "http://127.0.0.1:1/auth/callback".into(),
         };
         let http = reqwest::Client::new();
         let e = Endpoints::local(&fake.base);
@@ -1393,7 +1530,7 @@ mod tests {
             state: "s".into(),
             nonce: "n".into(),
             verifier: "v".into(),
-            redirect_uri: "http://127.0.0.1:1/callback".into(),
+            redirect_uri: "http://127.0.0.1:1/auth/callback".into(),
         };
         assert_eq!(
             exchange(&http, &e, "oaiapp_1", "c", &attempt)
@@ -1440,7 +1577,7 @@ mod tests {
         let address = listener
             .redirect_uri()
             .trim_start_matches("http://")
-            .trim_end_matches("/callback")
+            .trim_end_matches("/auth/callback")
             .to_string();
         // Connected before the wait starts, so the listener accepts it at once.
         let mut late = tokio::net::TcpStream::connect(&address).await.unwrap();
@@ -1451,7 +1588,7 @@ mod tests {
                 .unwrap_err(),
             "Sign-in timed out. Try again."
         );
-        late.write_all(b"GET /callback?code=c&state=s HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+        late.write_all(b"GET /auth/callback?code=c&state=s HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
         let mut page = String::new();
