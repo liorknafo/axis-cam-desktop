@@ -159,7 +159,7 @@ pub fn check_setup(
                         min: [to[0] - radius, to[1] - radius, low],
                         max: [to[0] + radius, to[1] + radius, top],
                     };
-                    r.top(column, low - 0.001, top) <= low + EPS
+                    r.beside(column) || r.top(column, low - 0.001, top) <= low + EPS
                 })
             };
             if !vertical {
@@ -395,9 +395,11 @@ mod tests {
         // Facing removed 4 mm; the stock box is X-62 to 62, Y-42 to 42 from the work zero.
         assert_eq!(problems(4., -55., -35.), Vec::<String>::new());
         assert!(refused(&problems(4.2, -55., -35.)));
-        // A column that overlaps the faced corner is proven; one wholly outside the stock is not.
+        // A column that overlaps the stock is proven only as deep as the facing went there.
         assert_eq!(problems(3., -61.5, -41.5), Vec::<String>::new());
-        assert!(refused(&problems(3., -66., -46.)));
+        assert!(refused(&problems(4.2, -61.5, -41.5)));
+        // Wholly beside the stock box there was never any stock.
+        assert_eq!(problems(6., -66., -46.), Vec::<String>::new());
     }
     #[test]
     fn visited_positions_reset_at_a_tool_change() {

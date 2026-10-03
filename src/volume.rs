@@ -37,6 +37,16 @@ impl Frame {
     pub fn transfer(self, p: [f32; 3], to: Self) -> [f32; 3] {
         to.map(self.unmap(p))
     }
+    /// Whether the axes of `self` are parallel to the axes of `to` (any multiple of 90°).
+    pub fn square_to(self, to: Self) -> bool {
+        [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]
+            .into_iter()
+            .all(|axis| {
+                self.transfer_vector(axis, to)
+                    .into_iter()
+                    .all(|v| v.abs() < 1e-4 || (v.abs() - 1.).abs() < 1e-4)
+            })
+    }
     pub fn transfer_vector(self, v: [f32; 3], to: Self) -> [f32; 3] {
         let part: [f32; 3] = std::array::from_fn(|i| (0..3).map(|k| v[k] * self.basis[i][k]).sum());
         std::array::from_fn(|k| (0..3).map(|i| to.basis[i][k] * part[i]).sum())
@@ -248,6 +258,33 @@ mod tests {
         s.p.insert("rx".into(), "180".into());
         s.p.insert("tx".into(), "12".into());
         (a, Frame::new(&s, &mesh))
+    }
+    #[test]
+    fn frames_are_square_only_at_multiples_of_90_degrees() {
+        let mesh = mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = |angles: [&str; 3]| {
+            let mut s = Setup::new(Machine::new(3), "G54");
+            for (k, v) in ["rx", "ry", "rz"].into_iter().zip(angles) {
+                s.p.insert(k.into(), v.into());
+            }
+            Frame::new(&s, &mesh)
+        };
+        let unrotated = frame(["0", "0", "0"]);
+        for angles in [
+            ["0", "0", "0"],
+            ["180", "0", "0"],
+            ["0", "-90", "0"],
+            ["90", "0", "90"],
+        ] {
+            let f = frame(angles);
+            assert!(f.square_to(unrotated), "{angles:?}");
+            assert!(unrotated.square_to(f), "{angles:?}");
+        }
+        for angles in [["0", "0", "30"], ["45", "0", "0"]] {
+            let f = frame(angles);
+            assert!(!f.square_to(unrotated), "{angles:?}");
+            assert!(!unrotated.square_to(f), "{angles:?}");
+        }
     }
     #[test]
     fn stock_frame_roundtrips_after_flip_and_translation() {

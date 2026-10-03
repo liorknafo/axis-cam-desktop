@@ -102,6 +102,10 @@ impl RestStock {
             cuts,
         }
     }
+    /// Whether `region` lies wholly beside the stock box, where no stock ever was.
+    pub fn beside(&self, region: Bounds) -> bool {
+        (0..2).any(|k| region.max[k] <= self.extent.min[k] || region.min[k] >= self.extent.max[k])
+    }
     /// Upper bound on remaining material within an operation's XY envelope.
     /// Uncertain coverage, thin remnants, or exhausted work budgets keep the
     /// higher starting height. Clearance/retract planes are independent.
@@ -348,5 +352,21 @@ mod tests {
         face(&mut v, f, 8., &[-10., -6., -2., 2., 6., 10.], 10.);
         let rest = RestStock::new(&v, f);
         assert!(!rest.covered(b, &(0..rest.cuts.len()).collect::<Vec<_>>(), 0, &mut 0));
+    }
+    #[test]
+    fn a_region_is_beside_the_stock_only_when_it_shares_no_area_with_the_box() {
+        let (mut v, f, _, _, _) = fixture();
+        face(&mut v, f, 8., &[-10., -6., -2., 2., 6., 10.], 10.);
+        let rest = RestStock::new(&v, f);
+        let column = |x: f32, y: f32| Bounds {
+            min: [x - 3., y - 3., 0.],
+            max: [x + 3., y + 3., 12.],
+        };
+        for (x, y) in [(13., 0.), (0., -13.), (-14., 20.)] {
+            assert!(rest.beside(column(x, y)), "({x}, {y})");
+        }
+        for (x, y) in [(12.99, 0.), (0., -12.99), (0., 0.)] {
+            assert!(!rest.beside(column(x, y)), "({x}, {y})");
+        }
     }
 }

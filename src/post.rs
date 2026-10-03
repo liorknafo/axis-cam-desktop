@@ -737,6 +737,12 @@ pub(crate) fn prepare(
         &simulations[0].initial_volume,
         simulations[0].frame,
     ) {
+        if !volume.frame.square_to(frame) {
+            return Err(vec![format!(
+                "{}: the stock was defined in an orientation that is not square to this setup, so the {origin} work zero is not on a stock face. Choose Model origin for this setup.",
+                setup.name()
+            )]);
+        }
         let cuts = crate::rest::cut_boxes(volume, frame);
         let cut = stock_faces_cut(stock, &cuts, origin == "Stock top center");
         if let Some((last, rest)) = cut.split_last() {
@@ -1428,6 +1434,59 @@ M2
             .insert("origin".into(), "Model origin".into());
         let job = post_job(&doc, &mesh);
         assert!(job.ready(), "{:?}", errors(&job));
+    }
+    #[test]
+    fn a_contour_beside_stock_without_side_margin_exports() {
+        let (mut doc, mesh) = fixture::job();
+        let setup = &mut doc.setups[0];
+        // Facing 8 mm takes the approach below the stock top; with no front margin
+        // the contour's start column lies wholly in front of the stock box.
+        setup.p.insert("stock_front".into(), "0".into());
+        setup.p.insert("stock_top".into(), "8".into());
+        setup
+            .operations
+            .retain(|o| matches!(o.strategy, Strategy::Face | Strategy::Contour));
+        assert_eq!(setup.operations.len(), 2);
+        doc.sync_stock_sources();
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+    }
+    #[test]
+    fn stock_datums_are_refused_when_the_stock_is_not_square_to_the_setup() {
+        let (mut doc, mesh) = fixture::job();
+        let ops = doc.setups[0].operations.clone();
+        doc.setups[0].operations.truncate(1);
+        let mut turned = Setup::new(Machine::new(3), "G55");
+        turned.p.insert("name".into(), "Turned".into());
+        turned.p.insert("rz".into(), "30".into());
+        for op in &ops[..2] {
+            let mut op = op.clone();
+            op.id = id();
+            turned.operations.push(op);
+        }
+        doc.setups.push(turned);
+        doc.sync_stock_sources();
+        for origin in ["Stock top center", "Stock top front-left"] {
+            doc.setups[1].p.insert("origin".into(), origin.into());
+            let job = post_job(&doc, &mesh);
+            assert!(!job.ready());
+            assert!(
+                errors(&job)
+                    .iter()
+                    .any(|e| e.contains("not square to this setup") && e.contains("Model origin")),
+                "{:?}",
+                errors(&job)
+            );
+        }
+        doc.setups[1]
+            .p
+            .insert("origin".into(), "Model origin".into());
+        let job = post_job(&doc, &mesh);
+        assert!(
+            !errors(&job).iter().any(|e| e.contains("not square")),
+            "{:?}",
+            errors(&job)
+        );
     }
     #[test]
     fn touch_off_mode_writes_one_program_per_tool_run() {

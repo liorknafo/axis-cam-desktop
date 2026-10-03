@@ -5,7 +5,7 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 ## Automated checks
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **247 passed, 0 failed, 1 ignored** (23.62 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
+- `cargo test --locked`: **259 passed, 0 failed, 1 ignored** (20.3 seconds in the final full run; the ignored test touches the macOS Keychain and was not run).
 - Release build and renderer smoke: passed on Apple Silicon macOS 26.5.2, Rust 1.97.1.
 - Renderer smoke completed **80 static screens and 24 camera-motion samples** in an isolated workspace. The normal saved project was not used by this workflow.
 
@@ -26,6 +26,8 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 - Flipped setups produce separate G54/G55 programs.
 - Refusals: other controllers, 4/5-axis, travel, duplicate tool numbers, selected-point origin, non-LinuxCNC offsets, Air without an output, upstream failures, a setup without enabled operations and the example project.
 - Rapid-safety rule tested for accepted retracts and peck re-entry, and for refused unproven descents, sideways rapids, holder depth, feed, rpm and travel (including inch profiles).
+- A rapid that descends wholly beside the stock box is accepted (a region shares no area with the box only when it lies beside it on X or Y), while a descent over the stock is still proven only as deep as earlier cuts removed it. Face, then an outside Contour on stock with no front margin, posts.
+- A Stock top center or Stock top front-left work zero is refused when the stock was defined in an orientation that is not square to the setup (30° about Z), and accepted again with Model origin. Frames at 0°, 180°, -90° and 90°/90° are square; 30° and 45° are not. Flipped (180°) setups still post.
 
 ## Continuous stock and adaptive meshing
 
