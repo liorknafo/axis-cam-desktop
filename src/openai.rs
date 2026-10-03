@@ -303,8 +303,10 @@ impl Client {
     /// When OpenAI rejects the refresh token for good, another running copy
     /// of the app may have spent it and saved its new tokens. Those are then
     /// used from here on (the next call refreshes them if they are close to
-    /// expiry). Only a saved sign-in with the rejected refresh token is
-    /// deleted; one that cannot be read is left alone.
+    /// expiry), but only when they belong to the same user: another user's
+    /// sign-in is neither used nor deleted, and this client signs out. Only a
+    /// saved sign-in with the rejected refresh token is deleted; one that
+    /// cannot be read is left alone.
     async fn token(&self, rejected: Option<&str>) -> Result<String, ApiError> {
         let mut session = self.session.clone().lock_owned().await;
         let current = (*session)
@@ -334,11 +336,16 @@ impl Client {
                     }
                     Err(AuthError::Fatal(message)) => {
                         match store_load(&store).await {
-                            Ok(Some(saved)) if saved.refresh_token != current.refresh_token => {
+                            Ok(Some(saved))
+                                if saved.refresh_token != current.refresh_token
+                                    && saved.subject == current.subject =>
+                            {
                                 let token = saved.access_token.clone();
                                 *session = Some(saved);
                                 return Ok(token);
                             }
+                            // Another user's sign-in: not ours to use or delete.
+                            Ok(Some(saved)) if saved.refresh_token != current.refresh_token => {}
                             Ok(_) => {
                                 let _ = store_clear(&store).await;
                             }
@@ -461,9 +468,6 @@ impl Client {
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
-                // The reply is already complete: a connection that fails
-                // now has lost nothing.
-                Err(_) if reply.done => break,
                 Err(e) if e.is_timeout() => return Err(ApiError::Unavailable(TIMED_OUT.into())),
                 Err(_) => {
                     return Err(ApiError::Unavailable(
@@ -474,7 +478,9 @@ impl Client {
             for event in parser.push(&chunk) {
                 reply.apply(&event);
             }
-            if parser.too_large {
+            // The reply is complete: do not wait for the server to close
+            // the connection.
+            if parser.too_large || reply.done {
                 break;
             }
         }
@@ -808,6 +814,29 @@ mod tests {
         assert_eq!(refreshes[0].field("refresh_token"), "refresh-1");
     }
     #[tokio::test]
+    async fn a_fatal_refresh_does_not_adopt_another_users_saved_sign_in() {
+        let r = rejected_refresh().await;
+        // Another running copy of the app signed in as someone else.
+        let other = Session {
+            access_token: "access-2".into(),
+            refresh_token: "refresh-2".into(),
+            subject: "user-2".into(),
+            ..sample()
+        };
+        r.store.file.save(&other).unwrap();
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::SignedOut(_))
+        ));
+        // That sign-in is someone else's: it stays saved, and is not used.
+        assert_eq!(r.store.load().unwrap(), Some(other));
+        assert!(matches!(
+            r.client.models().await,
+            Err(ApiError::SignedOut(_))
+        ));
+        assert!(r.fake.seen("/v1/models").is_empty() && r.fake.seen("/v1/responses").is_empty());
+    }
+    #[tokio::test]
     async fn a_fatal_refresh_signs_out_when_no_newer_sign_in_can_be_read() {
         // Nothing is saved at all.
         let r = rejected_refresh().await;
@@ -958,6 +987,27 @@ mod tests {
             final_only.client.respond(&request()).await.unwrap().text,
             "{\"a\":1}"
         );
+        // The connection drops right after `response.completed`: the reply
+        // stays.
+        let dropped_after = rig(sample(), |_| Resp {
+            cut_after_ms: Some(0),
+            ..Resp::answer("{\"ok\":true}")
+        })
+        .await;
+        assert_eq!(
+            dropped_after.client.respond(&request()).await.unwrap().text,
+            "{\"ok\":true}"
+        );
+        // A reply that was cut off before it completed is an error.
+        let cut_off = rig(sample(), |_| Resp {
+            cut_after_ms: Some(0),
+            ..Resp::sse(&[json!({"type": "response.output_text.delta", "delta": "{"})])
+        })
+        .await;
+        assert_eq!(
+            cut_off.client.respond(&request()).await.unwrap_err(),
+            ApiError::Unavailable("The connection to OpenAI was interrupted.".into())
+        );
     }
     #[tokio::test]
     async fn a_final_event_without_a_blank_line_completes_the_reply() {
@@ -968,42 +1018,28 @@ mod tests {
         .await;
         assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
     }
-    /// An HTTP client that waits only half a second for data, far below its
-    /// total limit, in place of the two minutes the app allows.
+    /// An HTTP client that waits only a second and a half for data, far
+    /// below its total limit, in place of the two minutes the app allows.
+    /// The fakes stall for ten seconds, so a slow parallel test run cannot
+    /// reach the idle limit before the headers arrive.
     fn impatient() -> reqwest::Client {
-        oauth::http_client_with(Duration::from_millis(500), Duration::from_secs(30))
+        oauth::http_client_with(Duration::from_millis(1_500), Duration::from_secs(30))
     }
     #[tokio::test]
-    async fn a_reply_that_completed_before_the_connection_failed_is_kept() {
-        // The connection drops after `response.completed`, before the
-        // response has properly ended.
+    async fn a_completed_reply_is_returned_without_waiting_for_the_connection_to_close() {
+        // The whole reply arrives, then the server holds the connection open.
         let r = rig(sample(), |_| Resp {
-            cut_after_ms: Some(0),
+            cut_after_ms: Some(10_000),
             ..Resp::answer("{\"ok\":true}")
         })
         .await;
-        assert_eq!(
-            r.client.respond(&request()).await.unwrap().text,
-            "{\"ok\":true}"
-        );
-        // The connection stalls there instead: the wait ends, the reply stays.
-        let mut r = rig(sample(), |_| Resp {
-            cut_after_ms: Some(5_000),
-            ..Resp::answer("{}")
-        })
-        .await;
-        r.client.http = impatient();
-        assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
-        assert_eq!(r.fake.seen("/v1/responses").len(), 1);
-        // A reply that was cut off before it completed is still an error.
-        let r = rig(sample(), |_| Resp {
-            cut_after_ms: Some(0),
-            ..Resp::sse(&[json!({"type": "response.output_text.delta", "delta": "{"})])
-        })
-        .await;
-        assert_eq!(
-            r.client.respond(&request()).await.unwrap_err(),
-            ApiError::Unavailable("The connection to OpenAI was interrupted.".into())
+        let started = std::time::Instant::now();
+        let reply = r.client.respond(&request()).await.unwrap();
+        assert_eq!(reply.text, "{\"ok\":true}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} for a connection that was held open",
+            started.elapsed()
         );
     }
     #[tokio::test]
@@ -1011,7 +1047,7 @@ mod tests {
         let in_time = ApiError::Unavailable("OpenAI did not answer in time.".into());
         // The reply starts and then goes quiet.
         let mut r = rig(sample(), |_| Resp {
-            cut_after_ms: Some(5_000),
+            cut_after_ms: Some(10_000),
             ..Resp::sse(&[json!({"type": "response.output_text.delta", "delta": "{"})])
         })
         .await;
@@ -1019,7 +1055,7 @@ mod tests {
         assert_eq!(r.client.respond(&request()).await.unwrap_err(), in_time);
         // No answer at all. The request reached OpenAI, so it is not repeated.
         let mut r = rig(sample(), |_| Resp {
-            delay_ms: 5_000,
+            delay_ms: 10_000,
             ..Resp::answer("{}")
         })
         .await;
