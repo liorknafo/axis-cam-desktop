@@ -323,16 +323,29 @@ struct IdClaims {
     email: Option<String>,
     name: Option<String>,
 }
-/// The OAuth error code of a token-endpoint error body, in either common
-/// shape; `None` when the body carries no code.
+/// The OAuth error code of a token-endpoint error body: `error` when it is a
+/// string, or `error.code`; `None` when the body carries no code. `error.type`
+/// is never read: in OpenAI-style envelopes it is only a coarse category
+/// (`invalid_request_error`, `api_error`, ...), so it must not end a sign-in.
 fn error_code(body: &Value) -> Option<String> {
     let error = &body["error"];
     error
         .as_str()
         .or(error["code"].as_str())
-        .or(error["type"].as_str())
         .filter(|code| !code.is_empty())
         .map(str::to_string)
+}
+/// A name for a token-endpoint error in a message: the OAuth code, else
+/// `error.type`, else `unknown_error`.
+fn error_name(body: &Value) -> String {
+    let error = &body["error"];
+    error
+        .as_str()
+        .or(error["code"].as_str())
+        .or(error["type"].as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown_error")
+        .to_string()
 }
 /// Granted scopes: the token response's `scope`, else the access token's claim.
 fn granted_scope(tokens: &TokenResponse) -> String {
@@ -446,7 +459,7 @@ pub async fn exchange(
     if status != 200 {
         return Err(format!(
             "OpenAI rejected the sign-in ({}).",
-            error_code(&body).as_deref().unwrap_or("unknown_error")
+            error_name(&body)
         ));
     }
     let tokens: TokenResponse = serde_json::from_value(body)
@@ -1216,7 +1229,13 @@ mod tests {
     async fn refresh_is_fatal_on_lasting_oauth_errors_and_retries_transient_ones() {
         let fake = Fake::start(|r: &Req| {
             if r.field("grant_type") == "authorization_code" {
-                return Resp::json(400, json!({}));
+                return match r.field("code").as_str() {
+                    "typed" => Resp::json(
+                        400,
+                        json!({"error": {"type": "invalid_request_error", "code": null}}),
+                    ),
+                    _ => Resp::json(400, json!({})),
+                };
             }
             match r.field("refresh_token").as_str() {
                 "invalid_request" => Resp::json(
@@ -1233,6 +1252,12 @@ mod tests {
                     ..Resp::json(400, json!({}))
                 },
                 "transient" => Resp::json(400, json!({"error": "temporarily_unavailable"})),
+                // OpenAI-style envelopes: `type` is only a coarse category.
+                "typed_400" => Resp::json(
+                    400,
+                    json!({"error": {"type": "invalid_request_error", "code": null, "message": "bad"}}),
+                ),
+                "typed_401" => Resp::json(401, json!({"error": {"type": "invalid_grant"}})),
                 _ => Resp::json(403, json!({"error": "invalid_grant"})),
             }
         })
@@ -1256,7 +1281,7 @@ mod tests {
                 "{token}"
             );
         }
-        for token in ["no_code", "html", "transient"] {
+        for token in ["no_code", "html", "transient", "typed_400", "typed_401"] {
             assert!(
                 matches!(
                     refresh(&http, &e, "oaiapp_1", &with(token)).await,
@@ -1277,6 +1302,13 @@ mod tests {
                 .await
                 .unwrap_err(),
             "OpenAI rejected the sign-in (unknown_error)."
+        );
+        // Its message may still name the error by `type`.
+        assert_eq!(
+            exchange(&http, &e, "oaiapp_1", "typed", &attempt)
+                .await
+                .unwrap_err(),
+            "OpenAI rejected the sign-in (invalid_request_error)."
         );
     }
     #[tokio::test]
