@@ -1,3 +1,4 @@
+mod analysis;
 mod cam;
 mod choice_diagram;
 mod choice_help;

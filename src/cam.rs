@@ -8,8 +8,8 @@ use crate::{
     surface,
 };
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
-type Polygon = Vec<(f64, f64)>;
-type Region = Paths<Milli>;
+pub(crate) type Polygon = Vec<(f64, f64)>;
+pub(crate) type Region = Paths<Milli>;
 const LIMIT: usize = 30_000;
 pub(crate) fn number(op: &Operation, key: &str) -> Result<f32, String> {
     num(&op.p, key).ok_or_else(|| format!("Enter a finite {} value.", key.replace('_', " ")))
@@ -22,7 +22,7 @@ pub(crate) fn area(p: &Polygon) -> f64 {
         .sum::<f64>()
         / 2.
 }
-fn region(mut polygons: Vec<Polygon>) -> Result<Region, String> {
+pub(crate) fn region(mut polygons: Vec<Polygon>) -> Result<Region, String> {
     polygons.retain(|p| area(p).abs() > 0.000001);
     for p in &mut polygons {
         if area(p) < 0. {
@@ -32,16 +32,16 @@ fn region(mut polygons: Vec<Polygon>) -> Result<Region, String> {
     union::<Milli>(polygons, Vec::<Polygon>::new(), FillRule::NonZero).map_err(|e| e.to_string())
 }
 #[derive(Clone)]
-struct Triangle {
-    p: [[f32; 3]; 3],
-    feature: Option<usize>,
+pub(crate) struct Triangle {
+    pub p: [[f32; 3]; 3],
+    pub feature: Option<usize>,
 }
-struct Geometry {
-    triangles: Vec<Triangle>,
-    bounds: Bounds,
+pub(crate) struct Geometry {
+    pub triangles: Vec<Triangle>,
+    pub bounds: Bounds,
 }
 impl Geometry {
-    fn new(setup: &Setup, mesh: &Mesh) -> Self {
+    pub(crate) fn new(setup: &Setup, mesh: &Mesh) -> Self {
         let placement = Placement::new(mesh, Some(setup));
         let scale = mesh.display_scale();
         Self {
@@ -89,7 +89,7 @@ impl Geometry {
             .max_by(f32::total_cmp)
     }
 }
-fn plane_height(p: &[[f32; 3]; 3], xy: [f32; 2]) -> Option<f32> {
+pub(crate) fn plane_height(p: &[[f32; 3]; 3], xy: [f32; 2]) -> Option<f32> {
     let a = [p[1][0] - p[0][0], p[1][1] - p[0][1]];
     let b = [p[2][0] - p[0][0], p[2][1] - p[0][1]];
     let v = [xy[0] - p[0][0], xy[1] - p[0][1]];
