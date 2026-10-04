@@ -928,10 +928,14 @@ impl Document {
             .find(|m| !self.material_id.is_empty() && m.id == self.material_id)
     }
     /// `op`'s speed and feed against the selected material; None without a
-    /// material or when the operation's tool is not in the library.
+    /// material.
     pub fn speed_feed(&self, setup: &Setup, op: &Operation) -> Option<crate::material::SpeedFeed> {
         let material = self.selected_material()?;
-        let tool = self.tools.iter().find(|t| t.id == op.tool)?;
+        let Some(tool) = self.tools.iter().find(|t| t.id == op.tool) else {
+            return Some(crate::material::SpeedFeed::Unchecked(
+                "The operation has no tool in the library.".into(),
+            ));
+        };
         Some(crate::material::check(material, tool, op, &setup.machine))
     }
     /// Why `material` cannot be saved to the library: another material has

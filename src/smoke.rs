@@ -1344,6 +1344,12 @@ mod tests {
             let _ = a.view();
         }
     }
+    fn feed_lines(a: &App) -> Vec<String> {
+        crate::ui::speed_feed_lines(a)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect()
+    }
     #[test]
     fn picking_the_selected_material_again_changes_nothing() {
         // A pick_list sends the message again for the item already chosen;
@@ -1391,7 +1397,7 @@ mod tests {
     }
     #[test]
     fn speeds_and_feeds_outside_the_materials_data_warn_and_never_block_export() {
-        use crate::{material::SpeedFeed, ui::speed_feed_lines};
+        use crate::material::SpeedFeed;
         let dir = tempfile::tempdir().unwrap();
         let mut a = planning_app(&dir);
         let mesh = a.imported_mesh.clone().unwrap();
@@ -1400,7 +1406,7 @@ mod tests {
         let drill = &mut a.doc.setups[0].operations[3];
         drill.p.insert("rpm".into(), "12000".into());
         drill.p.insert("feed".into(), "1000".into());
-        assert_eq!(speed_feed_lines(&a), Vec::<String>::new());
+        assert_eq!(feed_lines(&a), Vec::<String>::new());
         let pocket_check = |a: &App| {
             let setup = &a.doc.setups[0];
             a.doc.speed_feed(setup, &setup.operations[1])
@@ -1417,7 +1423,7 @@ mod tests {
             };
             assert_eq!(problems.len(), 1);
             assert_eq!(
-                speed_feed_lines(&a),
+                feed_lines(&a),
                 vec![format!("Setup 1 · Pocket: {}", problems[0])]
             );
             let vc = if rpm == "30000" { "942" } else { "377" };
@@ -1446,7 +1452,7 @@ mod tests {
         }
         // A suppressed operation is not exported, so it is not listed.
         a.doc.setups[0].operations[1].enabled = false;
-        assert_eq!(speed_feed_lines(&a), Vec::<String>::new());
+        assert_eq!(feed_lines(&a), Vec::<String>::new());
         a.doc.setups[0].operations[1].enabled = true;
         // A material without cutting data: nothing is checked, and the
         // lines say so for each operation. No material: no lines.
@@ -1459,7 +1465,7 @@ mod tests {
             a.doc.speed_feed(setup, &setup.operations[1]),
             Some(SpeedFeed::Unchecked("Unknown has no cutting data.".into()))
         );
-        let lines = speed_feed_lines(&a);
+        let lines = feed_lines(&a);
         assert_eq!(lines.len(), 6, "{lines:?}");
         assert_eq!(
             lines[1],
@@ -1473,12 +1479,94 @@ mod tests {
         a.doc.material_id.clear();
         let setup = &a.doc.setups[0];
         assert_eq!(a.doc.speed_feed(setup, &setup.operations[1]), None);
-        assert!(speed_feed_lines(&a).is_empty());
-        // An operation whose tool is not in the library has nothing to check.
+        assert!(feed_lines(&a).is_empty());
+        // An operation whose tool is not in the library is not checked, and
+        // says why, in the editor and on the NC page.
         let _ = a.doc.select_material(&a.doc.materials[0].id.clone());
         a.doc.setups[0].operations[1].tool = "gone".into();
         let setup = &a.doc.setups[0];
+        let missing = "The operation has no tool in the library.";
+        assert_eq!(
+            a.doc.speed_feed(setup, &setup.operations[1]),
+            Some(SpeedFeed::Unchecked(missing.into()))
+        );
+        assert_eq!(
+            crate::ui::speed_feed_lines(&a),
+            vec![(false, format!("Setup 1 · Pocket: Not checked. {missing}"))]
+        );
+        let _ = a.update(Message::Page(Page::Post));
+        let _ = a.view();
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.view();
+        // With no material there is still nothing to say about the tool.
+        a.doc.material_id.clear();
+        let setup = &a.doc.setups[0];
         assert_eq!(a.doc.speed_feed(setup, &setup.operations[1]), None);
+    }
+    #[test]
+    fn the_nc_heading_follows_the_lines() {
+        use crate::ui::{speed_feed_heading, speed_feed_lines};
+        let outside = "Speeds and feeds outside the material's cutting data (export still allowed)";
+        let unchecked = "Speeds and feeds not checked (export still allowed)";
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        let drill = &mut a.doc.setups[0].operations[3];
+        drill.p.insert("rpm".into(), "12000".into());
+        drill.p.insert("feed".into(), "1000".into());
+        assert_eq!(speed_feed_lines(&a), vec![]);
+        // Valid cutting data, one operation out of range, another without a
+        // spindle speed: the list is mixed, so it is headed as a problem.
+        let pocket = &mut a.doc.setups[0].operations[1];
+        pocket.p.insert("rpm".into(), "12000".into());
+        pocket.p.insert("feed".into(), "2500".into());
+        a.doc.setups[0].operations[2]
+            .p
+            .insert("rpm".into(), " ".into());
+        let lines = speed_feed_lines(&a);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].0
+                && lines[0]
+                    .1
+                    .starts_with("Setup 1 · Pocket: Surface speed 377")
+        );
+        assert_eq!(
+            lines[1],
+            (
+                false,
+                "Setup 1 · Contour: Not checked. The operation has no spindle speed or feed."
+                    .into()
+            )
+        );
+        assert_eq!(speed_feed_heading(&lines), outside);
+        // Only the operation that could not be checked: not a problem list.
+        let pocket = &mut a.doc.setups[0].operations[1];
+        pocket.p.insert("rpm".into(), "8000".into());
+        pocket.p.insert("feed".into(), "1000".into());
+        let lines = speed_feed_lines(&a);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].0);
+        assert_eq!(speed_feed_heading(&lines), unchecked);
+        // A tool without flutes is the same, and so is a material without data.
+        a.doc.setups[0].operations[2]
+            .p
+            .insert("rpm".into(), "8000".into());
+        a.doc.tools[0].p.insert("flutes".into(), String::new());
+        let lines = speed_feed_lines(&a);
+        assert!(!lines.is_empty() && lines.iter().all(|l| !l.0), "{lines:?}");
+        assert!(lines[0].1.ends_with("The tool has no diameter or flutes."));
+        assert_eq!(speed_feed_heading(&lines), unchecked);
+        let bare = crate::material::Material::new("Unknown");
+        let id = bare.id.clone();
+        a.doc.materials.push(bare);
+        assert!(a.doc.select_material(&id));
+        let lines = speed_feed_lines(&a);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(speed_feed_heading(&lines), unchecked);
+        // The page builds with each list.
+        a.page = Page::Post;
+        let _ = a.view();
     }
     #[test]
     fn closing_waits_for_a_sign_out_and_exits_past_blocking_work() {

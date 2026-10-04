@@ -1819,22 +1819,32 @@ pub(crate) fn material_note(doc: &Document) -> Option<String> {
     }
 }
 /// The NC page's list: one line per speed or feed problem of an enabled
-/// operation, and one per operation that could not be checked.
-pub(crate) fn speed_feed_lines(app: &App) -> Vec<String> {
+/// operation (true), and one per operation that could not be checked (false).
+pub(crate) fn speed_feed_lines(app: &App) -> Vec<(bool, String)> {
     let mut lines = vec![];
     for (i, setup) in app.doc.setups.iter().enumerate() {
         for op in setup.operations.iter().filter(|o| o.enabled) {
             let at = format!("Setup {} · {}", i + 1, op.name());
             match app.doc.speed_feed(setup, op) {
                 Some(SpeedFeed::Out(problems)) => {
-                    lines.extend(problems.into_iter().map(|p| format!("{at}: {p}")))
+                    lines.extend(problems.into_iter().map(|p| (true, format!("{at}: {p}"))))
                 }
-                Some(SpeedFeed::Unchecked(why)) => lines.push(format!("{at}: Not checked. {why}")),
+                Some(SpeedFeed::Unchecked(why)) => {
+                    lines.push((false, format!("{at}: Not checked. {why}")))
+                }
                 _ => {}
             }
         }
     }
     lines
+}
+/// The NC page's heading for `lines`: a problem anywhere makes it a problem list.
+pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
+    if lines.iter().any(|(problem, _)| *problem) {
+        "Speeds and feeds outside the material's cutting data (export still allowed)"
+    } else {
+        "Speeds and feeds not checked (export still allowed)"
+    }
 }
 fn page_header<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
     row![
@@ -3010,12 +3020,8 @@ fn post(app: &App) -> Element<'_, Message> {
     let lines = speed_feed_lines(app);
     if !lines.is_empty() {
         summary = summary.push(caution(
-            if material_note(&app.doc).is_some() {
-                "Speeds and feeds not checked (export still allowed)"
-            } else {
-                "Speeds and feeds outside the material's cutting data (export still allowed)"
-            },
-            lines,
+            speed_feed_heading(&lines),
+            lines.into_iter().map(|(_, line)| line).collect(),
         ));
     }
     let mut code = column![].spacing(18);
