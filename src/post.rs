@@ -103,7 +103,7 @@ fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
     let band = short_mm(side_band(stock));
     match origin {
         "Stock top center" => Some(format!(
-            "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within {band} mm below the top"
+            "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and {band} mm below the top"
         )),
         "Stock top front-left" => {
             let stretch = |length: f32| {
@@ -120,7 +120,7 @@ fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
                 format!("the -X side {x} and the -Y side {y}")
             };
             Some(format!(
-                "Z0 on the stock top within {} mm of the front-left corner and X0 Y0 from {sides} from the front-left corner, within {band} mm below the top",
+                "Z0 on the stock top within {} mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from {sides} from the front-left corner, between 1 mm and {band} mm below the top",
                 short_mm(corner_area(stock))
             ))
         }
@@ -1476,7 +1476,7 @@ mod tests {
     const GOLDEN: &str = "(AXIS CAM Studio - LinuxCNC 3-axis program)
 (Job: Golden - Setup 1: Top side - G54)
 (Machine: Workshop Mill v1)
-(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top.)
+(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 2.5 mm below the top.)
 (Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
 (Fixture: Low profile clamps)
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
@@ -1528,11 +1528,11 @@ M2
         for (origin, spots) in [
             (
                 "Stock top center",
-                "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top",
+                "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 2.5 mm below the top",
             ),
             (
                 "Stock top front-left",
-                "Z0 on the stock top within 5 mm of the front-left corner and X0 Y0 from the -X and -Y sides between 1 mm and 3 mm from the front-left corner, within 2.5 mm below the top",
+                "Z0 on the stock top within 5 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X and -Y sides between 1 mm and 3 mm from the front-left corner, between 1 mm and 2.5 mm below the top",
             ),
         ] {
             setup.p.insert("origin".into(), origin.into());
@@ -1588,7 +1588,7 @@ M2
         };
         assert_eq!(
             touch_off_spots("Stock top front-left", stock).unwrap(),
-            "Z0 on the stock top within 10 mm of the front-left corner and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner, within 10 mm below the top"
+            "Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner, between 1 mm and 10 mm below the top"
         );
         // Rounded to 0.1 mm inside the checked area: a 13 mm tall stock is
         // touched within 3.2 mm, and its 14.2 mm -X side from 0.71 to 2.13 mm
@@ -1600,7 +1600,7 @@ M2
         assert_eq!((side_band(low), corner_area(low)), (3.2, 3.5));
         assert_eq!(
             touch_off_spots("Stock top front-left", low).unwrap(),
-            "Z0 on the stock top within 3.5 mm of the front-left corner and X0 Y0 from the -X side between 0.8 mm and 2.1 mm and the -Y side between 1.5 mm and 4.5 mm from the front-left corner, within 3.2 mm below the top"
+            "Z0 on the stock top within 3.5 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X side between 0.8 mm and 2.1 mm and the -Y side between 1.5 mm and 4.5 mm from the front-left corner, between 1 mm and 3.2 mm below the top"
         );
         assert_eq!(touch_off_spots("Model origin", stock), None);
     }
@@ -1615,7 +1615,7 @@ M2
         assert!(text.contains("(Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.)\n(Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.)\nG17 G21"), "{text}");
         assert_eq!(
             comment_parts(&text, "Before starting: ").join(" "),
-            "load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top.",
+            "load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 2.5 mm below the top.",
             "{text}"
         );
         assert!(
@@ -2108,17 +2108,19 @@ M2
                 ),
                 (
                     "Stock top front-left",
-                    "Z0 on the stock top within 10 mm of the front-left corner and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner",
+                    "Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner",
                 ),
             ] {
                 let (doc, mesh) = two_sided_job(bottom, origin);
                 let job = post_job(&doc, &mesh);
                 assert!(job.ready(), "{bottom} {origin}: {:?}", errors(&job));
-                // The 124 x 84 x 47 mm stock: within 10 mm below the top.
+                // The 124 x 84 x 47 mm stock: between 1 mm and 10 mm below the top.
                 let text = &setup_texts(&job, 1)[0];
                 assert_eq!(
                     comment_parts(text, "Work zero: ").join(" "),
-                    format!("{origin} in G55. Touch off {spots}, within 10 mm below the top."),
+                    format!(
+                        "{origin} in G55. Touch off {spots}, between 1 mm and 10 mm below the top."
+                    ),
                     "{text}"
                 );
             }
@@ -2260,7 +2262,7 @@ M2
             assert!(
                 comment_parts(text, "Work zero: ")
                     .join(" ")
-                    .ends_with(" within 3.5 mm below the top."),
+                    .ends_with(" between 1 mm and 3.5 mm below the top."),
                 "{text}"
             );
         }
@@ -2813,7 +2815,7 @@ M2
         // Setup 1's stock-based zero says where to touch off.
         let first = &setup_texts(&post_job(&job, &mesh), 0)[0];
         assert!(
-            first.contains("(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 10 mm below the top.)\n"),
+            first.contains("(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 10 mm below the top.)\n"),
             "{first}"
         );
         assert!(!first.contains("Part in work coordinates"));
@@ -3034,7 +3036,7 @@ M2
         for (part, instruction) in [
             (
                 (1, 2),
-                "then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top.",
+                "then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 2.5 mm below the top.",
             ),
             (
                 (2, 2),
