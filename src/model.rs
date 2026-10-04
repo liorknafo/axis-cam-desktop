@@ -849,6 +849,12 @@ pub struct Document {
     pub schema: u32,
     pub title: String,
     pub material: String,
+    /// The material library, carried to new projects like tools.
+    #[serde(default)]
+    pub materials: Vec<crate::material::Material>,
+    /// The selected library material's id; `material` keeps its name.
+    #[serde(default)]
+    pub material_id: String,
     pub file: Option<ModelFile>,
     #[serde(default)]
     pub sample_model: bool,
@@ -863,6 +869,8 @@ impl Default for Document {
             schema: 1,
             title: "Untitled project".into(),
             material: String::new(),
+            materials: vec![],
+            material_id: String::new(),
             file: None,
             sample_model: false,
             machines: vec![],
@@ -907,6 +915,7 @@ impl Document {
             machines,
             tools,
             setups: vec![s],
+            ..Self::default()
         };
         doc.number_tools();
         doc

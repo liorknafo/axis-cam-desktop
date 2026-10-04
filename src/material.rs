@@ -1,0 +1,454 @@
+//! The material library: what a material holds, the starter materials, and
+//! the speed and feed check against a material's cutting data.
+use crate::model::{Fields, Machine, Operation, Tool, fields, get, id, num};
+use serde::{Deserialize, Serialize};
+
+pub const GROUPS: [&str; 7] = [
+    "Aluminium",
+    "Steel",
+    "Stainless steel",
+    "Brass and copper",
+    "Plastic",
+    "Wood and composite",
+    "Other",
+];
+/// Chip-load bands: key prefix and the largest tool diameter (mm) in the band.
+pub const BANDS: [(&str, f32); 5] = [
+    ("fz3", 3.),
+    ("fz6", 6.),
+    ("fz10", 10.),
+    ("fz16", 16.),
+    ("fzbig", f32::INFINITY),
+];
+pub const STARTER_NOTE: &str =
+    "Starting point for carbide tools: adjust to your machine and your tool maker's data.";
+/// Every cutting-data key, in pairs.
+fn keys() -> Vec<String> {
+    std::iter::once("vc")
+        .chain(BANDS.iter().map(|(k, _)| *k))
+        .flat_map(|k| [format!("{k}_min"), format!("{k}_max")])
+        .collect()
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Material {
+    pub id: String,
+    pub p: Fields,
+}
+/// A material's complete cutting data: surface speed (m/min) and chip load
+/// per tooth (mm) for each band of `BANDS`, as (min, max).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CuttingData {
+    pub vc: (f32, f32),
+    pub fz: [(f32, f32); 5],
+}
+impl Material {
+    pub fn new(name: &str) -> Self {
+        Self {
+            id: id(),
+            p: fields(&[("name", name), ("group", "Other")]),
+        }
+    }
+    pub fn name(&self) -> &str {
+        get(&self.p, "name")
+    }
+    fn pair(&self, key: &str) -> Option<(f32, f32)> {
+        let min = num(&self.p, &format!("{key}_min"))?;
+        let max = num(&self.p, &format!("{key}_max"))?;
+        (min > 0. && min <= max).then_some((min, max))
+    }
+    pub fn cutting_data(&self) -> Option<CuttingData> {
+        let vc = self.pair("vc")?;
+        let mut fz = [(0., 0.); 5];
+        for (slot, (key, _)) in fz.iter_mut().zip(BANDS) {
+            *slot = self.pair(key)?;
+        }
+        Some(CuttingData { vc, fz })
+    }
+    pub fn issues(&self) -> Vec<String> {
+        let mut e = vec![];
+        if self.name().trim().is_empty() {
+            e.push("Give the material a name.".into());
+        }
+        if !GROUPS.contains(&get(&self.p, "group")) {
+            e.push("Choose a material group.".into());
+        }
+        if get(&self.p, "notes").chars().count() > 500 {
+            e.push("Notes can be at most 500 characters.".into());
+        }
+        let keys = keys();
+        let filled = keys
+            .iter()
+            .filter(|k| !get(&self.p, k).trim().is_empty())
+            .count();
+        if filled > 0 && filled < keys.len() {
+            e.push("Fill in every cutting-data field, or leave them all empty.".into());
+        }
+        if filled == keys.len() {
+            for k in &keys {
+                if !num(&self.p, k).is_some_and(|v| v > 0.) {
+                    e.push(format!("{k} must be a positive number."));
+                }
+            }
+            if self.pair("vc").is_none() {
+                e.push("Surface speed: the minimum must not exceed the maximum.".into());
+            }
+            for (k, limit) in BANDS {
+                if self.pair(k).is_none() {
+                    let band = if limit.is_finite() {
+                        format!("up to {limit} mm")
+                    } else {
+                        "over 16 mm".into()
+                    };
+                    e.push(format!(
+                        "Chip load {band}: the minimum must not exceed the maximum."
+                    ));
+                }
+            }
+        }
+        e
+    }
+}
+/// The chip-load band of a tool diameter (index into `BANDS`).
+pub fn band(diameter: f32) -> usize {
+    BANDS
+        .iter()
+        .position(|(_, limit)| diameter <= *limit)
+        .unwrap_or(4)
+}
+/// The result of checking one operation's speed and feed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpeedFeed {
+    InRange {
+        vc: f32,
+        fz: f32,
+    },
+    /// Each problem names the value and the material's range.
+    Out(Vec<String>),
+    /// Why the operation could not be checked.
+    Unchecked(String),
+}
+/// Checks an operation's spindle speed and feed against `material`, for
+/// `tool` on `machine` (whose maximum rpm and feed count as in range when the
+/// material asks for more). 1 % slack on every limit absorbs rounding.
+pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine) -> SpeedFeed {
+    let Some(data) = material.cutting_data() else {
+        return SpeedFeed::Unchecked(format!("{} has no cutting data.", material.name()));
+    };
+    let (Some(d), Some(z)) = (num(&tool.p, "diameter"), num(&tool.p, "flutes")) else {
+        return SpeedFeed::Unchecked("The tool has no diameter or flutes.".into());
+    };
+    let (Some(n), Some(f)) = (num(&op.p, "rpm"), num(&op.p, "feed")) else {
+        return SpeedFeed::Unchecked("The operation has no spindle speed or feed.".into());
+    };
+    if d <= 0. || z < 1. || n <= 0. || f <= 0. {
+        return SpeedFeed::Unchecked(
+            "The tool or the operation has no positive speed data.".into(),
+        );
+    }
+    let inch = if get(&machine.p, "units") == "inch" {
+        25.4
+    } else {
+        1.
+    };
+    let max_rpm = num(&machine.p, "rpm").unwrap_or(f32::INFINITY);
+    let max_feed = num(&machine.p, "feed").map_or(f32::INFINITY, |v| v * inch);
+    let vc = std::f32::consts::PI * d * n / 1000.;
+    let fz = f / (n * z);
+    let (vc_min, vc_max) = data.vc;
+    let (fz_min, fz_max) = data.fz[band(d)];
+    let name = material.name();
+    let mut out = vec![];
+    if vc > vc_max * 1.01 {
+        out.push(format!(
+            "Surface speed {vc:.0} m/min is above {name}'s {vc_min:.0}–{vc_max:.0} m/min."
+        ));
+    } else if vc < vc_min * 0.99 && n < max_rpm - 0.5 {
+        out.push(format!(
+            "Surface speed {vc:.0} m/min is below {name}'s {vc_min:.0}–{vc_max:.0} m/min."
+        ));
+    }
+    if fz > fz_max * 1.01 {
+        out.push(format!("Chip load {fz:.3} mm per tooth is above {name}'s {fz_min:.3}–{fz_max:.3} mm for a Ø{d} mm tool."));
+    } else if fz < fz_min * 0.99 && f < max_feed - 0.5 {
+        out.push(format!("Chip load {fz:.3} mm per tooth is below {name}'s {fz_min:.3}–{fz_max:.3} mm for a Ø{d} mm tool."));
+    }
+    if out.is_empty() {
+        SpeedFeed::InRange { vc, fz }
+    } else {
+        SpeedFeed::Out(out)
+    }
+}
+/// The starter library (spec table "Starter materials").
+pub fn starters() -> Vec<Material> {
+    let rows: [(&str, &str, &str, (f32, f32), [(f32, f32); 5], &str); 9] = [
+        (
+            "Aluminium 6061-T6",
+            "Aluminium",
+            "95 HB",
+            (150., 300.),
+            [
+                (0.010, 0.030),
+                (0.020, 0.050),
+                (0.030, 0.080),
+                (0.050, 0.100),
+                (0.060, 0.120),
+            ],
+            "Flood or mist; clear chips.",
+        ),
+        (
+            "Aluminium 7075-T6",
+            "Aluminium",
+            "150 HB",
+            (150., 280.),
+            [
+                (0.010, 0.025),
+                (0.020, 0.045),
+                (0.030, 0.070),
+                (0.040, 0.090),
+                (0.050, 0.110),
+            ],
+            "Flood or mist; clear chips.",
+        ),
+        (
+            "Mild steel 1018",
+            "Steel",
+            "126 HB",
+            (80., 150.),
+            [
+                (0.005, 0.015),
+                (0.010, 0.030),
+                (0.020, 0.050),
+                (0.030, 0.070),
+                (0.040, 0.090),
+            ],
+            "Flood; avoid rubbing at low feed.",
+        ),
+        (
+            "Stainless steel 304",
+            "Stainless steel",
+            "201 HB",
+            (50., 100.),
+            [
+                (0.005, 0.012),
+                (0.010, 0.025),
+                (0.015, 0.040),
+                (0.020, 0.050),
+                (0.030, 0.070),
+            ],
+            "Flood; keep the tool cutting, it work-hardens.",
+        ),
+        (
+            "Brass C360",
+            "Brass and copper",
+            "78 HRB",
+            (150., 300.),
+            [
+                (0.010, 0.030),
+                (0.020, 0.050),
+                (0.030, 0.070),
+                (0.040, 0.090),
+                (0.050, 0.110),
+            ],
+            "Dry or air; sharp tools.",
+        ),
+        (
+            "POM (Delrin)",
+            "Plastic",
+            "",
+            (150., 400.),
+            [
+                (0.020, 0.050),
+                (0.040, 0.100),
+                (0.060, 0.150),
+                (0.080, 0.200),
+                (0.100, 0.250),
+            ],
+            "Air; avoid melting with high feed per tooth.",
+        ),
+        (
+            "Acrylic (PMMA)",
+            "Plastic",
+            "",
+            (100., 300.),
+            [
+                (0.020, 0.050),
+                (0.030, 0.080),
+                (0.050, 0.120),
+                (0.060, 0.150),
+                (0.080, 0.180),
+            ],
+            "Air; single-flute tools give the best finish.",
+        ),
+        (
+            "HDPE",
+            "Plastic",
+            "",
+            (150., 400.),
+            [
+                (0.030, 0.070),
+                (0.050, 0.120),
+                (0.080, 0.180),
+                (0.100, 0.220),
+                (0.120, 0.250),
+            ],
+            "Air; it deflects, use light finishing passes.",
+        ),
+        (
+            "MDF",
+            "Wood and composite",
+            "",
+            (200., 500.),
+            [
+                (0.030, 0.080),
+                (0.050, 0.150),
+                (0.080, 0.200),
+                (0.100, 0.250),
+                (0.120, 0.300),
+            ],
+            "Dust extraction; no coolant.",
+        ),
+    ];
+    rows.into_iter()
+        .map(|(name, group, hardness, vc, fz, note)| {
+            let mut m = Material::new(name);
+            m.p.insert("group".into(), group.into());
+            m.p.insert("hardness".into(), hardness.into());
+            m.p.insert("notes".into(), format!("{STARTER_NOTE} {note}"));
+            m.p.insert("vc_min".into(), vc.0.to_string());
+            m.p.insert("vc_max".into(), vc.1.to_string());
+            for ((key, _), (min, max)) in BANDS.iter().zip(fz) {
+                m.p.insert(format!("{key}_min"), min.to_string());
+                m.p.insert(format!("{key}_max"), max.to_string());
+            }
+            m
+        })
+        .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Machine, Operation, Strategy, Tool};
+    fn op(rpm: &str, feed: &str) -> Operation {
+        let mut o = Operation::new(Strategy::Pocket, String::new());
+        o.p.insert("rpm".into(), rpm.into());
+        o.p.insert("feed".into(), feed.into());
+        o
+    }
+    fn alu() -> Material {
+        starters()
+            .into_iter()
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .unwrap()
+    }
+    #[test]
+    fn starters_are_valid_and_complete() {
+        let all = starters();
+        assert_eq!(all.len(), 9);
+        for m in &all {
+            assert!(m.issues().is_empty(), "{}: {:?}", m.name(), m.issues());
+            assert!(m.cutting_data().is_some(), "{}", m.name());
+            assert!(get(&m.p, "notes").starts_with(STARTER_NOTE));
+            assert!(GROUPS.contains(&get(&m.p, "group")));
+        }
+        let mut names: Vec<_> = all.iter().map(|m| m.name().to_lowercase()).collect();
+        names.dedup();
+        assert_eq!(names.len(), 9);
+        let data = alu().cutting_data().unwrap();
+        assert_eq!(data.vc, (150., 300.));
+        assert_eq!(data.fz[1], (0.02, 0.05));
+    }
+    #[test]
+    fn cutting_data_must_be_complete_positive_and_ordered() {
+        let mut m = Material::new("Test");
+        assert!(m.cutting_data().is_none() && m.issues().is_empty());
+        m.p.insert("vc_min".into(), "100".into());
+        assert!(
+            m.issues()
+                .iter()
+                .any(|e| e.contains("every cutting-data field"))
+        );
+        let mut full = alu();
+        full.p.insert("vc_min".into(), "400".into());
+        assert!(full.issues().iter().any(|e| e.contains("Surface speed")));
+        assert!(full.cutting_data().is_none());
+        let mut negative = alu();
+        negative.p.insert("fz6_min".into(), "-0.01".into());
+        assert!(!negative.issues().is_empty());
+        let mut blank = alu();
+        blank.p.insert("name".into(), " ".into());
+        assert!(blank.issues().iter().any(|e| e.contains("name")));
+        let mut long = alu();
+        long.p.insert("notes".into(), "x".repeat(501));
+        assert!(long.issues().iter().any(|e| e.contains("500")));
+    }
+    #[test]
+    fn bands_follow_the_tool_diameter() {
+        assert_eq!(
+            [2.9, 3., 3.1, 6., 10., 16., 16.1, 50.].map(band),
+            [0, 0, 1, 1, 2, 3, 4, 4]
+        );
+    }
+    #[test]
+    fn surface_speed_and_chip_load_are_checked_with_machine_limits() {
+        let machine = Machine::new(3); // 12000 rpm, 5000 mm/min
+        let tool = Tool::new("Flat 6", "Flat end mill", "6"); // 3 flutes
+        // 8000 rpm: Vc = π·6·8000/1000 = 150.8 m/min; 1000 mm/min: fz = 1000/(8000·3) = 0.0417
+        assert!(matches!(
+            check(&alu(), &tool, &op("8000", "1000"), &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        let SpeedFeed::Out(problems) = check(&alu(), &tool, &op("20000", "1000"), &machine) else {
+            panic!()
+        };
+        assert!(
+            problems[0]
+                .contains("Surface speed 377 m/min is above Aluminium 6061-T6's 150–300 m/min"),
+            "{problems:?}"
+        );
+        let SpeedFeed::Out(problems) = check(&alu(), &tool, &op("8000", "200"), &machine) else {
+            panic!()
+        };
+        assert!(
+            problems[0].contains("Chip load 0.008 mm per tooth is below"),
+            "{problems:?}"
+        );
+        // A 1 mm tool cannot reach 150 m/min under 12000 rpm: the machine's maximum counts.
+        let small = Tool::new("Flat 1", "Flat end mill", "1");
+        assert!(matches!(
+            check(&alu(), &small, &op("12000", "500"), &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        assert!(matches!(
+            check(&alu(), &small, &op("11000", "500"), &machine),
+            SpeedFeed::Out(_)
+        ));
+        // 1 % slack for rounding.
+        assert!(matches!(
+            check(&alu(), &tool, &op("7900", "1000"), &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        // Nothing to check against.
+        assert!(matches!(
+            check(
+                &Material::new("Unknown"),
+                &tool,
+                &op("8000", "1000"),
+                &machine
+            ),
+            SpeedFeed::Unchecked(_)
+        ));
+        let mut broken = tool.clone();
+        broken.p.insert("flutes".into(), "0".into());
+        assert!(matches!(
+            check(&alu(), &broken, &op("8000", "1000"), &machine),
+            SpeedFeed::Unchecked(_)
+        ));
+    }
+    #[test]
+    fn documents_saved_before_the_library_still_load() {
+        let old = r#"{"schema":1,"title":"Old","material":"Aluminum 6061","file":null,"machines":[],"tools":[],"setups":[],"active":""}"#;
+        let doc: crate::model::Document = serde_json::from_str(old).unwrap();
+        assert!(doc.materials.is_empty() && doc.material_id.is_empty());
+        assert_eq!(doc.material, "Aluminum 6061");
+    }
+}
