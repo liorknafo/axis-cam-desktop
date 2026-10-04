@@ -332,7 +332,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this material from the library. The project material cannot be deleted while it is selected: choose another one in the setup first."
         }
         PickMaterial(_) => {
-            "Use this library material for the project. Its cutting data are used to check speeds and feeds and are sent to the AI planner."
+            "Use this library material for the project. Its cutting data are used to check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
         }
         SetOpTool(_) => {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview."
@@ -454,19 +454,19 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(FixtureClearance),
         ),
         (Target::Material, "name") => (
-            "The material's name in the library and in the project material list. Each material needs its own name; capitals do not make a name different.",
+            "The material's name in the library and in the project material list. Each material needs its own name; capitals do not make a name different. When this is the project material, its name is sent to the AI planner.",
             None,
         ),
         (Target::Material, "group") => (
-            "The kind of material. It is saved with the material, shown in the library list and described to the AI planner.",
+            "The kind of material. It is saved with the material, shown in the library list and, when this is the project material, sent to the AI planner.",
             None,
         ),
         (Target::Material, "hardness") => (
-            "Optional hardness of the material, such as 95 HB. It is recorded with the material and does not change any limit.",
+            "Optional hardness of the material, such as 95 HB. It does not change any limit. When this is the project material, it is sent to the AI planner.",
             None,
         ),
         (Target::Material, "notes") => (
-            "Optional notes on the material, up to 500 characters: coolant, chip clearing or anything else to remember. They are saved with the material.",
+            "Optional notes on the material, up to 500 characters: coolant, chip clearing or anything else to remember. They are saved with the material and, when this is the project material, sent to the AI planner.",
             None,
         ),
         (Target::Material, "vc_min") => (
@@ -1605,11 +1605,22 @@ mod tests {
                 assert!(!body.contains(claim), "{message:?}: {body}");
             }
         }
+        let pick = command(&Message::PickMaterial("m".into()), "x".into()).body;
         assert!(
-            command(&Message::PickMaterial("m".into()), "x".into())
-                .body
-                .contains("sent to the AI planner")
+            pick.contains(
+                "its name, group, hardness, notes and cutting data are sent to the AI planner"
+            ),
+            "{pick}"
         );
+        // What the planner is sent of the project material is said on every
+        // field that goes: the name, group, hardness and notes.
+        for key in ["name", "group", "hardness", "notes"] {
+            let body = field_help(key, "x", Target::Material).body;
+            assert!(
+                body.contains("project material") && body.contains("sent to the AI planner"),
+                "{key}: {body}"
+            );
+        }
         assert!(
             command(&Message::DeleteMaterial("m".into()), "x".into())
                 .body

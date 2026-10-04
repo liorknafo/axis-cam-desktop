@@ -1790,7 +1790,7 @@ fn material_picker(app: &App) -> Element<'_, Message> {
                 .text_size(13),
             Help::text(
                 "Project material",
-                "Material from the library. Its cutting data are used to check speeds and feeds and are sent to the AI planner."
+                "Material from the library. Its cutting data are used to check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
             ),
             widget::tooltip::Position::Left
         ),
@@ -2416,7 +2416,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
 }
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
-pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material with its cutting data, stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
+pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
 fn planner_controls(app: &App) -> Element<'_, Message> {
     let checklist = app.plan_checklist();
     let ready = checklist.iter().all(|line| line.ok);

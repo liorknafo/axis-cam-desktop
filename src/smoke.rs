@@ -4152,7 +4152,7 @@ mod tests {
         // The page beside the Plan button says the cutting data are sent.
         assert!(
             crate::ui::SENT_TO_OPENAI.contains(
-                "your tools, machine limits, the project material with its cutting data,"
+                "your tools, machine limits, the project material (its name, group, hardness, notes and cutting data),"
             )
         );
         // The program page says what export repeats, and that the planner's
