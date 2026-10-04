@@ -20,6 +20,10 @@ pub const BANDS: [(&str, f32); 5] = [
     ("fz16", 16.),
     ("fzbig", f32::INFINITY),
 ];
+/// Whether two material names are the same: trimmed, ignoring case (Unicode).
+pub fn same_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
 /// The most characters a material's name may have; the checks name it.
 pub const NAME_LIMIT: usize = 60;
 pub const STARTER_NOTE: &str =
@@ -101,6 +105,8 @@ impl Material {
         let mut e = vec![];
         if self.name().trim().is_empty() {
             e.push("Give the material a name.".into());
+        } else if self.name().trim().chars().count() > NAME_LIMIT {
+            e.push(format!("The name can be at most {NAME_LIMIT} characters."));
         }
         if !GROUPS.contains(&get(&self.p, "group")) {
             e.push("Choose a material group.".into());
@@ -450,6 +456,27 @@ mod tests {
         );
         assert_eq!(label("fz16_max").unwrap(), "Chip load up to 16 mm, maximum");
         assert!(label("name").is_none() && label("fz7_min").is_none());
+    }
+    #[test]
+    fn a_name_is_at_most_60_characters() {
+        let issues = |name: &str| {
+            let mut m = alu();
+            m.p.insert("name".into(), name.into());
+            m.issues()
+        };
+        assert!(issues(&"n".repeat(60)).is_empty());
+        assert!(issues(&format!("  {}  ", "é".repeat(60))).is_empty());
+        assert_eq!(
+            issues(&"n".repeat(61)),
+            ["The name can be at most 60 characters."]
+        );
+        assert_eq!(NAME_LIMIT, 60);
+    }
+    #[test]
+    fn names_match_ignoring_case_and_surrounding_spaces() {
+        assert!(same_name(" Édelstahl 304", "édelstahl 304  "));
+        assert!(same_name("MDF", "mdf"));
+        assert!(!same_name("MDF", "MDF 2"));
     }
     #[test]
     fn the_ordering_message_needs_two_positive_numbers() {

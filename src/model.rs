@@ -941,19 +941,14 @@ impl Document {
     /// Why `material` cannot be saved to the library: another material has
     /// its name (ignoring case).
     pub fn material_name_issues(&self, material: &crate::material::Material) -> Vec<String> {
-        let name = material.name().trim().to_lowercase();
+        let name = material.name().trim();
         let taken = !name.is_empty()
             && self
                 .materials
                 .iter()
-                .any(|m| m.id != material.id && m.name().trim().to_lowercase() == name);
+                .any(|m| m.id != material.id && crate::material::same_name(m.name(), name));
         taken
-            .then(|| {
-                format!(
-                    "A material named {} is already in the library.",
-                    material.name().trim()
-                )
-            })
+            .then(|| format!("A material named {name} is already in the library."))
             .into_iter()
             .collect()
     }
@@ -973,6 +968,7 @@ impl Document {
     /// Gives a document with an empty library the starter materials and links
     /// a legacy material name to the library. Returns the note to show, if any.
     pub fn adopt_materials(&mut self) -> Option<String> {
+        let shown = |name: &str| crate::proposal::clip(name, crate::material::NAME_LIMIT);
         if self.materials.is_empty() {
             self.materials = crate::material::starters();
         }
@@ -986,13 +982,13 @@ impl Document {
         if let Some(m) = self
             .materials
             .iter()
-            .find(|m| m.name().eq_ignore_ascii_case(&name))
+            .find(|m| crate::material::same_name(m.name(), &name))
         {
             let id = m.id.clone();
             self.select_material(&id);
             return Some(format!(
                 "The project material \"{}\" was linked to the library.",
-                self.material
+                shown(&self.material)
             ));
         }
         let added = crate::material::Material::new(&name);
@@ -1000,7 +996,8 @@ impl Document {
         self.materials.push(added);
         self.select_material(&id);
         Some(format!(
-            "The project material \"{name}\" was added to the material library without cutting data; add it on the Materials page."
+            "The project material \"{}\" was added to the material library without cutting data; add it on the Materials page.",
+            shown(&name)
         ))
     }
     pub fn has_model(&self) -> bool {
@@ -1498,6 +1495,52 @@ mod tests {
             doc.material_name_issues(&Material::new("Titanium"))
                 .is_empty()
         );
+    }
+    #[test]
+    fn a_legacy_name_differing_only_by_a_non_ascii_capital_links_to_the_entry() {
+        use crate::material::Material;
+        let mut doc = Document {
+            materials: vec![Material::new("Édelstahl 1.4301")],
+            material: "  édelstahl 1.4301 ".into(),
+            ..Default::default()
+        };
+        let note = doc.adopt_materials().unwrap();
+        assert!(note.contains("linked to the library"), "{note}");
+        assert_eq!(doc.materials.len(), 1);
+        assert_eq!(doc.material, "Édelstahl 1.4301");
+        // The library's own name check compares the same way.
+        assert_eq!(
+            doc.material_name_issues(&Material::new(" ÉDELSTAHL 1.4301")),
+            ["A material named ÉDELSTAHL 1.4301 is already in the library."]
+        );
+    }
+    #[test]
+    fn a_long_legacy_name_is_clipped_to_one_line_of_60_characters_in_the_note() {
+        let long = format!("Legacy\nalloy {}", "x".repeat(300));
+        let mut doc = Document {
+            material: long.clone(),
+            ..Default::default()
+        };
+        let note = doc.adopt_materials().unwrap();
+        let name = note
+            .strip_prefix("The project material \"")
+            .and_then(|rest| rest.split_once("\" was added to the material library"))
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| panic!("{note}"));
+        assert!(name.starts_with("Legacy alloy xxx"), "{note}");
+        assert_eq!(name.chars().count(), 60, "{note}");
+        assert!(!note.contains('\n'));
+        // The library keeps the name as it was.
+        assert_eq!(doc.selected_material().unwrap().name(), long.trim());
+        // A linked name is clipped too.
+        let mut linked = Document {
+            materials: vec![crate::material::Material::new(&long)],
+            material: long,
+            ..Default::default()
+        };
+        let note = linked.adopt_materials().unwrap();
+        assert!(note.contains("linked to the library"), "{note}");
+        assert!(note.chars().count() < 120, "{note}");
     }
     #[test]
     fn a_library_with_entries_gets_no_starters() {

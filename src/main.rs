@@ -2878,7 +2878,7 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
 /// saved before they existed, is not added twice: the example's tool takes
 /// the user's number. Every other example tool whose number is then in use
 /// gets the smallest free one; the example's operations refer to it by ID.
-/// Materials match by name, ignoring case, and the user's entry is kept; the
+/// Materials match by name (`material::same_name`), and the user's entry is kept; the
 /// example's material is then linked to the library, or added to it without
 /// cutting data, and the status says which.
 fn merge_sample(user: &Document) -> (Document, String) {
@@ -2894,7 +2894,8 @@ fn merge_sample(user: &Document) -> (Document, String) {
     }
     let starters = crate::material::starters();
     let known = |list: &[crate::material::Material], name: &str| {
-        list.iter().any(|m| m.name().eq_ignore_ascii_case(name))
+        list.iter()
+            .any(|m| crate::material::same_name(m.name(), name))
     };
     for m in &user.materials {
         if !known(&doc.materials, m.name()) {

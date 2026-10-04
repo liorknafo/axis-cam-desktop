@@ -1218,6 +1218,28 @@ mod tests {
         );
     }
     #[test]
+    fn explore_matches_material_names_like_the_library_does() {
+        use crate::material::Material;
+        let user = Document {
+            materials: vec![
+                Material::new("Édelstahl 304"),
+                Material::new(" édelstahl 304 "),
+                Material::new(" aluminium 6061-t6 "),
+            ],
+            ..Document::default()
+        };
+        let (doc, status) = crate::merge_sample(&user);
+        // The second spelling is the first entry again; the third is the
+        // starter's, so it is not announced as the user's own addition.
+        let names: Vec<_> = doc.materials.iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["Édelstahl 304", " aluminium 6061-t6 "]);
+        assert!(
+            status.contains("Added from your library: material Édelstahl 304. Use New project"),
+            "{status}"
+        );
+        assert!(status.contains("linked to the library"), "{status}");
+    }
+    #[test]
     fn explore_example_adds_its_material_without_data_when_the_user_deleted_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
