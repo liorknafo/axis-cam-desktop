@@ -1034,6 +1034,58 @@ mod tests {
         assert_eq!(a.doc.tools[0].number(), Some(1));
     }
     #[test]
+    fn closing_waits_for_a_sign_out_and_exits_past_blocking_work() {
+        use crate::{CloseAction::*, close_action};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        // The workspace could not be saved: the window stays.
+        assert_eq!(close_action(false, None, false), Stay);
+        assert_eq!(close_action(false, Some(s(20)), true), Stay);
+        // Nothing pending: close; blocking work would keep a windowless
+        // process alive, so the process exits.
+        assert_eq!(close_action(true, None, false), Close);
+        assert_eq!(close_action(true, None, true), Exit);
+        // A sign-out or sign-in save is waited for, at most 10 seconds.
+        assert_eq!(close_action(true, Some(s(0)), true), Wait);
+        assert_eq!(
+            close_action(true, Some(Duration::from_millis(9_900)), false),
+            Wait
+        );
+        assert_eq!(close_action(true, Some(s(10)), false), Close);
+        // Never an exit while it is still pending.
+        assert_eq!(close_action(true, Some(s(10)), true), Close);
+    }
+    #[test]
+    fn close_waits_for_signing_out_then_closes() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let id = iced::window::Id::unique();
+        a.sign_out_pending = true;
+        let _ = a.update(Message::Close(id));
+        assert!(a.closing.is_some());
+        assert_eq!(
+            a.status,
+            "Closing when signing out has finished (at most 10 seconds)…"
+        );
+        // A second request keeps the first one's time.
+        let first = a.closing.unwrap().1;
+        let _ = a.update(Message::Close(id));
+        assert_eq!(a.closing.unwrap().1, first);
+        let _ = a.update(Message::SignedOut(Ok(())));
+        assert!(a.closing.is_none());
+        // Bounded: after 10 seconds the window closes anyway.
+        a.sign_out_pending = true;
+        let _ = a.update(Message::Close(id));
+        a.closing = Some((id, Instant::now() - Duration::from_secs(11)));
+        let _ = a.update(Message::Tick);
+        assert!(a.closing.is_none());
+        // Nothing pending: no waiting.
+        a.sign_out_pending = false;
+        let _ = a.update(Message::Close(id));
+        assert!(a.closing.is_none());
+    }
+    #[test]
     fn failed_archive_and_pending_file_actions_do_not_reset_work() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);

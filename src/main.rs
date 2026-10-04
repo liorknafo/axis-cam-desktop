@@ -277,6 +277,9 @@ pub struct App {
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
     pub icons: Vec<iced::widget::svg::Handle>,
+    /// A close request waiting for a sign-out or a sign-in save, and when
+    /// it first came.
+    closing: Option<(iced::window::Id, Instant)>,
 }
 type PlanSender = iced::futures::channel::mpsc::Sender<Message>;
 /// The Plan task: runs the planner, sends each stage as it starts, builds the
@@ -490,6 +493,7 @@ impl App {
             undo: None,
             confirm_delete_setup: false,
             icons,
+            closing: None,
         }
     }
     fn boot() -> (Self, Task<Message>) {
@@ -653,6 +657,47 @@ impl App {
             for o in &mut s.operations {
                 o.preview = false
             }
+        }
+    }
+    /// Blocking work that keeps the process alive after its window closes:
+    /// iced's runtime waits for it on exit.
+    fn blocking_work(&self) -> bool {
+        self.plan_busy.running() > 0 || self.post_busy || self.stock_mesh_job.is_some()
+    }
+    /// Saves the workspace, then closes the window, waits for a pending
+    /// sign-out or sign-in save, or ends the process (see `close_action`).
+    fn request_close(&mut self, id: iced::window::Id) -> Task<Message> {
+        self.persist();
+        let signing = self.sign_out_pending || self.saving_sign_in();
+        let waited = signing.then(|| self.closing.get_or_insert((id, Instant::now())).1.elapsed());
+        match close_action(!self.dirty, waited, self.blocking_work()) {
+            CloseAction::Stay => {
+                self.closing = None;
+                self.status = "Could not save before closing. Save Project to another location, then close again.".into();
+                Task::none()
+            }
+            CloseAction::Wait => {
+                self.status = if self.sign_out_pending {
+                    "Closing when signing out has finished (at most 10 seconds)…"
+                } else {
+                    "Closing when the sign-in has been saved (at most 10 seconds)…"
+                }
+                .into();
+                Task::none()
+            }
+            CloseAction::Close => {
+                self.closing = None;
+                iced::window::close(id)
+            }
+            // The workspace and History are written synchronously, so
+            // nothing is lost.
+            CloseAction::Exit => std::process::exit(0),
+        }
+    }
+    fn close_if_waiting(&mut self) -> Task<Message> {
+        match self.closing {
+            Some((id, _)) => self.request_close(id),
+            None => Task::none(),
         }
     }
     fn persist(&mut self) {
@@ -1955,7 +2000,13 @@ impl App {
                 if self.dirty && now.duration_since(self.last_edit) > Duration::from_millis(700) {
                     self.persist()
                 }
-                return Task::batch([self.refresh_stock_surface(), self.refresh_post()]);
+                // A close waiting for the sign-in is checked again, so that
+                // it happens when the wait is over.
+                let close = match self.closing {
+                    Some((id, _)) => self.request_close(id),
+                    None => Task::none(),
+                };
+                return Task::batch([close, self.refresh_stock_surface(), self.refresh_post()]);
             }
             Message::Plan => {
                 if matches!(self.planner, Planner::Running(_)) {
@@ -2159,14 +2210,7 @@ impl App {
                 self.touch();
                 self.status = status;
             }
-            Message::Close(id) => {
-                self.persist();
-                if self.dirty {
-                    self.status="Could not save before closing. Save Project to another location, then close again.".into()
-                } else {
-                    return iced::window::close(id);
-                }
-            }
+            Message::Close(id) => return self.request_close(id),
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
             Message::PostChecked(epoch, job) => {
@@ -2316,6 +2360,7 @@ impl App {
             Message::SessionSaved(Ok(session)) => {
                 let settings_failure = self.settings_failure.take();
                 let task = self.adopt_session(session);
+                let task = Task::batch([task, self.close_if_waiting()]);
                 if let Some(e) = settings_failure {
                     let sentence =
                         format!("Signed in for this session, but settings could not be saved: {e}");
@@ -2331,6 +2376,7 @@ impl App {
                 self.settings_failure = None;
                 self.account = Account::SignedOut;
                 self.account_note = e;
+                return self.close_if_waiting();
             }
             // Results of an earlier client's requests change nothing.
             Message::ModelsLoaded(epoch, _) | Message::ConnectionChecked(epoch, _)
@@ -2430,10 +2476,12 @@ impl App {
             Message::SignedOut(Ok(())) => {
                 self.sign_out_pending = false;
                 self.account_note = "Signed out.".into();
+                return self.close_if_waiting();
             }
             Message::SignedOut(Err(e)) => {
                 self.sign_out_pending = false;
                 self.account_note = e;
+                return self.close_if_waiting();
             }
             Message::PlanNoticeDismissed => {
                 self.settings.plan_notice_shown = true;
@@ -2679,6 +2727,34 @@ fn merge_sample(user: &Document) -> (Document, String) {
         )
     };
     (doc, status)
+}
+/// How long a close request waits for a sign-out or a sign-in save.
+const CLOSE_WAIT: Duration = Duration::from_secs(10);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseAction {
+    /// Keep the window: the workspace could not be saved.
+    Stay,
+    /// Wait for the sign-out or sign-in save, then ask again.
+    Wait,
+    /// Close the window.
+    Close,
+    /// End the process: blocking work would keep it running without a window.
+    Exit,
+}
+/// What a close request does once the workspace save was tried. `saved`:
+/// the workspace is saved. `signing`: how long a pending sign-out or sign-in
+/// save has been waited for. `blocking`: a plan stage, the NC program
+/// refresh or the stock mesher is still running. A pending sign-out or save
+/// is never cut short by ending the process; after `CLOSE_WAIT` the window
+/// closes and the runtime lets it finish.
+pub(crate) fn close_action(saved: bool, signing: Option<Duration>, blocking: bool) -> CloseAction {
+    match signing {
+        _ if !saved => CloseAction::Stay,
+        Some(waited) if waited < CLOSE_WAIT => CloseAction::Wait,
+        Some(_) => CloseAction::Close,
+        None if blocking => CloseAction::Exit,
+        None => CloseAction::Close,
+    }
 }
 /// The tool editor's draft when the library is empty, with the next free
 /// tool number so that its first Save is accepted.
