@@ -454,7 +454,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(FixtureClearance),
         ),
         (Target::Material, "name") => (
-            "The material's name in the library and in the project material list. Each material needs its own name; capitals do not make a name different. When this is the project material, its name is sent to the AI planner.",
+            "The material's name in the library and in the project material list. Each material needs its own name of up to 60 characters; capitals do not make a name different. When this is the project material, its name is sent to the AI planner.",
             None,
         ),
         (Target::Material, "group") => (
@@ -1621,6 +1621,11 @@ mod tests {
                 "{key}: {body}"
             );
         }
+        assert!(
+            field_help("name", "x", Target::Material)
+                .body
+                .contains("up to 60 characters")
+        );
         assert!(
             command(&Message::DeleteMaterial("m".into()), "x".into())
                 .body
