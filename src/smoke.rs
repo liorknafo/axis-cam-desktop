@@ -850,6 +850,120 @@ mod tests {
         assert_eq!(a.doc.title, "Unsaved custom job");
         assert!(a.is_sample());
     }
+    fn tool_numbers(doc: &Document) -> Vec<(String, u32)> {
+        doc.tools
+            .iter()
+            .map(|t| (t.name().to_string(), t.number().unwrap_or(0)))
+            .collect()
+    }
+    #[test]
+    fn explore_example_merges_a_legacy_library_without_duplicates() {
+        // A workspace saved before tool numbers and post settings: the user's
+        // own tool, then the example's tools from an earlier Explore example,
+        // and the example's machines without the post keys.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let sample = Document::sample();
+        let mut legacy = Document::default();
+        legacy.tools.push(Tool::new("My spot drill", "Drill", "6"));
+        legacy.tools.extend(sample.tools.iter().cloned());
+        for t in &mut legacy.tools {
+            t.p.remove("number");
+        }
+        legacy.machines = sample.machines.clone();
+        for m in &mut legacy.machines {
+            for key in POST_KEYS {
+                m.p.remove(key);
+            }
+        }
+        crate::storage::save(&path, &legacy).unwrap();
+        let mut a = App::from_workspace(path, None);
+        assert_eq!(
+            a.doc.tools.iter().map(|t| t.number()).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(3), Some(4)]
+        );
+        let _ = a.update(Message::OpenSample);
+        assert!(a.is_sample(), "{}", a.status);
+        // The example's tools take the numbers the user's copies had, and
+        // the user's own tool is added once.
+        let mut numbers = tool_numbers(&a.doc);
+        numbers.sort_by_key(|t| t.1);
+        assert_eq!(
+            numbers,
+            [
+                ("My spot drill".to_string(), 1),
+                ("Flat end mill · Ø10".to_string(), 2),
+                ("Ball end mill · Ø6".to_string(), 3),
+                ("Twist drill · Ø8".to_string(), 4),
+            ]
+        );
+        assert!(
+            a.doc
+                .tools
+                .iter()
+                .all(|t| a.doc.tool_number_issues(t).is_empty())
+        );
+        assert_eq!(a.doc.machines.len(), 3);
+        assert!(a.doc.validate_structure().is_ok());
+        // The example's operations still reference its tools.
+        assert!(
+            a.doc.setups[0]
+                .operations
+                .iter()
+                .all(|o| a.doc.tools.iter().any(|t| t.id == o.tool))
+        );
+        assert!(a.status.contains("My spot drill"), "{}", a.status);
+        assert!(!a.status.contains("Flat end mill"), "{}", a.status);
+        // New project keeps the merged library as it is.
+        let _ = a.update(Message::NewProject);
+        assert_eq!(a.doc.tools.len(), 4);
+        assert_eq!(a.doc.machines.len(), 3);
+    }
+    #[test]
+    fn explore_example_gives_its_tools_numbers_the_user_library_does_not_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        for (n, name) in ["My flat 6", "My ball 4", "My drill 5"].iter().enumerate() {
+            let mut tool = Tool::new(name, "Flat end mill", "6");
+            tool.p.insert("number".into(), (n + 1).to_string());
+            a.doc.tools.push(tool);
+        }
+        let mut machine = Machine::new(3);
+        machine.p.insert("name".into(), "Shop router".into());
+        a.doc.machines.push(machine);
+        let _ = a.update(Message::OpenSample);
+        assert_eq!(
+            tool_numbers(&a.doc),
+            [
+                ("Flat end mill · Ø10".to_string(), 4),
+                ("Ball end mill · Ø6".to_string(), 5),
+                ("Twist drill · Ø8".to_string(), 6),
+                ("My flat 6".to_string(), 1),
+                ("My ball 4".to_string(), 2),
+                ("My drill 5".to_string(), 3),
+            ]
+        );
+        assert!(
+            a.doc
+                .tools
+                .iter()
+                .all(|t| a.doc.tool_number_issues(t).is_empty())
+        );
+        assert_eq!(a.doc.machines.len(), 4);
+        for name in ["My flat 6", "My ball 4", "My drill 5", "Shop router"] {
+            assert!(a.status.contains(name), "{}", a.status);
+        }
+        // Opening it again adds nothing more.
+        let _ = a.update(Message::OpenSample);
+        assert_eq!(a.doc.tools.len(), 6);
+        assert_eq!(a.doc.machines.len(), 4);
+        assert!(
+            a.doc
+                .tools
+                .iter()
+                .all(|t| a.doc.tool_number_issues(t).is_empty())
+        );
+    }
     #[test]
     fn failed_archive_and_pending_file_actions_do_not_reset_work() {
         let dir = tempfile::tempdir().unwrap();

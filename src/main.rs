@@ -1056,21 +1056,10 @@ impl App {
                 if !self.archive_current() {
                     return Task::none();
                 }
-                let mut doc = Document::sample();
-                for m in &self.doc.machines {
-                    if !doc.machines.iter().any(|x| x.p == m.p) {
-                        doc.machines.push(m.clone());
-                    }
-                }
-                for t in &self.doc.tools {
-                    if !doc.tools.iter().any(|x| x.p == t.p) {
-                        doc.tools.push(t.clone());
-                    }
-                }
+                let (doc, status) = merge_sample(&self.doc);
                 self.replace_document(doc, None);
                 self.selected = Some(0);
-                self.status =
-                    "Example project opened. Use New project to return to a blank job.".into();
+                self.status = status;
             }
             Message::RecoverPrevious => {
                 if let Some(path) = self.last_archived.clone() {
@@ -2598,6 +2587,82 @@ fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<Str
         "Wrote {count} LinuxCNC program(s) to {}",
         path.display()
     ))
+}
+/// The example project with the user's tool and machine libraries merged
+/// in, and the status line naming the user's entries it adds. A user entry
+/// the example already has, ignoring tool numbers and post settings saved
+/// before they existed, is not added twice: the example's tool takes the
+/// user's number. Every other example tool whose number is then in use gets
+/// the smallest free one; the example's operations refer to it by ID.
+fn merge_sample(user: &Document) -> (Document, String) {
+    let mut doc = Document::sample();
+    let (mut tools, mut machines) = (vec![], vec![]);
+    for m in &user.machines {
+        let mut filled = m.clone();
+        filled.fill_post_defaults();
+        if !doc.machines.iter().any(|x| x.p == filled.p) {
+            doc.machines.push(m.clone());
+            machines.push(m.name().to_string());
+        }
+    }
+    let unnumbered = |t: &Tool| {
+        let mut p = t.p.clone();
+        p.remove("number");
+        p
+    };
+    let examples = doc.tools.len();
+    let mut taken = vec![false; examples];
+    let mut renumber = vec![true; examples];
+    for t in &user.tools {
+        let same = (0..examples).find(|&i| !taken[i] && unnumbered(&doc.tools[i]) == unnumbered(t));
+        if let Some(i) = same {
+            taken[i] = true;
+            if let Some(n) = t.number() {
+                doc.tools[i].p.insert("number".into(), n.to_string());
+                renumber[i] = false;
+            }
+        } else {
+            doc.tools.push(t.clone());
+            tools.push(t.name().to_string());
+        }
+    }
+    for i in (0..examples).filter(|&i| renumber[i]) {
+        let number = doc.tools[i].number();
+        let used = doc
+            .tools
+            .iter()
+            .enumerate()
+            .any(|(j, t)| j != i && t.number() == number);
+        if used {
+            let free = doc.next_tool_number();
+            doc.tools[i].p.insert("number".into(), free.to_string());
+        }
+    }
+    let list = |names: &[String], one: &str, many: &str| {
+        (!names.is_empty()).then(|| {
+            format!(
+                "{} {}",
+                if names.len() == 1 { one } else { many },
+                names.join(", ")
+            )
+        })
+    };
+    let added: Vec<String> = [
+        list(&tools, "tool", "tools"),
+        list(&machines, "machine", "machines"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let status = if added.is_empty() {
+        "Example project opened. Use New project to return to a blank job.".to_string()
+    } else {
+        format!(
+            "Example project opened. Added from your library: {}. Use New project to return to a blank job.",
+            added.join("; ")
+        )
+    };
+    (doc, status)
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
