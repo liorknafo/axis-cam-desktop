@@ -2904,31 +2904,44 @@ mod tests {
     }
     #[test]
     fn the_preview_and_the_program_page_say_what_their_checks_leave_out() {
-        use crate::ui::{PLAN_CHECKS, PLAN_NOT_CHECKED, PROGRAM_NOTE};
-        // The second check line names the machine limits that speeds and
-        // feeds are held to; the note under the lines says what is not checked.
+        use crate::ui::{plan_check_lines, plan_not_checked, plan_work_zero_line, program_note};
+        // The preview's check lines; the second names the machine limits
+        // that speeds and feeds are held to.
         assert_eq!(
-            PLAN_CHECKS[1],
-            "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance"
+            plan_check_lines(),
+            [
+                "Every operation generates with the stock left by the ones before it",
+                "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance",
+                "No tool centre line cuts into the part, and nothing goes below the stock",
+                "No gouging detected on the stock grid (coarse check)",
+            ]
         );
+        // The note under the lines says what is not checked.
         assert_eq!(
-            PLAN_NOT_CHECKED,
+            plan_not_checked(),
             "Not checked: whether speeds and feeds suit the material and tool (only the machine's limits are), cutting loads, fixtures, clamps and the machine body."
         );
         // The program page says what export repeats, and that the planner's
         // own checks covered the plan as applied, not later edits.
-        assert!(!PROGRAM_NOTE.contains("every check"), "{PROGRAM_NOTE}");
-        for part in [
-            "the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program",
-            "The planner's tool-axis and gouge checks covered the plan as applied, not later edits.",
-            "Fixtures, clamps and the machine body are not checked",
-        ] {
-            assert!(PROGRAM_NOTE.contains(part), "{part}");
-        }
-        // Both pages build with these lines.
+        assert_eq!(
+            program_note(),
+            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
+        );
+        // The good plan's work-zero lines, with the values its check found:
+        // setup 2's Model origin is located on the part and the stock top.
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
-        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        let preview = checked_preview(&a, false);
+        assert_eq!(
+            plan_work_zero_line(&preview.outcome, 0),
+            "Rotation [0, 0, 0]° · work zero: Stock top center"
+        );
+        assert_eq!(
+            plan_work_zero_line(&preview.outcome, 1),
+            "Rotation [180, 0, 0]° · work zero: Model origin — X0 Y0 at X+60 Y+40 mm from the part's −X −Y corner (part 120 × 80 mm), Z0 3 mm below the stock top"
+        );
+        // Both pages build with these lines.
+        a.planner = crate::Planner::Preview(preview);
         a.page = Page::Ai;
         let _ = a.view();
         a.page = Page::Post;
