@@ -364,24 +364,33 @@ pub fn coverage(
         note: "Approximate: measured on the coarse stock grid. Stock thinner than about 1.5 grid cells is not seen.",
     }
 }
-/// One problem per speed or feed of an operation that lies outside the
-/// project material's cutting data, naming its setup and operation. Each
-/// message is one line of at most 300 characters: it names the material.
+/// One problem per operation whose speed or feed lies outside the project
+/// material's cutting data, per value, or that cannot be checked (no
+/// material, no cutting data, a tool or operation without the numbers),
+/// naming its setup and operation. Each message is one line of at most 300
+/// characters: it names the material.
 fn cutting_data_problems(built: &Document) -> Vec<Problem> {
     let mut problems = vec![];
     for (si, setup) in built.setups.iter().enumerate() {
         for (oi, op) in setup.operations.iter().enumerate() {
-            if let Some(SpeedFeed::Out(messages)) = built.speed_feed(setup, op) {
-                problems.extend(messages.into_iter().map(|message| Problem {
-                    setup: si + 1,
-                    operation: Some(oi + 1),
-                    stage: "cutting data",
-                    message: proposal::clip(&message, 300),
-                }));
-            }
+            let messages = match built.speed_feed(setup, op) {
+                Some(SpeedFeed::InRange { .. }) => vec![],
+                Some(SpeedFeed::Out(messages)) => messages,
+                Some(SpeedFeed::Unchecked(why)) => vec![unchecked(&why)],
+                None => vec![unchecked("Choose a material with cutting data.")],
+            };
+            problems.extend(messages.into_iter().map(|message| Problem {
+                setup: si + 1,
+                operation: Some(oi + 1),
+                stage: "cutting data",
+                message: proposal::clip(&message, 300),
+            }));
         }
     }
     problems
+}
+fn unchecked(why: &str) -> String {
+    format!("Speeds and feeds could not be checked: {why}")
 }
 /// Runs every stage on a proposal. Returns the report and, when the plan
 /// passes, the job it describes.
@@ -719,12 +728,70 @@ mod tests {
                 "cutting data 1/Some(4): Chip load 0.008 mm per tooth is below Aluminium 6061-T6's 0.020–0.050 mm for a Ø4 mm tool."
             ]
         );
-        // Without a material in the job nothing can be checked, and nothing
-        // is refused here (planning itself requires one).
+    }
+    #[test]
+    fn a_plan_whose_speeds_and_feeds_cannot_be_checked_is_refused() {
+        let (doc, mesh, report) = block();
+        // Without a material in the job nothing can be checked.
         let mut none = doc.clone();
         none.material_id.clear();
-        let (check, _) = super::check(&none, &mesh, &report, &slow);
-        assert!(check.passed, "{:?}", stages(&check));
+        let (check, job) = check(&none, &mesh, &report, &good(&report));
+        assert!(!check.passed && job.is_none());
+        let refusals: Vec<String> = [(1, 1), (1, 2), (1, 3), (1, 4), (2, 1), (2, 2)]
+            .into_iter()
+            .map(|(s, o)| {
+                format!(
+                    "cutting data {s}/Some({o}): Speeds and feeds could not be checked: Choose a material with cutting data."
+                )
+            })
+            .collect();
+        assert_eq!(stages(&check), refusals);
+        // The other stages still run beside it.
+        assert_eq!(check.operations.len(), 6);
+        // A material without cutting data says so, once for each operation.
+        let mut bare = doc.clone();
+        let id = bare.material_id.clone();
+        let material = bare.materials.iter_mut().find(|m| m.id == id).unwrap();
+        material.p.remove("vc_min");
+        let (check, _) = super::check(&bare, &mesh, &report, &good(&report));
+        let found = stages(&check);
+        assert_eq!(found.len(), 6, "{found:?}");
+        assert_eq!(
+            found[0],
+            "cutting data 1/Some(1): Speeds and feeds could not be checked: Aluminium 6061-T6 has no cutting data."
+        );
+        // A tool with no flutes cannot be checked either.
+        let mut flat = doc.clone();
+        for tool in &mut flat.tools {
+            tool.p.insert("flutes".into(), "0".into());
+        }
+        let (check, _) = super::check(&flat, &mesh, &report, &good(&report));
+        let found: Vec<_> = stages(&check)
+            .into_iter()
+            .filter(|m| m.starts_with("cutting data "))
+            .collect();
+        assert_eq!(found.len(), 6, "{found:?}");
+        assert_eq!(
+            found[5],
+            "cutting data 2/Some(2): Speeds and feeds could not be checked: The tool or the operation has no positive speed data."
+        );
+        // A long name stays one clipped line.
+        let mut odd = doc.clone();
+        let id = odd.material_id.clone();
+        let material = odd.materials.iter_mut().find(|m| m.id == id).unwrap();
+        material.p.remove("vc_min");
+        material
+            .p
+            .insert("name".into(), format!("Odd\n{}", "x".repeat(500)));
+        let (check, _) = super::check(&odd, &mesh, &report, &good(&report));
+        for problem in check.problems.iter().filter(|p| p.stage == "cutting data") {
+            assert!(
+                problem.message.chars().count() <= 300 && !problem.message.contains('\n'),
+                "{}",
+                problem.message
+            );
+            assert!(problem.message.ends_with(" has no cutting data."));
+        }
     }
     #[test]
     fn a_cutting_data_message_is_one_clipped_line_whatever_the_materials_name() {
