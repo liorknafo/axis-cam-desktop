@@ -1533,6 +1533,34 @@ M2
         assert!(job.ready(), "{:?}", errors(&job));
     }
     #[test]
+    fn each_coolant_choice_writes_its_output_and_m9_at_the_end() {
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0].operations.truncate(1);
+        let mut codes = |coolant: &str, air: &str| -> Vec<String> {
+            doc.setups[0].operations[0]
+                .p
+                .insert("coolant".into(), coolant.into());
+            doc.setups[0]
+                .machine
+                .p
+                .insert("post_air".into(), air.into());
+            let job = post_job(&doc, &mesh);
+            assert!(job.ready(), "{coolant} {air}: {:?}", errors(&job));
+            let text = &job.setups[0].result.as_ref().unwrap()[0].text;
+            text.lines()
+                .filter(|l| ["M7", "M8", "M9"].contains(l))
+                .map(String::from)
+                .collect()
+        };
+        // Flood is M8, Mist M7, Air the machine's Air output, Off nothing;
+        // what was switched on is switched off with M9 at the end.
+        assert_eq!(codes("Flood", "M7"), ["M8", "M9"]);
+        assert_eq!(codes("Mist", "M8"), ["M7", "M9"]);
+        assert_eq!(codes("Air", "M7"), ["M7", "M9"]);
+        assert_eq!(codes("Air", "M8"), ["M8", "M9"]);
+        assert_eq!(codes("Off", "M7"), Vec::<String>::new());
+    }
+    #[test]
     fn a_stock_datum_is_refused_when_an_earlier_setup_cut_the_side_it_needs() {
         // Setup 1 cuts only an outside Contour on stock with a margin on one
         // side alone: the Contour removes that side face and leaves the top

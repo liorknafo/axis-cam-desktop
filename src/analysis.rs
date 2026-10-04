@@ -1133,6 +1133,49 @@ pub(crate) mod tests {
             assert!(seen.insert(*id));
         }
     }
+    /// A 40 × 20 × 10 mm block, its sides cut into 1 mm strips along X so
+    /// that its top face is 80 triangles, under a separate 40 × 20 × 5 mm
+    /// slab 10 mm above it whose −X end overhangs the block's top from X 0
+    /// to `cover`.
+    fn overhung(cover: f32) -> Mesh {
+        let (y, z) = (20f32, 10f32);
+        let mut t = vec![];
+        for i in 0..40 {
+            let (a, b) = (i as f32, i as f32 + 1.);
+            quad(&mut t, [[a, 0., z], [b, 0., z], [b, y, z], [a, y, z]]);
+            quad(&mut t, [[a, 0., 0.], [a, y, 0.], [b, y, 0.], [b, 0., 0.]]);
+            quad(&mut t, [[a, 0., 0.], [b, 0., 0.], [b, 0., z], [a, 0., z]]);
+            quad(&mut t, [[b, y, 0.], [a, y, 0.], [a, y, z], [b, y, z]]);
+        }
+        quad(&mut t, [[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
+        quad(
+            &mut t,
+            [[40., 0., 0.], [40., y, 0.], [40., y, z], [40., 0., z]],
+        );
+        t.extend(cuboid([cover - 40., 0., 20.], [cover, y, 25.]));
+        crate::mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn a_face_is_listed_only_when_at_least_half_of_it_is_visible_from_above() {
+        let (doc, _) = block();
+        // The block's top is 15 mm below the slab's top. With 6 of its 40 mm
+        // under the slab (85% visible) and with 16 (60%), the whole face is
+        // listed; with 24 (40%) and 34 (15%) it is not.
+        for (cover, listed) in [(6., true), (16., true), (24., false), (34., false)] {
+            let report = report(&doc, &overhung(cover)).unwrap();
+            let top = &report.orientations[0];
+            assert_eq!(top.up, "+Z");
+            assert_eq!(plane(top, 0.).kind, "top");
+            let step = top
+                .planes
+                .iter()
+                .find(|p| (p.depth_below_top - 15.).abs() < 0.01);
+            assert_eq!(step.is_some(), listed, "cover {cover}: {:?}", top.planes);
+            if let Some(step) = step {
+                assert!((step.area - 800.).abs() < 0.5, "{}", step.area);
+            }
+        }
+    }
     #[test]
     fn setup_one_must_be_square_and_keeps_its_own_rotation() {
         let (mut doc, mesh) = block();
@@ -2045,6 +2088,22 @@ pub(crate) mod tests {
         let flipped = crate::mesh::normalize(t).unwrap();
         assert_eq!(edges(&flipped), 0);
         assert_eq!(report(&doc, &flipped).unwrap_err(), NOT_SOLID);
+        // Two closed 0.1 mm cubes at opposite corners of a 100 mm square:
+        // no test ray hits either, and that counts as inconsistent.
+        let apart = crate::mesh::normalize(
+            [
+                cuboid([0.; 3], [0.1; 3]),
+                cuboid([99.9, 99.9, 0.], [100., 100., 0.1]),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(edges(&apart), 0);
+        assert_eq!(
+            inconsistent_share(&Geometry::new(&doc.setups[0], &apart)),
+            1.
+        );
+        assert_eq!(report(&doc, &apart).unwrap_err(), NOT_SOLID);
     }
     #[test]
     fn sound_parts_written_as_text_with_7_significant_digits_are_closed() {
