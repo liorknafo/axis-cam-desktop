@@ -112,20 +112,42 @@ pub fn coord(v: f32) -> String {
     if s == "-0.000" { "0.000".into() } else { s }
 }
 /// Comment text limited to printable ASCII on one line, without parentheses.
+///
+/// LinuxCNC runs a comment that begins with MSG, LOGOPEN, PROBEOPEN and the
+/// like as a command, so every comment that carries text from the user or
+/// the model begins with a fixed word of the app's and a colon.
 pub fn comment(s: &str) -> String {
     clean(s).chars().take(200).collect()
 }
-/// A long comment as lines of at most 200 characters, broken between words.
-fn comment_lines(s: &str) -> Vec<String> {
-    let mut lines: Vec<String> = vec![];
-    for word in clean(s).split(' ') {
-        let word: String = word.chars().take(200).collect();
-        match lines.last_mut() {
-            Some(line) if line.len() + 1 + word.len() <= 200 => {
-                line.push(' ');
-                line.push_str(&word);
+/// `text` as comment lines of at most 200 characters, broken between words
+/// (a word too long for a line is split, never cut off). The first line
+/// begins with `lead` and every later one with `continued`, so that no line
+/// begins with the text itself.
+fn comment_lines(lead: &str, continued: &str, text: &str) -> Vec<String> {
+    let mut lines = vec![lead.to_string()];
+    // The last line holds only its lead word.
+    let mut bare = true;
+    for word in clean(text).split(' ').filter(|w| !w.is_empty()) {
+        let mut word = word;
+        loop {
+            let line = lines.last_mut().unwrap();
+            let room = 200usize.saturating_sub(line.len() + usize::from(!bare));
+            if word.len() <= room {
+                if !bare {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                bare = false;
+                break;
             }
-            _ => lines.push(word),
+            if bare {
+                // `clean` leaves ASCII only, so any byte is a character boundary.
+                let (head, rest) = word.split_at(room);
+                line.push_str(head);
+                word = rest;
+            }
+            lines.push(continued.to_string());
+            bare = true;
         }
     }
     lines
@@ -421,7 +443,11 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     ));
     w.note(&format!("Fixture: {}", get(&setup.p, "fixture")));
     if !clean(get(&setup.p, "notes")).is_empty() {
-        for line in comment_lines(&format!("Workholding: {}", get(&setup.p, "notes"))) {
+        for line in comment_lines(
+            "Workholding: ",
+            "Workholding, continued: ",
+            get(&setup.p, "notes"),
+        ) {
             w.line(format!("({line})"));
         }
     }
@@ -471,7 +497,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         let (t, name) = (ops[0].tool, &ops[0].tool_name);
         if h.part.is_none_or(|(i, _)| i == 1) {
             w.note(&format!(
-                "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
+                "Before starting: load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
                 if model && top.is_some() {
                     "on a part wall or the stock top and enter its coordinate from the lines above."
                 } else if model {
@@ -483,7 +509,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             w.note("Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.");
         } else {
             w.note(&format!(
-                "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
+                "Before starting: load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
             ));
             w.note("Do not touch off on the stock: earlier programs have cut it.");
         }
@@ -1313,7 +1339,7 @@ M2
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
         assert!(text.contains("(Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.)\n(Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.)\nG17 G21"), "{text}");
-        assert!(text.contains("(Load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero.)"), "{text}");
+        assert!(text.contains("(Before starting: load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero.)"), "{text}");
         assert!(
             text.contains("(Operation 1/1: Face top - T1)\nG0 Z15.000\nS8000 M3\n"),
             "{text}"
@@ -1775,7 +1801,7 @@ M2
         assert!(
             programs[1]
                 .text
-                .contains("(Load T3 Drill 4, then use AXIS Touch Off")
+                .contains("(Before starting: load T3 Drill 4, then use AXIS Touch Off")
         );
         assert!(programs[1].text.contains("Do not touch off on the stock"));
         assert!(
@@ -2078,6 +2104,30 @@ M2
                 .all(|l| l[1..l.len() - 1].chars().all(|c| c != '(' && c != ')'))
         );
         assert!(lines[0].starts_with("(Workholding: Clamp soft jaws on the walls; keep Clamp"));
+        // Every later line names what it continues, so that none begins with
+        // the note's own text.
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|l| l.starts_with("(Workholding, continued: ")),
+            "{lines:?}"
+        );
+        // A word longer than a line is split over lines, not cut off.
+        let long = "x".repeat(450);
+        job.setups[1]
+            .p
+            .insert("notes".into(), format!("Use {long} here."));
+        let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
+        let joined: String = text
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("(Workholding: ")
+                    .or_else(|| l.strip_prefix("(Workholding, continued: "))
+            })
+            .map(|l| l.strip_suffix(')').unwrap().replace(' ', ""))
+            .collect();
+        assert_eq!(joined, format!("Use{long}here."));
+        assert!(text.lines().all(|l| l.len() <= 202), "{text}");
     }
     #[test]
     fn a_model_origin_header_locates_the_zero_from_the_part_and_the_stock_top() {
@@ -2115,10 +2165,198 @@ M2
             .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
         let text = &setup_texts(&post_job(&touch, &mesh), 1)[0];
         assert!(
-            text.contains("(Load T1 Flat 10, then use AXIS Touch Off, not Tool Touch Off, on a part wall or the stock top and enter its coordinate from the lines above.)"),
+            text.contains("(Before starting: load T1 Flat 10, then use AXIS Touch Off, not Tool Touch Off, on a part wall or the stock top and enter its coordinate from the lines above.)"),
             "{text}"
         );
         assert!(!text.contains("set X0 Y0 Z0 at the work zero"), "{text}");
+    }
+    /// How every comment the post writes begins; `#` stands for a number the
+    /// app writes. A comment that carries text from the user or the model
+    /// begins with a fixed word and a colon; the others are fixed sentences.
+    const COMMENT_STARTS: [&str; 23] = [
+        "AXIS CAM Studio - LinuxCNC 3-axis program",
+        "Job: ",
+        "Program # of # for this setup, one per tool",
+        "Machine: ",
+        "Work zero: ",
+        "Part in work coordinates: ",
+        "Touch off on a part wall or the stock top and enter its coordinate.",
+        STOCK_TOP_CUT,
+        "Stock: ",
+        "Fixture: ",
+        "Workholding: ",
+        "Workholding, continued: ",
+        "T#: ",
+        "Operation #: ",
+        "Operation #/#: ",
+        "Suppressed: ",
+        "Extents: ",
+        "Not checked: ",
+        "Start with the spindle raised clear of the part and fixtures: ",
+        "Before starting: ",
+        "Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.",
+        "Do not touch off on the stock: earlier programs have cut it.",
+        "Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.",
+    ];
+    fn starts_with_template(text: &str, template: &str) -> bool {
+        let mut rest = text;
+        for c in template.chars() {
+            if c == '#' {
+                let digits =
+                    rest.len() - rest.trim_start_matches(|d: char| d.is_ascii_digit()).len();
+                if digits == 0 {
+                    return false;
+                }
+                rest = &rest[digits..];
+            } else if let Some(r) = rest.strip_prefix(c) {
+                rest = r;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+    /// Every comment is a whole line, and its text, after leading spaces
+    /// (which LinuxCNC skips), begins with one of `COMMENT_STARTS`. Returns
+    /// how many comments use each start.
+    fn assert_comments_begin_with_app_words(text: &str) -> [usize; 23] {
+        let mut used = [0; 23];
+        for line in text.lines().filter(|l| l.contains(['(', ')'])) {
+            let inner = line
+                .strip_prefix('(')
+                .and_then(|l| l.strip_suffix(')'))
+                .filter(|l| !l.contains(['(', ')']))
+                .unwrap_or_else(|| panic!("not one whole comment: {line}"));
+            let inner = inner.trim_start();
+            let start = COMMENT_STARTS
+                .iter()
+                .position(|t| starts_with_template(inner, t))
+                .unwrap_or_else(|| panic!("a comment begins with other text: {line}"));
+            used[start] += 1;
+        }
+        used
+    }
+    /// `n` characters of words, then `inserted` and more words.
+    fn text_with(n: usize, inserted: &str) -> String {
+        let pad: String = "ab cde f ".chars().cycle().take(n).collect();
+        format!("{pad}{inserted} tail words")
+    }
+    const ACTIVE: [&str; 3] = ["LOGOPEN,/tmp/x.log", "MSG,hello", "PROBEOPEN,/tmp/p.txt"];
+    #[test]
+    fn no_comment_begins_with_text_from_the_user_or_the_model() {
+        // The golden plan, emitted with user text that holds LinuxCNC's
+        // active-comment words at every offset from 0 to 400 characters (the
+        // Workholding lines break near 187 and 363), and at offsets around
+        // those breaks in every other header the post writes: touch-off
+        // program 1 and a later one, clearance retracts, with and without
+        // Model origin, with and without the stock top.
+        let plan = golden_plan();
+        let mut used = [0; 23];
+        let every: Vec<usize> = (0..=400).collect();
+        let around: Vec<usize> = [
+            0, 1, 2, 185, 186, 187, 188, 189, 200, 361, 362, 363, 364, 365,
+        ]
+        .into();
+        for (key, value) in [
+            ("post_tool_length", POST_TOOL_LENGTH[0]),
+            ("post_tool_length", POST_TOOL_LENGTH[1]),
+            ("post_retract", POST_RETRACT[1]),
+        ] {
+            let mut machine = Machine::new(3);
+            machine.p.insert(key.into(), value.into());
+            let settings = PostSettings::from_machine(&machine).unwrap();
+            for word in ACTIVE {
+                for &n in if value == POST_TOOL_LENGTH[0] {
+                    &every
+                } else {
+                    &around
+                } {
+                    let user = text_with(n, word);
+                    let mut setup = Setup::new(machine.clone(), "G54");
+                    for field in ["name", "notes", "fixture", "rx"] {
+                        setup.p.insert(field.into(), user.clone());
+                    }
+                    setup.machine.p.insert("name".into(), user.clone());
+                    let ops = vec![OpState {
+                        name: user.clone(),
+                        tool_name: user.clone(),
+                        ..fixture::facing_op()
+                    }];
+                    let blocks = blocks(&ops, &[&plan], &settings);
+                    let headers = [
+                        (None, "Stock top center", Some(3.)),
+                        (Some((1, 2)), "Model origin", Some(3.)),
+                        (Some((2, 2)), "Model origin", None),
+                        (None, "Model origin", None),
+                    ];
+                    let sweep = value == POST_TOOL_LENGTH[0] && !around.contains(&n);
+                    for &(part, origin, top) in &headers[..if sweep { 1 } else { 4 }] {
+                        setup.p.insert("origin".into(), origin.into());
+                        let header = Header {
+                            job: &user,
+                            setup: &setup,
+                            number: 1,
+                            part,
+                            stock: plan.stock,
+                            located: Some((plan.stock, top)),
+                            datum: [0., 0., 10.],
+                            disabled: vec![user.clone()],
+                        };
+                        let text = emit(&header, &ops, &blocks, &settings);
+                        let counts = assert_comments_begin_with_app_words(&text);
+                        (0..23).for_each(|k| used[k] += counts[k]);
+                        assert_eq!(
+                            crate::ngc::verify(
+                                &text,
+                                &blocks,
+                                &ops,
+                                [0., 0., 10.],
+                                &settings,
+                                "G54"
+                            ),
+                            Ok(()),
+                            "{text}"
+                        );
+                    }
+                }
+            }
+        }
+        // Each kind of comment was written and checked.
+        for (k, start) in COMMENT_STARTS.iter().enumerate() {
+            assert!(used[k] > 0, "never written: {start}");
+        }
+        // A whole job: the good plan with the three words in the title, setup
+        // 2's name, notes and fixture, an operation's name, a tool's name and
+        // the machine's name, posted and verified in both tool modes. The
+        // text changes no move, so each mode is simulated once.
+        let (mut job, mesh) = good_plan_job();
+        for mode in POST_TOOL_LENGTH {
+            job.setups[1]
+                .machine
+                .p
+                .insert("post_tool_length".into(), mode.into());
+            let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> =
+                vec![vec![]; job.setups.len()];
+            crate::simulation::sequence(&job, &mesh, None, |s, o, r| results[s].push((o, r)));
+            for n in [0, 160] {
+                let user = text_with(n, &ACTIVE.join(" "));
+                let mut named = job.clone();
+                named.title = user.clone();
+                named.tools[0].p.insert("name".into(), user.clone());
+                let setup = &mut named.setups[1];
+                for field in ["name", "notes", "fixture"] {
+                    setup.p.insert(field.into(), user.clone());
+                }
+                setup.operations[0].p.insert("name".into(), user.clone());
+                setup.machine.p.insert("name".into(), user.clone());
+                let posted = post_simulated(&named, &mesh, &results);
+                assert!(posted.ready(), "{:?}", errors(&posted));
+                for text in setup_texts(&posted, 1) {
+                    assert!(ACTIVE.iter().all(|w| text.contains(w)), "{text}");
+                    assert_comments_begin_with_app_words(&text);
+                }
+            }
+        }
     }
     #[test]
     fn a_model_origin_header_gives_no_stock_top_an_earlier_setup_has_cut() {
