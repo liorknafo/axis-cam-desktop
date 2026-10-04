@@ -2619,6 +2619,23 @@ M2
             "{text}"
         );
         assert!(!text.contains("Stock top"), "{text}");
+        // Setup 1 faced only inside the part's top face and left a rim of
+        // stock at full height: the top is cut only in part, which only the
+        // removal test sees.
+        let (doc, mesh) = inside_face_job("Model origin");
+        let results = simulated(&doc, &mesh);
+        let first = results[1][0].1.as_ref().unwrap();
+        let (volume, frame) = (first.initial_volume.as_ref().unwrap(), first.frame.unwrap());
+        let whole = stock_faces_cut(
+            first.plan.stock,
+            &crate::rest::cut_boxes(volume, frame),
+            false,
+        );
+        assert!(!whole.contains(&"top face"), "{whole:?}");
+        let text = &setup_texts(&post_simulated(&doc, &mesh, &results), 1)[0];
+        assert!(text.contains(&format!("mm.)\n{CUT}")), "{text}");
+        assert!(!text.contains("Stock top"), "{text}");
+        assert!(stock_top_cut(first.plan.stock, volume, frame));
         // The good plan's flipped setup: setup 1 left the stock's underside,
         // now its top, in place.
         let (job, mesh) = good_plan_job();
