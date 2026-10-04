@@ -3135,34 +3135,170 @@ mod tests {
         let _ = a.view();
     }
     #[test]
-    fn a_new_request_starts_its_row_at_zero_characters() {
-        use crate::planner::{Event::*, Progress::*};
+    fn a_step_that_ended_without_a_result_is_not_ticked_and_says_why() {
+        use crate::planner::{Progress::*, StepResult};
+        use crate::ui::Mark::*;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.plan_model = "gpt-6.1-sol".into();
+        let now = std::time::Instant::now();
+        let problems = StepResult::Problems {
+            shown: vec!["Setup 1, operation 2: Pocket too deep.".into()],
+            more: 0,
+        };
+        let rows = |a: &App, finished| crate::ui::timeline_rows(a, now, finished);
+        let texts =
+            |a: &App| -> Vec<String> { rows(a, true).into_iter().map(|r| r.text).collect() };
+        let marks =
+            |a: &App, finished| -> Vec<_> { rows(a, finished).iter().map(|r| r.mark).collect() };
+        // A request that errored after a check found problems: its row is last.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 50, Some(49), None),
+                (Asking(1), 49, Some(30), None),
+                (Checking(1), 30, Some(20), Some(problems.clone())),
+                (Repairing(2), 20, Some(18), None),
+            ],
+        );
+        assert_eq!(
+            texts(&a),
+            [
+                "Analyzed the part · 1 s",
+                "Asked gpt-6.1-sol for a plan (1 of 4) · 19 s",
+                "Checked the plan (1 of 4) · 10 s · 1 problem",
+                "Asked gpt-6.1-sol for a correction (2 of 4) · 2 s · no reply",
+            ]
+        );
+        assert_eq!(marks(&a, true), [Done, Done, Warn, Warn]);
+        // A request whose reply was read, and then checked, is ticked.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 50, Some(49), None),
+                (Asking(1), 49, Some(30), None),
+                (Checking(1), 30, Some(20), Some(StepResult::Passed)),
+                (Extending(2), 20, Some(18), None),
+                (Checking(2), 18, Some(10), None),
+            ],
+        );
+        // A check that failed to run: its row is last.
+        assert_eq!(
+            texts(&a),
+            [
+                "Analyzed the part · 1 s",
+                "Asked gpt-6.1-sol for a plan (1 of 4) · 19 s",
+                "Checked the plan (1 of 4) · 10 s · passed",
+                "Asked gpt-6.1-sol about faces still covered (2 of 4) · 2 s",
+                "Checked the plan (2 of 4) · 8 s · did not finish",
+            ]
+        );
+        assert_eq!(marks(&a, true), [Done, Done, Done, Done, Warn]);
+        // The first check that failed to run, and an analysis that did.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 50, Some(49), None),
+                (Asking(1), 49, Some(30), None),
+                (Checking(1), 30, Some(20), None),
+            ],
+        );
+        assert!(texts(&a)[2].ends_with(" · did not finish"));
+        a.plan_timeline = steps_ago(now, vec![(Analyzing, 50, Some(49), None)]);
+        assert_eq!(texts(&a), ["Analyzed the part · 1 s · did not finish"]);
+        assert_eq!(marks(&a, true), [Warn]);
+        // While the run goes on (the 3D view is being built): the same marks,
+        // the reason under the row, and the problems of the others as before.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 60, Some(59), None),
+                (Asking(1), 59, Some(40), None),
+                (Checking(1), 40, Some(35), Some(problems)),
+                (Repairing(2), 35, Some(30), None),
+                (Checking(2), 30, Some(20), Some(StepResult::Passed)),
+                (Extending(3), 20, Some(18), None),
+                (Previewing, 18, None, None),
+            ],
+        );
+        assert_eq!(marks(&a, false), [Done, Done, Warn, Done, Done, Warn, Open]);
+        let running = rows(&a, false);
+        assert_eq!(running[5].notes, ["no reply"]);
+        assert_eq!(
+            running[2].notes,
+            ["• Setup 1, operation 2: Pocket too deep."]
+        );
+        assert!(running[3].notes.is_empty() && running[6].notes.is_empty());
+        assert_eq!(
+            running[5].text,
+            "Asked gpt-6.1-sol about faces still covered (3 of 4) · 2 s"
+        );
+        // The same run, its follow-up's check failing to run.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 60, Some(59), None),
+                (Asking(1), 59, Some(40), None),
+                (Checking(1), 40, Some(35), Some(StepResult::Passed)),
+                (Extending(2), 35, Some(30), None),
+                (Checking(2), 30, Some(20), None),
+                (Previewing, 20, None, None),
+            ],
+        );
+        assert_eq!(marks(&a, false), [Done, Done, Done, Done, Warn, Open]);
+        assert_eq!(rows(&a, false)[4].notes, ["did not finish"]);
+        // Both finished views build.
+        a.page = Page::Ai;
+        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        let _ = a.view();
+    }
+    #[tokio::test]
+    async fn a_new_requests_row_starts_at_zero_because_the_client_resets_the_count() {
+        use crate::fake_openai::{Fake, Resp};
+        use crate::openai::Role;
+        use crate::planner::{Backend, Event::*, OpenAiBackend, Progress::*};
+        use crate::session::SessionStore;
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
         let count = |a: &App| a.plan_received.load(std::sync::atomic::Ordering::Relaxed);
-        let stream = |a: &App, n| {
-            a.plan_received
-                .store(n, std::sync::atomic::Ordering::Relaxed)
-        };
+        // The run's backend counts into the App's own counter, as Plan sets it up.
+        let fake = Fake::start(|_| Resp::answer("{}")).await;
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        let client = crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        );
+        let backend = OpenAiBackend::new(
+            std::sync::Arc::new(client),
+            "gpt-6.1-sol".into(),
+            a.plan_received.clone(),
+        );
+        let conversation = [(Role::User, "Plan.".to_string())];
         send(&mut a, epoch, Stage(Analyzing));
         send(&mut a, epoch, Stage(Asking(1)));
-        stream(&a, 1200);
-        // A check does not touch the count; the next request starts again.
+        a.plan_received
+            .store(1200, std::sync::atomic::Ordering::Relaxed);
+        // The App does not touch the count when a stage starts, for a check
+        // or for the next request: only the client's attempts reset it.
         send(&mut a, epoch, Stage(Checking(1)));
-        assert_eq!(count(&a), 1200);
         for request in [Repairing(2), Extending(3), Asking(4)] {
             send(&mut a, epoch, Stage(request));
-            assert_eq!(count(&a), 0, "{request:?}");
-            let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
-            assert_eq!(rows.last().unwrap().notes, ["received 0 characters"]);
-            stream(&a, 900);
-            send(&mut a, epoch, Stage(Checking(2)));
+            assert_eq!(count(&a), 1200, "{request:?}");
         }
+        // The next request's attempt starts at zero and counts its own reply.
+        assert_eq!(backend.reply(&conversation).await.unwrap(), "{}");
+        assert_eq!(count(&a), 2);
+        let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
+        assert_eq!(rows.last().unwrap().notes, ["received 2 characters"]);
         // An event of an older run leaves the count alone.
         send(&mut a, epoch.wrapping_sub(1), Stage(Repairing(2)));
-        assert_eq!(count(&a), 900);
+        assert_eq!(count(&a), 2);
     }
     #[test]
     fn applying_a_plan_replaces_the_job_and_undo_restores_it() {

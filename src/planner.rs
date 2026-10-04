@@ -1794,6 +1794,101 @@ pub(crate) mod tests {
         }
     }
     #[tokio::test]
+    async fn a_request_that_errors_or_a_check_that_fails_to_run_ends_the_events_without_a_result() {
+        use Progress::*;
+        let (doc, mesh, report) = block();
+        let stage = Event::Stage;
+        let t9 = StepResult::Problems {
+            shown: vec!["Setup 1, operation 1: T9 is not in the tool library.".into()],
+            more: 0,
+        };
+        let passed = Event::Checked(1, StepResult::Passed);
+        let wrong = Event::Checked(1, t9);
+        // An API error on a request: its stage is the last event, with no
+        // Checked after it, on the first request, after a failed check and
+        // on the follow-up of a plan that passed.
+        for (replies, expected) in [
+            (
+                vec![Err(ApiError::UsageLimit)],
+                vec![stage(Analyzing), stage(Asking(1))],
+            ),
+            (
+                vec![json(&bad(&report)), Err(ApiError::UsageLimit)],
+                vec![
+                    stage(Analyzing),
+                    stage(Asking(1)),
+                    stage(Checking(1)),
+                    wrong.clone(),
+                    stage(Repairing(2)),
+                ],
+            ),
+            (
+                vec![json(&good(&report)), Err(ApiError::UsageLimit)],
+                vec![
+                    stage(Analyzing),
+                    stage(Asking(1)),
+                    stage(Checking(1)),
+                    passed.clone(),
+                    stage(Extending(2)),
+                ],
+            ),
+        ] {
+            let mut events = vec![];
+            let _ = plan(
+                &Script::new(replies),
+                doc.clone(),
+                mesh.clone(),
+                &Busy::default(),
+                |e| events.push(e),
+            )
+            .await;
+            assert_eq!(events, expected);
+        }
+        // A check that fails to run: its stage is the last event, on the
+        // first proposal, after a failed check and after a plan that passed.
+        for (replies, expected) in [
+            (
+                vec![json(&boom(&report))],
+                vec![stage(Analyzing), stage(Asking(1)), stage(Checking(1))],
+            ),
+            (
+                vec![json(&bad(&report)), json(&boom(&report))],
+                vec![
+                    stage(Analyzing),
+                    stage(Asking(1)),
+                    stage(Checking(1)),
+                    wrong.clone(),
+                    stage(Repairing(2)),
+                    stage(Checking(2)),
+                ],
+            ),
+            (
+                vec![json(&good(&report)), json(&boom(&report))],
+                vec![
+                    stage(Analyzing),
+                    stage(Asking(1)),
+                    stage(Checking(1)),
+                    passed.clone(),
+                    stage(Extending(2)),
+                    stage(Checking(2)),
+                ],
+            ),
+        ] {
+            let mut events = vec![];
+            let _ = plan_with(
+                &Script::new(replies),
+                doc.clone(),
+                mesh.clone(),
+                &Busy::default(),
+                |e| events.push(e),
+                analysis::report,
+                check_or_boom,
+            )
+            .await;
+            assert_eq!(events, expected);
+        }
+    }
+    #[tokio::test]
     async fn the_last_of_two_different_check_failures_is_reported() {
         let (doc, mesh, report) = block();
         let tool = |n: u32| {

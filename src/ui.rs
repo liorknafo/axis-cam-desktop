@@ -2919,8 +2919,8 @@ pub(crate) enum Mark {
     Open,
     /// The step ended, and a check on it, if any, passed: a tick.
     Done,
-    /// The step ended with a check that found problems, or a reply that
-    /// could not be read: an amber "!".
+    /// The step ended with a check that found problems, a reply that could
+    /// not be read, or no result it should have had: an amber "!".
     Warn,
 }
 /// One row of the planner's timeline.
@@ -2949,6 +2949,23 @@ pub(crate) fn done_text(stage: crate::planner::Progress, model: &str) -> String 
         Progress::Previewing => "Built the 3D view".into(),
     }
 }
+/// Why the ended step `i` has no result it should have: a check that did not
+/// finish, a request that no check follows (so the model never replied), or
+/// an analysis that nothing follows. None for a step that went through.
+fn lost(steps: &[crate::Step], i: usize) -> Option<&'static str> {
+    use crate::planner::Progress::*;
+    let step = &steps[i];
+    if step.ended.is_none() || step.result.is_some() {
+        return None;
+    }
+    let next = steps.get(i + 1).map(|next| next.stage);
+    match step.stage {
+        Checking(_) => Some("did not finish"),
+        Asking(n) | Repairing(n) | Extending(n) if next != Some(Checking(n)) => Some("no reply"),
+        Analyzing if next.is_none() => Some("did not finish"),
+        _ => None,
+    }
+}
 /// How a reply fared, in a few words.
 fn step_summary(result: &crate::planner::StepResult) -> String {
     use crate::planner::StepResult;
@@ -2964,6 +2981,8 @@ fn step_summary(result: &crate::planner::StepResult) -> String {
 /// The timeline's rows as of `now`. While the run goes (`finished` false) a
 /// check's problems and an unreadable reply's error are listed under their
 /// row; a finished run's rows are one line each, ending in a short summary.
+/// A step that ended without the result it should have gets the warning mark
+/// and says why (see `lost`).
 pub(crate) fn timeline_rows(
     app: &App,
     now: std::time::Instant,
@@ -2979,7 +2998,9 @@ pub(crate) fn timeline_rows(
     };
     app.plan_timeline
         .iter()
-        .map(|step| {
+        .enumerate()
+        .map(|(i, step)| {
+            let lost = lost(&app.plan_timeline, i);
             let took = step
                 .ended
                 .unwrap_or(now)
@@ -2994,7 +3015,12 @@ pub(crate) fn timeline_rows(
                 notes.push(format!("received {}", plural(received, "character")));
             }
             match (&step.result, finished) {
-                (None, _) => {}
+                (None, true) => {
+                    if let Some(why) = lost {
+                        text = format!("{text} · {why}");
+                    }
+                }
+                (None, false) => notes.extend(lost.map(String::from)),
                 (Some(result), true) => text = format!("{text} · {}", step_summary(result)),
                 (Some(StepResult::Passed), false) => notes.push("passed".into()),
                 (Some(StepResult::Problems { shown, more }), false) => {
@@ -3015,6 +3041,7 @@ pub(crate) fn timeline_rows(
                 (Some(_), Some(StepResult::Problems { .. } | StepResult::Unreadable(_))) => {
                     Mark::Warn
                 }
+                (Some(_), None) if lost.is_some() => Mark::Warn,
                 (Some(_), _) => Mark::Done,
             };
             TimelineRow { mark, text, notes }
