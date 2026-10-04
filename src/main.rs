@@ -278,9 +278,12 @@ pub struct App {
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
     pub icons: Vec<iced::widget::svg::Handle>,
-    /// A close request waiting for a sign-out or a sign-in save, and when
-    /// it first came.
+    /// A close request waiting for a sign-out, a sign-in save or a refresh
+    /// of the sign-in, and when it first came.
     closing: Option<(iced::window::Id, Instant)>,
+    /// The client a pending sign-out is signing out, so that a close that
+    /// stops waiting for it can delete the saved sign-in through it.
+    signing_out: Option<std::sync::Arc<openai::Client>>,
     /// G-code exports started and not yet reported (folder choice and write).
     gcode_exports: usize,
 }
@@ -497,6 +500,7 @@ impl App {
             confirm_delete_setup: false,
             icons,
             closing: None,
+            signing_out: None,
             gcode_exports: 0,
         }
     }
@@ -669,54 +673,67 @@ impl App {
         self.plan_busy.running() > 0 || self.post_busy || self.stock_mesh_job.is_some()
     }
     /// Work that must not be cut short by ending the process: a G-code
-    /// export, and a refresh saving the rotated sign-in (its old refresh
-    /// token is already spent). Their blocking parts finish on exit.
+    /// export. Its blocking part finishes on exit.
     fn finishing_work(&self) -> bool {
-        self.gcode_exports > 0 || self.client.as_ref().is_some_and(|c| c.saving())
+        self.gcode_exports > 0
     }
-    /// Saves the workspace, then closes the window, waits for a pending
-    /// sign-out or sign-in save, or ends the process (see `close_action`).
-    fn request_close(&mut self, id: iced::window::Id) -> Task<Message> {
-        self.persist();
-        let signing = self.sign_out_pending || self.saving_sign_in();
+    /// What a close request does now (see `close_action`): a pending
+    /// sign-out, sign-in save or refresh of the sign-in is waited for from
+    /// the first request's time, `now` being this request's. The wait is
+    /// dropped unless the answer is to keep waiting.
+    pub(crate) fn close_decision(&mut self, id: iced::window::Id, now: Instant) -> CloseAction {
+        let refreshing = self.client.as_ref().is_some_and(|c| c.refreshing());
+        let signing = self.sign_out_pending || self.saving_sign_in() || refreshing;
         let pending = signing.then(|| {
-            let waited = self.closing.get_or_insert((id, Instant::now())).1.elapsed();
-            (waited, self.sign_out_pending)
+            let first = self.closing.get_or_insert((id, now)).1;
+            (now.saturating_duration_since(first), self.sign_out_pending)
         });
-        match close_action(
+        let action = close_action(
             !self.dirty,
             pending,
             self.blocking_work(),
             self.finishing_work(),
-        ) {
+        );
+        if action != CloseAction::Wait {
+            self.closing = None;
+        }
+        action
+    }
+    /// Saves the workspace, then carries out `close_decision`: closes the
+    /// window, waits, or ends the process.
+    fn request_close(&mut self, id: iced::window::Id) -> Task<Message> {
+        self.persist();
+        match self.close_decision(id, Instant::now()) {
             CloseAction::Stay => {
-                self.closing = None;
                 self.status = "Could not save before closing. Save Project to another location, then close again.".into();
                 Task::none()
             }
             CloseAction::Wait => {
                 self.status = if self.sign_out_pending {
                     "Closing when signing out has finished (at most 10 seconds)…"
-                } else {
+                } else if self.saving_sign_in() {
                     "Closing when the sign-in has been saved (at most 10 seconds)…"
+                } else {
+                    "Closing when the sign-in refresh has finished (at most 10 seconds)…"
                 }
                 .into();
                 Task::none()
             }
-            CloseAction::Close => {
-                self.closing = None;
-                iced::window::close(id)
-            }
+            CloseAction::Close => iced::window::close(id),
             // The sign-out may still wait behind a refresh for the session,
             // and the runtime drops it when the app ends. The saved sign-in
             // is deleted on the blocking pool instead, which the runtime
-            // lets finish, before the window closes.
+            // lets finish, before the window closes; through the signing-out
+            // client, so that its refresh cannot save the sign-in again.
             CloseAction::ClearAndClose => {
-                self.closing = None;
-                let store = self.store.clone();
-                Task::future(async move { session::start_clear(store) })
-                    .discard()
-                    .chain(iced::window::close(id))
+                let clear = match self.signing_out.take() {
+                    Some(client) => Task::future(async move { client.start_abandoning() }),
+                    None => {
+                        let store = self.store.clone();
+                        Task::future(async move { session::start_clear(store) })
+                    }
+                };
+                clear.discard().chain(iced::window::close(id))
             }
             // The workspace and History are written synchronously, so
             // nothing is lost.
@@ -2490,6 +2507,7 @@ impl App {
                     self.plan_dropped = Some(PLAN_SIGNED_OUT);
                 }
                 let client = self.client.take();
+                self.signing_out = client.clone();
                 self.account = Account::SignedOut;
                 // Sign-in stays disabled until the old sign-in is deleted, so
                 // a late delete cannot remove a newer one.
@@ -2509,11 +2527,13 @@ impl App {
             }
             Message::SignedOut(Ok(())) => {
                 self.sign_out_pending = false;
+                self.signing_out = None;
                 self.account_note = "Signed out.".into();
                 return self.close_if_waiting();
             }
             Message::SignedOut(Err(e)) => {
                 self.sign_out_pending = false;
+                self.signing_out = None;
                 self.account_note = e;
                 return self.close_if_waiting();
             }
@@ -2762,13 +2782,14 @@ fn merge_sample(user: &Document) -> (Document, String) {
     };
     (doc, status)
 }
-/// How long a close request waits for a sign-out or a sign-in save.
+/// How long a close request waits for a sign-out, a sign-in save or a
+/// refresh of the sign-in.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseAction {
     /// Keep the window: the workspace could not be saved.
     Stay,
-    /// Wait for the sign-out or sign-in save, then ask again.
+    /// Wait for the sign-out, sign-in save or refresh, then ask again.
     Wait,
     /// Close the window.
     Close,
@@ -2779,14 +2800,14 @@ pub(crate) enum CloseAction {
     Exit,
 }
 /// What a close request does once the workspace save was tried. `saved`:
-/// the workspace is saved. `pending`: how long a pending sign-out or sign-in
-/// save has been waited for, and whether it is a sign-out. `blocking`: a plan
-/// stage, the NC program refresh or the stock mesher is still running.
-/// `finishing`: a G-code export or a refresh's save of the rotated sign-in is
-/// running. Neither a pending sign-out or save nor finishing work is cut
-/// short by ending the process: the window closes and the runtime lets their
-/// blocking parts finish. After `CLOSE_WAIT`, a pending sign-out also starts
-/// deleting the saved sign-in, which the process then waits for.
+/// the workspace is saved. `pending`: how long a pending sign-out, sign-in
+/// save or refresh of the sign-in has been waited for, and whether a
+/// sign-out is pending. `blocking`: a plan stage, the NC program refresh or
+/// the stock mesher is still running. `finishing`: a G-code export is
+/// running. Neither pending work nor finishing work is cut short by ending
+/// the process: the window closes and the runtime lets their blocking parts
+/// finish. After `CLOSE_WAIT`, a pending sign-out also starts deleting the
+/// saved sign-in, which the process then waits for.
 pub(crate) fn close_action(
     saved: bool,
     pending: Option<(Duration, bool)>,

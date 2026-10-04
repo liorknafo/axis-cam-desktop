@@ -273,9 +273,26 @@ async fn off_executor<T: Send + 'static>(
         .await
         .unwrap_or_else(|_| Err("the session store stopped unexpectedly".into()))
 }
-async fn store_save(store: &Arc<dyn SessionStore>, session: &Session) -> Result<(), String> {
-    let session = session.clone();
-    off_executor(store, move |store| store.save(&session)).await
+/// Saves a refresh's rotated tokens unless the client's sign-in has been
+/// abandoned (`Client::start_abandoning`). The check and the save hold the
+/// same lock as that delete, so a save can never land after it.
+async fn store_save_unless_abandoned(
+    store: &Arc<dyn SessionStore>,
+    abandoned: &Arc<std::sync::Mutex<bool>>,
+    session: &Session,
+) -> Result<(), String> {
+    let (abandoned, session) = (abandoned.clone(), session.clone());
+    off_executor(store, move |store| {
+        let abandoned = abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *abandoned {
+            Ok(())
+        } else {
+            store.save(&session)
+        }
+    })
+    .await
 }
 async fn store_clear(store: &Arc<dyn SessionStore>) -> Result<(), String> {
     off_executor(store, |store| store.clear()).await
@@ -293,6 +310,19 @@ fn newer_saved(saved: &Session, current: &Session, spent: &std::sync::Mutex<Vec<
         && saved.expires_at > current.expires_at
         && !spent.lock().unwrap().contains(&saved.refresh_token)
 }
+/// One refresh of the sign-in in flight, counted while it lives.
+pub(crate) struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+impl InFlight {
+    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 pub struct Client {
     http: reqwest::Client,
     endpoints: Endpoints,
@@ -302,8 +332,10 @@ pub struct Client {
     /// Refresh tokens this client has presented and OpenAI accepted or
     /// refused, kept for the client's lifetime: none is presented again.
     spent: Arc<std::sync::Mutex<Vec<String>>>,
-    /// Refreshes saving their rotated tokens right now (see `saving`).
-    saves: Arc<std::sync::atomic::AtomicUsize>,
+    /// Refreshes of the sign-in in flight (see `refreshing`).
+    refreshes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by `start_abandoning`: no refresh saves its tokens any more.
+    abandoned: Arc<std::sync::Mutex<bool>>,
     /// Base delay between retries.
     backoff: Duration,
 }
@@ -321,17 +353,38 @@ impl Client {
             store,
             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
             spent: Arc::default(),
-            saves: Arc::default(),
+            refreshes: Arc::default(),
+            abandoned: Arc::default(),
             backoff: Duration::from_secs(1),
         }
     }
-    /// Whether a refresh is saving its rotated tokens. The save runs on the
-    /// blocking pool, which the runtime lets finish when the app ends, so a
-    /// close then closes the window rather than ending the process: the old
-    /// refresh token is already spent, and losing the new set would sign the
-    /// user out.
-    pub fn saving(&self) -> bool {
-        self.saves.load(std::sync::atomic::Ordering::SeqCst) > 0
+    /// Whether a refresh of the sign-in is in flight, from before its
+    /// request until after its save. A close waits for it (at most
+    /// `CLOSE_WAIT`): once OpenAI has accepted the request, the old refresh
+    /// token is spent, and losing the new set would sign the user out.
+    pub fn refreshing(&self) -> bool {
+        self.refreshes.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+    /// A refresh in flight for as long as the result lives.
+    #[cfg(test)]
+    pub(crate) fn hold_refresh(&self) -> InFlight {
+        InFlight::new(&self.refreshes)
+    }
+    /// Starts deleting the saved sign-in on the blocking pool and returns at
+    /// once, for a close that stopped waiting for this client's sign-out.
+    /// Under the lock a refresh's save takes, it first marks the sign-in
+    /// abandoned, so a refresh still running cannot put its tokens back
+    /// afterwards. The runtime lets the delete finish when the app ends.
+    /// Call it from within a Tokio runtime.
+    pub fn start_abandoning(&self) {
+        let (store, abandoned) = (self.store.clone(), self.abandoned.clone());
+        drop(tokio::task::spawn_blocking(move || {
+            let mut abandoned = abandoned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *abandoned = true;
+            store.clear()
+        }));
     }
     /// A usable access token. Refreshes when it is close to expiry or when
     /// `rejected` is the token the API just refused. One refresh runs at a
@@ -370,9 +423,12 @@ impl Client {
         let store = self.store.clone();
         let backoff = self.backoff;
         let spent = self.spent.clone();
-        let saves = self.saves.clone();
+        let abandoned = self.abandoned.clone();
+        let in_flight = InFlight::new(&self.refreshes);
         let rejected = rejected.map(str::to_string);
         let refresh = async move {
+            // Counted until this ends, also when the runtime drops it.
+            let _in_flight = in_flight;
             // Another running copy may have refreshed already and saved the
             // rotated tokens; presenting the refresh token it spent would
             // look like reuse to OpenAI. Its saved set is used instead, and
@@ -396,11 +452,12 @@ impl Client {
                         // The old refresh token is spent now. If the store
                         // refuses twice, keep the new set in memory anyway.
                         spent.lock().unwrap().push(current.refresh_token.clone());
-                        saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if store_save(&store, &new).await.is_err() {
-                            let _ = store_save(&store, &new).await;
+                        if store_save_unless_abandoned(&store, &abandoned, &new)
+                            .await
+                            .is_err()
+                        {
+                            let _ = store_save_unless_abandoned(&store, &abandoned, &new).await;
                         }
-                        saves.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         let token = new.access_token.clone();
                         *session = Some(new);
                         return Ok(token);
@@ -1672,9 +1729,12 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn a_refresh_reports_that_it_is_saving_its_tokens() {
+    async fn a_refresh_is_in_flight_from_its_request_until_its_save_ends() {
         let fake = Fake::start(|req: &Req| match req.path.as_str() {
-            "/token" => rotated(),
+            "/token" => Resp {
+                delay_ms: 200,
+                ..rotated()
+            },
             _ => Resp::answer("{}"),
         })
         .await;
@@ -1696,19 +1756,77 @@ mod tests {
             store.clone(),
             soon,
         );
-        assert!(!client.saving());
+        assert!(!client.refreshing());
         let release = async {
+            // OpenAI has the request and has not answered yet.
+            assert!(
+                until(|| fake
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.path == "/token"))
+                .await
+            );
+            let requesting = client.refreshing();
             assert!(until(|| store.started.load(Ordering::SeqCst)).await);
-            let saving = client.saving();
+            let saving = client.refreshing();
             go.send(()).unwrap();
-            saving
+            (requesting, saving)
         };
         let request = request();
-        let (result, saving) = tokio::join!(client.respond(&request), release);
+        let (result, (requesting, saving)) = tokio::join!(client.respond(&request), release);
         result.unwrap();
-        assert!(saving);
-        assert!(!client.saving());
+        assert!(requesting && saving);
+        assert!(!client.refreshing());
         assert_eq!(store.load().unwrap().unwrap().refresh_token, "refresh-2");
+    }
+    #[tokio::test]
+    async fn a_refresh_save_after_an_abandoning_delete_leaves_the_store_empty() {
+        let fake = Fake::start(|req: &Req| match req.path.as_str() {
+            "/token" => Resp {
+                delay_ms: 300,
+                ..rotated()
+            },
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        let store = Arc::new(FileStore(dir.path().join("session.json")));
+        store.save(&soon).unwrap();
+        let client = Client::new(
+            Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store.clone(),
+            soon,
+        );
+        // A close that stopped waiting for a sign-out deletes the saved
+        // sign-in while the refresh's request is still out.
+        let abandon = async {
+            assert!(
+                until(|| fake
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.path == "/token"))
+                .await
+            );
+            assert!(client.refreshing());
+            client.start_abandoning();
+            assert!(until(|| store.load().unwrap().is_none()).await);
+        };
+        let request = request();
+        let (result, ()) = tokio::join!(client.respond(&request), abandon);
+        // The refresh still finished and its tokens were used, but its late
+        // save did not put the sign-in back.
+        result.unwrap();
+        assert!(!client.refreshing());
+        assert_eq!(store.load().unwrap(), None);
     }
     /// A store whose `clear` blocks its thread until the test releases it.
     struct GatedStore {

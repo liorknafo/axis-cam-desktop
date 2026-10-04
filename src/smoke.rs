@@ -1045,8 +1045,8 @@ mod tests {
         // process alive, so the process exits.
         assert_eq!(close_action(true, None, false, false), Close);
         assert_eq!(close_action(true, None, true, false), Exit);
-        // A G-code export or a refresh saving the rotated sign-in is never
-        // cut short: the window closes and the runtime finishes it.
+        // A G-code export is never cut short: the window closes and the
+        // runtime finishes it.
         assert_eq!(close_action(true, None, true, true), Close);
         assert_eq!(close_action(true, None, false, true), Close);
         // A sign-out or sign-in save is waited for, at most 10 seconds.
@@ -1101,6 +1101,95 @@ mod tests {
             assert!(a.closing.is_none(), "{ok}");
             assert!(!a.saving_sign_in());
         }
+    }
+    /// A client for `a` that never sends a request.
+    fn idle_client(a: &App) -> std::sync::Arc<crate::openai::Client> {
+        std::sync::Arc::new(crate::openai::Client::new(
+            a.endpoints.clone(),
+            String::new(),
+            a.store.clone(),
+            crate::session::sample(),
+        ))
+    }
+    #[test]
+    fn the_close_decision_follows_what_is_still_running() {
+        use crate::CloseAction::*;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = || App::from_workspace(dir.path().join("workspace.json"), None);
+        let id = iced::window::Id::unique();
+        let start = Instant::now();
+        let after = |seconds: f32| start + Duration::from_secs_f32(seconds);
+        // A sign-out still pending after 11 s: delete the saved sign-in,
+        // then close.
+        let mut a = fresh();
+        a.sign_out_pending = true;
+        assert_eq!(a.close_decision(id, start), Wait);
+        assert_eq!(a.close_decision(id, after(9.9)), Wait);
+        assert_eq!(a.close_decision(id, after(11.)), ClearAndClose);
+        assert!(a.closing.is_none());
+        // A sign-in save still pending after 11 s: close.
+        let mut a = fresh();
+        let _ = a.update(Message::SignIn);
+        let _ = a.update(Message::SignedIn(Ok((
+            crate::session::sample(),
+            "oaiapp_1".into(),
+        ))));
+        assert!(a.saving_sign_in());
+        assert_eq!(a.close_decision(id, start), Wait);
+        assert_eq!(a.close_decision(id, after(11.)), Close);
+        // Blocking work alone ends the process; with a G-code export
+        // running the window closes instead, so the export finishes.
+        let mut a = fresh();
+        a.post_busy = true;
+        assert_eq!(a.close_decision(id, start), Exit);
+        a.gcode_exports = 1;
+        assert_eq!(a.close_decision(id, start), Close);
+        a.post_busy = false;
+        assert_eq!(a.close_decision(id, start), Close);
+        // A refresh of the sign-in in flight is waited for, at most 10 s.
+        let mut a = fresh();
+        let client = idle_client(&a);
+        a.client = Some(client.clone());
+        let refresh = client.hold_refresh();
+        assert_eq!(a.close_decision(id, after(1.)), Wait);
+        assert_eq!(a.close_decision(id, after(10.5)), Wait);
+        assert_eq!(a.close_decision(id, after(11.5)), Close);
+        drop(refresh);
+        // Nothing pending: close.
+        assert_eq!(a.close_decision(id, after(12.)), Close);
+        assert!(a.closing.is_none());
+    }
+    #[test]
+    fn close_waits_for_a_refresh_in_flight_then_closes() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let client = idle_client(&a);
+        a.client = Some(client.clone());
+        let id = iced::window::Id::unique();
+        let refresh = client.hold_refresh();
+        let _ = a.update(Message::Close(id));
+        assert!(a.closing.is_some());
+        assert_eq!(
+            a.status,
+            "Closing when the sign-in refresh has finished (at most 10 seconds)…"
+        );
+        // Tick checks again: still refreshing, still waiting.
+        let _ = a.update(Message::Tick);
+        assert!(a.closing.is_some());
+        drop(refresh);
+        let _ = a.update(Message::Tick);
+        assert!(a.closing.is_none());
+        // A sign-out still pending after the wait hands its client to the
+        // delete, which then blocks that client's late refresh save.
+        a.signing_out = Some(client);
+        a.sign_out_pending = true;
+        let _ = a.update(Message::Close(id));
+        a.closing = Some((id, Instant::now() - Duration::from_secs(11)));
+        let _ = a.update(Message::Tick);
+        assert!(a.closing.is_none());
+        assert!(a.signing_out.is_none());
     }
     #[test]
     fn a_gcode_export_counts_as_work_that_must_finish() {
