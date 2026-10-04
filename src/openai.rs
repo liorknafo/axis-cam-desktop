@@ -316,6 +316,10 @@ impl Client {
     /// finishes, saves and updates the session even if this caller is
     /// dropped after OpenAI has accepted (and spent) the old refresh token.
     ///
+    /// Before refreshing, it reads the saved sign-in: when another running
+    /// copy has saved newer tokens for the same user, those are used, and
+    /// refreshed only if they are close to expiry themselves.
+    ///
     /// When OpenAI rejects the refresh token for good, another running copy
     /// of the app may have spent it and saved its new tokens. Those are then
     /// used from here on (the next call refreshes them if they are close to
@@ -337,7 +341,26 @@ impl Client {
         let client_id = self.client_id.clone();
         let store = self.store.clone();
         let backoff = self.backoff;
+        let rejected = rejected.map(str::to_string);
         let refresh = async move {
+            // Another running copy may have refreshed already and saved the
+            // rotated tokens; presenting the refresh token it spent would
+            // look like reuse to OpenAI. Its saved set is used instead, and
+            // refreshed only if it is close to expiry itself (or refused).
+            let mut current = current;
+            if let Ok(Some(saved)) = store_load(&store).await
+                && saved.subject == current.subject
+                && saved.refresh_token != current.refresh_token
+            {
+                if rejected.as_deref() != Some(saved.access_token.as_str())
+                    && !saved.expires_within(300, now())
+                {
+                    let token = saved.access_token.clone();
+                    *session = Some(saved);
+                    return Ok(token);
+                }
+                current = saved;
+            }
             for attempt in 1..=3 {
                 match oauth::refresh(&http, &endpoints, &client_id, &current).await {
                     Ok(new) => {
@@ -847,15 +870,99 @@ mod tests {
         .await
     }
     #[tokio::test]
+    async fn a_sign_in_refreshed_by_another_copy_is_adopted_without_a_refresh() {
+        // Copies A and B of the app restored the same sign-in. B refreshes
+        // first and saves the rotated tokens.
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        let r = rig(soon.clone(), |req| match req.path.as_str() {
+            "/token" => rotated(),
+            "/v1/models" => Resp::json(200, json!({"data": []})),
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        let mut b = Client::new(
+            Endpoints::local(&r.fake.base),
+            "oaiapp_1".into(),
+            r.store.clone(),
+            soon,
+        );
+        b.backoff = Duration::ZERO;
+        b.respond(&request()).await.unwrap();
+        // A then needs a token: it adopts B's saved set instead of
+        // presenting the refresh token B has already spent.
+        r.client.respond(&request()).await.unwrap();
+        r.client.models().await.unwrap();
+        let refreshes = r.fake.seen("/token");
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].field("refresh_token"), "refresh-1");
+        let auths: Vec<String> = r
+            .fake
+            .seen("/v1/responses")
+            .into_iter()
+            .chain(r.fake.seen("/v1/models"))
+            .map(|q| q.auth)
+            .collect();
+        assert_eq!(auths, ["Bearer access-2"; 3]);
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-2");
+    }
+    #[tokio::test]
+    async fn a_saved_sign_in_that_is_itself_near_expiry_is_refreshed_with_its_own_token() {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        let r = rig(soon, |req| match req.path.as_str() {
+            "/token" => Resp::json(
+                200,
+                json!({"access_token": "access-3", "refresh_token": "refresh-3", "expires_in": 3600}),
+            ),
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        let newer = Session {
+            access_token: "access-2".into(),
+            refresh_token: "refresh-2".into(),
+            expires_at: now() + 60,
+            ..sample()
+        };
+        r.store.file.save(&newer).unwrap();
+        r.client.respond(&request()).await.unwrap();
+        let refreshes = r.fake.seen("/token");
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].field("refresh_token"), "refresh-2");
+        assert_eq!(r.fake.seen("/v1/responses")[0].auth, "Bearer access-3");
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-3");
+    }
+    #[tokio::test]
     async fn a_fatal_refresh_uses_a_newer_saved_sign_in_instead_of_deleting_it() {
-        let r = rejected_refresh().await;
-        // Another running copy of the app has refreshed and saved its tokens.
+        // Another running copy of the app refreshes and saves its tokens
+        // while this copy's refresh is on its way.
         let newer = Session {
             access_token: "access-2".into(),
             refresh_token: "refresh-2".into(),
             ..sample()
         };
-        r.store.file.save(&newer).unwrap();
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        let path = Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
+        let (shared, saved) = (path.clone(), newer.clone());
+        let r = rig(soon, move |req| match req.path.as_str() {
+            "/token" => {
+                if let Some(p) = shared.lock().unwrap().clone() {
+                    FileStore(p).save(&saved).unwrap();
+                }
+                Resp::json(400, json!({"error": "refresh_token_reused"}))
+            }
+            "/v1/models" => Resp::json(200, json!({"data": []})),
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        *path.lock().unwrap() = Some(r.store.file.0.clone());
         r.client.respond(&request()).await.unwrap();
         assert_eq!(r.fake.seen("/v1/responses")[0].auth, "Bearer access-2");
         assert_eq!(r.store.load().unwrap(), Some(newer));
