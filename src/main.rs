@@ -2002,10 +2002,7 @@ impl App {
                 }
                 // A close waiting for the sign-in is checked again, so that
                 // it happens when the wait is over.
-                let close = match self.closing {
-                    Some((id, _)) => self.request_close(id),
-                    None => Task::none(),
-                };
+                let close = self.close_if_waiting();
                 return Task::batch([close, self.refresh_stock_surface(), self.refresh_post()]);
             }
             Message::Plan => {
