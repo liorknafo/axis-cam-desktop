@@ -922,10 +922,13 @@ fn touch_spots(s: Bounds, center: bool) -> Vec<(&'static str, Vec<[f32; 3]>)> {
         })
         .collect()
 }
-/// The faces a stock-based work zero needs that earlier setups have cut: a
-/// whole face (`stock_faces_cut` on `cut_boxes`, named alone), or the spot
-/// on it the operator touches off on (`touch_spots`, named with the spot)
-/// where `rest::Removed` finds that material can be gone.
+/// The faces a stock-based work zero needs that earlier setups have cut
+/// where the operator touches off on them: a face counts when one of its
+/// `touch_spots` points lies where `rest::Removed` finds material can be
+/// gone. It is named alone when the whole face is cut (`stock_faces_cut`
+/// on `cut_boxes`), otherwise with the spot. `cut_boxes` reach a tool
+/// radius below each cut, so they only choose the words: a side cut lower
+/// down, where the workholding holds it, does not count.
 fn stock_zero_cut(
     stock: Bounds,
     volume: &crate::volume::Volume,
@@ -938,12 +941,12 @@ fn stock_zero_cut(
         .into_iter()
         .zip(touch_spots(stock, center))
         .filter_map(|((face, ..), (spot, points))| {
-            if whole.contains(&face) {
-                Some(face.to_string())
-            } else if points.iter().any(|&p| removed.at(p)) {
-                Some(format!("{face} {spot}"))
-            } else {
+            if !points.iter().any(|&p| removed.at(p)) {
                 None
+            } else if whole.contains(&face) {
+                Some(face.to_string())
+            } else {
+                Some(format!("{face} {spot}"))
             }
         })
         .collect()
@@ -2141,6 +2144,95 @@ M2
             .insert("origin".into(), "Stock top front-left".into());
         let job = post_job(&doc, &mesh);
         assert!(job.ready(), "{:?}", errors(&job));
+    }
+    /// The reviewer's small cube job: examples/preview-cube.obj (30 x 20 x
+    /// 10) on 34 x 24 x 14 stock (2 mm side margins, 1 mm on top, 3 mm
+    /// below). Setup 1 faces and contours with the flat 10 mm down to
+    /// `bottom` mm above the part's underside; setup 2, "Underside" on G55,
+    /// is flipped about X, faces and has work zero `origin`.
+    fn cube_job(bottom: &str, origin: &str) -> (Document, Mesh) {
+        let (mut doc, _) = fixture::job();
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/preview-cube.obj");
+        let mesh = crate::mesh::load(&path).unwrap();
+        // The largest surface at the top of the part as `setup` places it.
+        let top = |setup: &Setup| {
+            let placement = Placement::new(&mesh, Some(setup));
+            let top = mesh
+                .surfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    (placement.transform(s.center)[2] - placement.bounds.max[2]).abs() < 0.01
+                })
+                .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+                .unwrap()
+                .0;
+            Some(crate::surface::Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: vec![top],
+            })
+        };
+        let setup = &mut doc.setups[0];
+        setup.p.insert("stock_top".into(), "1".into());
+        setup.p.insert("stock_bottom".into(), "3".into());
+        setup
+            .operations
+            .retain(|o| matches!(o.strategy, Strategy::Face | Strategy::Contour));
+        setup.operations[0].surfaces = top(setup);
+        setup.operations[1].p.insert("bottom".into(), bottom.into());
+        let mut underside = Setup::new(Machine::new(3), "G55");
+        underside.p.insert("name".into(), "Underside".into());
+        underside.p.insert("rx".into(), "180".into());
+        underside.p.insert("origin".into(), origin.into());
+        let mut face = doc.setups[0].operations[0].clone();
+        face.id = id();
+        face.surfaces = top(&underside);
+        underside.operations.push(face);
+        doc.setups.push(underside);
+        doc.file = Some(ModelFile {
+            name: "preview-cube.obj".into(),
+            path: path.to_string_lossy().into_owned(),
+            format: "obj".into(),
+            bytes: 0,
+        });
+        doc.sync_stock_sources();
+        (doc, mesh)
+    }
+    #[test]
+    fn a_side_cut_only_below_the_touch_off_band_keeps_a_stock_zero() {
+        // An earlier setup's cutter boxes reach a tool radius below the
+        // cut, so with a large cutter or a short stock they cover a whole
+        // side although the cut itself stops below where an edge finder
+        // touches it. Only the touch-off spots decide.
+        let origins = ["Stock top center", "Stock top front-left"];
+        // The reviewer's two-sided job with setup 1's Contour on a flat
+        // 25 mm cutter, 8 mm above the part's underside: setup 2's first
+        // side cut is 11 mm below its top, below the 10 mm band.
+        for origin in origins {
+            let (mut doc, mesh) = two_sided_job("8", origin);
+            let mut big = Tool::new("Flat 25", "Flat end mill", "25");
+            big.p.insert("length".into(), "60".into());
+            big.p.insert("stickout".into(), "65".into());
+            big.p.insert("number".into(), "4".into());
+            doc.setups[0].operations[2].tool = big.id.clone();
+            doc.tools.push(big);
+            let job = post_job(&doc, &mesh);
+            assert!(job.ready(), "D25 {origin}: {:?}", errors(&job));
+        }
+        // The small cube job: the Contour stops 5 mm below setup 2's top,
+        // below its 3.5 mm band (a quarter of the 14 mm stock).
+        for origin in origins {
+            let (doc, mesh) = cube_job("2", origin);
+            let job = post_job(&doc, &mesh);
+            assert!(job.ready(), "cube {origin}: {:?}", errors(&job));
+            let text = &setup_texts(&job, 1)[0];
+            assert!(
+                text.contains("(Stock: 34.000 x 24.000 x 14.000 mm.")
+                    && text.contains(" within 3.5 mm below the top.)\n"),
+                "{text}"
+            );
+        }
     }
     #[test]
     fn touch_off_spots_follow_the_work_zero() {
