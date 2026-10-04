@@ -2,7 +2,7 @@
 
 A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.14. It carries the web prototype's Manufacture-style layout into a native application, with local persistence, editable operation parameters and a 3D model viewport. There is no embedded browser.
 
-**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Fixture, clamp and machine-body collisions are not checked, and production CAM remains pending. The example project's other paths and its planner are demonstrations. The AI planner page can sign in with a ChatGPT account, but the planner itself is not yet connected to OpenAI.
+**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Fixture, clamp and machine-body collisions are not checked, and production CAM remains pending. The example project's other paths are demonstrations. The AI planner signs in with a ChatGPT account and proposes a whole job for an imported part; the app generates, simulates and checks every proposal before it can be applied (see **Plan a job with AI**).
 
 ![Native workspace](docs/workspace.png)
 
@@ -44,7 +44,7 @@ The script writes `dist/AXIS CAM Studio.app`. An optional first argument overrid
 | STEP / STP | Open CASCADE CAD import and complete tessellated preview, assembly placements, source units converted to mm |
 | 3MF | ZIP/XML mesh reader, declared units, build items, nested components, mirrored/placed instances and Production extension external model references |
 | Hover help | Descriptions for every app button/input; choice help follows the selected value and related settings; matching native concept animations |
-| Planner | Local deterministic sample plans for top, underside and side setups; review, apply and undo |
+| Planner | One click asks an OpenAI model, on your ChatGPT plan, for setups, operations, tools and cutting parameters; the app checks every proposal with its generators, simulation and export checks, sends failures back for correction, and shows a passing plan for review, apply and undo |
 | Simulation | Six imported strategies with cumulative stock across operations/setups, adaptive octree surface meshing, background detail updates, pause/replay/scrub; separate example motion |
 | Operation audit | Generate all checks every enabled operation across every setup, reports generated paths and actionable failures, skips suppressed operations |
 | Saving | Automatic local workspace saving; explicit JSON project save/open; complete machine, setup, tool and operation data |
@@ -95,7 +95,7 @@ Generation limits: 30,000 moves for the new kernels; up to 300 waterline layers;
 
 Hover a choice field to see **the selected option in the title** and its specific behavior. For example, Profile ramp explains a descending contour entry; Plunge explains a straight vertical entry. Changing the choice updates the text and illustration. Milling-method help also reads the saved spindle rotation; Facing explains when Both ways overrides the one-way method preference. Legacy values use the same resolved defaults as the visible control.
 
-Selected-state animations cover spindle rotation, Climb/Conventional, one-way/zigzag facing, keep-down/retract links, ramp/plunge entry, four drilling cycles and cutter containment. Setup, machine, tool-type, coolant, stock mode, AI example, playback-speed and display choices also have option-specific text. Saved preferences are distinguished from implemented behavior. These are explanatory animations, not previews of the current job.
+Selected-state animations cover spindle rotation, Climb/Conventional, one-way/zigzag facing, keep-down/retract links, ramp/plunge entry, four drilling cycles and cutter containment. Setup, machine, tool-type, coolant, stock mode, playback-speed and display choices also have option-specific text. Saved preferences are distinguished from implemented behavior. These are explanatory animations, not previews of the current job.
 
 The contextual approach references Autodesk's [Fusion Face parameter reference](https://help.autodesk.com/view/fusion360/ENU/?contextId=MFG-REF-2D-FACE-CMD). The native illustrations and descriptions are original and reflect this app's supported behavior. Stock-detail selection uses visible Draft / Standard / Fine buttons so its tooltip cannot obscure a drop-down menu.
 
@@ -134,7 +134,7 @@ The app opens on a start screen. Choose **New blank project** to begin with no m
 5. Add further setups for each repositioning of the part. The last setup can be deleted, returning the project to a part with no setups.
 6. Use **Save project** to create a portable `.axis.json` file, and **Open** to restore it later.
 
-Six operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks and the five explicitly unavailable strategies remain future work. To try the illustrative paths and planner, choose **Start → Explore example project** explicitly.
+Six operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks and the five explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
 
 ## Try the example workflow
 
@@ -147,7 +147,7 @@ Open **Start → Explore example project** first. This loads the housing, sample
 5. Set Heights, Passes/Cycle, Orientation when applicable, and Linking.
 6. Click **Generate sample preview**, then **Play**. Previews are invalidated when job parameters change.
 7. Duplicate a setup, use **Flip X 180°** or enter any rotation/translation, select its stock source and add reclamping instructions. Repositioned setups are saved and visualized; their toolpath calculation remains pending.
-8. Try **AI planner → Create example plan → Apply example plan**. Undo restores the previous job during the current session.
+8. The AI planner works on imported parts, not on this example (see **Plan a job with AI**).
 9. Open **NC program** to review configuration issues, export the setup sheet or export a non-executable program outline.
 10. **Save project** writes a portable `.axis.json` file. **Open** restores it.
 
@@ -268,7 +268,33 @@ The AI planner page has a **ChatGPT account** panel. **Continue with ChatGPT** o
 
 If you sign in without allowing plan usage, the panel says so; sign out and sign in again to allow it.
 
-In this version the account panel is the only part that talks to OpenAI. The planner below it is still the local example.
+If OpenAI's model list is empty or cannot be loaded, the app keeps the saved model, or uses `gpt-6.1-sol` when none is saved, and says so in the panel. **Check connection** shows whether that model answers, and **Load models** tries the list again.
+
+## Plan a job with AI
+
+**AI planner → Plan this job** asks the selected model for a complete job and checks it before you see it. It needs an imported part that is a closed solid; setup 1 complete as you have it (a name, a work offset, a 3-axis LinuxCNC machine, stock, and rotations that are multiples of 90°); a material; a tool library with unique tool numbers; and a ChatGPT sign-in with plan usage. The checklist on the page shows what is missing; the part's closed surface is checked when you click Plan.
+
+What happens after the click:
+
+1. The app builds the part report on your computer (see **Planner checks without AI**).
+2. The model proposes setups, operations, tools and cutting parameters. It can use only your tools and the six available strategies, and it is told the limits the app's generators enforce, such as each operation's 30,000-move limit and the stepdowns that keep within it.
+3. The app builds the job, generates and simulates every operation, and runs every check described in the next section.
+4. Problems go back to the model for correction. If a plan passes but faces are still covered by stock, one more request asks the model to machine them or to list them as not machinable. A run uses at most four model requests and can be cancelled at any time.
+5. A plan that passes is shown for review: setups and operations with estimated times, the values each operation will run with, the checks that passed, what is still covered by stock, what the planner could not machine and why, its warnings, and a 3D view of the stock after the whole plan. The view has its own camera; turning it does not move the machining viewport. Text written by the model (its summary, reasons, workholding notes, warnings and the Not machined list) is labelled as the planner's, and so are the names it gives operations and later setups ("Setup 2 · named by the planner: “Underside”"); those names keep only letters and digits of any script, accents and other marks on a letter, and - _ . , / ( ) # + : & % ~ < > = ± ° ⌀ ≤ ≥ ("Slot <6 mm", "Chamfer 45°", "Bore Ø10 ±0.02"). Fullwidth letters, digits and punctuation count as their ASCII forms ("粗加工（左）" becomes "粗加工(左)"), dashes and minus signs become - ("Holes 1-4", "Z-0.5"), ～ and 〜 become ~ ("穴あけ 1~4"), the Arabic decimal and thousands separators and percent sign become . , and % ("مته ۳.۵"), fraction and division slashes become / ("1/4 in drill"), ∅ becomes ⌀ and × becomes x; * becomes x between two digits ("10x10", "10 x 10") and is removed elsewhere ("**Roughing** pass" becomes "Roughing pass"); and an apostrophe stays between a letter or digit and a letter ("Bob's", "Op 2's"). Quotation and check marks and the listed look-alikes (letters drawn like quotes or primes, such as ʺ ʻ ʼ ᐥ) are removed from names; other symbols become spaces, so words and numbers never run together ("フェイス・トップ" becomes "フェイス トップ"). Invisible format characters (the soft hyphen, zero-width characters such as the Persian zero-width non-joiner, direction marks, the word joiner and the byte order mark) are dropped without a space, and so is a middle dot inside Catalan l·l ("paral·lel" becomes "parallel"); elsewhere a middle dot separates words ("드릴·탭" becomes "드릴 탭", "Face · top" becomes "Face top").
+
+While it runs, the page shows the stage and the model the run was started with: analyzing the part, asking for a plan (1 of 4), asking for a correction after a failed check or an unreadable reply, asking about faces still covered, checking the plan, and building the 3D view of a plan that passed. **Cancel** stops the requests at once; the part analysis, a check or the 3D view already under way cannot be interrupted and finish in the background. Until they have, **Plan** is refused: the status bar says the previous plan check is still finishing and asks you to try again in a moment.
+
+Nothing changes until you click **Apply plan**. Applying first keeps the current job in History (**Browse project history** on the start screen), then replaces the operations of setup 1 and removes later setups; setup 1 keeps its name, machine, stock, work zero and fixture, and the planner's workholding note for it is added at the end of setup 1's notes, on the same line ("Soft jaws. · Planner: …"); setup 1 remembers that note, saved with the project, and applying a later plan replaces it where it still stands unchanged and whole (followed by the end of the notes or a line break, or, when the note ends a sentence with . ! ? or 。, by a space) instead of adding another; your own text, including anything you typed before or after the planner's note, is never removed, and a planner note you changed stays as you left it. **Undo applied plan** first keeps the applied job, with your edits since, in History, then puts the previous setups and operations back, and re-adds any tool they use that you deleted since (each keeps its own tool number when no tool in the library has it; one whose number a newer tool has taken gets the lowest number that no tool uses or another re-added tool keeps; the status bar names each); tools, machines, the project title and the material you changed after applying stay as they are. Importing another part, opening or creating a project, or reloading the part ends the Undo (the job stays in History). Editing the job or opening another project discards a preview and cancels a running plan, because both describe the job as it was when you clicked; after an edit the status bar says so, after the edit's own message. Signing out during a run stops it, and the status bar says so too.
+
+What is sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, material and stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title, your setup names and your account details are not sent: the checks run on a copy of the job without the title and with every setup named by its number (Setup 1, Setup 2), and the plan you review and apply gets setup 1's own name back. Requests ask OpenAI not to store them (`store: false`).
+
+Limits:
+
+- A plan is only as good as the model's proposal. The app's checks refuse plans that cannot be generated, fail the export checks, send a tool's centre line into the part, go below the stock, or remove part material visibly on the stock grid. They do not check fixtures, clamps or the machine body, cutting loads, tool deflection, or whether the speeds and feeds suit the material.
+- The model is asked to list features it cannot machine under **Not machined**; the app does not verify that list. Compare it with the **Still covered** lines and the 3D view before applying. The planner uses only the tools in your library.
+- Review each operation and play the simulation before exporting. Export is on the **NC program** page and runs its own checks again.
+- If no proposal passes within four requests, the page shows the last problems and nothing can be applied.
+- A planning request can take several minutes and counts against your ChatGPT plan.
 
 ## Planner checks without AI
 
@@ -308,7 +334,7 @@ Other platforms use the OS local application data directory. Writes use a tempor
 
 Older project files without an explicit sample-model flag retain their sample housing when they contain setups and no imported file. Newly saved blank projects stay blank after reopening.
 
-Projects contain the **source file path and metadata**, not an embedded copy of the imported mesh. Keep the original mesh file accessible when reopening a project. No API keys are stored and the app has no telemetry. The only network requests are those of the ChatGPT account panel (see above).
+Projects contain the **source file path and metadata**, not an embedded copy of the imported mesh. Keep the original mesh file accessible when reopening a project. No API keys are stored and the app has no telemetry. The only network requests are those of the ChatGPT sign-in and the AI planner (see above).
 
 The `examples` directory includes a sample AXIS project, an OBJ cube, matching four-setup STEP and 3MF parts, an inch-unit STEP block and a placed/rotated STEP assembly.
 
@@ -322,7 +348,7 @@ cargo run --locked -- --smoke-test ./smoke-output
 cargo run --release --locked -- --smoke-test ./help-output --help-only
 ```
 
-The explicit smoke-test mode uses an isolated workspace, exercises eighty screens plus twenty-four camera-motion samples through Iced's renderer and closes itself. The motion samples check that the model remains present across orbit, pan and zoom changes, with stock both shown and hidden. It does not modify the normal workspace. Simulation tests verify continuous motion, parameter-derived spacing/depth/time, stock removal against known volume, rapid moves removing nothing, swept cutter footprint, rewind/incremental consistency, rotated setups, rejected configurations the Play/pause/replay/invalidation lifecycle, both-way continuation at odd/even row counts and varied angles, one-way returns, reduced return time, unchanged final stock, and saved/legacy direction preferences. Imported Facing checks cover real visible-surface picking after setup transforms, planar grouping, selection persistence, replacement and stale-mesh handling, and sample isolation. Unit tests also cover complete tile pixel/gutter preservation below the upload threshold, stable orbit scale, blank startup and project recovery, the first import/machine/setup/tool flow, removal of the last setup, independent stock offsets, rotated and translated stock, stock transparency and occlusion, legacy stock migration, configuration validation, snapshots and dependencies, AI apply/undo, preview invalidation, import parsers, persistence, picking and the LinuxCNC program page (blocked and ready).
+The explicit smoke-test mode uses an isolated workspace, exercises eighty-five screens plus twenty-four camera-motion samples through Iced's renderer and closes itself. The motion samples check that the model remains present across orbit, pan and zoom changes, with stock both shown and hidden. It does not modify the normal workspace. Simulation tests verify continuous motion, parameter-derived spacing/depth/time, stock removal against known volume, rapid moves removing nothing, swept cutter footprint, rewind/incremental consistency, rotated setups, rejected configurations the Play/pause/replay/invalidation lifecycle, both-way continuation at odd/even row counts and varied angles, one-way returns, reduced return time, unchanged final stock, and saved/legacy direction preferences. Imported Facing checks cover real visible-surface picking after setup transforms, planar grouping, selection persistence, replacement and stale-mesh handling, and sample isolation. Unit tests also cover complete tile pixel/gutter preservation below the upload threshold, stable orbit scale, blank startup and project recovery, the first import/machine/setup/tool flow, removal of the last setup, independent stock offsets, rotated and translated stock, stock transparency and occlusion, legacy stock migration, configuration validation, snapshots and dependencies, planner start, cancel, apply and undo, preview invalidation, import parsers, persistence, picking and the LinuxCNC program page (blocked and ready).
 
 ## Code map
 
@@ -347,6 +373,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises eighty screen
 - `src/analysis.rs`: part report (planes, pocket floors and holes for each of six orientations), orientation helpers and the planning preconditions.
 - `src/proposal.rs`: plan format and JSON schema, reference checks and building a job from a plan.
 - `src/plan_check.rs`: plan stages (structure, generation, export, tool axis, coarse gouge) and coverage.
+- `src/planner.rs`: the one-button planner: instructions for the model, requests, correction rounds, the best passing plan.
 - `src/oauth.rs`: Sign in with ChatGPT: PKCE, loopback redirect, ID token validation, refresh, revoke.
 - `src/session.rs`: session and its Keychain or file store.
 - `src/settings.rs`: non-secret app settings.
@@ -361,9 +388,9 @@ The explicit smoke-test mode uses an isolated workspace, exercises eighty screen
 2. Extend the six bounded operation previews into a production 3-axis CAM engine with exact boundaries, robust linking, additional strategies, rest-aware path optimization and fixture collision checks.
 3. Implement rotary and 5-axis kinematics, limit checking, singularity handling and machine simulation.
 4. Add more postprocessors (GRBL, Fanuc…), arcs and canned cycles, each with the same replay verification, and validate them on known machines.
-5. Connect OpenAI planning to a typed, validated planning interface. Retain the review/apply workflow and use OS credential storage or a backend for secrets.
+5. Extend the planner as more strategies become available for imported parts, and make it aware of fixtures.
 
-The current parameter checks are UI configuration checks, not machine safety or manufacturability verification. Several stock, fixture, compensation and collision-preference fields currently record intent only. The example AI brief is a placeholder; structured coverage and priority controls drive the local plan. The native JSON schema is separate from the earlier web prototype schema.
+The current parameter checks are UI configuration checks, not machine safety or manufacturability verification. Several stock, fixture, compensation and collision-preference fields currently record intent only. The native JSON schema is separate from the earlier web prototype schema.
 
 ## Third-party components
 
