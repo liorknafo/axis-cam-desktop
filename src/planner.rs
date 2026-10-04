@@ -540,7 +540,8 @@ fn json_object(text: &str) -> &str {
 /// The document the checks run on: no project title, and every setup named
 /// by its number, so no check message carries the title or a setup name to
 /// OpenAI. The cutting-data messages name the project's material, which the
-/// part report sends anyway, and each is clipped to 300 characters.
+/// part report sends anyway; both carry its name clipped to 60 characters,
+/// and each message is clipped to 300 characters.
 fn anonymized(doc: &Document) -> Document {
     let mut doc = doc.clone();
     doc.title.clear();

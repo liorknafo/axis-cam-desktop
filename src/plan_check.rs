@@ -742,10 +742,30 @@ mod tests {
             .filter(|p| p.stage == "cutting data")
             .collect();
         assert_eq!(found.len(), 2, "{:?}", stages(&check));
-        for problem in found {
+        // The name is clipped to 60 characters, so the message keeps its
+        // range numbers whatever the name.
+        let named = |message: &str, before: &str, after: &str| {
+            message
+                .strip_prefix(before)
+                .and_then(|rest| rest.strip_suffix(after))
+                .map(str::to_string)
+        };
+        let speed = named(
+            &found[0].message,
+            "Surface speed 63 m/min is below ",
+            "'s 150–300 m/min.",
+        );
+        let load = named(
+            &found[1].message,
+            "Chip load 0.167 mm per tooth is above ",
+            "'s 0.030–0.080 mm for a Ø10 mm tool.",
+        );
+        for (problem, name) in found.iter().zip([speed, load]) {
             let message = &problem.message;
-            assert_eq!(message.chars().count(), 300, "{message}");
-            assert!(message.contains(" Odd alloy xxx"), "{message}");
+            let name = name.unwrap_or_else(|| panic!("the range is cut off: {message}"));
+            assert!(name.chars().count() <= 60, "{name}");
+            assert!(name.starts_with("Odd alloy xxx"), "{name}");
+            assert!(message.chars().count() <= 300, "{message}");
             assert!(!message.contains(['\n', '\u{202e}']), "{message}");
         }
     }

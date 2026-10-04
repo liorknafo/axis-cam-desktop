@@ -20,6 +20,8 @@ pub const BANDS: [(&str, f32); 5] = [
     ("fz16", 16.),
     ("fzbig", f32::INFINITY),
 ];
+/// The most characters a material's name may have; the checks name it.
+pub const NAME_LIMIT: usize = 60;
 pub const STARTER_NOTE: &str =
     "Starting point for carbide tools: adjust to your machine and your tool maker's data.";
 /// Every cutting-data key prefix: the surface speed, then each chip-load band.
@@ -158,8 +160,9 @@ pub enum SpeedFeed {
 /// `tool` on `machine` (whose maximum rpm and feed count as in range when the
 /// material asks for more). 1 % slack on every limit absorbs rounding.
 pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine) -> SpeedFeed {
+    let name = crate::proposal::clip(material.name(), NAME_LIMIT);
     let Some(data) = material.cutting_data() else {
-        return SpeedFeed::Unchecked(format!("{} has no cutting data.", material.name()));
+        return SpeedFeed::Unchecked(format!("{name} has no cutting data."));
     };
     let (Some(d), Some(z)) = (num(&tool.p, "diameter"), num(&tool.p, "flutes")) else {
         return SpeedFeed::Unchecked("The tool has no diameter or flutes.".into());
@@ -183,7 +186,6 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
     let fz = f / (n * z);
     let (vc_min, vc_max) = data.vc;
     let (fz_min, fz_max) = data.fz[band(d)];
-    let name = material.name();
     let mut out = vec![];
     if vc > vc_max * 1.01 {
         out.push(format!(
@@ -571,41 +573,80 @@ mod tests {
             "{problems:?}"
         );
     }
+    /// An operation for the Ø6, 3-flute `flat_6` at `vc` m/min and `fz` mm per
+    /// tooth, rounded to whole rpm and mm/min.
+    fn at(vc: f32, fz: f32) -> Operation {
+        let n = (vc * 1000. / (std::f32::consts::PI * 6.)).round();
+        op(&n.to_string(), &(fz * n * 3.).round().to_string())
+    }
+    fn flat_6() -> Tool {
+        Tool::new("Flat 6", "Flat end mill", "6")
+    }
+    /// The words of the problems `at(vc, fz)` runs into, none when it is in range.
+    fn found(vc: f32, fz: f32) -> Vec<&'static str> {
+        let machine = Machine::new(3);
+        let SpeedFeed::Out(problems) = check(&alu(), &flat_6(), &at(vc, fz), &machine) else {
+            return vec![];
+        };
+        problems
+            .iter()
+            .map(
+                |p| match (p.starts_with("Surface"), p.contains(" is above ")) {
+                    (true, true) => "speed above",
+                    (true, false) => "speed below",
+                    (false, true) => "load above",
+                    (false, false) => "load below",
+                },
+            )
+            .collect()
+    }
     #[test]
     fn the_upper_limits_have_one_percent_slack() {
+        // Ø6: 150–300 m/min, 0.02–0.05 mm
+        assert!(found(300. * 1.005, 0.03).is_empty());
+        assert_eq!(found(300. * 1.02, 0.03), ["speed above"]);
+        assert!(found(200., 0.05 * 1.005).is_empty());
+        assert_eq!(found(200., 0.05 * 1.02), ["load above"]);
+    }
+    #[test]
+    fn a_value_between_one_and_two_percent_past_a_limit_is_refused() {
+        // The slack is 1 %, not 2 %: halfway to 2 % is already out.
+        assert_eq!(found(300. * 1.015, 0.03), ["speed above"]);
+        assert_eq!(found(200., 0.05 * 1.015), ["load above"]);
+        assert_eq!(found(150. * 0.985, 0.03), ["speed below"]);
+        assert_eq!(found(200., 0.02 * 0.985), ["load below"]);
+    }
+    #[test]
+    fn the_lower_limits_have_one_percent_slack() {
+        assert!(found(150. * 0.995, 0.03).is_empty());
+        assert_eq!(found(150. * 0.98, 0.03), ["speed below"]);
+        assert!(found(200., 0.02 * 0.995).is_empty());
+        assert_eq!(found(200., 0.02 * 0.98), ["load below"]);
+    }
+    #[test]
+    fn the_materials_name_in_a_message_is_one_line_of_at_most_60_characters() {
         let machine = Machine::new(3);
-        let tool = Tool::new("Flat 6", "Flat end mill", "6"); // Ø6: 150–300 m/min, 0.02–0.05 mm
-        let at = |vc: f32, fz: f32| {
-            let n = (vc * 1000. / (std::f32::consts::PI * 6.)).round();
-            op(&n.to_string(), &(fz * n * 3.).round().to_string())
-        };
-        assert!(matches!(
-            check(&alu(), &tool, &at(300. * 1.005, 0.03), &machine),
-            SpeedFeed::InRange { .. }
-        ));
-        let SpeedFeed::Out(problems) = check(&alu(), &tool, &at(300. * 1.02, 0.03), &machine)
-        else {
-            panic!()
-        };
-        assert!(
-            problems.len() == 1
-                && problems[0].contains("Surface speed")
-                && problems[0].contains("above"),
-            "{problems:?}"
+        let mut odd = alu();
+        odd.p.insert(
+            "name".into(),
+            format!("Odd\nalloy \u{202e}{}", "x".repeat(200)),
         );
-        assert!(matches!(
-            check(&alu(), &tool, &at(200., 0.05 * 1.005), &machine),
-            SpeedFeed::InRange { .. }
-        ));
-        let SpeedFeed::Out(problems) = check(&alu(), &tool, &at(200., 0.05 * 1.02), &machine)
-        else {
+        let SpeedFeed::Out(problems) = check(&odd, &flat_6(), &at(100., 0.03), &machine) else {
             panic!()
         };
+        let name = problems[0]
+            .strip_prefix("Surface speed 100 m/min is below ")
+            .and_then(|rest| rest.strip_suffix("'s 150–300 m/min."))
+            .unwrap();
+        assert!(name.starts_with("Odd alloy xxx") && name.chars().count() == 60);
+        let bare = Material::new(&format!("Odd\n{}", "y".repeat(200)));
+        let SpeedFeed::Unchecked(why) = check(&bare, &flat_6(), &at(100., 0.03), &machine) else {
+            panic!()
+        };
+        let name = why.strip_suffix(" has no cutting data.").unwrap();
         assert!(
-            problems.len() == 1
-                && problems[0].contains("Chip load")
-                && problems[0].contains("above"),
-            "{problems:?}"
+            name.starts_with("Odd yyy") && name.chars().count() == 60,
+            "{why}"
         );
     }
     #[test]
