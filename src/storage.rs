@@ -116,6 +116,18 @@ mod tests {
         fs::remove_file(p).unwrap();
     }
     #[test]
+    fn the_bearing_housing_example_links_to_a_starter_material() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bearing-housing.axis.json");
+        let (doc, notes) = load_reporting(&path).unwrap();
+        let material: Vec<_> = notes.iter().filter(|n| n.contains("material")).collect();
+        assert_eq!(
+            material,
+            ["The project material \"Aluminium 6061-T6\" was linked to the library."]
+        );
+        assert_eq!(doc.materials.len(), 9);
+        assert!(doc.selected_material().unwrap().cutting_data().is_some());
+    }
+    #[test]
     fn loading_refuses_materials_that_share_an_id_or_have_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("materials.axis.json");

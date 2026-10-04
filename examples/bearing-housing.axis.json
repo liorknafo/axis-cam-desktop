@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "title": "Bearing housing",
-  "material": "Aluminum 6061",
+  "material": "Aluminium 6061-T6",
   "file": null,
   "machines": [
     {
