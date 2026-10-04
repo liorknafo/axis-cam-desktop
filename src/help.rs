@@ -204,6 +204,9 @@ pub fn command(m: &Message, label: String) -> Help {
         Page(crate::Page::Tools) => {
             "Define cutters and holders, then choose a saved tool inside each operation."
         }
+        Page(crate::Page::Materials) => {
+            "Manage the material library: each material's group, notes and the surface speed and chip load ranges for carbide tools that speeds and feeds are checked against. Choose the project material in the setup."
+        }
         Page(crate::Page::Ai) => {
             "Sign in with ChatGPT and let the model propose a complete job for the imported part. The app checks every proposal before you can apply it; nothing is sent until you click Plan."
         }
@@ -315,6 +318,21 @@ pub fn command(m: &Message, label: String) -> Help {
         SaveTool => "Validate the cutter and save it to the project's tool library.",
         DeleteTool(_) => {
             "Remove this cutter if no operation uses it. Assign another tool to those operations first."
+        }
+        NewMaterial => {
+            "Create a material with a name, group, notes and optional cutting data. It joins the library when you save it."
+        }
+        EditMaterial(_) => {
+            "Edit this library material. Its cutting data are starting points for carbide tools; compare them with your tool maker's data."
+        }
+        SaveMaterial => {
+            "Validate the material and save it to the library. The name must be new and the cutting data complete or empty."
+        }
+        DeleteMaterial(_) => {
+            "Remove this material from the library. The project material cannot be deleted while it is selected: choose another one in the setup first."
+        }
+        PickMaterial(_) => {
+            "Use this library material for the project. Its cutting data are used to check speeds and feeds and are sent to the AI planner."
         }
         SetOpTool(_) => {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview."
@@ -434,6 +452,38 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (Target::Setup, "clearance") => (
             "Requested minimum gap between the fixture and the outside of the cutter or holder, in mm. The illustration shows a side gap measured from the wider holder. This value is saved with the setup; it does not change operation heights or toolpaths. Fixture geometry and collision checking are not connected yet.",
             Some(FixtureClearance),
+        ),
+        (Target::Material, "name") => (
+            "The material's name in the library and in the project material list. Each material needs its own name; capitals do not make a name different.",
+            None,
+        ),
+        (Target::Material, "group") => (
+            "The kind of material. It is saved with the material, shown in the library list and described to the AI planner.",
+            None,
+        ),
+        (Target::Material, "hardness") => (
+            "Optional hardness of the material, such as 95 HB. It is recorded with the material and does not change any limit.",
+            None,
+        ),
+        (Target::Material, "notes") => (
+            "Optional notes on the material, up to 500 characters: coolant, chip clearing or anything else to remember. They are saved with the material.",
+            None,
+        ),
+        (Target::Material, "vc_min") => (
+            "Lowest recommended surface speed for carbide tools, in m/min. Surface speed = π × tool diameter × spindle rpm ÷ 1000. A slower operation is flagged, unless the machine's top spindle speed is the limit.",
+            None,
+        ),
+        (Target::Material, "vc_max") => (
+            "Highest recommended surface speed for carbide tools, in m/min. Surface speed = π × tool diameter × spindle rpm ÷ 1000. A faster operation is flagged.",
+            None,
+        ),
+        (Target::Material, k) if k.starts_with("fz") && k.ends_with("_min") => (
+            "Lowest recommended chip load per tooth, in mm, for tools in this diameter range. Chip load = feed ÷ (rpm × flutes). A lower value is flagged, unless the machine's top feed is the limit.",
+            None,
+        ),
+        (Target::Material, k) if k.starts_with("fz") && k.ends_with("_max") => (
+            "Highest recommended chip load per tooth, in mm, for tools in this diameter range. Chip load = feed ÷ (rpm × flutes). A higher value is flagged.",
+            None,
         ),
         (_, "name") => (
             "A descriptive name shown in the browser, library and setup sheet. Use names that identify the part position, operation or hardware.",
@@ -797,7 +847,9 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
     };
     Help {
-        title: label.into(),
+        title: crate::material::label(key)
+            .filter(|_| target == Target::Material)
+            .unwrap_or_else(|| label.into()),
         body: body.into(),
         diagram,
     }
@@ -1533,6 +1585,67 @@ mod tests {
         assert_eq!(
             command(&Message::SignOut, "x".into()).body,
             "Sign out of ChatGPT on this computer and ask OpenAI to revoke this sign-in. The saved sign-in is deleted."
+        );
+    }
+    #[test]
+    fn material_commands_and_fields_have_specific_help() {
+        use crate::Page::Materials;
+        let generic = command(&Message::Noop, "x".into()).body;
+        for message in [
+            Message::NewMaterial,
+            Message::EditMaterial("m".into()),
+            Message::SaveMaterial,
+            Message::DeleteMaterial("m".into()),
+            Message::PickMaterial("m".into()),
+            Message::Page(Materials),
+        ] {
+            let body = command(&message, "x".into()).body;
+            assert_ne!(body, generic, "{message:?}");
+            for claim in ["collision", "gouge", "cutting load", "cutting-load"] {
+                assert!(!body.contains(claim), "{message:?}: {body}");
+            }
+        }
+        assert!(
+            command(&Message::PickMaterial("m".into()), "x".into())
+                .body
+                .contains("sent to the AI planner")
+        );
+        assert!(
+            command(&Message::DeleteMaterial("m".into()), "x".into())
+                .body
+                .contains("project material")
+        );
+        let unknown = field_help("zz", "x", Target::Material).body;
+        assert!(unknown.starts_with("Saved parameter"));
+        let keys = ["name", "group", "hardness", "notes", "vc_min", "vc_max"]
+            .into_iter()
+            .map(String::from)
+            .chain(
+                ["fz3", "fz6", "fz10", "fz16", "fzbig"]
+                    .into_iter()
+                    .flat_map(|b| [format!("{b}_min"), format!("{b}_max")]),
+            );
+        for key in keys {
+            let help = field_help(&key, "Minimum", Target::Material);
+            assert_ne!(help.body, unknown, "{key}");
+            assert!(!help.body.contains("reclamp"), "{key}: {}", help.body);
+        }
+        // A cutting-data field names itself in full, whatever its label says.
+        assert_eq!(
+            field_help("fz6_min", "Minimum", Target::Material).title,
+            "Chip load up to 6 mm, minimum"
+        );
+        assert_eq!(
+            field_help("vc_max", "Maximum", Target::Material).title,
+            "Surface speed, maximum"
+        );
+        assert_eq!(
+            field_help("name", "Material name", Target::Material).title,
+            "Material name"
+        );
+        assert_eq!(
+            field_help("fz6_min", "Minimum", Target::Tool).title,
+            "Minimum"
         );
     }
     #[test]

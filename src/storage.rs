@@ -116,6 +116,23 @@ mod tests {
         fs::remove_file(p).unwrap();
     }
     #[test]
+    fn loading_refuses_materials_that_share_an_id_or_have_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("materials.axis.json");
+        let mut doc = Document::default();
+        doc.adopt_materials();
+        save(&path, &doc).unwrap();
+        assert_eq!(load(&path).unwrap().materials.len(), 9);
+        let first = doc.materials[0].id.clone();
+        doc.materials[1].id = first;
+        save(&path, &doc).unwrap();
+        let error = load(&path).unwrap_err();
+        assert!(error.contains("duplicate library identifier"), "{error}");
+        doc.materials[1].id.clear();
+        save(&path, &doc).unwrap();
+        assert!(load(&path).is_err());
+    }
+    #[test]
     fn legacy_relative_dimensions_are_preserved_and_new_offsets_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stock.axis.json");

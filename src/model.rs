@@ -927,6 +927,25 @@ impl Document {
             .iter()
             .find(|m| !self.material_id.is_empty() && m.id == self.material_id)
     }
+    /// Why `material` cannot be saved to the library: another material has
+    /// its name (ignoring case).
+    pub fn material_name_issues(&self, material: &crate::material::Material) -> Vec<String> {
+        let name = material.name().trim().to_lowercase();
+        let taken = !name.is_empty()
+            && self
+                .materials
+                .iter()
+                .any(|m| m.id != material.id && m.name().trim().to_lowercase() == name);
+        taken
+            .then(|| {
+                format!(
+                    "A material named {} is already in the library.",
+                    material.name().trim()
+                )
+            })
+            .into_iter()
+            .collect()
+    }
     pub fn select_material(&mut self, id: &str) -> bool {
         let Some(name) = self
             .materials
@@ -1050,6 +1069,7 @@ impl Document {
                 .map(|m| m.id.as_str())
                 .collect::<Vec<_>>(),
             self.tools.iter().map(|t| t.id.as_str()).collect(),
+            self.materials.iter().map(|m| m.id.as_str()).collect(),
         ] {
             let mut seen = HashSet::new();
             if ids.iter().any(|id| id.is_empty() || !seen.insert(id)) {
@@ -1429,6 +1449,44 @@ mod tests {
         assert!(doc.select_material(&id));
         assert_eq!(doc.material, "Mild steel 1018");
         assert!(!doc.select_material("missing"));
+    }
+    #[test]
+    fn a_project_with_duplicate_or_empty_material_ids_is_refused() {
+        use crate::material::Material;
+        let mut doc = Document::default();
+        doc.adopt_materials();
+        assert!(doc.validate_structure().is_ok());
+        let mut copy = doc.materials[0].clone();
+        copy.p.insert("name".into(), "Other name".into());
+        doc.materials.push(copy);
+        let error = doc.validate_structure().unwrap_err();
+        assert!(error.contains("duplicate library identifier"), "{error}");
+        doc.materials.pop();
+        let mut blank = Material::new("No id");
+        blank.id.clear();
+        doc.materials.push(blank);
+        assert!(doc.validate_structure().is_err());
+        doc.materials.pop();
+        assert!(doc.validate_structure().is_ok());
+    }
+    #[test]
+    fn a_material_name_is_taken_regardless_of_case_and_spaces() {
+        use crate::material::Material;
+        let mut doc = Document::default();
+        doc.adopt_materials();
+        let mut same = Material::new(" aluminium 6061-t6 ");
+        assert_eq!(
+            doc.material_name_issues(&same),
+            ["A material named aluminium 6061-t6 is already in the library."]
+        );
+        // The material itself keeps its name, and a blank name is not a clash.
+        same.id = doc.materials[0].id.clone();
+        assert!(doc.material_name_issues(&same).is_empty());
+        assert!(doc.material_name_issues(&Material::new("  ")).is_empty());
+        assert!(
+            doc.material_name_issues(&Material::new("Titanium"))
+                .is_empty()
+        );
     }
     #[test]
     fn a_library_with_entries_gets_no_starters() {

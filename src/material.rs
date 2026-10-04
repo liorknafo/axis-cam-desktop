@@ -22,12 +22,36 @@ pub const BANDS: [(&str, f32); 5] = [
 ];
 pub const STARTER_NOTE: &str =
     "Starting point for carbide tools: adjust to your machine and your tool maker's data.";
+/// Every cutting-data key prefix: the surface speed, then each chip-load band.
+fn bases() -> impl Iterator<Item = &'static str> {
+    std::iter::once("vc").chain(BANDS.iter().map(|(k, _)| *k))
+}
 /// Every cutting-data key, in pairs.
 fn keys() -> Vec<String> {
-    std::iter::once("vc")
-        .chain(BANDS.iter().map(|(k, _)| *k))
+    bases()
         .flat_map(|k| [format!("{k}_min"), format!("{k}_max")])
         .collect()
+}
+/// What a cutting-data key prefix measures, such as "Chip load up to 6 mm".
+fn what(base: &str) -> Option<String> {
+    if base == "vc" {
+        return Some("Surface speed".into());
+    }
+    let i = BANDS.iter().position(|(k, _)| *k == base)?;
+    Some(match BANDS[i].1 {
+        limit if limit.is_finite() => format!("Chip load up to {limit} mm"),
+        _ => format!("Chip load over {} mm", BANDS[i - 1].1),
+    })
+}
+/// A cutting-data key in words, such as "Chip load up to 6 mm, minimum".
+pub fn label(key: &str) -> Option<String> {
+    let (base, side) = key.rsplit_once('_')?;
+    let side = match side {
+        "min" => "minimum",
+        "max" => "maximum",
+        _ => return None,
+    };
+    Some(format!("{}, {side}", what(base)?))
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Material {
@@ -51,10 +75,17 @@ impl Material {
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
+    fn positive(&self, key: &str) -> Option<f32> {
+        num(&self.p, key).filter(|v| *v > 0.)
+    }
+    fn bounds(&self, base: &str) -> Option<(f32, f32)> {
+        Some((
+            self.positive(&format!("{base}_min"))?,
+            self.positive(&format!("{base}_max"))?,
+        ))
+    }
     fn pair(&self, key: &str) -> Option<(f32, f32)> {
-        let min = num(&self.p, &format!("{key}_min"))?;
-        let max = num(&self.p, &format!("{key}_max"))?;
-        (min > 0. && min <= max).then_some((min, max))
+        self.bounds(key).filter(|(min, max)| min <= max)
     }
     pub fn cutting_data(&self) -> Option<CuttingData> {
         let vc = self.pair("vc")?;
@@ -85,22 +116,18 @@ impl Material {
         }
         if filled == keys.len() {
             for k in &keys {
-                if !num(&self.p, k).is_some_and(|v| v > 0.) {
-                    e.push(format!("{k} must be a positive number."));
+                if self.positive(k).is_none() {
+                    e.push(format!(
+                        "{}, must be a positive number.",
+                        label(k).unwrap_or_else(|| k.clone())
+                    ));
                 }
             }
-            if self.pair("vc").is_none() {
-                e.push("Surface speed: the minimum must not exceed the maximum.".into());
-            }
-            for (k, limit) in BANDS {
-                if self.pair(k).is_none() {
-                    let band = if limit.is_finite() {
-                        format!("up to {limit} mm")
-                    } else {
-                        "over 16 mm".into()
-                    };
+            for base in bases() {
+                if self.bounds(base).is_some() && self.pair(base).is_none() {
                     e.push(format!(
-                        "Chip load {band}: the minimum must not exceed the maximum."
+                        "{}: the minimum must not exceed the maximum.",
+                        what(base).unwrap_or_else(|| base.into())
                     ));
                 }
             }
@@ -380,6 +407,70 @@ mod tests {
         let mut long = alu();
         long.p.insert("notes".into(), "x".repeat(501));
         assert!(long.issues().iter().any(|e| e.contains("500")));
+    }
+    #[test]
+    fn a_bad_value_is_named_in_words_without_a_false_ordering_message() {
+        for (key, value, expected) in [
+            (
+                "fz6_min",
+                "-0.01",
+                "Chip load up to 6 mm, minimum, must be a positive number.",
+            ),
+            (
+                "vc_max",
+                "abc",
+                "Surface speed, maximum, must be a positive number.",
+            ),
+            (
+                "fzbig_max",
+                "0",
+                "Chip load over 16 mm, maximum, must be a positive number.",
+            ),
+            (
+                "fz3_min",
+                "",
+                "Fill in every cutting-data field, or leave them all empty.",
+            ),
+        ] {
+            let mut m = alu();
+            m.p.insert(key.into(), value.into());
+            assert_eq!(m.issues(), [expected], "{key}");
+        }
+        let mut both = alu();
+        both.p.insert("vc_min".into(), "x".into());
+        both.p.insert("fz10_max".into(), "-1".into());
+        assert_eq!(
+            both.issues(),
+            [
+                "Surface speed, minimum, must be a positive number.",
+                "Chip load up to 10 mm, maximum, must be a positive number."
+            ]
+        );
+        assert_eq!(label("fz16_max").unwrap(), "Chip load up to 16 mm, maximum");
+        assert!(label("name").is_none() && label("fz7_min").is_none());
+    }
+    #[test]
+    fn the_ordering_message_needs_two_positive_numbers() {
+        let mut m = alu();
+        m.p.insert("vc_min".into(), "400".into());
+        m.p.insert("fzbig_min".into(), "0.5".into());
+        assert_eq!(
+            m.issues(),
+            [
+                "Surface speed: the minimum must not exceed the maximum.",
+                "Chip load over 16 mm: the minimum must not exceed the maximum."
+            ]
+        );
+        // A minimum equal to the maximum is fine.
+        let mut equal = alu();
+        equal.p.insert("vc_min".into(), "300".into());
+        assert!(equal.issues().is_empty() && equal.cutting_data().is_some());
+        // A non-positive or non-numeric partner is reported on its own.
+        let mut zero = alu();
+        zero.p.insert("vc_max".into(), "0".into());
+        assert_eq!(zero.issues().len(), 1);
+        assert!(zero.issues()[0].contains("must be a positive number"));
+        assert!(zero.cutting_data().is_none());
     }
     #[test]
     fn bands_follow_the_tool_diameter() {

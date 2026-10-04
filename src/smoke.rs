@@ -100,6 +100,7 @@ impl App {
                 106 => "83-planner-failed".into(),
                 107 => "84-planner-running".into(),
                 108 => "85-planner-ready".into(),
+                109 => "86-materials".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -160,6 +161,7 @@ impl App {
             8 => vec![Message::Page(Page::Post)],
             9 => {
                 self.doc = crate::model::Document::sample();
+                self.doc.adopt_materials();
                 let _ = self.update(Message::SelectOp(3));
                 let _ = self.update(Message::Edit(
                     Target::Operation,
@@ -176,6 +178,7 @@ impl App {
                     .join(format!("examples/four-setup-block.{format}"));
                 let mesh = crate::mesh::load(&path).expect("real CAD fixture import");
                 self.doc = crate::model::Document::sample();
+                self.doc.adopt_materials();
                 let info = crate::model::ModelFile {
                     name: format!("four-setup-block.{format}"),
                     path: path.to_string_lossy().into_owned(),
@@ -194,7 +197,9 @@ impl App {
             15 => vec![Message::NewProject],
             16 => vec![Message::Page(Page::Home)],
             17 => {
-                self.replace_document(crate::model::Document::default(), None);
+                let mut doc = crate::model::Document::default();
+                doc.adopt_materials();
+                self.replace_document(doc, None);
                 let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("examples/four-setup-block.3mf");
                 let mesh = crate::mesh::load(&path).unwrap();
@@ -765,6 +770,7 @@ impl App {
                 assert!(unmet.is_empty(), "the ready screen's checklist: {unmet:?}");
                 vec![]
             }
+            109 => vec![Message::Page(Page::Materials)],
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());
@@ -816,6 +822,7 @@ mod tests {
             Page::Work,
             Page::Machines,
             Page::Tools,
+            Page::Materials,
             Page::Ai,
             Page::Post,
             Page::Wizard,
@@ -1178,6 +1185,164 @@ mod tests {
         let _ = a.update(Message::SaveTool);
         assert_eq!(a.doc.tools.len(), 1, "{}", a.status);
         assert_eq!(a.doc.tools[0].number(), Some(1));
+    }
+    #[test]
+    fn materials_are_created_edited_saved_and_deleted_like_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let before = a.doc.materials.len();
+        let _ = a.update(Message::NewMaterial);
+        assert_eq!(a.page, Page::Materials);
+        let _ = a.update(Message::Edit(
+            Target::Material,
+            "name",
+            "Titanium Gr5".into(),
+        ));
+        let _ = a.update(Message::SaveMaterial);
+        assert_eq!(a.doc.materials.len(), before + 1);
+        // A duplicate name is refused.
+        let _ = a.update(Message::NewMaterial);
+        let _ = a.update(Message::Edit(
+            Target::Material,
+            "name",
+            "titanium gr5".into(),
+        ));
+        let _ = a.update(Message::SaveMaterial);
+        assert_eq!(a.doc.materials.len(), before + 1);
+        assert!(a.status.contains("already"), "{}", a.status);
+        // Partial cutting data is refused with the material's issue.
+        let id = a.doc.materials.last().unwrap().id.clone();
+        let _ = a.update(Message::EditMaterial(id.clone()));
+        let _ = a.update(Message::Edit(Target::Material, "vc_min", "40".into()));
+        let _ = a.update(Message::SaveMaterial);
+        assert!(
+            a.status.contains("every cutting-data field"),
+            "{}",
+            a.status
+        );
+        // The project material cannot be deleted while selected.
+        let _ = a.update(Message::PickMaterial(id.clone()));
+        assert_eq!(a.doc.material, "Titanium Gr5");
+        let _ = a.update(Message::DeleteMaterial(id.clone()));
+        assert!(a.doc.materials.iter().any(|m| m.id == id));
+        assert!(a.status.contains("project material"), "{}", a.status);
+        let other = a.doc.materials[0].id.clone();
+        let _ = a.update(Message::PickMaterial(other));
+        let _ = a.update(Message::DeleteMaterial(id.clone()));
+        assert!(!a.doc.materials.iter().any(|m| m.id == id));
+        a.page = Page::Materials;
+        let _ = a.view();
+    }
+    #[test]
+    fn saving_a_material_keeps_names_unique_trimmed_and_the_project_material_in_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        // The editor starts on the first library material, like the tool editor.
+        assert_eq!(a.material_draft.id, a.doc.materials[0].id);
+        let _ = a.update(Message::NewMaterial);
+        let _ = a.update(Message::Edit(
+            Target::Material,
+            "name",
+            "  Titanium Gr5  ".into(),
+        ));
+        let _ = a.update(Message::SaveMaterial);
+        assert_eq!(a.status, "Material saved to the library.");
+        let id = a.doc.materials.last().unwrap().id.clone();
+        assert_eq!(a.doc.materials.last().unwrap().name(), "Titanium Gr5");
+        // Renaming the project material renames the project's material too,
+        // and keeping the same name in another case is not a clash with itself.
+        let _ = a.update(Message::PickMaterial(id.clone()));
+        let _ = a.update(Message::EditMaterial(id.clone()));
+        let _ = a.update(Message::Edit(
+            Target::Material,
+            "name",
+            "TITANIUM GR5".into(),
+        ));
+        let _ = a.update(Message::SaveMaterial);
+        assert_eq!(a.doc.material, "TITANIUM GR5");
+        assert_eq!(a.doc.selected_material().unwrap().name(), "TITANIUM GR5");
+        assert_eq!(a.doc.materials.iter().filter(|m| m.id == id).count(), 1);
+        // A rename onto another material's name is refused, in any case.
+        let _ = a.update(Message::Edit(
+            Target::Material,
+            "name",
+            "mild STEEL 1018".into(),
+        ));
+        assert!(
+            a.doc
+                .material_name_issues(&a.material_draft)
+                .iter()
+                .any(|e| e.contains("already")),
+        );
+        let _ = a.update(Message::SaveMaterial);
+        assert!(a.status.contains("already"), "{}", a.status);
+        assert_eq!(a.doc.material, "TITANIUM GR5");
+        assert_eq!(a.doc.material_id, id);
+        // Another material's save leaves the project material alone.
+        let first = a.doc.materials[0].id.clone();
+        let _ = a.update(Message::EditMaterial(first));
+        let _ = a.update(Message::Edit(Target::Material, "notes", "Checked.".into()));
+        let _ = a.update(Message::SaveMaterial);
+        assert_eq!(a.doc.material, "TITANIUM GR5");
+        assert_eq!(get(&a.doc.materials[0].p, "notes"), "Checked.");
+        assert!(a.doc.validate_structure().is_ok());
+        // Deleting a material puts the editor on the first one that is left.
+        let _ = a.update(Message::DeleteMaterial(first_but(&a, &id)));
+        assert_eq!(a.material_draft.id, a.doc.materials[0].id);
+        assert!(a.status.contains("deleted"), "{}", a.status);
+        // Deleting a draft that was never saved only discards it.
+        let count = a.doc.materials.len();
+        let _ = a.update(Message::NewMaterial);
+        let draft = a.material_draft.id.clone();
+        let _ = a.update(Message::DeleteMaterial(draft));
+        assert_eq!(a.doc.materials.len(), count);
+        assert_eq!(a.material_draft.id, a.doc.materials[0].id);
+        assert!(a.status.contains("discarded"), "{}", a.status);
+    }
+    fn first_but(a: &App, id: &str) -> String {
+        a.doc
+            .materials
+            .iter()
+            .find(|m| m.id != id)
+            .unwrap()
+            .id
+            .clone()
+    }
+    #[test]
+    fn the_material_picker_selects_by_id_and_every_state_renders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.replace_document(Document::sample(), None);
+        a.doc.adopt_materials();
+        a.page = Page::Work;
+        let _ = a.update(Message::SetupEditor);
+        let _ = a.view();
+        let steel = a.doc.materials[2].id.clone();
+        a.project_dirty = false;
+        let _ = a.update(Message::PickMaterial(steel.clone()));
+        assert_eq!(
+            (a.doc.material.as_str(), &a.doc.material_id),
+            ("Mild steel 1018", &steel)
+        );
+        assert!(a.project_dirty);
+        // An id that is not in the library changes nothing.
+        a.project_dirty = false;
+        let _ = a.update(Message::PickMaterial("missing".into()));
+        assert_eq!(a.doc.material_id, steel);
+        assert!(!a.project_dirty);
+        // A material without cutting data, and none at all, still render.
+        let mut bare = crate::material::Material::new("Inconel 718");
+        bare.p.insert("notes".into(), "Hard.".into());
+        let bare_id = bare.id.clone();
+        a.doc.materials.push(bare);
+        let _ = a.update(Message::PickMaterial(bare_id));
+        let _ = a.view();
+        a.doc.material_id.clear();
+        let _ = a.view();
+        for page in [Page::Materials, Page::Work] {
+            a.page = page;
+            let _ = a.view();
+        }
     }
     #[test]
     fn closing_waits_for_a_sign_out_and_exits_past_blocking_work() {
@@ -2371,7 +2536,15 @@ mod tests {
         let _ = a.update(Message::NewMachine);
         let _ = a.update(Message::SaveMachine);
         let _ = a.update(Message::Title("Renamed after apply".into()));
-        let _ = a.update(Message::Material("Brass".into()));
+        let brass = a
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Brass C360")
+            .unwrap()
+            .id
+            .clone();
+        let _ = a.update(Message::PickMaterial(brass));
         let (tools, machines) = (json(&a.doc.tools), json(&a.doc.machines));
         assert_eq!(a.doc.tools.len(), before.tools.len() + 1);
         assert_eq!(a.doc.machines.len(), before.machines.len() + 1);
@@ -2396,7 +2569,7 @@ mod tests {
         assert_eq!(json(&a.doc.tools), tools);
         assert_eq!(json(&a.doc.machines), machines);
         assert_eq!(a.doc.title, "Renamed after apply");
-        assert_eq!(a.doc.material, "Brass");
+        assert_eq!(a.doc.material, "Brass C360");
         assert!(a.undo.is_none());
         assert!(a.doc.validate_structure().is_ok());
     }

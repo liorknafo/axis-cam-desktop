@@ -285,6 +285,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 app.page == Page::Machines
             ),
             btn("Tools", Message::Page(Page::Tools), app.page == Page::Tools),
+            btn(
+                "Materials",
+                Message::Page(Page::Materials),
+                app.page == Page::Materials
+            ),
             btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai),
             btn(
                 "Operation support",
@@ -308,6 +313,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Page::Machines => machines(app),
         Page::Wizard => wizard(app),
         Page::Tools => tools(app),
+        Page::Materials => materials(app),
         Page::Ai => ai(app),
         Page::Post => post(app),
         Page::Audit => operation_audit(app),
@@ -1590,13 +1596,7 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
             ],
             t
         ),
-        column![
-            muted("Project material"),
-            help::wrap(text_input("Material", &app.doc.material)
-                .on_input(Message::Material).padding(8).size(13),
-                Help::text("Project material", "Material to machine, such as Aluminum 6061. This is recorded in the setup sheet; automatic feed and speed recommendations are not connected yet."), widget::tooltip::Position::Left)
-        ]
-        .spacing(5),
+        material_picker(app),
         section("Stock")
     ]
     .spacing(12);
@@ -1743,6 +1743,67 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
         c=c.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![btn("Cancel",Message::ConfirmDeleteSetup(false),false),primary("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
     } else {
         c = c.push(btn("Delete setup…", Message::RemoveSetup, false).width(Fill));
+    }
+    c.into()
+}
+/// A library material in the project material list.
+#[derive(Clone, PartialEq)]
+struct MaterialChoice {
+    id: String,
+    name: String,
+}
+impl std::fmt::Display for MaterialChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+fn material_picker(app: &App) -> Element<'_, Message> {
+    let choices: Vec<MaterialChoice> = app
+        .doc
+        .materials
+        .iter()
+        .map(|m| MaterialChoice {
+            id: m.id.clone(),
+            name: m.name().to_string(),
+        })
+        .collect();
+    let selected = app.doc.selected_material();
+    let chosen = selected.and_then(|m| choices.iter().find(|c| c.id == m.id).cloned());
+    let mut c = column![
+        muted("Project material"),
+        help::wrap(
+            pick_list(choices, chosen, |c| Message::PickMaterial(c.id))
+                .placeholder("Choose a material")
+                .width(Fill)
+                .padding([7, 9])
+                .text_size(13),
+            Help::text(
+                "Project material",
+                "Material from the library. Its cutting data are used to check speeds and feeds and are sent to the AI planner."
+            ),
+            widget::tooltip::Position::Left
+        ),
+        btn(
+            "Open material library",
+            Message::Page(Page::Materials),
+            false
+        )
+        .width(Fill)
+    ]
+    .spacing(5);
+    match selected {
+        Some(m) if m.cutting_data().is_none() => {
+            c = c.push(muted(format!(
+                "{} has no cutting data: speeds and feeds are not checked.",
+                m.name()
+            )))
+        }
+        None => {
+            c = c.push(muted(
+                "No material is chosen: speeds and feeds are not checked.",
+            ))
+        }
+        _ => {}
     }
     c.into()
 }
@@ -2088,6 +2149,100 @@ fn tools(app: &App) -> Element<'_, Message> {
         .spacing(10),
     );
     container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),container(scrollable(form)).padding(24).width(Fill).height(Fill).style(panel_style)].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
+}
+fn materials(app: &App) -> Element<'_, Message> {
+    let mut list = column![
+        bold("Material library", 17),
+        primary("+ New material", Message::NewMaterial)
+    ]
+    .spacing(12);
+    for m in &app.doc.materials {
+        let data = m.cutting_data().map_or("no cutting data".to_string(), |d| {
+            format!("Vc {}–{} m/min", d.vc.0, d.vc.1)
+        });
+        list = list.push(
+            btn(
+                format!("{}\n{} · {}", m.name(), get(&m.p, "group"), data),
+                Message::EditMaterial(m.id.clone()),
+                app.material_draft.id == m.id,
+            )
+            .width(Fill),
+        );
+    }
+    let p = &app.material_draft.p;
+    let t = Target::Material;
+    let mut form = column![
+        bold("Material definition", 21),
+        field(p, "name", "Material name", t),
+        choice(p, "group", "Material group", &crate::material::GROUPS, t),
+        field(p, "hardness", "Hardness", t),
+        field(p, "notes", "Notes", t),
+        section("Cutting data for carbide tools"),
+        muted("Fill in every field, or leave them all empty.")
+    ]
+    .spacing(14);
+    let pair = |label: &'static str, min: &'static str, max: &'static str| {
+        column![
+            muted(label),
+            row![
+                container(field(p, min, "Minimum", t)).width(Length::FillPortion(1)),
+                container(field(p, max, "Maximum", t)).width(Length::FillPortion(1))
+            ]
+            .spacing(10)
+        ]
+        .spacing(5)
+    };
+    form = form
+        .push(pair("Surface speed · m/min", "vc_min", "vc_max"))
+        .push(muted("Chip load per tooth · mm"));
+    for (label, min, max) in [
+        ("Ø up to 3", "fz3_min", "fz3_max"),
+        ("Ø 3–6", "fz6_min", "fz6_max"),
+        ("Ø 6–10", "fz10_min", "fz10_max"),
+        ("Ø 10–16", "fz16_min", "fz16_max"),
+        ("Ø over 16", "fzbig_min", "fzbig_max"),
+    ] {
+        form = form.push(pair(label, min, max));
+    }
+    let mut issues = app.material_draft.issues();
+    issues.extend(app.doc.material_name_issues(&app.material_draft));
+    form = form.push(warnings(issues)).push(
+        row![
+            primary("Save material", Message::SaveMaterial),
+            btn(
+                "Delete material",
+                Message::DeleteMaterial(app.material_draft.id.clone()),
+                false
+            )
+        ]
+        .spacing(10),
+    );
+    container(
+        column![
+            page_header(
+                "Materials",
+                "Cutting data are for carbide tools and are starting points."
+            ),
+            row![
+                container(scrollable(list))
+                    .padding(20)
+                    .width(320)
+                    .height(Fill)
+                    .style(panel_style),
+                container(scrollable(form))
+                    .padding(24)
+                    .width(Fill)
+                    .height(Fill)
+                    .style(panel_style)
+            ]
+            .spacing(20)
+            .height(Fill)
+        ]
+        .spacing(24),
+    )
+    .padding(28)
+    .height(Fill)
+    .into()
 }
 fn account_panel(app: &App) -> Element<'_, Message> {
     use crate::Account;

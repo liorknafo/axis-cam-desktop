@@ -44,6 +44,7 @@ pub enum Page {
     Work,
     Machines,
     Tools,
+    Materials,
     Wizard,
     Ai,
     Post,
@@ -55,6 +56,7 @@ pub enum Target {
     Setup,
     Machine,
     Tool,
+    Material,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Account {
@@ -93,7 +95,6 @@ pub enum Message {
     Tab(String),
     Edit(Target, &'static str, String),
     Title(String),
-    Material(String),
     AddOp(Strategy),
     DuplicateOp,
     RemoveOp,
@@ -120,6 +121,11 @@ pub enum Message {
     NewTool,
     SaveTool,
     DeleteTool(String),
+    EditMaterial(String),
+    NewMaterial,
+    SaveMaterial,
+    DeleteMaterial(String),
+    PickMaterial(String),
     SetOpTool(String),
     RestSource(String),
     StockSource(String),
@@ -240,6 +246,7 @@ pub struct App {
     pub machine_draft: Machine,
     pub wizard_step: usize,
     pub tool_draft: Tool,
+    pub material_draft: material::Material,
     pub camera: viewport::Camera,
     pub sample_mesh: mesh::Mesh,
     pub imported_mesh: Option<mesh::Mesh>,
@@ -443,6 +450,7 @@ impl App {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| blank_tool(&doc)),
+            material_draft: material_draft(&doc),
             doc,
             page: Page::Home,
             selected: None,
@@ -556,6 +564,7 @@ impl App {
             .first()
             .cloned()
             .unwrap_or_else(|| blank_tool(&doc));
+        self.material_draft = material_draft(&doc);
         self.doc = doc;
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -1293,13 +1302,12 @@ impl App {
                 Target::Tool => {
                     self.tool_draft.p.insert(k.into(), v);
                 }
+                Target::Material => {
+                    self.material_draft.p.insert(k.into(), v);
+                }
             },
             Message::Title(v) => {
                 self.doc.title = v;
-                self.touch()
-            }
-            Message::Material(v) => {
-                self.doc.material = v;
                 self.touch()
             }
             Message::AddOp(strategy) => {
@@ -1695,6 +1703,61 @@ impl App {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| blank_tool(&self.doc));
+                    self.touch()
+                }
+            }
+            Message::EditMaterial(id) => {
+                if let Some(m) = self.doc.materials.iter().find(|m| m.id == id) {
+                    self.material_draft = m.clone();
+                    self.page = Page::Materials
+                }
+            }
+            Message::NewMaterial => {
+                self.material_draft = material::Material::new("New material");
+                self.page = Page::Materials
+            }
+            Message::SaveMaterial => {
+                let mut issues = self.material_draft.issues();
+                issues.extend(self.doc.material_name_issues(&self.material_draft));
+                if issues.is_empty() {
+                    let name = self.material_draft.name().trim().to_string();
+                    self.material_draft.p.insert("name".into(), name);
+                    let saved = self.material_draft.clone();
+                    if let Some(m) = self.doc.materials.iter_mut().find(|m| m.id == saved.id) {
+                        *m = saved.clone()
+                    } else {
+                        self.doc.materials.push(saved.clone())
+                    }
+                    if self
+                        .doc
+                        .selected_material()
+                        .is_some_and(|m| m.id == saved.id)
+                    {
+                        self.doc.select_material(&saved.id);
+                    }
+                    self.touch();
+                    self.status = "Material saved to the library.".into()
+                } else {
+                    self.status = issues.join(" ")
+                }
+            }
+            Message::DeleteMaterial(id) => {
+                if self.doc.selected_material().is_some_and(|m| m.id == id) {
+                    self.status = "This is the project material. Choose another project material before deleting it.".into()
+                } else {
+                    let before = self.doc.materials.len();
+                    self.doc.materials.retain(|m| m.id != id);
+                    self.material_draft = material_draft(&self.doc);
+                    if self.doc.materials.len() < before {
+                        self.touch();
+                        self.status = "Material deleted from the library.".into()
+                    } else {
+                        self.status = "The unsaved material was discarded.".into()
+                    }
+                }
+            }
+            Message::PickMaterial(id) => {
+                if self.doc.select_material(&id) {
                     self.touch()
                 }
             }
@@ -2875,6 +2938,13 @@ fn blank_tool(doc: &Document) -> Tool {
     tool.p
         .insert("number".into(), doc.next_tool_number().to_string());
     tool
+}
+/// The material editor's draft: the first library material, or a new one.
+fn material_draft(doc: &Document) -> material::Material {
+    doc.materials
+        .first()
+        .cloned()
+        .unwrap_or_else(|| material::Material::new("New material"))
 }
 /// A status line, followed by the notes of loading the project.
 fn with_notes(status: &str, notes: &[String]) -> String {
