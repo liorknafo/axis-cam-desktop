@@ -302,6 +302,8 @@ pub struct Client {
     /// Refresh tokens this client has presented and OpenAI accepted or
     /// refused, kept for the client's lifetime: none is presented again.
     spent: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Refreshes saving their rotated tokens right now (see `saving`).
+    saves: Arc<std::sync::atomic::AtomicUsize>,
     /// Base delay between retries.
     backoff: Duration,
 }
@@ -319,8 +321,17 @@ impl Client {
             store,
             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
             spent: Arc::default(),
+            saves: Arc::default(),
             backoff: Duration::from_secs(1),
         }
+    }
+    /// Whether a refresh is saving its rotated tokens. The save runs on the
+    /// blocking pool, which the runtime lets finish when the app ends, so a
+    /// close then closes the window rather than ending the process: the old
+    /// refresh token is already spent, and losing the new set would sign the
+    /// user out.
+    pub fn saving(&self) -> bool {
+        self.saves.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
     /// A usable access token. Refreshes when it is close to expiry or when
     /// `rejected` is the token the API just refused. One refresh runs at a
@@ -359,6 +370,7 @@ impl Client {
         let store = self.store.clone();
         let backoff = self.backoff;
         let spent = self.spent.clone();
+        let saves = self.saves.clone();
         let rejected = rejected.map(str::to_string);
         let refresh = async move {
             // Another running copy may have refreshed already and saved the
@@ -384,9 +396,11 @@ impl Client {
                         // The old refresh token is spent now. If the store
                         // refuses twice, keep the new set in memory anyway.
                         spent.lock().unwrap().push(current.refresh_token.clone());
+                        saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         if store_save(&store, &new).await.is_err() {
                             let _ = store_save(&store, &new).await;
                         }
+                        saves.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         let token = new.access_token.clone();
                         *session = Some(new);
                         return Ok(token);
@@ -1637,6 +1651,64 @@ mod tests {
         assert_eq!(refreshes[0].field("refresh_token"), "refresh-1");
         // It is not the rejected one, so it is left as it is.
         assert_eq!(r.store.load().unwrap(), Some(older));
+    }
+    /// A file store whose `save` blocks its thread until the test releases it.
+    struct GatedSave {
+        file: FileStore,
+        started: AtomicBool,
+        go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl SessionStore for GatedSave {
+        fn load(&self) -> Result<Option<Session>, String> {
+            self.file.load()
+        }
+        fn save(&self, session: &Session) -> Result<(), String> {
+            self.started.store(true, Ordering::SeqCst);
+            let _ = self.go.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            self.file.save(session)
+        }
+        fn clear(&self) -> Result<(), String> {
+            self.file.clear()
+        }
+    }
+    #[tokio::test]
+    async fn a_refresh_reports_that_it_is_saving_its_tokens() {
+        let fake = Fake::start(|req: &Req| match req.path.as_str() {
+            "/token" => rotated(),
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (go, wait) = std::sync::mpsc::channel();
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        let store = Arc::new(GatedSave {
+            file: FileStore(dir.path().join("session.json")),
+            started: AtomicBool::new(false),
+            go: std::sync::Mutex::new(wait),
+        });
+        store.file.save(&soon).unwrap();
+        let client = Client::new(
+            Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store.clone(),
+            soon,
+        );
+        assert!(!client.saving());
+        let release = async {
+            assert!(until(|| store.started.load(Ordering::SeqCst)).await);
+            let saving = client.saving();
+            go.send(()).unwrap();
+            saving
+        };
+        let request = request();
+        let (result, saving) = tokio::join!(client.respond(&request), release);
+        result.unwrap();
+        assert!(saving);
+        assert!(!client.saving());
+        assert_eq!(store.load().unwrap().unwrap().refresh_token, "refresh-2");
     }
     /// A store whose `clear` blocks its thread until the test releases it.
     struct GatedStore {

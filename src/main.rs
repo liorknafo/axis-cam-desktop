@@ -157,7 +157,8 @@ pub enum Message {
     ExportError(String),
     PostChecked(u64, std::sync::Arc<post::JobPost>),
     ExportGcode,
-    GcodeExported(Result<(PathBuf, usize), String>),
+    /// None when no folder was chosen.
+    GcodeExported(Option<Result<(PathBuf, usize), String>>),
     AccountRestored(Result<Option<session::Session>, String>),
     SignIn,
     SignInCancel,
@@ -280,6 +281,8 @@ pub struct App {
     /// A close request waiting for a sign-out or a sign-in save, and when
     /// it first came.
     closing: Option<(iced::window::Id, Instant)>,
+    /// G-code exports started and not yet reported (folder choice and write).
+    gcode_exports: usize,
 }
 type PlanSender = iced::futures::channel::mpsc::Sender<Message>;
 /// The Plan task: runs the planner, sends each stage as it starts, builds the
@@ -494,6 +497,7 @@ impl App {
             confirm_delete_setup: false,
             icons,
             closing: None,
+            gcode_exports: 0,
         }
     }
     fn boot() -> (Self, Task<Message>) {
@@ -664,13 +668,27 @@ impl App {
     fn blocking_work(&self) -> bool {
         self.plan_busy.running() > 0 || self.post_busy || self.stock_mesh_job.is_some()
     }
+    /// Work that must not be cut short by ending the process: a G-code
+    /// export, and a refresh saving the rotated sign-in (its old refresh
+    /// token is already spent). Their blocking parts finish on exit.
+    fn finishing_work(&self) -> bool {
+        self.gcode_exports > 0 || self.client.as_ref().is_some_and(|c| c.saving())
+    }
     /// Saves the workspace, then closes the window, waits for a pending
     /// sign-out or sign-in save, or ends the process (see `close_action`).
     fn request_close(&mut self, id: iced::window::Id) -> Task<Message> {
         self.persist();
         let signing = self.sign_out_pending || self.saving_sign_in();
-        let waited = signing.then(|| self.closing.get_or_insert((id, Instant::now())).1.elapsed());
-        match close_action(!self.dirty, waited, self.blocking_work()) {
+        let pending = signing.then(|| {
+            let waited = self.closing.get_or_insert((id, Instant::now())).1.elapsed();
+            (waited, self.sign_out_pending)
+        });
+        match close_action(
+            !self.dirty,
+            pending,
+            self.blocking_work(),
+            self.finishing_work(),
+        ) {
             CloseAction::Stay => {
                 self.closing = None;
                 self.status = "Could not save before closing. Save Project to another location, then close again.".into();
@@ -688,6 +706,17 @@ impl App {
             CloseAction::Close => {
                 self.closing = None;
                 iced::window::close(id)
+            }
+            // The sign-out may still wait behind a refresh for the session,
+            // and the runtime drops it when the app ends. The saved sign-in
+            // is deleted on the blocking pool instead, which the runtime
+            // lets finish, before the window closes.
+            CloseAction::ClearAndClose => {
+                self.closing = None;
+                let store = self.store.clone();
+                Task::future(async move { session::start_clear(store) })
+                    .discard()
+                    .chain(iced::window::close(id))
             }
             // The workspace and History are written synchronously, so
             // nothing is lost.
@@ -2224,6 +2253,7 @@ impl App {
                     return Task::none();
                 };
                 let doc = self.doc.clone();
+                self.gcode_exports += 1;
                 return Task::perform(
                     async move {
                         let folder = rfd::AsyncFileDialog::new()
@@ -2240,17 +2270,24 @@ impl App {
                             .unwrap_or_else(|e| Err(format!("Export worker failed: {e}"))),
                         )
                     },
-                    |r| r.map_or(Message::Noop, Message::GcodeExported),
+                    Message::GcodeExported,
                 );
             }
-            Message::GcodeExported(Ok((folder, count))) => {
-                self.status = format!(
-                    "Exported {count} LinuxCNC program{} to {}. Preview each in LinuxCNC and air-cut before cutting.",
-                    if count == 1 { "" } else { "s" },
-                    folder.display()
-                )
+            Message::GcodeExported(result) => {
+                self.gcode_exports = self.gcode_exports.saturating_sub(1);
+                match result {
+                    Some(Ok((folder, count))) => {
+                        self.status = format!(
+                            "Exported {count} LinuxCNC program{} to {}. Preview each in LinuxCNC and air-cut before cutting.",
+                            if count == 1 { "" } else { "s" },
+                            folder.display()
+                        )
+                    }
+                    Some(Err(e)) => self.status = format!("G-code export failed: {e}"),
+                    // No folder was chosen.
+                    None => {}
+                }
             }
-            Message::GcodeExported(Err(e)) => self.status = format!("G-code export failed: {e}"),
             // Only the read that is pending can report a saved sign-in. A
             // result nobody is waiting for changes nothing, so a session the
             // user has signed out of since cannot come back.
@@ -2735,20 +2772,33 @@ pub(crate) enum CloseAction {
     Wait,
     /// Close the window.
     Close,
+    /// Start deleting the saved sign-in on the blocking pool, then close the
+    /// window: a sign-out is still pending after the wait.
+    ClearAndClose,
     /// End the process: blocking work would keep it running without a window.
     Exit,
 }
 /// What a close request does once the workspace save was tried. `saved`:
-/// the workspace is saved. `signing`: how long a pending sign-out or sign-in
-/// save has been waited for. `blocking`: a plan stage, the NC program
-/// refresh or the stock mesher is still running. A pending sign-out or save
-/// is never cut short by ending the process; after `CLOSE_WAIT` the window
-/// closes and the runtime lets it finish.
-pub(crate) fn close_action(saved: bool, signing: Option<Duration>, blocking: bool) -> CloseAction {
-    match signing {
+/// the workspace is saved. `pending`: how long a pending sign-out or sign-in
+/// save has been waited for, and whether it is a sign-out. `blocking`: a plan
+/// stage, the NC program refresh or the stock mesher is still running.
+/// `finishing`: a G-code export or a refresh's save of the rotated sign-in is
+/// running. Neither a pending sign-out or save nor finishing work is cut
+/// short by ending the process: the window closes and the runtime lets their
+/// blocking parts finish. After `CLOSE_WAIT`, a pending sign-out also starts
+/// deleting the saved sign-in, which the process then waits for.
+pub(crate) fn close_action(
+    saved: bool,
+    pending: Option<(Duration, bool)>,
+    blocking: bool,
+    finishing: bool,
+) -> CloseAction {
+    match pending {
         _ if !saved => CloseAction::Stay,
-        Some(waited) if waited < CLOSE_WAIT => CloseAction::Wait,
-        Some(_) => CloseAction::Close,
+        Some((waited, _)) if waited < CLOSE_WAIT => CloseAction::Wait,
+        Some((_, true)) => CloseAction::ClearAndClose,
+        Some((_, false)) => CloseAction::Close,
+        None if finishing => CloseAction::Close,
         None if blocking => CloseAction::Exit,
         None => CloseAction::Close,
     }

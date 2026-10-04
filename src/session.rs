@@ -142,6 +142,13 @@ pub fn default_store(data_dir: &Path, isolated: bool) -> Arc<dyn SessionStore> {
     Arc::new(FileStore(data_dir.join("chatgpt-session.json")))
 }
 
+/// Starts deleting the saved sign-in on Tokio's blocking pool and returns at
+/// once. The runtime lets blocking work finish when it shuts down, so the
+/// delete completes even when the app ends right after. Call it from within
+/// a Tokio runtime.
+pub fn start_clear(store: Arc<dyn SessionStore>) {
+    drop(tokio::task::spawn_blocking(move || store.clear()));
+}
 #[cfg(test)]
 pub(crate) fn sample() -> Session {
     Session {
@@ -158,6 +165,34 @@ pub(crate) fn sample() -> Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A store whose delete takes a while, like a Keychain that is slow.
+    struct SlowClear(FileStore);
+    impl SessionStore for SlowClear {
+        fn load(&self) -> Result<Option<Session>, String> {
+            self.0.load()
+        }
+        fn save(&self, session: &Session) -> Result<(), String> {
+            self.0.save(session)
+        }
+        fn clear(&self) -> Result<(), String> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            self.0.clear()
+        }
+    }
+    #[test]
+    fn a_clear_started_just_before_the_runtime_ends_still_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SlowClear(FileStore(dir.path().join("session.json"))));
+        store.save(&sample()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let started = store.clone();
+        runtime.block_on(async move { start_clear(started) });
+        // Ending the runtime, as closing the app does, waits for the delete.
+        drop(runtime);
+        assert_eq!(store.load().unwrap(), None);
+    }
     #[test]
     fn debug_output_never_contains_tokens() {
         let text = format!("{:?}", sample());

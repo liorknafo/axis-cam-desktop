@@ -1039,21 +1039,90 @@ mod tests {
         use std::time::Duration;
         let s = Duration::from_secs;
         // The workspace could not be saved: the window stays.
-        assert_eq!(close_action(false, None, false), Stay);
-        assert_eq!(close_action(false, Some(s(20)), true), Stay);
+        assert_eq!(close_action(false, None, false, false), Stay);
+        assert_eq!(close_action(false, Some((s(20), true)), true, true), Stay);
         // Nothing pending: close; blocking work would keep a windowless
         // process alive, so the process exits.
-        assert_eq!(close_action(true, None, false), Close);
-        assert_eq!(close_action(true, None, true), Exit);
+        assert_eq!(close_action(true, None, false, false), Close);
+        assert_eq!(close_action(true, None, true, false), Exit);
+        // A G-code export or a refresh saving the rotated sign-in is never
+        // cut short: the window closes and the runtime finishes it.
+        assert_eq!(close_action(true, None, true, true), Close);
+        assert_eq!(close_action(true, None, false, true), Close);
         // A sign-out or sign-in save is waited for, at most 10 seconds.
-        assert_eq!(close_action(true, Some(s(0)), true), Wait);
+        for sign_out in [true, false] {
+            assert_eq!(
+                close_action(true, Some((s(0), sign_out)), true, false),
+                Wait
+            );
+            assert_eq!(
+                close_action(
+                    true,
+                    Some((Duration::from_millis(9_900), sign_out)),
+                    false,
+                    false
+                ),
+                Wait
+            );
+        }
+        // Then the window closes, never an exit while it is still pending;
+        // a sign-out first starts deleting the saved sign-in.
         assert_eq!(
-            close_action(true, Some(Duration::from_millis(9_900)), false),
-            Wait
+            close_action(true, Some((s(10), false)), false, false),
+            Close
         );
-        assert_eq!(close_action(true, Some(s(10)), false), Close);
-        // Never an exit while it is still pending.
-        assert_eq!(close_action(true, Some(s(10)), true), Close);
+        assert_eq!(close_action(true, Some((s(10), false)), true, false), Close);
+        assert_eq!(
+            close_action(true, Some((s(10), true)), true, false),
+            ClearAndClose
+        );
+    }
+    #[test]
+    fn close_waits_for_a_sign_in_save_then_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = crate::session::sample();
+        for saved in [
+            Ok(session.clone()),
+            Err("Keychain: save denied".to_string()),
+        ] {
+            let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+            let id = iced::window::Id::unique();
+            let _ = a.update(Message::SignIn);
+            let _ = a.update(Message::SignedIn(Ok((session.clone(), "oaiapp_1".into()))));
+            assert!(a.saving_sign_in());
+            let _ = a.update(Message::Close(id));
+            assert!(a.closing.is_some());
+            assert_eq!(
+                a.status,
+                "Closing when the sign-in has been saved (at most 10 seconds)…"
+            );
+            let ok = saved.is_ok();
+            let _ = a.update(Message::SessionSaved(saved));
+            assert!(a.closing.is_none(), "{ok}");
+            assert!(!a.saving_sign_in());
+        }
+    }
+    #[test]
+    fn a_gcode_export_counts_as_work_that_must_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        assert!(!a.finishing_work());
+        let _ = a.update(Message::ExportGcode);
+        assert!(a.finishing_work());
+        // No folder chosen.
+        let _ = a.update(Message::GcodeExported(None));
+        assert!(!a.finishing_work());
+        let _ = a.update(Message::ExportGcode);
+        let _ = a.update(Message::ExportGcode);
+        let _ = a.update(Message::GcodeExported(Some(Err("disk full".into()))));
+        assert!(a.finishing_work());
+        let _ = a.update(Message::GcodeExported(Some(Ok((dir.path().into(), 2)))));
+        assert!(!a.finishing_work());
+        assert!(
+            a.status.starts_with("Exported 2 LinuxCNC programs"),
+            "{}",
+            a.status
+        );
     }
     #[test]
     fn close_waits_for_signing_out_then_closes() {
