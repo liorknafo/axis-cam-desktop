@@ -155,7 +155,7 @@ pub enum Message {
     },
     Tick,
     Plan,
-    PlanProgress(u64, planner::Progress),
+    PlanProgress(u64, planner::Event),
     PlanFinished(u64, Result<std::sync::Arc<PlanPreview>, planner::Failure>),
     PlanCancel,
     ApplyPlan,
@@ -202,6 +202,16 @@ pub enum Planner {
     Running(planner::Progress),
     Preview(std::sync::Arc<PlanPreview>),
     Failed(planner::Failure),
+}
+/// One stage of a planner run as the timeline shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub stage: planner::Progress,
+    pub started: Instant,
+    pub ended: Option<Instant>,
+    /// How the reply of this request fared: on the checking step, or on the
+    /// request step when the reply could not be read.
+    pub result: Option<planner::StepResult>,
 }
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 pub struct App {
@@ -277,6 +287,11 @@ pub struct App {
     plan_account_epoch: u64,
     /// The model the current run asks.
     pub plan_model: String,
+    /// The stages of the current or last run, with their times and results;
+    /// kept after the run for the preview or the failure.
+    pub plan_timeline: Vec<Step>,
+    /// Characters of the model's reply streamed so far in the current run.
+    pub plan_received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Blocking stages still running, also those of cancelled runs.
     pub plan_busy: planner::Busy,
     /// Set by an edit that dropped a running plan or a preview, or by a
@@ -322,14 +337,14 @@ pub(crate) async fn run_plan_with(
 ) {
     use iced::futures::SinkExt;
     let mut stages = sender.clone();
-    let result = planner::plan(backend, doc, mesh.clone(), &busy, move |stage| {
-        // Stages are only shown; one that does not fit the channel is skipped.
-        let _ = stages.try_send(Message::PlanProgress(epoch, stage));
+    let result = planner::plan(backend, doc, mesh.clone(), &busy, move |event| {
+        // Events are only shown; one that does not fit the channel is skipped.
+        let _ = stages.try_send(Message::PlanProgress(epoch, event));
     })
     .await;
     let result = match result {
         Ok(outcome) => {
-            let previewing = planner::Progress::Previewing;
+            let previewing = planner::Event::Stage(planner::Progress::Previewing);
             let _ = sender.send(Message::PlanProgress(epoch, previewing)).await;
             let job = outcome.job.clone();
             let view = planner::blocking(&busy, move || view(&job, &mesh))
@@ -505,6 +520,8 @@ impl App {
             plan_epoch: 0,
             plan_account_epoch: 0,
             plan_model: String::new(),
+            plan_timeline: vec![],
+            plan_received: Default::default(),
             plan_camera: viewport::Camera::default(),
             plan_busy: planner::Busy::default(),
             plan_dropped: None,
@@ -1006,6 +1023,50 @@ impl App {
         }
         self.plan_epoch = self.plan_epoch.wrapping_add(1);
         self.planner = Planner::Idle;
+        self.plan_timeline.clear();
+        // The aborted run may still hold the old count.
+        self.plan_received = Default::default();
+    }
+    /// Ends the timeline's open step, if any, now.
+    fn end_plan_step(&mut self) {
+        if let Some(step) = self.plan_timeline.last_mut() {
+            step.ended.get_or_insert_with(Instant::now);
+        }
+    }
+    /// Adds a run's event to the timeline: a stage ends the open step and
+    /// starts its own; a result joins the step of its request and ends it.
+    fn record_plan_event(&mut self, event: planner::Event) {
+        use planner::{Event, Progress, StepResult};
+        match event {
+            Event::Stage(stage) => {
+                self.end_plan_step();
+                self.plan_timeline.push(Step {
+                    stage,
+                    started: Instant::now(),
+                    ended: None,
+                    result: None,
+                });
+                self.planner = Planner::Running(stage);
+            }
+            Event::Checked(n, result) => {
+                let reply = matches!(result, StepResult::Unreadable(_));
+                let found = self
+                    .plan_timeline
+                    .iter_mut()
+                    .rev()
+                    .find(|step| match step.stage {
+                        Progress::Checking(at) => !reply && at == n,
+                        Progress::Asking(at)
+                        | Progress::Repairing(at)
+                        | Progress::Extending(at) => reply && at == n,
+                        _ => false,
+                    });
+                if let Some(step) = found {
+                    step.result = Some(result);
+                    step.ended.get_or_insert_with(Instant::now);
+                }
+            }
+        }
     }
     /// The planner's checklist: what must be in place before Plan is offered.
     pub fn plan_checklist(&self) -> Vec<analysis::Precondition> {
@@ -2165,7 +2226,11 @@ impl App {
                 self.plan_model = self.settings.model.clone();
                 self.planner = Planner::Running(planner::Progress::Analyzing);
                 self.status = "Planning. Nothing changes until you apply a plan.".into();
-                let backend = planner::OpenAiBackend::new(client, self.settings.model.clone());
+                let backend = planner::OpenAiBackend::new(
+                    client,
+                    self.settings.model.clone(),
+                    self.plan_received.clone(),
+                );
                 let doc = self.doc.clone();
                 let busy = self.plan_busy.clone();
                 let run = iced::stream::channel(16, async move |sender: PlanSender| {
@@ -2175,9 +2240,9 @@ impl App {
                 self.plan_run = Some(handle);
                 return task;
             }
-            Message::PlanProgress(epoch, stage) => {
+            Message::PlanProgress(epoch, event) => {
                 if epoch == self.plan_epoch && matches!(self.planner, Planner::Running(_)) {
-                    self.planner = Planner::Running(stage);
+                    self.record_plan_event(event);
                 }
             }
             Message::PlanFinished(epoch, result) => {
@@ -2185,6 +2250,7 @@ impl App {
                     return Task::none();
                 }
                 self.plan_run = None;
+                self.end_plan_step();
                 let same_client = self.plan_account_epoch == self.account_epoch;
                 match result {
                     Ok(preview) => {
@@ -2242,6 +2308,7 @@ impl App {
             Message::DiscardPlan => {
                 if matches!(self.planner, Planner::Preview(_) | Planner::Failed(_)) {
                     self.planner = Planner::Idle;
+                    self.plan_timeline.clear();
                 }
             }
             Message::ApplyPlan => {

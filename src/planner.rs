@@ -36,6 +36,45 @@ pub enum Progress {
     /// The plan passed; the 3D view of the stock is being built.
     Previewing,
 }
+/// What a run reports as it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A stage starts.
+    Stage(Progress),
+    /// The outcome of request `n`'s reply: its check, or why it was not read.
+    Checked(usize, StepResult),
+}
+/// How a reply fared: the check passed, failed with these problems, or the
+/// reply was not a proposal at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepResult {
+    Passed,
+    /// The first `SHOWN_PROBLEMS` problems, one line each, and how many more.
+    Problems {
+        shown: Vec<String>,
+        more: usize,
+    },
+    /// The parse error, one line of at most 300 characters.
+    Unreadable(String),
+}
+/// Problems a check result lists before saying how many more there were.
+const SHOWN_PROBLEMS: usize = 5;
+impl StepResult {
+    fn of(check: &CheckReport) -> Self {
+        if check.passed {
+            return Self::Passed;
+        }
+        Self::Problems {
+            shown: check
+                .problems
+                .iter()
+                .take(SHOWN_PROBLEMS)
+                .map(Problem::line)
+                .collect(),
+            more: check.problems.len().saturating_sub(SHOWN_PROBLEMS),
+        }
+    }
+}
 /// Counts the blocking stages still running, including those of runs that
 /// were cancelled: blocking work cannot be interrupted.
 #[derive(Debug, Clone, Default)]
@@ -128,7 +167,7 @@ SPEEDS AND FEEDS
 - The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter. Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
 - Drills are checked like end mills: a Drill's `feed` is divided by rpm × flutes in the same way and must give a chip load inside the band of the drill's diameter, so choose drill feeds inside those bands. A small drill needs a high rpm to reach the surface speed.
 - When even the machine's maximum rpm (`machine.max_rpm`) gives a tool less than the minimum surface speed, running at that maximum rpm counts as in range. When the minimum chip load needs more than the machine's maximum feed (`machine.max_feed`), running at that maximum feed counts as in range. A value above the material's maximum is never excused, and rounding gets 1% of slack on each limit.
-- Plunge and ramp feeds are not checked. Plans with a spindle speed or feed outside the material's cutting data are refused: each such operation comes back as a problem with the stage `cutting data`, together with the other problems.
+- Plunge and ramp feeds are not checked. Plans with a spindle speed or feed outside the material's cutting data are refused: each such operation comes back as a problem with the stage `cutting data`, together with the generation, export, tool-axis and gouge problems.
 
 RULES
 - Use only tool numbers from `tools` and surface IDs from the chosen orientation's `planes`. Never invent either.
@@ -499,7 +538,9 @@ fn json_object(text: &str) -> &str {
     }
 }
 /// The document the checks run on: no project title, and every setup named
-/// by its number, so no check message can carry the user's names to OpenAI.
+/// by its number, so no check message carries the title or a setup name to
+/// OpenAI. The cutting-data messages name the project's material, which the
+/// part report sends anyway, and each is clipped to 300 characters.
 fn anonymized(doc: &Document) -> Document {
     let mut doc = doc.clone();
     doc.title.clear();
@@ -508,14 +549,15 @@ fn anonymized(doc: &Document) -> Document {
     }
     doc
 }
-/// Runs the planner. `progress` is called as each stage starts. The job and
-/// mesh are taken by value so the returned future can move between threads.
+/// Runs the planner. `progress` is called as each stage starts and with each
+/// check's result. The job and mesh are taken by value so the returned
+/// future can move between threads.
 pub async fn plan(
     backend: &(impl Backend + Sync),
     doc: Document,
     mesh: Mesh,
     busy: &Busy,
-    progress: impl FnMut(Progress) + Send,
+    progress: impl FnMut(Event) + Send,
 ) -> Result<Outcome, Failure> {
     plan_with(
         backend,
@@ -536,7 +578,7 @@ async fn plan_with<A, C>(
     doc: Document,
     mesh: Mesh,
     busy: &Busy,
-    mut progress: impl FnMut(Progress) + Send,
+    mut progress: impl FnMut(Event) + Send,
     analyze: A,
     check: C,
 ) -> Result<Outcome, Failure>
@@ -555,7 +597,7 @@ where
         api,
         requests,
     };
-    progress(Progress::Analyzing);
+    progress(Event::Stage(Progress::Analyzing));
     let (part_doc, part_mesh) = (doc.clone(), mesh.clone());
     let report = blocking(busy, move || analyze(&part_doc, &part_mesh))
         .await
@@ -577,7 +619,7 @@ where
     let mut note = None;
     let mut stage: fn(usize) -> Progress = Progress::Asking;
     for request in 1..=MAX_REQUESTS {
-        progress(stage(request));
+        progress(Event::Stage(stage(request)));
         made = request;
         let text = match backend.reply(&messages).await {
             Ok(text) => text,
@@ -597,7 +639,12 @@ where
                 ));
             }
         };
-        let (proposal, more_warnings, more_unmachined) = match proposal::parse(json_object(&text)) {
+        let parsed = proposal::parse(json_object(&text));
+        if let Err(error) = &parsed {
+            let unreadable = StepResult::Unreadable(proposal::clip(error, 300));
+            progress(Event::Checked(request, unreadable));
+        }
+        let (proposal, more_warnings, more_unmachined) = match parsed {
             Ok(proposal) => tidy(proposal),
             Err(_) if best.is_some() => break,
             Err(error) => {
@@ -613,7 +660,7 @@ where
                 continue;
             }
         };
-        progress(Progress::Checking(request));
+        progress(Event::Stage(Progress::Checking(request)));
         let (doc, mesh, part, candidate, check) = (
             doc.clone(),
             mesh.clone(),
@@ -635,6 +682,7 @@ where
                 ));
             }
         };
+        progress(Event::Checked(request, StepResult::of(&check)));
         let next = feedback(&check);
         if let (true, Some(mut job)) = (check.passed, job) {
             // The job is the user's again: Apply keeps setup 1's real name.
@@ -703,13 +751,20 @@ pub struct OpenAiBackend {
     /// Set once the plan route refused structured output: later requests of
     /// the run ask for plain JSON at once.
     plain: std::sync::atomic::AtomicBool,
+    /// Characters of the current reply streamed so far, for the page.
+    received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 impl OpenAiBackend {
-    pub fn new(client: std::sync::Arc<crate::openai::Client>, model: String) -> Self {
+    pub fn new(
+        client: std::sync::Arc<crate::openai::Client>,
+        model: String,
+        received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         Self {
             client,
             model,
             plain: false.into(),
+            received,
         }
     }
 }
@@ -723,9 +778,13 @@ impl Backend for OpenAiBackend {
             schema: proposal::schema(),
         };
         if self.plain.load(Ordering::Relaxed) {
-            return self.client.respond_plain(&request).await.map(|r| r.text);
+            let reply = self.client.respond_plain_counting(&request, &self.received);
+            return reply.await.map(|r| r.text);
         }
-        let reply = self.client.respond(&request).await?;
+        let reply = self
+            .client
+            .respond_counting(&request, &self.received)
+            .await?;
         if !reply.structured {
             self.plain.store(true, Ordering::Relaxed);
         }
@@ -794,6 +853,16 @@ pub(crate) mod tests {
     fn json(proposal: &Proposal) -> Result<String, ApiError> {
         Ok(serde_json::to_string(proposal).unwrap())
     }
+    /// The stages of a run's events, in order.
+    fn stages(events: &[Event]) -> Vec<Progress> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Stage(stage) => Some(*stage),
+                Event::Checked(..) => None,
+            })
+            .collect()
+    }
     fn bad(report: &PartReport) -> Proposal {
         let mut bad = good(report);
         bad.setups[0].operations[0].tool = 9;
@@ -805,9 +874,9 @@ pub(crate) mod tests {
         let mut smaller = good(&report);
         smaller.setups.truncate(1);
         let script = Script::new(vec![json(&smaller), json(&good(&report))]);
-        let mut stages = vec![];
-        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |p| {
-            stages.push(p)
+        let mut events = vec![];
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |e| {
+            events.push(e)
         })
         .await
         .unwrap();
@@ -816,7 +885,7 @@ pub(crate) mod tests {
         assert_eq!(outcome.job.setups.len(), 2);
         assert!(outcome.check.passed);
         assert_eq!(
-            stages,
+            stages(&events),
             vec![
                 Progress::Analyzing,
                 Progress::Asking(1),
@@ -1329,16 +1398,16 @@ pub(crate) mod tests {
             json(&good(&report)),
             json(&good(&report)),
         ]);
-        let mut stages = vec![];
-        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |p| {
-            stages.push(p)
+        let mut events = vec![];
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |e| {
+            events.push(e)
         })
         .await
         .unwrap();
         assert_eq!(outcome.requests, 3, "repair, then one coverage round");
         assert_eq!(outcome.chosen, 3);
         assert_eq!(
-            stages,
+            stages(&events),
             vec![
                 Progress::Analyzing,
                 Progress::Asking(1),
@@ -1395,9 +1464,9 @@ pub(crate) mod tests {
             Ok("oops".into()),
             json(&good(&report)),
         ]);
-        let mut stages = vec![];
-        let failure = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |p| {
-            stages.push(p)
+        let mut events = vec![];
+        let failure = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |e| {
+            events.push(e)
         })
         .await
         .unwrap_err();
@@ -1409,7 +1478,7 @@ pub(crate) mod tests {
         assert!(failure.problems[0].message.contains("not valid JSON"));
         assert_eq!(failure.api, None);
         assert_eq!(
-            stages,
+            stages(&events),
             vec![
                 Progress::Analyzing,
                 Progress::Asking(1),
@@ -1426,6 +1495,190 @@ pub(crate) mod tests {
             seen[2][5].1.contains("not valid JSON")
                 && seen[2][5].1.contains("Reply with the full proposal")
         );
+    }
+    #[tokio::test]
+    async fn a_run_reports_each_check_result() {
+        let (doc, mesh, report) = block();
+        let script = Script::new(vec![
+            json(&bad(&report)),
+            json(&good(&report)),
+            json(&good(&report)),
+        ]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        let problems = StepResult::Problems {
+            shown: vec!["Setup 1, operation 1: T9 is not in the tool library.".into()],
+            more: 0,
+        };
+        // Each result follows its check's stage and comes before the next stage.
+        assert_eq!(
+            events,
+            vec![
+                Event::Stage(Progress::Analyzing),
+                Event::Stage(Progress::Asking(1)),
+                Event::Stage(Progress::Checking(1)),
+                Event::Checked(1, problems),
+                Event::Stage(Progress::Repairing(2)),
+                Event::Stage(Progress::Checking(2)),
+                Event::Checked(2, StepResult::Passed),
+                Event::Stage(Progress::Extending(3)),
+                Event::Stage(Progress::Checking(3)),
+                Event::Checked(3, StepResult::Passed),
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn an_unreadable_reply_is_reported() {
+        let (doc, mesh, report) = block();
+        let script = Script::new(vec![Ok("Here is my plan!".into()), json(&good(&report))]);
+        let mut events = vec![];
+        plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |e| {
+            events.push(e)
+        })
+        .await
+        .unwrap();
+        let Some(Event::Checked(1, StepResult::Unreadable(why))) = events
+            .iter()
+            .find(|e| matches!(e, Event::Checked(1, _)))
+            .cloned()
+        else {
+            panic!("{events:?}")
+        };
+        assert!(
+            why.contains("not valid JSON") && why.chars().count() <= 300,
+            "{why}"
+        );
+        assert_eq!(
+            events[..4],
+            [
+                Event::Stage(Progress::Analyzing),
+                Event::Stage(Progress::Asking(1)),
+                Event::Checked(1, StepResult::Unreadable(why)),
+                Event::Stage(Progress::Repairing(2)),
+            ]
+        );
+        assert!(events.contains(&Event::Checked(2, StepResult::Passed)));
+        // A reply that cannot be read after a plan passed is reported too.
+        let script = Script::new(vec![json(&good(&report)), Ok("oops".into())]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        assert!(events.contains(&Event::Checked(1, StepResult::Passed)));
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Checked(2, StepResult::Unreadable(_)))
+            ),
+            "{events:?}"
+        );
+        // The model's text is bounded: a long reply's error says at most 300 characters.
+        let long = format!("{{\"summary\": \"{}", "x".repeat(2000));
+        let script = Script::new(vec![Ok(long), Err(ApiError::UsageLimit)]);
+        let (doc, mesh, _) = block();
+        let mut events = vec![];
+        let _ = plan(&script, doc, mesh, &Busy::default(), |e| events.push(e)).await;
+        let Some(Event::Checked(1, StepResult::Unreadable(why))) =
+            events.iter().find(|e| matches!(e, Event::Checked(1, _)))
+        else {
+            panic!("{events:?}")
+        };
+        assert!(why.chars().count() <= 300 && !why.contains('\n'), "{why}");
+    }
+    #[tokio::test]
+    async fn a_check_result_lists_five_problems_and_counts_the_rest() {
+        let (doc, mesh, report) = block();
+        let script = Script::new(vec![json(&good(&report))]);
+        let mut events = vec![];
+        let failure = plan_with(
+            &script,
+            doc,
+            mesh,
+            &Busy::default(),
+            |e| events.push(e),
+            analysis::report,
+            |_: &Document, _: &Mesh, _: &PartReport, _: &Proposal| {
+                let problems = (1..=8)
+                    .map(|i| Problem {
+                        setup: 1,
+                        operation: Some(i),
+                        stage: "generation",
+                        message: format!("Problem {i} {}", "x".repeat(400)),
+                    })
+                    .collect();
+                let report = CheckReport {
+                    passed: false,
+                    problems,
+                    operations: vec![],
+                    coverage: None,
+                    total_minutes: 0.,
+                    zeros: vec![],
+                };
+                (report, None)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.problems.len(), 8, "the failure keeps every problem");
+        let Some(Event::Checked(1, StepResult::Problems { shown, more })) =
+            events.iter().find(|e| matches!(e, Event::Checked(1, _)))
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!((shown.len(), *more), (5, 3));
+        let place = "Setup 1, operation 1: ".len();
+        assert!(shown[0].starts_with("Setup 1, operation 1: Problem 1 xxx"));
+        for line in shown {
+            assert_eq!(line.chars().count(), place + 300, "{line}");
+        }
+        // Exactly five problems leave nothing to count.
+        let script = Script::new(vec![json(&good(&report))]);
+        let (doc, mesh, _) = block();
+        let mut events = vec![];
+        let _ = plan_with(
+            &script,
+            doc,
+            mesh,
+            &Busy::default(),
+            |e| events.push(e),
+            analysis::report,
+            |_: &Document, _: &Mesh, _: &PartReport, _: &Proposal| {
+                let problems = (0..5)
+                    .map(|_| Problem {
+                        setup: 0,
+                        operation: None,
+                        stage: "format",
+                        message: "Bad.".into(),
+                    })
+                    .collect();
+                let report = CheckReport {
+                    passed: false,
+                    problems,
+                    operations: vec![],
+                    coverage: None,
+                    total_minutes: 0.,
+                    zeros: vec![],
+                };
+                (report, None)
+            },
+        )
+        .await;
+        let found = events.iter().find_map(|e| match e {
+            Event::Checked(1, StepResult::Problems { shown, more }) => Some((shown.clone(), *more)),
+            _ => None,
+        });
+        assert_eq!(found, Some((vec!["Plan: Bad.".to_string(); 5], 0)));
+    }
+    #[test]
+    fn the_instructions_say_which_problems_come_with_the_cutting_data_ones() {
+        let text = instructions();
+        assert!(
+            text.contains("together with the generation, export, tool-axis and gouge problems."),
+            "{text}"
+        );
+        assert!(!text.contains("together with the other problems"));
     }
     /// The plan check, except that it panics, as a check that fails to run
     /// would, on a proposal whose summary is "boom".
@@ -2234,8 +2487,8 @@ pub(crate) mod tests {
     async fn a_first_plan_with_nothing_covered_makes_one_request() {
         let (doc, mesh, report) = open_box();
         let script = Script::new(vec![json(&complete(&report)), json(&complete(&report))]);
-        let mut stages = vec![];
-        let outcome = plan(&script, doc, mesh, &Busy::default(), |p| stages.push(p))
+        let mut events = vec![];
+        let outcome = plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
             .await
             .unwrap();
         let cover = outcome.check.coverage.as_ref().unwrap();
@@ -2246,7 +2499,7 @@ pub(crate) mod tests {
         assert_eq!((outcome.requests, outcome.chosen), (1, 1));
         assert_eq!(script.seen.lock().unwrap().len(), 1);
         assert_eq!(
-            stages,
+            stages(&events),
             vec![
                 Progress::Analyzing,
                 Progress::Asking(1),
@@ -2269,12 +2522,12 @@ pub(crate) mod tests {
             assert_eq!(outcome.requests, 1);
         }
         let script = Script::new(vec![Ok("No plan.".into()), json(&complete(&report))]);
-        let mut stages = vec![];
-        plan(&script, doc, mesh, &Busy::default(), |p| stages.push(p))
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
             .await
             .unwrap();
         assert_eq!(
-            stages,
+            stages(&events),
             vec![
                 Progress::Analyzing,
                 Progress::Asking(1),
@@ -2305,15 +2558,24 @@ pub(crate) mod tests {
             store,
             session,
         );
-        let backend = OpenAiBackend::new(std::sync::Arc::new(client), "gpt-6.1-sol".into());
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = OpenAiBackend::new(
+            std::sync::Arc::new(client),
+            "gpt-6.1-sol".into(),
+            received.clone(),
+        );
         let messages = vec![
             (Role::System, "Plan.".to_string()),
             (Role::User, "Part.".into()),
             (Role::Assistant, "{}".into()),
             (Role::User, "Fix it.".into()),
         ];
+        let count = || received.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(backend.reply(&messages).await.unwrap(), "{}");
+        assert_eq!(count(), 2, "the structured refusal streamed nothing");
+        received.store(40, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(backend.reply(&messages).await.unwrap(), "{}");
+        assert_eq!(count(), 2, "the plain request starts the count again");
         let sent = fake.seen("/v1/responses");
         assert_eq!(
             sent.len(),

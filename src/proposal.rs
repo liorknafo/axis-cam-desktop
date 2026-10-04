@@ -93,6 +93,18 @@ pub struct Problem {
     pub stage: &'static str,
     pub message: String,
 }
+impl Problem {
+    /// The problem as the page shows it, "Setup 1, operation 2: message" with
+    /// the message one line of at most 300 characters.
+    pub(crate) fn line(&self) -> String {
+        let place = match (self.setup, self.operation) {
+            (0, _) => "Plan".to_string(),
+            (s, None) => format!("Setup {s}"),
+            (s, Some(o)) => format!("Setup {s}, operation {o}"),
+        };
+        format!("{place}: {}", clip(&self.message, 300))
+    }
+}
 fn object(properties: Value) -> Value {
     let required: Vec<&String> = properties.as_object().unwrap().keys().collect();
     json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false})

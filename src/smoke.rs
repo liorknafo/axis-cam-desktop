@@ -1,8 +1,37 @@
 //! Explicit renderer smoke test. It uses an isolated data directory and never
 //! sends native input events or changes the user's regular saved workspace.
-use crate::{App, Message, Page, Target, model::Machine};
+use crate::{
+    App, Message, Page, Target,
+    model::Machine,
+    planner::{Progress, StepResult},
+};
 use iced::Task;
 use std::fs;
+/// Timeline steps for the renderer smoke test: the stage, when it began and
+/// ended in seconds before now (None while it runs), and its result.
+fn smoke_steps(steps: Vec<(Progress, u64, Option<u64>, Option<StepResult>)>) -> Vec<crate::Step> {
+    let now = std::time::Instant::now();
+    let ago = |seconds| now.checked_sub(std::time::Duration::from_secs(seconds));
+    steps
+        .into_iter()
+        .map(|(stage, began, ended, result)| crate::Step {
+            stage,
+            started: ago(began).unwrap_or(now),
+            ended: ended.and_then(ago),
+            result,
+        })
+        .collect()
+}
+/// A failed check's result: two problem lines and `more` others.
+fn smoke_problems(more: usize) -> StepResult {
+    StepResult::Problems {
+        shown: vec![
+            "Setup 1, operation 2: Pocket depth must be less than tool stickout. Choose a tool with adequate reach.".into(),
+            "Setup 1, operation 3: Contour stepdown must be at most the flute length.".into(),
+        ],
+        more,
+    }
+}
 impl App {
     pub fn capture_smoke(&mut self, image: iced::window::Screenshot) -> Task<Message> {
         let Some(dir) = self.smoke_dir.clone() else {
@@ -101,6 +130,7 @@ impl App {
                 107 => "84-planner-running".into(),
                 108 => "85-planner-ready".into(),
                 109 => "86-materials".into(),
+                110 => "87-planner-timeline".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -656,7 +686,6 @@ impl App {
             }
             104 => {
                 // A checked plan for the imported block, as the planner shows it.
-                use crate::proposal::{Proposal, ProposedOp, ProposedSetup, Unmachined};
                 self.account = crate::Account::SignedIn {
                     name: "Lior".into(),
                     email: "lior@example.com".into(),
@@ -675,70 +704,7 @@ impl App {
                     .id
                     .clone();
                 assert!(self.doc.select_material(&starter));
-                let mesh = self.imported_mesh.clone().expect("imported part");
-                let report = crate::analysis::report(&self.doc, &mesh).expect("part report");
-                let first = &report.orientations[0];
-                let plane = |depth: f32| {
-                    let found = first
-                        .planes
-                        .iter()
-                        .find(|p| (p.depth_below_top - depth).abs() < 0.01);
-                    found.expect("plane").surfaces.clone()
-                };
-                let flat = report
-                    .tools
-                    .iter()
-                    .find(|t| t.kind == "Flat end mill")
-                    .expect("flat tool");
-                let op = |strategy: &str, surfaces: Vec<usize>| ProposedOp {
-                    strategy: strategy.into(),
-                    name: strategy.into(),
-                    tool: flat.number,
-                    surfaces,
-                    rpm: 8000.,
-                    feed: 800.,
-                    coolant: "Flood".into(),
-                    reason: "smoke".into(),
-                    ..Default::default()
-                };
-                let proposal = Proposal {
-                    summary: "Face the top, clear the main pocket and cut the outline from the top. The holes and the side features need tools and setups this plan does not have.".into(),
-                    setups: vec![ProposedSetup {
-                        orientation: first.up.into(),
-                        name: "Top".into(),
-                        origin: "Stock top center".into(),
-                        workholding: "Vise on the long sides.".into(),
-                        operations: vec![
-                            op("Face", plane(0.)),
-                            op("Pocket", plane(12.)),
-                            op("Contour", vec![]),
-                        ],
-                    }],
-                    unmachined: vec![Unmachined {
-                        feature: "Four counterbored through holes".into(),
-                        reason: "The library has no drill small enough for the 6.6 mm holes.".into(),
-                    }],
-                    warnings: vec!["The outline is cut to full depth; hold the part below the cut.".into()],
-                };
-                let (check, job) = crate::plan_check::check(&self.doc, &mesh, &report, &proposal);
-                assert!(check.passed, "smoke plan: {:?}", check.problems);
-                let job = job.expect("built job");
-                let view = crate::planner::final_view(&job, &mesh);
-                assert!(view.is_some(), "smoke plan view");
-                self.planner = crate::Planner::Preview(std::sync::Arc::new(crate::PlanPreview {
-                    outcome: crate::planner::Outcome {
-                        proposal,
-                        check,
-                        job,
-                        report,
-                        requests: 2,
-                        chosen: 2,
-                        more_warnings: 0,
-                        more_unmachined: 0,
-                        note: None,
-                    },
-                    view,
-                }));
+                self.planner = crate::Planner::Preview(self.smoke_plan_preview());
                 self.page = Page::Ai;
                 vec![]
             }
@@ -765,12 +731,22 @@ impl App {
             }
             107 => {
                 // A run started with the picked model, asking for a correction.
+                use Progress::*;
                 self.plan_model = self.settings.model.clone();
-                self.planner = crate::Planner::Running(crate::planner::Progress::Repairing(2));
+                self.planner = crate::Planner::Running(Repairing(2));
+                self.plan_timeline = smoke_steps(vec![
+                    (Analyzing, 68, Some(66), None),
+                    (Asking(1), 66, Some(29), None),
+                    (Checking(1), 29, Some(22), Some(smoke_problems(2))),
+                    (Repairing(2), 22, None, None),
+                ]);
+                self.plan_received
+                    .store(1840, std::sync::atomic::Ordering::Relaxed);
                 vec![]
             }
             108 => {
                 self.planner = crate::Planner::Idle;
+                self.plan_timeline.clear();
                 let unmet: Vec<_> = self
                     .plan_checklist()
                     .into_iter()
@@ -781,6 +757,22 @@ impl App {
                 vec![]
             }
             109 => vec![Message::Page(Page::Materials)],
+            110 => {
+                // The finished run above its preview.
+                use Progress::*;
+                self.plan_model = self.settings.model.clone();
+                self.planner = crate::Planner::Preview(self.smoke_plan_preview());
+                self.plan_timeline = smoke_steps(vec![
+                    (Analyzing, 91, Some(89), None),
+                    (Asking(1), 89, Some(52), None),
+                    (Checking(1), 52, Some(43), Some(smoke_problems(0))),
+                    (Repairing(2), 43, Some(19), None),
+                    (Checking(2), 19, Some(7), Some(StepResult::Passed)),
+                    (Previewing, 7, Some(4), None),
+                ]);
+                self.page = Page::Ai;
+                vec![]
+            }
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());
@@ -807,6 +799,74 @@ impl App {
             );
         }
         Task::none()
+    }
+    /// A checked plan for the imported block, as the planner shows it.
+    fn smoke_plan_preview(&self) -> std::sync::Arc<crate::PlanPreview> {
+        use crate::proposal::{Proposal, ProposedOp, ProposedSetup, Unmachined};
+        let mesh = self.imported_mesh.clone().expect("imported part");
+        let report = crate::analysis::report(&self.doc, &mesh).expect("part report");
+        let first = &report.orientations[0];
+        let plane = |depth: f32| {
+            let found = first
+                .planes
+                .iter()
+                .find(|p| (p.depth_below_top - depth).abs() < 0.01);
+            found.expect("plane").surfaces.clone()
+        };
+        let flat = report
+            .tools
+            .iter()
+            .find(|t| t.kind == "Flat end mill")
+            .expect("flat tool");
+        let op = |strategy: &str, surfaces: Vec<usize>| ProposedOp {
+            strategy: strategy.into(),
+            name: strategy.into(),
+            tool: flat.number,
+            surfaces,
+            rpm: 8000.,
+            feed: 800.,
+            coolant: "Flood".into(),
+            reason: "smoke".into(),
+            ..Default::default()
+        };
+        let proposal = Proposal {
+            summary: "Face the top, clear the main pocket and cut the outline from the top. The holes and the side features need tools and setups this plan does not have.".into(),
+            setups: vec![ProposedSetup {
+                orientation: first.up.into(),
+                name: "Top".into(),
+                origin: "Stock top center".into(),
+                workholding: "Vise on the long sides.".into(),
+                operations: vec![
+                    op("Face", plane(0.)),
+                    op("Pocket", plane(12.)),
+                    op("Contour", vec![]),
+                ],
+            }],
+            unmachined: vec![Unmachined {
+                feature: "Four counterbored through holes".into(),
+                reason: "The library has no drill small enough for the 6.6 mm holes.".into(),
+            }],
+            warnings: vec!["The outline is cut to full depth; hold the part below the cut.".into()],
+        };
+        let (check, job) = crate::plan_check::check(&self.doc, &mesh, &report, &proposal);
+        assert!(check.passed, "smoke plan: {:?}", check.problems);
+        let job = job.expect("built job");
+        let view = crate::planner::final_view(&job, &mesh);
+        assert!(view.is_some(), "smoke plan view");
+        std::sync::Arc::new(crate::PlanPreview {
+            outcome: crate::planner::Outcome {
+                proposal,
+                check,
+                job,
+                report,
+                requests: 2,
+                chosen: 2,
+                more_warnings: 0,
+                more_unmachined: 0,
+                note: None,
+            },
+            view,
+        })
     }
 }
 #[cfg(test)]
@@ -2672,8 +2732,8 @@ mod tests {
         let preview = checked_preview(&a, false);
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
-        let asking = crate::planner::Progress::Asking(2);
-        let _ = a.update(Message::PlanProgress(epoch.wrapping_sub(1), asking));
+        let asking = crate::planner::Event::Stage(crate::planner::Progress::Asking(2));
+        let _ = a.update(Message::PlanProgress(epoch.wrapping_sub(1), asking.clone()));
         assert!(matches!(
             a.planner,
             crate::Planner::Running(crate::planner::Progress::Analyzing)
@@ -2692,6 +2752,228 @@ mod tests {
         assert!(matches!(a.planner, crate::Planner::Preview(_)));
         assert_eq!(a.status, "Plan ready to review: 2 setups, 6 operations.");
         assert!(a.plan_run.is_none());
+    }
+    fn send(a: &mut App, epoch: u64, event: crate::planner::Event) {
+        let _ = a.update(Message::PlanProgress(epoch, event));
+    }
+    #[test]
+    fn the_timeline_follows_the_runs_events_and_stays_until_the_plan_goes() {
+        use crate::planner::{Event::*, Progress::*, StepResult};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.page = Page::Ai;
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        assert!(a.plan_timeline.is_empty());
+        let _ = a.view();
+        // An event of an older run changes nothing.
+        send(&mut a, epoch.wrapping_sub(1), Stage(Asking(1)));
+        assert!(a.plan_timeline.is_empty());
+        send(&mut a, epoch, Stage(Asking(1)));
+        assert_eq!(a.plan_timeline.len(), 1);
+        assert_eq!(a.plan_timeline[0].stage, Asking(1));
+        assert!(a.plan_timeline[0].ended.is_none() && a.plan_timeline[0].result.is_none());
+        assert!(matches!(a.planner, crate::Planner::Running(Asking(1))));
+        // The next stage ends the open step; its check's result joins it.
+        send(&mut a, epoch, Stage(Checking(1)));
+        assert_eq!(a.plan_timeline.len(), 2);
+        let first = &a.plan_timeline[0];
+        assert!(first.ended.is_some_and(|ended| ended >= first.started));
+        assert!(a.plan_timeline[1].ended.is_none());
+        let problems = StepResult::Problems {
+            shown: vec!["Setup 1, operation 1: T9 is not in the tool library.".into()],
+            more: 0,
+        };
+        send(&mut a, epoch, Checked(1, problems.clone()));
+        assert_eq!(a.plan_timeline[1].result, Some(problems.clone()));
+        assert!(a.plan_timeline[1].ended.is_some());
+        // A result for a request with no step of its kind goes nowhere.
+        send(&mut a, epoch, Checked(9, StepResult::Passed));
+        send(
+            &mut a,
+            epoch,
+            Checked(2, StepResult::Unreadable("x".into())),
+        );
+        assert_eq!(a.plan_timeline.len(), 2);
+        assert!(
+            a.plan_timeline
+                .iter()
+                .all(|s| s.result != Some(StepResult::Passed))
+        );
+        // An unreadable reply joins its request's step, and ends it.
+        send(&mut a, epoch, Stage(Repairing(2)));
+        send(
+            &mut a,
+            epoch,
+            Checked(2, StepResult::Unreadable("not valid JSON".into())),
+        );
+        assert_eq!(
+            a.plan_timeline[2].result,
+            Some(StepResult::Unreadable("not valid JSON".into()))
+        );
+        assert!(a.plan_timeline[2].ended.is_some());
+        for stage in [Repairing(3), Checking(3)] {
+            send(&mut a, epoch, Stage(stage));
+        }
+        let _ = a.view();
+        send(&mut a, epoch.wrapping_sub(1), Checked(3, problems.clone()));
+        send(&mut a, epoch, Checked(3, StepResult::Passed));
+        send(&mut a, epoch, Stage(Previewing));
+        assert_eq!(a.plan_timeline.len(), 6);
+        assert_eq!(a.plan_timeline[4].result, Some(StepResult::Passed));
+        assert!(a.plan_timeline[5].ended.is_none());
+        // The finished run keeps its timeline, every step ended.
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert_eq!(a.plan_timeline.len(), 6);
+        assert!(a.plan_timeline.iter().all(|s| s.ended.is_some()));
+        let _ = a.view();
+        // A late event does not touch it.
+        send(&mut a, epoch, Stage(Asking(1)));
+        assert_eq!(a.plan_timeline.len(), 6);
+        // Discard, and an edit, clear it.
+        let _ = a.update(Message::DiscardPlan);
+        assert!(a.plan_timeline.is_empty());
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        send(&mut a, epoch, Stage(Analyzing));
+        assert_eq!(a.plan_timeline.len(), 1);
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "6".into()));
+        assert!(a.plan_timeline.is_empty());
+        // A new run starts a new timeline; Cancel clears the old one.
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        send(&mut a, epoch, Stage(Analyzing));
+        let _ = a.update(Message::PlanCancel);
+        assert!(a.plan_timeline.is_empty());
+    }
+    #[test]
+    fn a_failed_run_keeps_its_timeline_and_the_next_run_starts_clean() {
+        use crate::planner::{Event::*, Progress::*, StepResult};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.page = Page::Ai;
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        send(&mut a, epoch, Stage(Analyzing));
+        send(&mut a, epoch, Stage(Asking(1)));
+        send(
+            &mut a,
+            epoch,
+            Checked(1, StepResult::Unreadable("oops".into())),
+        );
+        send(&mut a, epoch, Stage(Repairing(2)));
+        let failure = crate::planner::Failure {
+            message: "No plan.".into(),
+            problems: vec![],
+            api: None,
+            requests: 2,
+        };
+        let _ = a.update(Message::PlanFinished(epoch, Err(failure)));
+        assert!(matches!(a.planner, crate::Planner::Failed(_)));
+        assert_eq!(a.plan_timeline.len(), 3);
+        assert!(a.plan_timeline.iter().all(|s| s.ended.is_some()));
+        assert_eq!(
+            a.plan_timeline[1].result,
+            Some(StepResult::Unreadable("oops".into()))
+        );
+        let _ = a.view();
+        // Try again: the old timeline and count are gone.
+        let counted = a.plan_received.clone();
+        counted.store(900, std::sync::atomic::Ordering::Relaxed);
+        let _ = a.update(Message::Plan);
+        assert!(a.plan_timeline.is_empty());
+        assert!(!std::sync::Arc::ptr_eq(&counted, &a.plan_received));
+        assert_eq!(
+            a.plan_received.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+    #[test]
+    fn timeline_rows_show_each_steps_time_and_how_its_check_went() {
+        use crate::planner::{Progress::*, StepResult};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.plan_model = "gpt-6.1-sol".into();
+        let now = std::time::Instant::now();
+        let ago = |seconds| now.checked_sub(Duration::from_secs(seconds)).unwrap();
+        let step = |stage, began, ended: Option<u64>, result| crate::Step {
+            stage,
+            started: ago(began),
+            ended: ended.map(ago),
+            result,
+        };
+        let problems = StepResult::Problems {
+            shown: vec!["Setup 1, operation 2: Pocket too deep.".into()],
+            more: 2,
+        };
+        a.plan_timeline = vec![
+            step(Analyzing, 60, Some(58), None),
+            step(Asking(1), 58, Some(20), None),
+            step(Checking(1), 20, Some(11), Some(problems)),
+            step(
+                Repairing(2),
+                11,
+                Some(10),
+                Some(StepResult::Unreadable("not valid JSON".into())),
+            ),
+            step(Checking(2), 10, Some(8), Some(StepResult::Passed)),
+            step(
+                Checking(3),
+                8,
+                Some(7),
+                Some(StepResult::Problems {
+                    shown: vec![],
+                    more: 0,
+                }),
+            ),
+            step(Extending(3), 7, None, None),
+        ];
+        a.plan_received
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let rows = crate::ui::timeline_rows(&a, now);
+        let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "Analyzing the part… · 2 s",
+                "Asking gpt-6.1-sol for a plan (1 of 4)… · 38 s",
+                "Checking the plan with the simulation and export checks (1 of 4)… · 9 s",
+                "The last proposal did not pass; asking gpt-6.1-sol for a correction (2 of 4)… · 1 s",
+                "Checking the plan with the simulation and export checks (2 of 4)… · 2 s",
+                "Checking the plan with the simulation and export checks (3 of 4)… · 1 s",
+                "The plan passes; asking gpt-6.1-sol about faces still covered (3 of 4)… · 7 s",
+            ]
+        );
+        let done: Vec<_> = rows.iter().map(|r| r.done).collect();
+        assert_eq!(done, [true, true, true, true, true, true, false]);
+        assert!(rows[0].notes.is_empty() && rows[1].notes.is_empty());
+        assert_eq!(
+            rows[2].notes,
+            ["• Setup 1, operation 2: Pocket too deep.", "• and 2 more"]
+        );
+        assert_eq!(
+            rows[3].notes,
+            ["The reply could not be read: not valid JSON"]
+        );
+        assert_eq!(rows[4].notes, ["passed"]);
+        assert_eq!(rows[5].notes, ["did not pass"]);
+        // Only the open request shows what has streamed in so far.
+        assert_eq!(rows[6].notes, ["received 1 character"]);
+        a.plan_received
+            .store(1840, std::sync::atomic::Ordering::Relaxed);
+        let rows = crate::ui::timeline_rows(&a, now);
+        assert_eq!(rows[6].notes, ["received 1840 characters"]);
+        assert!(
+            rows[..6]
+                .iter()
+                .all(|r| r.notes.iter().all(|n| !n.starts_with("received")))
+        );
+        // An open check says nothing yet.
+        a.plan_timeline[6].stage = Checking(3);
+        assert!(crate::ui::timeline_rows(&a, now)[6].notes.is_empty());
     }
     #[test]
     fn applying_a_plan_replaces_the_job_and_undo_restores_it() {
@@ -3229,7 +3511,7 @@ mod tests {
     }
     #[tokio::test]
     async fn the_plan_task_sends_its_stages_and_its_result_with_the_runs_epoch() {
-        use crate::planner::{Progress, tests::Script};
+        use crate::planner::{Event, Progress, StepResult, tests::Script};
         let dir = tempfile::tempdir().unwrap();
         let (mut a, report) = signed_in_box_app(&dir);
         let _ = a.update(Message::Plan);
@@ -3242,21 +3524,22 @@ mod tests {
         let plan = crate::planner::tests::complete(&report);
         let script = Script::new(vec![Ok(serde_json::to_string(&plan).unwrap())]);
         let messages = run_task(&a, script).await;
-        let mut stages = vec![];
+        let mut events = vec![];
         for message in &messages[..messages.len() - 1] {
-            let Message::PlanProgress(e, stage) = message else {
+            let Message::PlanProgress(e, event) = message else {
                 panic!("{message:?}")
             };
             assert_eq!(*e, epoch);
-            stages.push(*stage);
+            events.push(event.clone());
         }
         assert_eq!(
-            stages,
+            events,
             [
-                Progress::Analyzing,
-                Progress::Asking(1),
-                Progress::Checking(1),
-                Progress::Previewing
+                Event::Stage(Progress::Analyzing),
+                Event::Stage(Progress::Asking(1)),
+                Event::Stage(Progress::Checking(1)),
+                Event::Checked(1, StepResult::Passed),
+                Event::Stage(Progress::Previewing)
             ]
         );
         let Some(Message::PlanFinished(e, Ok(preview))) = messages.last() else {
@@ -3272,6 +3555,21 @@ mod tests {
         assert_eq!(a.status, "Plan ready to review: 1 setup, 2 operations.");
         assert!(a.plan_run.is_none());
         assert_eq!(a.plan_busy.running(), 0);
+        // The timeline of the run stays with its preview, every step ended.
+        let kept: Vec<_> = a
+            .plan_timeline
+            .iter()
+            .map(|s| (s.stage, s.ended.is_some(), s.result.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (Progress::Analyzing, true, None),
+                (Progress::Asking(1), true, None),
+                (Progress::Checking(1), true, Some(StepResult::Passed)),
+                (Progress::Previewing, true, None),
+            ]
+        );
         // A run that fails ends with PlanFinished(Err), with the same epoch.
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
@@ -3282,11 +3580,10 @@ mod tests {
             Some(Message::PlanFinished(e, Err(f))) if *e == epoch
                 && f.api == Some(crate::openai::ApiError::UsageLimit)
         ));
-        assert!(
-            !messages
-                .iter()
-                .any(|m| matches!(m, Message::PlanProgress(_, Progress::Previewing)))
-        );
+        assert!(!messages.iter().any(|m| matches!(
+            m,
+            Message::PlanProgress(_, Event::Stage(Progress::Previewing))
+        )));
         for message in messages {
             let _ = a.update(message);
         }
@@ -3341,7 +3638,7 @@ mod tests {
             // The next run is not fooled by the first run's late messages.
             let _ = a.update(Message::Plan);
             assert!(matches!(a.planner, crate::Planner::Running(_)));
-            let asking = crate::planner::Progress::Asking(3);
+            let asking = crate::planner::Event::Stage(crate::planner::Progress::Asking(3));
             let _ = a.update(Message::PlanProgress(first, asking));
             let _ = a.update(Message::PlanFinished(first, Ok(preview.clone())));
             assert!(matches!(

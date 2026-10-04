@@ -2900,14 +2900,7 @@ pub(crate) fn problem_lines(problems: &[crate::proposal::Problem]) -> Vec<String
     let mut lines: Vec<String> = problems
         .iter()
         .take(12)
-        .map(|problem| {
-            let place = match (problem.setup, problem.operation) {
-                (0, _) => "Plan".to_string(),
-                (s, None) => format!("Setup {s}"),
-                (s, Some(o)) => format!("Setup {s}, operation {o}"),
-            };
-            format!("• {place}: {}", clip(&problem.message, 300))
-        })
+        .map(|problem| format!("• {}", problem.line()))
         .collect();
     if problems.len() > 12 {
         let more = problems.len() - 12;
@@ -2917,6 +2910,97 @@ pub(crate) fn problem_lines(problems: &[crate::proposal::Problem]) -> Vec<String
         ));
     }
     lines
+}
+/// One row of the planner's timeline.
+pub(crate) struct TimelineRow {
+    /// The step has ended: a tick, otherwise a bullet.
+    pub done: bool,
+    /// The step and how long it took (so far, while it runs).
+    pub text: String,
+    /// Under it: the characters received while a request runs, or how its
+    /// check went.
+    pub notes: Vec<String>,
+}
+/// The timeline's rows as of `now`.
+pub(crate) fn timeline_rows(app: &App, now: std::time::Instant) -> Vec<TimelineRow> {
+    use crate::planner::{Progress, StepResult};
+    let received = app.plan_received.load(std::sync::atomic::Ordering::Relaxed);
+    let request = |stage| {
+        matches!(
+            stage,
+            Progress::Asking(_) | Progress::Repairing(_) | Progress::Extending(_)
+        )
+    };
+    app.plan_timeline
+        .iter()
+        .map(|step| {
+            let took = step
+                .ended
+                .unwrap_or(now)
+                .saturating_duration_since(step.started);
+            let mut notes = vec![];
+            if step.ended.is_none() && request(step.stage) {
+                notes.push(format!("received {}", plural(received, "character")));
+            }
+            match &step.result {
+                None => {}
+                Some(StepResult::Passed) => notes.push("passed".into()),
+                Some(StepResult::Problems { shown, more }) => {
+                    notes.extend(shown.iter().map(|line| format!("• {line}")));
+                    if *more > 0 {
+                        notes.push(format!("• and {more} more"));
+                    }
+                    if notes.is_empty() {
+                        notes.push("did not pass".into());
+                    }
+                }
+                Some(StepResult::Unreadable(why)) => {
+                    notes.push(format!("The reply could not be read: {}", clip(why, 300)))
+                }
+            }
+            TimelineRow {
+                done: step.ended.is_some(),
+                text: format!(
+                    "{} · {:.0} s",
+                    stage_text(step.stage, &app.plan_model),
+                    took.as_secs_f32()
+                ),
+                notes,
+            }
+        })
+        .collect()
+}
+/// The timeline as page rows, or None before the run's first stage.
+fn timeline_view<'a>(app: &App) -> Option<Column<'a, Message>> {
+    let rows = timeline_rows(app, std::time::Instant::now());
+    if rows.is_empty() {
+        return None;
+    }
+    let mut c = column![].spacing(6);
+    for row in rows {
+        let mark = if row.done {
+            text("✓").size(13).color(GOOD)
+        } else {
+            text("•").size(13).color(MUTED)
+        };
+        let mut item = column![text(row.text).size(13)].spacing(2);
+        for line in row.notes {
+            item = item.push(muted(line));
+        }
+        c = c.push(row![mark, item].spacing(8));
+    }
+    Some(c)
+}
+/// A finished run's timeline under `heading`, in a panel.
+fn finished_timeline<'a>(app: &App, heading: &'static str) -> Option<Element<'a, Message>> {
+    let rows = timeline_view(app)?;
+    Some(
+        container(column![bold(heading, 15), rows].spacing(8))
+            .padding(16)
+            .width(Fill)
+            .style(panel_style)
+            .into(),
+    )
 }
 fn plan_result(app: &App) -> Element<'_, Message> {
     use crate::Planner;
@@ -2945,24 +3029,30 @@ fn plan_result(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .style(panel_style)
         .into(),
-        Planner::Running(stage) => container(
-            column![
-                bold(running_text(app, *stage), 20),
-                muted("This can take a few minutes. Nothing changes until you apply a plan."),
-                btn("Cancel", Message::PlanCancel, false)
-            ]
-            .spacing(14),
-        )
-        .padding(35)
-        .width(Fill)
-        .style(panel_style)
-        .into(),
+        Planner::Running(stage) => {
+            let mut c = column![bold(running_text(app, *stage), 20)].spacing(14);
+            if let Some(rows) = timeline_view(app) {
+                c = c.push(rows);
+            }
+            container(
+                c.push(muted(
+                    "This can take a few minutes. Nothing changes until you apply a plan.",
+                ))
+                .push(btn("Cancel", Message::PlanCancel, false)),
+            )
+            .padding(35)
+            .width(Fill)
+            .style(panel_style)
+            .into()
+        }
         Planner::Failed(failure) => {
-            let mut c = column![
-                bold("No plan this time", 21),
-                text(failure.message.clone()).size(13)
-            ]
-            .spacing(12);
+            let mut c = column![].spacing(12);
+            if let Some(tried) = finished_timeline(app, "What the planner tried") {
+                c = c.push(tried);
+            }
+            c = c
+                .push(bold("No plan this time", 21))
+                .push(text(failure.message.clone()).size(13));
             for line in problem_lines(&failure.problems) {
                 c = c.push(muted(line));
             }
@@ -2975,7 +3065,10 @@ fn plan_result(app: &App) -> Element<'_, Message> {
             )
             .into()
         }
-        Planner::Preview(preview) => plan_preview(app, preview),
+        Planner::Preview(preview) => match finished_timeline(app, "How the plan was made") {
+            Some(made) => column![made, plan_preview(app, preview)].spacing(12).into(),
+            None => plan_preview(app, preview),
+        },
     }
 }
 fn ai(app: &App) -> Element<'_, Message> {

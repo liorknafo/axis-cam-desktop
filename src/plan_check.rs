@@ -365,7 +365,8 @@ pub fn coverage(
     }
 }
 /// One problem per speed or feed of an operation that lies outside the
-/// project material's cutting data, naming its setup and operation.
+/// project material's cutting data, naming its setup and operation. Each
+/// message is one line of at most 300 characters: it names the material.
 fn cutting_data_problems(built: &Document) -> Vec<Problem> {
     let mut problems = vec![];
     for (si, setup) in built.setups.iter().enumerate() {
@@ -375,7 +376,7 @@ fn cutting_data_problems(built: &Document) -> Vec<Problem> {
                     setup: si + 1,
                     operation: Some(oi + 1),
                     stage: "cutting data",
-                    message,
+                    message: proposal::clip(&message, 300),
                 }));
             }
         }
@@ -724,6 +725,29 @@ mod tests {
         none.material_id.clear();
         let (check, _) = super::check(&none, &mesh, &report, &slow);
         assert!(check.passed, "{:?}", stages(&check));
+    }
+    #[test]
+    fn a_cutting_data_message_is_one_clipped_line_whatever_the_materials_name() {
+        let (mut doc, mesh, report) = block();
+        let id = doc.material_id.clone();
+        let odd = format!("Odd\nalloy \u{202e}{}", "x".repeat(500));
+        let material = doc.materials.iter_mut().find(|m| m.id == id).unwrap();
+        material.p.insert("name".into(), odd);
+        let mut slow = good(&report);
+        slow.setups[0].operations[1].rpm = 2000.;
+        let (check, _) = check(&doc, &mesh, &report, &slow);
+        let found: Vec<_> = check
+            .problems
+            .iter()
+            .filter(|p| p.stage == "cutting data")
+            .collect();
+        assert_eq!(found.len(), 2, "{:?}", stages(&check));
+        for problem in found {
+            let message = &problem.message;
+            assert_eq!(message.chars().count(), 300, "{message}");
+            assert!(message.contains(" Odd alloy xxx"), "{message}");
+            assert!(!message.contains(['\n', '\u{202e}']), "{message}");
+        }
     }
     #[test]
     fn reference_problems_stop_before_generation() {

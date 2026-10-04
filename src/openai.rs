@@ -5,7 +5,13 @@ use crate::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 pub const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
 /// The most one request may take in total: a planning reply can stream for
@@ -199,9 +205,15 @@ struct Accumulator {
     error: Option<ApiError>,
 }
 impl Accumulator {
-    fn apply(&mut self, event: &Value) {
+    /// Folds in one event; returns the characters of reply text it streamed.
+    fn apply(&mut self, event: &Value) -> usize {
+        let mut streamed = 0;
         match event["type"].as_str().unwrap_or("") {
-            "response.output_text.delta" => self.text += event["delta"].as_str().unwrap_or(""),
+            "response.output_text.delta" => {
+                let delta = event["delta"].as_str().unwrap_or("");
+                self.text += delta;
+                streamed = delta.chars().count();
+            }
             "response.refusal.delta" => self.refusal += event["delta"].as_str().unwrap_or(""),
             "response.completed" => {
                 if self.text.is_empty() {
@@ -247,6 +259,7 @@ impl Accumulator {
             self.error
                 .get_or_insert(ApiError::Other("The reply was too large.".into()));
         }
+        streamed
     }
     fn finish(self) -> Result<String, ApiError> {
         if let Some(error) = self.error {
@@ -593,17 +606,37 @@ impl Client {
             .collect())
     }
     pub async fn respond(&self, request: &Request) -> Result<Reply, ApiError> {
-        match self.attempt(request, true).await {
-            Err(ApiError::Unsupported(_)) => self.attempt(request, false).await,
+        self.respond_counting(request, &AtomicUsize::new(0)).await
+    }
+    /// `respond` that counts the characters of reply text as they stream in:
+    /// `received` is set to 0 when each attempt starts, so it always holds
+    /// the length of the reply being streamed.
+    pub async fn respond_counting(
+        &self,
+        request: &Request,
+        received: &AtomicUsize,
+    ) -> Result<Reply, ApiError> {
+        match self.attempt(request, true, received).await {
+            Err(ApiError::Unsupported(_)) => self.attempt(request, false, received).await,
             other => other,
         }
     }
-    /// `respond` without the structured attempt, for a caller that already
-    /// knows the plan route refuses it.
-    pub async fn respond_plain(&self, request: &Request) -> Result<Reply, ApiError> {
-        self.attempt(request, false).await
+    /// `respond_counting` without the structured attempt, for a caller that
+    /// already knows the plan route refuses it.
+    pub async fn respond_plain_counting(
+        &self,
+        request: &Request,
+        received: &AtomicUsize,
+    ) -> Result<Reply, ApiError> {
+        self.attempt(request, false, received).await
     }
-    async fn attempt(&self, request: &Request, structured: bool) -> Result<Reply, ApiError> {
+    async fn attempt(
+        &self,
+        request: &Request,
+        structured: bool,
+        received: &AtomicUsize,
+    ) -> Result<Reply, ApiError> {
+        received.store(0, Ordering::Relaxed);
         let url = format!("{}/responses", self.endpoints.api);
         let body = request.body(structured);
         let response = self
@@ -626,7 +659,7 @@ impl Client {
                 }
             };
             for event in parser.push(&chunk) {
-                reply.apply(&event);
+                received.fetch_add(reply.apply(&event), Ordering::Relaxed);
             }
             // The reply is complete, or too large to keep: do not wait for
             // the server to close the connection.
@@ -635,7 +668,7 @@ impl Client {
             }
         }
         if let Some(event) = parser.finish()? {
-            reply.apply(&event);
+            received.fetch_add(reply.apply(&event), Ordering::Relaxed);
         }
         let text = reply.finish();
         if matches!(text, Err(ApiError::SignedOut(_))) {
@@ -1309,6 +1342,75 @@ mod tests {
         })
         .await;
         assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
+    }
+    #[tokio::test]
+    async fn respond_counting_adds_the_streamed_characters_and_each_call_starts_at_zero() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let r = rig(sample(), move |_| {
+            let deltas = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec!["{".to_string(), "x".repeat(2000), "é}".into()]
+            } else {
+                vec!["{}".to_string()]
+            };
+            let mut events = vec![json!({"type": "response.created"})];
+            for delta in deltas {
+                events.push(json!({"type": "response.output_text.delta", "delta": delta}));
+            }
+            events.push(json!({"type": "response.completed", "response": {"status": "completed"}}));
+            Resp::sse(&events)
+        })
+        .await;
+        // Characters, not bytes; a count left from an earlier reply is cleared.
+        let received = AtomicUsize::new(7);
+        let reply = r
+            .client
+            .respond_counting(&request(), &received)
+            .await
+            .unwrap();
+        assert_eq!(reply.text.chars().count(), 2003);
+        assert!(reply.text.len() > 2003);
+        assert_eq!(received.load(Ordering::SeqCst), 2003);
+        r.client
+            .respond_counting(&request(), &received)
+            .await
+            .unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        received.store(9, Ordering::SeqCst);
+        r.client
+            .respond_plain_counting(&request(), &received)
+            .await
+            .unwrap();
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        // `respond` counts into a counter of its own.
+        assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
+    }
+    #[tokio::test]
+    async fn the_count_grows_while_the_reply_is_still_streaming() {
+        let r = rig(sample(), |_| Resp {
+            cut_after_ms: Some(10_000),
+            ..Resp::sse(&[
+                json!({"type": "response.created"}),
+                json!({"type": "response.output_text.delta", "delta": "{\"a\""}),
+                json!({"type": "response.output_text.delta", "delta": ":1"}),
+            ])
+        })
+        .await;
+        let received = AtomicUsize::new(0);
+        let request = request();
+        let mut call = Box::pin(r.client.respond_counting(&request, &received));
+        let watch = async {
+            while received.load(Ordering::SeqCst) < 6 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut call => panic!("the reply is not complete"),
+            grown = tokio::time::timeout(Duration::from_secs(5), watch) => {
+                grown.expect("the count grows as the text streams");
+            }
+        }
+        assert_eq!(received.load(Ordering::SeqCst), 6);
     }
     /// An HTTP client that waits only a second and a half for data, far
     /// below its total limit, in place of the two minutes the app allows.
