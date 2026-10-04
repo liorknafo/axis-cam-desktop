@@ -1265,7 +1265,8 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let _within = runtime.enter();
+        let within = runtime.enter();
+        a.store.save(&crate::session::sample()).unwrap();
         a.signing_out = Some(client);
         a.sign_out_pending = true;
         let _ = a.update(Message::Close(id));
@@ -1273,6 +1274,11 @@ mod tests {
         let _ = a.update(Message::Tick);
         assert!(a.closing.is_none());
         assert!(a.signing_out.is_none());
+        // Ending the runtime, as the app does when it ends, joins the delete
+        // the client started: the saved sign-in is gone.
+        drop(within);
+        drop(runtime);
+        assert_eq!(a.store.load().unwrap(), None);
     }
     #[test]
     fn a_gcode_export_counts_as_work_that_must_finish() {
@@ -1321,12 +1327,18 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let _within = runtime.enter();
+        let within = runtime.enter();
+        a.store.save(&crate::session::sample()).unwrap();
         a.sign_out_pending = true;
         let _ = a.update(Message::Close(id));
         a.closing = Some((id, Instant::now() - Duration::from_secs(11)));
         let _ = a.update(Message::Tick);
         assert!(a.closing.is_none());
+        // Ending the runtime, as the app does when it ends, joins the
+        // delete: the saved sign-in is gone.
+        drop(within);
+        drop(runtime);
+        assert_eq!(a.store.load().unwrap(), None);
         // Nothing pending: no waiting.
         a.sign_out_pending = false;
         let _ = a.update(Message::Close(id));
