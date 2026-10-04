@@ -95,16 +95,35 @@ fn short_mm(v: f32) -> String {
 /// `stock_zero_cut` checks), said after "Touch off" in the program header
 /// and in touch-off program 1's instruction. The help texts and the
 /// planner's rule use the same words. None for other work zeros.
+///
+/// Front-left's stretch of each side, 5% to 15% of its length from the
+/// corner, is rounded inwards to 0.1 mm, so that it lies in the checked
+/// stretch; the -X and -Y sides are named apart when their stretches differ.
 fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
     let band = short_mm(side_band(stock));
     match origin {
         "Stock top center" => Some(format!(
-            "Z0 on the stock top at its centre and X0 Y0 from the four sides within {band} mm below the top"
+            "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within {band} mm below the top"
         )),
-        "Stock top front-left" => Some(format!(
-            "Z0 on the stock top within {} mm of the front-left corner and X0 Y0 from the -X and -Y sides within {band} mm below the top",
-            short_mm(corner_area(stock))
-        )),
+        "Stock top front-left" => {
+            let stretch = |length: f32| {
+                let from = (length * 0.05 * 10. - 0.001).ceil() / 10.;
+                let to = (length * 0.15 * 10. + 0.001).floor() / 10.;
+                format!("between {} mm and {} mm", short_mm(from), short_mm(to))
+            };
+            // The -X side runs along Y, the -Y side along X.
+            let size = stock.dimensions();
+            let (x, y) = (stretch(size[1]), stretch(size[0]));
+            let sides = if x == y {
+                format!("the -X and -Y sides {x}")
+            } else {
+                format!("the -X side {x} and the -Y side {y}")
+            };
+            Some(format!(
+                "Z0 on the stock top within {} mm of the front-left corner and X0 Y0 from {sides} from the front-left corner, within {band} mm below the top",
+                short_mm(corner_area(stock))
+            ))
+        }
         _ => None,
     }
 }
@@ -438,9 +457,11 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             "Work zero: {origin} in {offset}. X0 Y0 are unchanged from program 1."
         ));
     } else if let Some(spots) = touch_off_spots(origin, h.stock) {
-        w.note(&format!(
-            "Work zero: {origin} in {offset}. Touch off {spots}."
-        ));
+        // Front-left's sentence runs on over a second line.
+        w.wrapped(
+            "Work zero: ",
+            &format!("{origin} in {offset}. Touch off {spots}."),
+        );
     } else {
         w.note(&format!("Work zero: {origin} in {offset}."));
     }
@@ -1455,7 +1476,7 @@ mod tests {
     const GOLDEN: &str = "(AXIS CAM Studio - LinuxCNC 3-axis program)
 (Job: Golden - Setup 1: Top side - G54)
 (Machine: Workshop Mill v1)
-(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides within 2.5 mm below the top.)
+(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top.)
 (Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
 (Fixture: Low profile clamps)
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
@@ -1491,8 +1512,10 @@ M2
     #[test]
     fn a_stock_based_work_zero_says_where_to_touch_off() {
         // The golden program's 20 x 20 x 10 mm stock: the sides are touched
-        // within 2.5 mm (a quarter of its height) below the top, and the
-        // front-left corner's area is 5 mm (a quarter of its shorter side).
+        // within 2.5 mm (a quarter of its height) below the top, front-left's
+        // from 1 to 3 mm (5% to 15% of each 20 mm side) from the corner, and
+        // the front-left corner's area is 5 mm (a quarter of its shorter
+        // side).
         let mut machine = Machine::new(3);
         machine
             .p
@@ -1505,11 +1528,11 @@ M2
         for (origin, spots) in [
             (
                 "Stock top center",
-                "Z0 on the stock top at its centre and X0 Y0 from the four sides within 2.5 mm below the top",
+                "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top",
             ),
             (
                 "Stock top front-left",
-                "Z0 on the stock top within 5 mm of the front-left corner and X0 Y0 from the -X and -Y sides within 2.5 mm below the top",
+                "Z0 on the stock top within 5 mm of the front-left corner and X0 Y0 from the -X and -Y sides between 1 mm and 3 mm from the front-left corner, within 2.5 mm below the top",
             ),
         ] {
             setup.p.insert("origin".into(), origin.into());
@@ -1531,23 +1554,16 @@ M2
                 )
             };
             let first = text((1, 2));
-            assert!(
-                first.contains(&format!(
-                    "(Work zero: {origin} in G59.3. Touch off {spots}.)\n"
-                )),
+            // The header line and program 1's instruction, read back across
+            // their lines; no line is cut off.
+            assert_eq!(
+                comment_parts(&first, "Work zero: ").join(" "),
+                format!("{origin} in G59.3. Touch off {spots}."),
                 "{first}"
             );
-            // Program 1's instruction, read back across its lines.
-            let before: Vec<&str> = first
-                .lines()
-                .filter_map(|l| {
-                    l.strip_prefix("(Before starting: ")
-                        .or_else(|| l.strip_prefix("(Before starting, continued: "))
-                })
-                .map(|l| l.strip_suffix(')').unwrap())
-                .collect();
+            assert!(first.lines().all(|l| l.len() <= 202), "{first}");
             assert_eq!(
-                before.join(" "),
+                comment_parts(&first, "Before starting: ").join(" "),
                 format!(
                     "load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to touch off {spots}."
                 ),
@@ -1564,21 +1580,28 @@ M2
             );
             assert!(!later.contains(spots), "{later}");
         }
-        // 10 mm at most: a 124 x 84 x 47 mm stock.
+        // 10 mm at most: a 124 x 84 x 47 mm stock. Its -X side is 84 mm
+        // long and its -Y side 124 mm, so each gets its own stretch.
         let stock = Bounds {
             min: [-62., -42., -47.],
             max: [62., 42., 0.],
         };
         assert_eq!(
             touch_off_spots("Stock top front-left", stock).unwrap(),
-            "Z0 on the stock top within 10 mm of the front-left corner and X0 Y0 from the -X and -Y sides within 10 mm below the top"
+            "Z0 on the stock top within 10 mm of the front-left corner and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner, within 10 mm below the top"
         );
-        // Rounded down to 0.1 mm: a 13 mm tall stock is touched within 3.2 mm.
+        // Rounded to 0.1 mm inside the checked area: a 13 mm tall stock is
+        // touched within 3.2 mm, and its 14.2 mm -X side from 0.71 to 2.13 mm
+        // from the corner is said as 0.8 to 2.1 mm.
         let low = Bounds {
             min: [0., 0., 0.],
             max: [30., 14.2, 13.],
         };
         assert_eq!((side_band(low), corner_area(low)), (3.2, 3.5));
+        assert_eq!(
+            touch_off_spots("Stock top front-left", low).unwrap(),
+            "Z0 on the stock top within 3.5 mm of the front-left corner and X0 Y0 from the -X side between 0.8 mm and 2.1 mm and the -Y side between 1.5 mm and 4.5 mm from the front-left corner, within 3.2 mm below the top"
+        );
         assert_eq!(touch_off_spots("Model origin", stock), None);
     }
     #[test]
@@ -1590,7 +1613,11 @@ M2
         m.p.insert("post_dwell".into(), "0".into());
         let (text, _, _) = program(m);
         assert!(text.contains("(Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.)\n(Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.)\nG17 G21"), "{text}");
-        assert!(text.contains("(Before starting: load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides within 2.5 mm below the top.)"), "{text}");
+        assert_eq!(
+            comment_parts(&text, "Before starting: ").join(" "),
+            "load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top.",
+            "{text}"
+        );
         assert!(
             text.contains("(Operation 1/1: Face top - T1)\nG0 Z15.000\nS8000 M3\n"),
             "{text}"
@@ -2077,22 +2104,21 @@ M2
             for (origin, spots) in [
                 (
                     "Stock top center",
-                    "Z0 on the stock top at its centre and X0 Y0 from the four sides",
+                    "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles",
                 ),
                 (
                     "Stock top front-left",
-                    "Z0 on the stock top within 10 mm of the front-left corner and X0 Y0 from the -X and -Y sides",
+                    "Z0 on the stock top within 10 mm of the front-left corner and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner",
                 ),
             ] {
                 let (doc, mesh) = two_sided_job(bottom, origin);
                 let job = post_job(&doc, &mesh);
                 assert!(job.ready(), "{bottom} {origin}: {:?}", errors(&job));
-                // The 47 mm tall stock: within 10 mm below the top.
+                // The 124 x 84 x 47 mm stock: within 10 mm below the top.
                 let text = &setup_texts(&job, 1)[0];
-                assert!(
-                    text.contains(&format!(
-                        "(Work zero: {origin} in G55. Touch off {spots} within 10 mm below the top.)\n"
-                    )),
+                assert_eq!(
+                    comment_parts(text, "Work zero: ").join(" "),
+                    format!("{origin} in G55. Touch off {spots}, within 10 mm below the top."),
                     "{text}"
                 );
             }
@@ -2228,8 +2254,13 @@ M2
             assert!(job.ready(), "cube {origin}: {:?}", errors(&job));
             let text = &setup_texts(&job, 1)[0];
             assert!(
-                text.contains("(Stock: 34.000 x 24.000 x 14.000 mm.")
-                    && text.contains(" within 3.5 mm below the top.)\n"),
+                text.contains("(Stock: 34.000 x 24.000 x 14.000 mm."),
+                "{text}"
+            );
+            assert!(
+                comment_parts(text, "Work zero: ")
+                    .join(" ")
+                    .ends_with(" within 3.5 mm below the top."),
                 "{text}"
             );
         }
@@ -2682,6 +2713,26 @@ M2
             Err(e) => panic!("{e:?}"),
         }
     }
+    /// The text of the comment that begins with `lead`, such as "Work
+    /// zero: ", then of each "<lead word>, continued: " line after it,
+    /// without the leads and parentheses: joined with spaces, the sentence
+    /// the post wrote. Empty when no comment begins with `lead`.
+    fn comment_parts<'a>(text: &'a str, lead: &str) -> Vec<&'a str> {
+        let continued = format!("({}, continued: ", lead.trim_end_matches(": "));
+        text.lines()
+            .skip_while(|l| !l.starts_with(&format!("({lead}")))
+            .enumerate()
+            .take_while(|(k, l)| *k == 0 || l.starts_with(&continued))
+            .map(|(k, l)| {
+                let l = l.strip_suffix(')').unwrap();
+                if k == 0 {
+                    &l[lead.len() + 1..]
+                } else {
+                    &l[continued.len()..]
+                }
+            })
+            .collect()
+    }
     #[test]
     fn planned_setups_carry_setup_1s_fixture_and_their_workholding_note() {
         use crate::proposal::tests::{block, good};
@@ -2762,7 +2813,7 @@ M2
         // Setup 1's stock-based zero says where to touch off.
         let first = &setup_texts(&post_job(&job, &mesh), 0)[0];
         assert!(
-            first.contains("(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides within 10 mm below the top.)\n"),
+            first.contains("(Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 10 mm below the top.)\n"),
             "{first}"
         );
         assert!(!first.contains("Part in work coordinates"));
@@ -2790,7 +2841,7 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 32] = [
+    const COMMENT_STARTS: [&str; 33] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
         "Job, continued: ",
@@ -2798,6 +2849,7 @@ M2
         "Machine: ",
         "Machine, continued: ",
         "Work zero: ",
+        "Work zero, continued: ",
         "Part in work coordinates: ",
         "Touch off on a part wall or the stock top and enter its coordinate.",
         STOCK_TOP_CUT,
@@ -2914,9 +2966,10 @@ M2
                         (Some((1, 2)), "Model origin", Some(3.)),
                         (Some((2, 2)), "Model origin", None),
                         (None, "Model origin", None),
+                        (Some((1, 2)), "Stock top front-left", Some(3.)),
                     ];
                     let sweep = value == POST_TOOL_LENGTH[0] && !around.contains(&n);
-                    for &(part, origin, top) in &headers[..if sweep { 1 } else { 4 }] {
+                    for &(part, origin, top) in &headers[..if sweep { 1 } else { headers.len() }] {
                         setup.p.insert("origin".into(), origin.into());
                         let header = Header {
                             job: &user,
@@ -2974,28 +3027,14 @@ M2
         // The text of the comments that begin with `lead`, then go on after
         // "<lead word>, continued: ", read back as one sentence.
         let whole = |text: &str, lead: &str| -> String {
-            let continued = format!("({}, continued: ", lead.trim_end_matches(": "));
-            let parts: Vec<&str> = text
-                .lines()
-                .skip_while(|l| !l.starts_with(&format!("({lead}")))
-                .enumerate()
-                .take_while(|(k, l)| *k == 0 || l.starts_with(&continued))
-                .map(|(k, l)| {
-                    let l = l.strip_suffix(')').unwrap();
-                    if k == 0 {
-                        &l[lead.len() + 1..]
-                    } else {
-                        &l[continued.len()..]
-                    }
-                })
-                .collect();
+            let parts = comment_parts(text, lead);
             assert!(parts.len() > 1, "{lead} fits on one line:\n{text}");
             parts.join(" ")
         };
         for (part, instruction) in [
             (
                 (1, 2),
-                "then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides within 2.5 mm below the top.",
+                "then use AXIS Touch Off, not Tool Touch Off, to touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, within 2.5 mm below the top.",
             ),
             (
                 (2, 2),
