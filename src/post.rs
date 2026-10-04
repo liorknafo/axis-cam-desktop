@@ -365,8 +365,18 @@ impl Writer {
         self.0.push_str(s.as_ref());
         self.0.push('\n');
     }
+    /// A comment of the app's own words, which always fit on one line.
     fn note(&mut self, s: &str) {
         self.line(format!("({})", comment(s)));
+    }
+    /// `text` after `lead` as whole comment lines, never cut off: later
+    /// lines begin with the lead's words and ", continued: "
+    /// (`comment_lines`).
+    fn wrapped(&mut self, lead: &str, text: &str) {
+        let continued = format!("{}, continued: ", lead.trim_end().trim_end_matches(':'));
+        for line in comment_lines(lead, &continued, text) {
+            self.line(format!("({})", line.trim_end()));
+        }
     }
 }
 pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettings) -> String {
@@ -374,22 +384,24 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     let offset = get(&setup.p, "offset");
     let mut w = Writer(String::new());
     w.line("(AXIS CAM Studio - LinuxCNC 3-axis program)");
-    w.note(&format!(
-        "Job: {} - Setup {}: {} - {offset}",
-        h.job,
-        h.number,
-        setup.name()
-    ));
+    w.wrapped(
+        "Job: ",
+        &format!(
+            "{} - Setup {}: {} - {offset}",
+            h.job,
+            h.number,
+            setup.name()
+        ),
+    );
     if let Some((i, count)) = h.part {
         w.note(&format!(
             "Program {i} of {count} for this setup, one per tool"
         ));
     }
-    w.note(&format!(
-        "Machine: {} v{}",
-        setup.machine.name(),
-        setup.machine.version
-    ));
+    w.wrapped(
+        "Machine: ",
+        &format!("{} v{}", setup.machine.name(), setup.machine.version),
+    );
     // Later touch-off programs keep program 1's X/Y; the stock top may already be cut.
     let later = h.part.is_some_and(|(i, _)| i > 1);
     // Model origin is a point in the CAD file, often inside the part or the
@@ -432,50 +444,51 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         }
     }
     let size = h.stock.dimensions();
-    w.note(&format!(
-        "Stock: {} x {} x {} mm. Part rotation X{} Y{} Z{} deg.",
-        coord(size[0]),
-        coord(size[1]),
-        coord(size[2]),
-        get(&setup.p, "rx"),
-        get(&setup.p, "ry"),
-        get(&setup.p, "rz")
-    ));
-    w.note(&format!("Fixture: {}", get(&setup.p, "fixture")));
+    w.wrapped(
+        "Stock: ",
+        &format!(
+            "{} x {} x {} mm. Part rotation X{} Y{} Z{} deg.",
+            coord(size[0]),
+            coord(size[1]),
+            coord(size[2]),
+            get(&setup.p, "rx"),
+            get(&setup.p, "ry"),
+            get(&setup.p, "rz")
+        ),
+    );
+    w.wrapped("Fixture: ", get(&setup.p, "fixture"));
     if !clean(get(&setup.p, "notes")).is_empty() {
-        for line in comment_lines(
-            "Workholding: ",
-            "Workholding, continued: ",
-            get(&setup.p, "notes"),
-        ) {
-            w.line(format!("({line})"));
-        }
+        w.wrapped("Workholding: ", get(&setup.p, "notes"));
     }
     let mut listed = vec![];
     for op in ops {
         if !listed.contains(&op.tool) {
             listed.push(op.tool);
-            w.note(&format!(
-                "T{}: {} - diameter {} mm - stickout {} mm",
-                op.tool,
-                op.tool_name,
-                coord(op.diameter),
-                coord(op.stickout)
-            ));
+            w.wrapped(
+                &format!("T{}: ", op.tool),
+                &format!(
+                    "{} - diameter {} mm - stickout {} mm",
+                    op.tool_name,
+                    coord(op.diameter),
+                    coord(op.stickout)
+                ),
+            );
         }
     }
     for (k, op) in ops.iter().enumerate() {
-        w.note(&format!(
-            "Operation {}: {} - {} - T{} - S{}",
-            k + 1,
-            op.name,
-            op.strategy,
-            op.tool,
-            op.rpm.round()
-        ));
+        w.wrapped(
+            &format!("Operation {}: ", k + 1),
+            &format!(
+                "{} - {} - T{} - S{}",
+                op.name,
+                op.strategy,
+                op.tool,
+                op.rpm.round()
+            ),
+        );
     }
     for name in &h.disabled {
-        w.note(&format!("Suppressed: {name}"));
+        w.wrapped("Suppressed: ", name);
     }
     let e = extents(blocks);
     w.line(format!(
@@ -496,8 +509,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         // Earlier programs cut away the Z0 surface, so later tools use a fixed reference.
         let (t, name) = (ops[0].tool, &ops[0].tool_name);
         if h.part.is_none_or(|(i, _)| i == 1) {
-            w.note(&format!(
-                "Before starting: load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
+            w.wrapped(
+                "Before starting: ",
+                &format!(
+                    "load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
                 if model && top.is_some() {
                     "on a part wall or the stock top and enter its coordinate from the lines above."
                 } else if model {
@@ -505,12 +520,16 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                 } else {
                     "to set X0 Y0 Z0 at the work zero."
                 }
-            ));
+                ),
+            );
             w.note("Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.");
         } else {
-            w.note(&format!(
-                "Before starting: load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
-            ));
+            w.wrapped(
+                "Before starting: ",
+                &format!(
+                    "load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
+                ),
+            );
             w.note("Do not touch off on the stock: earlier programs have cut it.");
         }
         // A G43 left active from an earlier program would offset the touch-off.
@@ -553,13 +572,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             }
             Block::Start { op, change } => {
                 let s = &ops[*op];
-                w.note(&format!(
-                    "Operation {}/{}: {} - T{}",
-                    op + 1,
-                    ops.len(),
-                    s.name,
-                    s.tool
-                ));
+                w.wrapped(
+                    &format!("Operation {}/{}: ", op + 1, ops.len()),
+                    &format!("{} - T{}", s.name, s.tool),
+                );
                 if *change && settings.tool_table {
                     w.line(format!("T{} M6", s.tool));
                     w.line(format!("G43 H{}", s.tool));
@@ -2380,27 +2396,36 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 23] = [
+    const COMMENT_STARTS: [&str; 32] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
+        "Job, continued: ",
         "Program # of # for this setup, one per tool",
         "Machine: ",
+        "Machine, continued: ",
         "Work zero: ",
         "Part in work coordinates: ",
         "Touch off on a part wall or the stock top and enter its coordinate.",
         STOCK_TOP_CUT,
         "Stock: ",
+        "Stock, continued: ",
         "Fixture: ",
+        "Fixture, continued: ",
         "Workholding: ",
         "Workholding, continued: ",
         "T#: ",
+        "T#, continued: ",
         "Operation #: ",
+        "Operation #, continued: ",
         "Operation #/#: ",
+        "Operation #/#, continued: ",
         "Suppressed: ",
+        "Suppressed, continued: ",
         "Extents: ",
         "Not checked: ",
         "Start with the spindle raised clear of the part and fixtures: ",
         "Before starting: ",
+        "Before starting, continued: ",
         "Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.",
         "Do not touch off on the stock: earlier programs have cut it.",
         "Run G49 in MDI before touching off, and jog the tool clear of the part before Cycle Start.",
@@ -2426,8 +2451,8 @@ M2
     /// Every comment is a whole line, and its text, after leading spaces
     /// (which LinuxCNC skips), begins with one of `COMMENT_STARTS`. Returns
     /// how many comments use each start.
-    fn assert_comments_begin_with_app_words(text: &str) -> [usize; 23] {
-        let mut used = [0; 23];
+    fn assert_comments_begin_with_app_words(text: &str) -> [usize; COMMENT_STARTS.len()] {
+        let mut used = [0; COMMENT_STARTS.len()];
         for line in text.lines().filter(|l| l.contains(['(', ')'])) {
             let inner = line
                 .strip_prefix('(')
@@ -2458,7 +2483,7 @@ M2
         // program 1 and a later one, clearance retracts, with and without
         // Model origin, with and without the stock top.
         let plan = golden_plan();
-        let mut used = [0; 23];
+        let mut used = [0; COMMENT_STARTS.len()];
         let every: Vec<usize> = (0..=400).collect();
         let around: Vec<usize> = [
             0, 1, 2, 185, 186, 187, 188, 189, 200, 361, 362, 363, 364, 365,
@@ -2511,7 +2536,7 @@ M2
                         };
                         let text = emit(&header, &ops, &blocks, &settings);
                         let counts = assert_comments_begin_with_app_words(&text);
-                        (0..23).for_each(|k| used[k] += counts[k]);
+                        (0..COMMENT_STARTS.len()).for_each(|k| used[k] += counts[k]);
                         assert_eq!(
                             crate::ngc::verify(
                                 &text,
@@ -2531,6 +2556,81 @@ M2
         // Each kind of comment was written and checked.
         for (k, start) in COMMENT_STARTS.iter().enumerate() {
             assert!(used[k] > 0, "never written: {start}");
+        }
+        // A 200-character tool name: the touch-off instruction and the tool
+        // line run on over more lines, and nothing is cut off.
+        let name: String = "Flat end mill 10 mm "
+            .chars()
+            .cycle()
+            .take(199)
+            .chain(['x'])
+            .collect();
+        assert_eq!(name.len(), 200);
+        let mut machine = Machine::new(3);
+        machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let settings = PostSettings::from_machine(&machine).unwrap();
+        let setup = Setup::new(machine, "G54");
+        let ops = vec![OpState {
+            tool_name: name.clone(),
+            ..fixture::facing_op()
+        }];
+        let blocks = blocks(&ops, &[&plan], &settings);
+        // The text of the comments that begin with `lead`, then go on after
+        // "<lead word>, continued: ", read back as one sentence.
+        let whole = |text: &str, lead: &str| -> String {
+            let continued = format!("({}, continued: ", lead.trim_end_matches(": "));
+            let parts: Vec<&str> = text
+                .lines()
+                .skip_while(|l| !l.starts_with(&format!("({lead}")))
+                .enumerate()
+                .take_while(|(k, l)| *k == 0 || l.starts_with(&continued))
+                .map(|(k, l)| {
+                    let l = l.strip_suffix(')').unwrap();
+                    if k == 0 {
+                        &l[lead.len() + 1..]
+                    } else {
+                        &l[continued.len()..]
+                    }
+                })
+                .collect();
+            assert!(parts.len() > 1, "{lead} fits on one line:\n{text}");
+            parts.join(" ")
+        };
+        for (part, instruction) in [
+            (
+                (1, 2),
+                "then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero.",
+            ),
+            (
+                (2, 2),
+                "then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z.",
+            ),
+        ] {
+            let header = Header {
+                job: "Long names",
+                setup: &setup,
+                number: 1,
+                part: Some(part),
+                stock: plan.stock,
+                located: None,
+                datum: [0., 0., 10.],
+                disabled: vec![],
+            };
+            let text = emit(&header, &ops, &blocks, &settings);
+            assert_comments_begin_with_app_words(&text);
+            assert!(text.lines().all(|l| l.len() <= 202), "{text}");
+            assert_eq!(
+                whole(&text, "Before starting: "),
+                clean(&format!("load T1 {name}, {instruction}")),
+                "{text}"
+            );
+            assert_eq!(
+                whole(&text, "T1: "),
+                clean(&format!("{name} - diameter 10.000 mm - stickout 35.000 mm")),
+                "{text}"
+            );
         }
         // A whole job: the good plan with the three words in the title, setup
         // 2's name, notes and fixture, an operation's name, a tool's name and
