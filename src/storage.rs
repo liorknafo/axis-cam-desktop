@@ -10,7 +10,14 @@ pub fn state_path() -> PathBuf {
         .join("AXIS CAM Studio")
         .join("workspace.json")
 }
+/// Said after loading a project whose tools were numbered by `load_reporting`.
+pub const NUMBERED_TOOLS: &str = "Tools in this project had no tool numbers and were numbered T1–Tn in library order. Check each one against your LinuxCNC tool table before exporting.";
 pub fn load(path: &Path) -> Result<Document, String> {
+    load_reporting(path).map(|(d, _)| d)
+}
+/// Loads a project, and whether tools saved without a tool number were
+/// numbered in library order (see `NUMBERED_TOOLS`).
+pub fn load_reporting(path: &Path) -> Result<(Document, bool), String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.len() > 20_000_000 {
         return Err("Project exceeds 20 MB.".into());
@@ -40,9 +47,9 @@ pub fn load(path: &Path) -> Result<Document, String> {
             }
         }
     }
-    d.number_tools();
+    let numbered = d.number_tools();
     d.validate_structure()?;
-    Ok(d)
+    Ok((d, numbered))
 }
 pub fn archive(state_path: &Path, doc: &Document) -> Result<PathBuf, String> {
     let folder = state_path
@@ -159,5 +166,23 @@ mod tests {
         let numbers: Vec<_> = loaded.tools.iter().map(|t| t.number()).collect();
         assert_eq!(numbers, vec![Some(1), Some(2), Some(3)]);
         fs::remove_file(p).unwrap();
+    }
+    #[test]
+    fn loading_reports_whether_tools_were_numbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("old.axis.json");
+        let mut d = Document::sample();
+        for t in &mut d.tools {
+            t.p.remove("number");
+        }
+        save(&p, &d).unwrap();
+        let (loaded, numbered) = load_reporting(&p).unwrap();
+        assert!(numbered);
+        // Saved with its numbers, it loads without numbering again.
+        save(&p, &loaded).unwrap();
+        let (again, numbered) = load_reporting(&p).unwrap();
+        assert!(!numbered);
+        assert_eq!(again.tools[2].number(), Some(3));
+        assert!(load_reporting(&dir.path().join("missing.json")).is_err());
     }
 }

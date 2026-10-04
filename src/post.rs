@@ -1802,7 +1802,39 @@ M2
         )
         .unwrap();
         assert!(message.starts_with("Wrote 1 LinuxCNC program"));
+        assert!(!message.contains("LinuxCNC tool table"), "{message}");
         assert!(out.join("Fixture block - 1 Top (G54).ngc").exists());
+    }
+    #[test]
+    fn headless_export_announces_tools_numbered_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, _) = fixture::job();
+        for t in &mut doc.tools {
+            t.p.remove("number");
+        }
+        let project = dir.path().join("job.axis.json");
+        crate::storage::save(&project, &doc).unwrap();
+        let out = dir.path().join("out");
+        let message = crate::export_gcode(
+            Some(&project.to_string_lossy().into_owned()),
+            Some(&out.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
+        assert!(
+            message.ends_with(crate::storage::NUMBERED_TOOLS),
+            "{message}"
+        );
+        // A refused export carries the note too.
+        doc.setups[0].p.insert("offset".into(), "G99".into());
+        crate::storage::save(&project, &doc).unwrap();
+        let error = crate::export_gcode(
+            Some(&project.to_string_lossy().into_owned()),
+            Some(&out.to_string_lossy().into_owned()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Nothing was written."), "{error}");
+        assert!(error.ends_with(crate::storage::NUMBERED_TOOLS), "{error}");
     }
     #[test]
     fn posting_simulations_already_run_matches_post_job() {

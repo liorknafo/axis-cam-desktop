@@ -125,7 +125,8 @@ pub enum Message {
     OpenHistory,
     Import,
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
-    ProjectOpened(Option<Result<(Document, PathBuf), String>>),
+    /// The project, its path, and whether its tools were numbered on load.
+    ProjectOpened(Option<Result<(Document, PathBuf, bool), String>>),
     ModelRestored(Result<mesh::Mesh, String>),
     Saved(Option<Result<PathBuf, String>>),
     Export(&'static str),
@@ -369,10 +370,13 @@ impl App {
             isolated,
         );
         let (mut doc, status) = if state_path.exists() && smoke_dir.is_none() {
-            match storage::load(&state_path) {
-                Ok(d) => (
+            match storage::load_reporting(&state_path) {
+                Ok((d, numbered)) => (
                     d,
-                    "Choose New project, Open, or Continue your previous project.".into(),
+                    with_numbered_note(
+                        "Choose New project, Open, or Continue your previous project.",
+                        numbered,
+                    ),
                 ),
                 Err(e) => {
                     state_path =
@@ -1063,7 +1067,7 @@ impl App {
             }
             Message::RecoverPrevious => {
                 if let Some(path) = self.last_archived.clone() {
-                    let result = storage::load(&path).map(|d| (d, path));
+                    let result = storage::load_reporting(&path).map(|(d, n)| (d, path, n));
                     return self.update(Message::ProjectOpened(Some(result)));
                 }
             }
@@ -1630,7 +1634,7 @@ impl App {
                         }
                         let file = dialog.pick_file().await?;
                         let p = file.path().to_path_buf();
-                        Some(storage::load(&p).map(|d| (d, p)))
+                        Some(storage::load_reporting(&p).map(|(d, n)| (d, p, n)))
                     },
                     Message::ProjectOpened,
                 );
@@ -1748,13 +1752,16 @@ impl App {
                     }
                 }
             }
-            Message::ProjectOpened(Some(Ok((d, p)))) => {
+            Message::ProjectOpened(Some(Ok((d, p, numbered)))) => {
                 self.import_busy = false;
                 if !self.archive_current() {
                     return Task::none();
                 }
                 self.replace_document(d, Some(p));
-                self.status = "Project opened. Your previous workspace is in History.".into();
+                self.status = with_numbered_note(
+                    "Project opened. Your previous workspace is in History.",
+                    numbered,
+                );
                 return self.restore_model();
             }
             Message::ProjectOpened(Some(Err(e))) => {
@@ -2561,7 +2568,16 @@ fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<Str
     let (Some(project), Some(folder)) = (project, folder) else {
         return Err("Usage: axis-cam --export-gcode <project.json> <output folder>".into());
     };
-    let mut doc = storage::load(std::path::Path::new(project))?;
+    let (doc, numbered) = storage::load_reporting(std::path::Path::new(project))?;
+    let result = export_document(doc, folder);
+    if !numbered {
+        return result;
+    }
+    // The note follows the outcome, on standard output or standard error.
+    let note = |message: String| format!("{message}\n{}", storage::NUMBERED_TOOLS);
+    result.map(note).map_err(note)
+}
+fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
     doc.sync_stock_sources();
     let file = doc
         .file
@@ -2663,6 +2679,15 @@ fn merge_sample(user: &Document) -> (Document, String) {
         )
     };
     (doc, status)
+}
+/// A status line, followed by `storage::NUMBERED_TOOLS` when the loaded
+/// project's tools were numbered.
+fn with_numbered_note(status: &str, numbered: bool) -> String {
+    if numbered {
+        format!("{status} {}", storage::NUMBERED_TOOLS)
+    } else {
+        status.to_string()
+    }
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();

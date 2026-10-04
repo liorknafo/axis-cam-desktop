@@ -965,6 +965,54 @@ mod tests {
         );
     }
     #[test]
+    fn tools_numbered_on_load_are_announced() {
+        let note = "Tools in this project had no tool numbers and were numbered T1–Tn in library order. Check each one against your LinuxCNC tool table before exporting.";
+        assert_eq!(crate::storage::NUMBERED_TOOLS, note);
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = Document::sample();
+        for t in &mut legacy.tools {
+            t.p.remove("number");
+        }
+        // Workspace start.
+        let path = dir.path().join("workspace.json");
+        crate::storage::save(&path, &legacy).unwrap();
+        let mut a = App::from_workspace(path.clone(), None);
+        assert!(a.status.ends_with(note), "{}", a.status);
+        // Open, with the flag from the load.
+        let project = dir.path().join("old.axis.json");
+        crate::storage::save(&project, &legacy).unwrap();
+        let (doc, numbered) = crate::storage::load_reporting(&project).unwrap();
+        let _ = a.update(Message::ProjectOpened(Some(Ok((
+            doc,
+            project.clone(),
+            numbered,
+        )))));
+        assert!(
+            a.status.starts_with("Project opened.") && a.status.ends_with(note),
+            "{}",
+            a.status
+        );
+        // A project that already had numbers says nothing about them.
+        let numbered_doc = crate::storage::load(&project).unwrap();
+        let _ = a.update(Message::ProjectOpened(Some(Ok((
+            numbered_doc,
+            project,
+            false,
+        )))));
+        assert!(!a.status.contains("LinuxCNC tool table"), "{}", a.status);
+        // Recover previous loads the archived project the same way.
+        let archived = a.last_archived.clone().unwrap();
+        crate::storage::save(&archived, &legacy).unwrap();
+        let _ = a.update(Message::RecoverPrevious);
+        assert!(a.status.ends_with(note), "{}", a.status);
+        // A workspace with numbers starts without the note.
+        let fresh = tempfile::tempdir().unwrap();
+        let path = fresh.path().join("workspace.json");
+        crate::storage::save(&path, &Document::sample()).unwrap();
+        let a = App::from_workspace(path, None);
+        assert!(!a.status.contains("LinuxCNC tool table"), "{}", a.status);
+    }
+    #[test]
     fn failed_archive_and_pending_file_actions_do_not_reset_work() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
@@ -2116,7 +2164,13 @@ mod tests {
     #[test]
     fn new_project_and_open_drop_the_preview_the_run_and_the_undo() {
         let dir = tempfile::tempdir().unwrap();
-        let other = || (Document::default(), dir.path().join("project-b.json"));
+        let other = || {
+            (
+                Document::default(),
+                dir.path().join("project-b.json"),
+                false,
+            )
+        };
         for open in [false, true] {
             let switch = |a: &mut App| {
                 let message = if open {
