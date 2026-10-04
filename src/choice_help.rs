@@ -131,16 +131,16 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Record the opposite wear-compensation sign convention. This sample preference is not implemented for imported machining or controller output."
         }
         ("coolant", "Flood") => {
-            "Request a continuous liquid coolant stream. This is saved for future postprocessing; it does not simulate coolant flow or turn on a machine output."
+            "Flood coolant: LinuxCNC export writes M8 when the operation starts, and M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant."
         }
         ("coolant", "Mist") => {
-            "Request a mist coolant mode. The preference is saved with the operation; the current preview does not simulate mist or emit coolant commands."
+            "Mist coolant: LinuxCNC export writes M7 when the operation starts, and M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant."
         }
         ("coolant", "Air") => {
-            "Request an air blast for chip clearing. This records the intended mode; no machine output is generated."
+            "Air blast for chip clearing: LinuxCNC export writes the machine's Air output (M7 or M8, set on the machine) when the operation starts, and M9 when the coolant changes, at a tool change and at the end of the program. Export is refused when the machine has no Air output. The preview does not simulate coolant."
         }
         ("coolant", "Off") => {
-            "Request no coolant output for this operation. The preview and material removal are unchanged by this saved preference."
+            "No coolant: LinuxCNC export writes no coolant command for this operation, after an M9 when an earlier operation left coolant on. The preview does not simulate coolant."
         }
         ("stock_type", "Relative size box") => {
             "Build the blank from the placed part bounds plus six independent offsets. Top adds material only above the part; Right adds material only on +X. Offsets follow setup rotation and translation. The first setup defines the blank for the whole job."
@@ -591,6 +591,34 @@ mod tests {
         );
         assert!(fixed.body.contains("overall X, Y and Z"));
         assert!(fixed.diagram.is_none());
+    }
+    #[test]
+    fn coolant_help_says_what_the_export_writes() {
+        let p = Fields::new();
+        let body = |v: &str| selected("coolant", "Coolant", v, Target::Operation, &p).body;
+        assert!(body("Flood").contains("M8"));
+        assert!(body("Mist").contains("M7"));
+        assert!(body("Air").contains("machine's Air output"));
+        assert!(body("Air").contains("refused"));
+        assert!(body("Off").contains("no coolant command"));
+        let field = crate::help::field_help("coolant", "Coolant", Target::Operation).body;
+        assert!(field.contains("M8") && field.contains("M7") && field.contains("M9"));
+        for text in ["Flood", "Mist", "Air", "Off"]
+            .map(body)
+            .into_iter()
+            .chain([field])
+        {
+            assert!(text.contains("does not simulate coolant"), "{text}");
+            for stale in [
+                "future postprocessing",
+                "no machine output",
+                "saved preference",
+            ] {
+                assert!(!text.contains(stale), "{text}");
+            }
+        }
+        let rpm = crate::help::field_help("rpm", "Spindle speed", Target::Operation).body;
+        assert!(rpm.contains("LinuxCNC export writes it as S"), "{rpm}");
     }
     #[test]
     fn post_settings_have_choice_specific_help() {

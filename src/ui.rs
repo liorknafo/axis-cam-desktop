@@ -960,7 +960,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
             c = c
                 .push(btn("Open tool library", Message::Page(Page::Tools), false))
                 .push(section("Feeds & speeds"))
-                .push(field(p, "rpm", "Spindle speed · rpm (saved)", t));
+                .push(field(p, "rpm", "Spindle speed · rpm", t));
             if o.strategy.imported_preview() && !app.is_sample() {
                 c = c
                     .push(choice_value(
@@ -983,7 +983,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
                 .push(choice(
                     p,
                     "coolant",
-                    "Coolant (saved for postprocessing)",
+                    "Coolant",
                     &["Flood", "Mist", "Air", "Off"],
                     t,
                 ));
@@ -2280,6 +2280,7 @@ pub(crate) fn operation_lines(
     let mut values = vec![
         format!("{} rpm", n(value("rpm").round())),
         format!("{} mm/min", n(value("feed"))),
+        format!("coolant {}", get(p, "coolant")),
     ];
     let mut push = |text: String| values.push(text);
     let stepdown = format!("stepdown {} mm", n(value("stepdown")));
@@ -2302,6 +2303,7 @@ pub(crate) fn operation_lines(
     };
     match op.strategy {
         Strategy::Face => {
+            push(format!("facing area {}", get(p, "boundary").to_lowercase()));
             push(stepdown);
             push(stepover);
             bottom.into_iter().for_each(&mut push);

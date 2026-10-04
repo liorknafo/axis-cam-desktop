@@ -2634,13 +2634,13 @@ mod tests {
             lines(0),
             [
                 "Facing · “Face by planner” · T1 Flat 10 · 1.3 min",
-                "8000 rpm · 1000 mm/min · stepdown 2 mm · stepover 40% · bottom offset 0.5 mm",
+                "8000 rpm · 1000 mm/min · coolant Flood · facing area stock silhouette · stepdown 2 mm · stepover 40% · bottom offset 0.5 mm",
                 "The planner's reason: Because.",
             ]
         );
         assert_eq!(
             lines(1)[1],
-            "8001 rpm · 1000 mm/min · stepdown 2 mm · stepover 35% · axial allowance 0.1 mm · entry Profile ramp at 3° · 2 finish passes"
+            "8001 rpm · 1000 mm/min · coolant Flood · stepdown 2 mm · stepover 35% · axial allowance 0.1 mm · entry Profile ramp at 3° · 2 finish passes"
         );
         assert_eq!(
             lines(1)[0],
@@ -2650,21 +2650,33 @@ mod tests {
             lines(2)[..2],
             [
                 "Contour, outside · “Contour by planner” · T1 Flat 10 · 1.3 min",
-                "8000 rpm · 1000 mm/min · stepdown 2 mm · radial allowance 0.25 mm · 1 finish pass",
+                "8000 rpm · 1000 mm/min · coolant Flood · stepdown 2 mm · radial allowance 0.25 mm · 1 finish pass",
             ]
         );
         assert_eq!(
             lines(3)[1],
-            "2400 rpm · 280 mm/min · Deep drilling, peck 3 mm · through, breakthrough 1.5 mm · holes of Ø6.6 mm only"
+            "2400 rpm · 280 mm/min · coolant Flood · Deep drilling, peck 3 mm · through, breakthrough 1.5 mm · holes of Ø6.6 mm only"
         );
         assert_eq!(
             lines(4)[..2],
             [
                 "Parallel finishing · “Parallel by planner” · T1 Flat 10 · 1.3 min",
-                "8000 rpm · 1000 mm/min · surface stepover 0.8 mm · tolerance 0.02 mm",
+                "8000 rpm · 1000 mm/min · coolant Flood · surface stepover 0.8 mm · tolerance 0.02 mm",
             ]
         );
-        assert_eq!(lines(5)[1], "8000 rpm · 1000 mm/min · stepdown 3 mm");
+        assert_eq!(
+            lines(5)[1],
+            "8000 rpm · 1000 mm/min · coolant Flood · stepdown 3 mm"
+        );
+        // Face says which area it faces; coolant shows the value that runs.
+        let mut face = ops[0].clone();
+        face.p.insert("boundary".into(), "Model silhouette".into());
+        face.p.insert("coolant".into(), "Off".into());
+        assert!(
+            crate::ui::operation_lines(&face, "T1", 1., "")[1].starts_with(
+                "8000 rpm · 1000 mm/min · coolant Off · facing area model silhouette · "
+            )
+        );
         // An inside contour, and a drill that stops in the hole.
         let mut inside = ops[2].clone();
         inside.p.insert("side".into(), "Inside".into());
@@ -2678,7 +2690,7 @@ mod tests {
         // It runs as a floor profile: Pocket's entry and ramp, a fixed stepover.
         assert_eq!(
             crate::ui::operation_lines(&inside, "T1", 1., "")[1],
-            "8000 rpm · 1000 mm/min · stepdown 2 mm · stepover 40% (fixed) · radial allowance 0.25 mm · entry Profile ramp at 2° · 1 finish pass"
+            "8000 rpm · 1000 mm/min · coolant Flood · stepdown 2 mm · stepover 40% (fixed) · radial allowance 0.25 mm · entry Profile ramp at 2° · 1 finish pass"
         );
         inside.p.insert("pocket_entry".into(), "Plunge".into());
         assert!(
@@ -2692,7 +2704,7 @@ mod tests {
         blind.p.insert("hole_diameter".into(), "0".into());
         assert_eq!(
             crate::ui::operation_lines(&blind, "T3", 1., "")[1],
-            "2400 rpm · 280 mm/min · Drilling · not through"
+            "2400 rpm · 280 mm/min · coolant Flood · Drilling · not through"
         );
         assert_eq!(
             crate::ui::operation_lines(&blind, "T3", 1., "")[2],

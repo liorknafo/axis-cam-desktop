@@ -440,7 +440,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "rpm") => (
-            "Spindle revolutions per minute. Select a value appropriate to the cutter, material and machine limit; this prototype does not calculate a recommended speed.",
+            "Spindle revolutions per minute. LinuxCNC export writes it as S, rounded to a whole number. Select a value appropriate to the cutter, material and machine limit; this prototype does not calculate a recommended speed.",
             Some(Tool),
         ),
         (_, "spindle_rotation") => (
@@ -464,7 +464,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Tool),
         ),
         (_, "coolant") => (
-            "Requested coolant mode for this operation: flood, mist, air or off. It is saved for future postprocessing.",
+            "Coolant for this operation. LinuxCNC export writes M8 for Flood, M7 for Mist, the machine's Air output for Air (refused when it has none) and nothing for Off, then M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
             None,
         ),
         (_, "hole_diameter") => (
