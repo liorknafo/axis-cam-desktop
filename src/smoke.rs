@@ -2874,12 +2874,12 @@ mod tests {
             max: [60., 40., 0.],
         };
         assert_eq!(
-            crate::ui::work_zero_line(&setup, Some((part, 3.))),
+            crate::ui::work_zero_line(&setup, Some((part, Some(3.)))),
             "Rotation [180, 0, 0]° · work zero: Stock top center"
         );
         setup.p.insert("origin".into(), "Model origin".into());
         assert_eq!(
-            crate::ui::work_zero_line(&setup, Some((part, 3.))),
+            crate::ui::work_zero_line(&setup, Some((part, Some(3.)))),
             "Rotation [180, 0, 0]° · work zero: Model origin — X0 Y0 at X+60 Y+40 mm from the part's −X −Y corner (part 120 × 80 mm), Z0 3 mm below the stock top"
         );
         // A file origin far from the part is visibly off it.
@@ -2888,12 +2888,22 @@ mod tests {
             max: [-240., 40., 0.],
         };
         assert_eq!(
-            crate::ui::work_zero_line(&setup, Some((far, -2.5))),
+            crate::ui::work_zero_line(&setup, Some((far, Some(-2.5)))),
             "Rotation [180, 0, 0]° · work zero: Model origin — X0 Y0 at X+360 Y+40 mm from the part's −X −Y corner (part 120 × 80 mm), Z0 2.5 mm above the stock top"
         );
         assert_eq!(
             crate::ui::work_zero_line(&setup, None),
             "Rotation [180, 0, 0]° · work zero: Model origin"
+        );
+        // An earlier setup cut the stock top: Z0 from the part's top, and
+        // touch off on a part face.
+        let side = crate::mesh::Bounds {
+            min: [-60., 0., -40.],
+            max: [60., 40., 40.],
+        };
+        assert_eq!(
+            crate::ui::work_zero_line(&setup, Some((side, None))),
+            "Rotation [180, 0, 0]° · work zero: Model origin — X0 Y0 at X+60 Y0 mm from the part's −X −Y corner (part 120 × 40 mm), Z0 40 mm below the part's top. The stock top was cut by an earlier setup; touch off on a part face."
         );
     }
     #[test]

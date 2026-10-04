@@ -6,7 +6,7 @@ use crate::{
     analysis::{self, Index, PartReport},
     cam::Geometry,
     mesh::{Bounds, Mesh},
-    model::{Document, get},
+    model::Document,
     proposal::{self, Problem, Proposal},
     simulation::{Motion, Plan, Simulation},
     volume::Volume,
@@ -25,9 +25,10 @@ pub struct CheckReport {
     pub total_minutes: f32,
     /// Per setup, for a Model-origin zero that passed the export stage: the
     /// part's box and the stock top in work coordinates (mm), which locate it
-    /// on the preview. Not sent to the model.
+    /// on the preview; the stock top is None when an earlier setup has cut it
+    /// (`post::model_zero`). Not sent to the model.
     #[serde(skip)]
-    pub zeros: Vec<Option<(Bounds, f32)>>,
+    pub zeros: Vec<Option<(Bounds, Option<f32>)>>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OpResult {
@@ -518,16 +519,8 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
                 .iter()
                 .zip(&results)
                 .map(|(setup, sims)| {
-                    if get(&setup.p, "origin") != "Model origin" {
-                        return None;
-                    }
-                    let stock = sims.iter().find_map(|(_, r)| r.as_ref().ok())?.plan.stock;
-                    let datum = crate::post::datum(setup, stock, mesh).ok()?;
-                    Some(crate::post::zero_place(
-                        crate::post::part_box(setup, mesh),
-                        stock,
-                        datum,
-                    ))
+                    let first = sims.iter().find_map(|(_, r)| r.as_ref().ok())?;
+                    crate::post::model_zero(setup, mesh, first)
                 })
                 .collect();
         }
@@ -565,6 +558,23 @@ mod tests {
             .collect()
     }
     #[test]
+    fn a_side_up_setup_after_a_contour_is_located_without_the_cut_stock_top() {
+        use crate::proposal::tests::side_up;
+        let (doc, mesh, report) = block();
+        let (check, built) = check(&doc, &mesh, &report, &side_up(&report, "-Y"));
+        assert!(check.passed, "{:?}", stages(&check));
+        let (part, top) = check.zeros[1].unwrap();
+        assert_eq!(top, None, "{part:?}");
+        let line = crate::ui::work_zero_line(&built.unwrap().setups[1], check.zeros[1]);
+        assert!(
+            line.ends_with(
+                "Z0 40 mm below the part's top. The stock top was cut by an earlier setup; touch off on a part face."
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("Stock top") && !line.contains("below the stock top"));
+    }
+    #[test]
     fn a_good_two_setup_plan_passes_every_stage() {
         let (doc, mesh, report) = block();
         let (check, built) = check(&doc, &mesh, &report, &good(&report));
@@ -577,7 +587,7 @@ mod tests {
         assert!(check.operations.iter().all(|o| o.minutes > 0.));
         let sum: f32 = check.operations.iter().map(|o| o.minutes).sum();
         assert!((check.total_minutes - sum).abs() < 0.11);
-        assert_eq!(built.unwrap().setups.len(), 2);
+        assert_eq!(built.as_ref().unwrap().setups.len(), 2);
         // Setup 2's Model origin is located for the preview: the part's box
         // and the stock top in its work coordinates.
         assert_eq!(check.zeros.len(), 2);
@@ -588,7 +598,11 @@ mod tests {
             near(part.min, [-60., -40., -40.]) && near(part.max, [60., 40., 0.]),
             "{part:?}"
         );
-        assert!((top - 3.).abs() < 0.01, "{top}");
+        assert!(top.is_some_and(|top| (top - 3.).abs() < 0.01), "{top:?}");
+        assert!(
+            crate::ui::work_zero_line(&built.as_ref().unwrap().setups[1], check.zeros[1])
+                .ends_with("Z0 3 mm below the stock top")
+        );
         let coverage = check.coverage.unwrap();
         assert!(
             coverage.exposed_percent > 60. && coverage.exposed_percent < 100.,

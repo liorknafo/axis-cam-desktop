@@ -134,7 +134,7 @@ RULES
 - No tool tip may go deeper below the stock top than the tool's stickout.
 - Choose conservative spindle speeds and feeds for the material and each tool, within the machine's limits.
 - Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, allowances and `bottom_offset` 0.
-- For later setups choose the work zero: `Model origin` is accepted; the program tells the operator where it lies relative to the part and the stock top. Prefer a stock-based zero when the stock face it uses is untouched; a stock-based zero is refused when earlier setups have cut that stock face.
+- For later setups choose the work zero: `Model origin` is accepted; the program tells the operator where it lies relative to the part, and to the stock top while no earlier setup has cut it. Prefer a stock-based zero when the stock face it uses is untouched; a stock-based zero is refused when earlier setups have cut that stock face.
 - Give each setup a short `workholding` note. Clamps are not modelled, so say what must be kept clear.
 - List every feature you cannot machine with these tools and strategies in `unmachined`, with the reason. Do not leave it out silently, and do not add an operation that cannot work.
 - Put risks the operator should know about in `warnings`.

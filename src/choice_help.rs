@@ -155,7 +155,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Program zero is the stock's top corner on −X and −Y in setup coordinates, independent of camera orientation. Touch off X0 Y0 Z0 on that corner."
         }
         ("origin", "Model origin") => {
-            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. The LinuxCNC program lists the part's box and the stock top in work coordinates, to touch off on a part wall or the stock top. Check that the point can be located on the machine before choosing it."
+            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top. Check that the point can be located on the machine before choosing it."
         }
         ("origin", "Selected point (planned)") => {
             "Picking an arbitrary work zero is planned. G-code export is refused while this is selected."

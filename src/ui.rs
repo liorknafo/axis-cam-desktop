@@ -2472,10 +2472,12 @@ pub(crate) fn setup_title(index: usize, name: &str) -> String {
 }
 /// A planned setup's rotation and work zero. A Model-origin zero is located
 /// from the part's −X −Y corner and the stock top, given `zero`: the part's
-/// box and the stock top in work coordinates (mm).
+/// box and the stock top in work coordinates (mm). When an earlier setup has
+/// cut the stock top (None), Z0 is located from the part's top instead and
+/// the line says to touch off on a part face.
 pub(crate) fn work_zero_line(
     setup: &crate::model::Setup,
-    zero: Option<(crate::mesh::Bounds, f32)>,
+    zero: Option<(crate::mesh::Bounds, Option<f32>)>,
 ) -> String {
     let origin = get(&setup.p, "origin");
     let mut line = format!(
@@ -2495,19 +2497,23 @@ pub(crate) fn work_zero_line(
         };
         let signed = |v: f32| {
             let text = n(v);
-            if text.starts_with('-') {
+            if text.starts_with('-') || text == "0" {
                 text
             } else {
                 format!("+{text}")
             }
         };
         let size = part.dimensions();
-        let z = if n(top) == "0" {
-            "Z0 on the stock top".to_string()
-        } else if top > 0. {
-            format!("Z0 {} mm below the stock top", n(top))
+        let (height, reference) = match top {
+            Some(top) => (top, "the stock top"),
+            None => (part.max[2], "the part's top"),
+        };
+        let z = if n(height) == "0" {
+            format!("Z0 on {reference}")
+        } else if height > 0. {
+            format!("Z0 {} mm below {reference}", n(height))
         } else {
-            format!("Z0 {} mm above the stock top", n(-top))
+            format!("Z0 {} mm above {reference}", n(-height))
         };
         line += &format!(
             " — X0 Y0 at X{} Y{} mm from the part's −X −Y corner (part {} × {} mm), {z}",
@@ -2516,6 +2522,9 @@ pub(crate) fn work_zero_line(
             n(size[0]),
             n(size[1]),
         );
+        if top.is_none() {
+            line += &format!(". {}", crate::post::STOCK_TOP_CUT);
+        }
     }
     line
 }

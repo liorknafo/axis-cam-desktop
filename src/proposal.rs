@@ -727,6 +727,14 @@ pub(crate) mod tests {
             warnings: vec![],
         }
     }
+    /// `good` with setup 2 turned so that `up` faces up, after setup 1's
+    /// Contour has removed the stock's side margins, and one Face on that side.
+    pub fn side_up(report: &PartReport, up: &str) -> Proposal {
+        let mut proposal = good(report);
+        proposal.setups[1].orientation = up.into();
+        proposal.setups[1].operations = vec![op("Face", 1, ids(report, up, 0.))];
+        proposal
+    }
     fn messages(result: Result<Document, Vec<Problem>>) -> Vec<String> {
         result
             .unwrap_err()

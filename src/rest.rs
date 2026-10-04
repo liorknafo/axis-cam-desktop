@@ -66,6 +66,31 @@ pub fn cut_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
         })
         .collect()
 }
+/// Box, in `current`, around the material each earlier cut can have
+/// removed: within the tool radius of its path, from its lowest tip up to
+/// its flute top, as `Volume::cut` carves. `cut_boxes` also reaches a tool
+/// radius below the tip.
+pub fn removal_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
+    volume
+        .cuts
+        .iter()
+        .map(|c| {
+            let b = Bounds {
+                min: [
+                    c.a[0].min(c.b[0]) - c.radius,
+                    c.a[1].min(c.b[1]) - c.radius,
+                    c.a[2].min(c.b[2]),
+                ],
+                max: [
+                    c.a[0].max(c.b[0]) + c.radius,
+                    c.a[1].max(c.b[1]) + c.radius,
+                    c.a[2].max(c.b[2]) + c.flute,
+                ],
+            };
+            transformed(b, c.frame, current)
+        })
+        .collect()
+}
 impl RestStock {
     pub fn new(volume: &Volume, current: Frame) -> Self {
         let cuts = volume
@@ -280,6 +305,18 @@ mod tests {
         for &y in ys {
             v.cut([-15., y, z], [15., y, z], 2.5, flute, CutterShape::Flat, f);
         }
+    }
+    #[test]
+    fn removal_boxes_start_at_the_tool_tip() {
+        let (mut v, f, _, _, _) = fixture();
+        face(&mut v, f, 8., &[-6.], 3.);
+        let removed = removal_boxes(&v, f)[0];
+        assert_eq!(
+            (removed.min, removed.max),
+            ([-17.5, -8.5, 8.], [17.5, -3.5, 11.])
+        );
+        // cut_boxes reaches a tool radius lower.
+        assert_eq!(cut_boxes(&v, f)[0].min[2], 5.5);
     }
     #[test]
     fn overlapping_cylinders_prove_full_cap_without_voxel_evidence() {

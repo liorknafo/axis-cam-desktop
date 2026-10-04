@@ -73,15 +73,39 @@ pub fn datum(setup: &Setup, stock: Bounds, mesh: &Mesh) -> Result<[f32; 3], Stri
     }
 }
 /// The part's box in a setup's plan coordinates (mm).
-pub fn part_box(setup: &Setup, mesh: &Mesh) -> Bounds {
+fn part_box(setup: &Setup, mesh: &Mesh) -> Bounds {
     Placement::new(mesh, Some(setup))
         .bounds
         .scaled(1. / mesh.display_scale())
 }
 /// What locates a work zero the operator cannot touch directly (Model
 /// origin): the part's box and the stock top, in work coordinates (mm).
-pub fn zero_place(part: Bounds, stock: Bounds, datum: [f32; 3]) -> (Bounds, f32) {
+fn zero_place(part: Bounds, stock: Bounds, datum: [f32; 3]) -> (Bounds, f32) {
     (part.translated(datum.map(|v| -v)), stock.max[2] - datum[2])
+}
+/// Said in place of the stock top when an earlier setup has cut it.
+pub const STOCK_TOP_CUT: &str =
+    "The stock top was cut by an earlier setup; touch off on a part face.";
+/// A Model-origin setup's work zero located for the operator, from the
+/// setup's first simulation: the part's box in work coordinates (mm) and the
+/// stock top's Z, or None for the stock top when an earlier setup has cut it
+/// (`stock_top_cut`). None for other work zeros.
+pub(crate) fn model_zero(
+    setup: &Setup,
+    mesh: &Mesh,
+    sim: &Simulation,
+) -> Option<(Bounds, Option<f32>)> {
+    if get(&setup.p, "origin") != "Model origin" {
+        return None;
+    }
+    let stock = sim.plan.stock;
+    let zero = datum(setup, stock, mesh).ok()?;
+    let (part, top) = zero_place(part_box(setup, mesh), stock, zero);
+    let cut = match (&sim.initial_volume, sim.frame) {
+        (Some(volume), Some(frame)) => stock_top_cut(stock, volume, frame),
+        _ => false,
+    };
+    Some((part, (!cut).then_some(top)))
 }
 pub fn coord(v: f32) -> String {
     let s = format!("{v:.3}");
@@ -308,8 +332,8 @@ pub struct Header<'a> {
     /// (program, count) when touch-off mode splits a setup into one program per tool run.
     pub part: Option<(usize, usize)>,
     pub stock: Bounds,
-    /// The part's box in plan coordinates (mm).
-    pub part_box: Bounds,
+    /// A Model-origin zero located for the operator (see `model_zero`).
+    pub located: Option<(Bounds, Option<f32>)>,
     pub datum: [f32; 3],
     pub disabled: Vec<String>,
 }
@@ -361,8 +385,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             "Work zero: {origin} in {offset}. Touch off X0 Y0 Z0 there."
         ));
     }
-    if model {
-        let (part, top) = zero_place(h.part_box, h.stock, d);
+    // The stock top is offered only while no earlier setup has cut it.
+    let top = h.located.and_then(|(_, top)| top);
+    if let (true, Some((part, _))) = (model, h.located) {
         w.note(&format!(
             "Part in work coordinates: X{} to {} Y{} to {} Z{} to {} mm.{}",
             coord(part.min[0]),
@@ -371,14 +396,17 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             coord(part.max[1]),
             coord(part.min[2]),
             coord(part.max[2]),
-            if later {
-                String::new()
-            } else {
-                format!(" Stock top Z{}.", coord(top))
+            match top {
+                Some(top) if !later => format!(" Stock top Z{}.", coord(top)),
+                _ => String::new(),
             }
         ));
         if !later {
-            w.note("Touch off on a part wall or the stock top and enter its coordinate.");
+            w.note(if top.is_some() {
+                "Touch off on a part wall or the stock top and enter its coordinate."
+            } else {
+                STOCK_TOP_CUT
+            });
         }
     }
     let size = h.stock.dimensions();
@@ -444,8 +472,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         if h.part.is_none_or(|(i, _)| i == 1) {
             w.note(&format!(
                 "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
-                if model {
+                if model && top.is_some() {
                     "on a part wall or the stock top and enter its coordinate from the lines above."
+                } else if model {
+                    "on a part face and enter its coordinate from the lines above."
                 } else {
                     "to set X0 Y0 Z0 at the work zero."
                 }
@@ -702,6 +732,23 @@ pub(crate) fn op_state(
         coolant: coolant.unwrap(),
     })
 }
+/// 7 × 7 sample points across a face of stock box `s`, inset 1% from its
+/// edges, on the plane at `plane` across axis `k`.
+fn face_points(s: Bounds, k: usize, plane: f32) -> impl Iterator<Item = [f32; 3]> {
+    let at =
+        move |k: usize, n: usize| s.min[k] + (s.max[k] - s.min[k]) * (0.01 + 0.98 * n as f32 / 6.);
+    let (i, j) = ((k + 1) % 3, (k + 2) % 3);
+    (0..49).map(move |n| {
+        let mut p = [plane; 3];
+        (p[i], p[j]) = (at(i, n % 7), at(j, n / 7));
+        p
+    })
+}
+/// Whether `p` lies in box `b`. A small guard keeps float error in the frame
+/// transforms on the safe side: a point that close counts as cut.
+fn in_box(p: [f32; 3], b: &Bounds) -> bool {
+    (0..3).all(|a| p[a] >= b.min[a] - 0.001 && p[a] <= b.max[a] + 0.001)
+}
 /// Stock faces a stock-based work zero needs (the top, and the sides that place X0 Y0)
 /// with no sample point left outside every earlier cut box.
 fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str> {
@@ -716,21 +763,27 @@ fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str
     if center {
         faces.push(("+Y side", 1, s.max[1] - 0.01));
     }
-    let at = |k: usize, n: usize| s.min[k] + (s.max[k] - s.min[k]) * (0.01 + 0.98 * n as f32 / 6.);
     faces
         .into_iter()
         .filter(|&(_, k, plane)| {
-            let (i, j) = ((k + 1) % 3, (k + 2) % 3);
-            !(0..49).any(|n| {
-                let mut p = [plane; 3];
-                (p[i], p[j]) = (at(i, n % 7), at(j, n / 7));
-                // A small guard keeps float error in the frame transforms on the safe side.
-                cuts.iter()
-                    .all(|b| (0..3).any(|a| p[a] < b.min[a] - 0.001 || p[a] > b.max[a] + 0.001))
-            })
+            face_points(s, k, plane).all(|p| cuts.iter().any(|b| in_box(p, b)))
         })
         .map(|f| f.0)
         .collect()
+}
+/// Whether earlier setups have cut the stock's top face, wholly or in part:
+/// wholly by the stock-based zeros' test (`stock_faces_cut` on `cut_boxes`),
+/// in part when one of its sample points lies where an earlier cut can have
+/// removed material (`removal_boxes`, which reach no lower than the tool tip,
+/// so an uncut underside 3 mm below a contour's floor stays a stock top).
+fn stock_top_cut(
+    stock: Bounds,
+    volume: &crate::volume::Volume,
+    frame: crate::volume::Frame,
+) -> bool {
+    let removed = crate::rest::removal_boxes(volume, frame);
+    stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), false).contains(&"top face")
+        || face_points(stock, 2, stock.max[2] - 0.01).any(|p| removed.iter().any(|b| in_box(p, b)))
 }
 pub(crate) struct Prepared {
     pub file_name: String,
@@ -820,6 +873,7 @@ pub(crate) fn prepare(
             )]);
         }
     }
+    let located = model_zero(setup, mesh, simulations[0]);
     // Touch-off mode: one program per run of the same tool, touched off before it starts.
     let mut groups: Vec<std::ops::Range<usize>> = vec![];
     for k in 0..ops.len() {
@@ -849,7 +903,7 @@ pub(crate) fn prepare(
             number: si + 1,
             part: part.map(|(i, count, _)| (i, count)),
             stock: plans[0].stock,
-            part_box: part_box(setup, mesh),
+            located,
             datum: zero,
             disabled: setup
                 .operations
@@ -1208,7 +1262,7 @@ mod tests {
             number: 1,
             part: None,
             stock: plan.stock,
-            part_box: plan.stock,
+            located: None,
             datum: [0., 0., 10.],
             disabled: vec![],
         };
@@ -2065,5 +2119,66 @@ M2
             "{text}"
         );
         assert!(!text.contains("set X0 Y0 Z0 at the work zero"), "{text}");
+    }
+    #[test]
+    fn a_model_origin_header_gives_no_stock_top_an_earlier_setup_has_cut() {
+        use crate::proposal::tests::{block, side_up};
+        const CUT: &str =
+            "(The stock top was cut by an earlier setup; touch off on a part face.)\n";
+        // Setup 1's Contour removes the 2 mm side margins, so a side-up later
+        // setup has no stock top left: the highest material is the part wall.
+        let (doc, mesh, report) = block();
+        let job = crate::proposal::build(&doc, &mesh, &report, &side_up(&report, "-Y")).unwrap();
+        let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
+        assert!(
+            text.contains(&format!(
+                "(Work zero: Model origin in G55.)\n(Part in work coordinates: X-60.000 to 60.000 Y0.000 to 40.000 Z-40.000 to 40.000 mm.)\n{CUT}"
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Stock top") && !text.contains("or the stock top"),
+            "{text}"
+        );
+        // Touch-off mode: program 1 names a part face only.
+        let mut touch = job.clone();
+        touch.setups[1]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let text = &setup_texts(&post_job(&touch, &mesh), 1)[0];
+        assert!(
+            text.contains("then use AXIS Touch Off, not Tool Touch Off, on a part face and enter its coordinate from the lines above.)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Stock top") && !text.contains("or the stock top"),
+            "{text}"
+        );
+        // A user's job: setup 1 faces the whole stock top, and setup 2 has
+        // the same orientation.
+        let (mut doc, mesh) = fixture::job();
+        let ops = doc.setups[0].operations.clone();
+        doc.setups[0].operations.truncate(1);
+        let mut later = Setup::new(Machine::new(3), "G55");
+        later.p.insert("name".into(), "Later".into());
+        later.p.insert("origin".into(), "Model origin".into());
+        let mut contour = ops[2].clone();
+        contour.id = id();
+        later.operations.push(contour);
+        doc.setups.push(later);
+        doc.sync_stock_sources();
+        let text = &setup_texts(&post_job(&doc, &mesh), 1)[0];
+        assert!(
+            text.contains(&format!("Z0.000 to 40.000 mm.)\n{CUT}")),
+            "{text}"
+        );
+        assert!(!text.contains("Stock top"), "{text}");
+        // The good plan's flipped setup: setup 1 left the stock's underside,
+        // now its top, in place.
+        let (job, mesh) = good_plan_job();
+        let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
+        assert!(text.contains(" Stock top Z3.000.)\n"), "{text}");
+        assert!(!text.contains(CUT), "{text}");
     }
 }
