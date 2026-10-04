@@ -402,7 +402,10 @@ impl App {
             state_path.parent().unwrap_or(std::path::Path::new(".")),
             isolated,
         );
-        let (mut doc, status) = if state_path.exists() && smoke_dir.is_none() {
+        // A load that changed something has notes; the workspace is then
+        // saved once, so they are not repeated and what the load added, a
+        // material for a legacy name, keeps its identifier.
+        let (mut doc, status, migrated) = if state_path.exists() && smoke_dir.is_none() {
             match storage::load_reporting(&state_path) {
                 Ok((d, notes)) => (
                     d,
@@ -410,6 +413,7 @@ impl App {
                         "Choose New project, Open, or Continue your previous project.",
                         &notes,
                     ),
+                    !notes.is_empty(),
                 ),
                 Err(e) => {
                     state_path =
@@ -419,6 +423,7 @@ impl App {
                         format!(
                             "{e} Original file preserved. A separate recovery workspace will be used."
                         ),
+                        false,
                     )
                 }
             }
@@ -426,6 +431,7 @@ impl App {
             (
                 Document::default(),
                 "Start a new project or open an existing one.".into(),
+                false,
             )
         };
         // A blank workspace has the starter materials too.
@@ -509,7 +515,7 @@ impl App {
             progress: 0.,
             speed: 1.,
             last_tick: Instant::now(),
-            dirty: false,
+            dirty: migrated,
             last_edit: Instant::now(),
             state_path,
             project_path: None,

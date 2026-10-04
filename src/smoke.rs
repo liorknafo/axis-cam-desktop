@@ -1145,6 +1145,53 @@ mod tests {
         assert_eq!(a.doc.selected_material().unwrap().name(), "Brass C360");
     }
     #[test]
+    fn a_workspace_migrated_on_start_is_saved_once_and_its_note_does_not_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let legacy = Document {
+            material: "Inconel 718".into(),
+            ..Document::default()
+        };
+        crate::storage::save(&path, &legacy).unwrap();
+        let note = "The project material \"Inconel 718\" was added to the material library without cutting data; add it on the Materials page.";
+        let mut a = App::from_workspace(path.clone(), None);
+        assert!(a.status.contains(note), "{}", a.status);
+        assert!(a.dirty, "the migrated workspace is to be saved");
+        let id = a.doc.material_id.clone();
+        assert_eq!(a.doc.selected_material().unwrap().name(), "Inconel 718");
+        // The autosave writes it once the edit delay has passed.
+        let _ = a.update(Message::Tick);
+        assert!(a.dirty, "not before the delay");
+        a.last_edit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let _ = a.update(Message::Tick);
+        assert!(!a.dirty);
+        // The next start has nothing to say, keeps the material's id and
+        // does not write the workspace again.
+        let b = App::from_workspace(path.clone(), None);
+        assert!(!b.status.contains("material library"), "{}", b.status);
+        assert_eq!(
+            b.status,
+            "Choose New project, Open, or Continue your previous project."
+        );
+        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 10));
+        assert!(!b.dirty);
+        // A workspace that needed no migration starts clean, and so does a blank one.
+        let c = App::from_workspace(path, None);
+        assert!(!c.dirty);
+        let other = tempfile::tempdir().unwrap();
+        assert!(!fresh_app(&other).dirty);
+        // Tools numbered on load are saved too.
+        let mut unnumbered = Document::sample();
+        for tool in &mut unnumbered.tools {
+            tool.p.remove("number");
+        }
+        let path = other.path().join("numbered").join("workspace.json");
+        crate::storage::save(&path, &unnumbered).unwrap();
+        let d = App::from_workspace(path, None);
+        assert!(d.status.contains("numbered T1"), "{}", d.status);
+        assert!(d.dirty);
+    }
+    #[test]
     fn new_project_and_explore_example_carry_materials_without_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
