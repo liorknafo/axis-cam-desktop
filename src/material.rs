@@ -444,6 +444,79 @@ mod tests {
             SpeedFeed::Unchecked(_)
         ));
     }
+    fn machine(feed: &str, units: &str) -> Machine {
+        let mut m = Machine::new(3);
+        m.p.insert("feed".into(), feed.into());
+        m.p.insert("units".into(), units.into());
+        m
+    }
+    #[test]
+    fn the_machine_feed_limit_counts_in_its_own_units() {
+        let tool = Tool::new("Flat 6", "Flat end mill", "6");
+        // 8000 rpm, Ø6, 3 flutes: 300 mm/min is fz 0.0125, below the 0.02 minimum.
+        let mm = machine("300", "mm");
+        assert!(matches!(
+            check(&alu(), &tool, &op("8000", "300"), &mm),
+            SpeedFeed::InRange { .. }
+        ));
+        let SpeedFeed::Out(problems) = check(&alu(), &tool, &op("8000", "299"), &mm) else {
+            panic!()
+        };
+        assert!(
+            problems[0].contains("Chip load") && problems[0].contains("below"),
+            "{problems:?}"
+        );
+        // The machine's 11.811 in/min is 300 mm/min; operation feeds are mm/min.
+        let inch = machine("11.811", "inch");
+        assert!(matches!(
+            check(&alu(), &tool, &op("8000", "300"), &inch),
+            SpeedFeed::InRange { .. }
+        ));
+        let SpeedFeed::Out(problems) = check(&alu(), &tool, &op("8000", "299"), &inch) else {
+            panic!()
+        };
+        assert!(
+            problems[0].contains("Chip load") && problems[0].contains("below"),
+            "{problems:?}"
+        );
+    }
+    #[test]
+    fn the_upper_limits_have_one_percent_slack() {
+        let machine = Machine::new(3);
+        let tool = Tool::new("Flat 6", "Flat end mill", "6"); // Ø6: 150–300 m/min, 0.02–0.05 mm
+        let at = |vc: f32, fz: f32| {
+            let n = (vc * 1000. / (std::f32::consts::PI * 6.)).round();
+            op(&n.to_string(), &(fz * n * 3.).round().to_string())
+        };
+        assert!(matches!(
+            check(&alu(), &tool, &at(300. * 1.005, 0.03), &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        let SpeedFeed::Out(problems) = check(&alu(), &tool, &at(300. * 1.02, 0.03), &machine)
+        else {
+            panic!()
+        };
+        assert!(
+            problems.len() == 1
+                && problems[0].contains("Surface speed")
+                && problems[0].contains("above"),
+            "{problems:?}"
+        );
+        assert!(matches!(
+            check(&alu(), &tool, &at(200., 0.05 * 1.005), &machine),
+            SpeedFeed::InRange { .. }
+        ));
+        let SpeedFeed::Out(problems) = check(&alu(), &tool, &at(200., 0.05 * 1.02), &machine)
+        else {
+            panic!()
+        };
+        assert!(
+            problems.len() == 1
+                && problems[0].contains("Chip load")
+                && problems[0].contains("above"),
+            "{problems:?}"
+        );
+    }
     #[test]
     fn documents_saved_before_the_library_still_load() {
         let old = r#"{"schema":1,"title":"Old","material":"Aluminum 6061","file":null,"machines":[],"tools":[],"setups":[],"active":""}"#;
