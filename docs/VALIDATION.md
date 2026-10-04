@@ -5,9 +5,9 @@ This evidence covers the native Rust/Iced prototype's imports, bounded CAM previ
 ## Automated checks
 
 - `cargo fmt --check`: passed.
-- `cargo test --locked`: **429 passed, 0 failed, 1 ignored** (65 seconds in the final full run, 4 October 2026, after the fifth final fix wave; the ignored test touches the macOS Keychain and was not run).
+- `cargo test --locked`: **429 passed, 0 failed, 1 ignored** (82 seconds in the final full run, 4 October 2026, at commit 06dbfd5; the ignored test touches the macOS Keychain and was not run).
 - Release build: passed after the fifth final fix wave (4 October 2026) on Apple Silicon macOS 26.5.2, Rust 1.97.1.
-- Renderer smoke completed **85 static screens and 24 camera-motion samples** in an isolated workspace (re-run 4 October 2026, before the final fix waves; not re-run after them). The normal saved project was not used by this workflow.
+- Renderer smoke completed **85 static screens and 24 camera-motion samples** in an isolated workspace (re-run 4 October 2026 at commit 06dbfd5, after the final fix waves; planner screens 81 and 85 inspected). The normal saved project was not used by this workflow.
 
 ## Sign in with ChatGPT
 
@@ -139,7 +139,7 @@ Fixture-clearance follow-up: the setup field now uses a dedicated side-gap anima
 
 ## Packaging
 
-The bundle must be rebuilt from this source with `scripts/package-macos.sh`. The packaging evidence in this section and the next comes from a bundle built before the LinuxCNC G-code export and the AI planner, and was not repeated for them. Bundle status: not yet rebuilt from this source; this sentence is updated when it is.
+The bundle is built from this source with `scripts/package-macos.sh`. Bundle status: rebuilt from this source on 4 October 2026 (commit 06dbfd5), with the LinuxCNC G-code export and the AI planner. The script bundled the STEP reader and 27 libraries (freetype 2.14.3, libpng 1.6.58, Open CASCADE 7.9.3, TBB 2023.1.0) and its deep/strict signature check passed; the app ZIP was extracted into a clean temporary folder, passed the same signature check, and its executable matches the bundle's.
 
 The script builds the release binary, bundles the STEP helper with the non-system libraries it needs, the CAD resources, the icon and the license notices, signs the bundle ad hoc in a temporary staging directory and verifies its deep/strict signature, creates the ZIP when `AXIS_PACKAGE_ZIP` is set, and then copies the bundle to its destination. The earlier bundle had 27 relocated non-system dylibs; Fidget's MPL-2.0 license/source notice accompanied the unmodified dependency, and the Clipper and CAD notices were included.
 
@@ -147,7 +147,7 @@ Cargo still reports a future-compatibility notice in transitive `block 0.1.6` fr
 
 ## Native project and final archive checks
 
-These checks were made with the earlier bundle (see **Packaging**) and were not repeated for the G-code export and the AI planner.
+Except where **Packaging** says otherwise, these checks were made with the earlier bundle and were not repeated for the G-code export and the AI planner.
 
 - The rebuilt adaptive-stock core resumed the user's existing `AXIS_FourSetup_Block.3mf`. Pocket generated with stock after one earlier Facing operation. Live playback advanced, Pause worked, and forward scrubbing showed the machined pocket. The existing project, stock dimensions and machine/tool libraries were retained. In the follow-up, the user's current two-operation Facing/Pocket project is the workspace being preserved.
 - Selected-option cards were inspected through the shared Iced renderer. After the Mac was unlocked, the corrected fixture-clearance tooltip was also verified as a live native overlay.

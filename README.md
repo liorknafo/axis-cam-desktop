@@ -8,7 +8,7 @@ A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.
 
 ## Run
 
-The app bundle must be built from this source with `./scripts/package-macos.sh` (see below): a bundle built before the LinuxCNC G-code export and the AI planner has neither. Bundle status: not yet rebuilt from this source; this sentence is updated when it is. A bundle is an Apple Silicon build for macOS 26 or later (the bundled CAD libraries require macOS 26). It includes its STEP reader and runtime libraries; end users do not need Homebrew or Python. Double-click it to open. It is ad-hoc signed, not notarized for public distribution.
+The app bundle is built from this source with `./scripts/package-macos.sh` (see below); a bundle built before the LinuxCNC G-code export and the AI planner has neither. Bundle status: rebuilt from this source on 4 October 2026 (commit 06dbfd5). A bundle is an Apple Silicon build for macOS 26 or later (the bundled CAD libraries require macOS 26). It includes its STEP reader and runtime libraries; end users do not need Homebrew or Python. Double-click it to open. It is ad-hoc signed, not notarized for public distribution.
 
 To build from source with a current stable Rust toolchain:
 
