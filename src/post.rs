@@ -355,12 +355,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     }
     for (k, op) in ops.iter().enumerate() {
         w.note(&format!(
-            "Operation {}: {} - {} - T{} - S{:.0}",
+            "Operation {}: {} - {} - T{} - S{}",
             k + 1,
             op.name,
             op.strategy,
             op.tool,
-            op.rpm
+            op.rpm.round()
         ));
     }
     for name in &h.disabled {
@@ -454,9 +454,10 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             } => {
                 let s = &ops[*op];
                 if *spindle {
+                    // The replay expects rpm.round(); `{:.0}` would round ties to even.
                     w.line(format!(
-                        "S{:.0} {}",
-                        s.rpm,
+                        "S{} {}",
+                        s.rpm.round(),
                         if s.clockwise { "M3" } else { "M4" }
                     ));
                     spindle_on = true;
@@ -851,10 +852,11 @@ pub(crate) fn post_simulated(
                             &p.settings,
                             &p.offset,
                         )
+                        // Named by number: the file name carries the project title.
                         .map_err(|e| {
                             vec![format!(
-                                "{}: round-trip verification failed: {e}",
-                                p.file_name
+                                "Setup {}: round-trip verification failed: {e}",
+                                si + 1
                             )]
                         })?;
                         let mut tools: Vec<String> = vec![];
@@ -1346,6 +1348,18 @@ M2
         }
         assert_eq!(program.operations.len(), 6);
         assert!(program.lines > 1000);
+    }
+    #[test]
+    fn a_fractional_spindle_speed_posts_and_verifies() {
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0].operations[0]
+            .p
+            .insert("rpm".into(), "8000.5".into());
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let program = &job.setups[0].result.as_ref().unwrap()[0];
+        assert!(program.text.contains("\nS8001 M3\n"));
+        assert!(program.text.contains("- T1 - S8001)"));
     }
     #[test]
     fn corrupted_programs_fail_verification() {

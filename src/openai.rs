@@ -28,15 +28,21 @@ pub enum ApiError {
     Other(String),
 }
 impl ApiError {
+    /// The sentence to show. Every text the variants carry can come from
+    /// OpenAI's server or the model, so each is shown as one cleaned line of
+    /// at most 300 characters.
     pub fn message(&self) -> String {
+        let clip = |m: &str| crate::proposal::clip(m, 300);
         match self {
             Self::UsageLimit => {
                 "Usage limit reached. Manage usage in your ChatGPT settings.".into()
             }
-            Self::NotEligible(m) => format!("Your ChatGPT plan cannot be used in this app. {m}"),
-            Self::Refused(m) => format!("The model declined the request: {m}"),
+            Self::NotEligible(m) => {
+                format!("Your ChatGPT plan cannot be used in this app. {}", clip(m))
+            }
+            Self::Refused(m) => format!("The model declined the request: {}", clip(m)),
             Self::SignedOut(m) | Self::Unavailable(m) | Self::Unsupported(m) | Self::Other(m) => {
-                m.clone()
+                clip(m)
             }
         }
     }
@@ -73,6 +79,7 @@ fn api_error(status: u16, body: &Value) -> ApiError {
 pub enum Role {
     System,
     User,
+    Assistant,
 }
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -92,6 +99,7 @@ impl Request {
                 let role = match role {
                     Role::System => "system",
                     Role::User => "user",
+                    Role::Assistant => "assistant",
                 };
                 json!({"role": role, "content": text})
             })
@@ -180,6 +188,8 @@ impl SseParser {
         Ok(sse_event(&std::mem::take(&mut self.buffer)))
     }
 }
+/// The most reply text (output and refusal) one request may stream.
+const MAX_REPLY: usize = 4 * 1024 * 1024;
 /// Folds response events into the reply text or the first error.
 #[derive(Default)]
 struct Accumulator {
@@ -230,6 +240,12 @@ impl Accumulator {
                     .get_or_insert(api_error(0, &json!({"error": error})));
             }
             _ => {}
+        }
+        if self.text.len() + self.refusal.len() > MAX_REPLY {
+            self.text = String::new();
+            self.refusal = String::new();
+            self.error
+                .get_or_insert(ApiError::Other("The reply was too large.".into()));
         }
     }
     fn finish(self) -> Result<String, ApiError> {
@@ -453,6 +469,11 @@ impl Client {
             other => other,
         }
     }
+    /// `respond` without the structured attempt, for a caller that already
+    /// knows the plan route refuses it.
+    pub async fn respond_plain(&self, request: &Request) -> Result<Reply, ApiError> {
+        self.attempt(request, false).await
+    }
     async fn attempt(&self, request: &Request, structured: bool) -> Result<Reply, ApiError> {
         let url = format!("{}/responses", self.endpoints.api);
         let body = request.body(structured);
@@ -478,9 +499,9 @@ impl Client {
             for event in parser.push(&chunk) {
                 reply.apply(&event);
             }
-            // The reply is complete: do not wait for the server to close
-            // the connection.
-            if parser.too_large || reply.done {
+            // The reply is complete, or too large to keep: do not wait for
+            // the server to close the connection.
+            if parser.too_large || reply.done || reply.error.is_some() {
                 break;
             }
         }
@@ -573,6 +594,38 @@ mod tests {
             schema_name: "plan",
             schema: json!({"type": "object"}),
         }
+    }
+    #[test]
+    fn every_message_from_openai_is_one_clean_bounded_line() {
+        let hostile = format!("Bad\nnews \u{202e}\u{7}{}", "x".repeat(5000));
+        for (error, prefix) in [
+            (ApiError::SignedOut(hostile.clone()), ""),
+            (
+                ApiError::NotEligible(hostile.clone()),
+                "Your ChatGPT plan cannot be used in this app. ",
+            ),
+            (ApiError::Unavailable(hostile.clone()), ""),
+            (
+                ApiError::Refused(hostile.clone()),
+                "The model declined the request: ",
+            ),
+            (ApiError::Unsupported(hostile.clone()), ""),
+            (ApiError::Other(hostile.clone()), ""),
+        ] {
+            let message = error.message();
+            assert!(
+                message.starts_with(&format!("{prefix}Bad news x")),
+                "{message}"
+            );
+            assert!(!message.contains(['\n', '\u{202e}', '\u{7}']), "{error:?}");
+            assert_eq!(message.chars().count(), prefix.chars().count() + 300);
+        }
+        // The server's own text, from a response body, is bounded the same way.
+        let body = json!({"error": {"code": "other", "message": hostile}});
+        assert_eq!(api_error(400, &body).message().chars().count(), 300);
+        // Short messages are unchanged.
+        let short = ApiError::Other("OpenAI returned HTTP 418.".into());
+        assert_eq!(short.message(), "OpenAI returned HTTP 418.");
     }
     /// A file store that can be told to fail, like a Keychain that refuses.
     struct TestStore {
@@ -1007,6 +1060,31 @@ mod tests {
         assert_eq!(
             cut_off.client.respond(&request()).await.unwrap_err(),
             ApiError::Unavailable("The connection to OpenAI was interrupted.".into())
+        );
+    }
+    #[test]
+    fn a_refusal_is_shown_as_one_bounded_line() {
+        let hostile = format!("No\nway \u{202e}\u{7}{}", "x".repeat(5000));
+        let message = ApiError::Refused(hostile).message();
+        assert!(message.starts_with("The model declined the request: No way "));
+        assert!(!message.contains(['\n', '\u{202e}', '\u{7}']));
+        assert!(message.chars().count() <= "The model declined the request: ".len() + 300);
+    }
+    #[tokio::test]
+    async fn a_reply_larger_than_4_mb_is_refused() {
+        let r = rig(sample(), |_| {
+            let chunk = "x".repeat(1 << 20);
+            let mut events = vec![json!({"type": "response.created"})];
+            for _ in 0..5 {
+                events.push(json!({"type": "response.output_text.delta", "delta": chunk}));
+            }
+            events.push(json!({"type": "response.completed"}));
+            Resp::sse(&events)
+        })
+        .await;
+        assert_eq!(
+            r.client.respond(&request()).await.unwrap_err(),
+            ApiError::Other("The reply was too large.".into())
         );
     }
     #[tokio::test]

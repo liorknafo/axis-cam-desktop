@@ -357,24 +357,6 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("stock_detail", "Fine") => {
             "Use an adaptive octree up to depth 9: a 512-cell span along the padded stock dimension. This resolves smaller curved features with more surface triangles and longer updates. No dense 512³ grid is stored. Features below the finest cell can still be missed."
         }
-        ("ai_coverage", "Top only") => {
-            "Create one example setup for top-side machining of the sample housing. This deterministic example does not analyze an imported part."
-        }
-        ("ai_coverage", "Top and bottom") => {
-            "Create two example setups for the sample housing: top side, then a flipped underside. Review the placement and operations before applying the example plan."
-        }
-        ("ai_coverage", "Top, bottom and side") => {
-            "Create three example machining positions, including side access. This is a local demonstration, not OpenAI planning or automatic access analysis."
-        }
-        ("ai_priority", "Balanced") => {
-            "Use the default example plan parameters. This does not optimize real machining time or choose tools for an imported model."
-        }
-        ("ai_priority", "Surface finish") => {
-            "Cap the example cutting feed at 700 mm/min instead of the default 1000 mm/min, subject to the machine limit. This is a local preset, not a computed surface-quality guarantee."
-        }
-        ("ai_priority", "Fewer tool changes") => {
-            "Record the planning preference in the local example workflow. The prototype does not currently perform a tool-change optimization."
-        }
         _ => "",
     };
     let mut body = body.to_string();

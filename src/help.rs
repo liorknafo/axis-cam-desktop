@@ -205,7 +205,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Define cutters and holders, then choose a saved tool inside each operation."
         }
         Page(crate::Page::Ai) => {
-            "Review a local example plan for the sample housing. The OpenAI connection and automatic analysis of imported geometry are not connected yet."
+            "Sign in with ChatGPT and let the model propose a complete job for the imported part. The app checks every proposal before you can apply it; nothing is sent until you click Plan."
         }
         Page(crate::Page::Work) => {
             "Return to the part viewport, setup browser and operation editor. Your current edits remain in the workspace."
@@ -355,13 +355,15 @@ pub fn command(m: &Message, label: String) -> Help {
             "Show or hide the cutter path. Pocket shows cuts on the current depth layer; Facing shows the latest cutting pass. Both show the active rapid; the example project shows illustrative paths."
         }
         Plan => {
-            "Prepare a deterministic sample plan using the selected coverage and priority. No OpenAI request is sent; the written brief is a placeholder."
+            "Ask the model for a complete job: setups, operations, tools and cutting parameters. The app checks every proposal with its generators, the stock simulation and the export checks, and sends problems back for correction, up to four requests. Requests count against your ChatGPT plan. Nothing changes until you apply the plan."
         }
+        PlanCancel => "Stop planning. The job is unchanged.",
         ApplyPlan => {
-            "Replace the current setups with the reviewed sample plan. The AI panel keeps one undo snapshot of the previous job."
+            "Replace the operations of setup 1 and remove later setups, adding the planned ones. Setup 1 keeps its name, machine, stock, work zero and fixture. The previous job is saved to History first and can be undone on this page."
         }
+        DiscardPlan => "Close this result. The job is unchanged.",
         UndoPlan => {
-            "Restore the job saved immediately before the most recent example plan was applied."
+            "Put back the setups and operations from before the plan was applied, and any tool they use that was deleted since (keeping its own number when no tool has it, otherwise with a free one). The applied job, with your edits since, is saved to History first. Tools, machines, the project title and the material changed since stay. Importing a part or opening or creating a project ends the Undo; the job stays in History."
         }
         Tab(t) => {
             return Help::text(
@@ -1531,6 +1533,38 @@ mod tests {
         assert_eq!(
             command(&Message::SignOut, "x".into()).body,
             "Sign out of ChatGPT on this computer and ask OpenAI to revoke this sign-in. The saved sign-in is deleted."
+        );
+    }
+    #[test]
+    fn planner_commands_describe_the_live_planner() {
+        let generic = command(&Message::Noop, "x".into()).body;
+        for message in [
+            Message::Plan,
+            Message::PlanCancel,
+            Message::ApplyPlan,
+            Message::DiscardPlan,
+            Message::UndoPlan,
+            Message::Page(crate::Page::Ai),
+        ] {
+            let body = command(&message, "x".into()).body;
+            assert_ne!(body, generic, "{message:?}");
+            for stale in ["not connected", "example plan", "sample housing"] {
+                assert!(!body.contains(stale), "{message:?}: {body}");
+            }
+        }
+        let plan = command(&Message::Plan, "x".into()).body;
+        assert!(plan.contains("four requests") && plan.contains("Nothing changes until you apply"));
+        assert!(
+            command(&Message::ApplyPlan, "x".into())
+                .body
+                .contains("History")
+        );
+        let undo = command(&Message::UndoPlan, "x".into()).body;
+        assert!(undo.contains("Tools, machines") && undo.contains("saved to History first"));
+        assert!(
+            command(&Message::Page(crate::Page::Ai), "x".into())
+                .body
+                .contains("Sign in with ChatGPT")
         );
     }
 }

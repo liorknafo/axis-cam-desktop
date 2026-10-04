@@ -1101,78 +1101,6 @@ impl Document {
         }
         e
     }
-    pub fn sample_plan(&self, coverage: &str, priority: &str) -> Vec<Setup> {
-        let mut setups = vec![];
-        if self.active_setup().is_none() || self.tools.is_empty() {
-            return setups;
-        }
-        let mut poses = vec![("Top side", "0", "0")];
-        if coverage != "Top only" {
-            poses.push(("Underside", "180", "0"))
-        }
-        if coverage == "Top, bottom and side" {
-            poses.push(("Right side", "0", "90"))
-        }
-        for (i, (name, rx, ry)) in poses.iter().enumerate() {
-            let mut s = Setup::new(self.setup().machine.clone(), &format!("G{}", 54 + i));
-            s.p.insert("name".into(), (*name).into());
-            s.p.insert("rx".into(), (*rx).into());
-            s.p.insert("ry".into(), (*ry).into());
-            if i > 0 {
-                s.p.insert(
-                    "stock_source".into(),
-                    setups.last().map(|s: &Setup| s.id.clone()).unwrap(),
-                );
-                s.p.insert("reposition".into(), "Reclamp and probe origin".into());
-                s.p.insert("notes".into(),format!("Reposition for {name}. Verify workholding and re-establish the work offset."));
-            }
-            let mut strategies = if i == 0 {
-                vec![Strategy::Face, Strategy::Adaptive, Strategy::Contour]
-            } else {
-                vec![Strategy::Face, Strategy::Contour]
-            };
-            if i == 0 && self.tools.iter().any(|t| get(&t.p, "type") == "Drill") {
-                strategies.push(Strategy::Drill)
-            }
-            for strategy in strategies {
-                let tool = self
-                    .tools
-                    .iter()
-                    .find(|t| (get(&t.p, "type") == "Drill") == (strategy == Strategy::Drill))
-                    .unwrap_or(&self.tools[0]);
-                let mut op = Operation::new(strategy, tool.id.clone());
-                let max = num(&s.machine.p, "rpm").unwrap_or(1000.);
-                op.p.insert(
-                    "rpm".into(),
-                    max.min(if strategy == Strategy::Drill {
-                        2400.
-                    } else {
-                        8000.
-                    })
-                    .to_string(),
-                );
-                let max_feed = num(&s.machine.p, "feed").unwrap_or(100.).max(1.)
-                    * if get(&s.machine.p, "units") == "inch" {
-                        25.4
-                    } else {
-                        1.
-                    };
-                op.p.insert(
-                    "feed".into(),
-                    max_feed
-                        .min(if priority == "Surface finish" {
-                            700.
-                        } else {
-                            1000.
-                        })
-                        .to_string(),
-                );
-                s.operations.push(op)
-            }
-            setups.push(s)
-        }
-        setups
-    }
     pub fn setup_sheet(&self, mesh: Option<&crate::mesh::Mesh>) -> String {
         let mut s = format!(
             "# {}\n\nNative UI prototype — sample planning data, not machining instructions.\n\nMaterial: {}\n",
@@ -1328,15 +1256,6 @@ mod tests {
         let decoded: Document = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert!(!decoded.setup().operations[0].preview);
         assert!(decoded.validate_structure().is_ok())
-    }
-    #[test]
-    fn plan_has_independent_offsets_and_stock() {
-        let d = Document::sample();
-        let s = d.sample_plan("Top, bottom and side", "Balanced");
-        assert_eq!(s.len(), 3);
-        assert_eq!(get(&s[2].p, "stock_source"), s[1].id);
-        assert_eq!(get(&s[2].p, "offset"), "G56");
-        assert_ne!(s[1].operations[0].id, s[0].operations[0].id)
     }
     #[test]
     fn invalid_numeric_input_not_hidden() {

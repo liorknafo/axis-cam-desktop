@@ -434,9 +434,9 @@ fn active(s: &Step, op: &OpState, settings: &PostSettings, offset: &str) -> Resu
         "a touch-off program must not change tools or use a length offset".into()
     } else if !spinning(st, op) {
         format!(
-            "the spindle is not running {} at S{:.0}",
+            "the spindle is not running {} at S{}",
             if op.clockwise { "M3" } else { "M4" },
-            op.rpm
+            op.rpm.round()
         )
     } else if (st.mist, st.flood) != op.coolant {
         "the coolant state is wrong".into()

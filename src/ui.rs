@@ -2151,6 +2151,12 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                     .align_y(Alignment::Center),
                 );
                 if app.models.is_empty() {
+                    if !app.settings.model.is_empty() {
+                        c = c.push(muted(format!(
+                            "Model: {} (the model list is not loaded)",
+                            app.settings.model
+                        )));
+                    }
                     c = c.push(btn("Load models", Message::LoadModels, false).width(Fill));
                 } else {
                     c = c.push(
@@ -2167,6 +2173,8 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                         ]
                         .spacing(5),
                     );
+                }
+                if !app.settings.model.is_empty() {
                     c = if app.account_busy {
                         c.push(muted("Checking the connection…"))
                     } else {
@@ -2189,76 +2197,545 @@ fn account_panel(app: &App) -> Element<'_, Message> {
     }
     c.into()
 }
-fn ai(app: &App) -> Element<'_, Message> {
-    let controls=column![bold("Planning brief",18),help::wrap(text_input("Describe the intended machining job",&app.ai_brief).on_input(Message::AiBrief).padding(12).size(13),Help::text("Planning brief", "Describe the result you want. The brief is saved but does not influence the current example planner; OpenAI planning will be connected later."),widget::tooltip::Position::Right),muted("Example coverage"),help::wrap(pick_list(vec!["Top only".to_string(),"Top and bottom".into(),"Top, bottom and side".into()],Some(app.ai_coverage.clone()),Message::AiCoverage).width(Fill).padding(9).text_size(13),crate::choice_help::selected("ai_coverage","Example coverage",&app.ai_coverage,Target::Setup,&Fields::new()),widget::tooltip::Position::Right),muted("Priority"),help::wrap(pick_list(vec!["Balanced".to_string(),"Surface finish".into(),"Fewer tool changes".into()],Some(app.ai_priority.clone()),Message::AiPriority).width(Fill).padding(9).text_size(13),crate::choice_help::selected("ai_priority","Planning priority",&app.ai_priority,Target::Setup,&Fields::new()),widget::tooltip::Position::Right),note("This is a deterministic example planner for the sample housing. Coverage and priority drive the example; the brief is a UI placeholder. No OpenAI API is connected and no files leave this app."),primary("Create example plan",Message::Plan).width(Fill),btn("Undo last applied plan",Message::UndoPlan,false).width(Fill)].spacing(14);
-    let mut review = column![
-        bold("Review before applying", 21),
-        muted("An applied plan replaces the current setups. You can undo it here.")
-    ]
-    .spacing(14);
-    if app.plan.is_empty() {
-        review = review.push(
-            container(
-                column![
-                    bold("From part to machining plan", 22),
-                    muted("1. Choose setup coverage"),
-                    muted("2. Review part placements and operations"),
-                    muted("3. Apply the plan and tune each operation"),
-                    muted("4. Generate previews and review the NC program")
-                ]
-                .spacing(18),
+/// The stage of the current run, naming the model it asks.
+pub(crate) fn running_text(app: &App, stage: crate::planner::Progress) -> String {
+    stage_text(stage, &app.plan_model)
+}
+pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String {
+    use crate::planner::{MAX_REQUESTS, Progress};
+    match stage {
+        Progress::Analyzing => "Analyzing the part…".into(),
+        Progress::Asking(n) => format!("Asking {model} for a plan ({n} of {MAX_REQUESTS})…"),
+        Progress::Repairing(n) => format!(
+            "The last proposal did not pass; asking {model} for a correction ({n} of {MAX_REQUESTS})…"
+        ),
+        Progress::Extending(n) => format!(
+            "The plan passes; asking {model} about faces still covered ({n} of {MAX_REQUESTS})…"
+        ),
+        Progress::Checking(n) => {
+            format!(
+                "Checking the plan with the simulation and export checks ({n} of {MAX_REQUESTS})…"
             )
-            .padding(35)
-            .width(Fill)
-            .style(panel_style),
-        );
-    } else {
-        for s in &app.plan {
-            let mut card = column![
-                row![
-                    bold(s.name(), 17),
-                    space().width(Fill),
-                    muted(get(&s.p, "offset"))
-                ],
-                muted(format!(
-                    "Rotation [{}, {}, {}]° · {}",
-                    get(&s.p, "rx"),
-                    get(&s.p, "ry"),
-                    get(&s.p, "rz"),
-                    get(&s.p, "reposition")
-                ))
-            ]
-            .spacing(10);
-            for o in &s.operations {
-                card = card.push(
-                    row![icon(app, o.strategy, 22.), text(o.name()).size(13)]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                );
-            }
-            review = review.push(container(card).padding(18).width(Fill).style(panel_style));
         }
-        review = review.push(primary("Apply example plan", Message::ApplyPlan));
+        Progress::Previewing => "The plan passes; building the 3D view of the stock…".into(),
     }
+}
+const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
+pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, material and stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
+fn planner_controls(app: &App) -> Element<'_, Message> {
+    let checklist = app.plan_checklist();
+    let ready = checklist.iter().all(|line| line.ok);
+    let mut c = column![bold("Plan this job", 18)].spacing(10);
+    for line in checklist {
+        let mark = if line.ok {
+            text("✓").size(13).color(GOOD)
+        } else {
+            text("•").size(13).color(MUTED)
+        };
+        let mut item = column![text(line.label).size(13)].spacing(2);
+        if !line.ok {
+            item = item.push(muted(line.hint));
+        }
+        c = c.push(row![mark, item].spacing(8));
+    }
+    c = c.push(muted(SENT_TO_OPENAI));
+    if !ready {
+        c = c.push(muted(
+            "Plan becomes available when every item above is met.",
+        ));
+    }
+    if app.undo.is_some() {
+        c = c.push(btn("Undo applied plan", Message::UndoPlan, false).width(Fill));
+    }
+    c.into()
+}
+/// Model text is shown as plain text, shortened to keep the layout stable.
+/// One character more than shown is read, to know whether to add "…".
+fn clip(s: &str, limit: usize) -> String {
+    let flat = crate::proposal::clip(s, limit.saturating_add(1));
+    if flat.chars().count() > limit {
+        format!("{}…", flat.chars().take(limit).collect::<String>())
+    } else {
+        flat
+    }
+}
+/// One planned operation as the preview shows it: the strategy (app text),
+/// the model's name for it in quotes, the tool and the time; then the values
+/// that will run, read from the built operation; then the model's reason.
+pub(crate) fn operation_lines(
+    op: &Operation,
+    tool: &str,
+    minutes: f32,
+    reason: &str,
+) -> [String; 3] {
+    let p = &op.p;
+    let value = |key: &str| num(p, key).unwrap_or(0.);
+    let n = |v: f32| format!("{}", (v * 1000.).round() / 1000.);
+    let strategy = match op.strategy {
+        Strategy::Contour if get(p, "side") == "Inside" => "Contour, inside floor",
+        Strategy::Contour => "Contour, outside",
+        s => s.name(),
+    };
+    // The post rounds the spindle speed to a whole number.
+    let mut values = vec![
+        format!("{} rpm", n(value("rpm").round())),
+        format!("{} mm/min", n(value("feed"))),
+    ];
+    let mut push = |text: String| values.push(text);
+    let stepdown = format!("stepdown {} mm", n(value("stepdown")));
+    let stepover = format!("stepover {}%", n(value("stepover")));
+    let finish = match value("finish_passes") as u32 {
+        1 => "1 finish pass".to_string(),
+        passes => format!("{passes} finish passes"),
+    };
+    let nonzero = |key: &str, label: &str| {
+        let v = value(key);
+        (v != 0.).then(|| format!("{label} {} mm", n(v)))
+    };
+    let radial = nonzero("allowance", "radial allowance");
+    let axial = nonzero("axial_allowance", "axial allowance");
+    let bottom = nonzero("bottom", "bottom offset");
+    let entry = if pocket_setting(p, "pocket_entry") == "Profile ramp" {
+        format!("entry Profile ramp at {}°", n(value("ramp_angle")))
+    } else {
+        "entry Plunge".into()
+    };
+    match op.strategy {
+        Strategy::Face => {
+            push(stepdown);
+            push(stepover);
+            bottom.into_iter().for_each(&mut push);
+        }
+        Strategy::Pocket => {
+            push(stepdown);
+            push(stepover);
+            [radial, axial, bottom]
+                .into_iter()
+                .flatten()
+                .for_each(&mut push);
+            push(entry);
+            push(finish);
+        }
+        // An inside-floor Contour runs as a floor profile: Pocket's entry and
+        // ramp, with a stepover the app fixes at 40%.
+        Strategy::Contour if get(p, "side") == "Inside" => {
+            push(stepdown);
+            push("stepover 40% (fixed)".into());
+            [radial, bottom].into_iter().flatten().for_each(&mut push);
+            push(entry);
+            push(finish);
+        }
+        Strategy::Contour => {
+            push(stepdown);
+            [radial, bottom].into_iter().flatten().for_each(&mut push);
+            push(finish);
+        }
+        Strategy::Drill => {
+            let cycle = get(p, "cycle");
+            push(if ["Chip breaking", "Deep drilling"].contains(&cycle) {
+                format!("{cycle}, peck {} mm", n(value("peck")))
+            } else {
+                cycle.into()
+            });
+            push(if get(p, "through") == "Yes" {
+                format!("through, breakthrough {} mm", n(value("breakthrough")))
+            } else {
+                "not through".into()
+            });
+            if value("hole_diameter") > 0. {
+                push(format!("holes of Ø{} mm only", n(value("hole_diameter"))));
+            }
+            bottom.into_iter().for_each(&mut push);
+        }
+        Strategy::Parallel => {
+            push(format!(
+                "surface stepover {} mm",
+                n(value("surface_stepover"))
+            ));
+            push(format!("tolerance {} mm", n(value("tolerance"))));
+            [radial, bottom].into_iter().flatten().for_each(&mut push);
+        }
+        Strategy::Waterline => {
+            push(stepdown);
+            [radial, bottom].into_iter().flatten().for_each(&mut push);
+        }
+        _ => {}
+    }
+    [
+        format!("{strategy} · “{}” · {tool} · {minutes:.1} min", op.name()),
+        values.join(" · "),
+        if reason.is_empty() {
+            "The planner gave no reason.".into()
+        } else {
+            format!("The planner's reason: {reason}")
+        },
+    ]
+}
+/// What is still covered by stock: report planes, then the other surface by
+/// the direction it faces (in setup 1's frame), then how it was measured.
+pub(crate) fn coverage_lines(cover: &crate::plan_check::Coverage) -> Vec<String> {
+    let mut lines = vec![];
+    for plane in cover.covered_planes.iter().take(8) {
+        let face = if plane.depth_below_top.abs() < 0.005 {
+            "the top face".to_string()
+        } else {
+            format!("a face {} mm below the top", plane.depth_below_top)
+        };
+        lines.push(format!(
+            "• Still covered: {face}, seen from {} ({:.0}%)",
+            plane.orientation, plane.covered_percent
+        ));
+    }
+    if cover.covered_planes.len() > 8 {
+        let more = cover.covered_planes.len() - 8;
+        lines.push(format!(
+            "• and {more} more face{}",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    for side in &cover.covered_other {
+        let facing = match side.facing {
+            "top" => "up".to_string(),
+            "bottom" => "down".to_string(),
+            axis => axis.to_string(),
+        };
+        lines.push(format!(
+            "• Still covered: walls and curved surface facing {facing} in setup 1 ({:.0}% of {:.0} mm²)",
+            side.covered_percent, side.area
+        ));
+    }
+    lines.push(cover.note.to_string());
+    lines
+}
+/// The preview's totals, and a follow-up request's error when one failed.
+pub(crate) fn preview_totals(outcome: &crate::planner::Outcome) -> Vec<String> {
+    let (job, check) = (&outcome.job, &outcome.check);
+    let mut lines = vec![format!(
+        "{} in {} · about {:.0} min of machining · {}",
+        plural(check.operations.len(), "operation"),
+        plural(job.setups.len(), "setup"),
+        check.total_minutes,
+        plural(outcome.requests, "model request"),
+    )];
+    if let Some(error) = &outcome.note {
+        lines.push(format!("A follow-up request failed: {}", error.message()));
+    }
+    lines
+}
+/// "1 setup", "2 setups".
+pub(crate) fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+/// What Apply replaces in the user's job, and how to get it back.
+pub(crate) fn apply_note(doc: &crate::model::Document, job: &crate::model::Document) -> String {
+    let first = doc.setups.first().map_or(0, |s| s.operations.len());
+    let later = doc.setups.len().saturating_sub(1);
+    let later_ops: usize = doc.setups.iter().skip(1).map(|s| s.operations.len()).sum();
+    let removed = if later == 0 {
+        String::new()
+    } else {
+        format!(
+            " and removes your later {} ({})",
+            plural(later, "setup"),
+            plural(later_ops, "operation")
+        )
+    };
+    format!(
+        "Applying replaces the {} of setup 1{removed}; the plan has {}. Setup 1 keeps its name, machine, stock, work zero and fixture. The previous job is kept in History and can be undone here.",
+        plural(first, "operation"),
+        plural(job.setups.len(), "setup"),
+    )
+}
+/// The planner's workholding note on a setup's card, saying where it goes:
+/// setup 1's ends its notes on Apply, in place of an earlier planner note
+/// that is unchanged; a later setup's are its notes.
+pub(crate) fn workholding_line(index: usize, note: &str) -> String {
+    if index == 0 {
+        format!(
+            "Workholding (from the planner; on Apply it goes at the end of setup 1's notes, replacing an earlier planner note if it is unchanged): {note}"
+        )
+    } else {
+        format!("Workholding (from the planner): {note}")
+    }
+}
+/// A planned setup's card title. Setup 1 keeps the user's name; a later
+/// setup's name was chosen by the planner and is labelled as its text, the
+/// way operation names are.
+pub(crate) fn setup_title(index: usize, name: &str) -> String {
+    if index == 0 {
+        format!("Setup 1: {name}")
+    } else {
+        format!("Setup {} · named by the planner: “{name}”", index + 1)
+    }
+}
+fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a, Message> {
+    let outcome = &preview.outcome;
+    let (job, check, proposal) = (&outcome.job, &outcome.check, &outcome.proposal);
+    let actions = || {
+        row![
+            primary("Apply plan", Message::ApplyPlan),
+            btn("Discard", Message::DiscardPlan, false)
+        ]
+        .spacing(10)
+    };
+    let mut c = column![bold("Plan ready to review", 21)].spacing(12);
+    for line in preview_totals(outcome) {
+        c = c.push(muted(line));
+    }
+    let mut checks = column![].spacing(4);
+    for line in [
+        "Every operation generates with the stock left by the ones before it",
+        "LinuxCNC export checks pass: limits, travel, rapids into material, holder clearance",
+        "No tool centre line cuts into the part, and nothing goes below the stock",
+        "No gouging detected on the stock grid (coarse check)",
+    ] {
+        checks = checks.push(row![text("✓").size(13).color(GOOD), text(line).size(13)].spacing(8));
+    }
+    c = c.push(checks).push(actions());
+    // The model's words are labelled as the planner's; the app's are not.
+    if !proposal.summary.is_empty() {
+        c = c.push(
+            column![
+                bold("The planner's summary", 15),
+                text(clip(&proposal.summary, 600)).size(13)
+            ]
+            .spacing(6),
+        );
+    }
+    for (si, setup) in job.setups.iter().enumerate() {
+        let proposed = proposal.setups.get(si);
+        let mut card = column![
+            row![
+                bold(setup_title(si, setup.name()), 16),
+                space().width(Fill),
+                muted(get(&setup.p, "offset"))
+            ],
+            muted(format!(
+                "Rotation [{}, {}, {}]° · work zero: {}",
+                get(&setup.p, "rx"),
+                get(&setup.p, "ry"),
+                get(&setup.p, "rz"),
+                get(&setup.p, "origin")
+            ))
+        ]
+        .spacing(8);
+        if let Some(notes) = proposed
+            .map(|s| s.workholding.as_str())
+            .filter(|n| !n.is_empty())
+        {
+            card = card.push(muted(workholding_line(si, &clip(notes, 500))));
+        }
+        for (oi, o) in setup.operations.iter().enumerate() {
+            let tool = job
+                .tools
+                .iter()
+                .find(|t| t.id == o.tool)
+                .map(|t| format!("T{} {}", get(&t.p, "number"), t.name()))
+                .unwrap_or_default();
+            let minutes = check
+                .operations
+                .iter()
+                .find(|r| r.setup == si + 1 && r.operation == oi + 1)
+                .map_or(0., |r| r.minutes);
+            let reason = proposed
+                .and_then(|s| s.operations.get(oi))
+                .map_or(String::new(), |p| clip(&p.reason, 160));
+            let [head, values, why] = operation_lines(o, &tool, minutes, &reason);
+            card = card.push(
+                row![
+                    icon(app, o.strategy, 22.),
+                    column![text(head).size(13), muted(values), muted(why)].spacing(2)
+                ]
+                .spacing(8),
+            );
+        }
+        c = c.push(container(card).padding(16).width(Fill).style(panel_style));
+    }
+    if let Some(cover) = &check.coverage {
+        let left = &cover.leftover_cm3;
+        let mut block = column![
+            bold("What the plan leaves", 15),
+            text(format!("Part surface exposed: {:.0}% (approximate)", cover.exposed_percent)).size(13),
+            muted(format!(
+                "Stock left: {} cm³ above the part, {} around it, {} inside its bounding box, {} below.",
+                left.above, left.around, left.inside_bounding_box, left.below
+            )),
+        ]
+        .spacing(6);
+        for line in coverage_lines(cover) {
+            block = block.push(muted(line));
+        }
+        c = c.push(block);
+    }
+    if !outcome.proposal.unmachined.is_empty() {
+        let mut block = column![bold("Not machined (as listed by the planner)", 15)].spacing(6);
+        for item in &outcome.proposal.unmachined {
+            block = block.push(
+                text(format!(
+                    "• {}: {}",
+                    clip(&item.feature, 80),
+                    clip(&item.reason, 240)
+                ))
+                .size(13),
+            );
+        }
+        if outcome.more_unmachined > 0 {
+            block = block.push(muted(format!("• and {} more", outcome.more_unmachined)));
+        }
+        c = c.push(block);
+    }
+    if !outcome.proposal.warnings.is_empty() {
+        let mut block = column![bold("Warnings from the planner", 15)].spacing(6);
+        for warning in &outcome.proposal.warnings {
+            block = block.push(text(format!("• {}", clip(warning, 240))).size(13));
+        }
+        if outcome.more_warnings > 0 {
+            block = block.push(muted(format!("• and {} more", outcome.more_warnings)));
+        }
+        c = c.push(block);
+    }
+    if let (Some(view), Some(mesh)) = (&preview.view, app.imported_mesh.as_ref()) {
+        let setup = job.setups.iter().find(|s| s.id == view.plan.setup);
+        let operation =
+            setup.and_then(|s| s.operations.iter().find(|o| o.id == view.plan.operation));
+        let scene: Element<viewport::Event> = canvas(Viewport {
+            setup,
+            operation,
+            mesh,
+            simulation: Some(view),
+            sample: false,
+            camera: app.plan_camera,
+            picking: false,
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+        })
+        .width(Fill)
+        .height(380)
+        .into();
+        c = c
+            .push(bold("Stock after the whole plan", 15))
+            .push(muted("Drag to orbit, right-drag to pan, scroll to zoom."))
+            .push(
+                container(scene.map(Message::PlanViewport))
+                    .width(Fill)
+                    .style(panel_style),
+            );
+    }
+    c.push(note(apply_note(&app.doc, job)))
+        .push(actions())
+        .into()
+}
+/// A failed run's problems as page lines.
+pub(crate) fn problem_lines(problems: &[crate::proposal::Problem]) -> Vec<String> {
+    let mut lines: Vec<String> = problems
+        .iter()
+        .take(12)
+        .map(|problem| {
+            let place = match (problem.setup, problem.operation) {
+                (0, _) => "Plan".to_string(),
+                (s, None) => format!("Setup {s}"),
+                (s, Some(o)) => format!("Setup {s}, operation {o}"),
+            };
+            format!("• {place}: {}", clip(&problem.message, 300))
+        })
+        .collect();
+    if problems.len() > 12 {
+        let more = problems.len() - 12;
+        lines.push(format!(
+            "• and {more} more problem{}",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    lines
+}
+fn plan_result(app: &App) -> Element<'_, Message> {
+    use crate::Planner;
+    match &app.planner {
+        Planner::Idle => container(
+            column![
+                bold("One click plans the whole job", 22),
+                muted(
+                    "1. The app describes the part: faces, pockets and holes in six orientations"
+                ),
+                muted("2. The model proposes setups, operations, tools and cutting parameters"),
+                muted(
+                    "3. The app generates and simulates every operation and runs the export checks"
+                ),
+                muted("4. Problems go back to the model for correction, up to four requests"),
+                muted("5. You review the result and apply it; nothing changes before that"),
+                if app.plan_checklist().iter().all(|line| line.ok) {
+                    Element::from(primary("Plan this job", Message::Plan))
+                } else {
+                    muted("Complete the checklist on the left to plan.").into()
+                }
+            ]
+            .spacing(16),
+        )
+        .padding(35)
+        .width(Fill)
+        .style(panel_style)
+        .into(),
+        Planner::Running(stage) => container(
+            column![
+                bold(running_text(app, *stage), 20),
+                muted("This can take a few minutes. Nothing changes until you apply a plan."),
+                btn("Cancel", Message::PlanCancel, false)
+            ]
+            .spacing(14),
+        )
+        .padding(35)
+        .width(Fill)
+        .style(panel_style)
+        .into(),
+        Planner::Failed(failure) => {
+            let mut c = column![
+                bold("No plan this time", 21),
+                text(failure.message.clone()).size(13)
+            ]
+            .spacing(12);
+            for line in problem_lines(&failure.problems) {
+                c = c.push(muted(line));
+            }
+            c.push(
+                row![
+                    primary("Try again", Message::Plan),
+                    btn("Dismiss", Message::DiscardPlan, false)
+                ]
+                .spacing(10),
+            )
+            .into()
+        }
+        Planner::Preview(preview) => plan_preview(app, preview),
+    }
+}
+fn ai(app: &App) -> Element<'_, Message> {
     container(
         column![
             page_header(
                 "AI machining planner",
-                "Sign in with ChatGPT. The planner below is still the local example for the sample housing."
+                "Sign in with ChatGPT, then let the planner propose and check a complete job."
             ),
             row![
                 container(scrollable(
-                    column![account_panel(app), rule::horizontal(1), controls]
+                    container(
+                        column![
+                            account_panel(app),
+                            rule::horizontal(1),
+                            planner_controls(app)
+                        ]
                         .spacing(18)
-                        // The scrollbar is drawn over the content: keep it off the
-                        // right edge of full-width buttons, boxes and lists.
-                        .padding(iced::Padding::ZERO.right(14))
+                    )
+                    .padding(iced::Padding::default().right(14))
                 ))
-                    .padding(22)
-                    .width(370)
+                .padding(22)
+                .width(370)
+                .height(Fill)
+                .style(panel_style),
+                scrollable(container(plan_result(app)).padding(iced::Padding::default().right(14)))
+                    .id("planner-result")
                     .height(Fill)
-                    .style(panel_style),
-                scrollable(review).height(Fill).width(Fill)
+                    .width(Fill)
             ]
             .spacing(24)
             .height(Fill)

@@ -10,7 +10,7 @@ use crate::{
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
-const LIMIT: usize = 30_000;
+pub(crate) const LIMIT: usize = 30_000;
 pub(crate) fn number(op: &Operation, key: &str) -> Result<f32, String> {
     num(&op.p, key).ok_or_else(|| format!("Enter a finite {} value.", key.replace('_', " ")))
 }

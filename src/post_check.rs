@@ -79,8 +79,9 @@ pub fn check_setup(
                 Some(k),
                 "rpm",
                 format!(
-                    "{}: S{:.0} is outside the machine's 1-{max_rpm:.0} rpm range.",
-                    op.name, op.rpm
+                    "{}: S{} is outside the machine's 1-{max_rpm:.0} rpm range.",
+                    op.name,
+                    op.rpm.round()
                 ),
             );
         }

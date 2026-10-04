@@ -11,6 +11,7 @@ mod ngc;
 mod oauth;
 mod openai;
 mod plan_check;
+mod planner;
 mod pocket;
 mod post;
 mod post_check;
@@ -66,6 +67,14 @@ pub enum Account {
     },
 }
 const NO_MODELS: &str = "Your ChatGPT plan lists no models for this app.";
+/// The end of the note that says which model is used without a list.
+const FALLBACK: &str = "Check connection shows whether it answers.";
+const PLAN_STOPPED: &str = "Planning stopped because the job changed.";
+const PREVIEW_DISCARDED: &str = "The plan preview was discarded because the job changed.";
+const PLAN_SIGNED_OUT: &str = "Planning stopped because you are signed out.";
+const PLAN_BUSY: &str = "The previous plan check is still finishing; try again in a moment.";
+/// The model the planner was designed for; used when the list cannot be read.
+const DEFAULT_MODEL: &str = "gpt-6.1-sol";
 const NOT_GRANTED: &str =
     "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.";
 #[derive(Debug, Clone)]
@@ -124,6 +133,8 @@ pub enum Message {
     TogglePaths,
     Camera(&'static str),
     Viewport(viewport::Event),
+    /// Orbit, pan or zoom in the plan preview's 3D view.
+    PlanViewport(viewport::Event),
     Play,
     Scrub(f32),
     Speed(f32),
@@ -134,11 +145,12 @@ pub enum Message {
         result: Result<std::sync::Arc<stock_surface::SurfaceMesh>, String>,
     },
     Tick,
-    AiCoverage(String),
-    AiPriority(String),
-    AiBrief(String),
     Plan,
+    PlanProgress(u64, planner::Progress),
+    PlanFinished(u64, Result<std::sync::Arc<PlanPreview>, planner::Failure>),
+    PlanCancel,
     ApplyPlan,
+    DiscardPlan,
     UndoPlan,
     Exported(PathBuf),
     ExportError(String),
@@ -167,6 +179,19 @@ pub enum Message {
     Captured(iced::window::Screenshot),
     HelpHover(bool),
     Noop,
+}
+/// A plan that passed every check, with the stock it leaves for the 3D view.
+#[derive(Debug)]
+pub struct PlanPreview {
+    pub outcome: planner::Outcome,
+    pub view: Option<simulation::Simulation>,
+}
+#[derive(Debug, Clone)]
+pub enum Planner {
+    Idle,
+    Running(planner::Progress),
+    Preview(std::sync::Arc<PlanPreview>),
+    Failed(planner::Failure),
 }
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 pub struct App {
@@ -234,13 +259,86 @@ pub struct App {
     pub state_path: PathBuf,
     pub project_path: Option<PathBuf>,
     pub project_dirty: bool,
-    pub ai_coverage: String,
-    pub ai_priority: String,
-    pub ai_brief: String,
-    pub plan: Vec<Setup>,
+    pub planner: Planner,
+    plan_run: Option<iced::task::Handle>,
+    plan_epoch: u64,
+    /// The account epoch of the client the current run uses.
+    plan_account_epoch: u64,
+    /// The model the current run asks.
+    pub plan_model: String,
+    /// Blocking stages still running, also those of cancelled runs.
+    pub plan_busy: planner::Busy,
+    /// Set by an edit that dropped a running plan or a preview, or by a
+    /// sign-out that stopped a run: why the plan went.
+    plan_dropped: Option<&'static str>,
+    /// The plan preview's own camera: the machining viewport's stays put.
+    pub plan_camera: viewport::Camera,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
     pub icons: Vec<iced::widget::svg::Handle>,
+}
+type PlanSender = iced::futures::channel::mpsc::Sender<Message>;
+/// The Plan task: runs the planner, sends each stage as it starts, builds the
+/// 3D view of a plan that passed and sends the result. Every message carries
+/// the run's `epoch`, so the app can ignore those of a dropped run.
+pub(crate) async fn run_plan(
+    backend: &(impl planner::Backend + Sync),
+    doc: Document,
+    mesh: mesh::Mesh,
+    busy: planner::Busy,
+    epoch: u64,
+    sender: PlanSender,
+) {
+    run_plan_with(backend, doc, mesh, busy, epoch, sender, planner::final_view).await
+}
+/// `run_plan` with the 3D view's blocking stage given, so tests can hold it.
+pub(crate) async fn run_plan_with(
+    backend: &(impl planner::Backend + Sync),
+    doc: Document,
+    mesh: mesh::Mesh,
+    busy: planner::Busy,
+    epoch: u64,
+    mut sender: PlanSender,
+    view: impl FnOnce(&Document, &mesh::Mesh) -> Option<simulation::Simulation> + Send + 'static,
+) {
+    use iced::futures::SinkExt;
+    let mut stages = sender.clone();
+    let result = planner::plan(backend, doc, mesh.clone(), &busy, move |stage| {
+        // Stages are only shown; one that does not fit the channel is skipped.
+        let _ = stages.try_send(Message::PlanProgress(epoch, stage));
+    })
+    .await;
+    let result = match result {
+        Ok(outcome) => {
+            let previewing = planner::Progress::Previewing;
+            let _ = sender.send(Message::PlanProgress(epoch, previewing)).await;
+            let job = outcome.job.clone();
+            let view = planner::blocking(&busy, move || view(&job, &mesh))
+                .await
+                .ok()
+                .flatten();
+            Ok(std::sync::Arc::new(PlanPreview { outcome, view }))
+        }
+        Err(failure) => Err(failure),
+    };
+    let _ = sender.send(Message::PlanFinished(epoch, result)).await;
+}
+/// Orbit, pan or zoom `camera` as a viewport asks; picks do not move it.
+fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
+    match *event {
+        viewport::Event::Orbit(x, y) => {
+            camera.yaw += x;
+            camera.pitch = (camera.pitch + y).clamp(-1.5, 1.57)
+        }
+        viewport::Event::Pan(x, y) => {
+            camera.pan[0] += x;
+            camera.pan[1] += y
+        }
+        viewport::Event::Zoom(v) => {
+            camera.zoom = (camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(0.3, 4.)
+        }
+        viewport::Event::Pick(_) | viewport::Event::PickSurface(_) => {}
+    }
 }
 impl App {
     fn new() -> Self {
@@ -377,10 +475,14 @@ impl App {
             project_path: None,
             project_dirty: false,
             wizard_step: 0,
-            ai_coverage: "Top and bottom".into(),
-            ai_priority: "Balanced".into(),
-            ai_brief: String::new(),
-            plan: vec![],
+            planner: Planner::Idle,
+            plan_run: None,
+            plan_epoch: 0,
+            plan_account_epoch: 0,
+            plan_model: String::new(),
+            plan_camera: viewport::Camera::default(),
+            plan_busy: planner::Busy::default(),
+            plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
             icons,
@@ -397,17 +499,27 @@ impl App {
         }
         (app, Task::none())
     }
+    /// Archives the current project before a switch; Recover previous then
+    /// reopens it.
     fn archive_current(&mut self) -> bool {
-        match storage::archive(&self.state_path, &self.doc) {
-            Ok(path) => {
+        match self.archive_copy() {
+            Some(path) => {
                 self.last_archived = Some(path);
                 true
             }
+            None => false,
+        }
+    }
+    /// Keeps a copy of the current job in History. When that fails, the
+    /// status says so and the caller must change nothing.
+    fn archive_copy(&mut self) -> Option<PathBuf> {
+        match storage::archive(&self.state_path, &self.doc) {
+            Ok(path) => Some(path),
             Err(e) => {
                 self.status = format!(
                     "Could not preserve your project: {e}. Your current work is unchanged."
                 );
-                false
+                None
             }
         }
     }
@@ -439,9 +551,8 @@ impl App {
         self.tab = "Tool".into();
         self.stop_selection();
         self.help_animating = false;
-        self.plan.clear();
+        self.drop_plan();
         self.undo = None;
-        self.ai_brief.clear();
     }
     fn create_setup(&mut self, machine: Machine) {
         let mut setup = Setup::new(machine, &self.doc.next_offset());
@@ -521,6 +632,13 @@ impl App {
         }
         self.audit_report.clear();
         self.invalidate_post();
+        // A running plan and a preview describe the job as it was.
+        match self.planner {
+            Planner::Running(_) => self.plan_dropped = Some(PLAN_STOPPED),
+            Planner::Preview(_) => self.plan_dropped = Some(PREVIEW_DISCARDED),
+            _ => {}
+        }
+        self.drop_plan();
         self.dirty = true;
         self.project_dirty = true;
         self.last_edit = Instant::now();
@@ -752,9 +870,74 @@ impl App {
             Message::ModelsLoaded(epoch, result)
         })
     }
+    /// Stop a running plan and forget a preview: both describe the job as it was.
+    fn drop_plan(&mut self) {
+        if let Some(handle) = self.plan_run.take() {
+            handle.abort();
+        }
+        self.plan_epoch = self.plan_epoch.wrapping_add(1);
+        self.planner = Planner::Idle;
+    }
+    /// The planner's checklist: what must be in place before Plan is offered.
+    pub fn plan_checklist(&self) -> Vec<analysis::Precondition> {
+        let mut lines = analysis::preconditions(&self.doc, self.imported_mesh.as_ref());
+        // The checks run on a copy whose setup 1 is named "Setup 1", so setup
+        // 1's own settings, its name among them, are checked here as the
+        // applied job will have them.
+        if let Some(setup1) = self.doc.setups.first() {
+            let issues = setup1.issues();
+            match lines.iter_mut().find(|l| l.label.starts_with("Setup 1")) {
+                Some(line) if line.ok && !issues.is_empty() => {
+                    line.ok = false;
+                    line.hint = issues.join(" ");
+                }
+                Some(_) => {}
+                None => lines.push(analysis::Precondition {
+                    label: "Setup 1",
+                    ok: issues.is_empty(),
+                    hint: issues.join(" "),
+                }),
+            }
+        }
+        let signed_in = matches!(self.account, Account::SignedIn { granted: true, .. })
+            && self.client.is_some();
+        let hint = if !signed_in {
+            "Sign in with ChatGPT and allow plan usage."
+        } else if self.settings.model.is_empty() {
+            "Choose a model."
+        } else {
+            ""
+        };
+        lines.push(analysis::Precondition {
+            label: "ChatGPT sign-in",
+            ok: hint.is_empty(),
+            hint: hint.into(),
+        });
+        lines
+    }
+    /// Without a model list the planner still needs a model: keep the saved
+    /// one, or try the default, and say so. Check connection settles it.
+    fn fall_back_to_default_model(&mut self) {
+        if !matches!(self.account, Account::SignedIn { granted: true, .. }) {
+            return;
+        }
+        if self.settings.model.is_empty() {
+            self.settings.model = DEFAULT_MODEL.into();
+            self.save_settings();
+        }
+        self.account_note = format!(
+            "{} The app will use {}; {FALLBACK}",
+            self.account_note, self.settings.model
+        );
+    }
     fn account_error(&mut self, error: openai::ApiError) {
         self.usage_limit = error == openai::ApiError::UsageLimit;
         if matches!(error, openai::ApiError::SignedOut(_)) {
+            // A running plan uses the client that is gone, as on Sign out.
+            if matches!(self.planner, Planner::Running(_)) {
+                self.drop_plan();
+                self.plan_dropped = Some(PLAN_SIGNED_OUT);
+            }
             self.account = Account::SignedOut;
             self.client = None;
             self.models.clear();
@@ -795,6 +978,20 @@ impl App {
         self.confirm_delete_setup = false;
     }
     fn update(&mut self, message: Message) -> Task<Message> {
+        let before = self.status.clone();
+        let task = self.handle(message);
+        // A message that dropped a running plan or a preview says why. When
+        // its handler set a status of its own, both are shown, its own first.
+        if let Some(dropped) = self.plan_dropped.take() {
+            self.status = if self.status != before && !self.status.is_empty() {
+                format!("{} {dropped}", self.status)
+            } else {
+                dropped.into()
+            };
+        }
+        task
+    }
+    fn handle(&mut self, message: Message) -> Task<Message> {
         // These actions require an explicitly created setup; no hidden defaults.
         if self.doc.active_setup().is_none()
             && matches!(
@@ -1517,6 +1714,8 @@ impl App {
                     }
                 }
                 self.imported_mesh = m;
+                // Undo would put the previous part's job under this one.
+                self.undo = None;
                 self.camera = viewport::Camera::default();
                 self.picking = false;
                 self.page = Page::Work;
@@ -1535,6 +1734,7 @@ impl App {
                 match result {
                     Ok(mesh) => {
                         self.imported_mesh = Some(mesh);
+                        self.undo = None;
                         self.invalidate_post();
                         self.status = "Saved model geometry restored.".into();
                         // Migrate legacy imported projects that stored sample
@@ -1629,18 +1829,11 @@ impl App {
                     _ => Default::default(),
                 };
             }
+            Message::PlanViewport(e) => steer(&mut self.plan_camera, &e),
             Message::Viewport(e) => match e {
-                viewport::Event::Orbit(x, y) => {
-                    self.camera.yaw += x;
-                    self.camera.pitch = (self.camera.pitch + y).clamp(-1.5, 1.57)
-                }
-                viewport::Event::Pan(x, y) => {
-                    self.camera.pan[0] += x;
-                    self.camera.pan[1] += y
-                }
-                viewport::Event::Zoom(v) => {
-                    self.camera.zoom = (self.camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(0.3, 4.)
-                }
+                viewport::Event::Orbit(..)
+                | viewport::Event::Zoom(_)
+                | viewport::Event::Pan(..) => steer(&mut self.camera, &e),
                 viewport::Event::Pick(n) => {
                     if self.picking {
                         return self.update(Message::Feature(n));
@@ -1768,46 +1961,207 @@ impl App {
                 }
                 return Task::batch([self.refresh_stock_surface(), self.refresh_post()]);
             }
-            Message::AiCoverage(v) => {
-                self.ai_coverage = v;
-                self.plan.clear()
-            }
-            Message::AiPriority(v) => {
-                self.ai_priority = v;
-                self.plan.clear()
-            }
-            Message::AiBrief(v) => {
-                self.ai_brief = v;
-                self.plan.clear()
-            }
             Message::Plan => {
-                if self.doc.tools.is_empty() || !self.is_sample() {
-                    self.status = "The example planner needs the sample project and a saved tool. Choose Explore example from Start.".into();
+                if matches!(self.planner, Planner::Running(_)) {
                     return Task::none();
                 }
-                self.plan = self.doc.sample_plan(&self.ai_coverage, &self.ai_priority);
-                self.status =
-                    "Local example plan prepared for review. No OpenAI API request was made.".into()
+                // A cancelled run's blocking work cannot be interrupted.
+                if self.plan_busy.running() > 0 {
+                    self.status = PLAN_BUSY.into();
+                    return Task::none();
+                }
+                if let Some(unmet) = self.plan_checklist().into_iter().find(|line| !line.ok) {
+                    self.status = format!("{}: {}", unmet.label, unmet.hint);
+                    return Task::none();
+                }
+                let (Some(client), Some(mesh)) = (self.client.clone(), self.imported_mesh.clone())
+                else {
+                    return Task::none();
+                };
+                self.drop_plan();
+                let epoch = self.plan_epoch;
+                self.plan_account_epoch = self.account_epoch;
+                self.plan_model = self.settings.model.clone();
+                self.planner = Planner::Running(planner::Progress::Analyzing);
+                self.status = "Planning. Nothing changes until you apply a plan.".into();
+                let backend = planner::OpenAiBackend::new(client, self.settings.model.clone());
+                let doc = self.doc.clone();
+                let busy = self.plan_busy.clone();
+                let run = iced::stream::channel(16, async move |sender: PlanSender| {
+                    run_plan(&backend, doc, mesh, busy, epoch, sender).await
+                });
+                let (task, handle) = Task::run(run, |message| message).abortable();
+                self.plan_run = Some(handle);
+                return task;
+            }
+            Message::PlanProgress(epoch, stage) => {
+                if epoch == self.plan_epoch && matches!(self.planner, Planner::Running(_)) {
+                    self.planner = Planner::Running(stage);
+                }
+            }
+            Message::PlanFinished(epoch, result) => {
+                if epoch != self.plan_epoch || !matches!(self.planner, Planner::Running(_)) {
+                    return Task::none();
+                }
+                self.plan_run = None;
+                let same_client = self.plan_account_epoch == self.account_epoch;
+                match result {
+                    Ok(preview) => {
+                        self.status = format!(
+                            "Plan ready to review: {}, {}.",
+                            ui::plural(preview.outcome.job.setups.len(), "setup"),
+                            ui::plural(preview.outcome.check.operations.len(), "operation")
+                        );
+                        let note = preview.outcome.note.clone();
+                        self.planner = Planner::Preview(preview);
+                        // Each preview starts framed on the part.
+                        self.plan_camera = viewport::Camera::default();
+                        // The run's requests worked, so the limit is no longer
+                        // reached for that client, and the panel stops saying
+                        // so, also when the fallback sentence follows it.
+                        if same_client {
+                            self.usage_limit = false;
+                            if self
+                                .account_note
+                                .starts_with(&openai::ApiError::UsageLimit.message())
+                            {
+                                self.account_note.clear();
+                            }
+                        }
+                        // A follow-up request that found the sign-in gone or
+                        // the usage limit reached tells the account panel.
+                        if let (
+                            Some(
+                                error @ (openai::ApiError::SignedOut(_)
+                                | openai::ApiError::UsageLimit),
+                            ),
+                            true,
+                        ) = (note, same_client)
+                        {
+                            self.account_error(error);
+                        }
+                    }
+                    Err(failure) => {
+                        self.status = failure.message.clone();
+                        let api = failure.api.clone();
+                        self.planner = Planner::Failed(failure);
+                        // Only the client the run started with can be signed out by it.
+                        if let (Some(error), true) = (api, same_client) {
+                            self.account_error(error);
+                        }
+                    }
+                }
+            }
+            Message::PlanCancel => {
+                if matches!(self.planner, Planner::Running(_)) {
+                    self.drop_plan();
+                    self.status = "Planning cancelled. The job is unchanged.".into();
+                }
+            }
+            Message::DiscardPlan => {
+                if matches!(self.planner, Planner::Preview(_) | Planner::Failed(_)) {
+                    self.planner = Planner::Idle;
+                }
             }
             Message::ApplyPlan => {
-                if !self.plan.is_empty() {
-                    self.undo = Some(self.doc.clone());
-                    self.doc.setups = self.plan.clone();
-                    self.doc.active = self.doc.setups[0].id.clone();
-                    self.stop_selection();
-                    self.page = Page::Work;
-                    self.touch();
-                    self.status = "Example plan applied. Undo is available in AI planner.".into()
+                let Planner::Preview(preview) = &self.planner else {
+                    return Task::none();
+                };
+                let mut job = preview.outcome.job.clone();
+                // The planner's workholding note for setup 1 joins setup 1's
+                // own notes on the same line, in place of the exact note an
+                // earlier Apply added, which setup 1 keeps for this; Undo
+                // removes both with the rest of the plan.
+                let note = preview.outcome.proposal.setups.first();
+                if let Some(first) = job.setups.first_mut() {
+                    let note = note.map_or("", |s| s.workholding.as_str());
+                    let earlier = get(&first.p, planner::PLANNER_NOTE_KEY);
+                    let (notes, added) =
+                        planner::setup_1_notes(get(&first.p, "notes"), earlier, note);
+                    first.p.insert("notes".into(), notes);
+                    if added.is_empty() {
+                        first.p.remove(planner::PLANNER_NOTE_KEY);
+                    } else {
+                        first.p.insert(planner::PLANNER_NOTE_KEY.into(), added);
+                    }
                 }
+                // The previous job goes to History first, as on New project.
+                // Applying is not a project switch: Recover previous keeps
+                // pointing at the project before the last switch.
+                if self.archive_copy().is_none() {
+                    return Task::none();
+                }
+                self.undo = Some(self.doc.clone());
+                self.planner = Planner::Idle;
+                self.doc.setups = job.setups;
+                self.doc.active = job.active;
+                self.stop_selection();
+                self.page = Page::Work;
+                self.touch();
+                self.status = "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC program.".into();
             }
             Message::UndoPlan => {
-                if let Some(d) = self.undo.take() {
-                    self.doc = d;
-                    self.stop_selection();
-                    self.touch();
-                    self.plan.clear();
-                    self.status = "Previous setups restored.".into()
+                if self.undo.is_none() {
+                    return Task::none();
                 }
+                // The applied job, with any edits since, goes to History
+                // first; when it cannot be kept, nothing is undone.
+                if self.archive_copy().is_none() {
+                    return Task::none();
+                }
+                let Some(before) = self.undo.take() else {
+                    return Task::none();
+                };
+                let mut status = String::from(
+                    "The setups from before the plan are restored. The applied job is in History.",
+                );
+                // Only what Apply replaced comes back: tools, machines, the
+                // title and the material edited since then stay. A tool
+                // deleted since comes back, once.
+                let mut back: Vec<Tool> = vec![];
+                for op in before.setups.iter().flat_map(|s| &s.operations) {
+                    if self.doc.tools.iter().chain(&back).any(|t| t.id == op.tool) {
+                        continue;
+                    }
+                    if let Some(tool) = before.tools.iter().find(|t| t.id == op.tool) {
+                        back.push(tool.clone());
+                    }
+                }
+                // Each keeps its own number when no tool in the library has
+                // it (the first, if two share one). Only the others are
+                // renumbered, to numbers neither used nor kept.
+                let used = |n: u32, tools: &[Tool]| tools.iter().any(|t| t.number() == Some(n));
+                let mut kept: Vec<u32> = vec![];
+                let keeps: Vec<bool> = back
+                    .iter()
+                    .map(|tool| match tool.number() {
+                        Some(n) if !used(n, &self.doc.tools) && !kept.contains(&n) => {
+                            kept.push(n);
+                            true
+                        }
+                        Some(_) => false,
+                        None => true,
+                    })
+                    .collect();
+                for (mut tool, keep) in back.into_iter().zip(keeps) {
+                    if !keep {
+                        let free = (1..=TOOL_NUMBER_MAX)
+                            .find(|n| !used(*n, &self.doc.tools) && !kept.contains(n))
+                            .unwrap_or(TOOL_NUMBER_MAX);
+                        tool.p.insert("number".into(), free.to_string());
+                    }
+                    status += &format!(
+                        " {} is back in the library as T{}.",
+                        tool.name(),
+                        get(&tool.p, "number")
+                    );
+                    self.doc.tools.push(tool);
+                }
+                self.doc.setups = before.setups;
+                self.doc.active = before.active;
+                self.stop_selection();
+                self.touch();
+                self.status = status;
             }
             Message::Close(id) => {
                 self.persist();
@@ -1989,15 +2343,20 @@ impl App {
                 self.models = models;
                 if self.models.is_empty() {
                     self.account_note = NO_MODELS.into();
+                    self.fall_back_to_default_model();
                 } else {
-                    if self.account_note == NO_MODELS {
+                    // A list replaces the fallback note, whatever came before
+                    // it (no models, or why the list could not be read).
+                    if self.account_note.starts_with(NO_MODELS)
+                        || self.account_note.ends_with(FALLBACK)
+                    {
                         self.account_note.clear();
                     }
                     if !self.models.contains(&self.settings.model) {
                         self.settings.model = self
                             .models
                             .iter()
-                            .find(|m| *m == "gpt-6.1-sol")
+                            .find(|m| *m == DEFAULT_MODEL)
                             .or(self.models.first())
                             .cloned()
                             .unwrap_or_default();
@@ -2005,7 +2364,10 @@ impl App {
                     }
                 }
             }
-            Message::ModelsLoaded(_, Err(e)) => self.account_error(e),
+            Message::ModelsLoaded(_, Err(e)) => {
+                self.account_error(e);
+                self.fall_back_to_default_model();
+            }
             Message::LoadModels => return self.load_models(),
             Message::PickModel(model) => {
                 if self.models.contains(&model) {
@@ -2046,6 +2408,10 @@ impl App {
                 }
                 if let Some(handle) = self.sign_in.take() {
                     handle.abort();
+                }
+                if matches!(self.planner, Planner::Running(_)) {
+                    self.drop_plan();
+                    self.plan_dropped = Some(PLAN_SIGNED_OUT);
                 }
                 let client = self.client.take();
                 self.account = Account::SignedOut;
@@ -2179,14 +2545,14 @@ fn check_plan(args: &[String]) -> Result<(String, String, bool), String> {
     let json = serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?;
     let summary = if check.passed {
         format!(
-            "The plan passes every check: {} operations, {} min.",
-            check.operations.len(),
+            "The plan passes every check: {}, {} min.",
+            ui::plural(check.operations.len(), "operation"),
             check.total_minutes
         )
     } else {
         format!(
-            "The plan does not pass: {} problem(s).",
-            check.problems.len()
+            "The plan does not pass: {}.",
+            ui::plural(check.problems.len(), "problem")
         )
     };
     Ok((json, summary, check.passed))

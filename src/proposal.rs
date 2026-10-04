@@ -167,19 +167,32 @@ fn format_character(c: char) -> bool {
 }
 /// One line of plain text: whitespace turned into spaces, other control and
 /// format characters removed, whitespace collapsed, at most `limit` characters.
+/// Reading stops once `limit` characters are kept, so a huge text costs no
+/// more than a short one.
 pub(crate) fn clip(text: &str, limit: usize) -> String {
-    let plain: String = text
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|c| !c.is_control() && !format_character(*c))
-        .collect();
-    plain
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(limit)
-        .collect()
+    let mut line = String::new();
+    let (mut kept, mut space) = (0, false);
+    for c in text.chars() {
+        if kept == limit {
+            break;
+        }
+        if c.is_whitespace() {
+            // A space is kept only between two words.
+            space = kept > 0;
+        } else if !c.is_control() && !format_character(c) {
+            if space {
+                line.push(' ');
+                kept += 1;
+                space = false;
+                if kept == limit {
+                    break;
+                }
+            }
+            line.push(c);
+            kept += 1;
+        }
+    }
+    line
 }
 /// The plane of `orientation` that contains every listed surface.
 fn plane_of<'a>(orientation: &'a OrientationReport, surfaces: &[usize]) -> Option<&'a PlaneReport> {

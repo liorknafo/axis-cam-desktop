@@ -95,6 +95,11 @@ impl App {
                 101 => "78-chatgpt-notice".into(),
                 102 => "79-chatgpt-signed-in".into(),
                 103 => "80-chatgpt-not-granted".into(),
+                104 => "81-planner-preview".into(),
+                105 => "82-planner-preview-stock".into(),
+                106 => "83-planner-failed".into(),
+                107 => "84-planner-running".into(),
+                108 => "85-planner-ready".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -151,12 +156,8 @@ impl App {
                 vec![Message::Page(Page::Wizard), Message::WizardStep(2)]
             }
             6 => vec![Message::Page(Page::Tools)],
-            7 => vec![
-                Message::Page(Page::Ai),
-                Message::AiCoverage("Top, bottom and side".into()),
-                Message::Plan,
-            ],
-            8 => vec![Message::ApplyPlan, Message::Page(Page::Post)],
+            7 => vec![Message::Page(Page::Ai)],
+            8 => vec![Message::Page(Page::Post)],
             9 => {
                 self.doc = crate::model::Document::sample();
                 let _ = self.update(Message::SelectOp(3));
@@ -607,6 +608,25 @@ impl App {
                 ]
             }
             101 => {
+                // A signed-in account has a client, so every planner screen's
+                // checklist agrees with the account panel. This one never
+                // sends a request.
+                let placeholder = crate::session::Session {
+                    access_token: "smoke".into(),
+                    refresh_token: "smoke".into(),
+                    id_token: "smoke".into(),
+                    expires_at: crate::session::now() + 3600,
+                    scope: crate::session::PLAN_SCOPE.into(),
+                    subject: "smoke".into(),
+                    email: "lior@example.com".into(),
+                    name: "Lior".into(),
+                };
+                self.client = Some(std::sync::Arc::new(crate::openai::Client::new(
+                    self.endpoints.clone(),
+                    String::new(),
+                    self.store.clone(),
+                    placeholder,
+                )));
                 self.account = crate::Account::SignedIn {
                     name: "Lior".into(),
                     email: "lior@example.com".into(),
@@ -627,6 +647,122 @@ impl App {
                 self.account_note = crate::NOT_GRANTED.into();
                 // The once-only notice must stay hidden without plan usage.
                 self.settings.plan_notice_shown = false;
+                vec![]
+            }
+            104 => {
+                // A checked plan for the imported block, as the planner shows it.
+                use crate::proposal::{Proposal, ProposedOp, ProposedSetup, Unmachined};
+                self.account = crate::Account::SignedIn {
+                    name: "Lior".into(),
+                    email: "lior@example.com".into(),
+                    granted: true,
+                };
+                self.account_note.clear();
+                self.settings.plan_notice_shown = true;
+                self.doc.material = "Aluminum 6061".into();
+                let mesh = self.imported_mesh.clone().expect("imported part");
+                let report = crate::analysis::report(&self.doc, &mesh).expect("part report");
+                let first = &report.orientations[0];
+                let plane = |depth: f32| {
+                    let found = first
+                        .planes
+                        .iter()
+                        .find(|p| (p.depth_below_top - depth).abs() < 0.01);
+                    found.expect("plane").surfaces.clone()
+                };
+                let flat = report
+                    .tools
+                    .iter()
+                    .find(|t| t.kind == "Flat end mill")
+                    .expect("flat tool");
+                let op = |strategy: &str, surfaces: Vec<usize>| ProposedOp {
+                    strategy: strategy.into(),
+                    name: strategy.into(),
+                    tool: flat.number,
+                    surfaces,
+                    rpm: 8000.,
+                    feed: 800.,
+                    coolant: "Flood".into(),
+                    reason: "smoke".into(),
+                    ..Default::default()
+                };
+                let proposal = Proposal {
+                    summary: "Face the top, clear the main pocket and cut the outline from the top. The holes and the side features need tools and setups this plan does not have.".into(),
+                    setups: vec![ProposedSetup {
+                        orientation: first.up.into(),
+                        name: "Top".into(),
+                        origin: "Stock top center".into(),
+                        workholding: "Vise on the long sides.".into(),
+                        operations: vec![
+                            op("Face", plane(0.)),
+                            op("Pocket", plane(12.)),
+                            op("Contour", vec![]),
+                        ],
+                    }],
+                    unmachined: vec![Unmachined {
+                        feature: "Four counterbored through holes".into(),
+                        reason: "The library has no drill small enough for the 6.6 mm holes.".into(),
+                    }],
+                    warnings: vec!["The outline is cut to full depth; hold the part below the cut.".into()],
+                };
+                let (check, job) = crate::plan_check::check(&self.doc, &mesh, &report, &proposal);
+                assert!(check.passed, "smoke plan: {:?}", check.problems);
+                let job = job.expect("built job");
+                let view = crate::planner::final_view(&job, &mesh);
+                assert!(view.is_some(), "smoke plan view");
+                self.planner = crate::Planner::Preview(std::sync::Arc::new(crate::PlanPreview {
+                    outcome: crate::planner::Outcome {
+                        proposal,
+                        check,
+                        job,
+                        report,
+                        requests: 2,
+                        chosen: 2,
+                        more_warnings: 0,
+                        more_unmachined: 0,
+                        note: None,
+                    },
+                    view,
+                }));
+                self.page = Page::Ai;
+                vec![]
+            }
+            105 => {
+                self.smoke_pending = false;
+                return iced::widget::operation::scroll_to(
+                    "planner-result",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 5000. },
+                );
+            }
+            106 => {
+                self.planner = crate::Planner::Failed(crate::planner::Failure {
+                    message: "The planner could not produce a plan that passes every check in 4 attempts.".into(),
+                    problems: vec![crate::proposal::Problem {
+                        setup: 1,
+                        operation: Some(2),
+                        stage: "generation",
+                        message: "Pocket depth must be less than tool stickout, with stickout at least the flute length. Choose a tool with adequate reach.".into(),
+                    }],
+                    api: None,
+                    requests: 4,
+                });
+                vec![]
+            }
+            107 => {
+                // A run started with the picked model, asking for a correction.
+                self.plan_model = self.settings.model.clone();
+                self.planner = crate::Planner::Running(crate::planner::Progress::Repairing(2));
+                vec![]
+            }
+            108 => {
+                self.planner = crate::Planner::Idle;
+                let unmet: Vec<_> = self
+                    .plan_checklist()
+                    .into_iter()
+                    .filter(|line| !line.ok)
+                    .map(|line| line.label)
+                    .collect();
+                assert!(unmet.is_empty(), "the ready screen's checklist: {unmet:?}");
                 vec![]
             }
             _ => {
@@ -703,7 +839,8 @@ mod tests {
         let tool = a.doc.tools[0].id.clone();
         let _ = a.update(Message::NewProject);
         assert!(!a.is_sample() && !a.doc.has_model() && a.doc.setups.is_empty());
-        assert!(a.selected.is_none() && a.plan.is_empty() && a.undo.is_none());
+        assert!(a.selected.is_none() && a.undo.is_none());
+        assert!(matches!(a.planner, crate::Planner::Idle));
         assert_eq!(a.doc.machines[0].id, machine);
         assert_eq!(a.doc.tools[0].id, tool);
         let archive = crate::storage::load(a.last_archived.as_ref().unwrap()).unwrap();
@@ -1007,7 +1144,7 @@ mod tests {
         assert!(!a.operation().unwrap().preview);
         assert!(a.status.contains("preview ready"), "{}", a.status);
         let _ = a.update(Message::Plan);
-        assert!(a.plan.is_empty());
+        assert!(matches!(a.planner, crate::Planner::Idle));
         let document = serde_json::from_str(&serde_json::to_string(&a.doc).unwrap()).unwrap();
         a.replace_document(document, None);
         let _ = a.update(Message::ModelRestored(crate::mesh::load(
@@ -1284,17 +1421,6 @@ mod tests {
         assert_ne!(get(&a.doc.setup().machine.p, "rpm"), "500")
     }
     #[test]
-    fn ai_apply_and_undo_preserve_job() {
-        let mut a = app();
-        let before = a.doc.setup().id.clone();
-        let _ = a.update(Message::Plan);
-        let _ = a.update(Message::ApplyPlan);
-        assert_eq!(a.doc.setups.len(), 2);
-        assert_ne!(a.doc.setup().id, before);
-        let _ = a.update(Message::UndoPlan);
-        assert_eq!(a.doc.setup().id, before)
-    }
-    #[test]
     fn tool_in_use_cannot_be_deleted() {
         let mut a = app();
         let tool = a.doc.tools[0].id.clone();
@@ -1366,6 +1492,1270 @@ mod tests {
             a.account_note.clone(),
             a.account_epoch,
         )
+    }
+    /// The fixture block, imported, with a material: ready to plan once signed in.
+    fn planning_app(dir: &tempfile::TempDir) -> App {
+        let mut a = fresh_app(dir);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.material = "Aluminum 6061".into();
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a
+    }
+    fn signed_in_planning_app(dir: &tempfile::TempDir) -> App {
+        let mut a = planning_app(dir);
+        sign_in_with(&mut a, dir, crate::session::sample());
+        let epoch = a.account_epoch;
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec!["gpt-6.1-sol".into()])));
+        a
+    }
+    fn checked_preview(a: &App, view: bool) -> std::sync::Arc<crate::PlanPreview> {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let report = crate::analysis::report(&a.doc, mesh).unwrap();
+        let proposal = crate::proposal::tests::good(&report);
+        let (check, job) = crate::plan_check::check(&a.doc, mesh, &report, &proposal);
+        assert!(check.passed, "{:?}", check.problems);
+        let job = job.unwrap();
+        let view = view.then(|| crate::planner::final_view(&job, mesh).unwrap());
+        std::sync::Arc::new(crate::PlanPreview {
+            outcome: crate::planner::Outcome {
+                proposal,
+                check,
+                job,
+                report,
+                requests: 2,
+                chosen: 2,
+                more_warnings: 0,
+                more_unmachined: 0,
+                note: None,
+            },
+            view,
+        })
+    }
+    #[test]
+    fn plan_starts_only_when_the_checklist_is_met() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        let unmet = |a: &App| -> Vec<&'static str> {
+            a.plan_checklist()
+                .into_iter()
+                .filter(|l| !l.ok)
+                .map(|l| l.label)
+                .collect()
+        };
+        assert_eq!(unmet(&a), vec!["ChatGPT sign-in"]);
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert!(
+            a.status.starts_with("ChatGPT sign-in: Sign in"),
+            "{}",
+            a.status
+        );
+        let mut a = signed_in_planning_app(&dir);
+        assert!(unmet(&a).is_empty());
+        a.doc.material.clear();
+        assert_eq!(unmet(&a), vec!["Material"]);
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        a.doc.material = "Aluminum 6061".into();
+        let _ = a.update(Message::Plan);
+        assert!(matches!(
+            a.planner,
+            crate::Planner::Running(crate::planner::Progress::Analyzing)
+        ));
+        assert!(a.plan_run.is_some());
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::Plan);
+        assert_eq!(
+            a.plan_epoch, epoch,
+            "a second click while running does nothing"
+        );
+    }
+    #[test]
+    fn setup_1_must_be_valid_as_the_user_has_it() {
+        // The checks run on a copy where setup 1 is named "Setup 1", so a
+        // blank name would pass them and then fail in the applied job.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.doc.setups[0].p.insert("name".into(), "  ".into());
+        let unmet: Vec<_> = a.plan_checklist().into_iter().filter(|l| !l.ok).collect();
+        assert_eq!(
+            unmet.len(),
+            1,
+            "{:?}",
+            unmet.iter().map(|l| l.label).collect::<Vec<_>>()
+        );
+        assert!(unmet[0].label.starts_with("Setup 1"), "{}", unmet[0].label);
+        assert_eq!(unmet[0].hint, "Give the setup a name.");
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert!(
+            a.status.ends_with(": Give the setup a name."),
+            "{}",
+            a.status
+        );
+        // Any of setup 1's own issues counts, here a negative clearance.
+        a.doc.setups[0].p.insert("name".into(), "Top".into());
+        assert!(a.plan_checklist().iter().all(|l| l.ok));
+        a.doc.setups[0].p.insert("clearance".into(), "-1".into());
+        let unmet: Vec<_> = a.plan_checklist().into_iter().filter(|l| !l.ok).collect();
+        assert_eq!(unmet.len(), 1);
+        assert_eq!(unmet[0].hint, a.doc.setups[0].issues().join(" "));
+    }
+    #[test]
+    fn progress_and_results_belong_to_the_current_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let asking = crate::planner::Progress::Asking(2);
+        let _ = a.update(Message::PlanProgress(epoch.wrapping_sub(1), asking));
+        assert!(matches!(
+            a.planner,
+            crate::Planner::Running(crate::planner::Progress::Analyzing)
+        ));
+        let _ = a.update(Message::PlanProgress(epoch, asking));
+        assert!(matches!(
+            a.planner,
+            crate::Planner::Running(crate::planner::Progress::Asking(2))
+        ));
+        let _ = a.update(Message::PlanFinished(
+            epoch.wrapping_sub(1),
+            Ok(preview.clone()),
+        ));
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert_eq!(a.status, "Plan ready to review: 2 setups, 6 operations.");
+        assert!(a.plan_run.is_none());
+    }
+    #[test]
+    fn applying_a_plan_replaces_the_job_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let before = serde_json::to_string(&a.doc).unwrap();
+        let first = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(
+            serde_json::to_string(&a.doc).unwrap(),
+            before,
+            "nothing to apply yet"
+        );
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        assert_eq!(
+            serde_json::to_string(&a.doc).unwrap(),
+            before,
+            "a preview changes nothing"
+        );
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(a.doc.setups.len(), 2);
+        assert_eq!(a.doc.setups[0].id, first);
+        assert_eq!(a.doc.active, first);
+        assert_eq!(a.doc.setups[0].operations.len(), 4);
+        assert_eq!(get(&a.doc.setups[1].p, "offset"), "G55");
+        assert_eq!(a.page, Page::Work);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert!(a.undo.is_some() && a.dirty);
+        assert!(a.doc.validate_structure().is_ok());
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(serde_json::to_string(&a.doc).unwrap(), before);
+        assert!(a.undo.is_none());
+    }
+    /// Plan, show the checked preview and apply it.
+    fn apply_checked_plan(a: &mut App) {
+        let preview = checked_preview(a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        let _ = a.update(Message::ApplyPlan);
+        assert!(a.undo.is_some());
+    }
+    fn json<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_string(value).unwrap()
+    }
+    /// A closed box mesh, `size` in mm.
+    fn box_mesh(size: [f32; 3]) -> crate::mesh::Mesh {
+        let v = |i: usize| -> [f32; 3] {
+            std::array::from_fn(|k| if i >> k & 1 == 0 { 0. } else { size[k] })
+        };
+        let mut triangles = vec![];
+        for q in [
+            [0, 2, 3, 1],
+            [4, 5, 7, 6],
+            [0, 1, 5, 4],
+            [2, 6, 7, 3],
+            [0, 4, 6, 2],
+            [1, 3, 7, 5],
+        ] {
+            triangles.push([v(q[0]), v(q[1]), v(q[2])]);
+            triangles.push([v(q[0]), v(q[2]), v(q[3])]);
+        }
+        crate::mesh::normalize(triangles).unwrap()
+    }
+    #[test]
+    fn apply_keeps_the_previous_job_in_history_and_undo_restores_only_its_setups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let before = a.doc.clone();
+        apply_checked_plan(&mut a);
+        // The copy is in History; Recover previous still means the project
+        // before the last switch (there was none here).
+        let history: Vec<_> = std::fs::read_dir(dir.path().join("history"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(history.len(), 1);
+        let archived = crate::storage::load(&history[0]).unwrap();
+        assert_eq!(json(&archived.setups), json(&before.setups));
+        assert!(a.last_archived.is_none());
+        assert!(a.status.contains("History"), "{}", a.status);
+        // Work done after Apply: a tool, a machine, the title and the material.
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::Edit(Target::Tool, "name", "Spot drill".into()));
+        let _ = a.update(Message::SaveTool);
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::SaveMachine);
+        let _ = a.update(Message::Title("Renamed after apply".into()));
+        let _ = a.update(Message::Material("Brass".into()));
+        let (tools, machines) = (json(&a.doc.tools), json(&a.doc.machines));
+        assert_eq!(a.doc.tools.len(), before.tools.len() + 1);
+        assert_eq!(a.doc.machines.len(), before.machines.len() + 1);
+        let applied = json(&a.doc);
+        let _ = a.update(Message::UndoPlan);
+        // Undo first keeps the applied job, with the edits since, in History.
+        let history: Vec<String> = std::fs::read_dir(dir.path().join("history"))
+            .unwrap()
+            .map(|entry| json(&crate::storage::load(&entry.unwrap().path()).unwrap()))
+            .collect();
+        assert_eq!(history.len(), 2);
+        assert!(history.contains(&applied), "the applied job is in History");
+        assert!(
+            a.status.starts_with(
+                "The setups from before the plan are restored. The applied job is in History."
+            ),
+            "{}",
+            a.status
+        );
+        assert_eq!(json(&a.doc.setups), json(&before.setups));
+        assert_eq!(a.doc.active, before.active);
+        assert_eq!(json(&a.doc.tools), tools);
+        assert_eq!(json(&a.doc.machines), machines);
+        assert_eq!(a.doc.title, "Renamed after apply");
+        assert_eq!(a.doc.material, "Brass");
+        assert!(a.undo.is_none());
+        assert!(a.doc.validate_structure().is_ok());
+    }
+    /// Plans again with setup 1's workholding note set to `note`, and applies.
+    fn apply_with_setup_1_note(a: &mut App, note: &str) {
+        let mut preview = std::sync::Arc::try_unwrap(checked_preview(a, false)).unwrap();
+        preview.outcome.proposal.setups[0].workholding = note.into();
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(
+            epoch,
+            Ok(std::sync::Arc::new(preview)),
+        ));
+        let _ = a.update(Message::ApplyPlan);
+        assert!(a.undo.is_some(), "{}", a.status);
+    }
+    #[test]
+    fn apply_adds_the_planners_setup_1_note_on_one_line_and_undo_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.doc.setups[0]
+            .p
+            .insert("notes".into(), "Soft jaws.".into());
+        let before = json(&a.doc.setups);
+        apply_checked_plan(&mut a);
+        assert_eq!(
+            get(&a.doc.setups[0].p, "notes"),
+            "Soft jaws. · Planner: Vise on the long sides."
+        );
+        // Setup 1 keeps the note Apply added, saved with the project.
+        assert_eq!(
+            get(&a.doc.setups[0].p, "planner_note"),
+            "Vise on the long sides."
+        );
+        let saved = dir.path().join("planner-note.axis.json");
+        crate::storage::save(&saved, &a.doc).unwrap();
+        let loaded = crate::storage::load(&saved).unwrap();
+        assert_eq!(
+            get(&loaded.setups[0].p, "planner_note"),
+            "Vise on the long sides."
+        );
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(json(&a.doc.setups), before);
+        assert!(!a.doc.setups[0].p.contains_key("planner_note"));
+        // A later Apply replaces the part an earlier Apply added, and the
+        // planner's line breaks become spaces.
+        apply_checked_plan(&mut a);
+        apply_with_setup_1_note(&mut a, "Clamp the\nlong sides.\r\n\nKeep the top clear.");
+        let notes = get(&a.doc.setups[0].p, "notes");
+        assert_eq!(
+            notes,
+            "Soft jaws. · Planner: Clamp the long sides. Keep the top clear."
+        );
+        // Without notes of its own, setup 1 gets the planner's note alone,
+        // within 500 characters, and a later Apply replaces it too.
+        let mut a = signed_in_planning_app(&dir);
+        apply_with_setup_1_note(&mut a, &"w".repeat(900));
+        let notes = get(&a.doc.setups[0].p, "notes");
+        assert!(notes.starts_with("Planner: www"), "{notes}");
+        assert_eq!(notes.chars().count(), 500);
+        apply_with_setup_1_note(&mut a, "Vise.");
+        assert_eq!(get(&a.doc.setups[0].p, "notes"), "Planner: Vise.");
+        // Text the user typed after the planner's note survives a second
+        // Apply; only the note an earlier Apply added is replaced.
+        a.doc.setups[0].p.insert(
+            "notes".into(),
+            "Soft jaws. · Planner: Vise. Torque 40 Nm.".into(),
+        );
+        apply_with_setup_1_note(&mut a, "Clamps.");
+        assert_eq!(
+            get(&a.doc.setups[0].p, "notes"),
+            "Soft jaws. Torque 40 Nm. · Planner: Clamps."
+        );
+        assert_eq!(get(&a.doc.setups[0].p, "planner_note"), "Clamps.");
+        // Notes the user starts with "Planner: " survive too.
+        a.doc.setups[0]
+            .p
+            .insert("notes".into(), "Planner: Alice checks jaws.".into());
+        apply_with_setup_1_note(&mut a, "Vise.");
+        assert_eq!(
+            get(&a.doc.setups[0].p, "notes"),
+            "Planner: Alice checks jaws. · Planner: Vise."
+        );
+        // A plan without a note for setup 1 removes its earlier one and
+        // keeps nothing to remove later.
+        apply_with_setup_1_note(&mut a, "");
+        assert_eq!(
+            get(&a.doc.setups[0].p, "notes"),
+            "Planner: Alice checks jaws."
+        );
+        assert!(!a.doc.setups[0].p.contains_key("planner_note"));
+        // The card says where the note goes.
+        assert_eq!(
+            crate::ui::workholding_line(0, "Vise."),
+            "Workholding (from the planner; on Apply it goes at the end of setup 1's notes, replacing an earlier planner note if it is unchanged): Vise."
+        );
+        assert_eq!(
+            crate::ui::workholding_line(1, "Flip."),
+            "Workholding (from the planner): Flip."
+        );
+    }
+    #[test]
+    fn apply_changes_nothing_when_the_job_cannot_be_kept_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        // A file where the history folder belongs makes archiving fail.
+        std::fs::write(dir.path().join("history"), "").unwrap();
+        let before = json(&a.doc);
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(json(&a.doc), before);
+        assert!(a.undo.is_none());
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert!(
+            a.status.starts_with("Could not preserve your project"),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn undo_brings_back_a_tool_deleted_after_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let ball = a.doc.tools[1].clone();
+        assert_eq!((ball.name(), ball.number()), ("Ball 6", Some(2)));
+        apply_checked_plan(&mut a);
+        // The plan does not use the ball mill, so it can be deleted now.
+        let _ = a.update(Message::DeleteTool(ball.id.clone()));
+        assert!(!a.doc.tools.iter().any(|t| t.id == ball.id), "{}", a.status);
+        let _ = a.update(Message::UndoPlan);
+        assert!(a.doc.tools.iter().any(|t| t.id == ball.id));
+        assert!(
+            a.doc.setups[0].operations.iter().any(|o| o.tool == ball.id),
+            "the restored Parallel uses it"
+        );
+        assert!(
+            a.status.ends_with(" Ball 6 is back in the library as T2."),
+            "{}",
+            a.status
+        );
+        // A new tool took T2 after the delete: the ball mill comes back as
+        // the next free number, and the status names it.
+        let mut a = signed_in_planning_app(&dir);
+        let ball = a.doc.tools[1].clone();
+        apply_checked_plan(&mut a);
+        let _ = a.update(Message::DeleteTool(ball.id.clone()));
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::SaveTool);
+        assert!(
+            a.doc
+                .tools
+                .iter()
+                .any(|t| t.number() == Some(2) && t.id != ball.id)
+        );
+        let _ = a.update(Message::UndoPlan);
+        let back = a.doc.tools.iter().find(|t| t.id == ball.id).unwrap();
+        assert_eq!(back.number(), Some(4));
+        assert!(
+            a.status.ends_with(" Ball 6 is back in the library as T4."),
+            "{}",
+            a.status
+        );
+        for tool in &a.doc.tools {
+            assert_eq!(a.doc.tool_number_issues(tool), Vec::<String>::new());
+        }
+    }
+    #[test]
+    fn undo_keeps_every_free_tool_number_and_renumbers_only_taken_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        // A fourth tool, used after the ball mill's Parallel in the job.
+        let mut flat = Tool::new("Flat 4", "Flat end mill", "4");
+        flat.p.insert("number".into(), "4".into());
+        a.doc.tools.push(flat.clone());
+        a.doc.setups[0]
+            .operations
+            .push(Operation::new(Strategy::Contour, flat.id.clone()));
+        let ball = a.doc.tools[1].clone();
+        assert_eq!(ball.number(), Some(2));
+        apply_checked_plan(&mut a);
+        // Both are deleted, and a new tool takes T2, the ball mill's number.
+        for id in [&ball.id, &flat.id] {
+            let _ = a.update(Message::DeleteTool(id.clone()));
+            assert!(!a.doc.tools.iter().any(|t| &t.id == id), "{}", a.status);
+        }
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::SaveTool);
+        let numbers =
+            |a: &App| -> Vec<Option<u32>> { a.doc.tools.iter().map(|t| t.number()).collect() };
+        assert_eq!(numbers(&a), [Some(1), Some(3), Some(2)]);
+        let _ = a.update(Message::UndoPlan);
+        // Flat 4 keeps T4, which is free. The ball mill's T2 is taken, so it
+        // gets a number that is neither used nor kept: T5, not T4.
+        let number = |id: &str| a.doc.tools.iter().find(|t| t.id == id).unwrap().number();
+        assert_eq!(number(&flat.id), Some(4));
+        assert_eq!(number(&ball.id), Some(5));
+        assert!(
+            a.status.ends_with(
+                " Ball 6 is back in the library as T5. Flat 4 is back in the library as T4."
+            ),
+            "{}",
+            a.status
+        );
+        for tool in &a.doc.tools {
+            assert_eq!(a.doc.tool_number_issues(tool), Vec::<String>::new());
+        }
+    }
+    #[test]
+    fn undo_changes_nothing_when_the_applied_job_cannot_be_kept_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        apply_checked_plan(&mut a);
+        // A file where the history folder belongs makes archiving fail.
+        std::fs::remove_dir_all(dir.path().join("history")).unwrap();
+        std::fs::write(dir.path().join("history"), "").unwrap();
+        let applied = json(&a.doc);
+        let _ = a.update(Message::UndoPlan);
+        assert!(json(&a.doc) == applied, "the job is unchanged");
+        assert!(a.undo.is_some(), "Undo is still offered");
+        assert!(
+            a.status.starts_with("Could not preserve your project"),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn a_new_part_drops_the_undo_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        apply_checked_plan(&mut a);
+        let file = ModelFile {
+            name: "other.stl".into(),
+            path: dir.path().join("other.stl").to_string_lossy().into_owned(),
+            format: "stl".into(),
+            bytes: 1,
+        };
+        let other = box_mesh([30., 20., 10.]);
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(other))))));
+        assert!(a.undo.is_none());
+        let after = json(&a.doc);
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(json(&a.doc), after, "Undo changes nothing for the new part");
+        // Restoring the model also drops it.
+        let mut a = signed_in_planning_app(&dir);
+        apply_checked_plan(&mut a);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let _ = a.update(Message::ModelRestored(Ok(mesh)));
+        assert!(a.undo.is_none());
+    }
+    #[test]
+    fn new_project_and_open_drop_the_preview_the_run_and_the_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = || (Document::default(), dir.path().join("project-b.json"));
+        for open in [false, true] {
+            let switch = |a: &mut App| {
+                let message = if open {
+                    Message::ProjectOpened(Some(Ok(other())))
+                } else {
+                    Message::NewProject
+                };
+                let _ = a.update(message);
+            };
+            // A preview of project A cannot be applied to project B.
+            let mut a = signed_in_planning_app(&dir);
+            let preview = checked_preview(&a, false);
+            let _ = a.update(Message::Plan);
+            let epoch = a.plan_epoch;
+            let _ = a.update(Message::PlanFinished(epoch, Ok(preview.clone())));
+            switch(&mut a);
+            assert!(matches!(a.planner, crate::Planner::Idle));
+            let b = json(&a.doc);
+            let _ = a.update(Message::ApplyPlan);
+            assert_eq!(json(&a.doc), b);
+            // A running plan stops, and its late result is ignored.
+            let mut a = signed_in_planning_app(&dir);
+            let _ = a.update(Message::Plan);
+            let epoch = a.plan_epoch;
+            switch(&mut a);
+            assert!(a.plan_run.is_none() && matches!(a.planner, crate::Planner::Idle));
+            let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+            assert!(matches!(a.planner, crate::Planner::Idle));
+            // Undo of project A is gone.
+            let mut a = signed_in_planning_app(&dir);
+            apply_checked_plan(&mut a);
+            switch(&mut a);
+            assert!(a.undo.is_none());
+            let b = json(&a.doc);
+            let _ = a.update(Message::UndoPlan);
+            assert_eq!(json(&a.doc), b);
+        }
+    }
+    #[test]
+    fn cancel_discard_edits_and_sign_out_drop_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let before = json(&a.doc);
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanCancel);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert!(a.plan_run.is_none());
+        assert_eq!(a.status, "Planning cancelled. The job is unchanged.");
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview.clone())));
+        assert!(
+            matches!(a.planner, crate::Planner::Idle),
+            "a cancelled run's result is ignored"
+        );
+        assert_eq!(json(&a.doc), before, "Cancel leaves the job unchanged");
+        // Discard
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview.clone())));
+        let _ = a.update(Message::DiscardPlan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(json(&a.doc), before, "Discard leaves the job unchanged");
+        // An edit makes a preview stale.
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "6".into()));
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(a.doc.setups.len(), 1);
+        // Signing out stops a running plan.
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        let edited = json(&a.doc);
+        let _ = a.update(Message::SignOut);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(a.status, "Planning stopped because you are signed out.");
+        assert_eq!(json(&a.doc), edited, "Sign out leaves the job unchanged");
+    }
+    /// The open box imported and signed in: one Face and Contour plan covers it.
+    fn signed_in_box_app(dir: &tempfile::TempDir) -> (App, crate::analysis::PartReport) {
+        let (mut doc, mesh, report) = crate::planner::tests::open_box();
+        doc.material = "Aluminum 6061".into();
+        let mut a = fresh_app(dir);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        sign_in_with(&mut a, dir, crate::session::sample());
+        let epoch = a.account_epoch;
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec!["gpt-6.1-sol".into()])));
+        (a, report)
+    }
+    /// Runs the Plan task body with `script` and collects what it sends.
+    async fn run_task(a: &App, script: crate::planner::tests::Script) -> Vec<Message> {
+        use iced::futures::StreamExt;
+        let (sender, receiver) = iced::futures::channel::mpsc::channel(16);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let busy = a.plan_busy.clone();
+        crate::run_plan(&script, a.doc.clone(), mesh, busy, a.plan_epoch, sender).await;
+        receiver.collect().await
+    }
+    #[tokio::test]
+    async fn the_plan_task_sends_its_stages_and_its_result_with_the_runs_epoch() {
+        use crate::planner::{Progress, tests::Script};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, report) = signed_in_box_app(&dir);
+        let _ = a.update(Message::Plan);
+        assert!(
+            matches!(a.planner, crate::Planner::Running(_)),
+            "{}",
+            a.status
+        );
+        let epoch = a.plan_epoch;
+        let plan = crate::planner::tests::complete(&report);
+        let script = Script::new(vec![Ok(serde_json::to_string(&plan).unwrap())]);
+        let messages = run_task(&a, script).await;
+        let mut stages = vec![];
+        for message in &messages[..messages.len() - 1] {
+            let Message::PlanProgress(e, stage) = message else {
+                panic!("{message:?}")
+            };
+            assert_eq!(*e, epoch);
+            stages.push(*stage);
+        }
+        assert_eq!(
+            stages,
+            [
+                Progress::Analyzing,
+                Progress::Asking(1),
+                Progress::Checking(1),
+                Progress::Previewing
+            ]
+        );
+        let Some(Message::PlanFinished(e, Ok(preview))) = messages.last() else {
+            panic!("{:?}", messages.last())
+        };
+        assert_eq!(*e, epoch);
+        assert!(preview.view.is_some(), "the 3D view is built");
+        assert_eq!(preview.outcome.requests, 1);
+        for message in messages {
+            let _ = a.update(message);
+        }
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert_eq!(a.status, "Plan ready to review: 1 setup, 2 operations.");
+        assert!(a.plan_run.is_none());
+        assert_eq!(a.plan_busy.running(), 0);
+        // A run that fails ends with PlanFinished(Err), with the same epoch.
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let script = Script::new(vec![Err(crate::openai::ApiError::UsageLimit)]);
+        let messages = run_task(&a, script).await;
+        assert!(matches!(
+            messages.last(),
+            Some(Message::PlanFinished(e, Err(f))) if *e == epoch
+                && f.api == Some(crate::openai::ApiError::UsageLimit)
+        ));
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, Message::PlanProgress(_, Progress::Previewing)))
+        );
+        for message in messages {
+            let _ = a.update(message);
+        }
+        assert!(matches!(a.planner, crate::Planner::Failed(_)) && a.usage_limit);
+    }
+    #[tokio::test]
+    async fn a_dropped_plan_task_counts_its_3d_view_until_it_ends() {
+        use crate::planner::tests::{Gate, Script, complete, drop_while_held};
+        let dir = tempfile::tempdir().unwrap();
+        let (a, report) = signed_in_box_app(&dir);
+        let gate = Gate::default();
+        let held = gate.clone();
+        let script = Script::new(vec![Ok(serde_json::to_string(&complete(&report)).unwrap())]);
+        let (sender, _receiver) = iced::futures::channel::mpsc::channel(16);
+        let busy = a.plan_busy.clone();
+        let run = crate::run_plan_with(
+            &script,
+            a.doc.clone(),
+            a.imported_mesh.clone().unwrap(),
+            busy.clone(),
+            a.plan_epoch,
+            sender,
+            move |_: &Document, _: &crate::mesh::Mesh| {
+                held.hold();
+                None
+            },
+        );
+        drop_while_held(run, &gate, &busy).await;
+    }
+    #[test]
+    fn cancel_and_edits_abort_the_task_and_a_late_result_is_not_the_next_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let preview = checked_preview(&a, false);
+        let stop: [fn(&mut App); 2] = [
+            |a| {
+                let _ = a.update(Message::PlanCancel);
+            },
+            |a| {
+                let _ = a.update(Message::Edit(Target::Setup, "stock_top", "6".into()));
+            },
+        ];
+        for stop in stop {
+            let _ = a.update(Message::Plan);
+            let first = a.plan_epoch;
+            let handle = a.plan_run.clone().expect("the run's handle");
+            assert!(!handle.is_aborted());
+            stop(&mut a);
+            assert!(handle.is_aborted(), "the task is aborted");
+            assert!(a.plan_run.is_none());
+            assert_ne!(a.plan_epoch, first, "the epoch moves on");
+            // The next run is not fooled by the first run's late messages.
+            let _ = a.update(Message::Plan);
+            assert!(matches!(a.planner, crate::Planner::Running(_)));
+            let asking = crate::planner::Progress::Asking(3);
+            let _ = a.update(Message::PlanProgress(first, asking));
+            let _ = a.update(Message::PlanFinished(first, Ok(preview.clone())));
+            assert!(matches!(
+                a.planner,
+                crate::Planner::Running(crate::planner::Progress::Analyzing)
+            ));
+            let _ = a.update(Message::PlanCancel);
+        }
+    }
+    #[test]
+    fn apply_from_a_later_active_setup_removes_it_and_activates_setup_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let first = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::DuplicateSetup);
+        let _ = a.update(Message::Flip("rx"));
+        let later = a.doc.setups[1].id.clone();
+        assert_eq!((a.doc.setups.len(), &a.doc.active), (2, &later));
+        let preview = checked_preview(&a, false);
+        let planned: Vec<String> = preview
+            .outcome
+            .job
+            .setups
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(planned[0], first);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        let _ = a.update(Message::ApplyPlan);
+        let ids: Vec<String> = a.doc.setups.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, planned);
+        assert!(!ids.contains(&later), "the later setup is gone");
+        assert_eq!(a.doc.active, first);
+        assert!(a.doc.validate_structure().is_ok());
+        // Undo puts the later setup back, still active.
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(a.doc.setups.len(), 2);
+        assert_eq!(a.doc.active, later);
+    }
+    #[test]
+    fn a_failed_run_shows_its_problems_and_account_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let failure = |api: Option<crate::openai::ApiError>| crate::planner::Failure {
+            message: api
+                .as_ref()
+                .map_or("No plan passed.".into(), |e| e.message()),
+            problems: vec![],
+            api,
+            requests: 1,
+        };
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let limit = failure(Some(crate::openai::ApiError::UsageLimit));
+        let _ = a.update(Message::PlanFinished(epoch, Err(limit)));
+        assert!(matches!(a.planner, crate::Planner::Failed(_)));
+        assert!(a.usage_limit);
+        assert!(a.status.contains("Usage limit reached"));
+        let _ = a.update(Message::Plan);
+        assert!(
+            matches!(a.planner, crate::Planner::Running(_)),
+            "Try again starts a new run"
+        );
+        let epoch = a.plan_epoch;
+        let gone = failure(Some(crate::openai::ApiError::SignedOut(
+            "Sign in again.".into(),
+        )));
+        let _ = a.update(Message::PlanFinished(epoch, Err(gone)));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert!(matches!(a.planner, crate::Planner::Failed(_)));
+        let _ = a.update(Message::Plan);
+        assert!(
+            matches!(a.planner, crate::Planner::Failed(_)),
+            "not signed in: no new run"
+        );
+        let _ = a.update(Message::DiscardPlan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        // Every API error reaches the failed panel, the status and the account.
+        use crate::openai::ApiError;
+        for error in [
+            ApiError::SignedOut("Sign in again.".into()),
+            ApiError::UsageLimit,
+            ApiError::NotEligible("Upgrade your plan.".into()),
+            ApiError::Unavailable("OpenAI is unavailable.".into()),
+            ApiError::Refused("No.".into()),
+            ApiError::Unsupported("Not on this plan.".into()),
+            ApiError::Other("Something else.".into()),
+        ] {
+            let mut a = signed_in_planning_app(&dir);
+            let _ = a.update(Message::Plan);
+            let epoch = a.plan_epoch;
+            let _ = a.update(Message::PlanFinished(
+                epoch,
+                Err(failure(Some(error.clone()))),
+            ));
+            let crate::Planner::Failed(shown) = &a.planner else {
+                panic!("{error:?}: no failed panel")
+            };
+            assert_eq!(shown.message, error.message());
+            assert_eq!(a.status, error.message());
+            assert_eq!(a.account_note, error.message());
+            assert_eq!(a.usage_limit, error == ApiError::UsageLimit);
+            let signed_out = matches!(error, ApiError::SignedOut(_));
+            assert_eq!(a.account == crate::Account::SignedOut, signed_out);
+        }
+        // A failed check's problems are listed on the failed panel.
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let problem = crate::proposal::Problem {
+            setup: 1,
+            operation: Some(2),
+            stage: "generation",
+            message: "Pocket depth must be less than tool stickout.".into(),
+        };
+        let mut no_plan = failure(None);
+        no_plan.problems = vec![problem];
+        let _ = a.update(Message::PlanFinished(epoch, Err(no_plan)));
+        let crate::Planner::Failed(shown) = &a.planner else {
+            panic!("no failed panel")
+        };
+        assert_eq!(
+            crate::ui::problem_lines(&shown.problems),
+            ["• Setup 1, operation 2: Pocket depth must be less than tool stickout."]
+        );
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(a.doc.setups.len(), 1, "a failed run has nothing to apply");
+    }
+    #[test]
+    fn a_dead_clients_run_never_signs_out_a_new_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Plan);
+        let first_run = a.plan_epoch;
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        // A connection check reports that the sign-in is gone: the run,
+        // which uses that client, stops as it does on Sign out.
+        let _ = a.update(Message::CheckConnection);
+        let gone = || crate::openai::ApiError::SignedOut("Sign in again.".into());
+        let _ = a.update(Message::ConnectionChecked(a.account_epoch, Err(gone())));
+        assert_eq!(a.account, crate::Account::SignedOut);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(a.status, "Planning stopped because you are signed out.");
+        assert!(a.plan_run.is_none());
+        assert_ne!(a.plan_epoch, first_run);
+        // The user signs in again; the old run's failure arrives late.
+        sign_in_with(&mut a, &dir, crate::session::sample());
+        let _ = a.update(Message::ModelsLoaded(
+            a.account_epoch,
+            Ok(vec!["gpt-6.1-sol".into()]),
+        ));
+        let before = snapshot(&a);
+        let failure = crate::planner::Failure {
+            message: "Sign in with ChatGPT to continue.".into(),
+            problems: vec![],
+            api: Some(gone()),
+            requests: 2,
+        };
+        let _ = a.update(Message::PlanFinished(first_run, Err(failure)));
+        assert_eq!(snapshot(&a), before, "the new sign-in is kept");
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        assert!(matches!(a.planner, crate::Planner::Idle));
+    }
+    #[tokio::test]
+    async fn a_refusal_reaches_the_status_the_account_and_the_page_clean_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let hostile = format!("No\nway \u{202e}\u{7}{}", "x".repeat(5000));
+        let script = crate::planner::tests::Script::new(vec![Err(
+            crate::openai::ApiError::Refused(hostile),
+        )]);
+        let (doc, mesh) = (a.doc.clone(), a.imported_mesh.clone().unwrap());
+        let busy = crate::planner::Busy::default();
+        let failure = crate::planner::plan(&script, doc, mesh, &busy, |_| {})
+            .await
+            .unwrap_err();
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Err(failure)));
+        let crate::Planner::Failed(shown) = &a.planner else {
+            panic!("no failure shown")
+        };
+        for text in [&a.status, &a.account_note, &shown.message] {
+            assert!(text.starts_with("The model declined the request: No way "));
+            assert!(!text.contains(['\n', '\u{202e}', '\u{7}']), "{text}");
+            assert!(text.chars().count() <= 340);
+        }
+        a.page = Page::Ai;
+        let _ = a.view();
+    }
+    #[test]
+    fn a_failed_run_lists_twelve_problems_and_how_many_more() {
+        let problems: Vec<crate::proposal::Problem> = (0..15)
+            .map(|i| crate::proposal::Problem {
+                setup: 1,
+                operation: Some(i + 1),
+                stage: "structure",
+                message: format!("problem {i}"),
+            })
+            .collect();
+        let lines = crate::ui::problem_lines(&problems);
+        assert_eq!(lines.len(), 13);
+        assert_eq!(lines[0], "• Setup 1, operation 1: problem 0");
+        assert_eq!(lines[12], "• and 3 more problems");
+        assert_eq!(crate::ui::problem_lines(&problems[..2]).len(), 2);
+        assert_eq!(
+            crate::ui::problem_lines(&problems[..13])[12],
+            "• and 1 more problem"
+        );
+    }
+    #[test]
+    fn preview_rows_show_the_strategy_and_the_values_that_will_run() {
+        use crate::proposal::tests::{block, good, op};
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        {
+            let ops = &mut proposal.setups[0].operations;
+            ops[0].bottom_offset = Some(0.5);
+            let pocket = &mut ops[1];
+            pocket.rpm = 8000.5;
+            pocket.stepover_percent = Some(35.);
+            pocket.axial_allowance = Some(0.1);
+            pocket.ramp_angle = Some(3.);
+            pocket.finish_passes = Some(2);
+            ops[2].radial_allowance = Some(0.25);
+            ops[3].hole_diameter = Some(6.6);
+            ops[3].through = Some(true);
+            ops[3].breakthrough = Some(1.5);
+            let mut parallel = op("Parallel", 2, vec![]);
+            parallel.surface_stepover = Some(0.8);
+            parallel.tolerance = Some(0.02);
+            let mut waterline = op("Waterline", 1, vec![]);
+            waterline.stepdown = Some(3.);
+            ops.extend([parallel, waterline]);
+        }
+        let job = crate::proposal::build(&doc, &mesh, &report, &proposal).unwrap();
+        let ops = &job.setups[0].operations;
+        let lines = |i: usize| crate::ui::operation_lines(&ops[i], "T1 Flat 10", 1.3, "Because.");
+        assert_eq!(
+            lines(0),
+            [
+                "Facing · “Face by planner” · T1 Flat 10 · 1.3 min",
+                "8000 rpm · 1000 mm/min · stepdown 2 mm · stepover 40% · bottom offset 0.5 mm",
+                "The planner's reason: Because.",
+            ]
+        );
+        assert_eq!(
+            lines(1)[1],
+            "8001 rpm · 1000 mm/min · stepdown 2 mm · stepover 35% · axial allowance 0.1 mm · entry Profile ramp at 3° · 2 finish passes"
+        );
+        assert_eq!(
+            lines(1)[0],
+            "Pocket · “Pocket by planner” · T1 Flat 10 · 1.3 min"
+        );
+        assert_eq!(
+            lines(2)[..2],
+            [
+                "Contour, outside · “Contour by planner” · T1 Flat 10 · 1.3 min",
+                "8000 rpm · 1000 mm/min · stepdown 2 mm · radial allowance 0.25 mm · 1 finish pass",
+            ]
+        );
+        assert_eq!(
+            lines(3)[1],
+            "2400 rpm · 280 mm/min · Deep drilling, peck 3 mm · through, breakthrough 1.5 mm · holes of Ø6.6 mm only"
+        );
+        assert_eq!(
+            lines(4)[..2],
+            [
+                "Parallel finishing · “Parallel by planner” · T1 Flat 10 · 1.3 min",
+                "8000 rpm · 1000 mm/min · surface stepover 0.8 mm · tolerance 0.02 mm",
+            ]
+        );
+        assert_eq!(lines(5)[1], "8000 rpm · 1000 mm/min · stepdown 3 mm");
+        // An inside contour, and a drill that stops in the hole.
+        let mut inside = ops[2].clone();
+        inside.p.insert("side".into(), "Inside".into());
+        inside
+            .p
+            .insert("boundary".into(), "Selected geometry".into());
+        assert!(
+            crate::ui::operation_lines(&inside, "T1", 1., "")[0]
+                .starts_with("Contour, inside floor · ")
+        );
+        // It runs as a floor profile: Pocket's entry and ramp, a fixed stepover.
+        assert_eq!(
+            crate::ui::operation_lines(&inside, "T1", 1., "")[1],
+            "8000 rpm · 1000 mm/min · stepdown 2 mm · stepover 40% (fixed) · radial allowance 0.25 mm · entry Profile ramp at 2° · 1 finish pass"
+        );
+        inside.p.insert("pocket_entry".into(), "Plunge".into());
+        assert!(
+            crate::ui::operation_lines(&inside, "T1", 1., "")[1].ends_with(
+                " · stepover 40% (fixed) · radial allowance 0.25 mm · entry Plunge · 1 finish pass"
+            )
+        );
+        let mut blind = ops[3].clone();
+        blind.p.insert("through".into(), "No".into());
+        blind.p.insert("cycle".into(), "Drilling".into());
+        blind.p.insert("hole_diameter".into(), "0".into());
+        assert_eq!(
+            crate::ui::operation_lines(&blind, "T3", 1., "")[1],
+            "2400 rpm · 280 mm/min · Drilling · not through"
+        );
+        assert_eq!(
+            crate::ui::operation_lines(&blind, "T3", 1., "")[2],
+            "The planner gave no reason."
+        );
+    }
+    #[test]
+    fn later_setup_names_are_labelled_as_the_planners() {
+        // Setup 1 keeps the user's name; a later setup's name is the planner's.
+        assert_eq!(crate::ui::setup_title(0, "Top"), "Setup 1: Top");
+        assert_eq!(
+            crate::ui::setup_title(1, "Underside"),
+            "Setup 2 · named by the planner: “Underside”"
+        );
+    }
+    #[test]
+    fn the_preview_lists_covered_walls_and_how_coverage_is_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = signed_in_planning_app(&dir);
+        let preview = checked_preview(&a, false);
+        let cover = preview.outcome.check.coverage.as_ref().unwrap();
+        assert!(!cover.covered_other.is_empty());
+        let lines = crate::ui::coverage_lines(cover);
+        assert!(
+            lines.iter().any(|l| l
+                .starts_with("• Still covered: walls and curved surface facing down in setup 1 (")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("facing +X")));
+        assert_eq!(lines.last().unwrap(), cover.note);
+    }
+    #[test]
+    fn a_follow_up_error_reaches_the_account_and_the_preview() {
+        use crate::openai::ApiError;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        for (note, signed_out) in [
+            (ApiError::UsageLimit, false),
+            (ApiError::SignedOut("Sign in again.".into()), true),
+        ] {
+            let mut a = signed_in_planning_app(&dir);
+            let mut preview = Arc::try_unwrap(checked_preview(&a, false)).unwrap();
+            preview.outcome.note = Some(note.clone());
+            let lines = crate::ui::preview_totals(&preview.outcome);
+            assert!(lines[0].ends_with("· 2 model requests"), "{}", lines[0]);
+            assert_eq!(
+                lines[1],
+                format!("A follow-up request failed: {}", note.message())
+            );
+            let _ = a.update(Message::Plan);
+            let epoch = a.plan_epoch;
+            let _ = a.update(Message::PlanFinished(epoch, Ok(Arc::new(preview))));
+            assert!(matches!(a.planner, crate::Planner::Preview(_)));
+            assert_eq!(a.account == crate::Account::SignedOut, signed_out);
+            assert_eq!(a.usage_limit, !signed_out);
+            assert_eq!(a.account_note, note.message());
+        }
+        // A note from a run whose client was replaced changes nothing.
+        let mut a = signed_in_planning_app(&dir);
+        let mut preview = Arc::try_unwrap(checked_preview(&a, false)).unwrap();
+        preview.outcome.note = Some(ApiError::SignedOut("Sign in again.".into()));
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        a.account_epoch = a.account_epoch.wrapping_add(1);
+        let _ = a.update(Message::PlanFinished(epoch, Ok(Arc::new(preview))));
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert!(matches!(a.account, crate::Account::SignedIn { .. }));
+    }
+    #[test]
+    fn the_preview_view_has_its_own_camera() {
+        use crate::viewport::Event;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Viewport(Event::Orbit(0.3, 0.1)));
+        let workspace = format!("{:?}", a.camera);
+        let framed = format!("{:?}", crate::viewport::Camera::default());
+        assert_ne!(workspace, framed);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, true))));
+        assert_eq!(format!("{:?}", a.plan_camera), framed, "starts framed");
+        for event in [
+            Event::Orbit(0.5, -0.2),
+            Event::Pan(4., 2.),
+            Event::Zoom(0.2),
+        ] {
+            let _ = a.update(Message::PlanViewport(event));
+        }
+        let moved = a.plan_camera;
+        assert!(moved.yaw != 0.75 && moved.pan == [4., 2.] && moved.zoom > 1.);
+        assert_eq!(
+            format!("{:?}", a.camera),
+            workspace,
+            "the workspace camera stays"
+        );
+        a.page = Page::Ai;
+        let _ = a.view();
+        // The next preview starts framed again.
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        assert_eq!(format!("{:?}", a.plan_camera), framed);
+    }
+    #[test]
+    fn every_planner_stage_has_its_own_page_text() {
+        use crate::planner::Progress::*;
+        let texts: Vec<String> = [
+            Analyzing,
+            Asking(1),
+            Repairing(2),
+            Extending(2),
+            Checking(2),
+            Previewing,
+        ]
+        .into_iter()
+        .map(|stage| crate::ui::stage_text(stage, "gpt-6.1-sol"))
+        .collect();
+        for (i, text) in texts.iter().enumerate() {
+            assert!(!texts[..i].contains(text), "{text}");
+        }
+        assert!(texts[1].contains("gpt-6.1-sol") && texts[1].contains("1 of 4"));
+        assert!(texts[2].contains("correction") && texts[2].contains("2 of 4"));
+        assert!(texts[3].contains("still covered") && texts[3].contains("2 of 4"));
+        assert!(texts[4].contains("2 of 4"));
+        assert!(texts[5].contains("3D view"));
+    }
+    #[test]
+    fn a_plan_dropped_by_an_edit_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = "Planning stopped because the job changed.";
+        let discarded = "The plan preview was discarded because the job changed.";
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Plan);
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "6".into()));
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(a.status, stopped);
+        // An edit elsewhere with a status of its own, even one that changes
+        // nothing, says both.
+        let _ = a.update(Message::SaveTool);
+        let own = a.status.clone();
+        let _ = a.update(Message::Plan);
+        let _ = a.update(Message::SaveTool);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(a.status, format!("{own} {stopped}"));
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        let _ = a.update(Message::Title("Renamed".into()));
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(a.status, discarded);
+        // Nothing to drop: the edit's own status stays.
+        let _ = a.update(Message::SaveTool);
+        assert_eq!(a.status, own);
+        // Undo with a preview on screen says what it restored, then why the
+        // preview went.
+        apply_checked_plan(&mut a);
+        let preview = checked_preview(&a, false);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+        let _ = a.update(Message::UndoPlan);
+        assert!(a.undo.is_none());
+        assert!(
+            a.status.starts_with(
+                "The setups from before the plan are restored. The applied job is in History."
+            ) && a.status.ends_with(&format!(" {discarded}")),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn the_running_stage_names_the_model_the_run_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let epoch = a.account_epoch;
+        let both = vec!["gpt-6.1-sol".to_string(), "gpt-6-luna".into()];
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(both)));
+        let _ = a.update(Message::Plan);
+        let _ = a.update(Message::PickModel("gpt-6-luna".into()));
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        let text = crate::ui::running_text(&a, crate::planner::Progress::Asking(1));
+        assert!(
+            text.contains("gpt-6.1-sol") && !text.contains("gpt-6-luna"),
+            "{text}"
+        );
+    }
+    #[test]
+    fn plan_waits_for_the_blocking_work_of_an_earlier_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Plan);
+        let _ = a.update(Message::PlanCancel);
+        // The cancelled run's check is still running on the blocking pool.
+        let check = a.plan_busy.enter();
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(
+            a.status,
+            "The previous plan check is still finishing; try again in a moment."
+        );
+        drop(check);
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+    }
+    #[test]
+    fn the_planner_page_builds_in_every_planner_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.page = Page::Ai;
+        let _ = a.view();
+        a.planner = crate::Planner::Running(crate::planner::Progress::Checking(3));
+        let _ = a.view();
+        a.planner = crate::Planner::Failed(crate::planner::Failure {
+            message: "No plan passed.".into(),
+            problems: vec![crate::proposal::Problem {
+                setup: 1,
+                operation: Some(2),
+                stage: "generation",
+                message: "x".repeat(900),
+            }],
+            api: None,
+            requests: 4,
+        });
+        let _ = a.view();
+        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        let _ = a.view();
+        a.planner = crate::Planner::Preview(checked_preview(&a, true));
+        let _ = a.view();
+        a.undo = Some(a.doc.clone());
+        let _ = a.view();
     }
     fn signed_in_app(dir: &tempfile::TempDir) -> App {
         let mut a = fresh_app(dir);
@@ -1741,14 +3131,144 @@ mod tests {
         );
         assert_eq!(
             a.account_note,
-            "Your ChatGPT plan lists no models for this app."
+            "Your ChatGPT plan lists no models for this app. The app will use gpt-6-luna; Check connection shows whether it answers."
         );
+        // The saved model can still be checked without a list.
+        assert_eq!(a.update(Message::CheckConnection).units(), 1);
+        let _ = a.update(Message::ConnectionChecked(a.account_epoch, Ok("ok".into())));
+        let _ = a.update(Message::ModelsLoaded(epoch, Ok(vec![])));
         // The panel offers Load models; a new list replaces the note.
         assert_eq!(a.update(Message::LoadModels).units(), 1);
         let _ = a.update(Message::ModelsLoaded(epoch, Ok(both.clone())));
         assert_eq!(a.models, both);
         assert_eq!(a.settings.model, "gpt-6-luna");
         assert!(a.account_note.is_empty());
+    }
+    #[test]
+    fn without_a_model_list_the_planner_falls_back_to_the_default_model() {
+        for result in [
+            Ok(vec![]),
+            Err(crate::openai::ApiError::Unavailable(
+                "OpenAI is unavailable.".into(),
+            )),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = signed_in_app(&dir);
+            assert!(a.settings.model.is_empty());
+            let failed = result.is_err();
+            let _ = a.update(Message::ModelsLoaded(a.account_epoch, result));
+            assert_eq!(a.settings.model, "gpt-6.1-sol");
+            assert_eq!(
+                crate::settings::load(&dir.path().join("settings.json")).model,
+                "gpt-6.1-sol"
+            );
+            assert!(a.models.is_empty());
+            assert!(
+                a.account_note.ends_with(
+                    "The app will use gpt-6.1-sol; Check connection shows whether it answers."
+                ),
+                "{}",
+                a.account_note
+            );
+            assert_eq!(a.account_note.contains("OpenAI is unavailable."), failed);
+            a.page = Page::Ai;
+            let _ = a.view();
+        }
+        // A sign-in that is gone, or has no plan usage, gets no model.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let gone = crate::openai::ApiError::SignedOut("Sign in again.".into());
+        let _ = a.update(Message::ModelsLoaded(a.account_epoch, Err(gone)));
+        assert!(a.settings.model.is_empty());
+        assert_eq!(a.account_note, "Sign in again.");
+    }
+    #[test]
+    fn a_model_list_clears_the_fallback_note_whatever_its_first_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_app(&dir);
+        let unavailable = crate::openai::ApiError::Unavailable("OpenAI is unavailable.".into());
+        let _ = a.update(Message::ModelsLoaded(a.account_epoch, Err(unavailable)));
+        assert!(
+            a.account_note.starts_with("OpenAI is unavailable.")
+                && a.account_note.contains("The app will use gpt-6.1-sol"),
+            "{}",
+            a.account_note
+        );
+        let _ = a.update(Message::LoadModels);
+        let luna = vec!["gpt-6-luna".to_string()];
+        let _ = a.update(Message::ModelsLoaded(a.account_epoch, Ok(luna)));
+        assert_eq!(a.settings.model, "gpt-6-luna");
+        assert!(a.account_note.is_empty(), "{}", a.account_note);
+        // A note that is not about the fallback stays.
+        a.account_note = "ok".into();
+        let both = vec!["gpt-6-luna".to_string(), "gpt-6.1-sol".into()];
+        let _ = a.update(Message::ModelsLoaded(a.account_epoch, Ok(both)));
+        assert_eq!(a.account_note, "ok");
+    }
+    #[test]
+    fn a_successful_plan_clears_the_usage_limit_banner() {
+        use crate::openai::ApiError;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let limited = |a: &mut App| {
+            let _ = a.update(Message::Plan);
+            let epoch = a.plan_epoch;
+            let failure = crate::planner::Failure {
+                message: ApiError::UsageLimit.message(),
+                problems: vec![],
+                api: Some(ApiError::UsageLimit),
+                requests: 1,
+            };
+            let _ = a.update(Message::PlanFinished(epoch, Err(failure)));
+            assert!(a.usage_limit);
+        };
+        limited(&mut a);
+        assert_eq!(a.account_note, ApiError::UsageLimit.message());
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert!(!a.usage_limit);
+        assert_eq!(
+            a.account_note, "",
+            "the panel no longer says the limit is reached"
+        );
+        // So does one that carries the fallback sentence after the limit,
+        // as a model list that hit the limit leaves it.
+        let epoch = a.account_epoch;
+        let _ = a.update(Message::ModelsLoaded(epoch, Err(ApiError::UsageLimit)));
+        assert!(a.usage_limit);
+        assert!(
+            a.account_note.starts_with(&format!(
+                "{} The app will use",
+                ApiError::UsageLimit.message()
+            )),
+            "{}",
+            a.account_note
+        );
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        assert!(!a.usage_limit);
+        assert_eq!(a.account_note, "", "the fallback sentence goes with it");
+        // Another note stays.
+        a.account_note = "Connection works: gpt-6.1-sol answered.".into();
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        assert_eq!(a.account_note, "Connection works: gpt-6.1-sol answered.");
+        // A follow-up request that hit the limit keeps the banner.
+        limited(&mut a);
+        let mut preview = std::sync::Arc::try_unwrap(checked_preview(&a, false)).unwrap();
+        preview.outcome.note = Some(ApiError::UsageLimit);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(
+            epoch,
+            Ok(std::sync::Arc::new(preview)),
+        ));
+        assert!(a.usage_limit);
+        assert_eq!(a.account_note, ApiError::UsageLimit.message());
     }
     #[test]
     fn loading_models_needs_a_granted_sign_in() {
