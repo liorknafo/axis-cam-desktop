@@ -283,12 +283,25 @@ async fn store_clear(store: &Arc<dyn SessionStore>) -> Result<(), String> {
 async fn store_load(store: &Arc<dyn SessionStore>) -> Result<Option<Session>, String> {
     off_executor(store, |store| store.load()).await
 }
+/// Whether a saved sign-in may replace this client's `current` one: the same
+/// user, a different refresh token that this client has not spent, and newer
+/// (it expires later). An older saved set, such as one a failed save left
+/// behind, holds a refresh token OpenAI has already rotated.
+fn newer_saved(saved: &Session, current: &Session, spent: &std::sync::Mutex<Vec<String>>) -> bool {
+    saved.subject == current.subject
+        && saved.refresh_token != current.refresh_token
+        && saved.expires_at > current.expires_at
+        && !spent.lock().unwrap().contains(&saved.refresh_token)
+}
 pub struct Client {
     http: reqwest::Client,
     endpoints: Endpoints,
     client_id: String,
     store: Arc<dyn SessionStore>,
     session: Arc<tokio::sync::Mutex<Option<Session>>>,
+    /// Refresh tokens this client has presented and OpenAI accepted or
+    /// refused, kept for the client's lifetime: none is presented again.
+    spent: Arc<std::sync::Mutex<Vec<String>>>,
     /// Base delay between retries.
     backoff: Duration,
 }
@@ -305,6 +318,7 @@ impl Client {
             client_id,
             store,
             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
+            spent: Arc::default(),
             backoff: Duration::from_secs(1),
         }
     }
@@ -318,15 +332,18 @@ impl Client {
     ///
     /// Before refreshing, it reads the saved sign-in: when another running
     /// copy has saved newer tokens for the same user, those are used, and
-    /// refreshed only if they are close to expiry themselves.
+    /// refreshed only if they are close to expiry themselves. A saved set is
+    /// adopted only when it is newer than this client's own and holds no
+    /// refresh token this client has spent (`newer_saved`): after both saves
+    /// of a refresh failed, the store still holds the rotated-out set.
     ///
     /// When OpenAI rejects the refresh token for good, another running copy
     /// of the app may have spent it and saved its new tokens. Those are then
     /// used from here on (the next call refreshes them if they are close to
-    /// expiry), but only when they belong to the same user: another user's
-    /// sign-in is neither used nor deleted, and this client signs out. Only a
-    /// saved sign-in with the rejected refresh token is deleted; one that
-    /// cannot be read is left alone.
+    /// expiry), but only when they belong to the same user and are newer:
+    /// another user's sign-in is neither used nor deleted, and this client
+    /// signs out. Only a saved sign-in with the rejected refresh token is
+    /// deleted; one that cannot be read is left alone.
     async fn token(&self, rejected: Option<&str>) -> Result<String, ApiError> {
         let mut session = self.session.clone().lock_owned().await;
         let current = (*session)
@@ -341,6 +358,7 @@ impl Client {
         let client_id = self.client_id.clone();
         let store = self.store.clone();
         let backoff = self.backoff;
+        let spent = self.spent.clone();
         let rejected = rejected.map(str::to_string);
         let refresh = async move {
             // Another running copy may have refreshed already and saved the
@@ -349,8 +367,7 @@ impl Client {
             // refreshed only if it is close to expiry itself (or refused).
             let mut current = current;
             if let Ok(Some(saved)) = store_load(&store).await
-                && saved.subject == current.subject
-                && saved.refresh_token != current.refresh_token
+                && newer_saved(&saved, &current, &spent)
             {
                 if rejected.as_deref() != Some(saved.access_token.as_str())
                     && !saved.expires_within(300, now())
@@ -366,6 +383,7 @@ impl Client {
                     Ok(new) => {
                         // The old refresh token is spent now. If the store
                         // refuses twice, keep the new set in memory anyway.
+                        spent.lock().unwrap().push(current.refresh_token.clone());
                         if store_save(&store, &new).await.is_err() {
                             let _ = store_save(&store, &new).await;
                         }
@@ -374,11 +392,9 @@ impl Client {
                         return Ok(token);
                     }
                     Err(AuthError::Fatal(message)) => {
+                        spent.lock().unwrap().push(current.refresh_token.clone());
                         match store_load(&store).await {
-                            Ok(Some(saved))
-                                if saved.refresh_token != current.refresh_token
-                                    && saved.subject == current.subject =>
-                            {
+                            Ok(Some(saved)) if newer_saved(&saved, &current, &spent) => {
                                 let token = saved.access_token.clone();
                                 *session = Some(saved);
                                 return Ok(token);
@@ -922,10 +938,11 @@ mod tests {
             _ => Resp::answer("{}"),
         })
         .await;
+        // Newer than this client's set, and near expiry itself.
         let newer = Session {
             access_token: "access-2".into(),
             refresh_token: "refresh-2".into(),
-            expires_at: now() + 60,
+            expires_at: now() + 120,
             ..sample()
         };
         r.store.file.save(&newer).unwrap();
@@ -1488,7 +1505,7 @@ mod tests {
         assert_eq!(r.store.saves.load(Ordering::SeqCst), 2);
         assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-2");
         // Every save fails: the new tokens are still used, from memory.
-        let r = rig(soon, handler).await;
+        let r = rig(soon.clone(), handler).await;
         r.store.failing_saves.store(usize::MAX, Ordering::SeqCst);
         r.client.respond(&request()).await.unwrap();
         r.client.respond(&request()).await.unwrap();
@@ -1498,6 +1515,128 @@ mod tests {
         assert!(sent.iter().all(|s| s.auth == "Bearer access-2"));
         assert_eq!(r.fake.seen("/token").len(), 1);
         assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-1");
+        // Both saves of the first refresh fail, so the store keeps the spent
+        // refresh-1 set. When the rotated set nears expiry, the next refresh
+        // sends its own refresh-2: the older saved set is not adopted.
+        let used = std::sync::Mutex::new(Vec::<String>::new());
+        let r = rig(soon, move |req| match req.path.as_str() {
+            "/token" => {
+                // Like OpenAI, each refresh token is accepted once.
+                let token = req.field("refresh_token");
+                let mut used = used.lock().unwrap();
+                if used.contains(&token) {
+                    return Resp::json(400, json!({"error": "refresh_token_reused"}));
+                }
+                used.push(token.clone());
+                let next = match token.as_str() {
+                    "refresh-1" => json!({"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 60}),
+                    _ => json!({"access_token": "access-3", "refresh_token": "refresh-3", "expires_in": 3600}),
+                };
+                Resp::json(200, next)
+            }
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        r.store.failing_saves.store(2, Ordering::SeqCst);
+        r.client.respond(&request()).await.unwrap();
+        r.client.respond(&request()).await.unwrap();
+        let refreshes: Vec<String> = r
+            .fake
+            .seen("/token")
+            .iter()
+            .map(|q| q.field("refresh_token"))
+            .collect();
+        assert_eq!(refreshes, ["refresh-1", "refresh-2"]);
+        let auths: Vec<String> = r
+            .fake
+            .seen("/v1/responses")
+            .into_iter()
+            .map(|q| q.auth)
+            .collect();
+        assert_eq!(auths, ["Bearer access-2", "Bearer access-3"]);
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-3");
+    }
+    /// Like OpenAI, accepts each refresh token once: refresh-n rotates to
+    /// refresh-(n+1), with `expires_in` from `lifetimes` (by n, then 3600 s).
+    fn rotating(lifetimes: &'static [u64]) -> impl Fn(&Req) -> Resp + Send + Sync + 'static {
+        let used = std::sync::Mutex::new(Vec::<String>::new());
+        move |req: &Req| match req.path.as_str() {
+            "/token" => {
+                let token = req.field("refresh_token");
+                let mut used = used.lock().unwrap();
+                if used.contains(&token) {
+                    return Resp::json(400, json!({"error": "refresh_token_reused"}));
+                }
+                used.push(token.clone());
+                let n: usize = token.trim_start_matches("refresh-").parse().unwrap();
+                Resp::json(
+                    200,
+                    json!({
+                        "access_token": format!("access-{}", n + 1),
+                        "refresh_token": format!("refresh-{}", n + 1),
+                        "expires_in": lifetimes.get(n - 1).copied().unwrap_or(3600),
+                    }),
+                )
+            }
+            _ => Resp::answer("{}"),
+        }
+    }
+    #[tokio::test]
+    async fn a_refresh_token_this_client_spent_is_never_presented_again() {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        // refresh-2's set lives 60 s and refresh-3's only 30 s.
+        let r = rig(soon, rotating(&[60, 30])).await;
+        r.client.respond(&request()).await.unwrap();
+        // The second refresh's saves fail: the store keeps refresh-2's set,
+        // which expires after this client's refresh-3 set although OpenAI
+        // has already spent refresh-2.
+        r.store.failing_saves.store(2, Ordering::SeqCst);
+        r.client.respond(&request()).await.unwrap();
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-2");
+        r.client.respond(&request()).await.unwrap();
+        let refreshes: Vec<String> = r
+            .fake
+            .seen("/token")
+            .iter()
+            .map(|q| q.field("refresh_token"))
+            .collect();
+        assert_eq!(refreshes, ["refresh-1", "refresh-2", "refresh-3"]);
+        let auths: Vec<String> = r
+            .fake
+            .seen("/v1/responses")
+            .into_iter()
+            .map(|q| q.auth)
+            .collect();
+        assert_eq!(
+            auths,
+            ["Bearer access-2", "Bearer access-3", "Bearer access-4"]
+        );
+        assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-4");
+    }
+    #[tokio::test]
+    async fn a_fatal_refresh_does_not_adopt_an_older_saved_sign_in() {
+        let r = rejected_refresh().await;
+        // The same user's set from before this client's: it expires sooner.
+        let older = Session {
+            access_token: "access-0".into(),
+            refresh_token: "refresh-0".into(),
+            expires_at: now() + 30,
+            ..sample()
+        };
+        r.store.file.save(&older).unwrap();
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::SignedOut(_))
+        ));
+        assert!(r.fake.seen("/v1/responses").is_empty());
+        let refreshes = r.fake.seen("/token");
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].field("refresh_token"), "refresh-1");
+        // It is not the rejected one, so it is left as it is.
+        assert_eq!(r.store.load().unwrap(), Some(older));
     }
     /// A store whose `clear` blocks its thread until the test releases it.
     struct GatedStore {
