@@ -89,6 +89,25 @@ pub fn coord(v: f32) -> String {
 }
 /// Comment text limited to printable ASCII on one line, without parentheses.
 pub fn comment(s: &str) -> String {
+    clean(s).chars().take(200).collect()
+}
+/// A long comment as lines of at most 200 characters, broken between words.
+fn comment_lines(s: &str) -> Vec<String> {
+    let mut lines: Vec<String> = vec![];
+    for word in clean(s).split(' ') {
+        let word: String = word.chars().take(200).collect();
+        match lines.last_mut() {
+            Some(line) if line.len() + 1 + word.len() <= 200 => {
+                line.push(' ');
+                line.push_str(&word);
+            }
+            _ => lines.push(word),
+        }
+    }
+    lines
+}
+/// Printable ASCII on one line, without parentheses or repeated spaces.
+fn clean(s: &str) -> String {
     let mapped: String = s
         .chars()
         .map(|c| match c {
@@ -101,13 +120,7 @@ pub fn comment(s: &str) -> String {
             _ => '?',
         })
         .collect();
-    mapped
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(200)
-        .collect()
+    mapped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 pub fn preview(text: &str, lines: usize) -> String {
     let total = text.lines().count();
@@ -379,6 +392,11 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         get(&setup.p, "rz")
     ));
     w.note(&format!("Fixture: {}", get(&setup.p, "fixture")));
+    if !clean(get(&setup.p, "notes")).is_empty() {
+        for line in comment_lines(&format!("Workholding: {}", get(&setup.p, "notes"))) {
+            w.line(format!("({line})"));
+        }
+    }
     let mut listed = vec![];
     for op in ops {
         if !listed.contains(&op.tool) {
@@ -1873,6 +1891,45 @@ M2
             Ok(programs) => programs.iter().map(|p| p.text.clone()).collect(),
             Err(e) => panic!("{e:?}"),
         }
+    }
+    #[test]
+    fn planned_setups_carry_setup_1s_fixture_and_their_workholding_note() {
+        use crate::proposal::tests::{block, good};
+        let (mut doc, mesh, report) = block();
+        doc.setups[0].p.insert("fixture".into(), "Vise".into());
+        let mut job = crate::proposal::build(&doc, &mesh, &report, &good(&report)).unwrap();
+        assert_eq!(get(&job.setups[1].p, "fixture"), "Vise");
+        let posted = post_job(&job, &mesh);
+        let text = &setup_texts(&posted, 1)[0];
+        assert!(
+            text.contains(
+                "(Fixture: Vise)\n(Workholding: Flip about X; clamp on the machined walls.)\n"
+            ),
+            "{text}"
+        );
+        // Setup 1 has no notes, so no Workholding line.
+        assert!(!setup_texts(&posted, 0)[0].contains("Workholding"));
+        // Long notes are cleaned and broken between words, never cut off.
+        let words = "Clamp (soft jaws)\non the walls; keep ".repeat(12) + "the end.";
+        job.setups[1].p.insert("notes".into(), words);
+        let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
+        let lines: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("(Workholding: "))
+            .take_while(|l| !l.starts_with("(T1:"))
+            .collect();
+        assert!(lines.len() > 2, "{text}");
+        assert!(lines.iter().all(|l| l.len() <= 202), "{lines:?}");
+        assert!(
+            lines.last().unwrap().ends_with("keep the end.)"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l[1..l.len() - 1].chars().all(|c| c != '(' && c != ')'))
+        );
+        assert!(lines[0].starts_with("(Workholding: Clamp soft jaws on the walls; keep Clamp"));
     }
     #[test]
     fn a_model_origin_header_locates_the_zero_from_the_part_and_the_stock_top() {

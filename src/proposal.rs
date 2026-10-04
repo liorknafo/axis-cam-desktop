@@ -589,6 +589,11 @@ pub fn build(
                 setup.p.insert((*key).into(), value.to_string());
             }
             setup.p.insert("origin".into(), proposed.origin.clone());
+            // The same workholding as setup 1 until the user says otherwise;
+            // the planner's advice for it is in the notes.
+            setup
+                .p
+                .insert("fixture".into(), get(&setup1.p, "fixture").into());
             setup
                 .p
                 .insert("reposition".into(), "Reclamp and probe origin".into());
