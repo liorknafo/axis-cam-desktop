@@ -214,7 +214,10 @@ fn crossings(index: &Index, xy: [f32; 2]) -> Vec<(f32, bool)> {
     hits
 }
 /// Solid spans from `hits`, lowest first, or `None` when the face directions
-/// are inconsistent.
+/// are inconsistent. A column whose spans are all of zero length (a crossing
+/// facing down and one facing up within 0.0001 mm of one height, with
+/// nothing solid on either side, as through a sheet written with both
+/// windings) is inconsistent too.
 fn spans(hits: &[(f32, bool)]) -> Option<Vec<(f32, f32)>> {
     let mut spans = vec![];
     let (mut depth, mut start, mut consistent) = (0i32, 0f32, true);
@@ -232,7 +235,8 @@ fn spans(hits: &[(f32, bool)]) -> Option<Vec<(f32, f32)>> {
             consistent &= depth >= 0;
         }
     }
-    (consistent && depth == 0).then_some(spans)
+    let solid = spans.is_empty() || spans.iter().any(|(lo, hi)| hi - lo >= 1e-4);
+    (consistent && depth == 0 && solid).then_some(spans)
 }
 /// The lowest crossing of an inconsistent column and whether it faces down,
 /// and the highest and whether it faces up.
@@ -338,26 +342,37 @@ fn mm_triangles(mesh: &Mesh) -> (Vec<[[f64; 3]; 3]>, f64) {
 struct Closure {
     open_edges: usize,
     encloses_volume: bool,
+    /// A coordinate lies beyond `FAR` or is not finite.
+    far: bool,
 }
-/// How far apart two points may be and still be one point after float
-/// rounding, in a part whose coordinates reach `largest` mm: 8 f32 steps at
-/// that coordinate, and at least 0.000001 mm.
+/// How far apart two points may be and still be one point, in a part whose
+/// coordinates reach `largest` mm: 8 f32 steps at that coordinate (float
+/// rounding), or √3 times the last digit of 7 significant digits there if
+/// that is more (coordinates written as text, as ASCII STL's `%.6e`), with
+/// the reach taken as at least 1 mm.
 fn tolerance(largest: f64) -> f64 {
     let f = largest as f32;
-    (8. * f64::from(f32::from_bits(f.to_bits() + 1) - f)).max(1e-6)
+    let float = 8. * f64::from(f32::from_bits(f.to_bits() + 1) - f);
+    // The power of ten at or below the reach.
+    let mut decade = 1f64;
+    while decade < FAR && decade * 10. <= largest {
+        decade *= 10.;
+    }
+    float.max(3f64.sqrt() * decade / 1e6)
 }
 /// The closed-surface test on `triangles` (mm), whose coordinates reached
 /// `largest` mm in the part's file. The tolerance comes from the largest
 /// absolute coordinate in either frame (see `tolerance`). Points within it of
-/// each other are one vertex (see `weld`), zero-area triangles are ignored,
-/// and a triangle written more than once with the same winding counts once;
-/// with opposite windings both count, and their edges cancel. An edge used by
-/// an odd number of triangles is open. Each open edge is then split at every
-/// end of an open edge that lies within the tolerance of it and farther than
-/// that from both its ends, as at a T-junction, and the pieces used an odd
-/// number of times are the open edges left. The enclosed volume is about zero
-/// when it is under 1e-9 of the bounding box's, as for a sheet written with
-/// both windings. Coordinates beyond `FAR` or not finite make every edge open.
+/// each other are one vertex unless they span more than twice the tolerance
+/// (see `weld`), zero-area triangles are ignored, and a triangle written more
+/// than once with the same winding counts once; with opposite windings both
+/// count, and their edges cancel. An edge used by an odd number of triangles
+/// is open. Each open edge is then split at every end of an open edge that
+/// lies within the tolerance of it and farther than that from both its ends,
+/// as at a T-junction, and the pieces used an odd number of times are the
+/// open edges left. The enclosed volume is about zero when it is under 1e-9
+/// of the bounding box's, as for a sheet written with both windings.
+/// Coordinates beyond `FAR` or not finite set `far` and make every edge open.
 fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
     let mut largest = largest;
     for v in triangles.iter().flatten().flatten() {
@@ -371,6 +386,7 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
         return Closure {
             open_edges: 3 * triangles.len(),
             encloses_volume: false,
+            far: true,
         };
     }
     let tol = tolerance(largest);
@@ -423,6 +439,7 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
         return Closure {
             open_edges: 0,
             encloses_volume,
+            far: false,
         };
     }
     // Only the ends of open edges can split one.
@@ -455,6 +472,7 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
     Closure {
         open_edges: odd(pieces).len(),
         encloses_volume,
+        far: false,
     }
 }
 /// The edges that occur an odd number of times in `edges`.
@@ -467,11 +485,16 @@ fn odd(mut edges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
         .collect()
 }
 /// Welded vertex ids of the corners of `triangles`, and a position for each
-/// (its first copy). Copies within `tol` of each other are one vertex, and so
-/// are chains of such copies. Bit-identical copies are found first. The rest
-/// are grouped in cells `tol` / √3 across, so all copies in one cell are
-/// within `tol` of each other and need no comparison, and each cell is
-/// compared only with the cells up to two cells away.
+/// (its first copy). Copies within `tol` of each other are grouped, and so
+/// are chains of such copies; a group is one vertex when its points fit in a
+/// box whose diagonal is at most 2 × `tol` (so no group wider than that is
+/// welded), and otherwise its points stay distinct, as a row of distinct
+/// points is not copies of one. Copies that differ only by rounding are
+/// within `tol` of each other, so their box's diagonal is at most √3 × `tol`.
+/// Equal copies are found first. The rest are grouped in cells `tol` / √3
+/// across, so all copies in one cell are within `tol` of each other and need
+/// no comparison, and each cell is compared only with the cells up to two
+/// cells away.
 fn weld(triangles: &[[[f64; 3]; 3]], tol: f64) -> (Vec<[u32; 3]>, Vec<[f64; 3]>) {
     use std::collections::HashMap;
     let mut seen: HashMap<[u64; 3], u32> = HashMap::new();
@@ -480,10 +503,13 @@ fn weld(triangles: &[[[f64; 3]; 3]], tol: f64) -> (Vec<[u32; 3]>, Vec<[f64; 3]>)
         .iter()
         .map(|t| {
             t.map(|p| {
-                *seen.entry(p.map(f64::to_bits)).or_insert_with(|| {
-                    points.push(p);
-                    points.len() as u32 - 1
-                })
+                // Adding zero makes -0 and 0 one key.
+                *seen
+                    .entry(p.map(|v| (v + 0.).to_bits()))
+                    .or_insert_with(|| {
+                        points.push(p);
+                        points.len() as u32 - 1
+                    })
             })
         })
         .collect();
@@ -542,16 +568,33 @@ fn weld(triangles: &[[[f64; 3]; 3]], tol: f64) -> (Vec<[u32; 3]>, Vec<[f64; 3]>)
             }
         }
     }
-    let mut cell_of = vec![0u32; points.len()];
+    let mut group_of = vec![0usize; points.len()];
     for (c, (_, range)) in cells.iter().enumerate() {
+        let r = root(&mut parent, c as u32) as usize;
         for (_, i) in &order[range.clone()] {
-            cell_of[*i as usize] = c as u32;
+            group_of[*i as usize] = r;
+        }
+    }
+    // Each group's box.
+    let (mut lo, mut hi) = (
+        vec![[f64::INFINITY; 3]; cells.len()],
+        vec![[f64::NEG_INFINITY; 3]; cells.len()],
+    );
+    for (p, &r) in points.iter().zip(&group_of) {
+        for k in 0..3 {
+            lo[r][k] = lo[r][k].min(p[k]);
+            hi[r][k] = hi[r][k].max(p[k]);
         }
     }
     // Ids in order of first use, each placed at its first copy.
     let (mut id_of_root, mut ids, mut welded) = (vec![u32::MAX; cells.len()], vec![], vec![]);
-    for (p, c) in points.iter().zip(cell_of) {
-        let r = root(&mut parent, c) as usize;
+    for (p, r) in points.iter().zip(group_of) {
+        let diagonal = sub(hi[r], lo[r]);
+        if dot(diagonal, diagonal) > 4. * tol * tol {
+            ids.push(welded.len() as u32);
+            welded.push(*p);
+            continue;
+        }
         if id_of_root[r] == u32::MAX {
             id_of_root[r] = welded.len() as u32;
             welded.push(*p);
@@ -926,6 +969,9 @@ pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
 fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
     let (triangles, largest) = mm_triangles(mesh);
     let found = closure(&triangles, largest);
+    if found.far {
+        return Err("The part lies more than 1 000 000 mm from its file origin. Move it closer to the origin and re-export it.".into());
+    }
     if found.open_edges > 0 {
         return Err(format!(
             "The part is not a closed solid ({} open edges), so the planner cannot check its plans against it. Repair or re-export the model.",
@@ -1222,11 +1268,18 @@ pub(crate) mod tests {
     /// A 120 × 80 × 40 box with a centred `top` × `top` square missing from
     /// its top face and a `bottom` × `bottom` one missing from its bottom face.
     pub(crate) fn holed(top: f32, bottom: f32) -> Mesh {
+        crate::mesh::normalize(holed_triangles([top; 2], [bottom; 2])).unwrap()
+    }
+    /// The triangles of a 120 × 80 × 40 box from the origin with a centred
+    /// rectangle (X and Y sizes) missing from its top face and another from
+    /// its bottom face, with no walls between them.
+    fn holed_triangles(top: [f32; 2], bottom: [f32; 2]) -> Vec<Tri> {
         let (x, y, z) = (120f32, 80f32, 40f32);
         let mut t = vec![];
         for (h, zz, up) in [(top, z, true), (bottom, 0., false)] {
-            let (a0, a1, b0, b1) = ((x - h) / 2., (x + h) / 2., (y - h) / 2., (y + h) / 2.);
-            let quads = if h > 0. {
+            let (a0, a1) = ((x - h[0]) / 2., (x + h[0]) / 2.);
+            let (b0, b1) = ((y - h[1]) / 2., (y + h[1]) / 2.);
+            let quads = if h[0] > 0. {
                 vec![
                     [[0., 0., zz], [x, 0., zz], [a1, b0, zz], [a0, b0, zz]],
                     [[x, 0., zz], [x, y, zz], [a1, b1, zz], [a1, b0, zz]],
@@ -1244,7 +1297,7 @@ pub(crate) mod tests {
             }
         }
         walls(&mut t, x, y, z);
-        crate::mesh::normalize(t).unwrap()
+        t
     }
     /// A 120 × 80 × 40 box with a 40 × 30 × 6 pocket open from below, and a
     /// centred `patch` × `patch` square missing from the top face, over the pocket.
@@ -1523,21 +1576,121 @@ pub(crate) mod tests {
     fn reversed(t: &[Tri]) -> Vec<Tri> {
         t.iter().map(|p| [p[0], p[2], p[1]]).collect()
     }
+    type Tri64 = [[f64; 3]; 3];
+    /// The example block in mm with its lowest corner at the origin, scaled
+    /// so that its longest side is `length` mm, as an exporter's doubles.
+    fn cornered(mesh: &Mesh, length: f64) -> Vec<Tri64> {
+        let t = source(mesh, [0.; 3]);
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for q in t.iter().flatten() {
+            for k in 0..3 {
+                lo[k] = lo[k].min(f64::from(q[k]));
+                hi[k] = hi[k].max(f64::from(q[k]));
+            }
+        }
+        let scale = length / (0..3).map(|k| hi[k] - lo[k]).fold(0., f64::max);
+        t.iter()
+            .map(|p| p.map(|q| std::array::from_fn(|k| (f64::from(q[k]) - lo[k]) * scale)))
+            .collect()
+    }
+    /// `split`, computed in f64 as an exporter computes it.
+    fn split64(t: &[Tri64], every: usize, pieces: usize) -> Vec<Tri64> {
+        let mut out = vec![];
+        for (i, p) in t.iter().enumerate() {
+            if i % every != 0 {
+                out.push(*p);
+                continue;
+            }
+            let length = |k: usize| dot(sub(p[(k + 1) % 3], p[k]), sub(p[(k + 1) % 3], p[k]));
+            let e = (0..3)
+                .max_by(|a, b| length(*a).total_cmp(&length(*b)))
+                .unwrap();
+            let (a, b, c) = (p[e], p[(e + 1) % 3], p[(e + 2) % 3]);
+            let at = |s: usize| -> [f64; 3] {
+                let s = s as f64 / pieces as f64;
+                std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s)
+            };
+            for s in 0..pieces {
+                out.push([at(s), at(s + 1), c]);
+            }
+        }
+        out
+    }
+    /// `t` written as ASCII STL with `digits` significant digits (C's `%.6e`
+    /// for 7) and read back by the app's STL reader.
+    fn ascii_stl(t: &[Tri64], digits: usize) -> Vec<Tri> {
+        let number = |v: f64| {
+            let text = format!("{v:.*e}", digits - 1);
+            let (mantissa, exponent) = text.split_once('e').unwrap();
+            format!("{mantissa}e{:+03}", exponent.parse::<i32>().unwrap())
+        };
+        let mut s = String::from("solid part\n");
+        for p in t {
+            s.push_str("  facet normal 0 0 0\n    outer loop\n");
+            for q in p {
+                let [x, y, z] = q.map(number);
+                s.push_str(&format!("      vertex {x} {y} {z}\n"));
+            }
+            s.push_str("    endloop\n  endfacet\n");
+        }
+        s.push_str("endsolid part\n");
+        crate::mesh::stl(s.as_bytes()).unwrap()
+    }
+    /// Zero-area triangles whose corners are `step` mm apart along the line
+    /// from `p` to `q` (computed in f64 and rounded once to f32): each repeats
+    /// a corner, or, when `collinear`, has three corners on the line.
+    fn chain(p: [f64; 3], q: [f64; 3], step: f64, collinear: bool) -> Vec<Tri> {
+        let n = (dot(sub(q, p), sub(q, p)).sqrt() / step).ceil() as usize;
+        let at = |i: usize| -> [f32; 3] {
+            std::array::from_fn(|k| (p[k] + (q[k] - p[k]) * i.min(n) as f64 / n as f64) as f32)
+        };
+        if collinear {
+            (0..n)
+                .step_by(2)
+                .map(|i| [at(i), at(i + 1), at(i + 2)])
+                .collect()
+        } else {
+            (0..n).map(|i| [at(i), at(i), at(i + 1)]).collect()
+        }
+    }
     #[test]
     fn open_edges_are_the_edges_left_once_float_rounding_is_absorbed() {
         let (o, a, b, c) = ([0., 0., 0.], [10., 0., 0.], [0., 10., 0.], [0., 0., 10.]);
         let tetrahedron = |moved: [f32; 3]| vec![[moved, b, a], [o, a, c], [o, c, b], [a, b, c]];
         assert_eq!(count(&tetrahedron(o)), 0);
         assert_eq!(count(&[[o, a, b]]), 3);
-        // The tolerance here is 8 f32 steps at 10 mm, 0.0000076 mm: copies of
-        // a vertex that close are one vertex.
-        for off in [0.000001, 0.000005] {
+        // The tolerance is 8 f32 steps at the largest coordinate, or √3 times
+        // the last digit of 7 significant digits there if that is more.
+        let root3 = 3f64.sqrt();
+        for (largest, tol) in [
+            (0.5, root3 * 1e-6),
+            (10., root3 * 1e-5),
+            (99.9, 8. * 2f64.powi(-17)),
+            (120., root3 * 1e-4),
+            (1012.3, root3 * 1e-3),
+            (3000., 8. * 2f64.powi(-12)),
+        ] {
+            assert!((tolerance(largest) - tol).abs() < tol * 1e-9, "{largest}");
+        }
+        // Here it is √3 × 0.00001 mm: copies of a vertex that close are one
+        // vertex.
+        for off in [0.000001, 0.000005, 0.00001, 0.000015] {
             assert_eq!(count(&tetrahedron([0., 0., -off])), 0, "{off}");
         }
         // Copies farther apart are distinct vertices: four open edges.
-        for off in [0.00001, 0.00005, 0.0005, 0.00099, 0.01] {
+        for off in [0.00002, 0.00005, 0.0005, 0.00099, 0.01] {
             assert_eq!(count(&tetrahedron([0., 0., -off])), 4, "{off}");
         }
+        // Copies 0.00001 mm apart in a row (joined by zero-area triangles) are
+        // welded only while the row spans at most twice the tolerance.
+        let row = |length: usize| {
+            let mut t = tetrahedron([0., 0., -0.00001 * length as f32]);
+            let z = |k: usize| [0., 0., -0.00001 * k as f32];
+            t.extend((0..length).map(|k| [z(k), z(k), z(k + 1)]));
+            t
+        };
+        assert_eq!(count(&row(3)), 0);
+        assert_eq!(count(&row(4)), 4);
         // A zero-area triangle and a triangle written again with the same
         // winding, from another corner, change nothing.
         let mut t = tetrahedron(o);
@@ -1619,7 +1772,8 @@ pub(crate) mod tests {
         assert_eq!(edges(&cup), n);
         assert_eq!(report(&doc, &cup).unwrap_err(), not_closed(n));
         // A UV sphere whose vertex copies are up to 0.0002 mm apart, far more
-        // than float rounding at 30 mm: the copies are distinct vertices.
+        // than the tolerance at 30 mm (0.000017 mm): the copies are distinct
+        // vertices.
         let soup =
             crate::mesh::normalize(jittered(&sphere_triangles(96, 48, 30.), 0.0001)).unwrap();
         let n = edges(&soup);
@@ -1891,5 +2045,105 @@ pub(crate) mod tests {
         let flipped = crate::mesh::normalize(t).unwrap();
         assert_eq!(edges(&flipped), 0);
         assert_eq!(report(&doc, &flipped).unwrap_err(), NOT_SOLID);
+    }
+    #[test]
+    fn sound_parts_written_as_text_with_7_significant_digits_are_closed() {
+        let (doc, mesh) = block();
+        // T-junctions computed in f64 and written as ASCII STL with %.6e, so
+        // every T-vertex and edge end is rounded to 7 significant digits.
+        for (name, t) in [
+            (
+                "example block at 0-120 mm, every 10th longest edge split into 30",
+                split64(&cornered(&mesh, 120.), 10, 30),
+            ),
+            (
+                "example block 101.6 mm (4 in) long with T-junctions",
+                split64(&cornered(&mesh, 101.6), 3, 2),
+            ),
+            (
+                "example block 101.6 mm (4 in) long, every 10th longest edge split into 30",
+                split64(&cornered(&mesh, 101.6), 10, 30),
+            ),
+        ] {
+            let m = crate::mesh::normalize(ascii_stl(&t, 7)).unwrap();
+            assert_eq!(edges(&m), 0, "{name}");
+            assert_eq!(closed_solid(&doc.setups[0], &m), Ok(()), "{name}");
+        }
+    }
+    #[test]
+    fn rows_of_nearby_points_do_not_weld_an_opening_shut() {
+        let (doc, _) = block();
+        // The reviewer's 12 x 12 openings in the top and the bottom, with no
+        // walls, placed at (412.3, -287.6, 95.1) mm, where the tolerance is
+        // 0.00049 mm. Each opening's corners are joined across it in pairs by
+        // rows of zero-area triangles whose points are 0.0003 mm apart.
+        let at = [412.3, -287.6, 95.1];
+        let mut t = placed(&holed_triangles([12.; 2], [12.; 2]), [0.; 2], 1., at);
+        for z in [40., 0.] {
+            for x in [54., 66.] {
+                let p = [x + at[0], 34. + at[1], z + at[2]];
+                let q = [x + at[0], 46. + at[1], z + at[2]];
+                t.extend(chain(p, q, 0.0003, false));
+            }
+        }
+        let openings = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&openings), 8);
+        assert_eq!(report(&doc, &openings).unwrap_err(), not_closed(8));
+        // The reviewer's 40 x 3 mm slot through the top and the bottom at the
+        // origin, its ends bridged by collinear zero-area triangles whose
+        // points are 0.000055 mm apart.
+        let mut t = holed_triangles([40., 3.], [40., 3.]);
+        for z in [40., 0.] {
+            for x in [40., 80.] {
+                t.extend(chain([x, 38.5, z], [x, 41.5, z], 0.000055, true));
+            }
+        }
+        let slot = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&slot), 8);
+        assert_eq!(report(&doc, &slot).unwrap_err(), not_closed(8));
+    }
+    #[test]
+    fn a_double_sided_sheet_with_opposite_diagonals_is_refused() {
+        let (doc, _) = block();
+        // The reviewer's OBJ: 100 x 100 quads of 1 mm on z = 0.00005 (x - 50)
+        // (y - 50), each written as `f p q r s` and again as `f s r q p`. The
+        // OBJ reader fans a face from its first vertex, so the two sides use
+        // opposite diagonals and enclose about 0.08 mm³ between them.
+        let z = |x: f32, y: f32| 5e-5 * (x - 50.) * (y - 50.);
+        let mut t = vec![];
+        for i in 0..100 {
+            for j in 0..100 {
+                let (x, y) = (i as f32, j as f32);
+                let [p, q, r, s] = [[x, y], [x + 1., y], [x + 1., y + 1.], [x, y + 1.]]
+                    .map(|[x, y]| [x, y, z(x, y)]);
+                t.extend([[p, q, r], [p, r, s], [s, r, q], [s, q, p]]);
+            }
+        }
+        let sheet = crate::mesh::normalize(t).unwrap();
+        let (triangles, largest) = mm_triangles(&sheet);
+        let found = closure(&triangles, largest);
+        assert_eq!(found.open_edges, 0);
+        assert!(found.encloses_volume);
+        // Every ray meets one crossing facing down and one facing up at one
+        // height, with nothing solid on either side: inconsistent, and so
+        // solid from the bottom of the model to its top.
+        let setup1 = &doc.setups[0];
+        assert_eq!(inconsistent_share(&Geometry::new(setup1, &sheet)), 1.);
+        assert_eq!(column(setup1, &sheet), vec![[0., 0.25]]);
+        assert_eq!(report(&doc, &sheet).unwrap_err(), NOT_SOLID);
+    }
+    #[test]
+    fn a_part_far_from_its_file_origin_has_its_own_message() {
+        let (doc, _) = block();
+        let far = crate::mesh::normalize(cuboid([1.1e6, 0., 0.], [1.1e6 + 40., 30., 20.])).unwrap();
+        assert_eq!(
+            report(&doc, &far).unwrap_err(),
+            "The part lies more than 1 000 000 mm from its file origin. Move it closer to the origin and re-export it."
+        );
+        // Just inside the limit it is checked as usual.
+        let near =
+            crate::mesh::normalize(cuboid([9.9e5, 0., 0.], [9.9e5 + 40., 30., 20.])).unwrap();
+        assert_eq!(edges(&near), 0);
+        assert!(report(&doc, &near).is_ok());
     }
 }
