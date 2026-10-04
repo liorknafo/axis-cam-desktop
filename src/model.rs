@@ -909,7 +909,7 @@ impl Document {
             schema: 1,
             sample_model: true,
             title: "Bearing housing".into(),
-            material: "Aluminum 6061".into(),
+            material: "Aluminium 6061-T6".into(),
             file: None,
             active: s.id.clone(),
             machines,
@@ -922,6 +922,60 @@ impl Document {
     }
 }
 impl Document {
+    pub fn selected_material(&self) -> Option<&crate::material::Material> {
+        self.materials.iter().find(|m| m.id == self.material_id)
+    }
+    pub fn select_material(&mut self, id: &str) -> bool {
+        let Some(name) = self
+            .materials
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.name().to_string())
+        else {
+            return false;
+        };
+        self.material_id = id.into();
+        self.material = name;
+        true
+    }
+    /// Gives the document the starter materials it lacks and links a legacy
+    /// material name to the library. Returns the note to show, if any.
+    pub fn adopt_materials(&mut self) -> Option<String> {
+        let has = |list: &[crate::material::Material], name: &str| {
+            list.iter().any(|m| m.name().eq_ignore_ascii_case(name))
+        };
+        for starter in crate::material::starters() {
+            if !has(&self.materials, starter.name()) {
+                self.materials.push(starter);
+            }
+        }
+        if !self.material_id.is_empty() && self.selected_material().is_none() {
+            self.material_id.clear();
+        }
+        let name = self.material.trim().to_string();
+        if !self.material_id.is_empty() || name.is_empty() {
+            return None;
+        }
+        if let Some(m) = self
+            .materials
+            .iter()
+            .find(|m| m.name().eq_ignore_ascii_case(&name))
+        {
+            let id = m.id.clone();
+            self.select_material(&id);
+            return Some(format!(
+                "The project material \"{}\" was linked to the library.",
+                self.material
+            ));
+        }
+        let added = crate::material::Material::new(&name);
+        let id = added.id.clone();
+        self.materials.push(added);
+        self.select_material(&id);
+        Some(format!(
+            "The project material \"{name}\" was added to the material library without cutting data; add it on the Materials page."
+        ))
+    }
     pub fn has_model(&self) -> bool {
         self.file.is_some() || self.sample_model
     }
@@ -1333,5 +1387,50 @@ mod tests {
             m.issues().is_empty(),
             "post settings never block simulation"
         );
+    }
+    #[test]
+    fn adopting_materials_adds_starters_and_links_legacy_names() {
+        let mut doc = Document {
+            material: "aluminium 6061-t6".into(),
+            ..Default::default()
+        };
+        let note = doc.adopt_materials().unwrap();
+        assert_eq!(doc.materials.len(), 9);
+        assert!(note.contains("linked to the library"), "{note}");
+        assert_eq!(doc.selected_material().unwrap().name(), "Aluminium 6061-T6");
+        assert_eq!(doc.material, "Aluminium 6061-T6");
+        assert!(
+            doc.adopt_materials().is_none(),
+            "a second call changes nothing"
+        );
+        assert_eq!(doc.materials.len(), 9);
+
+        let mut odd = Document {
+            material: "Inconel 718".into(),
+            ..Default::default()
+        };
+        let note = odd.adopt_materials().unwrap();
+        assert!(note.contains("without cutting data"), "{note}");
+        assert_eq!(odd.materials.len(), 10);
+        assert!(odd.selected_material().unwrap().cutting_data().is_none());
+
+        let mut none = Document::default();
+        assert!(none.adopt_materials().is_none());
+        assert_eq!(none.materials.len(), 9);
+        assert!(none.material_id.is_empty());
+
+        let mut stale = none.clone();
+        stale.material_id = "gone".into();
+        stale.adopt_materials();
+        assert!(stale.material_id.is_empty());
+    }
+    #[test]
+    fn selecting_a_material_sets_its_id_and_name() {
+        let mut doc = Document::default();
+        doc.adopt_materials();
+        let id = doc.materials[2].id.clone();
+        assert!(doc.select_material(&id));
+        assert_eq!(doc.material, "Mild steel 1018");
+        assert!(!doc.select_material("missing"));
     }
 }

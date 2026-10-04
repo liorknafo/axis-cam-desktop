@@ -78,6 +78,8 @@ const PLAN_BUSY: &str = "The previous plan check is still finishing; try again i
 const DEFAULT_MODEL: &str = "gpt-6.1-sol";
 const NOT_GRANTED: &str =
     "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.";
+/// A loaded project, its path, and the notes of the load (`load_reporting`).
+type Opened = Result<(Document, PathBuf, Vec<String>), String>;
 #[derive(Debug, Clone)]
 pub enum Message {
     NewProject,
@@ -126,8 +128,7 @@ pub enum Message {
     OpenHistory,
     Import,
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
-    /// The project, its path, and whether its tools were numbered on load.
-    ProjectOpened(Option<Result<(Document, PathBuf, bool), String>>),
+    ProjectOpened(Option<Opened>),
     ModelRestored(Result<mesh::Mesh, String>),
     Saved(Option<Result<PathBuf, String>>),
     Export(&'static str),
@@ -381,11 +382,11 @@ impl App {
         );
         let (mut doc, status) = if state_path.exists() && smoke_dir.is_none() {
             match storage::load_reporting(&state_path) {
-                Ok((d, numbered)) => (
+                Ok((d, notes)) => (
                     d,
-                    with_numbered_note(
+                    with_notes(
                         "Choose New project, Open, or Continue your previous project.",
-                        numbered,
+                        &notes,
                     ),
                 ),
                 Err(e) => {
@@ -405,6 +406,8 @@ impl App {
                 "Start a new project or open an existing one.".into(),
             )
         };
+        // A blank workspace has the starter materials too.
+        doc.adopt_materials();
         if !doc.sample_model {
             doc.sync_stock_sources();
         }
@@ -508,7 +511,9 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let mut app = Self::new();
         if app.smoke_dir.is_some() {
-            app.replace_document(Document::sample(), None);
+            let mut sample = Document::sample();
+            sample.adopt_materials();
+            app.replace_document(sample, None);
             app.selected = Some(0);
             if std::env::args().any(|arg| arg == "--help-only") {
                 app.smoke_step = 14;
@@ -1152,13 +1157,15 @@ impl App {
                 if !self.archive_current() {
                     return Task::none();
                 }
-                let doc = Document {
+                let mut doc = Document {
                     machines: self.doc.machines.clone(),
                     tools: self.doc.tools.clone(),
+                    materials: self.doc.materials.clone(),
                     ..Document::default()
                 };
+                doc.adopt_materials();
                 self.replace_document(doc, None);
-                self.status = "Blank project created. Saved machines and tools are available; your previous project is in History.".into();
+                self.status = "Blank project created. Saved machines, tools and materials are available; your previous project is in History.".into();
             }
             Message::ResumeProject => {
                 self.page = Page::Work;
@@ -1863,15 +1870,15 @@ impl App {
                     }
                 }
             }
-            Message::ProjectOpened(Some(Ok((d, p, numbered)))) => {
+            Message::ProjectOpened(Some(Ok((d, p, notes)))) => {
                 self.import_busy = false;
                 if !self.archive_current() {
                     return Task::none();
                 }
                 self.replace_document(d, Some(p));
-                self.status = with_numbered_note(
+                self.status = with_notes(
                     "Project opened. Your previous workspace is in History.",
-                    numbered,
+                    &notes,
                 );
                 return self.restore_model();
             }
@@ -2690,13 +2697,13 @@ fn export_gcode(project: Option<&String>, folder: Option<&String>) -> Result<Str
     let (Some(project), Some(folder)) = (project, folder) else {
         return Err("Usage: axis-cam --export-gcode <project.json> <output folder>".into());
     };
-    let (doc, numbered) = storage::load_reporting(std::path::Path::new(project))?;
+    let (doc, notes) = storage::load_reporting(std::path::Path::new(project))?;
     let result = export_document(doc, folder);
-    if !numbered {
+    if notes.is_empty() {
         return result;
     }
-    // The note follows the outcome, on standard output or standard error.
-    let note = |message: String| format!("{message}\n{}", storage::NUMBERED_TOOLS);
+    // The notes follow the outcome, on standard output or standard error.
+    let note = |message: String| format!("{message}\n{}", notes.join(" "));
     result.map(note).map_err(note)
 }
 fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
@@ -2726,15 +2733,17 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         path.display()
     ))
 }
-/// The example project with the user's tool and machine libraries merged
-/// in, and the status line naming the user's entries it adds. A user entry
-/// the example already has, ignoring tool numbers and post settings saved
-/// before they existed, is not added twice: the example's tool takes the
-/// user's number. Every other example tool whose number is then in use gets
-/// the smallest free one; the example's operations refer to it by ID.
+/// The example project with the user's tool, machine and material libraries
+/// merged in, and the status line naming the user's entries it adds. A user
+/// entry the example already has, ignoring tool numbers and post settings
+/// saved before they existed, is not added twice: the example's tool takes
+/// the user's number. Every other example tool whose number is then in use
+/// gets the smallest free one; the example's operations refer to it by ID.
+/// Materials match by name, ignoring case, and the user's entry is kept; the
+/// example's material is then linked to the library.
 fn merge_sample(user: &Document) -> (Document, String) {
     let mut doc = Document::sample();
-    let (mut tools, mut machines) = (vec![], vec![]);
+    let (mut tools, mut machines, mut materials) = (vec![], vec![], vec![]);
     for m in &user.machines {
         let mut filled = m.clone();
         filled.fill_post_defaults();
@@ -2743,6 +2752,19 @@ fn merge_sample(user: &Document) -> (Document, String) {
             machines.push(m.name().to_string());
         }
     }
+    let starters = crate::material::starters();
+    let known = |list: &[crate::material::Material], name: &str| {
+        list.iter().any(|m| m.name().eq_ignore_ascii_case(name))
+    };
+    for m in &user.materials {
+        if !known(&doc.materials, m.name()) {
+            doc.materials.push(m.clone());
+            if !known(&starters, m.name()) {
+                materials.push(m.name().to_string());
+            }
+        }
+    }
+    doc.adopt_materials();
     let unnumbered = |t: &Tool| {
         let mut p = t.p.clone();
         p.remove("number");
@@ -2788,6 +2810,7 @@ fn merge_sample(user: &Document) -> (Document, String) {
     let added: Vec<String> = [
         list(&tools, "tool", "tools"),
         list(&machines, "machine", "machines"),
+        list(&materials, "material", "materials"),
     ]
     .into_iter()
     .flatten()
@@ -2852,14 +2875,12 @@ fn blank_tool(doc: &Document) -> Tool {
         .insert("number".into(), doc.next_tool_number().to_string());
     tool
 }
-/// A status line, followed by `storage::NUMBERED_TOOLS` when the loaded
-/// project's tools were numbered.
-fn with_numbered_note(status: &str, numbered: bool) -> String {
-    if numbered {
-        format!("{status} {}", storage::NUMBERED_TOOLS)
-    } else {
-        status.to_string()
-    }
+/// A status line, followed by the notes of loading the project.
+fn with_notes(status: &str, notes: &[String]) -> String {
+    std::iter::once(status)
+        .chain(notes.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();

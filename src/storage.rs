@@ -10,14 +10,15 @@ pub fn state_path() -> PathBuf {
         .join("AXIS CAM Studio")
         .join("workspace.json")
 }
-/// Said after loading a project whose tools were numbered by `load_reporting`.
+/// First of the notes `load_reporting` returns when it numbered the tools.
 pub const NUMBERED_TOOLS: &str = "Tools in this project had no tool numbers and were numbered T1–Tn in library order. Check each one against your LinuxCNC tool table before exporting.";
 pub fn load(path: &Path) -> Result<Document, String> {
     load_reporting(path).map(|(d, _)| d)
 }
-/// Loads a project, and whether tools saved without a tool number were
-/// numbered in library order (see `NUMBERED_TOOLS`).
-pub fn load_reporting(path: &Path) -> Result<(Document, bool), String> {
+/// Loads a project with what the load changed worth saying: tools saved
+/// without a tool number numbered in library order (`NUMBERED_TOOLS`), then
+/// the note of linking a legacy material to the library.
+pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.len() > 20_000_000 {
         return Err("Project exceeds 20 MB.".into());
@@ -47,9 +48,13 @@ pub fn load_reporting(path: &Path) -> Result<(Document, bool), String> {
             }
         }
     }
-    let numbered = d.number_tools();
+    let mut notes = vec![];
+    if d.number_tools() {
+        notes.push(NUMBERED_TOOLS.to_string());
+    }
+    notes.extend(d.adopt_materials());
     d.validate_structure()?;
-    Ok((d, numbered))
+    Ok((d, notes))
 }
 pub fn archive(state_path: &Path, doc: &Document) -> Result<PathBuf, String> {
     let folder = state_path
@@ -176,12 +181,14 @@ mod tests {
             t.p.remove("number");
         }
         save(&p, &d).unwrap();
-        let (loaded, numbered) = load_reporting(&p).unwrap();
-        assert!(numbered);
-        // Saved with its numbers, it loads without numbering again.
+        let (loaded, notes) = load_reporting(&p).unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0], NUMBERED_TOOLS);
+        assert!(notes[1].contains("linked to the library"), "{notes:?}");
+        // Saved with its numbers and its material link, it loads without notes.
         save(&p, &loaded).unwrap();
-        let (again, numbered) = load_reporting(&p).unwrap();
-        assert!(!numbered);
+        let (again, notes) = load_reporting(&p).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(again.tools[2].number(), Some(3));
         assert!(load_reporting(&dir.path().join("missing.json")).is_err());
     }

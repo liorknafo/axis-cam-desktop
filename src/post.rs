@@ -2644,6 +2644,7 @@ M2
         .unwrap();
         assert!(message.starts_with("Wrote 1 LinuxCNC program"));
         assert!(!message.contains("LinuxCNC tool table"), "{message}");
+        assert!(!message.contains("material"), "{message}");
         assert!(out.join("Fixture block - 1 Top (G54).ngc").exists());
     }
     #[test]
@@ -2653,6 +2654,7 @@ M2
         for t in &mut doc.tools {
             t.p.remove("number");
         }
+        doc.material = "Brass C360".into();
         let project = dir.path().join("job.axis.json");
         crate::storage::save(&project, &doc).unwrap();
         let out = dir.path().join("out");
@@ -2662,10 +2664,12 @@ M2
         )
         .unwrap();
         assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
-        assert!(
-            message.ends_with(crate::storage::NUMBERED_TOOLS),
-            "{message}"
+        // The notes of the load follow the outcome, in the order of the load.
+        let notes = format!(
+            "{} The project material \"Brass C360\" was linked to the library.",
+            crate::storage::NUMBERED_TOOLS
         );
+        assert!(message.ends_with(&format!("\n{notes}")), "{message}");
         // A refused export carries the note too.
         doc.setups[0].p.insert("offset".into(), "G99".into());
         crate::storage::save(&project, &doc).unwrap();
@@ -2675,7 +2679,7 @@ M2
         )
         .unwrap_err();
         assert!(error.starts_with("Nothing was written."), "{error}");
-        assert!(error.ends_with(crate::storage::NUMBERED_TOOLS), "{error}");
+        assert!(error.ends_with(&format!("\n{notes}")), "{error}");
     }
     #[test]
     fn posting_simulations_already_run_matches_post_job() {

@@ -977,18 +977,21 @@ mod tests {
         let path = dir.path().join("workspace.json");
         crate::storage::save(&path, &legacy).unwrap();
         let mut a = App::from_workspace(path.clone(), None);
-        assert!(a.status.ends_with(note), "{}", a.status);
-        // Open, with the flag from the load.
+        assert!(a.status.contains(note), "{}", a.status);
+        // Open, with the notes from the load.
         let project = dir.path().join("old.axis.json");
         crate::storage::save(&project, &legacy).unwrap();
-        let (doc, numbered) = crate::storage::load_reporting(&project).unwrap();
+        let (doc, notes) = crate::storage::load_reporting(&project).unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0], note);
+        let all = notes.join(" ");
         let _ = a.update(Message::ProjectOpened(Some(Ok((
             doc,
             project.clone(),
-            numbered,
+            notes,
         )))));
         assert!(
-            a.status.starts_with("Project opened.") && a.status.ends_with(note),
+            a.status.starts_with("Project opened.") && a.status.ends_with(&all),
             "{}",
             a.status
         );
@@ -997,20 +1000,127 @@ mod tests {
         let _ = a.update(Message::ProjectOpened(Some(Ok((
             numbered_doc,
             project,
-            false,
+            vec![],
         )))));
         assert!(!a.status.contains("LinuxCNC tool table"), "{}", a.status);
         // Recover previous loads the archived project the same way.
         let archived = a.last_archived.clone().unwrap();
         crate::storage::save(&archived, &legacy).unwrap();
         let _ = a.update(Message::RecoverPrevious);
-        assert!(a.status.ends_with(note), "{}", a.status);
+        assert!(a.status.contains(note), "{}", a.status);
         // A workspace with numbers starts without the note.
         let fresh = tempfile::tempdir().unwrap();
         let path = fresh.path().join("workspace.json");
         crate::storage::save(&path, &Document::sample()).unwrap();
         let a = App::from_workspace(path, None);
         assert!(!a.status.contains("LinuxCNC tool table"), "{}", a.status);
+    }
+    #[test]
+    fn loading_a_project_with_a_legacy_material_links_it_and_says_so() {
+        let linked = "The project material \"Brass C360\" was linked to the library.";
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = Document {
+            material: "Brass C360".into(),
+            ..Document::default()
+        };
+        let project = dir.path().join("brass.axis.json");
+        crate::storage::save(&project, &legacy).unwrap();
+        let (doc, notes) = crate::storage::load_reporting(&project).unwrap();
+        assert_eq!(notes, [linked]);
+        assert_eq!(doc.materials.len(), 9);
+        assert_eq!(doc.selected_material().unwrap().name(), "Brass C360");
+        // Open: the status carries the note.
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let _ = a.update(Message::ProjectOpened(Some(Ok((
+            doc,
+            project.clone(),
+            notes,
+        )))));
+        assert!(
+            a.status.starts_with("Project opened.") && a.status.contains(linked),
+            "{}",
+            a.status
+        );
+        // Saved with its link, it loads without the note.
+        crate::storage::save(&project, &a.doc).unwrap();
+        assert!(
+            crate::storage::load_reporting(&project)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        // Workspace start and Recover previous say it too.
+        let path = dir.path().join("start").join("workspace.json");
+        crate::storage::save(&path, &legacy).unwrap();
+        let mut a = App::from_workspace(path, None);
+        assert!(a.status.contains(linked), "{}", a.status);
+        let _ = a.update(Message::NewProject);
+        let archived = a.last_archived.clone().unwrap();
+        crate::storage::save(&archived, &legacy).unwrap();
+        let _ = a.update(Message::RecoverPrevious);
+        assert!(a.status.contains(linked), "{}", a.status);
+        assert_eq!(a.doc.selected_material().unwrap().name(), "Brass C360");
+    }
+    #[test]
+    fn new_project_and_explore_example_carry_materials_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        // A blank workspace starts with the starter materials.
+        assert_eq!(a.doc.materials.len(), 9);
+        let user = crate::material::Material::new("Titanium Gr5");
+        assert!(user.issues().is_empty());
+        let titanium = user.id.clone();
+        a.doc.materials.push(user);
+        let _ = a.update(Message::NewProject);
+        assert_eq!(a.doc.materials.len(), 10);
+        assert!(a.doc.material_id.is_empty() && a.doc.material.is_empty());
+        // The user's own copy of a starter, renamed in another case and
+        // edited, is kept; no starter is added next to it.
+        a.doc.materials[0]
+            .p
+            .insert("name".into(), "aluminium 6061-t6".into());
+        a.doc.materials[0]
+            .p
+            .insert("hardness".into(), "mine".into());
+        let mine = a.doc.materials[0].id.clone();
+        let _ = a.update(Message::OpenSample);
+        assert!(a.is_sample(), "{}", a.status);
+        let names: Vec<_> = a
+            .doc
+            .materials
+            .iter()
+            .map(|m| m.name().to_lowercase())
+            .collect();
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(names.len(), 10);
+        assert_eq!(unique.len(), 10, "{names:?}");
+        assert!(a.doc.materials.iter().any(|m| m.id == titanium));
+        assert_eq!(a.doc.material_id, mine);
+        assert_eq!(
+            a.doc.selected_material().unwrap().name(),
+            "aluminium 6061-t6"
+        );
+        assert_eq!(a.doc.material, "aluminium 6061-t6");
+        assert!(a.status.contains("Titanium Gr5"), "{}", a.status);
+        assert!(!a.status.contains("Brass C360"), "{}", a.status);
+        // Opening it again, and a new project, add nothing more.
+        let _ = a.update(Message::OpenSample);
+        assert_eq!(a.doc.materials.len(), 10);
+        let _ = a.update(Message::NewProject);
+        assert_eq!(a.doc.materials.len(), 10);
+        assert!(a.doc.material_id.is_empty());
+        // An example opened from a library without the user's edits links
+        // its material to the starter.
+        let mut fresh = App::from_workspace(dir.path().join("other").join("workspace.json"), None);
+        let _ = fresh.update(Message::OpenSample);
+        assert_eq!(fresh.doc.materials.len(), 9);
+        assert_eq!(
+            fresh.doc.selected_material().unwrap().name(),
+            "Aluminium 6061-T6"
+        );
+        assert!(!fresh.status.contains("material"), "{}", fresh.status);
     }
     #[test]
     fn the_first_save_on_an_empty_library_gets_a_tool_number() {
@@ -1991,7 +2101,15 @@ mod tests {
     fn planning_app(dir: &tempfile::TempDir) -> App {
         let mut a = fresh_app(dir);
         let (mut doc, mesh) = crate::post::fixture::job();
-        doc.material = "Aluminum 6061".into();
+        doc.adopt_materials();
+        let starter = doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&starter));
         a.replace_document(doc, None);
         a.imported_mesh = Some(mesh);
         a
@@ -2549,7 +2667,7 @@ mod tests {
             (
                 Document::default(),
                 dir.path().join("project-b.json"),
-                false,
+                vec![],
             )
         };
         for open in [false, true] {
