@@ -1533,6 +1533,72 @@ M2
         assert!(job.ready(), "{:?}", errors(&job));
     }
     #[test]
+    fn a_stock_datum_is_refused_when_an_earlier_setup_cut_the_side_it_needs() {
+        // Setup 1 cuts only an outside Contour on stock with a margin on one
+        // side alone: the Contour removes that side face and leaves the top
+        // and the other sides. Setup 2 has the same orientation.
+        let job_with_margin = |side: &str| {
+            let (mut doc, mesh) = fixture::job();
+            let ops = doc.setups[0].operations.clone();
+            let setup = &mut doc.setups[0];
+            for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+                setup.p.insert(key.into(), "0".into());
+            }
+            setup.p.insert(side.into(), "2".into());
+            setup.operations.retain(|o| o.strategy == Strategy::Contour);
+            let mut later = Setup::new(Machine::new(3), "G55");
+            later.p.insert("name".into(), "Later".into());
+            let mut face = ops[0].clone();
+            face.id = id();
+            later.operations.push(face);
+            doc.setups.push(later);
+            doc.sync_stock_sources();
+            (doc, mesh)
+        };
+        let setup_2 = |doc: &mut Document, mesh: &Mesh, origin: &str| {
+            doc.setups[1].p.insert("origin".into(), origin.into());
+            let job = post_job(doc, mesh);
+            job.setups[1]
+                .result
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_default()
+        };
+        for (side, face, needed_by_front_left) in [
+            ("stock_right", "+X side", false),
+            ("stock_back", "+Y side", false),
+            ("stock_left", "-X side", true),
+            ("stock_front", "-Y side", true),
+        ] {
+            let (mut doc, mesh) = job_with_margin(side);
+            let refused = setup_2(&mut doc, &mesh, "Stock top center");
+            assert_eq!(
+                refused,
+                vec![format!(
+                    "Later: earlier setups have cut the stock's {face}, so the Stock top center work zero is no longer on the stock. Choose Model origin for this setup."
+                )],
+                "{side}"
+            );
+            let front_left = setup_2(&mut doc, &mesh, "Stock top front-left");
+            if needed_by_front_left {
+                assert_eq!(
+                    front_left,
+                    vec![format!(
+                        "Later: earlier setups have cut the stock's {face}, so the Stock top front-left work zero is no longer on the stock. Choose Model origin for this setup."
+                    )],
+                    "{side}"
+                );
+            } else {
+                assert!(front_left.is_empty(), "{side}: {front_left:?}");
+            }
+            assert!(
+                setup_2(&mut doc, &mesh, "Model origin").is_empty(),
+                "{side}"
+            );
+        }
+    }
+    #[test]
     fn a_contour_beside_stock_without_side_margin_exports() {
         let (mut doc, mesh) = fixture::job();
         let setup = &mut doc.setups[0];

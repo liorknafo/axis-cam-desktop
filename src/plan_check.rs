@@ -683,6 +683,9 @@ mod tests {
         let (full, _) = super::check(&doc, &mesh, &report, &good(&report));
         let full = full.coverage.unwrap();
         assert!(faced.exposed_percent > 5. && faced.exposed_percent < full.exposed_percent);
+        // The finished good plan leaves no stock above or below the part.
+        assert_eq!(full.leftover_cm3.above, 0.);
+        assert_eq!(full.leftover_cm3.below, 0.);
         assert_eq!(faced.leftover_cm3.above, 0.);
         assert!(faced.leftover_cm3.inside_bounding_box > full.leftover_cm3.inside_bounding_box);
         assert!(faced.leftover_cm3.around > full.leftover_cm3.around);
@@ -1124,6 +1127,25 @@ mod tests {
         assert!(!check.passed && job.is_none(), "{found:?}");
         assert!(
             found.iter().any(|m| m.starts_with("gouge 1/Some(2): ")),
+            "{found:?}"
+        );
+        // Both gouge checks see it: the tool axis, and the coarse check on
+        // the stock grid, which names the Waterline and where it cut.
+        assert!(
+            found
+                .iter()
+                .any(|m| m.starts_with("gouge 1/Some(2): The tool's centre line passes through ")),
+            "{found:?}"
+        );
+        let coarse: Vec<&String> = found
+            .iter()
+            .filter(|m| m.contains("This operation cuts into the part: about "))
+            .collect();
+        assert_eq!(coarse.len(), 1, "{found:?}");
+        assert!(
+            coarse[0].starts_with("gouge 1/Some(2): ")
+                && coarse[0]
+                    .contains(" mm below the top (setup 1 axes, from the model's -X/-Y corner)."),
             "{found:?}"
         );
         let closed = analysis::tests::holed(0., 0.);

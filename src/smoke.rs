@@ -2110,21 +2110,36 @@ mod tests {
         let mut a = signed_in_planning_app(&dir);
         let ball = a.doc.tools[1].clone();
         assert_eq!((ball.name(), ball.number()), ("Ball 6", Some(2)));
+        // Two operations of the job use the ball mill; it comes back once.
+        let mut second = Operation::new(Strategy::Parallel, ball.id.clone());
+        second.p.insert("surface_stepover".into(), "2".into());
+        a.doc.setups[0].operations.push(second);
+        let uses = |a: &App| {
+            a.doc.setups[0]
+                .operations
+                .iter()
+                .filter(|o| o.tool == ball.id)
+                .count()
+        };
+        assert_eq!(uses(&a), 2);
         apply_checked_plan(&mut a);
         // The plan does not use the ball mill, so it can be deleted now.
         let _ = a.update(Message::DeleteTool(ball.id.clone()));
         assert!(!a.doc.tools.iter().any(|t| t.id == ball.id), "{}", a.status);
         let _ = a.update(Message::UndoPlan);
-        assert!(a.doc.tools.iter().any(|t| t.id == ball.id));
-        assert!(
-            a.doc.setups[0].operations.iter().any(|o| o.tool == ball.id),
-            "the restored Parallel uses it"
+        assert_eq!(
+            a.doc.tools.iter().filter(|t| t.id == ball.id).count(),
+            1,
+            "the ball mill is back once"
         );
+        assert_eq!(uses(&a), 2, "both restored operations use it");
+        assert!(a.doc.validate_structure().is_ok());
         assert!(
             a.status.ends_with(" Ball 6 is back in the library as T2."),
             "{}",
             a.status
         );
+        assert_eq!(a.status.matches("Ball 6").count(), 1, "{}", a.status);
         // A new tool took T2 after the delete: the ball mill comes back as
         // the next free number, and the status names it.
         let mut a = signed_in_planning_app(&dir);
