@@ -149,10 +149,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Use the entered overall X, Y and Z stock dimensions. The preview centers it in X/Y with its bottom at Z=0. The box can be smaller than the part, which is reported. Relative offsets are retained for switching back."
         }
         ("origin", "Stock top center") => {
-            "Program zero is the center of the stock's top face: the LinuxCNC program puts X0 Y0 at the stock center and Z0 on its top. Touch off the work offset there."
+            "Program zero is the center of the stock's top face: the LinuxCNC program puts X0 Y0 at the stock center and Z0 on its top. Touch off the work offset there. G-code export is refused when an earlier setup has cut the top at its centre or a side near its centre."
         }
         ("origin", "Stock top front-left") => {
-            "Program zero is the stock's top corner on −X and −Y in setup coordinates, independent of camera orientation. Touch off X0 Y0 Z0 on that corner."
+            "Program zero is the stock's top corner on −X and −Y in setup coordinates, independent of camera orientation. Touch off X0 Y0 Z0 on that corner. G-code export is refused when an earlier setup has cut the top or the −X or −Y side near that corner."
         }
         ("origin", "Model origin") => {
             "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top. Check that the point can be located on the machine before choosing it."

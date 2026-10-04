@@ -775,9 +775,9 @@ fn face_points(s: Bounds, k: usize, plane: f32) -> impl Iterator<Item = [f32; 3]
 fn in_box(p: [f32; 3], b: &Bounds) -> bool {
     (0..3).all(|a| p[a] >= b.min[a] - 0.001 && p[a] <= b.max[a] + 0.001)
 }
-/// Stock faces a stock-based work zero needs (the top, and the sides that place X0 Y0)
-/// with no sample point left outside every earlier cut box.
-fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str> {
+/// The stock faces a stock-based work zero needs, as (name, axis, plane
+/// 0.01 mm inside the face): the top, and the sides that place X0 Y0.
+fn zero_faces(s: Bounds, center: bool) -> Vec<(&'static str, usize, f32)> {
     let mut faces = vec![
         ("top face", 2, s.max[2] - 0.01),
         ("-X side", 0, s.min[0] + 0.01),
@@ -790,11 +790,90 @@ fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str
         faces.push(("+Y side", 1, s.max[1] - 0.01));
     }
     faces
+}
+/// Faces of `zero_faces` with no sample point left outside every earlier cut box.
+fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str> {
+    zero_faces(s, center)
         .into_iter()
         .filter(|&(_, k, plane)| {
             face_points(s, k, plane).all(|p| cuts.iter().any(|b| in_box(p, b)))
         })
         .map(|f| f.0)
+        .collect()
+}
+/// 7 × 7 sample points over a square of side `side` centred at `c`, on the
+/// plane through `c` across axis `k`.
+fn square_points(c: [f32; 3], k: usize, side: f32) -> impl Iterator<Item = [f32; 3]> {
+    let (i, j) = ((k + 1) % 3, (k + 2) % 3);
+    (0..49).map(move |n| {
+        let mut p = c;
+        p[i] += side * ((n % 7) as f32 / 6. - 0.5);
+        p[j] += side * ((n / 7) as f32 / 6. - 0.5);
+        p
+    })
+}
+/// Where the operator touches off each face of `zero_faces`, with the words
+/// that name the spot. Stock top center: the top at its XY centre, and each
+/// side at mid-height near its centre, over a square 10% of the face's
+/// shorter side. Stock top front-left: the top near that corner, over a
+/// square 2% of its shorter side that begins 1% in from both edges, where a
+/// touch at the corner lands; and the -X and -Y sides at mid-height near
+/// that corner, over a square 10% of the face's shorter side that begins 5%
+/// of the face's length from the corner, where an edge finder touches them
+/// clear of the corner's edge.
+fn touch_spots(s: Bounds, center: bool) -> Vec<(&'static str, Vec<[f32; 3]>)> {
+    let size = s.dimensions();
+    zero_faces(s, center)
+        .into_iter()
+        .map(|(_, k, plane)| {
+            let (i, j) = ((k + 1) % 3, (k + 2) % 3);
+            let shorter = size[i].min(size[j]);
+            let mut c: [f32; 3] = std::array::from_fn(|a| (s.min[a] + s.max[a]) / 2.);
+            c[k] = plane;
+            if center {
+                let words = if k == 2 {
+                    "at its centre"
+                } else {
+                    "near its centre"
+                };
+                return (words, square_points(c, k, 0.1 * shorter).collect());
+            }
+            let (side, from) = if k == 2 { (0.02, 0.01) } else { (0.1, 0.05) };
+            let side = side * shorter;
+            for a in [i, j].into_iter().filter(|&a| a != 2) {
+                c[a] = s.min[a] + from * size[a] + side / 2.;
+            }
+            (
+                "near the front-left corner",
+                square_points(c, k, side).collect(),
+            )
+        })
+        .collect()
+}
+/// The faces a stock-based work zero needs that earlier setups have cut: a
+/// whole face (`stock_faces_cut` on `cut_boxes`, named alone), or the spot
+/// on it the operator touches off on (`touch_spots`, named with the spot)
+/// where `rest::Removed` finds that material can be gone.
+fn stock_zero_cut(
+    stock: Bounds,
+    volume: &crate::volume::Volume,
+    frame: crate::volume::Frame,
+    center: bool,
+) -> Vec<String> {
+    let whole = stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), center);
+    let removed = crate::rest::Removed::new(volume, frame);
+    zero_faces(stock, center)
+        .into_iter()
+        .zip(touch_spots(stock, center))
+        .filter_map(|((face, ..), (spot, points))| {
+            if whole.contains(&face) {
+                Some(face.to_string())
+            } else if points.iter().any(|&p| removed.at(p)) {
+                Some(format!("{face} {spot}"))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 /// Whether earlier setups have cut the stock's top face, wholly or in part:
@@ -885,8 +964,7 @@ pub(crate) fn prepare(
                 setup.name()
             )]);
         }
-        let cuts = crate::rest::cut_boxes(volume, frame);
-        let cut = stock_faces_cut(stock, &cuts, origin == "Stock top center");
+        let cut = stock_zero_cut(stock, volume, frame, origin == "Stock top center");
         if let Some((last, rest)) = cut.split_last() {
             let list = if rest.is_empty() {
                 last.to_string()
@@ -1690,10 +1768,11 @@ M2
             );
             let front_left = setup_2(&mut doc, &mesh, "Stock top front-left");
             if needed_by_front_left {
+                // The Contour also took the margin at the top's corner.
                 assert_eq!(
                     front_left,
                     vec![format!(
-                        "Later: earlier setups have cut the stock's {face}, so the Stock top front-left work zero is no longer on the stock. Choose Model origin for this setup."
+                        "Later: earlier setups have cut the stock's top face near the front-left corner and {face}, so the Stock top front-left work zero is no longer on the stock. Choose Model origin for this setup."
                     )],
                     "{side}"
                 );
@@ -1705,6 +1784,134 @@ M2
                 "{side}"
             );
         }
+    }
+    /// The reviewer's job: setup 1 faces only inside the part's top face
+    /// (a new Face's default boundary, "Selected geometry" with "Tool inside
+    /// boundary"), which leaves a rim of stock at full height around a top
+    /// 4 mm lower. Setup 2, "Later" on G55, has the same orientation, a
+    /// Contour and work zero `origin`.
+    fn inside_face_job(origin: &str) -> (Document, Mesh) {
+        let (mut doc, mesh) = fixture::job();
+        let ops = doc.setups[0].operations.clone();
+        doc.setups[0].operations.truncate(1);
+        let face = &mut doc.setups[0].operations[0];
+        face.p.insert("boundary".into(), "Selected geometry".into());
+        face.p
+            .insert("containment".into(), "Tool inside boundary".into());
+        let mut later = Setup::new(Machine::new(3), "G55");
+        later.p.insert("name".into(), "Later".into());
+        later.p.insert("origin".into(), origin.into());
+        let mut contour = ops[2].clone();
+        contour.id = id();
+        later.operations.push(contour);
+        doc.setups.push(later);
+        doc.sync_stock_sources();
+        (doc, mesh)
+    }
+    /// Each setup's simulations, as `post_job` runs them.
+    fn simulated(doc: &Document, mesh: &Mesh) -> Vec<Vec<(usize, Result<Simulation, String>)>> {
+        let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> =
+            vec![vec![]; doc.setups.len()];
+        crate::simulation::sequence(doc, mesh, None, |s, o, r| results[s].push((o, r)));
+        results
+    }
+    #[test]
+    fn a_stock_datum_is_refused_when_an_earlier_setup_cut_its_touch_off_spot() {
+        // The whole top face is not cut: its rim is still there. But the
+        // stock-top centre, where Stock top center puts Z0, is 4 mm lower.
+        let (doc, mesh) = inside_face_job("Stock top center");
+        let results = simulated(&doc, &mesh);
+        let first = results[1][0].1.as_ref().unwrap();
+        let (volume, frame) = (first.initial_volume.as_ref().unwrap(), first.frame.unwrap());
+        let stock = first.plan.stock;
+        assert!(stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), true).is_empty());
+        let job = post_simulated(&doc, &mesh, &results);
+        assert_eq!(
+            job.setups[1].result.as_ref().err().cloned().unwrap_or_default(),
+            vec![
+                "Later: earlier setups have cut the stock's top face at its centre, so the Stock top center work zero is no longer on the stock. Choose Model origin for this setup.".to_string()
+            ]
+        );
+        // The front-left corner of the top, and the -X and -Y sides near it,
+        // are intact, so Stock top front-left is accepted.
+        let (doc, mesh) = inside_face_job("Stock top front-left");
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        assert!(
+            setup_texts(&job, 1)[0]
+                .contains("(Work zero: Stock top front-left in G55. Touch off X0 Y0 Z0 there.)\n")
+        );
+    }
+    #[test]
+    fn touch_off_spots_follow_the_work_zero() {
+        use crate::{simulation::CutterShape, volume::Volume};
+        let (doc, mesh) = fixture::job();
+        let frame = crate::volume::Frame::new(&doc.setups[0], &mesh);
+        let stock = Bounds {
+            min: [-50., -30., 0.],
+            max: [50., 30., 30.],
+        };
+        // What Stock top center and Stock top front-left find cut after
+        // the flat 6 mm cuts `path`, each (from, to) with a 5 mm flute.
+        let after = |path: &[([f32; 3], [f32; 3])]| {
+            let mut volume = Volume::new(stock, frame);
+            for &(a, b) in path {
+                volume.cut(a, b, 3., 5., CutterShape::Flat, frame);
+            }
+            [true, false].map(|center| stock_zero_cut(stock, &volume, frame, center))
+        };
+        let none = Vec::<String>::new();
+        let one = |face: &str| vec![face.to_string()];
+        // A 1 mm deep cut at the front-left corner of the top.
+        assert_eq!(
+            after(&[([-47., -27., 29.], [-46., -27., 29.])]),
+            [none.clone(), one("top face near the front-left corner")]
+        );
+        // A cut into the +X side at mid-height, near its centre.
+        assert_eq!(
+            after(&[([52., -1., 13.], [52., 1., 13.])]),
+            [one("+X side near its centre"), none.clone()]
+        );
+        // A cut into the -Y side at mid-height, a little way from the corner.
+        assert_eq!(
+            after(&[([-44., -32., 13.], [-43., -32., 13.])]),
+            [none.clone(), one("-Y side near the front-left corner")]
+        );
+        // A short cut in the middle of the top.
+        assert_eq!(
+            after(&[([-1., 0., 28.], [1., 0., 28.])]),
+            [one("top face at its centre"), none.clone()]
+        );
+        // The whole top faced: the face is named as before, with no spot.
+        let rows: Vec<_> = (0..17)
+            .map(|k| {
+                let y = -32. + 4. * k as f32;
+                ([-55., y, 29.], [55., y, 29.])
+            })
+            .collect();
+        assert_eq!(after(&rows), [one("top face"), one("top face")]);
+        // A contour arc around the corner, just outside the stock, leaves
+        // the corner intact although its boxes reach into it.
+        let arc: Vec<_> = (0..10)
+            .map(|k| {
+                let at = |k: f32| {
+                    let t = std::f32::consts::PI * (1. + k / 20.);
+                    [-50. + 3.05 * t.cos(), -30. + 3.05 * t.sin(), -5.]
+                };
+                (at(k as f32), at(k as f32 + 1.))
+            })
+            .collect();
+        let mut volume = Volume::new(stock, frame);
+        for &(a, b) in &arc {
+            volume.cut(a, b, 3., 40., CutterShape::Flat, frame);
+        }
+        let corner = [stock.min[0] + 1., stock.min[1] + 0.6, stock.max[2] - 0.01];
+        assert!(
+            crate::rest::removal_boxes(&volume, frame)
+                .iter()
+                .any(|b| in_box(corner, b))
+        );
+        assert_eq!(after(&arc), [none.clone(), none]);
     }
     #[test]
     fn a_contour_beside_stock_without_side_margin_exports() {

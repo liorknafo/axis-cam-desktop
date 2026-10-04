@@ -91,6 +91,46 @@ pub fn removal_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
         })
         .collect()
 }
+/// Where earlier cuts can have removed material, for single points: within
+/// the tool radius of each cut's path, from its tip up to its flute top,
+/// tested with `Volume::cut`'s own `swept`. Tighter than `removal_boxes`
+/// around arcs and diagonal moves, whose boxes reach up to a tool radius
+/// past the path.
+pub struct Removed<'a> {
+    cuts: &'a [Cut],
+    current: Frame,
+    /// `removal_boxes`, one per cut: a quick test before the exact one.
+    boxes: Vec<Bounds>,
+}
+impl<'a> Removed<'a> {
+    pub fn new(volume: &'a Volume, current: Frame) -> Self {
+        Self {
+            cuts: &volume.cuts[..],
+            current,
+            boxes: removal_boxes(volume, current),
+        }
+    }
+    /// Whether an earlier cut can have removed material at `p`, in the
+    /// current frame. A point within 0.001 mm of a cut counts as removed,
+    /// which keeps float error in the frame transforms on the safe side.
+    pub fn at(&self, p: [f32; 3]) -> bool {
+        const GUARD: f32 = 0.001;
+        self.cuts.iter().zip(&self.boxes).any(|(cut, b)| {
+            (0..3).all(|k| p[k] >= b.min[k] - 2. * GUARD && p[k] <= b.max[k] + 2. * GUARD) && {
+                let q = transfer(p, self.current, cut.frame);
+                // Raised by the guard against a flute top raised twice as far.
+                crate::volume::swept(
+                    [q[0], q[1], q[2] + GUARD],
+                    cut.a,
+                    cut.b,
+                    cut.radius + GUARD,
+                    cut.flute + 2. * GUARD,
+                    cut.shape,
+                )
+            }
+        })
+    }
+}
 impl RestStock {
     pub fn new(volume: &Volume, current: Frame) -> Self {
         let cuts = volume
@@ -317,6 +357,33 @@ mod tests {
         );
         // cut_boxes reaches a tool radius lower.
         assert_eq!(cut_boxes(&v, f)[0].min[2], 5.5);
+    }
+    #[test]
+    fn removed_follows_the_tool_path_from_its_tip_to_its_flute_top() {
+        let (mut v, f, _, mut s, mesh) = fixture();
+        v.cut([-5., -5., 8.], [5., 5., 8.], 1., 3., CutterShape::Flat, f);
+        let removed = Removed::new(&v, f);
+        // Inside the cut's box, but 5.7 mm from its diagonal path.
+        assert!(in_any(&removal_boxes(&v, f), [4., -4., 9.]));
+        assert!(!removed.at([4., -4., 9.]));
+        assert!(removed.at([0.5, 0., 9.]));
+        // From the tip up to the flute top, with a 0.001 mm guard.
+        assert!(!removed.at([0., 0., 7.99]));
+        assert!(removed.at([0., 0., 7.9995]));
+        assert!(removed.at([0., 0., 11.0005]));
+        assert!(!removed.at([0., 0., 11.01]));
+        assert!(removed.at([1.4, 0., 9.]) && !removed.at([1.42, 0., 9.]));
+        // The same material seen from a flipped setup.
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let removed = Removed::new(&v, flipped);
+        assert!(removed.at(f.transfer([0.5, 0., 9.], flipped)));
+        assert!(!removed.at(f.transfer([4., -4., 9.], flipped)));
+    }
+    fn in_any(boxes: &[Bounds], p: [f32; 3]) -> bool {
+        boxes
+            .iter()
+            .any(|b| (0..3).all(|k| p[k] >= b.min[k] && p[k] <= b.max[k]))
     }
     #[test]
     fn overlapping_cylinders_prove_full_cap_without_voxel_evidence() {
