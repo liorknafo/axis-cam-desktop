@@ -2415,6 +2415,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
     }
 }
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
+const WARN: Color = Color::from_rgb8(166, 101, 32);
 pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material with its cutting data, stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
 fn planner_controls(app: &App) -> Element<'_, Message> {
     let checklist = app.plan_checklist();
@@ -2911,18 +2912,63 @@ pub(crate) fn problem_lines(problems: &[crate::proposal::Problem]) -> Vec<String
     }
     lines
 }
+/// The mark beside a timeline row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// The step is running: a bullet.
+    Open,
+    /// The step ended, and a check on it, if any, passed: a tick.
+    Done,
+    /// The step ended with a check that found problems, or a reply that
+    /// could not be read: an amber "!".
+    Warn,
+}
 /// One row of the planner's timeline.
 pub(crate) struct TimelineRow {
-    /// The step has ended: a tick, otherwise a bullet.
-    pub done: bool,
+    pub mark: Mark,
     /// The step and how long it took (so far, while it runs).
     pub text: String,
     /// Under it: the characters received while a request runs, or how its
-    /// check went.
+    /// check went. Empty in the finished view, which puts a summary in `text`.
     pub notes: Vec<String>,
 }
-/// The timeline's rows as of `now`.
-pub(crate) fn timeline_rows(app: &App, now: std::time::Instant) -> Vec<TimelineRow> {
+/// A step that has ended, in the past tense; `stage_text` words the one that
+/// is running.
+pub(crate) fn done_text(stage: crate::planner::Progress, model: &str) -> String {
+    use crate::planner::{MAX_REQUESTS, Progress};
+    match stage {
+        Progress::Analyzing => "Analyzed the part".into(),
+        Progress::Asking(n) => format!("Asked {model} for a plan ({n} of {MAX_REQUESTS})"),
+        Progress::Repairing(n) => {
+            format!("Asked {model} for a correction ({n} of {MAX_REQUESTS})")
+        }
+        Progress::Extending(n) => {
+            format!("Asked {model} about faces still covered ({n} of {MAX_REQUESTS})")
+        }
+        Progress::Checking(n) => format!("Checked the plan ({n} of {MAX_REQUESTS})"),
+        Progress::Previewing => "Built the 3D view".into(),
+    }
+}
+/// How a reply fared, in a few words.
+fn step_summary(result: &crate::planner::StepResult) -> String {
+    use crate::planner::StepResult;
+    match result {
+        StepResult::Passed => "passed".into(),
+        StepResult::Problems { shown, more } => match shown.len() + more {
+            0 => "did not pass".into(),
+            n => plural(n, "problem"),
+        },
+        StepResult::Unreadable(_) => "reply could not be read".into(),
+    }
+}
+/// The timeline's rows as of `now`. While the run goes (`finished` false) a
+/// check's problems and an unreadable reply's error are listed under their
+/// row; a finished run's rows are one line each, ending in a short summary.
+pub(crate) fn timeline_rows(
+    app: &App,
+    now: std::time::Instant,
+    finished: bool,
+) -> Vec<TimelineRow> {
     use crate::planner::{Progress, StepResult};
     let received = app.plan_received.load(std::sync::atomic::Ordering::Relaxed);
     let request = |stage| {
@@ -2938,14 +2984,20 @@ pub(crate) fn timeline_rows(app: &App, now: std::time::Instant) -> Vec<TimelineR
                 .ended
                 .unwrap_or(now)
                 .saturating_duration_since(step.started);
+            let head = match step.ended {
+                Some(_) => done_text(step.stage, &app.plan_model),
+                None => stage_text(step.stage, &app.plan_model),
+            };
+            let mut text = format!("{head} · {:.0} s", took.as_secs_f32());
             let mut notes = vec![];
             if step.ended.is_none() && request(step.stage) {
                 notes.push(format!("received {}", plural(received, "character")));
             }
-            match &step.result {
-                None => {}
-                Some(StepResult::Passed) => notes.push("passed".into()),
-                Some(StepResult::Problems { shown, more }) => {
+            match (&step.result, finished) {
+                (None, _) => {}
+                (Some(result), true) => text = format!("{text} · {}", step_summary(result)),
+                (Some(StepResult::Passed), false) => notes.push("passed".into()),
+                (Some(StepResult::Problems { shown, more }), false) => {
                     notes.extend(shown.iter().map(|line| format!("• {line}")));
                     if *more > 0 {
                         notes.push(format!("• and {more} more"));
@@ -2954,34 +3006,33 @@ pub(crate) fn timeline_rows(app: &App, now: std::time::Instant) -> Vec<TimelineR
                         notes.push("did not pass".into());
                     }
                 }
-                Some(StepResult::Unreadable(why)) => {
+                (Some(StepResult::Unreadable(why)), false) => {
                     notes.push(format!("The reply could not be read: {}", clip(why, 300)))
                 }
             }
-            TimelineRow {
-                done: step.ended.is_some(),
-                text: format!(
-                    "{} · {:.0} s",
-                    stage_text(step.stage, &app.plan_model),
-                    took.as_secs_f32()
-                ),
-                notes,
-            }
+            let mark = match (step.ended, &step.result) {
+                (None, _) => Mark::Open,
+                (Some(_), Some(StepResult::Problems { .. } | StepResult::Unreadable(_))) => {
+                    Mark::Warn
+                }
+                (Some(_), _) => Mark::Done,
+            };
+            TimelineRow { mark, text, notes }
         })
         .collect()
 }
 /// The timeline as page rows, or None before the run's first stage.
-fn timeline_view<'a>(app: &App) -> Option<Column<'a, Message>> {
-    let rows = timeline_rows(app, std::time::Instant::now());
+fn timeline_view<'a>(app: &App, finished: bool) -> Option<Column<'a, Message>> {
+    let rows = timeline_rows(app, std::time::Instant::now(), finished);
     if rows.is_empty() {
         return None;
     }
     let mut c = column![].spacing(6);
     for row in rows {
-        let mark = if row.done {
-            text("✓").size(13).color(GOOD)
-        } else {
-            text("•").size(13).color(MUTED)
+        let mark = match row.mark {
+            Mark::Open => text("•").size(13).color(MUTED),
+            Mark::Done => text("✓").size(13).color(GOOD),
+            Mark::Warn => text("!").size(13).color(WARN),
         };
         let mut item = column![text(row.text).size(13)].spacing(2);
         for line in row.notes {
@@ -2991,9 +3042,9 @@ fn timeline_view<'a>(app: &App) -> Option<Column<'a, Message>> {
     }
     Some(c)
 }
-/// A finished run's timeline under `heading`, in a panel.
+/// A finished run's timeline under `heading`, in a panel: one line a step.
 fn finished_timeline<'a>(app: &App, heading: &'static str) -> Option<Element<'a, Message>> {
-    let rows = timeline_view(app)?;
+    let rows = timeline_view(app, true)?;
     Some(
         container(column![bold(heading, 15), rows].spacing(8))
             .padding(16)
@@ -3031,7 +3082,7 @@ fn plan_result(app: &App) -> Element<'_, Message> {
         .into(),
         Planner::Running(stage) => {
             let mut c = column![bold(running_text(app, *stage), 20)].spacing(14);
-            if let Some(rows) = timeline_view(app) {
+            if let Some(rows) = timeline_view(app, false) {
                 c = c.push(rows);
             }
             container(

@@ -2890,65 +2890,89 @@ mod tests {
             0
         );
     }
+    /// Timeline steps `(stage, began, ended, result)`, the times in seconds
+    /// before `now`; None for an open step.
+    fn steps_ago(
+        now: std::time::Instant,
+        steps: Vec<(
+            crate::planner::Progress,
+            u64,
+            Option<u64>,
+            Option<crate::planner::StepResult>,
+        )>,
+    ) -> Vec<crate::Step> {
+        let ago = |seconds| {
+            now.checked_sub(std::time::Duration::from_secs(seconds))
+                .unwrap()
+        };
+        steps
+            .into_iter()
+            .map(|(stage, began, ended, result)| crate::Step {
+                stage,
+                started: ago(began),
+                ended: ended.map(ago),
+                result,
+            })
+            .collect()
+    }
     #[test]
-    fn timeline_rows_show_each_steps_time_and_how_its_check_went() {
+    fn running_rows_list_each_steps_problems_and_stream_count_under_it() {
         use crate::planner::{Progress::*, StepResult};
-        use std::time::Duration;
+        use crate::ui::Mark::*;
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
         a.plan_model = "gpt-6.1-sol".into();
         let now = std::time::Instant::now();
-        let ago = |seconds| now.checked_sub(Duration::from_secs(seconds)).unwrap();
-        let step = |stage, began, ended: Option<u64>, result| crate::Step {
-            stage,
-            started: ago(began),
-            ended: ended.map(ago),
-            result,
-        };
         let problems = StepResult::Problems {
             shown: vec!["Setup 1, operation 2: Pocket too deep.".into()],
             more: 2,
         };
-        a.plan_timeline = vec![
-            step(Analyzing, 60, Some(58), None),
-            step(Asking(1), 58, Some(20), None),
-            step(Checking(1), 20, Some(11), Some(problems)),
-            step(
-                Repairing(2),
-                11,
-                Some(10),
-                Some(StepResult::Unreadable("not valid JSON".into())),
-            ),
-            step(Checking(2), 10, Some(8), Some(StepResult::Passed)),
-            step(
-                Checking(3),
-                8,
-                Some(7),
-                Some(StepResult::Problems {
-                    shown: vec![],
-                    more: 0,
-                }),
-            ),
-            step(Extending(3), 7, None, None),
-        ];
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 60, Some(58), None),
+                (Asking(1), 58, Some(20), None),
+                (Checking(1), 20, Some(11), Some(problems)),
+                (
+                    Repairing(2),
+                    11,
+                    Some(10),
+                    Some(StepResult::Unreadable("not valid JSON".into())),
+                ),
+                (Checking(2), 10, Some(8), Some(StepResult::Passed)),
+                (
+                    Checking(3),
+                    8,
+                    Some(7),
+                    Some(StepResult::Problems {
+                        shown: vec![],
+                        more: 0,
+                    }),
+                ),
+                (Extending(3), 7, None, None),
+            ],
+        );
         a.plan_received
             .store(1, std::sync::atomic::Ordering::Relaxed);
-        let rows = crate::ui::timeline_rows(&a, now);
+        let rows = crate::ui::timeline_rows(&a, now, false);
         let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        // A step that ended reads in the past tense; the open one as it runs.
         assert_eq!(
             text,
             [
-                "Analyzing the part… · 2 s",
-                "Asking gpt-6.1-sol for a plan (1 of 4)… · 38 s",
-                "Checking the plan with the simulation and export checks (1 of 4)… · 9 s",
-                "The last proposal did not pass; asking gpt-6.1-sol for a correction (2 of 4)… · 1 s",
-                "Checking the plan with the simulation and export checks (2 of 4)… · 2 s",
-                "Checking the plan with the simulation and export checks (3 of 4)… · 1 s",
+                "Analyzed the part · 2 s",
+                "Asked gpt-6.1-sol for a plan (1 of 4) · 38 s",
+                "Checked the plan (1 of 4) · 9 s",
+                "Asked gpt-6.1-sol for a correction (2 of 4) · 1 s",
+                "Checked the plan (2 of 4) · 2 s",
+                "Checked the plan (3 of 4) · 1 s",
                 "The plan passes; asking gpt-6.1-sol about faces still covered (3 of 4)… · 7 s",
             ]
         );
-        let done: Vec<_> = rows.iter().map(|r| r.done).collect();
-        assert_eq!(done, [true, true, true, true, true, true, false]);
+        // A tick only for steps that went well; a check with problems and a
+        // reply that could not be read get the warning mark.
+        let marks: Vec<_> = rows.iter().map(|r| r.mark).collect();
+        assert_eq!(marks, [Done, Done, Warn, Warn, Done, Warn, Open]);
         assert!(rows[0].notes.is_empty() && rows[1].notes.is_empty());
         assert_eq!(
             rows[2].notes,
@@ -2964,7 +2988,7 @@ mod tests {
         assert_eq!(rows[6].notes, ["received 1 character"]);
         a.plan_received
             .store(1840, std::sync::atomic::Ordering::Relaxed);
-        let rows = crate::ui::timeline_rows(&a, now);
+        let rows = crate::ui::timeline_rows(&a, now, false);
         assert_eq!(rows[6].notes, ["received 1840 characters"]);
         assert!(
             rows[..6]
@@ -2973,7 +2997,144 @@ mod tests {
         );
         // An open check says nothing yet.
         a.plan_timeline[6].stage = Checking(3);
-        assert!(crate::ui::timeline_rows(&a, now)[6].notes.is_empty());
+        assert!(crate::ui::timeline_rows(&a, now, false)[6].notes.is_empty());
+    }
+    #[test]
+    fn a_finished_timeline_is_one_line_a_step_with_a_short_summary() {
+        use crate::planner::{Progress::*, StepResult};
+        use crate::ui::Mark::*;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.plan_model = "gpt-6.1-sol".into();
+        let now = std::time::Instant::now();
+        let many = StepResult::Problems {
+            shown: (1..=5)
+                .map(|i| format!("Setup 1, operation {i}: Too deep."))
+                .collect(),
+            more: 2,
+        };
+        let one = StepResult::Problems {
+            shown: vec!["Setup 1, operation 2: Too deep.".into()],
+            more: 0,
+        };
+        // A run that passed on its second proposal.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 91, Some(90), None),
+                (Asking(1), 90, Some(52), None),
+                (Checking(1), 52, Some(40), Some(many)),
+                (Repairing(2), 40, Some(19), None),
+                (Checking(2), 19, Some(7), Some(StepResult::Passed)),
+                (Previewing, 7, Some(3), None),
+            ],
+        );
+        let rows = crate::ui::timeline_rows(&a, now, true);
+        let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "Analyzed the part · 1 s",
+                "Asked gpt-6.1-sol for a plan (1 of 4) · 38 s",
+                "Checked the plan (1 of 4) · 12 s · 7 problems",
+                "Asked gpt-6.1-sol for a correction (2 of 4) · 21 s",
+                "Checked the plan (2 of 4) · 12 s · passed",
+                "Built the 3D view · 4 s",
+            ]
+        );
+        assert!(
+            rows.iter().all(|r| r.notes.is_empty()),
+            "no lines under a row"
+        );
+        let marks: Vec<_> = rows.iter().map(|r| r.mark).collect();
+        assert_eq!(marks, [Done, Done, Warn, Done, Done, Done]);
+        // A run that never passed: a reply that could not be read, and
+        // checks with one problem and with several.
+        a.plan_timeline = steps_ago(
+            now,
+            vec![
+                (Analyzing, 80, Some(79), None),
+                (
+                    Asking(1),
+                    79,
+                    Some(50),
+                    Some(StepResult::Unreadable("not valid JSON".into())),
+                ),
+                (Repairing(2), 50, Some(30), None),
+                (Checking(2), 30, Some(20), Some(one)),
+                (Repairing(3), 20, Some(5), None),
+                (
+                    Checking(3),
+                    5,
+                    Some(1),
+                    Some(StepResult::Problems {
+                        shown: vec![],
+                        more: 6,
+                    }),
+                ),
+            ],
+        );
+        let rows = crate::ui::timeline_rows(&a, now, true);
+        let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "Analyzed the part · 1 s",
+                "Asked gpt-6.1-sol for a plan (1 of 4) · 29 s · reply could not be read",
+                "Asked gpt-6.1-sol for a correction (2 of 4) · 20 s",
+                "Checked the plan (2 of 4) · 10 s · 1 problem",
+                "Asked gpt-6.1-sol for a correction (3 of 4) · 15 s",
+                "Checked the plan (3 of 4) · 4 s · 6 problems",
+            ]
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.notes.is_empty() && !r.text.contains(['…', '\n']))
+        );
+        let marks: Vec<_> = rows.iter().map(|r| r.mark).collect();
+        assert_eq!(marks, [Done, Warn, Done, Warn, Done, Warn]);
+        // Both finished views build: above a failure, and above a preview.
+        a.page = Page::Ai;
+        let failure = crate::planner::Failure {
+            message: "No plan.".into(),
+            problems: vec![],
+            api: None,
+            requests: 3,
+        };
+        a.planner = crate::Planner::Failed(failure);
+        let _ = a.view();
+        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        let _ = a.view();
+    }
+    #[test]
+    fn a_new_request_starts_its_row_at_zero_characters() {
+        use crate::planner::{Event::*, Progress::*};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let count = |a: &App| a.plan_received.load(std::sync::atomic::Ordering::Relaxed);
+        let stream = |a: &App, n| {
+            a.plan_received
+                .store(n, std::sync::atomic::Ordering::Relaxed)
+        };
+        send(&mut a, epoch, Stage(Analyzing));
+        send(&mut a, epoch, Stage(Asking(1)));
+        stream(&a, 1200);
+        // A check does not touch the count; the next request starts again.
+        send(&mut a, epoch, Stage(Checking(1)));
+        assert_eq!(count(&a), 1200);
+        for request in [Repairing(2), Extending(3), Asking(4)] {
+            send(&mut a, epoch, Stage(request));
+            assert_eq!(count(&a), 0, "{request:?}");
+            let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
+            assert_eq!(rows.last().unwrap().notes, ["received 0 characters"]);
+            stream(&a, 900);
+            send(&mut a, epoch, Stage(Checking(2)));
+        }
+        // An event of an older run leaves the count alone.
+        send(&mut a, epoch.wrapping_sub(1), Stage(Repairing(2)));
+        assert_eq!(count(&a), 900);
     }
     #[test]
     fn applying_a_plan_replaces_the_job_and_undo_restores_it() {

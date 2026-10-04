@@ -1039,6 +1039,14 @@ impl App {
         use planner::{Event, Progress, StepResult};
         match event {
             Event::Stage(stage) => {
+                // A new request's row starts from zero, not the last reply's count.
+                if matches!(
+                    stage,
+                    Progress::Asking(_) | Progress::Repairing(_) | Progress::Extending(_)
+                ) {
+                    self.plan_received
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.end_plan_step();
                 self.plan_timeline.push(Step {
                     stage,
