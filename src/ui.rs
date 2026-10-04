@@ -1,6 +1,7 @@
 use crate::{
     App, Message, Page, Target,
     help::{self, Help, HelpButton},
+    material::SpeedFeed,
     model::*,
     viewport::{self, Viewport},
 };
@@ -171,21 +172,21 @@ fn warnings<'a>(issues: Vec<String>) -> Element<'a, Message> {
         .padding([8, 0])
         .into();
     }
-    let mut c = column![
-        bold(
-            format!(
-                "{} configuration issue{}",
-                issues.len(),
-                if issues.len() == 1 { "" } else { "s" }
-            ),
-            12
-        )
-        .color(Color::from_rgb8(166, 101, 32))
-    ]
-    .spacing(5);
-    for issue in issues {
+    caution(
+        format!(
+            "{} configuration issue{}",
+            issues.len(),
+            if issues.len() == 1 { "" } else { "s" }
+        ),
+        issues,
+    )
+}
+/// An amber box: a heading and one bullet per line.
+fn caution<'a>(heading: impl Into<String>, lines: Vec<String>) -> Element<'a, Message> {
+    let mut c = column![bold(heading, 12).color(Color::from_rgb8(166, 101, 32))].spacing(5);
+    for line in lines {
         c = c.push(
-            text(format!("• {issue}"))
+            text(format!("• {line}"))
                 .size(12)
                 .color(Color::from_rgb8(141, 90, 39)),
         )
@@ -993,6 +994,16 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
                     &["Flood", "Mist", "Air", "Off"],
                     t,
                 ));
+            match app.doc.speed_feed(app.doc.setup(), o) {
+                Some(SpeedFeed::Out(problems)) => {
+                    c = c.push(caution(
+                        "Speed or feed outside the material's cutting data",
+                        problems,
+                    ))
+                }
+                Some(SpeedFeed::Unchecked(why)) => c = c.push(muted(format!("Not checked. {why}"))),
+                _ => {}
+            }
         }
         "Geometry" => {
             if let Some(file) = &app.doc.file {
@@ -1791,21 +1802,39 @@ fn material_picker(app: &App) -> Element<'_, Message> {
         .width(Fill)
     ]
     .spacing(5);
-    match selected {
-        Some(m) if m.cutting_data().is_none() => {
-            c = c.push(muted(format!(
-                "{} has no cutting data: speeds and feeds are not checked.",
-                m.name()
-            )))
-        }
-        None => {
-            c = c.push(muted(
-                "No material is chosen: speeds and feeds are not checked.",
-            ))
-        }
-        _ => {}
+    if let Some(note) = material_note(&app.doc) {
+        c = c.push(muted(note));
     }
     c.into()
+}
+/// Why the project's speeds and feeds are not checked, if they are not.
+pub(crate) fn material_note(doc: &Document) -> Option<String> {
+    match doc.selected_material() {
+        Some(m) if m.cutting_data().is_none() => Some(format!(
+            "{} has no cutting data: speeds and feeds are not checked.",
+            m.name()
+        )),
+        None => Some("No material is chosen: speeds and feeds are not checked.".into()),
+        _ => None,
+    }
+}
+/// The NC page's list: one line per speed or feed problem of an enabled
+/// operation, and one per operation that could not be checked.
+pub(crate) fn speed_feed_lines(app: &App) -> Vec<String> {
+    let mut lines = vec![];
+    for (i, setup) in app.doc.setups.iter().enumerate() {
+        for op in setup.operations.iter().filter(|o| o.enabled) {
+            let at = format!("Setup {} · {}", i + 1, op.name());
+            match app.doc.speed_feed(setup, op) {
+                Some(SpeedFeed::Out(problems)) => {
+                    lines.extend(problems.into_iter().map(|p| format!("{at}: {p}")))
+                }
+                Some(SpeedFeed::Unchecked(why)) => lines.push(format!("{at}: Not checked. {why}")),
+                _ => {}
+            }
+        }
+    }
+    lines
 }
 fn page_header<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
     row![
@@ -2978,6 +3007,17 @@ fn ai(app: &App) -> Element<'_, Message> {
 }
 fn post(app: &App) -> Element<'_, Message> {
     let mut summary = column![bold("Program review", 20), note(program_note()),].spacing(14);
+    let lines = speed_feed_lines(app);
+    if !lines.is_empty() {
+        summary = summary.push(caution(
+            if material_note(&app.doc).is_some() {
+                "Speeds and feeds not checked (export still allowed)"
+            } else {
+                "Speeds and feeds outside the material's cutting data (export still allowed)"
+            },
+            lines,
+        ));
+    }
     let mut code = column![].spacing(18);
     match &app.post {
         None => {

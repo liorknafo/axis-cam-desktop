@@ -1757,7 +1757,8 @@ impl App {
                 }
             }
             Message::PickMaterial(id) => {
-                if self.doc.select_material(&id) {
+                // A pick_list repeats the chosen item; that is not a change.
+                if self.doc.material_id != id && self.doc.select_material(&id) {
                     self.touch()
                 }
             }

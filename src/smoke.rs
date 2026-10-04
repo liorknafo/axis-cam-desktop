@@ -1345,6 +1345,142 @@ mod tests {
         }
     }
     #[test]
+    fn picking_the_selected_material_again_changes_nothing() {
+        // A pick_list sends the message again for the item already chosen;
+        // that must not drop a running plan.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let same = a.doc.material_id.clone();
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        a.project_dirty = false;
+        a.status = "Kept.".into();
+        let _ = a.update(Message::PickMaterial(same.clone()));
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        assert!(!a.project_dirty);
+        assert_eq!(a.status, "Kept.");
+        // Another material is a change to the job.
+        let other = first_but(&a, &same);
+        let _ = a.update(Message::PickMaterial(other.clone()));
+        assert_eq!(a.doc.material_id, other);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert!(a.project_dirty);
+        assert_eq!(a.status, "Planning stopped because the job changed.");
+    }
+    #[test]
+    fn the_material_note_has_three_outcomes() {
+        use crate::ui::material_note;
+        let mut doc = Document::sample();
+        doc.adopt_materials();
+        assert_eq!(doc.selected_material().unwrap().name(), "Aluminium 6061-T6");
+        assert_eq!(material_note(&doc), None);
+        let mut bare = crate::material::Material::new("Inconel 718");
+        bare.p.insert("notes".into(), "Hard.".into());
+        let id = bare.id.clone();
+        doc.materials.push(bare);
+        assert!(doc.select_material(&id));
+        assert_eq!(
+            material_note(&doc).as_deref(),
+            Some("Inconel 718 has no cutting data: speeds and feeds are not checked.")
+        );
+        doc.material_id.clear();
+        assert_eq!(
+            material_note(&doc).as_deref(),
+            Some("No material is chosen: speeds and feeds are not checked.")
+        );
+    }
+    #[test]
+    fn speeds_and_feeds_outside_the_materials_data_warn_and_never_block_export() {
+        use crate::{material::SpeedFeed, ui::speed_feed_lines};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        // The fixture's tools run in range, the drill once it turns faster
+        // and feeds more.
+        let drill = &mut a.doc.setups[0].operations[3];
+        drill.p.insert("rpm".into(), "12000".into());
+        drill.p.insert("feed".into(), "1000".into());
+        assert_eq!(speed_feed_lines(&a), Vec::<String>::new());
+        let pocket_check = |a: &App| {
+            let setup = &a.doc.setups[0];
+            a.doc.speed_feed(setup, &setup.operations[1])
+        };
+        assert_eq!(a.doc.setups[0].operations[1].name(), "Pocket");
+        // The check uses the operation's own values, whatever the machine
+        // allows (its limit blocks such an export on its own).
+        for (rpm, feed) in [("30000", "3000"), ("12000", "2500")] {
+            let pocket = &mut a.doc.setups[0].operations[1];
+            pocket.p.insert("rpm".into(), rpm.into());
+            pocket.p.insert("feed".into(), feed.into());
+            let Some(SpeedFeed::Out(problems)) = pocket_check(&a) else {
+                panic!("{:?}", pocket_check(&a))
+            };
+            assert_eq!(problems.len(), 1);
+            assert_eq!(
+                speed_feed_lines(&a),
+                vec![format!("Setup 1 · Pocket: {}", problems[0])]
+            );
+            let vc = if rpm == "30000" { "942" } else { "377" };
+            assert_eq!(
+                problems[0],
+                format!("Surface speed {vc} m/min is above Aluminium 6061-T6's 150–300 m/min.")
+            );
+        }
+        let setup = &a.doc.setups[0];
+        assert!(matches!(
+            a.doc.speed_feed(setup, &setup.operations[0]),
+            Some(SpeedFeed::InRange { .. })
+        ));
+        // At the machine's own maximum the program exports: the warning is
+        // advice and never blocks.
+        assert!(crate::post::post_job(&a.doc, &mesh).ready());
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.update(Message::Page(Page::Post));
+        assert!(a.post.as_ref().is_some_and(|j| j.ready()));
+        let _ = a.view();
+        for tab in ["Tool", "Passes"] {
+            let _ = a.update(Message::SelectOp(1));
+            let _ = a.update(Message::Tab(tab.into()));
+            assert_eq!(a.page, Page::Work);
+            let _ = a.view();
+        }
+        // A suppressed operation is not exported, so it is not listed.
+        a.doc.setups[0].operations[1].enabled = false;
+        assert_eq!(speed_feed_lines(&a), Vec::<String>::new());
+        a.doc.setups[0].operations[1].enabled = true;
+        // A material without cutting data: nothing is checked, and the
+        // lines say so for each operation. No material: no lines.
+        let bare = crate::material::Material::new("Unknown");
+        let id = bare.id.clone();
+        a.doc.materials.push(bare);
+        assert!(a.doc.select_material(&id));
+        let setup = &a.doc.setups[0];
+        assert_eq!(
+            a.doc.speed_feed(setup, &setup.operations[1]),
+            Some(SpeedFeed::Unchecked("Unknown has no cutting data.".into()))
+        );
+        let lines = speed_feed_lines(&a);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "Setup 1 · Pocket: Not checked. Unknown has no cutting data."
+        );
+        let _ = a.update(Message::Page(Page::Post));
+        let _ = a.view();
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.view();
+        a.doc.material_id.clear();
+        let setup = &a.doc.setups[0];
+        assert_eq!(a.doc.speed_feed(setup, &setup.operations[1]), None);
+        assert!(speed_feed_lines(&a).is_empty());
+        // An operation whose tool is not in the library has nothing to check.
+        let _ = a.doc.select_material(&a.doc.materials[0].id.clone());
+        a.doc.setups[0].operations[1].tool = "gone".into();
+        let setup = &a.doc.setups[0];
+        assert_eq!(a.doc.speed_feed(setup, &setup.operations[1]), None);
+    }
+    #[test]
     fn closing_waits_for_a_sign_out_and_exits_past_blocking_work() {
         use crate::{CloseAction::*, close_action};
         use std::time::Duration;
