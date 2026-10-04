@@ -2519,6 +2519,17 @@ pub(crate) fn work_zero_line(
     }
     line
 }
+/// The checks a plan passed before it is shown, as the preview lists them.
+pub(crate) const PLAN_CHECKS: [&str; 4] = [
+    "Every operation generates with the stock left by the ones before it",
+    "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance",
+    "No tool centre line cuts into the part, and nothing goes below the stock",
+    "No gouging detected on the stock grid (coarse check)",
+];
+/// What the preview's checks leave out, under the check lines.
+pub(crate) const PLAN_NOT_CHECKED: &str = "Not checked: whether speeds and feeds suit the material and tool (only the machine's limits are), cutting loads, fixtures, clamps and the machine body.";
+/// The NC program page's note on what export checks.
+pub(crate) const PROGRAM_NOTE: &str = "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first.";
 fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a, Message> {
     let outcome = &preview.outcome;
     let (job, check, proposal) = (&outcome.job, &outcome.check, &outcome.proposal);
@@ -2534,14 +2545,10 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
         c = c.push(muted(line));
     }
     let mut checks = column![].spacing(4);
-    for line in [
-        "Every operation generates with the stock left by the ones before it",
-        "LinuxCNC export checks pass: limits, travel, rapids into material, holder clearance",
-        "No tool centre line cuts into the part, and nothing goes below the stock",
-        "No gouging detected on the stock grid (coarse check)",
-    ] {
+    for line in PLAN_CHECKS {
         checks = checks.push(row![text("✓").size(13).color(GOOD), text(line).size(13)].spacing(8));
     }
+    checks = checks.push(muted(PLAN_NOT_CHECKED));
     c = c.push(checks).push(actions());
     // The model's words are labelled as the planner's; the app's are not.
     if !proposal.summary.is_empty() {
@@ -2795,11 +2802,7 @@ fn ai(app: &App) -> Element<'_, Message> {
     .into()
 }
 fn post(app: &App) -> Element<'_, Message> {
-    let mut summary = column![
-        bold("Program review", 20),
-        note("LinuxCNC 3-axis output, one .ngc program per setup. Export repeats every check, replays each program against the simulated moves and writes nothing if any setup fails. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."),
-    ]
-    .spacing(14);
+    let mut summary = column![bold("Program review", 20), note(PROGRAM_NOTE),].spacing(14);
     let mut code = column![].spacing(18);
     match &app.post {
         None => {

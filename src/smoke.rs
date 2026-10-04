@@ -2800,6 +2800,38 @@ mod tests {
         );
     }
     #[test]
+    fn the_preview_and_the_program_page_say_what_their_checks_leave_out() {
+        use crate::ui::{PLAN_CHECKS, PLAN_NOT_CHECKED, PROGRAM_NOTE};
+        // The second check line names the machine limits that speeds and
+        // feeds are held to; the note under the lines says what is not checked.
+        assert_eq!(
+            PLAN_CHECKS[1],
+            "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance"
+        );
+        assert_eq!(
+            PLAN_NOT_CHECKED,
+            "Not checked: whether speeds and feeds suit the material and tool (only the machine's limits are), cutting loads, fixtures, clamps and the machine body."
+        );
+        // The program page says what export repeats, and that the planner's
+        // own checks covered the plan as applied, not later edits.
+        assert!(!PROGRAM_NOTE.contains("every check"), "{PROGRAM_NOTE}");
+        for part in [
+            "the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program",
+            "The planner's tool-axis and gouge checks covered the plan as applied, not later edits.",
+            "Fixtures, clamps and the machine body are not checked",
+        ] {
+            assert!(PROGRAM_NOTE.contains(part), "{part}");
+        }
+        // Both pages build with these lines.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        a.page = Page::Ai;
+        let _ = a.view();
+        a.page = Page::Post;
+        let _ = a.view();
+    }
+    #[test]
     fn the_preview_locates_a_model_origin_zero_on_the_part_and_the_stock_top() {
         let mut setup = Setup::new(Machine::new(3), "G55");
         setup.p.insert("rx".into(), "180".into());
