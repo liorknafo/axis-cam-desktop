@@ -2740,7 +2740,8 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
 /// the user's number. Every other example tool whose number is then in use
 /// gets the smallest free one; the example's operations refer to it by ID.
 /// Materials match by name, ignoring case, and the user's entry is kept; the
-/// example's material is then linked to the library.
+/// example's material is then linked to the library, or added to it without
+/// cutting data, and the status says which.
 fn merge_sample(user: &Document) -> (Document, String) {
     let mut doc = Document::sample();
     let (mut tools, mut machines, mut materials) = (vec![], vec![], vec![]);
@@ -2764,7 +2765,7 @@ fn merge_sample(user: &Document) -> (Document, String) {
             }
         }
     }
-    doc.adopt_materials();
+    let material_note = doc.adopt_materials();
     let unnumbered = |t: &Tool| {
         let mut p = t.p.clone();
         p.remove("number");
@@ -2823,7 +2824,7 @@ fn merge_sample(user: &Document) -> (Document, String) {
             added.join("; ")
         )
     };
-    (doc, status)
+    (doc, with_notes(&status, material_note.as_slice()))
 }
 /// How long a close request waits for a sign-out, a sign-in save or a
 /// refresh of the sign-in.

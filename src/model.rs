@@ -923,7 +923,9 @@ impl Document {
 }
 impl Document {
     pub fn selected_material(&self) -> Option<&crate::material::Material> {
-        self.materials.iter().find(|m| m.id == self.material_id)
+        self.materials
+            .iter()
+            .find(|m| !self.material_id.is_empty() && m.id == self.material_id)
     }
     pub fn select_material(&mut self, id: &str) -> bool {
         let Some(name) = self
@@ -938,16 +940,11 @@ impl Document {
         self.material = name;
         true
     }
-    /// Gives the document the starter materials it lacks and links a legacy
-    /// material name to the library. Returns the note to show, if any.
+    /// Gives a document with an empty library the starter materials and links
+    /// a legacy material name to the library. Returns the note to show, if any.
     pub fn adopt_materials(&mut self) -> Option<String> {
-        let has = |list: &[crate::material::Material], name: &str| {
-            list.iter().any(|m| m.name().eq_ignore_ascii_case(name))
-        };
-        for starter in crate::material::starters() {
-            if !has(&self.materials, starter.name()) {
-                self.materials.push(starter);
-            }
+        if self.materials.is_empty() {
+            self.materials = crate::material::starters();
         }
         if !self.material_id.is_empty() && self.selected_material().is_none() {
             self.material_id.clear();
@@ -1432,5 +1429,32 @@ mod tests {
         assert!(doc.select_material(&id));
         assert_eq!(doc.material, "Mild steel 1018");
         assert!(!doc.select_material("missing"));
+    }
+    #[test]
+    fn a_library_with_entries_gets_no_starters() {
+        use crate::material::Material;
+        let mut doc = Document {
+            materials: vec![Material::new("Titanium Gr5")],
+            ..Default::default()
+        };
+        assert!(doc.adopt_materials().is_none());
+        assert_eq!(doc.materials.len(), 1);
+        // A legacy name still links to the library, or is added to it.
+        doc.material = "titanium GR5".into();
+        let note = doc.adopt_materials().unwrap();
+        assert!(note.contains("linked to the library"), "{note}");
+        assert_eq!(doc.materials.len(), 1);
+        doc.material_id.clear();
+        doc.material = "Aluminium 6061-T6".into();
+        let note = doc.adopt_materials().unwrap();
+        assert!(note.contains("without cutting data"), "{note}");
+        assert_eq!(doc.materials.len(), 2);
+        assert!(doc.selected_material().unwrap().cutting_data().is_none());
+        // No selection never matches a material that has no id.
+        let mut blank = Material::new("No id");
+        blank.id.clear();
+        doc.materials.push(blank);
+        doc.material_id.clear();
+        assert!(doc.selected_material().is_none());
     }
 }

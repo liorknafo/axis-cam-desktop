@@ -424,7 +424,7 @@ fn blank_project(app: &App) -> Element<'_, Message> {
         text("3   Set stock and workholding, then add tools and operations.").size(14),
         space().height(12),
         row![btn("Set up a machine",Message::NewMachine,false),btn("Saved machines",Message::Page(Page::Machines),false),btn("Tool library",Message::Page(Page::Tools),false)].spacing(8),
-        note("No sample geometry, setups or operations have been added. Saved machines and tools are available when you need them.")
+        note("No sample geometry, setups or operations have been added. Saved machines, tools and materials are available when you need them.")
     ].spacing(13).max_width(730);
     if app.last_archived.is_some() {
         body = body.push(btn(

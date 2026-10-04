@@ -1105,6 +1105,12 @@ mod tests {
         assert_eq!(a.doc.material, "aluminium 6061-t6");
         assert!(a.status.contains("Titanium Gr5"), "{}", a.status);
         assert!(!a.status.contains("Brass C360"), "{}", a.status);
+        assert!(
+            a.status
+                .ends_with("The project material \"aluminium 6061-t6\" was linked to the library."),
+            "{}",
+            a.status
+        );
         // Opening it again, and a new project, add nothing more.
         let _ = a.update(Message::OpenSample);
         assert_eq!(a.doc.materials.len(), 10);
@@ -1120,7 +1126,37 @@ mod tests {
             fresh.doc.selected_material().unwrap().name(),
             "Aluminium 6061-T6"
         );
-        assert!(!fresh.status.contains("material"), "{}", fresh.status);
+        assert!(
+            fresh
+                .status
+                .ends_with("The project material \"Aluminium 6061-T6\" was linked to the library."),
+            "{}",
+            fresh.status
+        );
+    }
+    #[test]
+    fn explore_example_adds_its_material_without_data_when_the_user_deleted_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.doc.materials.retain(|m| m.name() != "Aluminium 6061-T6");
+        assert_eq!(a.doc.materials.len(), 8);
+        let _ = a.update(Message::OpenSample);
+        // The deleted starter is not brought back with its data: the example's
+        // material is added to the library without cutting data, and says so.
+        assert_eq!(a.doc.materials.len(), 9);
+        let selected = a.doc.selected_material().unwrap();
+        assert_eq!(selected.name(), "Aluminium 6061-T6");
+        assert!(selected.cutting_data().is_none());
+        assert!(
+            a.status.ends_with("\"Aluminium 6061-T6\" was added to the material library without cutting data; add it on the Materials page."),
+            "{}",
+            a.status
+        );
+        // New project and a second Explore example keep that entry once.
+        let _ = a.update(Message::NewProject);
+        let _ = a.update(Message::OpenSample);
+        assert_eq!(a.doc.materials.len(), 9);
+        assert!(a.status.contains("linked to the library"), "{}", a.status);
     }
     #[test]
     fn the_first_save_on_an_empty_library_gets_a_tool_number() {
