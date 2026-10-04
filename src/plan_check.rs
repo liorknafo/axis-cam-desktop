@@ -5,8 +5,8 @@
 use crate::{
     analysis::{self, Index, PartReport},
     cam::Geometry,
-    mesh::Mesh,
-    model::Document,
+    mesh::{Bounds, Mesh},
+    model::{Document, get},
     proposal::{self, Problem, Proposal},
     simulation::{Motion, Plan, Simulation},
     volume::Volume,
@@ -23,6 +23,11 @@ pub struct CheckReport {
     pub operations: Vec<OpResult>,
     pub coverage: Option<Coverage>,
     pub total_minutes: f32,
+    /// Per setup, for a Model-origin zero that passed the export stage: the
+    /// part's box and the stock top in work coordinates (mm), which locate it
+    /// on the preview. Not sent to the model.
+    #[serde(skip)]
+    pub zeros: Vec<Option<(Bounds, f32)>>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OpResult {
@@ -377,6 +382,7 @@ pub fn check(
                 operations: vec![],
                 coverage: None,
                 total_minutes: 0.,
+                zeros: vec![],
             },
             None,
         ),
@@ -391,6 +397,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
         operations: vec![],
         coverage: None,
         total_minutes: 0.,
+        zeros: vec![],
     };
     if let Err(error) = built.validate_structure() {
         out.problems.push(Problem {
@@ -505,6 +512,25 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
                 });
             }
         }
+        if export.is_empty() {
+            out.zeros = built
+                .setups
+                .iter()
+                .zip(&results)
+                .map(|(setup, sims)| {
+                    if get(&setup.p, "origin") != "Model origin" {
+                        return None;
+                    }
+                    let stock = sims.iter().find_map(|(_, r)| r.as_ref().ok())?.plan.stock;
+                    let datum = crate::post::datum(setup, stock, mesh).ok()?;
+                    Some(crate::post::zero_place(
+                        crate::post::part_box(setup, mesh),
+                        stock,
+                        datum,
+                    ))
+                })
+                .collect();
+        }
         if !job.ready() && export.is_empty() {
             export.push(Problem {
                 setup: 0,
@@ -552,6 +578,17 @@ mod tests {
         let sum: f32 = check.operations.iter().map(|o| o.minutes).sum();
         assert!((check.total_minutes - sum).abs() < 0.11);
         assert_eq!(built.unwrap().setups.len(), 2);
+        // Setup 2's Model origin is located for the preview: the part's box
+        // and the stock top in its work coordinates.
+        assert_eq!(check.zeros.len(), 2);
+        assert!(check.zeros[0].is_none());
+        let (part, top) = check.zeros[1].unwrap();
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 0.01);
+        assert!(
+            near(part.min, [-60., -40., -40.]) && near(part.max, [60., 40., 0.]),
+            "{part:?}"
+        );
+        assert!((top - 3.).abs() < 0.01, "{top}");
         let coverage = check.coverage.unwrap();
         assert!(
             coverage.exposed_percent > 60. && coverage.exposed_percent < 100.,

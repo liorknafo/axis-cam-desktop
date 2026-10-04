@@ -2532,6 +2532,37 @@ mod tests {
         );
     }
     #[test]
+    fn the_preview_locates_a_model_origin_zero_on_the_part_and_the_stock_top() {
+        let mut setup = Setup::new(Machine::new(3), "G55");
+        setup.p.insert("rx".into(), "180".into());
+        let part = crate::mesh::Bounds {
+            min: [-60., -40., -40.],
+            max: [60., 40., 0.],
+        };
+        assert_eq!(
+            crate::ui::work_zero_line(&setup, Some((part, 3.))),
+            "Rotation [180, 0, 0]° · work zero: Stock top center"
+        );
+        setup.p.insert("origin".into(), "Model origin".into());
+        assert_eq!(
+            crate::ui::work_zero_line(&setup, Some((part, 3.))),
+            "Rotation [180, 0, 0]° · work zero: Model origin — X0 Y0 at X+60 Y+40 mm from the part's −X −Y corner (part 120 × 80 mm), Z0 3 mm below the stock top"
+        );
+        // A file origin far from the part is visibly off it.
+        let far = crate::mesh::Bounds {
+            min: [-360., -40., -40.],
+            max: [-240., 40., 0.],
+        };
+        assert_eq!(
+            crate::ui::work_zero_line(&setup, Some((far, -2.5))),
+            "Rotation [180, 0, 0]° · work zero: Model origin — X0 Y0 at X+360 Y+40 mm from the part's −X −Y corner (part 120 × 80 mm), Z0 2.5 mm above the stock top"
+        );
+        assert_eq!(
+            crate::ui::work_zero_line(&setup, None),
+            "Rotation [180, 0, 0]° · work zero: Model origin"
+        );
+    }
+    #[test]
     fn later_setup_names_are_labelled_as_the_planners() {
         // Setup 1 keeps the user's name; a later setup's name is the planner's.
         assert_eq!(crate::ui::setup_title(0, "Top"), "Setup 1: Top");

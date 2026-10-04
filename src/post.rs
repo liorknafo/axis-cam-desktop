@@ -72,6 +72,17 @@ pub fn datum(setup: &Setup, stock: Bounds, mesh: &Mesh) -> Result<[f32; 3], Stri
         other => Err(format!("Unsupported work origin \"{other}\".")),
     }
 }
+/// The part's box in a setup's plan coordinates (mm).
+pub fn part_box(setup: &Setup, mesh: &Mesh) -> Bounds {
+    Placement::new(mesh, Some(setup))
+        .bounds
+        .scaled(1. / mesh.display_scale())
+}
+/// What locates a work zero the operator cannot touch directly (Model
+/// origin): the part's box and the stock top, in work coordinates (mm).
+pub fn zero_place(part: Bounds, stock: Bounds, datum: [f32; 3]) -> (Bounds, f32) {
+    (part.translated(datum.map(|v| -v)), stock.max[2] - datum[2])
+}
 pub fn coord(v: f32) -> String {
     let s = format!("{v:.3}");
     if s == "-0.000" { "0.000".into() } else { s }
@@ -284,6 +295,8 @@ pub struct Header<'a> {
     /// (program, count) when touch-off mode splits a setup into one program per tool run.
     pub part: Option<(usize, usize)>,
     pub stock: Bounds,
+    /// The part's box in plan coordinates (mm).
+    pub part_box: Bounds,
     pub datum: [f32; 3],
     pub disabled: Vec<String>,
 }
@@ -320,15 +333,41 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     ));
     // Later touch-off programs keep program 1's X/Y; the stock top may already be cut.
     let later = h.part.is_some_and(|(i, _)| i > 1);
-    w.note(&format!(
-        "Work zero: {} in {offset}. {}",
-        get(&setup.p, "origin"),
-        if later {
-            "X0 Y0 are unchanged from program 1."
-        } else {
-            "Touch off X0 Y0 Z0 there."
+    // Model origin is a point in the CAD file, often inside the part or the
+    // stock: it is located from the part's walls and the stock top instead.
+    let origin = get(&setup.p, "origin");
+    let model = origin == "Model origin";
+    if later {
+        w.note(&format!(
+            "Work zero: {origin} in {offset}. X0 Y0 are unchanged from program 1."
+        ));
+    } else if model {
+        w.note(&format!("Work zero: {origin} in {offset}."));
+    } else {
+        w.note(&format!(
+            "Work zero: {origin} in {offset}. Touch off X0 Y0 Z0 there."
+        ));
+    }
+    if model {
+        let (part, top) = zero_place(h.part_box, h.stock, d);
+        w.note(&format!(
+            "Part in work coordinates: X{} to {} Y{} to {} Z{} to {} mm.{}",
+            coord(part.min[0]),
+            coord(part.max[0]),
+            coord(part.min[1]),
+            coord(part.max[1]),
+            coord(part.min[2]),
+            coord(part.max[2]),
+            if later {
+                String::new()
+            } else {
+                format!(" Stock top Z{}.", coord(top))
+            }
+        ));
+        if !later {
+            w.note("Touch off on a part wall or the stock top and enter its coordinate.");
         }
-    ));
+    }
     let size = h.stock.dimensions();
     w.note(&format!(
         "Stock: {} x {} x {} mm. Part rotation X{} Y{} Z{} deg.",
@@ -386,7 +425,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         let (t, name) = (ops[0].tool, &ops[0].tool_name);
         if h.part.is_none_or(|(i, _)| i == 1) {
             w.note(&format!(
-                "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, to set X0 Y0 Z0 at the work zero."
+                "Load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
+                if model {
+                    "on a part wall or the stock top and enter its coordinate from the lines above."
+                } else {
+                    "to set X0 Y0 Z0 at the work zero."
+                }
             ));
             w.note("Before removing this tool, note the Z of a fixed reference surface such as a vise jaw.");
         } else {
@@ -787,6 +831,7 @@ pub(crate) fn prepare(
             number: si + 1,
             part: part.map(|(i, count, _)| (i, count)),
             stock: plans[0].stock,
+            part_box: part_box(setup, mesh),
             datum: zero,
             disabled: setup
                 .operations
@@ -1145,6 +1190,7 @@ mod tests {
             number: 1,
             part: None,
             stock: plan.stock,
+            part_box: plan.stock,
             datum: [0., 0., 10.],
             disabled: vec![],
         };
@@ -1782,5 +1828,59 @@ M2
         assert_eq!(split.errors, direct.errors);
         assert_eq!(texts(&split), texts(&direct));
         assert!(texts(&direct)[0].as_ref().unwrap()[0].contains("G54"));
+    }
+    /// The good two-setup plan, built and posted; setup 2 uses Model origin.
+    fn good_plan_job() -> (Document, Mesh) {
+        use crate::proposal::tests::{block, good};
+        let (doc, mesh, report) = block();
+        let job = crate::proposal::build(&doc, &mesh, &report, &good(&report)).unwrap();
+        (job, mesh)
+    }
+    fn setup_texts(job: &JobPost, si: usize) -> Vec<String> {
+        match &job.setups[si].result {
+            Ok(programs) => programs.iter().map(|p| p.text.clone()).collect(),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    #[test]
+    fn a_model_origin_header_locates_the_zero_from_the_part_and_the_stock_top() {
+        let (job, mesh) = good_plan_job();
+        assert_eq!(get(&job.setups[1].p, "origin"), "Model origin");
+        let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
+        // The part is 120 x 80 x 40 mm with its file origin at the centre of
+        // its underside, which faces up in setup 2 under 3 mm of stock.
+        assert!(
+            text.contains(
+                "(Work zero: Model origin in G55.)\n(Part in work coordinates: X-60.000 to 60.000 Y-40.000 to 40.000 Z-40.000 to 0.000 mm. Stock top Z3.000.)\n(Touch off on a part wall or the stock top and enter its coordinate.)\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Touch off X0 Y0 Z0"), "{text}");
+        // Setup 1's stock-based zero keeps its short note.
+        let first = &setup_texts(&post_job(&job, &mesh), 0)[0];
+        assert!(
+            first.contains("(Work zero: Stock top center in G54. Touch off X0 Y0 Z0 there.)\n")
+        );
+        assert!(!first.contains("Part in work coordinates"));
+        // A file origin 300 mm from the part puts the part's box far from X0.
+        let mut far = mesh.clone();
+        far.origin[0] += 300. * far.display_scale();
+        let text = &setup_texts(&post_job(&job, &far), 1)[0];
+        assert!(
+            text.contains("(Part in work coordinates: X-360.000 to -240.000 Y-40.000 to 40.000 Z-40.000 to 0.000 mm. Stock top Z3.000.)"),
+            "{text}"
+        );
+        // Touch-off mode: program 1 says where to touch off.
+        let mut touch = job.clone();
+        touch.setups[1]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let text = &setup_texts(&post_job(&touch, &mesh), 1)[0];
+        assert!(
+            text.contains("(Load T1 Flat 10, then use AXIS Touch Off, not Tool Touch Off, on a part wall or the stock top and enter its coordinate from the lines above.)"),
+            "{text}"
+        );
+        assert!(!text.contains("set X0 Y0 Z0 at the work zero"), "{text}");
     }
 }

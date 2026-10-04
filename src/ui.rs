@@ -2468,6 +2468,55 @@ pub(crate) fn setup_title(index: usize, name: &str) -> String {
         format!("Setup {} · named by the planner: “{name}”", index + 1)
     }
 }
+/// A planned setup's rotation and work zero. A Model-origin zero is located
+/// from the part's −X −Y corner and the stock top, given `zero`: the part's
+/// box and the stock top in work coordinates (mm).
+pub(crate) fn work_zero_line(
+    setup: &crate::model::Setup,
+    zero: Option<(crate::mesh::Bounds, f32)>,
+) -> String {
+    let origin = get(&setup.p, "origin");
+    let mut line = format!(
+        "Rotation [{}, {}, {}]° · work zero: {origin}",
+        get(&setup.p, "rx"),
+        get(&setup.p, "ry"),
+        get(&setup.p, "rz"),
+    );
+    if let (Some((part, top)), "Model origin") = (zero, origin) {
+        let n = |v: f32| {
+            let v = (v * 1000.).round() / 1000.;
+            if v == 0. {
+                "0".to_string()
+            } else {
+                format!("{v}")
+            }
+        };
+        let signed = |v: f32| {
+            let text = n(v);
+            if text.starts_with('-') {
+                text
+            } else {
+                format!("+{text}")
+            }
+        };
+        let size = part.dimensions();
+        let z = if n(top) == "0" {
+            "Z0 on the stock top".to_string()
+        } else if top > 0. {
+            format!("Z0 {} mm below the stock top", n(top))
+        } else {
+            format!("Z0 {} mm above the stock top", n(-top))
+        };
+        line += &format!(
+            " — X0 Y0 at X{} Y{} mm from the part's −X −Y corner (part {} × {} mm), {z}",
+            signed(-part.min[0]),
+            signed(-part.min[1]),
+            n(size[0]),
+            n(size[1]),
+        );
+    }
+    line
+}
 fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a, Message> {
     let outcome = &preview.outcome;
     let (job, check, proposal) = (&outcome.job, &outcome.check, &outcome.proposal);
@@ -2510,12 +2559,9 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
                 space().width(Fill),
                 muted(get(&setup.p, "offset"))
             ],
-            muted(format!(
-                "Rotation [{}, {}, {}]° · work zero: {}",
-                get(&setup.p, "rx"),
-                get(&setup.p, "ry"),
-                get(&setup.p, "rz"),
-                get(&setup.p, "origin")
+            muted(work_zero_line(
+                setup,
+                check.zeros.get(si).copied().flatten()
             ))
         ]
         .spacing(8);
