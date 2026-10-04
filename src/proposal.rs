@@ -641,14 +641,18 @@ pub fn build(
 pub(crate) mod tests {
     use super::*;
     use crate::post::fixture;
+    /// A proposed operation with speeds inside Aluminium 6061-T6's cutting
+    /// data for the fixture's 3-flute tools: Ø10 and Ø6 at 8000 rpm and
+    /// 1000 mm/min (151–251 m/min, 0.042 mm per tooth); the Ø4 drill at the
+    /// machine's 12000 rpm and 1200 mm/min (151 m/min, 0.033 mm per tooth).
     pub fn op(strategy: &str, tool: u32, surfaces: Vec<usize>) -> ProposedOp {
         ProposedOp {
             strategy: strategy.into(),
             name: format!("{strategy} by planner"),
             tool,
             surfaces,
-            rpm: if strategy == "Drill" { 2400. } else { 8000. },
-            feed: if strategy == "Drill" { 280. } else { 1000. },
+            rpm: if strategy == "Drill" { 12000. } else { 8000. },
+            feed: if strategy == "Drill" { 1200. } else { 1000. },
             stepdown: None,
             stepover_percent: None,
             radial_allowance: None,
@@ -683,9 +687,23 @@ pub(crate) mod tests {
             .surfaces
             .clone()
     }
+    /// `doc` with the library's starter "Aluminium 6061-T6" selected, as
+    /// planning needs a material with cutting data.
+    pub fn aluminium(doc: &mut Document) {
+        doc.adopt_materials();
+        let starter = doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&starter));
+    }
     /// The fixture job with its part report: tools T1 flat Ø10, T2 ball Ø6, T3 drill Ø4.
     pub fn block() -> (Document, Mesh, PartReport) {
-        let (doc, mesh) = fixture::job();
+        let (mut doc, mesh) = fixture::job();
+        aluminium(&mut doc);
         let report = analysis::report(&doc, &mesh).unwrap();
         (doc, mesh, report)
     }

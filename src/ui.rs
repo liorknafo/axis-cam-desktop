@@ -2415,7 +2415,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
     }
 }
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
-pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, material and stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
+pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material with its cutting data, stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
 fn planner_controls(app: &App) -> Element<'_, Message> {
     let checklist = app.plan_checklist();
     let ready = checklist.iter().all(|line| line.ok);
@@ -2733,7 +2733,7 @@ pub(crate) fn plan_check_lines() -> [&'static str; 4] {
 }
 /// What the preview's checks leave out, under the check lines.
 pub(crate) fn plan_not_checked() -> &'static str {
-    "Not checked: whether speeds and feeds suit the material and tool (only the machine's limits are), cutting loads, fixtures, clamps and the machine body."
+    "Not checked: cutting loads, tool deflection, fixtures, clamps and the machine body. Speeds and feeds are checked against the material's cutting data, which are starting points."
 }
 /// Setup `si`'s rotation and work-zero line on the plan preview, with the
 /// Model-origin values the plan check found (see `work_zero_line`).

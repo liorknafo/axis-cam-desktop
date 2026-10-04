@@ -106,7 +106,7 @@ pub fn instructions() -> String {
     format!("You plan CNC milling jobs for AXIS CAM Studio, a 3-axis CAM program. You receive a JSON part report and reply with one JSON proposal that matches the given schema. The program then generates every operation, simulates the stock, runs its export safety checks and tells you what failed, so you can correct the proposal.
 
 THE PART REPORT
-- Lengths are millimetres. `tools` lists the only tools you may use, by `number`, with their flute length and stickout. `machine` gives the maximum rpm and feed.
+- Lengths are millimetres. `tools` lists the only tools you may use, by `number`, with their `diameter`, `flutes`, flute length and stickout. `machine` gives the maximum rpm and feed. `material` is the project's material with its cutting data (see SPEEDS AND FEEDS).
 - `orientations` lists six ways to clamp the part, named by the part axis that points up. The first entry is setup 1, where the stock is defined; your first setup must use it. Each orientation may be used by one setup only, so a plan has at most 6 setups. Add another setup only for features that cannot be reached otherwise.
 - In each orientation, `planes` are the horizontal faces visible from above, with their `surfaces` IDs. `kind` is `top` for the highest face and `floor` for lower faces. `depth_below_top` is measured from the model's top in that orientation. `stock_margin` is the untouched stock beyond the model: top, bottom, -X, +X, -Y, +Y. Faces that an earlier setup machined have no stock left on them.
 - A floor's `max_cutter_diameter` is the largest flat cutter that fits inside it. A plane's `holes` give the largest drill that fits (`diameter`), the opening diameter (`opening_diameter`, larger at a counterbore), the depth and whether the hole goes through.
@@ -123,6 +123,13 @@ STRATEGIES (the only six)
 - Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm. On a 120 × 80 mm part with a Ø6 ball end mill this means a `surface_stepover` of about 0.6 mm or more with `tolerance` 0.02.
 - Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. It cuts that height ÷ `stepdown` layers, at most 300, but its moves (about layers × the outline's points) usually reach the move limit first: on a part of about 120 × 80 mm keep `stepdown` at or above about 0.5 mm (see RULES).
 
+SPEEDS AND FEEDS
+- `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
+- The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter. Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
+- Drills are checked like end mills: a Drill's `feed` is divided by rpm × flutes in the same way and must give a chip load inside the band of the drill's diameter, so choose drill feeds inside those bands. A small drill needs a high rpm to reach the surface speed.
+- When even the machine's maximum rpm (`machine.max_rpm`) gives a tool less than the minimum surface speed, running at that maximum rpm counts as in range. When the minimum chip load needs more than the machine's maximum feed (`machine.max_feed`), running at that maximum feed counts as in range. A value above the material's maximum is never excused, and rounding gets 1% of slack on each limit.
+- Plunge and ramp feeds are not checked. Plans with a spindle speed or feed outside the material's cutting data are refused: each such operation comes back as a problem with the stage `cutting data`, together with the other problems.
+
 RULES
 - Use only tool numbers from `tools` and surface IDs from the chosen orientation's `planes`. Never invent either.
 - Every setup needs at least one operation. At most {per_setup} operations per setup and {total} in total. Spindle speed is at least 100 rpm and feed at least 1 mm/min, both within the machine's maximums.
@@ -132,7 +139,7 @@ RULES
 - `bottom_offset`, `radial_allowance` and `axial_allowance` cannot be negative. Only a through drill's breakthrough in setup 1 goes below the model, into the stock beneath it.
 - Order operations in a setup: Face, then Pocket, then Contour, then Drill, then finishing.
 - No tool tip may go deeper below the stock top than the tool's stickout.
-- Choose conservative spindle speeds and feeds for the material and each tool, within the machine's limits.
+- Choose each operation's spindle speed and feed from the material's cutting data (see SPEEDS AND FEEDS), within the machine's limits.
 - Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, allowances and `bottom_offset` 0.
 - For later setups choose the work zero: `Model origin` is accepted; the program tells the operator where it lies relative to the part, and to the stock top while no earlier setup has cut it. Prefer a stock-based zero when the stock it is touched off on is untouched. `Stock top center`: touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 10 mm below the top. `Stock top front-left`: touch off Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X and -Y sides between 5% and 15% of each side's length from the front-left corner, between 1 mm and 10 mm below the top. On stock under 40 mm tall the sides are touched within a quarter of its height below the top, and under 40 mm across the corner area is a quarter of the shorter top side. A stock-based zero is refused when earlier setups have cut the stock at one of those spots.
 - Give each setup a short `workholding` note. Clamps are not modelled, so say what must be kept clear.
@@ -963,6 +970,50 @@ pub(crate) mod tests {
         assert!(contour.contains("`stepdown` at most the flute length"));
     }
     #[test]
+    fn the_instructions_explain_the_speed_and_feed_check() {
+        let text = instructions();
+        for needed in [
+            "SPEEDS AND FEEDS",
+            "surface speed",
+            "chip load",
+            "Vc = π × D × rpm ÷ 1000",
+            "fz = feed ÷ (rpm × flutes)",
+            "`vc_min_m_per_min`",
+            "`chip_load_mm`",
+            "`up_to_mm`",
+            "`flutes`",
+            "Drills are checked like end mills",
+            "feed ÷ (rpm × flutes)",
+            "maximum rpm",
+            "maximum feed",
+            "outside the material's cutting data are refused",
+            "`cutting data`",
+        ] {
+            assert!(text.contains(needed), "{needed}");
+        }
+        assert!(text.contains('π') || text.contains("pi"));
+        // The older sentence about conservative values is replaced by the check.
+        assert!(!text.contains("Choose conservative spindle speeds"));
+        // The example in the text is what the program computes.
+        assert!(text.contains(
+            "a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth"
+        ));
+        let (doc, _, _) = block();
+        let tool = &doc.tools[0];
+        let mut op = crate::model::Operation::new(crate::model::Strategy::Pocket, tool.id.clone());
+        op.p.insert("rpm".into(), "8000".into());
+        op.p.insert("feed".into(), "1000".into());
+        let crate::material::SpeedFeed::InRange { vc, fz } = crate::material::check(
+            doc.selected_material().unwrap(),
+            tool,
+            &op,
+            &doc.setups[0].machine,
+        ) else {
+            panic!("the example is in range")
+        };
+        assert_eq!((vc.round(), (fz * 1000.).round() / 1000.), (251., 0.042));
+    }
+    #[test]
     fn the_parallel_example_in_the_instructions_holds_on_the_fixture() {
         let (doc, mesh, report) = block();
         let generate = |stepover: f32| {
@@ -1304,6 +1355,34 @@ pub(crate) mod tests {
         assert!(
             repair.contains("T9 is not in the tool library")
                 && repair.contains("\"stage\":\"structure\"")
+        );
+    }
+    #[tokio::test]
+    async fn a_speed_outside_the_materials_data_is_sent_back_and_the_repair_is_accepted() {
+        let (doc, mesh, report) = block();
+        let mut fast = good(&report);
+        fast.setups[0].operations[0].rpm = 2000.;
+        let script = Script::new(vec![
+            json(&fast),
+            json(&good(&report)),
+            json(&good(&report)),
+        ]);
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        assert!(outcome.check.passed);
+        assert_eq!(outcome.proposal, good(&report));
+        let seen = script.seen.lock().unwrap();
+        // The model sees the material's data in the report and the problem,
+        // by setup and operation, in the correction.
+        assert!(seen[0][1].1.contains("\"vc_min_m_per_min\":150.0"));
+        let repair = &seen[1][3].1;
+        assert!(repair.starts_with("The proposal did not pass."));
+        assert!(
+            repair.contains("\"stage\":\"cutting data\"")
+                && repair.contains("\"setup\":1,\"operation\":1,")
+                && repair
+                    .contains("Surface speed 63 m/min is below Aluminium 6061-T6's 150–300 m/min.")
         );
     }
     #[tokio::test]
@@ -2103,6 +2182,7 @@ pub(crate) mod tests {
     /// Contour leave nothing covered.
     pub(crate) fn open_box() -> (Document, Mesh, PartReport) {
         let (mut doc, _) = crate::post::fixture::job();
+        crate::proposal::tests::aluminium(&mut doc);
         let size = [60f32, 40., 20.];
         let v = |i: usize| -> [f32; 3] {
             std::array::from_fn(|k| if i >> k & 1 == 0 { 0. } else { size[k] })

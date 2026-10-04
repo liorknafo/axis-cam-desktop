@@ -1,10 +1,12 @@
 //! Checks an AI proposal with the real generators, the stock simulation, the
-//! export checks and the tool's centre line against the mesh, then measures
-//! what the plan leaves uncut. The coarse gouge and coverage numbers come from
-//! the stock grid and are approximate.
+//! export checks, the speeds and feeds against the material's cutting data and
+//! the tool's centre line against the mesh, then measures what the plan leaves
+//! uncut. The coarse gouge and coverage numbers come from the stock grid and
+//! are approximate.
 use crate::{
     analysis::{self, Index, PartReport},
     cam::Geometry,
+    material::SpeedFeed,
     mesh::{Bounds, Mesh},
     model::Document,
     proposal::{self, Problem, Proposal},
@@ -362,6 +364,24 @@ pub fn coverage(
         note: "Approximate: measured on the coarse stock grid. Stock thinner than about 1.5 grid cells is not seen.",
     }
 }
+/// One problem per speed or feed of an operation that lies outside the
+/// project material's cutting data, naming its setup and operation.
+fn cutting_data_problems(built: &Document) -> Vec<Problem> {
+    let mut problems = vec![];
+    for (si, setup) in built.setups.iter().enumerate() {
+        for (oi, op) in setup.operations.iter().enumerate() {
+            if let Some(SpeedFeed::Out(messages)) = built.speed_feed(setup, op) {
+                problems.extend(messages.into_iter().map(|message| Problem {
+                    setup: si + 1,
+                    operation: Some(oi + 1),
+                    stage: "cutting data",
+                    message,
+                }));
+            }
+        }
+    }
+    problems
+}
 /// Runs every stage on a proposal. Returns the report and, when the plan
 /// passes, the job it describes.
 pub fn check(
@@ -409,6 +429,9 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
         });
         return out;
     }
+    // Speeds and feeds against the material: reported beside the stages that
+    // follow, so one round of feedback carries every problem.
+    let cutting = cutting_data_problems(built);
     // Generation and cumulative stock, with the stock after each operation.
     let geometries: Vec<Geometry> = built
         .setups
@@ -534,6 +557,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
         }
         out.problems.extend(export);
     }
+    out.problems.extend(cutting);
     out.problems.extend(axis);
     out.problems.extend(gouges);
     if let (Some(stock), Some(part)) = (&last, &part) {
@@ -630,6 +654,76 @@ mod tests {
                 .iter()
                 .any(|p| p.orientation == "+X" || p.orientation == "-Y")
         );
+    }
+    #[test]
+    fn speeds_and_feeds_outside_the_materials_data_are_refused_beside_the_other_problems() {
+        let (doc, mesh, report) = block();
+        // Setup 1's Pocket at 2000 rpm: 63 m/min, and 0.167 mm per tooth at 1000 mm/min.
+        let mut slow = good(&report);
+        slow.setups[0].operations[1].rpm = 2000.;
+        let (check, job) = check(&doc, &mesh, &report, &slow);
+        assert!(!check.passed && job.is_none());
+        assert_eq!(
+            stages(&check),
+            vec![
+                "cutting data 1/Some(2): Surface speed 63 m/min is below Aluminium 6061-T6's 150–300 m/min.",
+                "cutting data 1/Some(2): Chip load 0.167 mm per tooth is above Aluminium 6061-T6's 0.030–0.080 mm for a Ø10 mm tool.",
+            ]
+        );
+        // The stage does not stop generation or the export checks.
+        assert_eq!(check.operations.len(), 6);
+        assert!(check.coverage.is_some());
+        // One round carries every problem: a generation failure in setup 1
+        // and a chip load that is too light in setup 2.
+        let mut both = good(&report);
+        both.setups[0].operations[1].stepdown = Some(500.);
+        both.setups[1].operations[0].feed = 100.;
+        let (check, _) = super::check(&doc, &mesh, &report, &both);
+        let found = stages(&check);
+        assert!(
+            found
+                .iter()
+                .any(|m| m.starts_with("generation 1/Some(2): ")),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|m| m.starts_with(
+                "cutting data 2/Some(1): Chip load 0.004 mm per tooth is below Aluminium 6061-T6's 0.030–0.080 mm"
+            )),
+            "{found:?}"
+        );
+        // The export checks still run beside it: the flipped setup's stock-based
+        // zero is refused after setup 1's Contour cut the stock's sides.
+        let mut export = slow.clone();
+        export.setups[1].origin = "Stock top center".into();
+        let (check, _) = super::check(&doc, &mesh, &report, &export);
+        let found = stages(&check);
+        assert!(
+            found.iter().any(|m| m.starts_with("export 2/None: ")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|m| m.starts_with("cutting data 1/Some(2): Surface speed")),
+            "{found:?}"
+        );
+        // Drills are checked like mills: feed per tooth from the drill's flutes.
+        let mut drill = good(&report);
+        drill.setups[0].operations[3].feed = 280.;
+        let (check, _) = super::check(&doc, &mesh, &report, &drill);
+        assert_eq!(
+            stages(&check),
+            vec![
+                "cutting data 1/Some(4): Chip load 0.008 mm per tooth is below Aluminium 6061-T6's 0.020–0.050 mm for a Ø4 mm tool."
+            ]
+        );
+        // Without a material in the job nothing can be checked, and nothing
+        // is refused here (planning itself requires one).
+        let mut none = doc.clone();
+        none.material_id.clear();
+        let (check, _) = super::check(&none, &mesh, &report, &slow);
+        assert!(check.passed, "{:?}", stages(&check));
     }
     #[test]
     fn reference_problems_stop_before_generation() {
@@ -759,7 +853,6 @@ mod tests {
     #[test]
     fn the_command_line_check_matches_the_library() {
         let (mut doc, _, report) = block();
-        doc.material = "Aluminum 6061".into();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("job.axis.json");
         crate::storage::save(&project, &doc).unwrap();
@@ -822,6 +915,7 @@ mod tests {
                 .starts_with("Usage")
         );
         doc.material.clear();
+        doc.material_id.clear();
         crate::storage::save(std::path::Path::new(&project), &doc).unwrap();
         assert!(
             crate::check_plan(&[project, good_file])
@@ -892,6 +986,8 @@ mod tests {
         let tool = thin_drill(&mut job);
         let drill = &mut job.setups[0].operations[3];
         drill.tool = tool;
+        // 0.02 mm per tooth at 12000 rpm: inside the material's band for a Ø1 tool.
+        drill.p.insert("feed".into(), "720".into());
         drill_through(drill, "6", "25");
         assert_eq!(
             stages(&check_built(&job, &mesh, &report)),
@@ -1169,7 +1265,7 @@ mod tests {
     }
     #[test]
     fn a_plunge_where_the_underside_is_open_is_refused() {
-        let (doc, _) = crate::post::fixture::job();
+        let (doc, _, _) = block();
         // A 12 × 12 square missing from the underside: the column through it
         // crosses only the top face. The report refuses the part for its open
         // edges; the tool axis check is the second line of defence.
@@ -1197,7 +1293,7 @@ mod tests {
     }
     #[test]
     fn a_pocket_under_an_open_top_square_passes_the_part_checks() {
-        let (doc, _) = crate::post::fixture::job();
+        let (doc, _, _) = block();
         // A pocket open from below with a 12 × 12 square missing from the top
         // face above it. The report refuses the part for its open edges; the
         // checks behind it must still accept this sound plan.

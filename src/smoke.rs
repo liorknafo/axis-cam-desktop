@@ -664,7 +664,17 @@ impl App {
                 };
                 self.account_note.clear();
                 self.settings.plan_notice_shown = true;
-                self.doc.material = "Aluminum 6061".into();
+                // Planning needs a library material with cutting data.
+                self.doc.adopt_materials();
+                let starter = self
+                    .doc
+                    .materials
+                    .iter()
+                    .find(|m| m.name() == "Aluminium 6061-T6")
+                    .expect("starter material")
+                    .id
+                    .clone();
+                assert!(self.doc.select_material(&starter));
                 let mesh = self.imported_mesh.clone().expect("imported part");
                 let report = crate::analysis::report(&self.doc, &mesh).expect("part report");
                 let first = &report.orientations[0];
@@ -2592,11 +2602,25 @@ mod tests {
         );
         let mut a = signed_in_planning_app(&dir);
         assert!(unmet(&a).is_empty());
-        a.doc.material.clear();
+        let starter = a.doc.material_id.clone();
+        a.doc.material_id.clear();
         assert_eq!(unmet(&a), vec!["Material"]);
         let _ = a.update(Message::Plan);
         assert!(matches!(a.planner, crate::Planner::Idle));
-        a.doc.material = "Aluminum 6061".into();
+        assert_eq!(a.status, "Material: Choose a material on the setup page.");
+        // A material without cutting data cannot be planned with either.
+        let bare = crate::material::Material::new("Inconel 718");
+        let bare_id = bare.id.clone();
+        a.doc.materials.push(bare);
+        assert!(a.doc.select_material(&bare_id));
+        assert_eq!(unmet(&a), vec!["Material"]);
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        assert_eq!(
+            a.status,
+            "Material: Add cutting data to Inconel 718 on the Materials page."
+        );
+        assert!(a.doc.select_material(&starter));
         let _ = a.update(Message::Plan);
         assert!(matches!(
             a.planner,
@@ -3185,8 +3209,7 @@ mod tests {
     }
     /// The open box imported and signed in: one Face and Contour plan covers it.
     fn signed_in_box_app(dir: &tempfile::TempDir) -> (App, crate::analysis::PartReport) {
-        let (mut doc, mesh, report) = crate::planner::tests::open_box();
-        doc.material = "Aluminum 6061".into();
+        let (doc, mesh, report) = crate::planner::tests::open_box();
         let mut a = fresh_app(dir);
         a.replace_document(doc, None);
         a.imported_mesh = Some(mesh);
@@ -3587,7 +3610,7 @@ mod tests {
         );
         assert_eq!(
             lines(3)[1],
-            "2400 rpm · 280 mm/min · coolant Flood · Deep drilling, peck 3 mm · through, breakthrough 1.5 mm · holes of Ø6.6 mm only"
+            "12000 rpm · 1200 mm/min · coolant Flood · Deep drilling, peck 3 mm · through, breakthrough 1.5 mm · holes of Ø6.6 mm only"
         );
         assert_eq!(
             lines(4)[..2],
@@ -3636,7 +3659,7 @@ mod tests {
         blind.p.insert("hole_diameter".into(), "0".into());
         assert_eq!(
             crate::ui::operation_lines(&blind, "T3", 1., "")[1],
-            "2400 rpm · 280 mm/min · coolant Flood · Drilling · not through"
+            "12000 rpm · 1200 mm/min · coolant Flood · Drilling · not through"
         );
         assert_eq!(
             crate::ui::operation_lines(&blind, "T3", 1., "")[2],
@@ -3660,7 +3683,13 @@ mod tests {
         // The note under the lines says what is not checked.
         assert_eq!(
             plan_not_checked(),
-            "Not checked: whether speeds and feeds suit the material and tool (only the machine's limits are), cutting loads, fixtures, clamps and the machine body."
+            "Not checked: cutting loads, tool deflection, fixtures, clamps and the machine body. Speeds and feeds are checked against the material's cutting data, which are starting points."
+        );
+        // The page beside the Plan button says the cutting data are sent.
+        assert!(
+            crate::ui::SENT_TO_OPENAI.contains(
+                "your tools, machine limits, the project material with its cutting data,"
+            )
         );
         // The program page says what export repeats, and that the planner's
         // own checks covered the plan as applied, not later edits.

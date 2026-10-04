@@ -2,8 +2,10 @@
 //! reached from each of the six axis-aligned orientations. Lengths are mm.
 use crate::{
     cam::{self, Geometry, Polygon},
+    material::BANDS,
     mesh::{Bounds, Mesh, rotation},
     model::{Document, Operation, Setup, Strategy, get, num},
+    proposal::clip,
     surface::Selection,
     volume::{Frame, Volume},
 };
@@ -30,7 +32,7 @@ const WALL: f32 = 0.0087;
 pub struct PartReport {
     pub units: &'static str,
     pub part_size: [f32; 3],
-    pub material: String,
+    pub material: MaterialReport,
     pub machine: MachineReport,
     pub tools: Vec<ToolReport>,
     /// The first entry is setup 1's orientation.
@@ -42,12 +44,32 @@ pub struct MachineReport {
     pub max_feed: f32,
     pub travel: [f32; 3],
 }
+/// The project material and its cutting data, as the model sees them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MaterialReport {
+    pub name: String,
+    pub group: String,
+    pub hardness: String,
+    pub notes: String,
+    pub vc_min_m_per_min: f32,
+    pub vc_max_m_per_min: f32,
+    pub chip_load_mm: Vec<ChipLoadBand>,
+}
+/// Chip load per tooth (mm) for tool diameters up to `up_to_mm` (and above
+/// the previous band); `None` is every larger diameter.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChipLoadBand {
+    pub up_to_mm: Option<f32>,
+    pub min: f32,
+    pub max: f32,
+}
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolReport {
     pub number: u32,
     pub name: String,
     pub kind: String,
     pub diameter: f32,
+    pub flutes: u32,
     pub flute_length: f32,
     pub stickout: f32,
 }
@@ -926,11 +948,7 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
                 })
             }),
     };
-    let material = doc
-        .material
-        .trim()
-        .is_empty()
-        .then(|| "Enter the material.".to_string());
+    let material = material_report(doc).err();
     let tools = if doc.tools.is_empty() {
         Some("Add at least one tool to the library.".to_string())
     } else {
@@ -944,6 +962,37 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
         line("Material", material),
         line("Tool library", tools),
     ]
+}
+/// The project's material and its cutting data, or why planning cannot use
+/// the project's material. The user's text is cleaned and bounded.
+fn material_report(doc: &Document) -> Result<MaterialReport, String> {
+    let material = doc
+        .selected_material()
+        .ok_or("Choose a material on the setup page.")?;
+    let data = material.cutting_data().ok_or_else(|| {
+        format!(
+            "Add cutting data to {} on the Materials page.",
+            material.name()
+        )
+    })?;
+    let text = |key: &str, limit| clip(get(&material.p, key), limit);
+    Ok(MaterialReport {
+        name: text("name", 60),
+        group: text("group", 40),
+        hardness: text("hardness", 40),
+        notes: text("notes", 500),
+        vc_min_m_per_min: data.vc.0,
+        vc_max_m_per_min: data.vc.1,
+        chip_load_mm: BANDS
+            .iter()
+            .zip(data.fz)
+            .map(|((_, up_to), (min, max))| ChipLoadBand {
+                up_to_mm: up_to.is_finite().then_some(*up_to),
+                min,
+                max,
+            })
+            .collect(),
+    })
 }
 /// Setup 1, the part axis that points up in it and its stock, or the first
 /// reason planning cannot start.
@@ -963,7 +1012,7 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
 pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
     let (setup1, first, stock) = basics(doc, mesh)?;
     closed_solid(setup1, mesh)?;
-    Ok(describe(doc, mesh, setup1, first, &stock))
+    describe(doc, mesh, setup1, first, &stock)
 }
 /// `Ok` when the part is a closed solid, otherwise why it is not.
 fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
@@ -991,7 +1040,7 @@ fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
 #[cfg(test)]
 pub(crate) fn report_unchecked(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
     let (setup1, first, stock) = basics(doc, mesh)?;
-    Ok(describe(doc, mesh, setup1, first, &stock))
+    describe(doc, mesh, setup1, first, &stock)
 }
 fn describe(
     doc: &Document,
@@ -999,7 +1048,7 @@ fn describe(
     setup1: &Setup,
     first: &'static str,
     stock: &Volume,
-) -> PartReport {
+) -> Result<PartReport, String> {
     let mut order: Vec<&'static str> = vec![first];
     order.extend(
         ORIENTATIONS
@@ -1013,10 +1062,10 @@ fn describe(
     } else {
         1.
     };
-    PartReport {
+    Ok(PartReport {
         units: "mm",
         part_size: mesh.dimensions.map(r2),
-        material: doc.material.clone(),
+        material: material_report(doc)?,
         machine: MachineReport {
             max_rpm: num(&machine.p, "rpm").unwrap_or(0.),
             max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
@@ -1031,6 +1080,7 @@ fn describe(
                     name: t.name().to_string(),
                     kind: get(&t.p, "type").to_string(),
                     diameter: num(&t.p, "diameter")?,
+                    flutes: num(&t.p, "flutes").filter(|f| *f >= 1. && f.fract() == 0.)? as u32,
                     flute_length: num(&t.p, "length")?,
                     stickout: num(&t.p, "stickout")?,
                 })
@@ -1040,7 +1090,7 @@ fn describe(
             .into_iter()
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))
             .collect(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1048,7 +1098,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::post::fixture;
     fn block() -> (Document, Mesh) {
-        fixture::job()
+        let (mut doc, mesh) = fixture::job();
+        crate::proposal::tests::aluminium(&mut doc);
+        (doc, mesh)
     }
     fn plane<'a>(o: &'a OrientationReport, depth: f32) -> &'a PlaneReport {
         o.planes
@@ -1202,7 +1254,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn preconditions_name_what_is_missing() {
-        let (mut doc, mesh) = block();
+        let (mut doc, mesh) = fixture::job();
         let unmet = |doc: &Document, mesh: Option<&Mesh>| -> Vec<&'static str> {
             preconditions(doc, mesh)
                 .into_iter()
@@ -1211,7 +1263,31 @@ pub(crate) mod tests {
                 .collect()
         };
         assert_eq!(unmet(&doc, Some(&mesh)), vec!["Material"]);
-        doc.material = "Aluminum 6061".into();
+        assert_eq!(
+            preconditions(&doc, Some(&mesh))[2].hint,
+            "Choose a material on the setup page."
+        );
+        // A library with no material chosen is the same.
+        doc.adopt_materials();
+        assert_eq!(
+            preconditions(&doc, Some(&mesh))[2].hint,
+            "Choose a material on the setup page."
+        );
+        // A material without cutting data cannot be planned with.
+        let bare = crate::material::Material::new("Inconel 718");
+        let id = bare.id.clone();
+        doc.materials.push(bare);
+        assert!(doc.select_material(&id));
+        assert_eq!(unmet(&doc, Some(&mesh)), vec!["Material"]);
+        assert_eq!(
+            preconditions(&doc, Some(&mesh))[2].hint,
+            "Add cutting data to Inconel 718 on the Materials page."
+        );
+        // A name alone, with no library material behind it, is not enough.
+        doc.material_id.clear();
+        doc.material = "Aluminium 6061-T6".into();
+        assert_eq!(unmet(&doc, Some(&mesh)), vec!["Material"]);
+        crate::proposal::tests::aluminium(&mut doc);
         assert!(unmet(&doc, Some(&mesh)).is_empty());
         assert_eq!(
             unmet(&doc, None),
@@ -1247,7 +1323,6 @@ pub(crate) mod tests {
     #[test]
     fn the_report_lists_tools_machine_limits_and_serializes() {
         let (mut doc, mesh) = block();
-        doc.material = "Aluminum 6061".into();
         doc.tools[1].p.remove("number");
         let report = report(&doc, &mesh).unwrap();
         assert_eq!(
@@ -1261,10 +1336,71 @@ pub(crate) mod tests {
         );
         let json = serde_json::to_string(&report).unwrap();
         assert!(
-            json.contains("\"material\":\"Aluminum 6061\"")
+            json.contains("\"material\":{\"name\":\"Aluminium 6061-T6\",\"group\":\"Aluminium\"")
                 && json.contains("\"max_cutter_diameter\"")
+                && json.contains("\"flutes\":3")
+                && json.contains("{\"up_to_mm\":null,\"min\":0.06,\"max\":0.12}")
         );
         assert!(json.len() < 20_000, "{}", json.len());
+    }
+    #[test]
+    fn the_report_carries_the_materials_cutting_data() {
+        let (mut doc, mesh) = block();
+        let report = report(&doc, &mesh).unwrap();
+        let m = &report.material;
+        assert_eq!(
+            (m.name.as_str(), m.group.as_str(), m.hardness.as_str()),
+            ("Aluminium 6061-T6", "Aluminium", "95 HB")
+        );
+        assert!(m.notes.starts_with("Starting point for carbide tools"));
+        assert!(m.notes.ends_with("Flood or mist; clear chips."));
+        assert_eq!((m.vc_min_m_per_min, m.vc_max_m_per_min), (150., 300.));
+        assert_eq!(m.chip_load_mm.len(), 5);
+        let limits: Vec<_> = m.chip_load_mm.iter().map(|b| b.up_to_mm).collect();
+        assert_eq!(limits, vec![Some(3.), Some(6.), Some(10.), Some(16.), None]);
+        let band = &m.chip_load_mm[2];
+        assert_eq!((band.min, band.max), (0.03, 0.08));
+        let last = &m.chip_load_mm[4];
+        assert_eq!((last.min, last.max), (0.06, 0.12));
+        // Every tool says how many flutes it has: the chip load needs them.
+        assert_eq!(
+            report.tools.iter().map(|t| t.flutes).collect::<Vec<_>>(),
+            vec![3, 3, 3]
+        );
+        // The user's text is one cleaned line of bounded length.
+        let id = doc.material_id.clone();
+        let chosen = doc.materials.iter_mut().find(|m| m.id == id).unwrap();
+        let long = format!("Line one\n\ttwo {}", "x".repeat(600));
+        chosen.p.insert("notes".into(), long.clone());
+        chosen.p.insert("name".into(), "N".repeat(80));
+        chosen.p.insert("group".into(), "G".repeat(80));
+        chosen
+            .p
+            .insert("hardness".into(), format!("{}\u{202e}", "H".repeat(80)));
+        let m = super::report(&doc, &mesh).unwrap().material;
+        assert_eq!(m.notes, crate::proposal::clip(&long, 500));
+        assert!(m.notes.starts_with("Line one two xxx"));
+        assert_eq!(m.notes.chars().count(), 500);
+        assert_eq!(m.name, "N".repeat(60));
+        assert_eq!(m.group, "G".repeat(40));
+        assert_eq!(m.hardness, "H".repeat(40));
+    }
+    #[test]
+    fn a_report_needs_a_material_with_cutting_data() {
+        let (mut doc, mesh) = block();
+        doc.material_id.clear();
+        assert_eq!(
+            report(&doc, &mesh).unwrap_err(),
+            "Choose a material on the setup page."
+        );
+        let bare = crate::material::Material::new("Inconel 718");
+        let id = bare.id.clone();
+        doc.materials.push(bare);
+        assert!(doc.select_material(&id));
+        assert_eq!(
+            report(&doc, &mesh).unwrap_err(),
+            "Add cutting data to Inconel 718 on the Materials page."
+        );
     }
     #[test]
     fn a_plane_with_more_hole_candidates_than_the_limit_lists_none() {
