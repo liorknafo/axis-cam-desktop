@@ -214,7 +214,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Return to the part viewport, setup browser and operation editor. Your current edits remain in the workspace."
         }
         Page(crate::Page::Post) => {
-            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance; fixtures and the machine body are not checked."
+            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance; fixtures and the machine body are not checked. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export."
         }
         Page(crate::Page::Wizard) | NewMachine => {
             "Create a reusable machine profile in five steps: identity, travel, kinematics, controller and review."
@@ -373,7 +373,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Show or hide the cutter path. Pocket shows cuts on the current depth layer; Facing shows the latest cutting pass. Both show the active rapid; the example project shows illustrative paths."
         }
         Plan => {
-            "Ask the model for a complete job: setups, operations, tools and cutting parameters. The app checks every proposal with its generators, the stock simulation and the export checks, and sends problems back for correction, up to four requests. Requests count against your ChatGPT plan. Nothing changes until you apply the plan."
+            "Ask the model for a complete job: setups, operations, tools and cutting parameters. The app checks every proposal with its generators, the stock simulation, the export checks and the speeds and feeds against the project material's cutting data, and sends problems back for correction, up to four requests. Requests count against your ChatGPT plan. Nothing changes until you apply the plan."
         }
         PlanCancel => "Stop planning. The job is unchanged.",
         ApplyPlan => {
@@ -490,7 +490,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "rpm") => (
-            "Spindle revolutions per minute. LinuxCNC export writes it as S, rounded to a whole number. Select a value appropriate to the cutter, material and machine limit; this prototype does not calculate a recommended speed.",
+            "Spindle revolutions per minute. LinuxCNC export writes it as S, rounded to a whole number. Surface speed = π × tool diameter × rpm ÷ 1000. When the project material has cutting data, a surface speed outside its range is flagged on this tab and on the NC program page; export still goes ahead. The app does not calculate a speed for you.",
             Some(Tool),
         ),
         (_, "spindle_rotation") => (
@@ -510,7 +510,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Ramp),
         ),
         (_, "feed") => (
-            "Cutter travel speed during cutting, in mm/min. Feed per tooth = feed ÷ (rpm × flute count). Check cutter and material data when choosing it.",
+            "Cutter travel speed during cutting, in mm/min. Feed per tooth = feed ÷ (rpm × flute count). When the project material has cutting data, a feed per tooth outside the range for the tool's diameter is flagged on this tab and on the NC program page; export still goes ahead. Plunge and ramp feeds are not checked.",
             Some(Tool),
         ),
         (_, "coolant") => (
@@ -1646,6 +1646,36 @@ mod tests {
         assert_eq!(
             field_help("fz6_min", "Minimum", Target::Tool).title,
             "Minimum"
+        );
+    }
+    #[test]
+    fn speed_and_feed_help_says_what_the_material_check_does() {
+        let rpm = field_help("rpm", "Spindle speed", Target::Operation).body;
+        let feed = field_help("feed", "Cutting feed", Target::Operation).body;
+        for body in [&rpm, &feed] {
+            assert!(
+                body.contains("project material has cutting data")
+                    && body.contains("flagged on this tab and on the NC program page")
+                    && body.contains("export still goes ahead"),
+                "{body}"
+            );
+            assert!(!body.contains("recommended speed"), "{body}");
+        }
+        assert!(rpm.contains("π × tool diameter × rpm ÷ 1000"), "{rpm}");
+        assert!(
+            feed.contains("Plunge and ramp feeds are not checked"),
+            "{feed}"
+        );
+        let post = command(&Message::Page(crate::Page::Post), "x".into()).body;
+        assert!(
+            post.contains("outside the project material's cutting data")
+                && post.contains("never block export"),
+            "{post}"
+        );
+        let plan = command(&Message::Plan, "x".into()).body;
+        assert!(
+            plan.contains("speeds and feeds against the project material's cutting data"),
+            "{plan}"
         );
     }
     #[test]

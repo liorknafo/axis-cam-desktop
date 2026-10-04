@@ -787,10 +787,16 @@ impl App {
             self.paths = false;
         }
         if self.smoke_step >= 50 {
-            return iced::widget::operation::scroll_to(
-                "inspector",
-                iced::widget::scrollable::AbsoluteOffset { x: 0., y: 0. },
-            );
+            // Screen 82 scrolls the planner's result to its end; a scrollable
+            // keeps that offset in the pages that follow (the Materials form
+            // shares its place in the tree), so each screen starts at the top.
+            let top = |id| {
+                iced::widget::operation::scroll_to(
+                    id,
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 0. },
+                )
+            };
+            return Task::batch([top("inspector"), top("planner-result")]);
         }
         if (21..=24).contains(&self.smoke_step) {
             return iced::widget::operation::scroll_to(
