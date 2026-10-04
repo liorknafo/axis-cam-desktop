@@ -679,11 +679,24 @@ impl App {
     }
     /// What a close request does now (see `close_action`): a pending
     /// sign-out, sign-in save or refresh of the sign-in is waited for from
-    /// the first request's time, `now` being this request's. The wait is
+    /// the first request's time, `now` being this request's. After
+    /// `CLOSE_WAIT`, a refresh still waiting for OpenAI no longer counts as
+    /// pending, so blocking work ends the process; one saving its tokens
+    /// still does, so the window closes and the save finishes. The wait is
     /// dropped unless the answer is to keep waiting.
     pub(crate) fn close_decision(&mut self, id: iced::window::Id, now: Instant) -> CloseAction {
-        let refreshing = self.client.as_ref().is_some_and(|c| c.refreshing());
-        let signing = self.sign_out_pending || self.saving_sign_in() || refreshing;
+        let client = self.client.as_ref();
+        let (refreshing, saving_refresh) = (
+            client.is_some_and(|c| c.refreshing()),
+            client.is_some_and(|c| c.saving_refresh()),
+        );
+        let waited_out = self
+            .closing
+            .is_some_and(|(_, first)| now.saturating_duration_since(first) >= CLOSE_WAIT);
+        let signing = self.sign_out_pending
+            || self.saving_sign_in()
+            || saving_refresh
+            || (refreshing && !waited_out);
         let pending = signing.then(|| {
             let first = self.closing.get_or_insert((id, now)).1;
             (now.saturating_duration_since(first), self.sign_out_pending)
@@ -722,22 +735,28 @@ impl App {
             CloseAction::Close => iced::window::close(id),
             // The sign-out may still wait behind a refresh for the session,
             // and the runtime drops it when the app ends. The saved sign-in
-            // is deleted on the blocking pool instead, which the runtime
-            // lets finish, before the window closes; through the signing-out
-            // client, so that its refresh cannot save the sign-in again.
+            // is deleted on the blocking pool instead, before the window
+            // closes.
             CloseAction::ClearAndClose => {
-                let clear = match self.signing_out.take() {
-                    Some(client) => Task::future(async move { client.start_abandoning() }),
-                    None => {
-                        let store = self.store.clone();
-                        Task::future(async move { session::start_clear(store) })
-                    }
-                };
-                clear.discard().chain(iced::window::close(id))
+                self.start_close_clear();
+                iced::window::close(id)
             }
             // The workspace and History are written synchronously, so
             // nothing is lost.
             CloseAction::Exit => std::process::exit(0),
+        }
+    }
+    /// Starts deleting the saved sign-in for a close that stopped waiting
+    /// for a sign-out (`CloseAction::ClearAndClose`), on the blocking pool,
+    /// which the runtime lets finish when the app ends: through the
+    /// signing-out client, so that a refresh it still has running cannot
+    /// save the sign-in again (`openai::Client::start_abandoning`), or from
+    /// the store when there is no such client. Call it within a Tokio
+    /// runtime: iced runs `update` inside its own.
+    pub(crate) fn start_close_clear(&mut self) {
+        match self.signing_out.take() {
+            Some(client) => client.start_abandoning(),
+            None => session::start_clear(self.store.clone()),
         }
     }
     fn close_if_waiting(&mut self) -> Task<Message> {

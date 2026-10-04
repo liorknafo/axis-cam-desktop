@@ -334,6 +334,9 @@ pub struct Client {
     spent: Arc<std::sync::Mutex<Vec<String>>>,
     /// Refreshes of the sign-in in flight (see `refreshing`).
     refreshes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Of those, the ones saving their rotated tokens (see
+    /// `saving_refresh`).
+    saves: Arc<std::sync::atomic::AtomicUsize>,
     /// Set by `start_abandoning`: no refresh saves its tokens any more.
     abandoned: Arc<std::sync::Mutex<bool>>,
     /// Base delay between retries.
@@ -354,6 +357,7 @@ impl Client {
             session: Arc::new(tokio::sync::Mutex::new(Some(session))),
             spent: Arc::default(),
             refreshes: Arc::default(),
+            saves: Arc::default(),
             abandoned: Arc::default(),
             backoff: Duration::from_secs(1),
         }
@@ -365,10 +369,23 @@ impl Client {
     pub fn refreshing(&self) -> bool {
         self.refreshes.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
+    /// Whether a refresh of the sign-in is saving its rotated tokens, from
+    /// OpenAI's answer until after the save. A close keeps the process for
+    /// it after `CLOSE_WAIT`; a refresh still waiting for OpenAI then is
+    /// dropped.
+    pub fn saving_refresh(&self) -> bool {
+        self.saves.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
     /// A refresh in flight for as long as the result lives.
     #[cfg(test)]
     pub(crate) fn hold_refresh(&self) -> InFlight {
         InFlight::new(&self.refreshes)
+    }
+    /// A refresh in flight and saving its tokens for as long as the result
+    /// lives.
+    #[cfg(test)]
+    pub(crate) fn hold_refresh_save(&self) -> (InFlight, InFlight) {
+        (InFlight::new(&self.refreshes), InFlight::new(&self.saves))
     }
     /// Starts deleting the saved sign-in on the blocking pool and returns at
     /// once, for a close that stopped waiting for this client's sign-out.
@@ -424,6 +441,7 @@ impl Client {
         let backoff = self.backoff;
         let spent = self.spent.clone();
         let abandoned = self.abandoned.clone();
+        let saves = self.saves.clone();
         let in_flight = InFlight::new(&self.refreshes);
         let rejected = rejected.map(str::to_string);
         let refresh = async move {
@@ -451,6 +469,7 @@ impl Client {
                     Ok(new) => {
                         // The old refresh token is spent now. If the store
                         // refuses twice, keep the new set in memory anyway.
+                        let _saving = InFlight::new(&saves);
                         spent.lock().unwrap().push(current.refresh_token.clone());
                         if store_save_unless_abandoned(&store, &abandoned, &new)
                             .await
@@ -1768,17 +1787,18 @@ mod tests {
                     .any(|r| r.path == "/token"))
                 .await
             );
-            let requesting = client.refreshing();
+            // In flight, and not yet in its save.
+            let requesting = (client.refreshing(), client.saving_refresh());
             assert!(until(|| store.started.load(Ordering::SeqCst)).await);
-            let saving = client.refreshing();
+            let saving = (client.refreshing(), client.saving_refresh());
             go.send(()).unwrap();
             (requesting, saving)
         };
         let request = request();
         let (result, (requesting, saving)) = tokio::join!(client.respond(&request), release);
         result.unwrap();
-        assert!(requesting && saving);
-        assert!(!client.refreshing());
+        assert_eq!((requesting, saving), ((true, false), (true, true)));
+        assert!(!client.refreshing() && !client.saving_refresh());
         assert_eq!(store.load().unwrap().unwrap().refresh_token, "refresh-2");
     }
     #[tokio::test]

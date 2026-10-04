@@ -1155,10 +1155,88 @@ mod tests {
         assert_eq!(a.close_decision(id, after(1.)), Wait);
         assert_eq!(a.close_decision(id, after(10.5)), Wait);
         assert_eq!(a.close_decision(id, after(11.5)), Close);
-        drop(refresh);
-        // Nothing pending: close.
-        assert_eq!(a.close_decision(id, after(12.)), Close);
+        // After the wait, a refresh still waiting for OpenAI is not waited
+        // for: with blocking work the process ends.
+        a.post_busy = true;
+        assert_eq!(a.close_decision(id, after(12.)), Wait);
+        assert_eq!(a.close_decision(id, after(22.5)), Exit);
         assert!(a.closing.is_none());
+        drop(refresh);
+        // A refresh saving its tokens is waited for too, and after the wait
+        // the window closes, so that the save finishes.
+        let save = client.hold_refresh_save();
+        assert_eq!(a.close_decision(id, after(23.)), Wait);
+        assert_eq!(a.close_decision(id, after(33.5)), Close);
+        assert!(a.closing.is_none());
+        drop(save);
+        a.post_busy = false;
+        // Nothing pending: close.
+        assert_eq!(a.close_decision(id, after(34.)), Close);
+        assert!(a.closing.is_none());
+    }
+    #[tokio::test]
+    async fn a_close_that_stops_waiting_deletes_through_the_signing_out_client() {
+        use crate::fake_openai::{Fake, Req, Resp};
+        use std::time::Duration;
+        // OpenAI answers the refresh after 300 ms.
+        let fake = Fake::start(|req: &Req| match req.path.as_str() {
+            "/token" => Resp {
+                delay_ms: 300,
+                ..Resp::json(
+                    200,
+                    serde_json::json!({"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 3600}),
+                )
+            },
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let soon = crate::session::Session {
+            expires_at: crate::session::now() + 60,
+            ..crate::session::sample()
+        };
+        a.store.save(&soon).unwrap();
+        let client = std::sync::Arc::new(crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            a.store.clone(),
+            soon,
+        ));
+        a.signing_out = Some(client.clone());
+        a.sign_out_pending = true;
+        // A request that first refreshes the sign-in; its /token is out.
+        let respond = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .respond(&crate::openai::Request {
+                        model: "gpt-6.1-sol".into(),
+                        messages: vec![(crate::openai::Role::User, "Part.".into())],
+                        schema_name: "plan",
+                        schema: serde_json::json!({"type": "object"}),
+                    })
+                    .await
+            })
+        };
+        let mut waited = 0;
+        while fake.seen("/token").is_empty() && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert!(client.refreshing() && !client.saving_refresh());
+        // The close stops waiting and starts the delete.
+        a.start_close_clear();
+        assert!(a.signing_out.is_none());
+        // The refresh finishes after the delete; its save is not made.
+        respond.await.unwrap().unwrap();
+        assert!(!client.refreshing());
+        let mut waited = 0;
+        while a.store.load().unwrap().is_some() && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(a.store.load().unwrap(), None);
     }
     #[test]
     fn close_waits_for_a_refresh_in_flight_then_closes() {
@@ -1182,7 +1260,12 @@ mod tests {
         let _ = a.update(Message::Tick);
         assert!(a.closing.is_none());
         // A sign-out still pending after the wait hands its client to the
-        // delete, which then blocks that client's late refresh save.
+        // delete, which then blocks that client's late refresh save. The
+        // delete starts on the blocking pool, as within the app's runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _within = runtime.enter();
         a.signing_out = Some(client);
         a.sign_out_pending = true;
         let _ = a.update(Message::Close(id));
@@ -1232,7 +1315,13 @@ mod tests {
         assert_eq!(a.closing.unwrap().1, first);
         let _ = a.update(Message::SignedOut(Ok(())));
         assert!(a.closing.is_none());
-        // Bounded: after 10 seconds the window closes anyway.
+        // Bounded: after 10 seconds the window closes anyway, once the
+        // saved sign-in's delete has started on the blocking pool, as within
+        // the app's runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _within = runtime.enter();
         a.sign_out_pending = true;
         let _ = a.update(Message::Close(id));
         a.closing = Some((id, Instant::now() - Duration::from_secs(11)));
