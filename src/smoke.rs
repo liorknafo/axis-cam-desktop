@@ -1751,7 +1751,9 @@ mod tests {
         let (check, job) = crate::plan_check::check(&a.doc, mesh, &report, &proposal);
         assert!(check.passed, "{:?}", check.problems);
         let job = job.unwrap();
-        let view = view.then(|| crate::planner::final_view(&job, mesh).unwrap());
+        // Draft is enough to build the page; the app meshes at Standard.
+        let draft = crate::stock_surface::Detail::Draft;
+        let view = view.then(|| crate::planner::final_view_at(&job, mesh, draft).unwrap());
         std::sync::Arc::new(crate::PlanPreview {
             outcome: crate::planner::Outcome {
                 proposal,
@@ -1986,9 +1988,32 @@ mod tests {
         assert!(a.doc.validate_structure().is_ok());
     }
     /// Plans again with setup 1's workholding note set to `note`, and applies.
-    fn apply_with_setup_1_note(a: &mut App, note: &str) {
-        let mut preview = std::sync::Arc::try_unwrap(checked_preview(a, false)).unwrap();
-        preview.outcome.proposal.setups[0].workholding = note.into();
+    /// `base` is the preview checked once for `a`'s job. A built job's setup 1
+    /// is a copy of the user's with the plan's operations, so it is copied
+    /// from `a` again here (Apply reads its notes) instead of checking the
+    /// same plan again; only setup 1's notes may have changed since.
+    fn apply_with_setup_1_note(a: &mut App, base: &crate::PlanPreview, note: &str) {
+        let mut outcome = base.outcome.clone();
+        let built = &mut outcome.job.setups[0];
+        let mut setup = a.doc.setups[0].clone();
+        let without_notes = |p: &crate::model::Fields| {
+            let mut p = p.clone();
+            p.remove("notes");
+            p.remove(crate::planner::PLANNER_NOTE_KEY);
+            p
+        };
+        assert_eq!(without_notes(&setup.p), without_notes(&built.p));
+        assert_eq!(
+            (&setup.id, json(&setup.machine)),
+            (&built.id, json(&built.machine))
+        );
+        setup.operations = std::mem::take(&mut built.operations);
+        *built = setup;
+        outcome.proposal.setups[0].workholding = note.into();
+        let preview = crate::PlanPreview {
+            outcome,
+            view: None,
+        };
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
         let _ = a.update(Message::PlanFinished(
@@ -2006,7 +2031,11 @@ mod tests {
             .p
             .insert("notes".into(), "Soft jaws.".into());
         let before = json(&a.doc.setups);
-        apply_checked_plan(&mut a);
+        // The plan is checked once per job; every Apply below reuses it.
+        let base = checked_preview(&a, false);
+        let vise = "Vise on the long sides.";
+        assert_eq!(base.outcome.proposal.setups[0].workholding, vise);
+        apply_with_setup_1_note(&mut a, &base, vise);
         assert_eq!(
             get(&a.doc.setups[0].p, "notes"),
             "Soft jaws. · Planner: Vise on the long sides."
@@ -2028,8 +2057,12 @@ mod tests {
         assert!(!a.doc.setups[0].p.contains_key("planner_note"));
         // A later Apply replaces the part an earlier Apply added, and the
         // planner's line breaks become spaces.
-        apply_checked_plan(&mut a);
-        apply_with_setup_1_note(&mut a, "Clamp the\nlong sides.\r\n\nKeep the top clear.");
+        apply_with_setup_1_note(&mut a, &base, vise);
+        apply_with_setup_1_note(
+            &mut a,
+            &base,
+            "Clamp the\nlong sides.\r\n\nKeep the top clear.",
+        );
         let notes = get(&a.doc.setups[0].p, "notes");
         assert_eq!(
             notes,
@@ -2038,11 +2071,12 @@ mod tests {
         // Without notes of its own, setup 1 gets the planner's note alone,
         // within 500 characters, and a later Apply replaces it too.
         let mut a = signed_in_planning_app(&dir);
-        apply_with_setup_1_note(&mut a, &"w".repeat(900));
+        let base = checked_preview(&a, false);
+        apply_with_setup_1_note(&mut a, &base, &"w".repeat(900));
         let notes = get(&a.doc.setups[0].p, "notes");
         assert!(notes.starts_with("Planner: www"), "{notes}");
         assert_eq!(notes.chars().count(), 500);
-        apply_with_setup_1_note(&mut a, "Vise.");
+        apply_with_setup_1_note(&mut a, &base, "Vise.");
         assert_eq!(get(&a.doc.setups[0].p, "notes"), "Planner: Vise.");
         // Text the user typed after the planner's note survives a second
         // Apply; only the note an earlier Apply added is replaced.
@@ -2050,7 +2084,7 @@ mod tests {
             "notes".into(),
             "Soft jaws. · Planner: Vise. Torque 40 Nm.".into(),
         );
-        apply_with_setup_1_note(&mut a, "Clamps.");
+        apply_with_setup_1_note(&mut a, &base, "Clamps.");
         assert_eq!(
             get(&a.doc.setups[0].p, "notes"),
             "Soft jaws. Torque 40 Nm. · Planner: Clamps."
@@ -2060,14 +2094,14 @@ mod tests {
         a.doc.setups[0]
             .p
             .insert("notes".into(), "Planner: Alice checks jaws.".into());
-        apply_with_setup_1_note(&mut a, "Vise.");
+        apply_with_setup_1_note(&mut a, &base, "Vise.");
         assert_eq!(
             get(&a.doc.setups[0].p, "notes"),
             "Planner: Alice checks jaws. · Planner: Vise."
         );
         // A plan without a note for setup 1 removes its earlier one and
         // keeps nothing to remove later.
-        apply_with_setup_1_note(&mut a, "");
+        apply_with_setup_1_note(&mut a, &base, "");
         assert_eq!(
             get(&a.doc.setups[0].p, "notes"),
             "Planner: Alice checks jaws."
@@ -2935,7 +2969,8 @@ mod tests {
         assert_ne!(workspace, framed);
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
-        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, true))));
+        // The camera is steered without the view, so none is built here.
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
         assert_eq!(format!("{:?}", a.plan_camera), framed, "starts framed");
         for event in [
             Event::Orbit(0.5, -0.2),
@@ -3081,9 +3116,13 @@ mod tests {
             requests: 4,
         });
         let _ = a.view();
-        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        let with_view = checked_preview(&a, true);
+        a.planner = crate::Planner::Preview(std::sync::Arc::new(crate::PlanPreview {
+            outcome: with_view.outcome.clone(),
+            view: None,
+        }));
         let _ = a.view();
-        a.planner = crate::Planner::Preview(checked_preview(&a, true));
+        a.planner = crate::Planner::Preview(with_view);
         let _ = a.view();
         a.undo = Some(a.doc.clone());
         let _ = a.view();
@@ -3553,11 +3592,13 @@ mod tests {
             let _ = a.update(Message::PlanFinished(epoch, Err(failure)));
             assert!(a.usage_limit);
         };
+        // The job does not change here, so one checked plan serves every run.
+        let checked = checked_preview(&a, false);
         limited(&mut a);
         assert_eq!(a.account_note, ApiError::UsageLimit.message());
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
-        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked.clone())));
         assert!(matches!(a.planner, crate::Planner::Preview(_)));
         assert!(!a.usage_limit);
         assert_eq!(
@@ -3579,18 +3620,21 @@ mod tests {
         );
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
-        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked.clone())));
         assert!(!a.usage_limit);
         assert_eq!(a.account_note, "", "the fallback sentence goes with it");
         // Another note stays.
         a.account_note = "Connection works: gpt-6.1-sol answered.".into();
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
-        let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
+        let _ = a.update(Message::PlanFinished(epoch, Ok(checked.clone())));
         assert_eq!(a.account_note, "Connection works: gpt-6.1-sol answered.");
         // A follow-up request that hit the limit keeps the banner.
         limited(&mut a);
-        let mut preview = std::sync::Arc::try_unwrap(checked_preview(&a, false)).unwrap();
+        let mut preview = crate::PlanPreview {
+            outcome: checked.outcome.clone(),
+            view: None,
+        };
         preview.outcome.note = Some(ApiError::UsageLimit);
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;

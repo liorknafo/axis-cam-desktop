@@ -725,14 +725,22 @@ impl Backend for OpenAiBackend {
         Ok(reply.text)
     }
 }
-/// The stock after the whole job, meshed for the preview's 3D view.
+/// The stock after the whole job, meshed at Standard detail for the
+/// preview's 3D view.
 pub fn final_view(job: &Document, mesh: &Mesh) -> Option<crate::simulation::Simulation> {
+    final_view_at(job, mesh, crate::stock_surface::Detail::Standard)
+}
+/// `final_view` meshed at `detail`; tests use Draft, which is faster.
+pub(crate) fn final_view_at(
+    job: &Document,
+    mesh: &Mesh,
+    detail: crate::stock_surface::Detail,
+) -> Option<crate::simulation::Simulation> {
     let si = job.setups.len().checked_sub(1)?;
     let oi = job.setups[si].operations.iter().rposition(|o| o.enabled)?;
     let mut sim = crate::simulation::prepare(job, mesh, si, oi).ok()?;
     sim.seek(1.);
     let volume = sim.volume.as_ref()?;
-    let detail = crate::stock_surface::Detail::Standard;
     let surface = crate::stock_surface::Snapshot {
         bounds: volume.bounds,
         frame: volume.frame,
@@ -2477,9 +2485,12 @@ pub(crate) mod tests {
     }
     #[test]
     fn the_final_view_shows_the_stock_after_every_operation() {
+        use crate::stock_surface::Detail;
         let (doc, mesh, report) = block();
         let job = proposal::build(&doc, &mesh, &report, &good(&report)).unwrap();
-        let view = final_view(&job, &mesh).unwrap();
+        // Meshed at Draft to keep the test fast; the app's view uses Standard,
+        // through the same function.
+        let view = final_view_at(&job, &mesh, Detail::Draft).unwrap();
         assert_eq!(view.plan.setup, job.setups[1].id);
         assert_eq!(view.plan.operation, job.setups[1].operations[1].id);
         assert!(
@@ -2487,6 +2498,8 @@ pub(crate) mod tests {
                 .as_ref()
                 .is_some_and(|s| !s.triangles.is_empty())
         );
+        assert_eq!(view.stock_surface_detail, Detail::Draft);
+        assert_eq!(view.stock_surface_seconds, view.seconds);
         assert_eq!(view.preceding, 5);
         let mut empty = job.clone();
         empty.setups[1]
