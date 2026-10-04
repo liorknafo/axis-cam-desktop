@@ -429,7 +429,7 @@ impl App {
                 .tools
                 .first()
                 .cloned()
-                .unwrap_or_else(|| Tool::new("", "Flat end mill", "6")),
+                .unwrap_or_else(|| blank_tool(&doc)),
             doc,
             page: Page::Home,
             selected: None,
@@ -537,7 +537,7 @@ impl App {
             .tools
             .first()
             .cloned()
-            .unwrap_or_else(|| Tool::new("", "Flat end mill", "6"));
+            .unwrap_or_else(|| blank_tool(&doc));
         self.doc = doc;
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -1576,7 +1576,7 @@ impl App {
                         .tools
                         .first()
                         .cloned()
-                        .unwrap_or_else(|| Tool::new("", "Flat end mill", "6"));
+                        .unwrap_or_else(|| blank_tool(&self.doc));
                     self.touch()
                 }
             }
@@ -2679,6 +2679,14 @@ fn merge_sample(user: &Document) -> (Document, String) {
         )
     };
     (doc, status)
+}
+/// The tool editor's draft when the library is empty, with the next free
+/// tool number so that its first Save is accepted.
+fn blank_tool(doc: &Document) -> Tool {
+    let mut tool = Tool::new("", "Flat end mill", "6");
+    tool.p
+        .insert("number".into(), doc.next_tool_number().to_string());
+    tool
 }
 /// A status line, followed by `storage::NUMBERED_TOOLS` when the loaded
 /// project's tools were numbered.

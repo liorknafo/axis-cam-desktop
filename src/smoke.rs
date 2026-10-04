@@ -1013,6 +1013,27 @@ mod tests {
         assert!(!a.status.contains("LinuxCNC tool table"), "{}", a.status);
     }
     #[test]
+    fn the_first_save_on_an_empty_library_gets_a_tool_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        // Tool library from the start screen, without New tool.
+        let _ = a.update(Message::Page(Page::Tools));
+        let _ = a.update(Message::Edit(Target::Tool, "name", "Flat 6".into()));
+        let _ = a.update(Message::SaveTool);
+        assert_eq!(a.doc.tools.len(), 1, "{}", a.status);
+        assert_eq!(a.doc.tools[0].number(), Some(1));
+        // After the last tool is deleted, and after New project on an empty library.
+        let id = a.doc.tools[0].id.clone();
+        let _ = a.update(Message::DeleteTool(id));
+        assert_eq!(a.tool_draft.number(), Some(1));
+        a.doc.tools.clear();
+        a.replace_document(Document::default(), None);
+        let _ = a.update(Message::Edit(Target::Tool, "name", "Drill 3".into()));
+        let _ = a.update(Message::SaveTool);
+        assert_eq!(a.doc.tools.len(), 1, "{}", a.status);
+        assert_eq!(a.doc.tools[0].number(), Some(1));
+    }
+    #[test]
     fn failed_archive_and_pending_file_actions_do_not_reset_work() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
