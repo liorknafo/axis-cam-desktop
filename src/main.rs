@@ -5,6 +5,7 @@ mod choice_help;
 #[cfg(test)]
 mod fake_openai;
 mod help;
+mod holding;
 mod material;
 mod mesh;
 mod model;
