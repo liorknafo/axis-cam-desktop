@@ -1028,37 +1028,75 @@ impl Document {
             self.workholding = crate::holding::starters();
         }
     }
-    /// What is wrong with setup `setup`'s modelled workholding: its layout,
-    /// its library entry, and for a vise the stock being wider across the jaws
-    /// than the vise opens (when the stock can be told, from the part `mesh`).
+    /// The starting stock box of setup `setup` in that setup's frame, in
+    /// millimetres: the first setup's own stock, and for a later one the first
+    /// setup's stock carried into its frame, as the simulation does (its own
+    /// stock keys are ignored). None when it cannot be told: the first
+    /// setup's stock cannot be resolved, a later setup needs the part `mesh`
+    /// (to place its frame) or has no valid rotation and translation.
+    pub fn setup_stock(
+        &self,
+        setup: usize,
+        mesh: Option<&crate::mesh::Mesh>,
+    ) -> Option<crate::mesh::Bounds> {
+        use crate::volume::Frame;
+        let first = crate::stock::resolve(self.setups.first()?, mesh)
+            .ok()?
+            .stock;
+        if setup == 0 {
+            return Some(first);
+        }
+        let (later, mesh) = (self.setups.get(setup)?, mesh?);
+        let placed = ["rx", "ry", "rz", "tx", "ty", "tz"]
+            .iter()
+            .all(|k| num(&later.p, k).is_some());
+        placed.then(|| {
+            Frame::new(&self.setups[0], mesh).transfer_bounds(first, Frame::new(later, mesh))
+        })
+    }
+    /// What is wrong with setup `setup`'s modelled workholding: its library
+    /// entry (none chosen, gone), then its layout, then the entry not fitting
+    /// the layout, and for a vise the stock being wider across the jaws than
+    /// the vise opens (when the stock can be told: `setup_stock`).
     pub fn holding_issues(&self, setup: usize, mesh: Option<&crate::mesh::Mesh>) -> Vec<String> {
-        use crate::holding::{DELETED, Layout, layout, opening_issue, refusal};
-        let Some(setup) = self.setups.get(setup) else {
+        use crate::holding::{DELETED, layout, opening_issue, refusal};
+        let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
-        let layout = match layout(setup) {
-            Ok(layout) => layout,
-            Err(error) => return vec![error],
+        let kind = match get(&s.p, "holding") {
+            "Vise" => "Vise",
+            "Clamps" => "Clamp",
+            _ => "",
         };
-        let (holder, kind) = match &layout {
-            Layout::None => return vec![],
-            Layout::Vise { holder, .. } => (holder, "vise"),
-            Layout::Clamps { holder, .. } => (holder, "clamp"),
-        };
-        if holder.is_empty() {
-            return vec![format!("Choose a {kind} from the library.")];
+        let id = get(&s.p, "holder");
+        let entry = self.holder(id);
+        let mut issues = vec![];
+        if !kind.is_empty() && id.is_empty() {
+            let none = !self.workholding.iter().any(|h| h.kind() == kind);
+            issues.push(format!(
+                "Choose a {} from the library.{}",
+                kind.to_lowercase(),
+                if none {
+                    " Add one on the Workholding page."
+                } else {
+                    ""
+                }
+            ));
+        } else if !kind.is_empty() && entry.is_none() {
+            issues.push(DELETED.into());
         }
-        let Some(entry) = self.holder(holder) else {
-            return vec![DELETED.into()];
-        };
-        if let Some(refused) = refusal(&layout, entry) {
-            return vec![refused];
+        match (layout(s), entry) {
+            (Err(error), _) => issues.push(error),
+            (Ok(layout), Some(entry)) if !kind.is_empty() => {
+                if let Some(refused) = refusal(&layout, entry) {
+                    issues.push(refused);
+                } else if let Some(stock) = self.setup_stock(setup, mesh) {
+                    issues.extend(opening_issue(&layout, entry, stock));
+                }
+            }
+            _ => {}
         }
-        crate::stock::resolve(setup, mesh)
-            .ok()
-            .and_then(|resolved| opening_issue(&layout, entry, resolved.stock))
-            .into_iter()
-            .collect()
+        issues
     }
     /// After a setup's `holding` or `holder` changed: a vise or clamps setup
     /// points at a library entry of its kind (its own when it has one, else
@@ -1907,5 +1945,139 @@ mod tests {
         assert_eq!(get(&none.setups[0].p, "holder"), "keep");
         assert_eq!(get(&none.setups[0].p, "holding_gap"), "");
         none.settle_holding(9);
+    }
+    fn two_setup_doc() -> Document {
+        let mut doc = doc_with_holding(&[
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "140"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+        ]);
+        // The second setup is turned 90 degrees about Z; its own stock keys
+        // are hidden in the editor and ignored.
+        let mut second = doc.setups[0].duplicate("G55");
+        for (k, v) in [
+            ("rz", "90"),
+            ("stock_x", "10"),
+            ("stock_y", "10"),
+            ("stock_z", "10"),
+        ] {
+            second.p.insert(k.into(), v.into());
+        }
+        doc.setups.push(second);
+        doc
+    }
+    fn dims(b: crate::mesh::Bounds) -> [f32; 3] {
+        b.dimensions().map(|v| (v * 100.).round() / 100.)
+    }
+    #[test]
+    fn a_later_setups_stock_is_the_first_setups_carried_into_its_frame() {
+        use crate::volume::{Frame, Volume};
+        let doc = two_setup_doc();
+        let mesh = crate::mesh::sample();
+        let first = doc.setup_stock(0, Some(&mesh)).unwrap();
+        assert_eq!(dims(first), [140., 100., 40.]);
+        let second = doc.setup_stock(1, Some(&mesh)).unwrap();
+        assert_eq!(dims(second), [100., 140., 40.]);
+        // Exactly what the simulation hands the second setup.
+        let carried = Volume::new(first, Frame::new(&doc.setups[0], &mesh))
+            .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
+        assert_eq!(second, carried);
+        // The first setup's fixed stock needs no part; a later setup's frame does.
+        assert_eq!(dims(doc.setup_stock(0, None).unwrap()), [140., 100., 40.]);
+        assert_eq!(doc.setup_stock(1, None), None);
+        assert_eq!(doc.setup_stock(2, Some(&mesh)), None);
+        // Relative stock needs the part even for the first setup.
+        let mut relative = doc.clone();
+        relative.setups[0]
+            .p
+            .insert("stock_type".into(), "Relative size box".into());
+        assert_eq!(relative.setup_stock(0, None), None);
+        assert!(relative.setup_stock(0, Some(&mesh)).is_some());
+        // A first stock that cannot be told, or a later setup with no valid
+        // placement, gives none.
+        let mut bad = doc.clone();
+        bad.setups[0].p.insert("stock_x".into(), "wide".into());
+        assert_eq!(bad.setup_stock(0, Some(&mesh)), None);
+        assert_eq!(bad.setup_stock(1, Some(&mesh)), None);
+        let mut unplaced = doc.clone();
+        unplaced.setups[1].p.insert("rz".into(), "turn".into());
+        assert_eq!(unplaced.setup_stock(1, Some(&mesh)), None);
+        assert!(unplaced.setup_stock(0, Some(&mesh)).is_some());
+        assert_eq!(Document::default().setup_stock(0, Some(&mesh)), None);
+    }
+    #[test]
+    fn the_opening_check_of_a_later_setup_uses_the_stock_it_really_starts_from() {
+        let mut doc = two_setup_doc();
+        let mesh = crate::mesh::sample();
+        let vise = starter(&doc, "Vise");
+        for s in &mut doc.setups {
+            for (k, v) in [("holding", "Vise"), ("vise_grip", "8")] {
+                s.p.insert(k.into(), v.into());
+            }
+            s.p.insert("holder".into(), vise.clone());
+        }
+        let issues = |doc: &Document, i: usize| doc.holding_issues(i, Some(&mesh));
+        let wide = "The stock is 140 mm across the jaws; this vise opens to 120 mm.";
+        // Setup 1 is 140 across X and 100 across Y.
+        assert_eq!(issues(&doc, 0), [wide]);
+        doc.setups[0].p.insert("vise_axis".into(), "Y".into());
+        assert!(issues(&doc, 0).is_empty());
+        // Setup 2 starts from the same stock turned: 100 across X, 140 across Y.
+        assert!(issues(&doc, 1).is_empty());
+        doc.setups[1].p.insert("vise_axis".into(), "Y".into());
+        assert_eq!(issues(&doc, 1), [wide]);
+        // Without the part the later setup's frame is not known: no opinion.
+        assert!(doc.holding_issues(1, None).is_empty());
+    }
+    #[test]
+    fn a_missing_entry_comes_first_and_says_where_to_add_one() {
+        use crate::holding::DELETED;
+        let mut doc = doc_with_holding(&[("holding", "Vise")]);
+        // No vise in the library and no grip: the entry first, then the grip.
+        doc.workholding.retain(|h| h.kind() != "Vise");
+        assert_eq!(
+            doc.holding_issues(0, None),
+            [
+                "Choose a vise from the library. Add one on the Workholding page.",
+                "The vise grip must be a positive number."
+            ]
+        );
+        doc.setup_mut().p.insert("vise_grip".into(), "8".into());
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["Choose a vise from the library. Add one on the Workholding page."]
+        );
+        // The library has a vise, but none is chosen: no pointer to the page.
+        doc.workholding = crate::holding::starters();
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["Choose a vise from the library."]
+        );
+        // Clamps likewise.
+        let mut clamps = doc_with_holding(&[("holding", "Clamps")]);
+        clamps.workholding.retain(|h| h.kind() != "Clamp");
+        assert_eq!(
+            clamps.holding_issues(0, None),
+            [
+                "Choose a clamp from the library. Add one on the Workholding page.",
+                "Place 1 to 8 clamps."
+            ]
+        );
+        // An entry that was deleted comes before the layout's error too.
+        doc.setup_mut().p.insert("holder".into(), "gone".into());
+        doc.setup_mut().p.insert("vise_offset".into(), "far".into());
+        assert_eq!(
+            doc.holding_issues(0, None),
+            [DELETED, "The vise offset must be a number."]
+        );
+        // No workholding and a choice that is not one: only the layout speaks.
+        let mut none = doc_with_holding(&[("holder", "gone")]);
+        assert!(none.holding_issues(0, None).is_empty());
+        none.setup_mut().p.insert("holding".into(), "Glue".into());
+        assert_eq!(
+            none.holding_issues(0, None),
+            ["\"Glue\" is not a workholding choice."]
+        );
     }
 }

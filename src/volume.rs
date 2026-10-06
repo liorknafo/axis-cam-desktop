@@ -37,6 +37,28 @@ impl Frame {
     pub fn transfer(self, p: [f32; 3], to: Self) -> [f32; 3] {
         to.map(self.unmap(p))
     }
+    /// The box around `bounds` (in this frame) as seen in the frame `to`.
+    pub fn transfer_bounds(self, bounds: Bounds, to: Self) -> Bounds {
+        let mut out = Bounds {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+        };
+        for mask in 0..8 {
+            let p = std::array::from_fn(|k| {
+                if mask & (1 << k) == 0 {
+                    bounds.min[k]
+                } else {
+                    bounds.max[k]
+                }
+            });
+            let p = self.transfer(p, to);
+            for k in 0..3 {
+                out.min[k] = out.min[k].min(p[k]);
+                out.max[k] = out.max[k].max(p[k]);
+            }
+        }
+        out
+    }
     /// Whether the axes of `self` are parallel to the axes of `to` (any multiple of 90°).
     pub fn square_to(self, to: Self) -> bool {
         [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]
@@ -91,25 +113,7 @@ impl Volume {
         (self.occupied.len() - self.remaining) as f32 * self.cell.iter().product::<f32>()
     }
     pub fn transformed_bounds(&self, to: Frame) -> Bounds {
-        let mut bounds = Bounds {
-            min: [f32::INFINITY; 3],
-            max: [f32::NEG_INFINITY; 3],
-        };
-        for mask in 0..8 {
-            let p = std::array::from_fn(|k| {
-                if mask & (1 << k) == 0 {
-                    self.bounds.min[k]
-                } else {
-                    self.bounds.max[k]
-                }
-            });
-            let p = self.frame.transfer(p, to);
-            for k in 0..3 {
-                bounds.min[k] = bounds.min[k].min(p[k]);
-                bounds.max[k] = bounds.max[k].max(p[k]);
-            }
-        }
-        bounds
+        self.frame.transfer_bounds(self.bounds, to)
     }
     pub fn cut(
         &mut self,

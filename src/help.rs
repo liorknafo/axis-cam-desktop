@@ -551,7 +551,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "vise_axis") => (
-            "Which sides of the stock the jaws face: X sides put one jaw on the −X side and one on the +X side, Y sides on −Y and +Y. The stock must fit within the vise's maximum opening across the jaws.",
+            "Which sides of the stock the jaws face: X sides put one jaw on the −X side and one on the +X side, Y sides on −Y and +Y. A stock wider across the jaws than the vise's maximum opening shows an issue.",
             None,
         ),
         (Target::Setup, "vise_offset") => (
@@ -559,11 +559,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "vise_grip") => (
-            "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. The jaws are modelled from far below the stock up to it, so the stock above is free to cut. It starts at the vise's own grip.",
+            "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. The jaws are modelled from far below the stock up to it; the stock above it is not covered by the modelled jaws. It starts at the vise's own grip.",
             None,
         ),
         (Target::Setup, "holding_gap") => (
-            "The clearance kept around the jaws or clamps, in mm: each box is grown by it when toolpaths are checked against it. 0 or more; left empty it is 2 mm.",
+            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm.",
             None,
         ),
         (Target::Setup, "clamps") => (
@@ -1806,6 +1806,38 @@ mod tests {
             assert_ne!(body, unknown, "{key}");
             assert!(!body.contains("cutter"), "{key}: {body}");
         }
+        // Nothing checks toolpaths against the modelled workholding yet, so no
+        // text of this page says it does or promises what the model leaves free.
+        for (target, key) in [
+            (Target::Setup, "holding"),
+            (Target::Setup, "holder"),
+            (Target::Setup, "vise_axis"),
+            (Target::Setup, "vise_offset"),
+            (Target::Setup, "vise_grip"),
+            (Target::Setup, "holding_gap"),
+            (Target::Setup, "clamps"),
+            (Target::Holder, "jaw_width"),
+            (Target::Holder, "jaw_height"),
+            (Target::Holder, "jaw_thickness"),
+            (Target::Holder, "max_opening"),
+            (Target::Holder, "grip"),
+            (Target::Holder, "length"),
+            (Target::Holder, "bite"),
+        ] {
+            let body = field_help(key, "x", target).body;
+            for claim in ["check", "refus", "toolpath", "free to cut", "safe"] {
+                assert!(!body.contains(claim), "{key}: {body}");
+            }
+        }
+        assert_eq!(
+            field_help("holding_gap", "x", Target::Setup).body,
+            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm."
+        );
+        assert!(
+            field_help("vise_grip", "x", Target::Setup)
+                .body
+                .contains("the stock above it is not covered by the modelled jaws")
+        );
         let clamps = field_help("clamps", "x", Target::Setup).body;
         for part in ["side:offset", "-X", "+X", "-Y", "+Y", "8"] {
             assert!(clamps.contains(part), "{part}: {clamps}");

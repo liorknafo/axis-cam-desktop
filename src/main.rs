@@ -1382,10 +1382,14 @@ impl App {
                     self.touch()
                 }
                 Target::Setup => {
-                    // A pick_list repeats the chosen item; that is not a change.
-                    if matches!(k, "holding" | "holder" | "vise_axis")
-                        && get(&self.doc.setup().p, k) == v
-                    {
+                    // A pick_list repeats the chosen item, which may be the
+                    // default it shows for an empty value: not a change.
+                    let shown = match (k, get(&self.doc.setup().p, k)) {
+                        ("holding", "") => "None",
+                        ("vise_axis", "") => "X",
+                        (_, value) => value,
+                    };
+                    if matches!(k, "holding" | "holder" | "vise_axis") && shown == v {
                         return Task::none();
                     }
                     self.doc.setup_mut().p.insert(k.into(), v);
@@ -2533,6 +2537,24 @@ impl App {
                         get(&tool.p, "number")
                     );
                     self.doc.tools.push(tool);
+                }
+                // The same for a workholding entry a restored setup uses; its
+                // name is made new when another entry has taken it.
+                for id in before
+                    .setups
+                    .iter()
+                    .filter(|s| matches!(get(&s.p, "holding"), "Vise" | "Clamps"))
+                    .map(|s| get(&s.p, "holder"))
+                {
+                    if let (None, Some(entry)) = (self.doc.holder(id), before.holder(id)) {
+                        let mut entry = entry.clone();
+                        if !self.doc.holder_name_issues(&entry).is_empty() {
+                            let name = proposal::clip(entry.name(), material::NAME_LIMIT - 11);
+                            entry.p.insert("name".into(), format!("{name} (restored)"));
+                        }
+                        status += &format!(" {} is back in the workholding library.", entry.name());
+                        self.doc.workholding.push(entry);
+                    }
                 }
                 self.doc.setups = before.setups;
                 self.doc.active = before.active;

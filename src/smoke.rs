@@ -2064,6 +2064,15 @@ mod tests {
     fn picking_the_chosen_holder_again_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
+        // A setup with no value shows None and X sides: picking those is no change.
+        a.project_dirty = false;
+        a.status = "Kept.".into();
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
+        let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "X".into()));
+        assert!(!a.project_dirty);
+        assert_eq!(a.status, "Kept.");
+        assert!(!a.doc.setup().p.contains_key("holding"));
+        assert!(!a.doc.setup().p.contains_key("vise_axis"));
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "Y".into()));
         let vise = first_of(&a, "Vise");
@@ -2122,12 +2131,20 @@ mod tests {
             assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0");
             assert_eq!(a.clamps_field(), (text.into(), Some(error.into())));
         }
-        // Another setup shows its own text; this one's draft is back on return.
+        // Another setup shows its own text. Only one draft is kept: this
+        // setup's is back on return unless a text that does not read was typed
+        // in another setup meanwhile, which takes its place.
         let _ = a.update(Message::SetClamps("-X:".into()));
         let _ = a.update(Message::DuplicateSetup);
         assert_eq!(a.clamps_field(), ("-X:0;+X:0".into(), None));
         let _ = a.update(Message::SelectSetup(0));
         assert_eq!(a.clamps_field().0, "-X:");
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetClamps("-Q".into()));
+        assert_eq!(a.clamps_field().0, "-Q");
+        let _ = a.update(Message::SelectSetup(0));
+        assert_eq!(a.clamps_field(), ("-X:0;+X:0".into(), None));
+        let _ = a.update(Message::SetClamps("-X:".into()));
         // A valid text clears the draft and is kept as typed; a valid text from
         // another writer drops a draft typed over the old one.
         let _ = a.update(Message::SetClamps("+Y: 4".into()));
@@ -2186,8 +2203,19 @@ mod tests {
             ["The workholding entry was deleted; choose another."]
         );
         let _ = a.view();
-        // A bad number is the layout's error.
+        // A bad number is the layout's error, after the entry's.
         edit_setup(&mut a, &[("vise_offset", "far")]);
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            [
+                "The workholding entry was deleted; choose another.",
+                "The vise offset must be a number."
+            ]
+        );
+        let vise = crate::holding::starters().remove(0);
+        let id = vise.id.clone();
+        a.doc.workholding.push(vise);
+        edit_setup(&mut a, &[("holder", &id)]);
         assert_eq!(
             crate::ui::holding_lines(&a),
             ["The vise offset must be a number."]
@@ -2240,6 +2268,115 @@ mod tests {
             blank.page = page;
             let _ = blank.view();
         }
+    }
+    #[test]
+    fn a_setup_with_no_entry_of_its_kind_says_so_before_any_number_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.doc.workholding.retain(|h| h.kind() == "Clamp");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(get(&a.doc.setup().p, "holder"), "");
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            [
+                "Choose a vise from the library. Add one on the Workholding page.",
+                "The vise grip must be a positive number."
+            ]
+        );
+        let _ = a.update(Message::SetupEditor);
+        let _ = a.view();
+        // Adding a vise on the Workholding page and choosing it settles both.
+        let _ = a.update(Message::NewHolder("Vise"));
+        edit_holder(
+            &mut a,
+            &[
+                ("name", "Kurt"),
+                ("jaw_width", "150"),
+                ("jaw_height", "40"),
+                ("jaw_thickness", "25"),
+                ("max_opening", "180"),
+                ("grip", "10"),
+            ],
+        );
+        let _ = a.update(Message::SaveHolder);
+        let kurt = first_of(&a, "Vise");
+        let _ = a.update(Message::Edit(Target::Setup, "holder", kurt));
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "10");
+        assert!(
+            crate::ui::holding_lines(&a).is_empty(),
+            "{:?}",
+            crate::ui::holding_lines(&a)
+        );
+    }
+    #[test]
+    fn undo_brings_back_a_workholding_entry_deleted_after_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let vise = first_of(&a, "Vise");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(get(&a.doc.setups[0].p, "holder"), vise);
+        apply_checked_plan(&mut a);
+        // The applied job's setup 1 keeps the vise; once it models none, the
+        // entry can be deleted.
+        let _ = a.update(Message::DeleteHolder(vise.clone()));
+        assert!(a.doc.holder(&vise).is_some(), "{}", a.status);
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        let _ = a.update(Message::DeleteHolder(vise.clone()));
+        assert!(a.doc.holder(&vise).is_none(), "{}", a.status);
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(
+            a.doc.workholding.iter().filter(|h| h.id == vise).count(),
+            1,
+            "the vise is back once"
+        );
+        assert_eq!(get(&a.doc.setups[0].p, "holder"), vise);
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        assert!(a.doc.validate_structure().is_ok());
+        assert!(
+            a.status
+                .ends_with(" 100 mm machine vise is back in the workholding library."),
+            "{}",
+            a.status
+        );
+        // An entry that was never deleted is not added again.
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let count = a.doc.workholding.len();
+        apply_checked_plan(&mut a);
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(a.doc.workholding.len(), count);
+        assert!(!a.status.contains("workholding library"), "{}", a.status);
+        // A name another entry has taken since is made new.
+        let mut a = signed_in_planning_app(&dir);
+        let vise = first_of(&a, "Vise");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        apply_checked_plan(&mut a);
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        let _ = a.update(Message::DeleteHolder(vise.clone()));
+        let _ = a.update(Message::NewHolder("Vise"));
+        edit_holder(
+            &mut a,
+            &[
+                ("name", "100 MM machine vise"),
+                ("jaw_width", "100"),
+                ("jaw_height", "30"),
+                ("jaw_thickness", "20"),
+                ("max_opening", "120"),
+                ("grip", "8"),
+            ],
+        );
+        let _ = a.update(Message::SaveHolder);
+        let _ = a.update(Message::UndoPlan);
+        let back = a.doc.holder(&vise).unwrap();
+        assert_eq!(back.name(), "100 mm machine vise (restored)");
+        assert!(back.issues().is_empty());
+        assert!(a.doc.holder_name_issues(back).is_empty());
+        assert!(
+            a.status
+                .ends_with(" 100 mm machine vise (restored) is back in the workholding library."),
+            "{}",
+            a.status
+        );
     }
     #[test]
     fn a_replaced_project_forgets_the_typed_clamp_text() {
