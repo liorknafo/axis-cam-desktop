@@ -714,6 +714,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             } else {
                 None
             },
+            holding: holding_boxes(app),
         })
         .width(Fill)
         .height(Fill)
@@ -1352,9 +1353,11 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
         }
         _ => {}
     }
+    c = c.push(rule::horizontal(1)).push(warnings(app.op_issues()));
+    if let Some((heading, lines)) = holding_warning(app) {
+        c = c.push(caution(heading, lines));
+    }
     c = c
-        .push(rule::horizontal(1))
-        .push(warnings(app.op_issues()))
         .push(
             primary(
                 if app.is_sample() {
@@ -1995,6 +1998,62 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
         kind,
         Target::Setup,
     )
+}
+/// The jaws or clamps the 3D view draws with the stock: the active setup's,
+/// round the stock of the preview shown or else the setup's own. None when
+/// the stock is hidden, the setup has no workholding or it cannot be modelled
+/// (the setup editor says why).
+pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
+    let boxes = || {
+        let setup = app
+            .doc
+            .active_setup()
+            .filter(|s| app.stock && matches!(get(&s.p, "holding"), "Vise" | "Clamps"))?;
+        let stock = app
+            .active_simulation()
+            .map(|sim| sim.plan.stock)
+            .or_else(|| app.doc.setup_stock(app.doc.index(), app.part_mesh()))?;
+        app.doc.holding_boxes(setup, stock).ok()
+    };
+    boxes().unwrap_or_default()
+}
+/// The inspector's warning about the preview shown: a heading and a line for
+/// each place where the generated operation's own toolpath comes within the
+/// gap of the setup's jaws or clamps, in work coordinates (the setup's frame
+/// when the work zero cannot be told), or why that was not checked. None when
+/// there is nothing to say. It never blocks: the export refuses these hits
+/// too, and those of the links, approaches and retracts.
+pub(crate) fn holding_warning(app: &App) -> Option<(String, Vec<String>)> {
+    let (sim, op, setup) = (
+        app.active_simulation()?,
+        app.operation()?,
+        app.doc.active_setup()?,
+    );
+    let plan = &sim.plan;
+    let boxes = match app.doc.holding_boxes(setup, plan.stock) {
+        Ok(boxes) => boxes,
+        Err(error) => {
+            return Some((
+                "Workholding is not checked for this operation".into(),
+                vec![error],
+            ));
+        }
+    };
+    let gap = crate::holding::gap(setup).unwrap_or_default();
+    let datum = app
+        .part_mesh()
+        .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok())
+        .unwrap_or_default();
+    let lines: Vec<String> = crate::holding::hits(plan, &boxes, gap)
+        .iter()
+        .map(|hit| crate::holding::message(op.name(), hit, gap, datum))
+        .collect();
+    (!lines.is_empty()).then(|| {
+        (
+            "Too close to the workholding (export will refuse this)".into(),
+            lines,
+        )
+    })
 }
 /// What is wrong with the active setup's workholding, as the setup editor
 /// lists it under the controls.
@@ -3137,6 +3196,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             show_stock: true,
             show_paths: false,
             progress: None,
+            holding: vec![],
         })
         .width(Fill)
         .height(380)

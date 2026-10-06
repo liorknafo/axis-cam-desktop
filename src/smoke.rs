@@ -2756,6 +2756,200 @@ mod tests {
             crate::ui::holding_lines(&a)
         );
     }
+    /// The fixture job with its first setup held by the starter clamp, on -X
+    /// at `bite` mm onto the stock (12 reaches only the stock's edge, 40 the
+    /// pocket), written on the setup directly so that nothing is suggested.
+    fn clamped_app(dir: &tempfile::TempDir, bite: &str) -> App {
+        let mut a = planning_app(dir);
+        let id = first_of(&a, "Clamp");
+        a.doc
+            .workholding
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .p
+            .insert("bite".into(), bite.into());
+        let p = &mut a.doc.setups[0].p;
+        for (k, v) in [("holding", "Clamps"), ("holder", &id), ("clamps", "-X:0")] {
+            p.insert(k.into(), v.into());
+        }
+        a
+    }
+    /// What the preview of the shown operation should say about its own plan.
+    fn expected_hits(a: &App) -> Vec<String> {
+        let sim = a.active_simulation().unwrap();
+        let (setup, mesh) = (a.doc.setup(), a.imported_mesh.as_ref().unwrap());
+        let boxes = a.doc.holding_boxes(setup, sim.plan.stock).unwrap();
+        let datum = crate::post::datum(setup, sim.plan.stock, mesh).unwrap();
+        crate::holding::hits(&sim.plan, &boxes, 2.)
+            .iter()
+            .map(|hit| crate::holding::message(a.operation().unwrap().name(), hit, 2., datum))
+            .collect()
+    }
+    #[test]
+    fn the_operation_preview_warns_when_the_toolpath_comes_within_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = clamped_app(&dir, "40");
+        assert_eq!(a.doc.setups[0].operations[1].name(), "Pocket");
+        let _ = a.update(Message::SelectOp(1));
+        // Nothing is said before the operation is generated.
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        let _ = a.view();
+        let _ = a.update(Message::Generate);
+        assert!(a.playback_ready(), "{}", a.status);
+        let expected = expected_hits(&a);
+        assert_eq!(expected.len(), 1);
+        assert!(
+            expected[0].starts_with("Pocket: the tool hits the clamp on -X at 0 at X-22.0 Y"),
+            "{expected:?}"
+        );
+        assert_eq!(
+            crate::ui::holding_warning(&a),
+            Some((
+                "Too close to the workholding (export will refuse this)".to_string(),
+                expected
+            ))
+        );
+        for tab in ["Tool", "Heights", "Passes", "Linking"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            assert!(crate::ui::holding_warning(&a).is_some(), "{tab}");
+            let _ = a.view();
+        }
+        // The warning never blocks: the preview is still there to play.
+        assert!(a.playback_ready());
+        // Picking geometry drops the preview, and the warning with it.
+        let _ = a.update(Message::Tab("Geometry".into()));
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        let _ = a.view();
+        // Another operation shown, or the operation edited, takes it away.
+        let _ = a.update(Message::SelectOp(0));
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        assert!(crate::ui::holding_warning(&a).is_some());
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "7000".into()));
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        // Moved clear of the pocket, the clamp is not in the way.
+        let _ = a.update(Message::Generate);
+        a.doc.setups[0].p.insert("clamps".into(), "-X:50".into());
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        let _ = a.view();
+        // A setup that cannot be modelled says the check did not run, with the editor's line.
+        a.doc.setups[0].p.insert("holder".into(), "gone".into());
+        assert_eq!(
+            crate::ui::holding_warning(&a),
+            Some((
+                "Workholding is not checked for this operation".to_string(),
+                vec![crate::holding::DELETED.to_string()]
+            ))
+        );
+        let _ = a.view();
+        // Without workholding there is nothing to say.
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        let _ = a.view();
+    }
+    #[test]
+    fn the_3d_view_gets_the_boxes_only_when_the_stock_is_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        assert!(a.stock);
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        let vise = first_of(&a, "Vise");
+        let p = &mut a.doc.setups[0].p;
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", &vise),
+            ("vise_axis", "Y"),
+            ("vise_grip", "8"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        let boxes = crate::ui::holding_boxes(&a);
+        let labels: Vec<_> = boxes.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["vise jaw on -Y", "vise jaw on +Y"]);
+        // They are the jaws round the setup's stock, without the gap.
+        let stock = a.doc.setup_stock(0, a.part_mesh()).unwrap();
+        let layout = crate::holding::layout(a.doc.setup()).unwrap();
+        let holder = a.doc.holder(&vise).unwrap();
+        assert_eq!(
+            boxes,
+            crate::holding::boxes(&layout, holder, stock).unwrap()
+        );
+        assert_eq!(boxes[1].bounds.min[1], stock.max[1]);
+        let _ = a.view();
+        // With a preview shown the plan's stock is the one used.
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        assert_eq!(crate::ui::holding_boxes(&a), boxes);
+        let _ = a.view();
+        // Hidden with the stock; not drawn when the setup cannot be modelled.
+        let _ = a.update(Message::ToggleStock);
+        assert!(!a.stock);
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        let _ = a.view();
+        let _ = a.update(Message::ToggleStock);
+        assert_eq!(crate::ui::holding_boxes(&a), boxes);
+        a.doc.setups[0].p.insert("holder".into(), "gone".into());
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        let _ = a.view();
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        // Clamps: one box each, on the sides asked for.
+        let clamp = first_of(&a, "Clamp");
+        for (k, v) in [
+            ("holding", "Clamps"),
+            ("holder", clamp.as_str()),
+            ("clamps", "-X:0;+Y:10"),
+        ] {
+            a.doc.setups[0].p.insert(k.into(), v.into());
+        }
+        let labels: Vec<_> = crate::ui::holding_boxes(&a)
+            .into_iter()
+            .map(|b| b.label)
+            .collect();
+        assert_eq!(labels, ["clamp on -X at 0", "clamp on +Y at 10"]);
+        let _ = a.view();
+    }
+    #[test]
+    fn the_nc_page_lists_what_a_modelled_setup_hits_and_leaves_other_setups_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = clamped_app(&dir, "40");
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.update(Message::Page(Page::Post));
+        let job = a.post.clone().unwrap();
+        assert!(!job.ready());
+        let problems = job.setups[0].result.as_ref().unwrap_err();
+        // The operations that come within the gap are named, at most the tool
+        // and the holder of each.
+        let named: Vec<_> = problems
+            .iter()
+            .map(|p| p.split(':').next().unwrap())
+            .collect();
+        assert!(
+            named.contains(&"Pocket") && named.contains(&"Facing"),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.ends_with("(within the 2 mm gap)."))
+        );
+        for name in &named {
+            assert!(
+                named.iter().filter(|n| *n == name).count() <= 2,
+                "{problems:?}"
+            );
+        }
+        let _ = a.view();
+        // The same job with no workholding exports.
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        a.invalidate_post();
+        let _ = a.update(Message::Page(Page::Post));
+        assert!(a.post.as_ref().is_some_and(|job| job.ready()));
+        let _ = a.view();
+    }
     #[test]
     fn undo_brings_back_a_workholding_entry_deleted_after_apply() {
         let dir = tempfile::tempdir().unwrap();
@@ -2763,6 +2957,9 @@ mod tests {
         let vise = first_of(&a, "Vise");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         assert_eq!(get(&a.doc.setups[0].p, "holder"), vise);
+        // The suggestion holds 3 mm; the plan's contour cuts down to 3 mm
+        // above the stock bottom, which is within the gap of jaws that high.
+        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         apply_checked_plan(&mut a);
         // The applied job's setup 1 keeps the vise; once it models none, the
         // entry can be deleted.
@@ -2789,6 +2986,9 @@ mod tests {
         // An entry that was never deleted is not added again.
         let mut a = signed_in_planning_app(&dir);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        // One clamp far along its side: the plan's facing covers the whole
+        // stock top, so any clamp on the stock is within its gap.
+        a.doc.setups[0].p.insert("clamps".into(), "-X:300".into());
         let count = a.doc.workholding.len();
         apply_checked_plan(&mut a);
         let _ = a.update(Message::UndoPlan);
@@ -2798,6 +2998,7 @@ mod tests {
         let mut a = signed_in_planning_app(&dir);
         let vise = first_of(&a, "Vise");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         apply_checked_plan(&mut a);
         a.doc.setups[0].p.insert("holding".into(), "None".into());
         let _ = a.update(Message::DeleteHolder(vise.clone()));

@@ -199,6 +199,7 @@ fn comment_lines(lead: &str, continued: &str, text: &str) -> Vec<String> {
 /// Printable ASCII on one line, without parentheses or repeated spaces.
 fn clean(s: &str) -> String {
     let mapped: String = s
+        .replace('±', "+-")
         .chars()
         .map(|c| match c {
             '(' | ')' => ' ',
@@ -401,6 +402,8 @@ pub struct Header<'a> {
     /// A Model-origin zero located for the operator (see `model_zero`).
     pub located: Option<(Bounds, Option<f32>)>,
     pub datum: [f32; 3],
+    /// The setup's modelled workholding in a sentence (`Document::holding_text`).
+    pub holding: Option<String>,
     pub disabled: Vec<String>,
 }
 struct Writer(String);
@@ -503,6 +506,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         ),
     );
     w.wrapped("Fixture: ", get(&setup.p, "fixture"));
+    if let Some(holding) = &h.holding {
+        w.wrapped("Workholding: ", holding);
+    }
     if !clean(get(&setup.p, "notes")).is_empty() {
         w.wrapped("Workholding: ", get(&setup.p, "notes"));
     }
@@ -1048,6 +1054,10 @@ pub(crate) fn prepare(
                 .into(),
         ]);
     }
+    let boxes = doc
+        .holding_boxes(setup, stock)
+        .map_err(|e| vec![format!("{}: {e}", setup.name())])?;
+    let gap = crate::holding::gap(setup).unwrap_or_default();
     let origin = get(&setup.p, "origin");
     if let (true, Some(volume), Some(frame)) = (
         origin == "Stock top center" || origin == "Stock top front-left",
@@ -1091,8 +1101,11 @@ pub(crate) fn prepare(
         let group_sims = &simulations[g];
         let plans: Vec<&Plan> = group_sims.iter().map(|s| &s.plan).collect();
         let blocks = blocks(group_ops, &plans, &settings);
-        let problems =
+        let mut problems =
             crate::post_check::check_setup(setup, group_ops, group_sims, &blocks, &settings, zero);
+        problems.extend(crate::post_check::holding_problems(
+            group_ops, &plans, &blocks, &settings, &boxes, gap, zero,
+        ));
         if !problems.is_empty() {
             return Err(problems);
         }
@@ -1105,6 +1118,7 @@ pub(crate) fn prepare(
             stock: plans[0].stock,
             located,
             datum: zero,
+            holding: doc.holding_text(setup),
             disabled: setup
                 .operations
                 .iter()
@@ -1469,6 +1483,7 @@ mod tests {
             stock: plan.stock,
             located: None,
             datum: [0., 0., 10.],
+            holding: None,
             disabled: vec![],
         };
         (emit(&header, &ops, &blocks, &settings), blocks, settings)
@@ -1546,6 +1561,7 @@ M2
                         stock: plan.stock,
                         located: None,
                         datum: [0., 0., 10.],
+                        holding: None,
                         disabled: vec![],
                     },
                     &ops,
@@ -2802,6 +2818,150 @@ M2
         assert_eq!(joined, format!("Use{long}here."));
         assert!(text.lines().all(|l| l.len() <= 202), "{text}");
     }
+    /// The fixture job reduced to its Pocket (its path lies within X -39 to
+    /// 23 and Y -15 to 15 of the stock's centre), with the starter library.
+    fn pocket_job() -> (Document, Mesh) {
+        let (mut doc, mesh) = fixture::job();
+        doc.adopt_holders();
+        doc.setups[0].operations.retain(|o| o.name() == "Pocket");
+        (doc, mesh)
+    }
+    /// Setup 1 held by the starter vise or clamp, with `pairs` on the setup.
+    fn hold(doc: &mut Document, kind: &str, pairs: &[(&str, &str)]) {
+        let id = doc
+            .workholding
+            .iter()
+            .find(|h| h.kind() == kind)
+            .unwrap()
+            .id
+            .clone();
+        let p = &mut doc.setups[0].p;
+        p.insert("holder".into(), id);
+        p.insert(
+            "holding".into(),
+            if kind == "Vise" { "Vise" } else { "Clamps" }.into(),
+        );
+        for (k, v) in pairs {
+            p.insert((*k).into(), (*v).into());
+        }
+    }
+    #[test]
+    fn workholding_over_the_toolpath_refuses_the_setup_and_clear_workholding_exports() {
+        use crate::holding;
+        let (mut doc, mesh) = pocket_job();
+        // No workholding: not checked, and an entry that is gone does not matter.
+        assert!(post_job(&doc, &mesh).ready());
+        doc.setups[0].p.insert("holder".into(), "gone".into());
+        assert!(post_job(&doc, &mesh).ready());
+        // A toe clamp on -X, 12 mm onto the stock, is clear of the pocket.
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0")]);
+        assert!(post_job(&doc, &mesh).ready());
+        // Reaching 40 mm onto the stock it is in the way: the setup is refused.
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        doc.workholding
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .p
+            .insert("bite".into(), "40".into());
+        let posted = post_job(&doc, &mesh);
+        assert!(!posted.ready());
+        let mut plans = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| plans.push(r.unwrap().plan));
+        let boxes = doc.holding_boxes(&doc.setups[0], plans[0].stock).unwrap();
+        let hit = &holding::hits(&plans[0], &boxes, 2.)[0];
+        let datum = datum(&doc.setups[0], plans[0].stock, &mesh).unwrap();
+        let expected = holding::message("Pocket", hit, 2., datum);
+        assert_eq!(errors(&posted), [expected.as_str()]);
+        // The clamp's inner face is X-22 in work coordinates; the rapids pass
+        // it 15 mm above the stock top.
+        assert!(
+            expected.starts_with("Pocket: the tool hits the clamp on -X at 0 at X-22.0 Y")
+                && expected.ends_with(" Z15.0 (within the 2 mm gap)."),
+            "{expected}"
+        );
+        // Moved along the side, clear of the pocket, it exports again.
+        doc.setups[0].p.insert("clamps".into(), "-X:50".into());
+        assert!(post_job(&doc, &mesh).ready());
+    }
+    #[test]
+    fn workholding_that_cannot_be_modelled_refuses_the_setup_with_the_editors_line() {
+        use crate::holding::DELETED;
+        let (mut doc, mesh) = pocket_job();
+        let refused = |doc: &Document| {
+            let posted = post_job(doc, &mesh);
+            assert!(!posted.ready());
+            errors(&posted)
+        };
+        // A deleted entry, none chosen, a clamp text that does not read.
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0"), ("holder", "gone")]);
+        assert_eq!(refused(&doc), [format!("Top: {DELETED}")]);
+        assert_eq!(doc.holding_issues(0, Some(&mesh))[0], DELETED);
+        doc.setups[0].p.insert("holder".into(), "".into());
+        assert_eq!(
+            refused(&doc),
+            ["Top: Choose a clamp from the library.".to_string()]
+        );
+        hold(&mut doc, "Clamp", &[("clamps", "-X")]);
+        assert_eq!(
+            refused(&doc),
+            ["Top: Write each clamp as side:offset, for example -X:0.".to_string()]
+        );
+        // The vise opens to 120 mm: the stock is 124 mm across X, 84 across Y.
+        hold(&mut doc, "Vise", &[("vise_axis", "X"), ("vise_grip", "8")]);
+        assert_eq!(
+            refused(&doc),
+            ["Top: The stock is 124 mm across the jaws; this vise opens to 120 mm.".to_string()]
+        );
+        assert_eq!(
+            doc.holding_issues(0, Some(&mesh)),
+            ["The stock is 124 mm across the jaws; this vise opens to 120 mm."]
+        );
+        doc.setups[0].p.insert("vise_axis".into(), "Y".into());
+        assert!(post_job(&doc, &mesh).ready());
+    }
+    #[test]
+    fn the_header_and_the_setup_sheet_say_what_holds_the_stock() {
+        let (mut doc, mesh) = pocket_job();
+        let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
+        // Without workholding neither names any.
+        assert!(!header(&doc).contains("Workholding"));
+        assert!(!doc.setup_sheet(Some(&mesh)).contains("Workholding"));
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let text = header(&doc);
+        assert!(
+            text.contains("(Fixture: Low profile clamps)\n(Workholding: 100 mm machine vise on +-Y, grip 8 mm, offset 0 mm, gap 2 mm.)\n(T1: "),
+            "{text}"
+        );
+        assert!(
+            doc.setup_sheet(Some(&mesh)).contains("Fixture: Low profile clamps\n\nWorkholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.\n\nRotation:")
+        );
+        // Four clamps, and the setup's own notes after them. A library name
+        // with active-comment words and brackets is written as text.
+        hold(
+            &mut doc,
+            "Clamp",
+            &[("clamps", "-X:0;+X:0;-Y:0;+Y:0"), ("notes", "Soft jaws")],
+        );
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        doc.workholding
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .p
+            .insert("name".into(), "Toe (MSG,hello) clamp Ø60".into());
+        let text = header(&doc);
+        assert!(
+            text.contains("(Fixture: Low profile clamps)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Workholding: Soft jaws)\n(T1: "),
+            "{text}"
+        );
+        assert_comments_begin_with_app_words(&text);
+        assert!(
+            doc.setup_sheet(Some(&mesh)).contains("Workholding: 4 × Toe (MSG,hello) clamp Ø60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.\n\nRotation:")
+        );
+        // The comment text keeps ± readable.
+        assert_eq!(comment("on ±Y"), "on +-Y");
+    }
     #[test]
     fn a_model_origin_header_locates_the_zero_from_the_part_and_the_stock_top() {
         let (job, mesh) = good_plan_job();
@@ -2985,6 +3145,7 @@ M2
                             stock: plan.stock,
                             located: Some((plan.stock, top)),
                             datum: [0., 0., 10.],
+                            holding: Some(user.clone()),
                             disabled: vec![user.clone()],
                         };
                         let text = emit(&header, &ops, &blocks, &settings);
@@ -3055,6 +3216,7 @@ M2
                 stock: plan.stock,
                 located: None,
                 datum: [0., 0., 10.],
+                holding: None,
                 disabled: vec![],
             };
             let text = emit(&header, &ops, &blocks, &settings);

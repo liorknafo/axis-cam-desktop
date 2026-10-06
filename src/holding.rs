@@ -254,10 +254,13 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
 }
 /// `v` mm for a message: up to two decimals, without trailing zeros.
 fn mm(v: f32) -> String {
-    format!("{v:.2}")
+    match format!("{v:.2}")
         .trim_end_matches('0')
         .trim_end_matches('.')
-        .to_string()
+    {
+        "-0" => "0".into(),
+        text => text.into(),
+    }
 }
 /// The vise's maximum opening is less than the stock is wide across the jaws.
 /// `stock` is the setup's starting stock box in millimetres.
@@ -510,6 +513,55 @@ pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
         boxes,
         gap,
     )
+}
+/// A hit as a problem line: the operation, the part of the tool, the box and
+/// where, in work coordinates (`datum` is the work zero in the setup's frame).
+pub fn message(operation: &str, hit: &Hit, gap: f32, datum: [f32; 3]) -> String {
+    let at = |k: usize| match format!("{:.1}", hit.at[k] - datum[k]).as_str() {
+        "-0.0" => "0.0".to_string(),
+        v => v.to_string(),
+    };
+    format!(
+        "{operation}: the {} hits the {} at X{} Y{} Z{} (within the {} mm gap).",
+        hit.part,
+        hit.label,
+        at(0),
+        at(1),
+        at(2),
+        mm(gap)
+    )
+}
+/// `layout` and its library entry in a sentence, for the setup sheet and the
+/// program header: what holds the stock, where and with what gap. Empty for
+/// no workholding.
+pub fn sentence(layout: &Layout, holder: &Holder) -> String {
+    let name = holder.name().trim();
+    match layout {
+        Layout::None => String::new(),
+        Layout::Vise {
+            axis_y,
+            offset,
+            grip,
+            gap,
+            ..
+        } => format!(
+            "{name} on ±{}, grip {} mm, offset {} mm, gap {} mm.",
+            if *axis_y { "Y" } else { "X" },
+            mm(*grip),
+            mm(*offset),
+            mm(*gap)
+        ),
+        Layout::Clamps { clamps, gap, .. } => format!(
+            "{} × {name} at {}, gap {} mm.",
+            clamps.len(),
+            clamps
+                .iter()
+                .map(|(side, offset)| format!("{} {}", side.label(), mm(*offset)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            mm(*gap)
+        ),
+    }
 }
 /// The least grip a suggested vise is reduced to, in mm.
 const MIN_GRIP: f32 = 3.;
@@ -1773,5 +1825,72 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+    #[test]
+    fn a_hit_reads_as_an_export_problem_in_work_coordinates() {
+        let hit = Hit {
+            label: "vise jaw on +Y".into(),
+            part: "tool",
+            at: [12.04, 51., 13.],
+        };
+        assert_eq!(
+            message("Contour", &hit, 2., [0., 10., 10.]),
+            "Contour: the tool hits the vise jaw on +Y at X12.0 Y41.0 Z3.0 (within the 2 mm gap)."
+        );
+        // The holder, a gap with decimals, and a hair below zero written as 0.0.
+        let hit = Hit {
+            label: "clamp on -X at 0".into(),
+            part: "holder",
+            at: [-5., 0.04, 20.],
+        };
+        assert_eq!(
+            message("Pocket 2", &hit, 1.5, [-5., 0.06, 20.]),
+            "Pocket 2: the holder hits the clamp on -X at 0 at X0.0 Y0.0 Z0.0 (within the 1.5 mm gap)."
+        );
+    }
+    #[test]
+    fn the_sentence_names_the_entry_and_where_it_sits() {
+        let jaws = |axis_y, offset, grip, gap| Layout::Vise {
+            holder: "v".into(),
+            axis_y,
+            offset,
+            grip,
+            gap,
+        };
+        assert_eq!(
+            sentence(&jaws(true, 0., 8., 2.), &vise()),
+            "100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm."
+        );
+        assert_eq!(
+            sentence(&jaws(false, -12.5, 3.25, 0.5), &vise()),
+            "100 mm machine vise on ±X, grip 3.25 mm, offset -12.5 mm, gap 0.5 mm."
+        );
+        // A shift that rounds to nothing is not written as -0.
+        assert_eq!(
+            sentence(&jaws(false, -0.001, 8., 2.), &vise()),
+            "100 mm machine vise on ±X, grip 8 mm, offset 0 mm, gap 2 mm."
+        );
+        let clamps = |clamps: &[(Side, f32)]| Layout::Clamps {
+            holder: "c".into(),
+            clamps: clamps.to_vec(),
+            gap: 2.,
+        };
+        assert_eq!(
+            sentence(
+                &clamps(&[
+                    (Side::MinusX, 0.),
+                    (Side::PlusX, 0.),
+                    (Side::MinusY, 0.),
+                    (Side::PlusY, 0.)
+                ]),
+                &clamp()
+            ),
+            "4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm."
+        );
+        assert_eq!(
+            sentence(&clamps(&[(Side::PlusY, 10.5)]), &clamp()),
+            "1 × Toe clamp 60 mm at +Y 10.5, gap 2 mm."
+        );
+        assert_eq!(sentence(&Layout::None, &clamp()), "");
     }
 }

@@ -2,11 +2,12 @@
 //! coordinates (setup frame, mm). The tool is modelled as the simulation
 //! models it: a cylinder of cutter diameter up to its stickout, then the holder.
 use crate::{
+    holding::HoldBox,
     mesh::Bounds,
     model::{Machine, Setup, get, num},
     post::{Block, Kind, OpState, PostSettings, clearance_plane, extents},
     rest::RestStock,
-    simulation::Simulation,
+    simulation::{Plan, Simulation},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -190,6 +191,94 @@ pub fn check_setup(
                 let z = visited.entry(key(p[0], p[1])).or_insert(p[2]);
                 *z = z.min(p[2]);
             }
+        }
+    }
+    problems.list
+}
+/// How far above the highest box a retract to the machine's Z home is checked
+/// to, in mm: the home height is not known, and it is above everything.
+const HOME_CLEARANCE: f32 = 10_000.;
+/// What the program's motion does to the jaws or clamps in `boxes` (each grown
+/// by `gap`): one problem per operation and part of its tool (`hits_segments`
+/// with the operation's own tool). Every stretch the tool tip travels counts,
+/// in plan coordinates: the moves and the links between operations, the
+/// retracts (straight up from where the tip is to the retract height, the
+/// clearance plane or, for the machine's Z home, far above every box), the
+/// approach after a tool change (across at the retract height from where the
+/// tip was; at the program's start only the point) and the descent. The
+/// retracts after the last operation belong to it. Messages are in work
+/// coordinates (`datum`).
+pub fn holding_problems(
+    ops: &[OpState],
+    plans: &[&Plan],
+    blocks: &[Block],
+    settings: &PostSettings,
+    boxes: &[HoldBox],
+    gap: f32,
+    datum: [f32; 3],
+) -> Vec<String> {
+    if boxes.is_empty() {
+        return vec![];
+    }
+    let top = boxes
+        .iter()
+        .map(|b| b.bounds.max[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let plane = clearance_plane(blocks);
+    let high = if settings.machine_home {
+        (top + gap + HOME_CLEARANCE).max(plane)
+    } else {
+        plane
+    };
+    let mut segments: Vec<Vec<([f32; 3], [f32; 3])>> = vec![vec![]; ops.len()];
+    let (mut tip, mut op): (Option<[f32; 3]>, usize) = (None, 0);
+    for block in blocks {
+        match block {
+            Block::Start { op: k, .. } | Block::Run { op: k, .. } => op = *k,
+            Block::Move {
+                op: k, from, to, ..
+            } => {
+                op = *k;
+                segments[op].push((*from, *to));
+                tip = Some(*to);
+            }
+            Block::Retract => {
+                if let Some(at) = tip {
+                    let to = [at[0], at[1], high];
+                    segments[op].push((at, to));
+                    tip = Some(to);
+                }
+            }
+            Block::Approach { op: k, xy } => {
+                op = *k;
+                let to = [xy[0], xy[1], high];
+                let from = tip.map_or(to, |at| [at[0], at[1], high]);
+                segments[op].push((from, to));
+                tip = Some(to);
+            }
+            Block::Descend { op: k, xy, z } => {
+                op = *k;
+                let to = [xy[0], xy[1], *z];
+                segments[op].push(([xy[0], xy[1], high], to));
+                tip = Some(to);
+            }
+            _ => {}
+        }
+    }
+    let mut problems = Problems::default();
+    for (k, path) in segments.iter().enumerate() {
+        let plan = plans[k];
+        let hits = crate::holding::hits_segments(
+            path,
+            plan.radius,
+            plan.tool_length,
+            plan.holder_radius,
+            boxes,
+            gap,
+        );
+        for hit in hits {
+            let message = crate::holding::message(&ops[k].name, &hit, gap, datum);
+            problems.add(Some(k), hit.part, message);
         }
     }
     problems.list
@@ -463,6 +552,247 @@ mod tests {
         assert!(
             problems.iter().any(|p| p.contains("not proven removed")),
             "{problems:?}"
+        );
+    }
+    fn clamp_box(label: &str, min: [f32; 3], max: [f32; 3]) -> HoldBox {
+        HoldBox {
+            label: label.into(),
+            bounds: Bounds { min, max },
+        }
+    }
+    /// The workholding problems of `ops` on `boxes` (2 mm gap, work zero at Z10).
+    fn walk(machine: Machine, ops: &[OpState], plans: &[&Plan], boxes: &[HoldBox]) -> Vec<String> {
+        let settings = PostSettings::from_machine(&machine).unwrap();
+        let blocks = blocks(ops, plans, &settings);
+        holding_problems(ops, plans, &blocks, &settings, boxes, 2., [0., 0., 10.])
+    }
+    fn clearance() -> Machine {
+        let mut machine = Machine::new(3);
+        machine
+            .p
+            .insert("post_retract".into(), crate::model::POST_RETRACT[1].into());
+        machine
+    }
+    fn named(name: &str) -> OpState {
+        OpState {
+            name: name.into(),
+            ..fixture::facing_op()
+        }
+    }
+    /// A clamp on +X: footprint X30-50 Y-10-10, Z10-35.
+    fn low_clamp() -> [HoldBox; 1] {
+        [clamp_box(
+            "clamp on +X at 0",
+            [30., -10., 10.],
+            [50., 10., 35.],
+        )]
+    }
+    #[test]
+    fn a_feed_through_a_clamp_is_one_problem_for_the_tool_in_work_coordinates() {
+        // The tool is Ø10 (reach 7 with the 2 mm gap), the holder Ø32 above 35 mm.
+        let plan = fixture::plan(
+            [-15., -15., 25.],
+            &[
+                (Motion::Rapid, [0., 0., 25.], 6000.),
+                (Motion::Feed, [0., 0., 20.], 250.),
+                (Motion::Feed, [40., 0., 20.], 1000.),
+                (Motion::Feed, [45., 0., 20.], 1000.),
+                (Motion::Rapid, [45., 0., 25.], 6000.),
+            ],
+        );
+        assert_eq!(
+            walk(
+                Machine::new(3),
+                &[fixture::facing_op()],
+                &[&plan],
+                &low_clamp()
+            ),
+            [
+                "Face top: the tool hits the clamp on +X at 0 at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+            ]
+        );
+        assert!(walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &[]).is_empty());
+    }
+    /// A clamp over the stock, Z40-60, on +X (footprint X30-50 Y-10-10), and
+    /// plans whose tool (thin holder, reach 5) works low beside it.
+    fn overhang() -> ([HoldBox; 1], impl Fn([f32; 3], [f32; 3]) -> Plan) {
+        let boxes = [clamp_box(
+            "clamp on +X at 0",
+            [30., -10., 40.],
+            [50., 10., 60.],
+        )];
+        let low = |start: [f32; 3], to: [f32; 3]| {
+            let mut plan = fixture::plan(start, &[(Motion::Feed, to, 1000.)]);
+            plan.holder_radius = 3.;
+            plan
+        };
+        (boxes, low)
+    }
+    #[test]
+    fn the_final_retract_is_checked_even_when_every_move_is_clear() {
+        use crate::holding;
+        let (boxes, low) = overhang();
+        let (a, b) = (
+            low([-15., 0., 0.], [-10., 0., 0.]),
+            low([-10., 0., 0.], [24., 0., 0.]),
+        );
+        assert!(holding::hits(&a, &boxes, 2.).is_empty());
+        assert!(holding::hits(&b, &boxes, 2.).is_empty());
+        // The retract after the last operation belongs to the last one.
+        assert_eq!(
+            walk(
+                Machine::new(3),
+                &[named("First"), named("Second")],
+                &[&a, &b],
+                &boxes
+            ),
+            [
+                "Second: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
+            ]
+        );
+        // At the clearance plane the retract goes only as high as the highest
+        // move, 0 here: nothing is passed.
+        assert!(
+            walk(
+                clearance(),
+                &[named("First"), named("Second")],
+                &[&a, &b],
+                &boxes
+            )
+            .is_empty()
+        );
+    }
+    #[test]
+    fn the_descent_is_checked_even_when_every_move_is_clear() {
+        use crate::holding;
+        let (boxes, low) = overhang();
+        // The program starts 6 mm from the clamp's edge, at Z0, and leaves.
+        let plan = low([24., 0., 0.], [-10., 0., 0.]);
+        assert!(holding::hits(&plan, &boxes, 2.).is_empty());
+        // Coming down from the retract height the tool passes the clamp from
+        // its top (62 with the gap, 52 above the work zero).
+        assert_eq!(
+            walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &boxes),
+            [
+                "Face top: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z52.0 (within the 2 mm gap)."
+            ]
+        );
+    }
+    #[test]
+    fn the_retract_before_a_tool_change_is_the_old_tools() {
+        let (boxes, low) = overhang();
+        let a = low([-15., 0., 0.], [24., 0., 0.]);
+        let mut b = low([100., 0., 0.], [110., 0., 0.]);
+        b.radius = 1.;
+        let other = OpState {
+            tool: 2,
+            tool_id: "t2".into(),
+            ..named("Cut B")
+        };
+        // Cut A's Ø10 tool is 6 mm from the clamp and rises past it; Cut B's
+        // Ø2 tool, there afterwards, would not touch it.
+        assert_eq!(
+            walk(Machine::new(3), &[named("Cut A"), other], &[&a, &b], &boxes),
+            [
+                "Cut A: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
+            ]
+        );
+    }
+    #[test]
+    fn a_tool_change_approach_sweeps_the_retract_height() {
+        let boxes = low_clamp();
+        let at_x = |x: f32| fixture::plan([x, 0., 20.], &[(Motion::Feed, [x, 0., 18.], 500.)]);
+        let (a, b) = (at_x(0.), at_x(80.));
+        let other = OpState {
+            tool: 2,
+            tool_id: "t2".into(),
+            ..named("Cut B")
+        };
+        let ops = [named("Cut A"), other];
+        // Neither operation reaches the clamp, but the rapid across at the
+        // clearance plane (20, the highest tip) goes through it at Z20.
+        assert_eq!(
+            walk(clearance(), &ops, &[&a, &b], &boxes),
+            [
+                "Cut B: the tool hits the clamp on +X at 0 at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+            ]
+        );
+        // Retracting to the machine's Z home goes over everything.
+        assert!(walk(Machine::new(3), &ops, &[&a, &b], &boxes).is_empty());
+    }
+    #[test]
+    fn a_link_between_operations_of_one_tool_is_checked_in_either_retract_mode() {
+        let boxes = low_clamp();
+        let at_x = |x: f32| fixture::plan([x, 0., 20.], &[(Motion::Feed, [x, 0., 18.], 500.)]);
+        let (a, b) = (at_x(0.), at_x(80.));
+        let ops = [named("Cut A"), named("Cut B")];
+        for machine in [clearance(), Machine::new(3)] {
+            assert_eq!(
+                walk(machine, &ops, &[&a, &b], &boxes),
+                [
+                    "Cut B: the tool hits the clamp on +X at 0 at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+                ]
+            );
+        }
+    }
+    #[test]
+    fn the_first_approach_is_a_point_not_a_sweep_from_the_origin() {
+        // A clamp at the origin, the work far from it.
+        let boxes = [clamp_box(
+            "clamp on -X at 0",
+            [-10., -10., 10.],
+            [10., 10., 35.],
+        )];
+        let plan = fixture::plan([50., 50., 20.], &[(Motion::Feed, [60., 50., 20.], 500.)]);
+        for machine in [clearance(), Machine::new(3)] {
+            assert_eq!(
+                walk(machine, &[fixture::facing_op()], &[&plan], &boxes),
+                Vec::<String>::new()
+            );
+        }
+    }
+    #[test]
+    fn one_problem_per_operation_and_part_whatever_the_boxes() {
+        // Two tall clamps; the holder (reach 18) comes within the gap of one
+        // before the tool (reach 7) does.
+        let boxes = [
+            clamp_box("clamp on +X at 0", [30., -10., 10.], [50., 10., 100.]),
+            clamp_box("clamp on -X at 0", [-50., -10., 10.], [-30., 10., 100.]),
+        ];
+        let plan = fixture::plan(
+            [0., 0., 20.],
+            &[
+                (Motion::Feed, [14., 0., 20.], 1000.),
+                (Motion::Feed, [24., 0., 20.], 1000.),
+                (Motion::Feed, [-24., 0., 20.], 1000.),
+            ],
+        );
+        assert_eq!(
+            walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &boxes),
+            [
+                "Face top: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z10.0 (within the 2 mm gap).",
+                "Face top: the holder hits the clamp on +X at 0 at X14.0 Y0.0 Z10.0 (within the 2 mm gap).",
+            ]
+        );
+    }
+    #[test]
+    fn each_operation_is_checked_with_its_own_tool() {
+        let boxes = low_clamp();
+        let path = [
+            (Motion::Feed, [24., 0., 20.], 1000.),
+            (Motion::Feed, [0., 0., 20.], 1000.),
+        ];
+        let wide = fixture::plan([0., 0., 20.], &path);
+        let mut narrow = fixture::plan([0., 0., 20.], &path);
+        narrow.radius = 1.;
+        assert_eq!(
+            walk(
+                Machine::new(3),
+                &[named("Wide"), named("Narrow")],
+                &[&wide, &narrow],
+                &boxes
+            ),
+            ["Wide: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z10.0 (within the 2 mm gap)."]
         );
     }
 }

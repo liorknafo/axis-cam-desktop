@@ -1059,10 +1059,18 @@ impl Document {
     /// the layout, and for a vise the stock being wider across the jaws than
     /// the vise opens (when the stock can be told: `setup_stock`).
     pub fn holding_issues(&self, setup: usize, mesh: Option<&crate::mesh::Mesh>) -> Vec<String> {
-        use crate::holding::{DELETED, layout, opening_issue, refusal};
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
+        self.holding_problems(s, || self.setup_stock(setup, mesh))
+    }
+    /// `holding_issues` of `s`, the stock being told by `stock` when needed.
+    fn holding_problems(
+        &self,
+        s: &Setup,
+        stock: impl FnOnce() -> Option<crate::mesh::Bounds>,
+    ) -> Vec<String> {
+        use crate::holding::{DELETED, layout, opening_issue, refusal};
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
@@ -1090,13 +1098,53 @@ impl Document {
             (Ok(layout), Some(entry)) if !kind.is_empty() => {
                 if let Some(refused) = refusal(&layout, entry) {
                     issues.push(refused);
-                } else if let Some(stock) = self.setup_stock(setup, mesh) {
+                } else if let Some(stock) = stock() {
                     issues.extend(opening_issue(&layout, entry, stock));
                 }
             }
             _ => {}
         }
         issues
+    }
+    /// The jaws or clamps of `setup` round its starting stock box `stock` (in
+    /// the setup's frame, mm), without the clearance gap; none without
+    /// workholding. Refuses with the first line `holding_issues` shows for
+    /// it, so that the editor and the export agree: an entry that is gone or
+    /// not chosen, a layout that does not read, an entry that does not fit,
+    /// a stock wider than the vise opens.
+    pub fn holding_boxes(
+        &self,
+        setup: &Setup,
+        stock: crate::mesh::Bounds,
+    ) -> Result<Vec<crate::holding::HoldBox>, String> {
+        if let Some(issue) = self
+            .holding_problems(setup, || Some(stock))
+            .into_iter()
+            .next()
+        {
+            return Err(issue);
+        }
+        let layout = crate::holding::layout(setup)?;
+        match self.holder(get(&setup.p, "holder")) {
+            Some(entry) => crate::holding::boxes(&layout, entry, stock),
+            None => Ok(vec![]),
+        }
+    }
+    /// Setup `setup`'s modelled workholding in a sentence, for the setup sheet
+    /// and the program header (`holding::sentence`); what is wrong with it
+    /// when it cannot be modelled; None without workholding.
+    pub fn holding_text(&self, setup: &Setup) -> Option<String> {
+        let layout = crate::holding::layout(setup);
+        if matches!(layout, Ok(crate::holding::Layout::None)) {
+            return None;
+        }
+        if let Some(issue) = self.holding_problems(setup, || None).into_iter().next() {
+            return Some(issue);
+        }
+        let (Ok(layout), Some(entry)) = (layout, self.holder(get(&setup.p, "holder"))) else {
+            return None;
+        };
+        Some(crate::holding::sentence(&layout, entry))
     }
     /// After a setup's `holding` or `holder` changed: a vise or clamps setup
     /// points at a library entry of its kind (its own when it has one, else
@@ -1325,7 +1373,7 @@ impl Document {
         );
         for setup in &self.setups {
             s += &format!(
-                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\nFixture: {}\n\nRotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\n{}\n\n",
+                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\nFixture: {}\n\n{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\n{}\n\n",
                 setup.name(),
                 get(&setup.p, "offset"),
                 setup.machine.name(),
@@ -1333,6 +1381,9 @@ impl Document {
                 crate::stock::sheet_description(setup, mesh),
                 get(&setup.p, "origin"),
                 get(&setup.p, "fixture"),
+                self.holding_text(setup)
+                    .map(|text| format!("Workholding: {text}\n\n"))
+                    .unwrap_or_default(),
                 get(&setup.p, "rx"),
                 get(&setup.p, "ry"),
                 get(&setup.p, "rz"),
@@ -1882,6 +1933,162 @@ mod tests {
             doc.holding_issues(0, None),
             ["Choose a clamp from the library."]
         );
+    }
+    #[test]
+    fn holding_boxes_refuse_with_the_first_line_the_editor_shows() {
+        use crate::holding::{self, DELETED};
+        let mut doc = doc_with_holding(&[
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "140"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+        ]);
+        let vise = starter(&doc, "Vise");
+        let clamp = starter(&doc, "Clamp");
+        let stock = doc.setup_stock(0, None).unwrap();
+        let set = |doc: &mut Document, pairs: &[(&str, &str)]| {
+            for (k, v) in pairs {
+                doc.setup_mut().p.insert((*k).into(), (*v).into());
+            }
+        };
+        // Without workholding there is nothing to refuse, whatever the entry says.
+        assert_eq!(doc.holding_boxes(doc.setup(), stock), Ok(vec![]));
+        set(&mut doc, &[("holder", "gone")]);
+        assert_eq!(doc.holding_boxes(doc.setup(), stock), Ok(vec![]));
+        // The jaws and the clamps are the ones the library entry and the layout make.
+        set(
+            &mut doc,
+            &[
+                ("holding", "Vise"),
+                ("holder", &vise),
+                ("vise_grip", "8"),
+                ("vise_axis", "Y"),
+            ],
+        );
+        let boxes = doc.holding_boxes(doc.setup(), stock).unwrap();
+        let labels: Vec<_> = boxes.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["vise jaw on -Y", "vise jaw on +Y"]);
+        let layout = holding::layout(doc.setup()).unwrap();
+        let entry = doc.holder(&vise).unwrap();
+        assert_eq!(boxes, holding::boxes(&layout, entry, stock).unwrap());
+        set(
+            &mut doc,
+            &[
+                ("holding", "Clamps"),
+                ("holder", &clamp),
+                ("clamps", "-X:0;+Y:10"),
+            ],
+        );
+        let boxes = doc.holding_boxes(doc.setup(), stock).unwrap();
+        let labels: Vec<_> = boxes.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["clamp on -X at 0", "clamp on +Y at 10"]);
+        // Every refusal is the first line `holding_issues` shows, the opening included.
+        set(
+            &mut doc,
+            &[
+                ("holding", "Vise"),
+                ("holder", &vise),
+                ("vise_axis", "X"),
+                ("vise_grip", "8"),
+            ],
+        );
+        let cases: [&[(&str, &str)]; 8] = [
+            &[],
+            &[("holder", "")],
+            &[("holder", "gone")],
+            &[("holder", &clamp)],
+            &[("holder", &vise), ("vise_grip", "-1")],
+            &[("vise_grip", "8"), ("vise_axis", "Z")],
+            &[("vise_axis", "X"), ("holding_gap", "-1")],
+            &[("holding_gap", "2"), ("holding", "Gripper")],
+        ];
+        for (n, pairs) in cases.into_iter().enumerate() {
+            set(&mut doc, pairs);
+            let issues = doc.holding_issues(0, None);
+            assert!(!issues.is_empty(), "case {n}");
+            assert_eq!(
+                doc.holding_boxes(doc.setup(), stock),
+                Err(issues[0].clone()),
+                "case {n}"
+            );
+        }
+        set(&mut doc, &[("holding", "Vise"), ("holder", "gone")]);
+        assert_eq!(
+            doc.holding_boxes(doc.setup(), stock),
+            Err(DELETED.to_string())
+        );
+        // The stock across the jaws is wider than the vise opens (140 against 120).
+        set(&mut doc, &[("holder", &vise), ("vise_axis", "X")]);
+        assert_eq!(
+            doc.holding_boxes(doc.setup(), stock),
+            Err("The stock is 140 mm across the jaws; this vise opens to 120 mm.".to_string())
+        );
+        // The stock given is the one that counts, not the setup's own.
+        let narrow = crate::mesh::Bounds {
+            min: [-50., -30., 0.],
+            max: [50., 30., 40.],
+        };
+        assert_eq!(doc.holding_boxes(doc.setup(), narrow).unwrap().len(), 2);
+    }
+    #[test]
+    fn the_setup_sheet_describes_modelled_workholding_after_the_fixture() {
+        let mut doc = doc_with_holding(&[]);
+        let vise = starter(&doc, "Vise");
+        let clamp = starter(&doc, "Clamp");
+        assert!(!doc.setup_sheet(None).contains("Workholding"));
+        assert_eq!(doc.holding_text(doc.setup()), None);
+        let fixture = get(&doc.setup().p, "fixture").to_string();
+        let after = |doc: &Document, line: &str| {
+            let sheet = doc.setup_sheet(None);
+            assert!(
+                sheet.contains(&format!(
+                    "Fixture: {fixture}\n\nWorkholding: {line}\n\nRotation:"
+                )),
+                "{sheet}"
+            );
+        };
+        let set = |doc: &mut Document, pairs: &[(&str, &str)]| {
+            for (k, v) in pairs {
+                doc.setup_mut().p.insert((*k).into(), (*v).into());
+            }
+        };
+        set(
+            &mut doc,
+            &[
+                ("holding", "Vise"),
+                ("holder", &vise),
+                ("vise_grip", "8"),
+                ("vise_axis", "Y"),
+                ("holding_gap", "2"),
+            ],
+        );
+        after(
+            &doc,
+            "100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.",
+        );
+        set(
+            &mut doc,
+            &[
+                ("holding", "Clamps"),
+                ("holder", &clamp),
+                ("clamps", "-X:0;+X:0;-Y:0;+Y:0"),
+            ],
+        );
+        after(
+            &doc,
+            "4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.",
+        );
+        assert_eq!(
+            doc.holding_text(doc.setup()).as_deref(),
+            Some("4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.")
+        );
+        // A setup that cannot be modelled says why, never what it would have been.
+        set(&mut doc, &[("holder", "gone")]);
+        after(&doc, "The workholding entry was deleted; choose another.");
+        set(&mut doc, &[("holder", &clamp), ("clamps", "-Z:0")]);
+        after(&doc, "A clamp side must be -X, +X, -Y or +Y.");
+        set(&mut doc, &[("holding", "None")]);
+        assert!(!doc.setup_sheet(None).contains("Workholding"));
     }
     #[test]
     fn the_opening_check_is_skipped_silently_when_the_stock_cannot_be_resolved() {

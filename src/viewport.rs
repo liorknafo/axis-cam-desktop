@@ -128,6 +128,8 @@ pub struct Viewport<'a> {
     pub show_stock: bool,
     pub show_paths: bool,
     pub progress: Option<f32>,
+    /// The jaws or clamps of the setup, in its frame in mm; drawn with the stock.
+    pub holding: Vec<crate::holding::HoldBox>,
 }
 struct Projector {
     camera: Camera,
@@ -261,6 +263,16 @@ impl Viewport<'_> {
         })
     }
     fn raster(&self, p: &Projector, bounds: Rectangle, hovered: Option<usize>) -> RasterFrame {
+        let (w, h, rgba) = self.pixels(p, bounds, hovered);
+        RasterFrame::from_rgba(w, h, &rgba)
+    }
+    /// The scene as RGBA pixels, `w` by `h`.
+    fn pixels(
+        &self,
+        p: &Projector,
+        bounds: Rectangle,
+        hovered: Option<usize>,
+    ) -> (u32, u32, Vec<u8>) {
         let ratio = (1600. / bounds.width.max(1.))
             .min(1200. / bounds.height.max(1.))
             .min(1.5);
@@ -363,6 +375,24 @@ impl Viewport<'_> {
             });
             raster_stock(&mut rgba, &depths, w, h, projected, ratio, p.scale);
         }
+        if self.show_stock {
+            let scale = self.mesh.display_scale();
+            for hold in &self.holding {
+                let projected = box_vertices(hold.bounds.scaled(scale)).map(|v| {
+                    let q = p.p(v);
+                    (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                });
+                raster_solid(
+                    &HOLDING,
+                    &mut rgba,
+                    &depths,
+                    (w, h),
+                    projected,
+                    ratio,
+                    p.scale,
+                );
+            }
+        }
         if self.sample && self.show_paths && self.setup.is_some_and(|s| !s.is_repositioned()) {
             let strategy = self
                 .operation
@@ -418,7 +448,7 @@ impl Viewport<'_> {
                 }
             }
         }
-        RasterFrame::from_rgba(w, h, &rgba)
+        (w, h, rgba)
     }
     fn raster_simulation(
         &self,
@@ -846,6 +876,7 @@ impl canvas::Program<Event> for Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
+        let key = format!("{key}|{:?}", self.holding);
         let mut cached = state.raster.borrow_mut();
         if cached.as_ref().is_none_or(|(previous, _)| *previous != key) {
             *cached = Some((key, self.raster(&p, bounds, hovered)));
@@ -996,13 +1027,50 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
     }
     pixel[3] = (output * 255.).round() as u8;
 }
-/// Composite only the nearest stock surface; use both surfaces and part depth
-/// to distinguish visible edges from dashed hidden edges.
+/// How a translucent box is painted: the tint of its top and bottom, of its
+/// X sides and of its Y sides, its edges (seen, and behind something), and
+/// how opaque it is over empty space and over the part.
+struct Look {
+    faces: [[u8; 3]; 3],
+    edge: [u8; 3],
+    hidden_edge: [u8; 3],
+    open: f32,
+    behind: f32,
+}
+const STOCK: Look = Look {
+    faces: [[222, 177, 91], [194, 141, 58], [210, 157, 65]],
+    edge: [163, 108, 25],
+    hidden_edge: [162, 129, 77],
+    open: 0.30,
+    behind: 0.12,
+};
+/// Jaws and clamps: a neutral grey, more opaque than the stock.
+const HOLDING: Look = Look {
+    faces: [[176, 176, 176], [138, 138, 138], [158, 158, 158]],
+    edge: [84, 84, 84],
+    hidden_edge: [118, 118, 118],
+    open: 0.5,
+    behind: 0.3,
+};
+/// The stock's box: `raster_solid` in the stock's colors.
 fn raster_stock(
     pixels: &mut [u8],
     part_depth: &[f32],
     w: u32,
     h: u32,
+    vertices: [(Point, f32); 8],
+    ratio: f32,
+    scale: f32,
+) {
+    raster_solid(&STOCK, pixels, part_depth, (w, h), vertices, ratio, scale);
+}
+/// Composite only the nearest surface of a box; use both surfaces and part
+/// depth to distinguish visible edges from dashed hidden edges.
+fn raster_solid(
+    look: &Look,
+    pixels: &mut [u8],
+    part_depth: &[f32],
+    (w, h): (u32, u32),
     vertices: [(Point, f32); 8],
     ratio: f32,
     scale: f32,
@@ -1063,14 +1131,14 @@ fn raster_stock(
     for (index, z) in near.iter().enumerate() {
         if z.is_finite() && *z >= part_depth[index] - 0.001 {
             let tint = match tones[index] {
-                0 | 1 => [222, 177, 91],
-                2 | 4 => [194, 141, 58],
-                _ => [210, 157, 65],
+                0 | 1 => look.faces[0],
+                2 | 4 => look.faces[1],
+                _ => look.faces[2],
             };
             let alpha = if part_depth[index].is_finite() {
-                0.12
+                look.behind
             } else {
-                0.30
+                look.open
             };
             alpha_over(&mut pixels[index * 4..index * 4 + 4], tint, alpha);
         }
@@ -1119,11 +1187,7 @@ fn raster_stock(
                 if coverage > 0. {
                     alpha_over(
                         &mut pixels[index * 4..index * 4 + 4],
-                        if hidden {
-                            [162, 129, 77]
-                        } else {
-                            [163, 108, 25]
-                        },
+                        if hidden { look.hidden_edge } else { look.edge },
                         coverage * if hidden { 0.34 } else { 0.95 },
                     );
                 }
@@ -1341,6 +1405,7 @@ mod tests {
             show_stock: true,
             show_paths: false,
             progress: None,
+            holding: vec![],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
         let reference = v.projector(b);
@@ -1390,6 +1455,63 @@ mod tests {
         assert!(transparent[index + 3] > 0 && transparent[index + 3] < 128);
     }
     #[test]
+    fn workholding_is_drawn_as_grey_translucent_boxes_with_the_stock_only() {
+        use crate::holding::HoldBox;
+        let d = crate::model::Document::sample();
+        let mesh = crate::mesh::sample();
+        let scale = mesh.display_scale();
+        // A jaw beyond the stock's +Y side, seen from above.
+        let jaw = HoldBox {
+            label: "vise jaw on +Y".into(),
+            bounds: crate::mesh::Bounds {
+                min: [-60., 60., -20.],
+                max: [60., 80., 30.],
+            },
+        };
+        let mut v = Viewport {
+            setup: Some(d.setup()),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: true,
+            camera: Camera {
+                yaw: 0.,
+                pitch: std::f32::consts::FRAC_PI_2,
+                ..Default::default()
+            },
+            picking: false,
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+        };
+        let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
+        let p = v.projector(b);
+        let (w, h, plain) = v.pixels(&p, b, None);
+        v.holding = vec![jaw];
+        let (_, _, drawn) = v.pixels(&p, b, None);
+        assert_eq!((w, h), (600, 450));
+        let at = |x: f32, y: f32| ((y * 1.5) as u32 * w + (x * 1.5) as u32) as usize * 4;
+        let top = p.p([0., 70. * scale, 30. * scale]);
+        let i = at(top.x, top.y);
+        // Nothing was there; now there is neutral grey, not opaque.
+        assert_eq!(plain[i + 3], 0);
+        let [r, g, bl, a] = [drawn[i], drawn[i + 1], drawn[i + 2], drawn[i + 3]];
+        assert!(a > 0 && a < 255, "{a}");
+        assert!(r == g && g == bl, "{r} {g} {bl}");
+        // Only the jaw's own pixels changed.
+        let changed = (0..plain.len() / 4)
+            .filter(|k| plain[k * 4..k * 4 + 4] != drawn[k * 4..k * 4 + 4])
+            .count();
+        assert!(changed > 0 && changed < (w * h) as usize / 4, "{changed}");
+        assert_eq!(plain[..4], drawn[..4]);
+        // Without the stock the boxes are not drawn either.
+        v.show_stock = false;
+        let (_, _, hidden) = v.pixels(&p, b, None);
+        v.holding.clear();
+        assert_eq!(v.pixels(&p, b, None).2, hidden);
+    }
+    #[test]
     fn camera_fit_contains_rotated_part_and_asymmetric_stock() {
         let mut d = crate::model::Document::sample();
         d.setup_mut().p.insert("ry".into(), "90".into());
@@ -1406,6 +1528,7 @@ mod tests {
             show_stock: true,
             show_paths: false,
             progress: None,
+            holding: vec![],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
         let p = v.projector(b);
@@ -1446,6 +1569,7 @@ mod tests {
             show_stock: false,
             show_paths: false,
             progress: None,
+            holding: vec![],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let p = v.projector(b);
@@ -1477,6 +1601,7 @@ mod tests {
             show_stock: true,
             show_paths: false,
             progress: None,
+            holding: vec![],
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);
