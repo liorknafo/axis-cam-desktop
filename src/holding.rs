@@ -1,6 +1,7 @@
 //! Workholding: vises and clamps from the library, where they sit in a
 //! setup, and whether a toolpath comes too close to them. Toolpaths are
 //! never changed; moves that hit are reported.
+use crate::material::NAME_LIMIT;
 use crate::mesh::Bounds;
 use crate::model::{Fields, Setup, fields, get, id, num};
 use crate::simulation::Plan;
@@ -11,6 +12,8 @@ const NOTE: &str = "Measure yours: these are typical sizes.";
 /// How far below the stock bottom a vise jaw is modelled to reach.
 const JAW_DEPTH: f32 = 100.;
 pub const MAX_CLAMPS: usize = 8;
+/// What a setup's issues say when the library entry it points at is gone.
+pub const DELETED: &str = "The workholding entry was deleted; choose another.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Holder {
@@ -47,6 +50,11 @@ impl Holder {
         let mut e = vec![];
         if self.name().trim().is_empty() {
             e.push("Give the workholding a name.".into());
+        } else if self.name().trim().chars().count() > NAME_LIMIT {
+            e.push(format!("The name can be at most {NAME_LIMIT} characters."));
+        }
+        if get(&self.p, "notes").chars().count() > 500 {
+            e.push("Notes can be at most 500 characters.".into());
         }
         if !KINDS.contains(&self.kind()) {
             e.push("Choose Vise or Clamp.".into());
@@ -198,35 +206,77 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
         other => Err(format!("\"{other}\" is not a workholding choice.")),
     }
 }
+/// Whether `text` reads as clamp positions: `layout` of a copy of `setup`
+/// holding clamps at `text`. The setup's other keys, a bad gap for one, are
+/// not this text's problem.
+pub fn check_clamps(setup: &Setup, text: &str) -> Result<(), String> {
+    let copy = Setup {
+        preview_stock: None,
+        preview_remaining: None,
+        id: setup.id.clone(),
+        machine: setup.machine.clone(),
+        p: fields(&[("holding", "Clamps"), ("clamps", text)]),
+        operations: vec![],
+    };
+    layout(&copy).map(|_| ())
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldBox {
     pub label: String,
     pub bounds: Bounds,
 }
+/// Why `holder` cannot serve `layout`: it is of the other kind or its
+/// dimensions are not usable. None for no workholding.
+pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
+    let want = match layout {
+        Layout::None => return None,
+        Layout::Vise { .. } => "Vise",
+        Layout::Clamps { .. } => "Clamp",
+    };
+    if holder.kind() != want && KINDS.contains(&holder.kind()) {
+        return Some(format!(
+            "The chosen workholding entry is a {}, not a {}.",
+            holder.kind().to_lowercase(),
+            want.to_lowercase()
+        ));
+    }
+    let issues = holder.issues();
+    (!issues.is_empty()).then(|| {
+        format!(
+            "The chosen workholding entry needs fixing: {}",
+            issues.join(" ")
+        )
+    })
+}
+/// `v` mm for a message: up to two decimals, without trailing zeros.
+fn mm(v: f32) -> String {
+    format!("{v:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+/// The vise's maximum opening is less than the stock is wide across the jaws.
+/// `stock` is the setup's starting stock box in millimetres.
+pub fn opening_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option<String> {
+    let Layout::Vise { axis_y, .. } = layout else {
+        return None;
+    };
+    let across = stock.dimensions()[usize::from(*axis_y)];
+    let opening = num(&holder.p, "max_opening").filter(|v| *v > 0.)?;
+    (across > opening + 0.005).then(|| {
+        format!(
+            "The stock is {} mm across the jaws; this vise opens to {} mm.",
+            mm(across),
+            mm(opening)
+        )
+    })
+}
 /// The jaws or clamps of `layout`, in the frame of `stock` (the setup's
 /// starting stock box). Without the clearance gap. Refuses a holder of the
-/// other kind or one whose dimensions are not usable.
+/// other kind or one whose dimensions are not usable (`refusal`).
 pub fn boxes(layout: &Layout, holder: &Holder, stock: Bounds) -> Result<Vec<HoldBox>, String> {
-    let want = match layout {
-        Layout::None => None,
-        Layout::Vise { .. } => Some("Vise"),
-        Layout::Clamps { .. } => Some("Clamp"),
-    };
-    if let Some(want) = want {
-        if holder.kind() != want && KINDS.contains(&holder.kind()) {
-            return Err(format!(
-                "The chosen workholding entry is a {}, not a {}.",
-                holder.kind().to_lowercase(),
-                want.to_lowercase()
-            ));
-        }
-        let issues = holder.issues();
-        if !issues.is_empty() {
-            return Err(format!(
-                "The chosen workholding entry needs fixing: {}",
-                issues.join(" ")
-            ));
-        }
+    if let Some(refused) = refusal(layout, holder) {
+        return Err(refused);
     }
     let n = |k| num(&holder.p, k).unwrap_or(0.);
     let centre = [
@@ -301,8 +351,9 @@ pub struct Hit {
     pub label: String,
     /// "tool" (cutter and shank, tip to stickout) or "holder" (above the stickout).
     pub part: &'static str,
-    /// The tip where the move first comes within reach of the box: where it
-    /// enters the box's footprint, or its closest point if it never does.
+    /// The tip where the move, clipped to the heights at which the part can
+    /// touch the box, first touches the box's footprint (the rectangle itself,
+    /// not grown by the reach); when it never does, its closest point to it.
     pub at: [f32; 3],
 }
 /// The parameters in 0..=1 at which `a + (b - a) t` lies within `lo..=hi`.
@@ -851,7 +902,7 @@ mod tests {
             "{:?}",
             through[0].at
         );
-        // The same move 1 mm to the side of the clamp's X range misses it.
+        // The same move 8 mm beyond the clamp's edge (X -30 against X -38) misses it.
         assert!(
             hits(
                 &plan(0.2, &[([-30., -1500.75, 41.], [-30., 1499.25, 41.])]),
@@ -883,6 +934,92 @@ mod tests {
         assert_eq!(clip[0].part, "tool");
         assert!(clip[0].label.contains("-Y"));
         assert!(hits(&diagonal(3.08), &jaws, 0.).is_empty());
+    }
+    #[test]
+    fn a_vise_too_narrow_for_the_stock_says_so_in_millimetres() {
+        let wide = |w: f32| Bounds {
+            min: [-w / 2., -30., 0.],
+            max: [w / 2., 30., 40.],
+        };
+        let across_x = vise_layout(false, 0., 2.);
+        assert_eq!(
+            opening_issue(&across_x, &vise(), wide(140.)).unwrap(),
+            "The stock is 140 mm across the jaws; this vise opens to 120 mm."
+        );
+        // A stock exactly as wide as the opening fits; a hair over is rounding.
+        assert_eq!(opening_issue(&across_x, &vise(), wide(120.)), None);
+        assert_eq!(opening_issue(&across_x, &vise(), wide(120.004)), None);
+        assert!(
+            opening_issue(&across_x, &vise(), wide(120.5))
+                .unwrap()
+                .contains("120.5 mm across")
+        );
+        // Jaws on the Y sides look at the stock's Y extent, not its X.
+        let across_y = vise_layout(true, 0., 2.);
+        assert_eq!(opening_issue(&across_y, &vise(), wide(140.)), None);
+        let tall = Bounds {
+            min: [-50., -65., 0.],
+            max: [50., 65., 40.],
+        };
+        assert_eq!(
+            opening_issue(&across_y, &vise(), tall).unwrap(),
+            "The stock is 130 mm across the jaws; this vise opens to 120 mm."
+        );
+        assert_eq!(opening_issue(&across_x, &vise(), tall), None);
+        // Clamps and no workholding have no opening.
+        let clamps = clamp_layout(&[(Side::MinusX, 0.)]);
+        assert_eq!(opening_issue(&clamps, &clamp(), wide(500.)), None);
+        assert_eq!(opening_issue(&Layout::None, &vise(), wide(500.)), None);
+    }
+    #[test]
+    fn a_holders_name_and_notes_are_bounded_like_a_materials() {
+        let mut v = vise();
+        v.p.insert("name".into(), "x".repeat(60));
+        assert!(v.issues().is_empty());
+        v.p.insert("name".into(), "x".repeat(61));
+        assert_eq!(v.issues(), ["The name can be at most 60 characters."]);
+        v.p.insert("name".into(), " ".into());
+        assert_eq!(v.issues(), ["Give the workholding a name."]);
+        v.p.insert("name".into(), "Vise".into());
+        v.p.insert("notes".into(), "n".repeat(500));
+        assert!(v.issues().is_empty());
+        v.p.insert("notes".into(), "n".repeat(501));
+        assert_eq!(v.issues(), ["Notes can be at most 500 characters."]);
+    }
+    #[test]
+    fn the_refusal_is_what_boxes_refuses() {
+        let jaws = vise_layout(false, 0., 2.);
+        let clamps = clamp_layout(&[(Side::MinusX, 0.)]);
+        assert_eq!(refusal(&jaws, &vise()), None);
+        assert_eq!(refusal(&clamps, &clamp()), None);
+        assert_eq!(refusal(&Layout::None, &Holder::new("Clamp", "x")), None);
+        assert_eq!(
+            refusal(&jaws, &clamp()).unwrap(),
+            boxes(&jaws, &clamp(), stock()).unwrap_err()
+        );
+        assert_eq!(
+            refusal(&clamps, &Holder::new("Clamp", "Empty")).unwrap(),
+            boxes(&clamps, &Holder::new("Clamp", "Empty"), stock()).unwrap_err()
+        );
+    }
+    #[test]
+    fn typed_clamp_positions_are_read_whatever_the_setups_other_keys_say() {
+        let setup = setup(&[("holding", "Vise"), ("holding_gap", "abc")]);
+        assert_eq!(check_clamps(&setup, "-X:0;+X:0"), Ok(()));
+        assert_eq!(check_clamps(&setup, " -X : 5 "), Ok(()));
+        assert_eq!(
+            check_clamps(&setup, "-X"),
+            Err("Write each clamp as side:offset, for example -X:0.".to_string())
+        );
+        assert_eq!(
+            check_clamps(&setup, "-Z:0"),
+            Err("A clamp side must be -X, +X, -Y or +Y.".to_string())
+        );
+        assert_eq!(
+            check_clamps(&setup, ""),
+            Err("Place 1 to 8 clamps.".to_string())
+        );
+        assert!(check_clamps(&setup, &["-X:0"; 9].join(";")).is_err());
     }
     #[test]
     fn slopes_and_plunges_are_checked_exactly() {

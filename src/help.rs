@@ -207,6 +207,9 @@ pub fn command(m: &Message, label: String) -> Help {
         Page(crate::Page::Materials) => {
             "Manage the material library: each material's group, notes and the surface speed and chip load ranges for carbide tools that speeds and feeds are checked against. Choose the project material in the setup."
         }
+        Page(crate::Page::Workholding) => {
+            "Manage the library of vises and toe clamps: their sizes and notes. Choose one for a setup under Workholding in the setup editor. The starter entries have typical sizes: measure yours."
+        }
         Page(crate::Page::Ai) => {
             "Sign in with ChatGPT and let the model propose a complete job for the imported part. The app checks every proposal before you can apply it; nothing is sent until you click Plan."
         }
@@ -333,6 +336,19 @@ pub fn command(m: &Message, label: String) -> Help {
         }
         PickMaterial(_) => {
             "Use this library material for the project. Its cutting data are used to check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
+        }
+        NewHolder("Clamp") => {
+            "Create a toe clamp with its length, width, height and bite. It joins the library when you save it. Enter the sizes of your own clamp."
+        }
+        NewHolder(_) => {
+            "Create a vise with its jaw sizes, maximum opening and grip. It joins the library when you save it. Enter the sizes of your own vise."
+        }
+        EditHolder(_) => "Edit this library entry. Changing it changes every setup that uses it.",
+        SaveHolder => {
+            "Validate the entry and save it to the library. The name must be new and every size a positive number; a clamp's bite must be shorter than its length."
+        }
+        DeleteHolder(_) => {
+            "Remove this entry from the library. It cannot be deleted while a setup uses it: choose other workholding in that setup first."
         }
         SetOpTool(_) => {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview."
@@ -483,6 +499,75 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Material, k) if k.starts_with("fz") && k.ends_with("_max") => (
             "Highest recommended chip load per tooth, in mm, for tools in this diameter range. Chip load = feed ÷ (rpm × flutes). A higher value is flagged.",
+            None,
+        ),
+        (Target::Holder, "name") => (
+            "The entry's name in the workholding library and in the setup's list. Each entry needs its own name of up to 60 characters; capitals do not make a name different.",
+            None,
+        ),
+        (Target::Holder, "notes") => (
+            "Optional notes on the entry, up to 500 characters, such as where its sizes were measured. The starter entries say to measure yours.",
+            None,
+        ),
+        (Target::Holder, "jaw_width") => (
+            "Length of each jaw along the jaws, in mm. The jaws are centred on the stock, or shifted by the setup's jaw offset.",
+            None,
+        ),
+        (Target::Holder, "jaw_height") => (
+            "Height of the jaws above the parallels' top, in mm. Kept for reference: the modelled jaws reach from far below the stock up to the setup's grip height.",
+            None,
+        ),
+        (Target::Holder, "jaw_thickness") => (
+            "How thick each jaw is, measured outward from the stock, in mm.",
+            None,
+        ),
+        (Target::Holder, "max_opening") => (
+            "The widest stock the jaws open to, in mm. A setup whose stock is wider across the jaws shows an issue.",
+            None,
+        ),
+        (Target::Holder, "grip") => (
+            "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. A setup starts from it and can change its own grip.",
+            None,
+        ),
+        (Target::Holder, "length") => (
+            "Length of the clamp from its tip outward, in mm; the bite is part of it. The rest of it reaches beyond the stock's edge.",
+            None,
+        ),
+        (Target::Holder, "width") => (
+            "Width of the clamp, in mm, along the side of the stock it sits on.",
+            None,
+        ),
+        (Target::Holder, "height") => ("Height of the clamp above the stock's top, in mm.", None),
+        (Target::Holder, "bite") => (
+            "How far the clamp reaches onto the stock from its edge, in mm. It must be shorter than the clamp's length.",
+            None,
+        ),
+        (Target::Setup, "holding") => (
+            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap. None models nothing; the Fixture note below is only a description.",
+            None,
+        ),
+        (Target::Setup, "holder") => (
+            "The library entry used: a vise for Vise, a clamp for Clamps. Entries are made on the Workholding page; changing one changes every setup that uses it.",
+            None,
+        ),
+        (Target::Setup, "vise_axis") => (
+            "Which sides of the stock the jaws face: X sides put one jaw on the −X side and one on the +X side, Y sides on −Y and +Y. The stock must fit within the vise's maximum opening across the jaws.",
+            None,
+        ),
+        (Target::Setup, "vise_offset") => (
+            "Shifts the jaws along their length from the middle of the stock, in mm: toward +Y for jaws on the X sides, toward +X for jaws on the Y sides. 0 centres them.",
+            None,
+        ),
+        (Target::Setup, "vise_grip") => (
+            "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. The jaws are modelled from far below the stock up to it, so the stock above is free to cut. It starts at the vise's own grip.",
+            None,
+        ),
+        (Target::Setup, "holding_gap") => (
+            "The clearance kept around the jaws or clamps, in mm: each box is grown by it when toolpaths are checked against it. 0 or more; left empty it is 2 mm.",
+            None,
+        ),
+        (Target::Setup, "clamps") => (
+            "Where the clamps sit, written side:offset and separated by semicolons, for example -X:0; +X:20. The sides are -X, +X, -Y and +Y of the stock; the offset, in mm, moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides). Place 1 to 8 clamps. The text is saved only when every clamp reads correctly; what is wrong is shown under the field.",
             None,
         ),
         (_, "name") => (
@@ -1662,6 +1747,79 @@ mod tests {
         assert_eq!(
             field_help("fz6_min", "Minimum", Target::Tool).title,
             "Minimum"
+        );
+    }
+    #[test]
+    fn workholding_commands_and_fields_have_specific_help() {
+        use crate::Page::Workholding;
+        let generic = command(&Message::Noop, "x".into()).body;
+        for message in [
+            Message::NewHolder("Vise"),
+            Message::NewHolder("Clamp"),
+            Message::EditHolder("h".into()),
+            Message::SaveHolder,
+            Message::DeleteHolder("h".into()),
+            Message::Page(Workholding),
+        ] {
+            let body = command(&message, "x".into()).body;
+            assert_ne!(body, generic, "{message:?}");
+        }
+        let delete = command(&Message::DeleteHolder("h".into()), "x".into()).body;
+        assert!(delete.contains("setup uses"), "{delete}");
+        let unknown = field_help("zz", "x", Target::Holder).body;
+        assert!(unknown.starts_with("Saved parameter"));
+        for key in [
+            "name",
+            "notes",
+            "jaw_width",
+            "jaw_height",
+            "jaw_thickness",
+            "max_opening",
+            "grip",
+            "length",
+            "width",
+            "height",
+            "bite",
+        ] {
+            let body = field_help(key, "x", Target::Holder).body;
+            assert_ne!(body, unknown, "{key}");
+            // The tool's and the operator's texts of the same keys are not shown.
+            for other in ["flutes", "reclamp", "holder diameter"] {
+                assert!(!body.contains(other), "{key}: {body}");
+            }
+        }
+        assert!(
+            field_help("name", "x", Target::Holder)
+                .body
+                .contains("up to 60 characters")
+        );
+        for key in [
+            "holding",
+            "holder",
+            "vise_axis",
+            "vise_offset",
+            "vise_grip",
+            "holding_gap",
+            "clamps",
+        ] {
+            let body = field_help(key, "x", Target::Setup).body;
+            assert_ne!(body, unknown, "{key}");
+            assert!(!body.contains("cutter"), "{key}: {body}");
+        }
+        let clamps = field_help("clamps", "x", Target::Setup).body;
+        for part in ["side:offset", "-X", "+X", "-Y", "+Y", "8"] {
+            assert!(clamps.contains(part), "{part}: {clamps}");
+        }
+        // The tool's holder diameter and flute length keep their own help.
+        assert!(
+            field_help("holder", "x", Target::Tool)
+                .body
+                .contains("Maximum holder diameter")
+        );
+        assert!(
+            field_help("length", "x", Target::Tool)
+                .body
+                .contains("flutes")
         );
     }
     #[test]

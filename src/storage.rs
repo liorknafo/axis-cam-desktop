@@ -17,7 +17,8 @@ pub fn load(path: &Path) -> Result<Document, String> {
 }
 /// Loads a project with what the load changed worth saying: tools saved
 /// without a tool number numbered in library order (`NUMBERED_TOOLS`), then
-/// the note of linking a legacy material to the library.
+/// the note of linking a legacy material to the library. An empty workholding
+/// library is given the starters without a note.
 pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.len() > 20_000_000 {
@@ -53,6 +54,7 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
         notes.push(NUMBERED_TOOLS.to_string());
     }
     notes.extend(d.adopt_materials());
+    d.adopt_holders();
     d.validate_structure()?;
     Ok((d, notes))
 }
@@ -141,6 +143,47 @@ mod tests {
         let error = load(&path).unwrap_err();
         assert!(error.contains("duplicate library identifier"), "{error}");
         doc.materials[1].id.clear();
+        save(&path, &doc).unwrap();
+        assert!(load(&path).is_err());
+    }
+    #[test]
+    fn a_project_without_a_workholding_library_gets_the_starters_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.axis.json");
+        let mut value = serde_json::to_value(Document::sample()).unwrap();
+        value.as_object_mut().unwrap().remove("workholding");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let (doc, notes) = load_reporting(&path).unwrap();
+        let names: Vec<_> = doc.workholding.iter().map(|h| h.name()).collect();
+        assert_eq!(names, ["100 mm machine vise", "Toe clamp 60 mm"]);
+        assert!(
+            notes.iter().all(|n| !n.contains("workholding")),
+            "{notes:?}"
+        );
+        // Its setups model no workholding.
+        let setup = &doc.setups[0];
+        assert!(!setup.p.contains_key("holding"));
+        assert_eq!(
+            crate::holding::layout(setup),
+            Ok(crate::holding::Layout::None)
+        );
+    }
+    #[test]
+    fn a_workholding_library_with_entries_is_loaded_as_it_is() {
+        use crate::holding::Holder;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("holders.axis.json");
+        let mut doc = Document::default();
+        doc.workholding.push(Holder::new("Clamp", "Strap clamp"));
+        save(&path, &doc).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.workholding, doc.workholding);
+        // Two entries with one identifier, or one without, are refused.
+        doc.workholding.push(doc.workholding[0].clone());
+        save(&path, &doc).unwrap();
+        let error = load(&path).unwrap_err();
+        assert!(error.contains("duplicate library identifier"), "{error}");
+        doc.workholding[1].id.clear();
         save(&path, &doc).unwrap();
         assert!(load(&path).is_err());
     }

@@ -855,6 +855,10 @@ pub struct Document {
     /// The selected library material's id; `material` keeps its name.
     #[serde(default)]
     pub material_id: String,
+    /// The workholding library: vises and clamps, carried to new projects
+    /// like tools.
+    #[serde(default)]
+    pub workholding: Vec<crate::holding::Holder>,
     pub file: Option<ModelFile>,
     #[serde(default)]
     pub sample_model: bool,
@@ -871,6 +875,7 @@ impl Default for Document {
             material: String::new(),
             materials: vec![],
             material_id: String::new(),
+            workholding: vec![],
             file: None,
             sample_model: false,
             machines: vec![],
@@ -1000,6 +1005,91 @@ impl Document {
             shown(&name)
         ))
     }
+    pub fn holder(&self, id: &str) -> Option<&crate::holding::Holder> {
+        self.workholding.iter().find(|h| h.id == id)
+    }
+    /// Why `holder` cannot be saved to the library: another entry has its
+    /// name (ignoring case).
+    pub fn holder_name_issues(&self, holder: &crate::holding::Holder) -> Vec<String> {
+        let name = holder.name().trim();
+        let taken = !name.is_empty()
+            && self
+                .workholding
+                .iter()
+                .any(|h| h.id != holder.id && crate::material::same_name(h.name(), name));
+        taken
+            .then(|| format!("A workholding entry named {name} is already in the library."))
+            .into_iter()
+            .collect()
+    }
+    /// Gives a document with an empty library the starter vise and clamp.
+    pub fn adopt_holders(&mut self) {
+        if self.workholding.is_empty() {
+            self.workholding = crate::holding::starters();
+        }
+    }
+    /// What is wrong with setup `setup`'s modelled workholding: its layout,
+    /// its library entry, and for a vise the stock being wider across the jaws
+    /// than the vise opens (when the stock can be told, from the part `mesh`).
+    pub fn holding_issues(&self, setup: usize, mesh: Option<&crate::mesh::Mesh>) -> Vec<String> {
+        use crate::holding::{DELETED, Layout, layout, opening_issue, refusal};
+        let Some(setup) = self.setups.get(setup) else {
+            return vec![];
+        };
+        let layout = match layout(setup) {
+            Ok(layout) => layout,
+            Err(error) => return vec![error],
+        };
+        let (holder, kind) = match &layout {
+            Layout::None => return vec![],
+            Layout::Vise { holder, .. } => (holder, "vise"),
+            Layout::Clamps { holder, .. } => (holder, "clamp"),
+        };
+        if holder.is_empty() {
+            return vec![format!("Choose a {kind} from the library.")];
+        }
+        let Some(entry) = self.holder(holder) else {
+            return vec![DELETED.into()];
+        };
+        if let Some(refused) = refusal(&layout, entry) {
+            return vec![refused];
+        }
+        crate::stock::resolve(setup, mesh)
+            .ok()
+            .and_then(|resolved| opening_issue(&layout, entry, resolved.stock))
+            .into_iter()
+            .collect()
+    }
+    /// After a setup's `holding` or `holder` changed: a vise or clamps setup
+    /// points at a library entry of its kind (its own when it has one, else
+    /// the first), a vise setup without a grip starts at the vise's grip, and
+    /// the clearance gap at 2 mm.
+    pub fn settle_holding(&mut self, setup: usize) {
+        let Some(s) = self.setups.get(setup) else {
+            return;
+        };
+        let kind = match get(&s.p, "holding") {
+            "Vise" => "Vise",
+            "Clamps" => "Clamp",
+            _ => return,
+        };
+        let mine = self
+            .holder(get(&s.p, "holder"))
+            .filter(|h| h.kind() == kind);
+        let chosen = mine.or_else(|| self.workholding.iter().find(|h| h.kind() == kind));
+        let holder = chosen.map(|h| h.id.clone()).unwrap_or_default();
+        let grip = chosen.map(|h| get(&h.p, "grip").to_string());
+        let p = &mut self.setups[setup].p;
+        p.insert("holder".into(), holder);
+        if let Some(grip) = grip.filter(|g| kind == "Vise" && !g.is_empty())
+            && get(p, "vise_grip").trim().is_empty()
+        {
+            p.insert("vise_grip".into(), grip);
+        }
+        if get(p, "holding_gap").trim().is_empty() {
+            p.insert("holding_gap".into(), "2".into());
+        }
+    }
     pub fn has_model(&self) -> bool {
         self.file.is_some() || self.sample_model
     }
@@ -1078,6 +1168,7 @@ impl Document {
                 .collect::<Vec<_>>(),
             self.tools.iter().map(|t| t.id.as_str()).collect(),
             self.materials.iter().map(|m| m.id.as_str()).collect(),
+            self.workholding.iter().map(|h| h.id.as_str()).collect(),
         ] {
             let mut seen = HashSet::new();
             if ids.iter().any(|id| id.is_empty() || !seen.insert(id)) {
@@ -1568,5 +1659,253 @@ mod tests {
         doc.materials.push(blank);
         doc.material_id.clear();
         assert!(doc.selected_material().is_none());
+    }
+    fn doc_with_holding(pairs: &[(&str, &str)]) -> Document {
+        let mut doc = Document::sample();
+        doc.adopt_holders();
+        for (k, v) in pairs {
+            doc.setup_mut().p.insert((*k).into(), (*v).into());
+        }
+        doc
+    }
+    fn starter(doc: &Document, kind: &str) -> String {
+        doc.workholding
+            .iter()
+            .find(|h| h.kind() == kind)
+            .unwrap()
+            .id
+            .clone()
+    }
+    #[test]
+    fn adopting_holders_adds_the_starters_only_to_an_empty_library() {
+        let mut doc = Document::default();
+        assert!(doc.workholding.is_empty());
+        doc.adopt_holders();
+        let names: Vec<_> = doc.workholding.iter().map(|h| h.name()).collect();
+        assert_eq!(names, ["100 mm machine vise", "Toe clamp 60 mm"]);
+        assert!(doc.validate_structure().is_ok());
+        // A library the user edited keeps their edits and is not topped up.
+        doc.workholding[0].p.insert("name".into(), "My vise".into());
+        doc.workholding.pop();
+        let id = doc.workholding[0].id.clone();
+        doc.adopt_holders();
+        assert_eq!(doc.workholding.len(), 1);
+        assert_eq!(
+            (doc.workholding[0].name(), &doc.workholding[0].id),
+            ("My vise", &id)
+        );
+    }
+    #[test]
+    fn a_project_with_duplicate_or_empty_holder_ids_is_refused() {
+        use crate::holding::Holder;
+        let mut doc = Document::default();
+        doc.adopt_holders();
+        assert!(doc.validate_structure().is_ok());
+        let mut copy = doc.workholding[0].clone();
+        copy.p.insert("name".into(), "Other name".into());
+        doc.workholding.push(copy);
+        let error = doc.validate_structure().unwrap_err();
+        assert!(error.contains("duplicate library identifier"), "{error}");
+        doc.workholding.pop();
+        let mut blank = Holder::new("Vise", "No id");
+        blank.id.clear();
+        doc.workholding.push(blank);
+        assert!(doc.validate_structure().is_err());
+        doc.workholding.pop();
+        assert!(doc.validate_structure().is_ok());
+    }
+    #[test]
+    fn a_holder_name_is_taken_regardless_of_case_and_spaces() {
+        use crate::holding::Holder;
+        let mut doc = Document::default();
+        doc.adopt_holders();
+        let mut same = Holder::new("Vise", " 100 MM machine vise ");
+        assert_eq!(
+            doc.holder_name_issues(&same),
+            ["A workholding entry named 100 MM machine vise is already in the library."]
+        );
+        same.id = doc.workholding[0].id.clone();
+        assert!(doc.holder_name_issues(&same).is_empty());
+        assert!(
+            doc.holder_name_issues(&Holder::new("Vise", "  "))
+                .is_empty()
+        );
+        assert!(
+            doc.holder_name_issues(&Holder::new("Clamp", "Strap"))
+                .is_empty()
+        );
+    }
+    #[test]
+    fn a_setup_without_holding_keys_is_none_and_has_no_issues() {
+        let doc = doc_with_holding(&[]);
+        let setup = doc.setup();
+        for key in ["holding", "holder", "vise_axis", "vise_grip", "clamps"] {
+            assert!(!setup.p.contains_key(key), "{key}");
+        }
+        assert_eq!(
+            crate::holding::layout(setup),
+            Ok(crate::holding::Layout::None)
+        );
+        assert!(doc.holding_issues(0, None).is_empty());
+        // An unknown setup index has none either.
+        assert!(doc.holding_issues(9, None).is_empty());
+        let json = serde_json::to_value(&doc).unwrap();
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("workholding");
+        let back: Document = serde_json::from_value(old).unwrap();
+        assert!(back.workholding.is_empty());
+    }
+    #[test]
+    fn holding_issues_name_the_layout_the_entry_and_the_opening() {
+        use crate::holding::DELETED;
+        let mut doc = doc_with_holding(&[
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "140"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+        ]);
+        let vise = starter(&doc, "Vise");
+        let clamp = starter(&doc, "Clamp");
+        // Without workholding nothing is said, however wide the stock is.
+        assert!(doc.holding_issues(0, None).is_empty());
+        let set = |doc: &mut Document, pairs: &[(&str, &str)]| {
+            for (k, v) in pairs {
+                doc.setup_mut().p.insert((*k).into(), (*v).into());
+            }
+        };
+        // The vise opens to 120 mm: 140 across X is too wide, 100 across Y fits.
+        set(
+            &mut doc,
+            &[("holding", "Vise"), ("holder", &vise), ("vise_grip", "8")],
+        );
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["The stock is 140 mm across the jaws; this vise opens to 120 mm."]
+        );
+        set(&mut doc, &[("vise_axis", "Y")]);
+        assert!(doc.holding_issues(0, None).is_empty());
+        set(&mut doc, &[("vise_axis", "X"), ("stock_x", "140.5")]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["The stock is 140.5 mm across the jaws; this vise opens to 120 mm."]
+        );
+        // The layout's own error comes alone.
+        set(&mut doc, &[("vise_grip", "-1")]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["The vise grip must be a positive number."]
+        );
+        set(&mut doc, &[("vise_grip", "8")]);
+        // An entry that is gone, none chosen, one of the other kind, and one
+        // that is not finished.
+        set(&mut doc, &[("holder", "gone")]);
+        assert_eq!(doc.holding_issues(0, None), [DELETED]);
+        assert_eq!(
+            DELETED,
+            "The workholding entry was deleted; choose another."
+        );
+        set(&mut doc, &[("holder", "")]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["Choose a vise from the library."]
+        );
+        set(&mut doc, &[("holder", &clamp)]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["The chosen workholding entry is a clamp, not a vise."]
+        );
+        set(&mut doc, &[("holder", &vise)]);
+        doc.workholding[0].p.remove("jaw_thickness");
+        let issues = doc.holding_issues(0, None);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("jaw thickness"), "{issues:?}");
+        doc.workholding[0]
+            .p
+            .insert("jaw_thickness".into(), "20".into());
+        // Clamps: the opening does not apply.
+        set(
+            &mut doc,
+            &[
+                ("holding", "Clamps"),
+                ("holder", &clamp),
+                ("clamps", "-X:0;+X:0"),
+            ],
+        );
+        assert!(doc.holding_issues(0, None).is_empty());
+        set(&mut doc, &[("clamps", "-Z:0")]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["A clamp side must be -X, +X, -Y or +Y."]
+        );
+        set(&mut doc, &[("clamps", "")]);
+        assert_eq!(doc.holding_issues(0, None), ["Place 1 to 8 clamps."]);
+        set(&mut doc, &[("clamps", "-X:0"), ("holder", "")]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            ["Choose a clamp from the library."]
+        );
+    }
+    #[test]
+    fn the_opening_check_is_skipped_silently_when_the_stock_cannot_be_resolved() {
+        // Relative stock needs the part; with none loaded the stock is unknown.
+        let mut doc = doc_with_holding(&[("holding", "Vise"), ("vise_grip", "8")]);
+        let vise = starter(&doc, "Vise");
+        doc.setup_mut().p.insert("holder".into(), vise);
+        assert!(doc.holding_issues(0, None).is_empty());
+        // Invalid stock numbers are the stock section's to report.
+        let p = &mut doc.setup_mut().p;
+        p.insert("stock_type".into(), "Fixed size box".into());
+        p.insert("stock_x".into(), "wide".into());
+        assert!(doc.holding_issues(0, None).is_empty());
+        // With the part loaded the relative stock is resolved: the sample part
+        // (140 × 94 mm) plus 5 mm on each side is 150 across X and 104 across Y.
+        let mesh = crate::mesh::sample();
+        let p = &mut doc.setup_mut().p;
+        p.insert("stock_type".into(), "Relative size box".into());
+        assert_eq!(
+            doc.holding_issues(0, Some(&mesh)),
+            ["The stock is 150 mm across the jaws; this vise opens to 120 mm."]
+        );
+        doc.setup_mut().p.insert("vise_axis".into(), "Y".into());
+        assert!(doc.holding_issues(0, Some(&mesh)).is_empty());
+    }
+    #[test]
+    fn settling_a_setups_holding_picks_an_entry_of_its_kind_a_grip_and_a_gap() {
+        let mut doc = doc_with_holding(&[("holding", "Vise")]);
+        let vise = starter(&doc, "Vise");
+        doc.settle_holding(0);
+        let p = &doc.setups[0].p;
+        assert_eq!(get(p, "holder"), vise);
+        assert_eq!(get(p, "vise_grip"), "8");
+        assert_eq!(get(p, "holding_gap"), "2");
+        // A grip the user has set stays; so does a gap.
+        let p = &mut doc.setups[0].p;
+        p.insert("vise_grip".into(), "5".into());
+        p.insert("holding_gap".into(), "3".into());
+        doc.settle_holding(0);
+        let p = &doc.setups[0].p;
+        assert_eq!((get(p, "vise_grip"), get(p, "holding_gap")), ("5", "3"));
+        // Clamps replace a holder of the other kind and take no grip.
+        let mut other = doc_with_holding(&[("holding", "Clamps")]);
+        let wrong = starter(&other, "Vise");
+        other.setup_mut().p.insert("holder".into(), wrong);
+        other.settle_holding(0);
+        assert_eq!(get(&other.setups[0].p, "holder"), starter(&other, "Clamp"));
+        assert_eq!(get(&other.setups[0].p, "vise_grip"), "");
+        // A holder that was deleted is replaced by one that exists, and a kind
+        // the library has none of leaves none chosen.
+        let mut gone = doc_with_holding(&[("holding", "Vise"), ("holder", "gone")]);
+        gone.settle_holding(0);
+        assert_eq!(get(&gone.setups[0].p, "holder"), starter(&gone, "Vise"));
+        gone.workholding.retain(|h| h.kind() != "Vise");
+        gone.setups[0].p.insert("holder".into(), "gone".into());
+        gone.settle_holding(0);
+        assert_eq!(get(&gone.setups[0].p, "holder"), "");
+        // None leaves the setup alone.
+        let mut none = doc_with_holding(&[("holding", "None"), ("holder", "keep")]);
+        none.settle_holding(0);
+        assert_eq!(get(&none.setups[0].p, "holder"), "keep");
+        assert_eq!(get(&none.setups[0].p, "holding_gap"), "");
+        none.settle_holding(9);
     }
 }

@@ -46,6 +46,7 @@ pub enum Page {
     Machines,
     Tools,
     Materials,
+    Workholding,
     Wizard,
     Ai,
     Post,
@@ -58,6 +59,7 @@ pub enum Target {
     Machine,
     Tool,
     Material,
+    Holder,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Account {
@@ -127,6 +129,13 @@ pub enum Message {
     SaveMaterial,
     DeleteMaterial(String),
     PickMaterial(String),
+    /// A new library vise or clamp: its kind, one of `holding::KINDS`.
+    NewHolder(&'static str),
+    EditHolder(String),
+    SaveHolder,
+    DeleteHolder(String),
+    /// The text of the clamp positions field of the active setup.
+    SetClamps(String),
     SetOpTool(String),
     RestSource(String),
     StockSource(String),
@@ -214,6 +223,13 @@ pub struct Step {
     /// request step when the reply could not be read.
     pub result: Option<planner::StepResult>,
 }
+/// Clamp positions typed over a setup's `over` that `holding::layout` refuses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClampsDraft {
+    pub setup: String,
+    pub text: String,
+    pub over: String,
+}
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 pub struct App {
     pub smoke_dir: Option<PathBuf>,
@@ -258,6 +274,10 @@ pub struct App {
     pub wizard_step: usize,
     pub tool_draft: Tool,
     pub material_draft: material::Material,
+    pub holder_draft: holding::Holder,
+    /// What was typed in the active setup's clamp positions field while it
+    /// does not read correctly; the setup keeps its last good text.
+    pub clamps_draft: Option<ClampsDraft>,
     pub camera: viewport::Camera,
     pub sample_mesh: mesh::Mesh,
     pub imported_mesh: Option<mesh::Mesh>,
@@ -435,8 +455,9 @@ impl App {
                 false,
             )
         };
-        // A blank workspace has the starter materials too.
+        // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
+        doc.adopt_holders();
         if !doc.sample_model {
             doc.sync_stock_sources();
         }
@@ -473,6 +494,8 @@ impl App {
                 .cloned()
                 .unwrap_or_else(|| blank_tool(&doc)),
             material_draft: material_draft(&doc),
+            holder_draft: holder_draft(&doc),
+            clamps_draft: None,
             doc,
             page: Page::Home,
             selected: None,
@@ -545,6 +568,7 @@ impl App {
         if app.smoke_dir.is_some() {
             let mut sample = Document::sample();
             sample.adopt_materials();
+            sample.adopt_holders();
             app.replace_document(sample, None);
             app.selected = Some(0);
             if std::env::args().any(|arg| arg == "--help-only") {
@@ -589,6 +613,8 @@ impl App {
             .cloned()
             .unwrap_or_else(|| blank_tool(&doc));
         self.material_draft = material_draft(&doc);
+        self.holder_draft = holder_draft(&doc);
+        self.clamps_draft = None;
         self.doc = doc;
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -657,6 +683,19 @@ impl App {
             Some(&self.sample_mesh)
         } else {
             None
+        }
+    }
+    /// The active setup's clamp positions field: its text and what is wrong
+    /// with it. The text is what was typed while that does not read (as long
+    /// as the setup's own has not changed since), otherwise the setup's.
+    pub fn clamps_field(&self) -> (String, Option<String>) {
+        let setup = self.doc.setup();
+        let saved = get(&setup.p, "clamps");
+        match &self.clamps_draft {
+            Some(d) if d.setup == setup.id && d.over == saved => {
+                (d.text.clone(), holding::check_clamps(setup, &d.text).err())
+            }
+            _ => (saved.to_string(), None),
         }
     }
     /// The second sign-in step: the browser part is done and the session is being saved.
@@ -1207,6 +1246,7 @@ impl App {
                     | Message::MoveSetup(_)
                     | Message::Flip(_)
                     | Message::StockSource(_)
+                    | Message::SetClamps(_)
                     | Message::Plan
             )
         {
@@ -1238,11 +1278,13 @@ impl App {
                     machines: self.doc.machines.clone(),
                     tools: self.doc.tools.clone(),
                     materials: self.doc.materials.clone(),
+                    workholding: self.doc.workholding.clone(),
                     ..Document::default()
                 };
                 doc.adopt_materials();
+                doc.adopt_holders();
                 self.replace_document(doc, None);
-                self.status = "Blank project created. Saved machines, tools and materials are available; your previous project is in History.".into();
+                self.status = "Blank project created. Saved machines, tools, materials and workholding are available; your previous project is in History.".into();
             }
             Message::ResumeProject => {
                 self.page = Page::Work;
@@ -1340,7 +1382,16 @@ impl App {
                     self.touch()
                 }
                 Target::Setup => {
+                    // A pick_list repeats the chosen item; that is not a change.
+                    if matches!(k, "holding" | "holder" | "vise_axis")
+                        && get(&self.doc.setup().p, k) == v
+                    {
+                        return Task::none();
+                    }
                     self.doc.setup_mut().p.insert(k.into(), v);
+                    if matches!(k, "holding" | "holder") {
+                        self.doc.settle_holding(self.doc.index());
+                    }
                     self.touch()
                 }
                 Target::Machine => {
@@ -1372,6 +1423,9 @@ impl App {
                 }
                 Target::Material => {
                     self.material_draft.p.insert(k.into(), v);
+                }
+                Target::Holder => {
+                    self.holder_draft.p.insert(k.into(), v);
                 }
             },
             Message::Title(v) => {
@@ -1830,6 +1884,74 @@ impl App {
                     self.touch()
                 }
             }
+            Message::EditHolder(id) => {
+                if let Some(h) = self.doc.holder(&id) {
+                    self.holder_draft = h.clone();
+                    self.page = Page::Workholding
+                }
+            }
+            Message::NewHolder(kind) => {
+                let name = format!("New {}", kind.to_lowercase());
+                self.holder_draft = holding::Holder::new(kind, &name);
+                self.page = Page::Workholding
+            }
+            Message::SaveHolder => {
+                let mut issues = self.holder_draft.issues();
+                issues.extend(self.doc.holder_name_issues(&self.holder_draft));
+                if issues.is_empty() {
+                    let name = self.holder_draft.name().trim().to_string();
+                    self.holder_draft.p.insert("name".into(), name);
+                    let saved = self.holder_draft.clone();
+                    if let Some(h) = self.doc.workholding.iter_mut().find(|h| h.id == saved.id) {
+                        *h = saved
+                    } else {
+                        self.doc.workholding.push(saved)
+                    }
+                    self.touch();
+                    self.status = "Workholding saved to the library.".into()
+                } else {
+                    self.status = issues.join(" ")
+                }
+            }
+            Message::DeleteHolder(id) => {
+                let using = self.doc.setups.iter().find(|s| {
+                    matches!(get(&s.p, "holding"), "Vise" | "Clamps") && get(&s.p, "holder") == id
+                });
+                if let Some(setup) = using {
+                    let name = self.doc.holder(&id).map_or("This entry", |h| h.name());
+                    self.status = format!(
+                        "{name} is used by the setup {}. Choose other workholding there before deleting it.",
+                        setup.name()
+                    )
+                } else {
+                    let before = self.doc.workholding.len();
+                    self.doc.workholding.retain(|h| h.id != id);
+                    self.holder_draft = holder_draft(&self.doc);
+                    if self.doc.workholding.len() < before {
+                        self.touch();
+                        self.status = "Workholding deleted from the library.".into()
+                    } else {
+                        self.status = "The unsaved entry was discarded.".into()
+                    }
+                }
+            }
+            Message::SetClamps(text) => match holding::check_clamps(self.doc.setup(), &text) {
+                Ok(()) => {
+                    self.clamps_draft = None;
+                    self.doc.setup_mut().p.insert("clamps".into(), text);
+                    self.touch();
+                    self.status = "Clamp positions saved with the setup.".into()
+                }
+                Err(error) => {
+                    let setup = self.doc.setup();
+                    self.clamps_draft = Some(ClampsDraft {
+                        setup: setup.id.clone(),
+                        over: get(&setup.p, "clamps").into(),
+                        text,
+                    });
+                    self.status = error
+                }
+            },
             Message::SetOpTool(id) => {
                 if let Some(o) = self.operation_mut() {
                     o.tool = id;
@@ -2871,18 +2993,19 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         path.display()
     ))
 }
-/// The example project with the user's tool, machine and material libraries
-/// merged in, and the status line naming the user's entries it adds. A user
+/// The example project with the user's tool, machine, material and workholding
+/// libraries merged in, and the status line naming the user's entries it adds. A user
 /// entry the example already has, ignoring tool numbers and post settings
 /// saved before they existed, is not added twice: the example's tool takes
 /// the user's number. Every other example tool whose number is then in use
 /// gets the smallest free one; the example's operations refer to it by ID.
 /// Materials match by name (`material::same_name`), and the user's entry is kept; the
 /// example's material is then linked to the library, or added to it without
-/// cutting data, and the status says which.
+/// cutting data, and the status says which. Workholding matches by name too;
+/// the starters are added only to an empty library.
 fn merge_sample(user: &Document) -> (Document, String) {
     let mut doc = Document::sample();
-    let (mut tools, mut machines, mut materials) = (vec![], vec![], vec![]);
+    let (mut tools, mut machines, mut materials, mut holders) = (vec![], vec![], vec![], vec![]);
     for m in &user.machines {
         let mut filled = m.clone();
         filled.fill_post_defaults();
@@ -2905,6 +3028,20 @@ fn merge_sample(user: &Document) -> (Document, String) {
         }
     }
     let material_note = doc.adopt_materials();
+    let starter_holders = holding::starters();
+    for h in &user.workholding {
+        let known = |list: &[holding::Holder]| {
+            list.iter()
+                .any(|x| crate::material::same_name(x.name(), h.name()))
+        };
+        if !known(&doc.workholding) {
+            doc.workholding.push(h.clone());
+            if !known(&starter_holders) {
+                holders.push(h.name().to_string());
+            }
+        }
+    }
+    doc.adopt_holders();
     let unnumbered = |t: &Tool| {
         let mut p = t.p.clone();
         p.remove("number");
@@ -2951,6 +3088,7 @@ fn merge_sample(user: &Document) -> (Document, String) {
         list(&tools, "tool", "tools"),
         list(&machines, "machine", "machines"),
         list(&materials, "material", "materials"),
+        list(&holders, "workholding entry", "workholding entries"),
     ]
     .into_iter()
     .flatten()
@@ -3014,6 +3152,13 @@ fn blank_tool(doc: &Document) -> Tool {
     tool.p
         .insert("number".into(), doc.next_tool_number().to_string());
     tool
+}
+/// The workholding editor's draft: the first library entry, or a new vise.
+fn holder_draft(doc: &Document) -> holding::Holder {
+    doc.workholding
+        .first()
+        .cloned()
+        .unwrap_or_else(|| holding::Holder::new("Vise", "New vise"))
 }
 /// The material editor's draft: the first library material, or a new one.
 fn material_draft(doc: &Document) -> material::Material {

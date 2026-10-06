@@ -899,6 +899,7 @@ mod tests {
             Page::Machines,
             Page::Tools,
             Page::Materials,
+            Page::Workholding,
             Page::Ai,
             Page::Post,
             Page::Wizard,
@@ -1712,6 +1713,544 @@ mod tests {
         // The page builds with each list.
         a.page = Page::Post;
         let _ = a.view();
+    }
+    fn holders_named(doc: &Document) -> Vec<String> {
+        doc.workholding
+            .iter()
+            .map(|h| h.name().to_string())
+            .collect()
+    }
+    fn edit_holder(a: &mut App, pairs: &[(&'static str, &str)]) {
+        for (key, value) in pairs {
+            let _ = a.update(Message::Edit(Target::Holder, key, (*value).into()));
+        }
+    }
+    fn edit_setup(a: &mut App, pairs: &[(&'static str, &str)]) {
+        for (key, value) in pairs {
+            let _ = a.update(Message::Edit(Target::Setup, key, (*value).into()));
+        }
+    }
+    /// The example job and the starter library, in an app of its own.
+    fn holding_app(dir: &tempfile::TempDir) -> App {
+        let mut a = fresh_app(dir);
+        a.replace_document(Document::sample(), None);
+        a.doc.adopt_holders();
+        a
+    }
+    fn first_of(a: &App, kind: &str) -> String {
+        a.doc
+            .workholding
+            .iter()
+            .find(|h| h.kind() == kind)
+            .unwrap()
+            .id
+            .clone()
+    }
+    #[test]
+    fn the_workholding_library_starts_with_the_starters_and_keeps_a_users_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let mut a = App::from_workspace(path.clone(), None);
+        assert_eq!(
+            holders_named(&a.doc),
+            ["100 mm machine vise", "Toe clamp 60 mm"]
+        );
+        assert_eq!(a.holder_draft.id, a.doc.workholding[0].id);
+        assert!(a.doc.validate_structure().is_ok());
+        // Edit the vise, delete the clamp, and save the workspace.
+        let vise = first_of(&a, "Vise");
+        let clamp = first_of(&a, "Clamp");
+        let _ = a.update(Message::EditHolder(vise.clone()));
+        edit_holder(&mut a, &[("jaw_width", "125")]);
+        let _ = a.update(Message::SaveHolder);
+        let _ = a.update(Message::DeleteHolder(clamp));
+        assert_eq!(holders_named(&a.doc), ["100 mm machine vise"]);
+        a.dirty = true;
+        a.persist();
+        // A library with entries gets no starters when it is opened again.
+        let reopened = App::from_workspace(path, None);
+        assert_eq!(holders_named(&reopened.doc), ["100 mm machine vise"]);
+        assert_eq!(reopened.doc.workholding[0].id, vise);
+        assert_eq!(get(&reopened.doc.workholding[0].p, "jaw_width"), "125");
+    }
+    #[test]
+    fn new_project_carries_the_workholding_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let mut mine = crate::holding::Holder::new("Clamp", "Strap clamp");
+        for (k, v) in [
+            ("length", "80"),
+            ("width", "25"),
+            ("height", "30"),
+            ("bite", "20"),
+        ] {
+            mine.p.insert(k.into(), v.into());
+        }
+        a.doc.workholding.push(mine.clone());
+        let ids: Vec<_> = a.doc.workholding.iter().map(|h| h.id.clone()).collect();
+        let _ = a.update(Message::NewProject);
+        assert!(a.doc.setups.is_empty());
+        assert_eq!(
+            a.doc
+                .workholding
+                .iter()
+                .map(|h| h.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(a.holder_draft.id, ids[0]);
+        // An empty library is given the starters again.
+        a.doc.workholding.clear();
+        let _ = a.update(Message::NewProject);
+        assert_eq!(a.doc.workholding.len(), 2);
+        assert!(
+            a.status.contains("materials and workholding are available"),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn explore_merges_workholding_without_duplicate_names() {
+        use crate::holding::Holder;
+        let user = Document {
+            workholding: vec![
+                Holder::new("Vise", " 100 MM machine VISE "),
+                Holder::new("Clamp", "Strap clamp"),
+                Holder::new("Clamp", " strap CLAMP"),
+            ],
+            ..Document::default()
+        };
+        let (doc, status) = crate::merge_sample(&user);
+        // The user's library is kept as it is, without starters next to it; the
+        // second spelling is the first entry again, and the starter's name is
+        // not announced as an addition of the user's.
+        assert_eq!(
+            holders_named(&doc),
+            [" 100 MM machine VISE ", "Strap clamp"]
+        );
+        assert!(status.contains("workholding entry Strap clamp"), "{status}");
+        assert!(!status.contains("VISE"), "{status}");
+        assert!(doc.validate_structure().is_ok());
+        // A user library of the starters adds nothing and says nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let ids: Vec<_> = a.doc.workholding.iter().map(|h| h.id.clone()).collect();
+        let _ = a.update(Message::OpenSample);
+        assert_eq!(
+            a.doc
+                .workholding
+                .iter()
+                .map(|h| h.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(!a.status.contains("workholding"), "{}", a.status);
+        // Several of the user's own are listed, and an empty library gets the starters.
+        let several = Document {
+            workholding: vec![Holder::new("Vise", "Kurt"), Holder::new("Clamp", "Strap")],
+            ..Document::default()
+        };
+        let (_, status) = crate::merge_sample(&several);
+        assert!(
+            status.contains("workholding entries Kurt, Strap"),
+            "{status}"
+        );
+        let (doc, _) = crate::merge_sample(&Document::default());
+        assert_eq!(holders_named(&doc).len(), 2);
+    }
+    #[test]
+    fn holders_are_created_edited_saved_refused_and_deleted_like_materials() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let before = a.doc.workholding.len();
+        let _ = a.update(Message::NewHolder("Vise"));
+        assert_eq!(a.page, Page::Workholding);
+        assert_eq!(
+            (a.holder_draft.kind(), a.holder_draft.name()),
+            ("Vise", "New vise")
+        );
+        // Nothing measured yet: refused with the entry's issues.
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), before);
+        assert!(
+            a.status.contains("jaw width must be a positive number."),
+            "{}",
+            a.status
+        );
+        edit_holder(
+            &mut a,
+            &[
+                ("name", "  Kurt 150  "),
+                ("jaw_width", "150"),
+                ("jaw_height", "40"),
+                ("jaw_thickness", "25"),
+                ("max_opening", "180"),
+                ("grip", "10"),
+            ],
+        );
+        a.project_dirty = false;
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.status, "Workholding saved to the library.");
+        assert!(a.project_dirty);
+        assert_eq!(a.doc.workholding.len(), before + 1);
+        let kurt = a.doc.workholding.last().unwrap().clone();
+        assert_eq!(kurt.name(), "Kurt 150");
+        assert_eq!(get(&kurt.p, "max_opening"), "180");
+        // The same name in another case is refused.
+        let _ = a.update(Message::NewHolder("Vise"));
+        edit_holder(
+            &mut a,
+            &[
+                ("name", "kurt 150"),
+                ("jaw_width", "100"),
+                ("jaw_height", "30"),
+                ("jaw_thickness", "20"),
+                ("max_opening", "120"),
+                ("grip", "8"),
+            ],
+        );
+        let _ = a.update(Message::SaveHolder);
+        assert!(a.status.contains("already in the library"), "{}", a.status);
+        assert_eq!(a.doc.workholding.len(), before + 1);
+        // A clamp whose bite is not shorter than its length is refused.
+        let _ = a.update(Message::NewHolder("Clamp"));
+        assert_eq!(
+            (a.holder_draft.kind(), a.holder_draft.name()),
+            ("Clamp", "New clamp")
+        );
+        edit_holder(
+            &mut a,
+            &[
+                ("name", "Strap 80"),
+                ("length", "80"),
+                ("width", "25"),
+                ("height", "30"),
+                ("bite", "80"),
+            ],
+        );
+        let _ = a.update(Message::SaveHolder);
+        assert!(
+            a.status.contains("bite must be shorter than its length"),
+            "{}",
+            a.status
+        );
+        assert_eq!(a.doc.workholding.len(), before + 1);
+        edit_holder(&mut a, &[("bite", "20")]);
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), before + 2);
+        // Editing an entry replaces it, keeping its identifier.
+        let _ = a.update(Message::EditHolder(kurt.id.clone()));
+        assert_eq!(a.holder_draft, kurt);
+        edit_holder(&mut a, &[("grip", "12")]);
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), before + 2);
+        let edited = a.doc.workholding.iter().find(|h| h.id == kurt.id).unwrap();
+        assert_eq!(get(&edited.p, "grip"), "12");
+        assert!(a.doc.validate_structure().is_ok());
+        // Deleting puts the editor on the first entry; a draft that was never
+        // saved is only discarded.
+        let _ = a.update(Message::DeleteHolder(kurt.id.clone()));
+        assert!(!a.doc.workholding.iter().any(|h| h.id == kurt.id));
+        assert!(a.status.contains("deleted"), "{}", a.status);
+        assert_eq!(a.holder_draft.id, a.doc.workholding[0].id);
+        let count = a.doc.workholding.len();
+        let _ = a.update(Message::NewHolder("Clamp"));
+        let draft = a.holder_draft.id.clone();
+        let _ = a.update(Message::DeleteHolder(draft));
+        assert_eq!(a.doc.workholding.len(), count);
+        assert!(a.status.contains("discarded"), "{}", a.status);
+        assert_eq!(a.holder_draft.id, a.doc.workholding[0].id);
+        a.page = Page::Workholding;
+        let _ = a.view();
+    }
+    #[test]
+    fn a_holder_a_setup_uses_cannot_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let (vise, clamp) = (first_of(&a, "Vise"), first_of(&a, "Clamp"));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::DuplicateSetup);
+        edit_setup(&mut a, &[("name", "Flipped side")]);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(a.doc.setups.len(), 2);
+        // Each is refused, naming the entry and the setup that uses it.
+        let _ = a.update(Message::DeleteHolder(vise.clone()));
+        assert!(a.doc.workholding.iter().any(|h| h.id == vise));
+        assert!(a.status.contains("100 mm machine vise"), "{}", a.status);
+        assert!(a.status.contains("Flipped side"), "{}", a.status);
+        let _ = a.update(Message::DeleteHolder(clamp.clone()));
+        assert!(a.doc.workholding.iter().any(|h| h.id == clamp));
+        assert!(a.status.contains("Toe clamp 60 mm"), "{}", a.status);
+        assert!(a.status.contains("Top side"), "{}", a.status);
+        // The first setup that uses it is named when two do.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::DeleteHolder(clamp.clone()));
+        assert!(a.status.contains("Top side"), "{}", a.status);
+        assert!(!a.status.contains("Flipped side"), "{}", a.status);
+        // A setup that no longer models workholding does not hold the entry.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
+        let _ = a.update(Message::DeleteHolder(clamp.clone()));
+        assert!(!a.doc.workholding.iter().any(|h| h.id == clamp));
+        assert!(a.status.contains("deleted"), "{}", a.status);
+    }
+    #[test]
+    fn choosing_a_vise_writes_the_setup_keys_and_the_layout_follows() {
+        use crate::holding::{Layout, layout};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let vise = first_of(&a, "Vise");
+        assert_eq!(layout(a.doc.setup()), Ok(Layout::None));
+        a.project_dirty = false;
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert!(a.project_dirty);
+        let p = &a.doc.setup().p;
+        assert_eq!(get(p, "holding"), "Vise");
+        assert_eq!(get(p, "holder"), vise);
+        assert_eq!(get(p, "vise_grip"), "8");
+        assert_eq!(get(p, "holding_gap"), "2");
+        assert_eq!(
+            layout(a.doc.setup()),
+            Ok(Layout::Vise {
+                holder: vise.clone(),
+                axis_y: false,
+                offset: 0.,
+                grip: 8.,
+                gap: 2.
+            })
+        );
+        edit_setup(&mut a, &[("vise_axis", "Y"), ("vise_offset", "5")]);
+        assert_eq!(
+            layout(a.doc.setup()),
+            Ok(Layout::Vise {
+                holder: vise.clone(),
+                axis_y: true,
+                offset: 5.,
+                grip: 8.,
+                gap: 2.
+            })
+        );
+        // Another vise from the library: its id is written; the grip the setup
+        // already has stays.
+        let mut other = crate::holding::starters().remove(0);
+        other.p.insert("name".into(), "Kurt".into());
+        other.p.insert("grip".into(), "15".into());
+        let other_id = other.id.clone();
+        a.doc.workholding.push(other);
+        let _ = a.update(Message::Edit(Target::Setup, "holder", other_id.clone()));
+        assert_eq!(get(&a.doc.setup().p, "holder"), other_id);
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
+        // A setup without a grip takes the chosen vise's.
+        edit_setup(&mut a, &[("vise_grip", "")]);
+        let _ = a.update(Message::Edit(Target::Setup, "holder", vise.clone()));
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
+        let _ = a.update(Message::Edit(Target::Setup, "vise_grip", String::new()));
+        let _ = a.update(Message::Edit(Target::Setup, "holder", other_id.clone()));
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "15");
+        // None keeps the entry but models nothing; Clamps picks a clamp.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
+        assert_eq!(layout(a.doc.setup()), Ok(Layout::None));
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(get(&a.doc.setup().p, "holder"), first_of(&a, "Clamp"));
+        assert_eq!(
+            a.doc.holding_issues(0, None),
+            ["Place 1 to 8 clamps."],
+            "the positions are still to be written"
+        );
+    }
+    #[test]
+    fn picking_the_chosen_holder_again_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "Y".into()));
+        let vise = first_of(&a, "Vise");
+        a.project_dirty = false;
+        a.status = "Kept.".into();
+        for (key, value) in [
+            ("holding", "Vise"),
+            ("holder", vise.as_str()),
+            ("vise_axis", "Y"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Setup, key, value.into()));
+        }
+        assert!(!a.project_dirty);
+        assert_eq!(a.status, "Kept.");
+        let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "X".into()));
+        assert!(a.project_dirty);
+    }
+    #[test]
+    fn clamp_positions_are_written_only_when_they_read_correctly() {
+        use crate::holding::{Layout, Side, layout};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let clamp = first_of(&a, "Clamp");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(a.clamps_field(), (String::new(), None));
+        a.project_dirty = false;
+        let _ = a.update(Message::SetClamps("-X:0;+X:0".into()));
+        assert!(a.project_dirty);
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0");
+        assert_eq!(
+            layout(a.doc.setup()),
+            Ok(Layout::Clamps {
+                holder: clamp,
+                clamps: vec![(Side::MinusX, 0.), (Side::PlusX, 0.)],
+                gap: 2.
+            })
+        );
+        assert_eq!(a.clamps_field(), ("-X:0;+X:0".into(), None));
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        // Text that does not read: the setup keeps what it had, the field keeps
+        // what was typed, and the error is in the status and under the field.
+        a.project_dirty = false;
+        let _ = a.update(Message::SetClamps("-X:0;+Q:3".into()));
+        assert!(!a.project_dirty);
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0");
+        let error = "A clamp side must be -X, +X, -Y or +Y.";
+        assert_eq!(a.status, error);
+        assert_eq!(a.clamps_field(), ("-X:0;+Q:3".into(), Some(error.into())));
+        for (text, error) in [
+            ("-X", "Write each clamp as side:offset, for example -X:0."),
+            ("-X:", "A clamp offset must be a number."),
+            ("", "Place 1 to 8 clamps."),
+        ] {
+            let _ = a.update(Message::SetClamps(text.into()));
+            assert_eq!(a.status, error);
+            assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0");
+            assert_eq!(a.clamps_field(), (text.into(), Some(error.into())));
+        }
+        // Another setup shows its own text; this one's draft is back on return.
+        let _ = a.update(Message::SetClamps("-X:".into()));
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.clamps_field(), ("-X:0;+X:0".into(), None));
+        let _ = a.update(Message::SelectSetup(0));
+        assert_eq!(a.clamps_field().0, "-X:");
+        // A valid text clears the draft and is kept as typed; a valid text from
+        // another writer drops a draft typed over the old one.
+        let _ = a.update(Message::SetClamps("+Y: 4".into()));
+        assert_eq!(a.status, "Clamp positions saved with the setup.");
+        assert_eq!(a.clamps_field(), ("+Y: 4".into(), None));
+        let _ = a.update(Message::SetClamps("+Y".into()));
+        a.doc.setup_mut().p.insert("clamps".into(), "-Y:1".into());
+        assert_eq!(a.clamps_field(), ("-Y:1".into(), None));
+        // The text is read as clamp positions whatever else the setup says: a
+        // bad gap does not refuse it.
+        edit_setup(&mut a, &[("holding_gap", "abc")]);
+        let _ = a.update(Message::SetClamps("-X:0;+X:5".into()));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:5");
+        assert_eq!(
+            a.doc.holding_issues(0, None),
+            ["The clearance gap must be 0 or more."]
+        );
+    }
+    #[test]
+    fn clamp_positions_need_a_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SetClamps("-X:0".into()));
+        assert!(a.doc.setups.is_empty());
+        assert!(a.status.contains("Create a setup"), "{}", a.status);
+    }
+    #[test]
+    fn the_setup_editor_shows_what_is_wrong_with_the_workholding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "140"),
+                ("stock_y", "100"),
+                ("stock_z", "40"),
+            ],
+        );
+        let _ = a.update(Message::SetupEditor);
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        let _ = a.view();
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            ["The stock is 140 mm across the jaws; this vise opens to 120 mm."]
+        );
+        let _ = a.view();
+        // The jaws facing the Y sides see 100 mm.
+        let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "Y".into()));
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        // An entry deleted from the library.
+        a.doc.workholding.retain(|h| h.kind() != "Vise");
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            ["The workholding entry was deleted; choose another."]
+        );
+        let _ = a.view();
+        // A bad number is the layout's error.
+        edit_setup(&mut a, &[("vise_offset", "far")]);
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            ["The vise offset must be a number."]
+        );
+    }
+    #[test]
+    fn the_workholding_page_and_the_setup_editor_build_in_each_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let build = |a: &mut App| {
+            let _ = a.update(Message::SetupEditor);
+            for page in [Page::Workholding, Page::Work] {
+                a.page = page;
+                let _ = a.view();
+            }
+        };
+        build(&mut a);
+        for holding in ["Vise", "Clamps", "None"] {
+            let _ = a.update(Message::Edit(Target::Setup, "holding", holding.into()));
+            build(&mut a);
+        }
+        // Clamps with a typed text that does not read, and one that does.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SetClamps("-X".into()));
+        build(&mut a);
+        let _ = a.update(Message::SetClamps("-X:0;+X:0".into()));
+        build(&mut a);
+        // The library page with a clamp, a vise, an unsaved one and an empty library.
+        for id in a
+            .doc
+            .workholding
+            .iter()
+            .map(|h| h.id.clone())
+            .collect::<Vec<_>>()
+        {
+            let _ = a.update(Message::EditHolder(id));
+            build(&mut a);
+        }
+        let _ = a.update(Message::NewHolder("Clamp"));
+        build(&mut a);
+        // A vise setup with no vise in the library and with a deleted one.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        a.doc.workholding.clear();
+        build(&mut a);
+        let _ = a.update(Message::DeleteHolder("none".into()));
+        build(&mut a);
+        // Without a setup, and with no document at all.
+        let mut blank = fresh_app(&dir);
+        for page in [Page::Workholding, Page::Work, Page::Home] {
+            blank.page = page;
+            let _ = blank.view();
+        }
+    }
+    #[test]
+    fn a_replaced_project_forgets_the_typed_clamp_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SetClamps("-X".into()));
+        assert!(a.clamps_draft.is_some());
+        a.replace_document(Document::sample(), None);
+        assert!(a.clamps_draft.is_none());
+        assert_eq!(a.holder_draft.name(), "New vise");
     }
     #[test]
     fn closing_waits_for_a_sign_out_and_exits_past_blocking_work() {
@@ -2672,6 +3211,7 @@ mod tests {
         let mut a = fresh_app(dir);
         let (mut doc, mesh) = crate::post::fixture::job();
         doc.adopt_materials();
+        doc.adopt_holders();
         let starter = doc
             .materials
             .iter()

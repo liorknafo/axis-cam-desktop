@@ -291,6 +291,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 Message::Page(Page::Materials),
                 app.page == Page::Materials
             ),
+            btn(
+                "Workholding",
+                Message::Page(Page::Workholding),
+                app.page == Page::Workholding
+            ),
             btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai),
             btn(
                 "Operation support",
@@ -315,6 +320,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Page::Wizard => wizard(app),
         Page::Tools => tools(app),
         Page::Materials => materials(app),
+        Page::Workholding => workholding(app),
         Page::Ai => ai(app),
         Page::Post => post(app),
         Page::Audit => operation_audit(app),
@@ -431,7 +437,7 @@ fn blank_project(app: &App) -> Element<'_, Message> {
         text("3   Set stock and workholding, then add tools and operations.").size(14),
         space().height(12),
         row![btn("Set up a machine",Message::NewMachine,false),btn("Saved machines",Message::Page(Page::Machines),false),btn("Tool library",Message::Page(Page::Tools),false)].spacing(8),
-        note("No sample geometry, setups or operations have been added. Saved machines, tools and materials are available when you need them.")
+        note("No sample geometry, setups or operations have been added. Saved machines, tools, materials and workholding are available when you need them.")
     ].spacing(13).max_width(730);
     if app.last_archived.is_some() {
         body = body.push(btn(
@@ -1712,8 +1718,11 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
     ] {
         c = c.push(field(p, k, l, t));
     }
+    c = c.push(section("Workholding"));
+    for control in holding_controls(app) {
+        c = c.push(control);
+    }
     c = c
-        .push(section("Workholding"))
         .push(choice(
             p,
             "fixture",
@@ -1757,23 +1766,23 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
     }
     c.into()
 }
-/// A library material in the project material list.
+/// An item of a pick list: what is sent when it is chosen, and what it says.
 #[derive(Clone, PartialEq)]
-struct MaterialChoice {
+struct Named {
     id: String,
     name: String,
 }
-impl std::fmt::Display for MaterialChoice {
+impl std::fmt::Display for Named {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.name)
     }
 }
 fn material_picker(app: &App) -> Element<'_, Message> {
-    let choices: Vec<MaterialChoice> = app
+    let choices: Vec<Named> = app
         .doc
         .materials
         .iter()
-        .map(|m| MaterialChoice {
+        .map(|m| Named {
             id: m.id.clone(),
             name: m.name().to_string(),
         })
@@ -1845,6 +1854,147 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
     } else {
         "Speeds and feeds not checked (export still allowed)"
     }
+}
+/// The setup editor's controls for the modelled workholding, above the
+/// fixture description.
+fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
+    let p = &app.doc.setup().p;
+    let t = Target::Setup;
+    let holding = match get(p, "holding") {
+        "" => "None",
+        value => value,
+    };
+    let mut c: Vec<Element<_>> = vec![
+        muted("The vise or clamps that hold the stock, from the workholding library.").into(),
+        choice_value(
+            p,
+            holding,
+            "holding",
+            "Modelled workholding",
+            &["None", "Vise", "Clamps"],
+            t,
+        ),
+    ];
+    match holding {
+        "Vise" => {
+            c.push(holder_picker(app, "Vise"));
+            let axes: Vec<Named> = [("X", "X sides"), ("Y", "Y sides")]
+                .iter()
+                .map(|(id, name)| Named {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                })
+                .collect();
+            let chosen = axes[usize::from(get(p, "vise_axis") == "Y")].clone();
+            c.push(help::field(
+                column![
+                    muted("Jaws face"),
+                    pick_list(axes, Some(chosen), |a| Message::Edit(
+                        Target::Setup,
+                        "vise_axis",
+                        a.id
+                    ))
+                    .width(Fill)
+                    .padding([7, 9])
+                    .text_size(13)
+                ]
+                .spacing(5),
+                "vise_axis",
+                "Jaws face",
+                t,
+            ));
+            c.push(
+                row![
+                    container(field(p, "vise_offset", "Jaw offset · mm", t))
+                        .width(Length::FillPortion(1)),
+                    container(field(p, "vise_grip", "Grip · mm", t)).width(Length::FillPortion(1))
+                ]
+                .spacing(10)
+                .into(),
+            );
+        }
+        "Clamps" => {
+            c.push(holder_picker(app, "Clamp"));
+            let (typed, error) = app.clamps_field();
+            c.push(help::field(
+                column![
+                    muted("Clamp positions"),
+                    text_input("-X:0; +X:0", &typed)
+                        .on_input(Message::SetClamps)
+                        .padding([7, 9])
+                        .size(13)
+                ]
+                .spacing(5),
+                "clamps",
+                "Clamp positions",
+                t,
+            ));
+            if let Some(error) = error {
+                c.push(text(error).size(12).color(WARN).into());
+            }
+        }
+        _ => {}
+    }
+    if holding != "None" {
+        c.push(field(p, "holding_gap", "Clearance gap · mm", t));
+        let lines = holding_lines(app);
+        if !lines.is_empty() {
+            let heading = format!(
+                "{} workholding issue{}",
+                lines.len(),
+                if lines.len() == 1 { "" } else { "s" }
+            );
+            c.push(caution(heading, lines));
+        }
+    }
+    c.push(
+        btn(
+            "Open workholding library",
+            Message::Page(Page::Workholding),
+            false,
+        )
+        .width(Fill)
+        .into(),
+    );
+    c
+}
+/// The picker of the library's vises or clamps (`kind`) for the active setup.
+fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
+    let choices: Vec<Named> = app
+        .doc
+        .workholding
+        .iter()
+        .filter(|h| h.kind() == kind)
+        .map(|h| Named {
+            id: h.id.clone(),
+            name: h.name().to_string(),
+        })
+        .collect();
+    let current = get(&app.doc.setup().p, "holder");
+    let chosen = choices.iter().find(|c| c.id == current).cloned();
+    help::field(
+        column![
+            muted(kind),
+            pick_list(choices, chosen, |c| Message::Edit(
+                Target::Setup,
+                "holder",
+                c.id
+            ))
+            .placeholder(format!("Choose a {}", kind.to_lowercase()))
+            .width(Fill)
+            .padding([7, 9])
+            .text_size(13)
+        ]
+        .spacing(5),
+        "holder",
+        kind,
+        Target::Setup,
+    )
+}
+/// What is wrong with the active setup's workholding, as the setup editor
+/// lists it under the controls.
+pub(crate) fn holding_lines(app: &App) -> Vec<String> {
+    app.doc.holding_issues(app.doc.index(), app.part_mesh())
 }
 fn page_header<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
     row![
@@ -2261,6 +2411,109 @@ fn materials(app: &App) -> Element<'_, Message> {
             page_header(
                 "Materials",
                 "Cutting data are for carbide tools and are starting points."
+            ),
+            row![
+                container(scrollable(list))
+                    .padding(20)
+                    .width(320)
+                    .height(Fill)
+                    .style(panel_style),
+                container(scrollable(form))
+                    .padding(24)
+                    .width(Fill)
+                    .height(Fill)
+                    .style(panel_style)
+            ]
+            .spacing(20)
+            .height(Fill)
+        ]
+        .spacing(24),
+    )
+    .padding(28)
+    .height(Fill)
+    .into()
+}
+const VISE_FIELDS: [(&str, &str); 5] = [
+    ("jaw_width", "Jaw width · mm"),
+    ("jaw_height", "Jaw height · mm"),
+    ("jaw_thickness", "Jaw thickness · mm"),
+    ("max_opening", "Maximum opening · mm"),
+    ("grip", "Grip height · mm"),
+];
+const CLAMP_FIELDS: [(&str, &str); 4] = [
+    ("length", "Length · mm"),
+    ("width", "Width · mm"),
+    ("height", "Height above the stock · mm"),
+    ("bite", "Bite onto the stock · mm"),
+];
+/// A library entry's key sizes, for the list.
+fn holder_summary(h: &crate::holding::Holder) -> String {
+    let n = |key| get(&h.p, key);
+    match h.kind() {
+        "Vise" => format!(
+            "Vise · jaws {} wide, {} thick · opens to {} mm",
+            n("jaw_width"),
+            n("jaw_thickness"),
+            n("max_opening")
+        ),
+        "Clamp" => format!(
+            "Clamp · {} long, {} wide · bite {} mm",
+            n("length"),
+            n("width"),
+            n("bite")
+        ),
+        other => other.to_string(),
+    }
+}
+fn workholding(app: &App) -> Element<'_, Message> {
+    let mut list = column![
+        bold("Workholding library", 17),
+        row![
+            primary("+ New vise", Message::NewHolder("Vise")),
+            primary("+ New clamp", Message::NewHolder("Clamp"))
+        ]
+        .spacing(8)
+    ]
+    .spacing(12);
+    for h in &app.doc.workholding {
+        list = list.push(
+            btn(
+                format!("{}\n{}", h.name(), holder_summary(h)),
+                Message::EditHolder(h.id.clone()),
+                app.holder_draft.id == h.id,
+            )
+            .width(Fill),
+        );
+    }
+    let draft = &app.holder_draft;
+    let p = &draft.p;
+    let t = Target::Holder;
+    let (title, sizes): (&str, &[(&str, &str)]) = match draft.kind() {
+        "Vise" => ("Vise definition", &VISE_FIELDS),
+        "Clamp" => ("Clamp definition", &CLAMP_FIELDS),
+        _ => ("Workholding definition", &[]),
+    };
+    let mut form = column![bold(title, 21), field(p, "name", "Name", t)].spacing(14);
+    for (key, label) in sizes {
+        form = form.push(field(p, key, label, t));
+    }
+    let mut issues = draft.issues();
+    issues.extend(app.doc.holder_name_issues(draft));
+    form = form
+        .push(field(p, "notes", "Notes", t))
+        .push(warnings(issues))
+        .push(
+            row![
+                primary("Save", Message::SaveHolder),
+                btn("Delete", Message::DeleteHolder(draft.id.clone()), false)
+            ]
+            .spacing(10),
+        );
+    container(
+        column![
+            page_header(
+                "Workholding",
+                "Vises and toe clamps your setups can model. The starter entries have typical sizes: measure yours."
             ),
             row![
                 container(scrollable(list))
