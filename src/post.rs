@@ -127,6 +127,9 @@ fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
         _ => None,
     }
 }
+/// What the header says last of what was not checked.
+const SOFT_LIMITS: &str =
+    "LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.";
 /// Said in place of the stock top when an earlier setup has cut it.
 pub const STOCK_TOP_CUT: &str =
     "The stock top was cut by an earlier setup; touch off on a part face.";
@@ -553,11 +556,14 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         coord(e.max[2] - d[2])
     ));
     // The program is only written once its jaws or clamps have been checked.
-    w.line(if h.holding.is_some() {
-        "(Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)"
+    if h.holding.is_some() {
+        w.note("Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap.");
+        w.note(SOFT_LIMITS);
     } else {
-        "(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)"
-    });
+        w.line(format!(
+            "(Not checked: fixtures, clamps and the machine body. {SOFT_LIMITS})"
+        ));
+    }
     if settings.tool_table && !settings.machine_home {
         w.note("Start with the spindle raised clear of the part and fixtures: the first tool change happens at the current height.");
     }
@@ -3245,7 +3251,7 @@ M2
         let (mut doc, mesh) = pocket_job();
         let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
         let old = "(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
-        let held = "(Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
+        let held = "(Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap.)\n(LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
         // Without modelled workholding the old note stands, whatever the
         // setup's fixture description says.
         let text = header(&doc);
@@ -3261,6 +3267,9 @@ M2
             let text = header(&doc);
             assert!(text.contains(held) && !text.contains(old), "{kind}: {text}");
             assert_comments_begin_with_app_words(&text);
+            // Each comment line is short, as the others are: none comes near
+            // LinuxCNC's limit of 255 characters.
+            assert!(text.lines().all(|l| l.len() <= 202), "{kind}: {text}");
         }
         // Back to None: the old note again.
         doc.setups[0].p.insert("holding".into(), "None".into());
@@ -3311,7 +3320,7 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 35] = [
+    const COMMENT_STARTS: [&str; 36] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
         "Job, continued: ",
@@ -3341,6 +3350,7 @@ M2
         "Suppressed, continued: ",
         "Extents: ",
         "Not checked: ",
+        SOFT_LIMITS,
         "Start with the spindle raised clear of the part and fixtures: ",
         "Before starting: ",
         "Before starting, continued: ",

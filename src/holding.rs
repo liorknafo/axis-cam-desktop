@@ -852,10 +852,14 @@ pub enum Held {
     Every,
 }
 pub fn held<'a>(setups: impl IntoIterator<Item = &'a Setup>) -> Held {
+    held_of(setups.into_iter().map(modelled))
+}
+/// `held` of setups that are, or are not, modelled as `flags` says.
+pub fn held_of(flags: impl IntoIterator<Item = bool>) -> Held {
     let (mut any, mut all) = (false, true);
-    for setup in setups {
-        any |= modelled(setup);
-        all &= modelled(setup);
+    for flag in flags {
+        any |= flag;
+        all &= flag;
     }
     match (any, all) {
         (false, _) => Held::No,

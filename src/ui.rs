@@ -809,9 +809,9 @@ fn workspace(app: &App) -> Element<'_, Message> {
             ),
             space().width(Fill),
             muted(if app.is_sample() {
-                "Illustrative motion"
+                "Illustrative motion".to_string()
             } else {
-                fixtures(Note::Panel, modelled(app))
+                fixture_note(app, Note::Panel)
             })
             .size(10)
         ]
@@ -1093,10 +1093,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
-                        _ => format!(
-                            "Selections use connected planar regions of the imported mesh. Facing simulation uses a rectangular raster preview. {}",
-                            fixtures(Note::Facing, modelled(app))
-                        ),
+                        _ => fixture_note(app, Note::Facing),
                     }));
                 } else {
                     c = c.push(note("This operation is unavailable for imported parts. Open Operation support for its status."));
@@ -1314,7 +1311,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
                 c = c.push(field(p, "ramp_angle", "Ramp angle · degrees", t));
             }
             c = c.push(note("Profile ramp descends around each closed contour at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. All transfers between contours retract to clearance; no sideways shortcut crosses an island."));
-            c = c.push(note(format!("Offset contours run from the interior toward the walls at each depth. Entry/full-width cuts can contain both milling modes. {}", fixtures(Note::Pocket, modelled(app)))));
+            c = c.push(note(fixture_note(app, Note::Pocket)));
         }
         "Linking" if !app.is_sample() && o.strategy == Strategy::Face => {
             if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
@@ -1334,10 +1331,10 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
             } else {
                 c = c.push(note("One way uses the selected Climb or Conventional direction. It retracts to clearance for each return and starts each depth at the first row. Switch Passes → Pass pattern to Both ways for keep-down links and continuation from the previous endpoint."));
             }
-            c = c.push(note(format!("Entry and depth changes feed down at 25% of cutting feed. Keep-down links use cutting feed within the rectangular preview boundary. {}", fixtures(Note::Entry, modelled(app)))));
+            c = c.push(note(fixture_note(app, Note::Entry)));
         }
         "Linking" if !app.is_sample() && o.strategy.imported_preview() => {
-            c=c.push(note(format!("Separate paths retract vertically to clearance, move in XY, then approach at retract height. Entry feed is 25% of cutting feed. {}", fixtures(Note::Separate, modelled(app)))));
+            c = c.push(note(fixture_note(app, Note::Separate)));
         }
         "Linking" => {
             if o.strategy == Strategy::Drill {
@@ -1557,7 +1554,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     if !app.is_sample() && s == Strategy::Face {
         c = c.push(note("The preview supports flat end mills and face mills on the highest planar face. Continuous cutter sweeps preserve removed stock; fully cleared top layers are skipped automatically. This does not establish machining accuracy or collision clearance."));
     } else if !app.is_sample() && s == Strategy::Pocket {
-        c = c.push(note("Use stepover up to 50%. Finishing passes repeat the wall/island contours at the requested allowance. Earlier cuts determine the cutting start. A small additional margin (max of 0.02 mm or 1% of cutter radius) covers polygon rounding; exact CAD accuracy and collision verification are not available."));
+        c = c.push(note(fixture_note(app, Note::Passes)));
     } else {
         c = c.push(field(p, "tolerance", "Tolerance · mm", t));
     }
@@ -3140,14 +3137,14 @@ pub(crate) fn program_note(held: Held) -> &'static str {
             "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked: preview each program in LinuxCNC and air-cut first."
         }
         Held::Mixed => {
-            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups that model none: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked: preview each program in LinuxCNC and air-cut first."
         }
     }
 }
 /// The notes that say what is checked of fixtures, in the words for a setup
 /// that models none (`modelled` false: the old wording) and for one that
 /// models a vise or clamps.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Note {
     /// The status after an operation preview is generated, after "Sampled removal; ".
     Preview,
@@ -3161,6 +3158,43 @@ pub(crate) enum Note {
     Separate,
     /// The label over the simulation.
     Panel,
+    /// The end of the Pocket passes note.
+    Passes,
+    /// The end of what the playback strip says before a preview is generated.
+    Playback,
+}
+/// The whole text of a note that says what is checked of the fixtures, for the
+/// active setup: what comes before the words of `fixtures`, then those.
+pub(crate) fn fixture_note(app: &App, note: Note) -> String {
+    let before = match note {
+        Note::Preview | Note::Panel => "",
+        Note::Facing => {
+            "Selections use connected planar regions of the imported mesh. Facing simulation uses a rectangular raster preview. "
+        }
+        Note::Pocket => {
+            "Offset contours run from the interior toward the walls at each depth. Entry/full-width cuts can contain both milling modes. "
+        }
+        Note::Entry => {
+            "Entry and depth changes feed down at 25% of cutting feed. Keep-down links use cutting feed within the rectangular preview boundary. "
+        }
+        Note::Separate => {
+            "Separate paths retract vertically to clearance, move in XY, then approach at retract height. Entry feed is 25% of cutting feed. "
+        }
+        Note::Passes => {
+            "Use stepover up to 50%. Finishing passes repeat the wall/island contours at the requested allowance. Earlier cuts determine the cutting start. A small additional margin (max of 0.02 mm or 1% of cutter radius) covers polygon rounding; "
+        }
+        Note::Playback => {
+            "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; "
+        }
+    };
+    format!("{before}{}", fixtures(note, modelled(app)))
+}
+/// How many of the job's setups have their vise or clamps checked: those that
+/// model them and have nothing wrong with how (`holding_issues`).
+pub(crate) fn held(app: &App) -> Held {
+    crate::holding::held_of(app.doc.setups.iter().enumerate().map(|(i, setup)| {
+        crate::holding::modelled(setup) && app.doc.holding_issues(i, app.part_mesh()).is_empty()
+    }))
 }
 /// Whether the active setup's vise or clamps are checked: it models them and
 /// there is nothing wrong with how (`holding_lines`).
@@ -3198,6 +3232,14 @@ pub(crate) fn fixtures(note: Note, modelled: bool) -> &'static str {
         }
         (Note::Separate, true) => {
             "No lead arcs, stay-down links or fixture avoidance are available: export refuses a move within the clearance gap of the vise jaws or clamps instead of rerouting it."
+        }
+        (Note::Passes, false) => "exact CAD accuracy and collision verification are not available.",
+        (Note::Passes, true) => {
+            "exact CAD accuracy and collision verification beyond the modelled vise jaws and clamps are not available."
+        }
+        (Note::Playback, false) => "collision checking is not implemented.",
+        (Note::Playback, true) => {
+            "collision checks beyond the modelled vise jaws and clamps are not implemented."
         }
         (Note::Panel, false) => "Adaptive stock · no collision checking",
         (Note::Panel, true) => "Adaptive stock · jaws and clamps checked as boxes",
@@ -3646,11 +3688,8 @@ fn ai(app: &App) -> Element<'_, Message> {
     .into()
 }
 fn post(app: &App) -> Element<'_, Message> {
-    let mut summary = column![
-        bold("Program review", 20),
-        note(program_note(crate::holding::held(&app.doc.setups))),
-    ]
-    .spacing(14);
+    let mut summary =
+        column![bold("Program review", 20), note(program_note(held(app))),].spacing(14);
     let lines = speed_feed_lines(app);
     if !lines.is_empty() {
         summary = summary.push(caution(

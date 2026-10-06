@@ -2855,9 +2855,80 @@ mod tests {
     }
     #[test]
     fn the_status_and_the_notes_say_what_is_checked_only_where_workholding_is_modelled() {
-        use crate::ui::{Note, fixtures};
+        use crate::ui::{Note, fixture_note, fixtures};
+        const NOTES: [Note; 8] = [
+            Note::Preview,
+            Note::Facing,
+            Note::Pocket,
+            Note::Entry,
+            Note::Separate,
+            Note::Panel,
+            Note::Passes,
+            Note::Playback,
+        ];
+        // What each note says before the words of `fixtures`, and in full for
+        // a setup with no checked workholding.
+        let old_notes = [
+            (
+                Note::Facing,
+                "Selections use connected planar regions of the imported mesh. Facing simulation uses a rectangular raster preview. Exact CAD faces and fixture or machine collision checks are not implemented; the moves can be exported as LinuxCNC G-code.",
+            ),
+            (
+                Note::Pocket,
+                "Offset contours run from the interior toward the walls at each depth. Entry/full-width cuts can contain both milling modes. No fixture or holder collision solver is connected.",
+            ),
+            (
+                Note::Entry,
+                "Entry and depth changes feed down at 25% of cutting feed. Keep-down links use cutting feed within the rectangular preview boundary. Lead-in curves, fixture avoidance and collision checking are not implemented.",
+            ),
+            (
+                Note::Separate,
+                "Separate paths retract vertically to clearance, move in XY, then approach at retract height. Entry feed is 25% of cutting feed. No lead arcs, stay-down links, fixture avoidance or holder collision checks are available.",
+            ),
+            (Note::Panel, "Adaptive stock · no collision checking"),
+            (
+                Note::Passes,
+                "Use stepover up to 50%. Finishing passes repeat the wall/island contours at the requested allowance. Earlier cuts determine the cutting start. A small additional margin (max of 0.02 mm or 1% of cutter radius) covers polygon rounding; exact CAD accuracy and collision verification are not available.",
+            ),
+            (
+                Note::Playback,
+                "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented.",
+            ),
+        ];
         let dir = tempfile::tempdir().unwrap();
         let mut a = clamped_app(&dir, "40");
+        let _ = a.update(Message::SelectOp(1));
+        // Modelled and usable: every note the app builds (the views call
+        // `fixture_note`, so these are the texts they show) names the vise
+        // jaws or clamps, and the strip under the viewport too.
+        for note in NOTES.into_iter().filter(|n| *n != Note::Preview) {
+            let text = fixture_note(&a, note);
+            assert!(text.ends_with(fixtures(note, true)), "{note:?}: {text}");
+            assert!(
+                old_notes.iter().all(|(n, old)| *n != note || text != *old),
+                "{note:?}: {text}"
+            );
+        }
+        assert_eq!(
+            a.playback_reason(),
+            "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checks beyond the modelled vise jaws and clamps are not implemented."
+        );
+        assert_eq!(
+            fixture_note(&a, Note::Passes),
+            "Use stepover up to 50%. Finishing passes repeat the wall/island contours at the requested allowance. Earlier cuts determine the cutting start. A small additional margin (max of 0.02 mm or 1% of cutter radius) covers polygon rounding; exact CAD accuracy and collision verification beyond the modelled vise jaws and clamps are not available."
+        );
+        assert_eq!(
+            fixture_note(&a, Note::Panel),
+            "Adaptive stock · jaws and clamps checked as boxes"
+        );
+        // The views build with them, on the tabs that carry them.
+        for op in [0, 1] {
+            let _ = a.update(Message::SelectOp(op));
+            for tab in ["Passes", "Linking", "Geometry", "Tool"] {
+                let _ = a.update(Message::Tab(tab.into()));
+                let _ = a.view();
+            }
+        }
         let _ = a.update(Message::SelectOp(1));
         let _ = a.update(Message::Generate);
         assert!(a.playback_ready(), "{}", a.status);
@@ -2873,19 +2944,16 @@ mod tests {
             "{}",
             a.status
         );
-        // Every note builds in the modelled state, on the tabs that carry them.
-        for op in [0, 1] {
-            let _ = a.update(Message::SelectOp(op));
-            for tab in ["Passes", "Linking", "Geometry", "Tool"] {
-                let _ = a.update(Message::Tab(tab.into()));
-                let _ = a.view();
+        // Workholding that cannot be checked is not claimed: the old wording
+        // everywhere, as for None.
+        let old = |a: &App| {
+            for (note, text) in &old_notes {
+                assert_eq!(fixture_note(a, *note), *text, "{note:?}");
             }
-        }
-        let _ = a.update(Message::SelectOp(1));
-        let _ = a.update(Message::Generate);
-        // Workholding that cannot be checked is not claimed: the old wording.
+        };
         let id = get(&a.doc.setups[0].p, "holder").to_string();
         a.doc.workholding.retain(|h| h.id != id);
+        old(&a);
         let _ = a.update(Message::Generate);
         assert!(
             a.status.contains(
@@ -2894,16 +2962,25 @@ mod tests {
             "{}",
             a.status
         );
+        assert_eq!(
+            a.playback_reason(),
+            "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented."
+        );
         // None keeps the old wording too.
         a.doc.setups[0].p.insert("holding".into(), "None".into());
+        old(&a);
         let _ = a.update(Message::Generate);
         assert!(
             a.status.contains("Sampled removal; fixture and machine collisions are not checked. Export G-code from the NC program page."),
             "{}",
             a.status
         );
-        // The wording for a setup without modelled workholding is the old one
-        // of each note; the other names the vise jaws or clamps, no more.
+        for tab in ["Passes", "Linking"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            let _ = a.view();
+        }
+        // The words of each note: the old ones for no modelled workholding,
+        // the others name the vise jaws or clamps, no more.
         assert_eq!(
             fixtures(Note::Facing, false),
             "Exact CAD faces and fixture or machine collision checks are not implemented; the moves can be exported as LinuxCNC G-code."
@@ -2920,18 +2997,7 @@ mod tests {
             fixtures(Note::Separate, false),
             "No lead arcs, stay-down links, fixture avoidance or holder collision checks are available."
         );
-        assert_eq!(
-            fixtures(Note::Panel, false),
-            "Adaptive stock · no collision checking"
-        );
-        for note in [
-            Note::Preview,
-            Note::Facing,
-            Note::Pocket,
-            Note::Entry,
-            Note::Separate,
-            Note::Panel,
-        ] {
+        for note in NOTES {
             let held = fixtures(note, true);
             assert_ne!(held, fixtures(note, false), "{note:?}");
             assert!(
@@ -2946,6 +3012,42 @@ mod tests {
             fixtures(Note::Facing, true)
                 .contains("parallels, bolts, the table and the machine body are not")
         );
+    }
+    #[test]
+    fn the_nc_page_note_counts_only_workholding_that_can_be_checked() {
+        use crate::holding::Held;
+        use crate::ui::{held, program_note};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = clamped_app(&dir, "12");
+        assert_eq!(held(&a), Held::Every);
+        assert!(program_note(held(&a)).contains("Every program move"));
+        // A second setup with the same clamps: still every setup.
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        assert_eq!(held(&a), Held::Every);
+        // One whose entry is gone is not checked: it counts with those that
+        // model nothing, and the note says so.
+        a.doc.setups[1].p.insert("holder".into(), "gone".into());
+        assert_eq!(held(&a), Held::Mixed);
+        let mixed = program_note(held(&a));
+        assert!(
+            mixed.contains("the setups whose workholding is not modelled or cannot be checked"),
+            "{mixed}"
+        );
+        // None of them can be checked: the old wording, which claims nothing.
+        let id = get(&a.doc.setups[0].p, "holder").to_string();
+        a.doc.workholding.retain(|h| h.id != id);
+        assert_eq!(held(&a), Held::No);
+        let old = program_note(held(&a));
+        assert!(
+            old.ends_with("Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."),
+            "{old}"
+        );
+        // A clamp text that does not read cannot be checked either.
+        let other = tempfile::tempdir().unwrap();
+        let mut b = clamped_app(&other, "12");
+        b.doc.setups[0].p.insert("clamps".into(), "-X".into());
+        assert_eq!(held(&b), Held::No);
     }
     #[test]
     fn the_operation_preview_warns_when_the_toolpath_comes_within_the_gap() {
@@ -5966,7 +6068,7 @@ mod tests {
         assert_eq!(
             program_note(Held::Mixed),
             format!(
-                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups that model none: preview each program in LinuxCNC and air-cut first."
+                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked: preview each program in LinuxCNC and air-cut first."
             )
         );
         // The good plan's work-zero lines, with the values its check found:

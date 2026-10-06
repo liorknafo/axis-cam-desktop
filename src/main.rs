@@ -994,7 +994,7 @@ impl App {
         if let Some(issue) = self.op_issues().first() {
             return issue.clone();
         }
-        "Generate the operation preview, or press Generate & play. Stock uses adaptive surface meshing and inherits earlier cuts; collision checking is not implemented.".into()
+        ui::fixture_note(self, ui::Note::Playback)
     }
     fn stock_mesh_key(&self) -> Option<StockMeshKey> {
         let sim = self.active_simulation()?;
