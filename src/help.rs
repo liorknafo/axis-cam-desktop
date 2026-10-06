@@ -208,7 +208,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Manage the material library: each material's group, notes and the surface speed and chip load ranges for carbide tools that speeds and feeds are checked against. Choose the project material in the setup."
         }
         Page(crate::Page::Workholding) => {
-            "Manage the library of vises and toe clamps: their sizes and notes. Choose one for a setup under Workholding in the setup editor. The starter entries have typical sizes: measure yours."
+            "Manage the library of vises and toe clamps: their sizes and notes. Choose one for a setup under Workholding in the setup editor; that setup's jaws or clamps are then checked as boxes with a clearance gap. The starter entries have typical sizes: measure yours."
         }
         Page(crate::Page::Ai) => {
             "Sign in with ChatGPT and let the model propose a complete job for the imported part. The app checks every proposal before you can apply it; nothing is sent until you click Plan."
@@ -217,7 +217,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Return to the part viewport, setup browser and operation editor. Your current edits remain in the workspace."
         }
         Page(crate::Page::Post) => {
-            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance; fixtures and the machine body are not checked. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export."
+            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; parallels, bolts, the table, the machine body and other fixtures are not checked. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export."
         }
         Page(crate::Page::Wizard) | NewMachine => {
             "Create a reusable machine profile in five steps: identity, travel, kinematics, controller and review."
@@ -469,7 +469,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (Target::Setup, "clearance") => (
-            "Requested minimum gap between the fixture and the outside of the cutter or holder, in mm. The illustration shows a side gap measured from the wider holder. This value is saved with the setup; it does not change operation heights or toolpaths. Fixture geometry and collision checking are not connected yet.",
+            "Requested minimum gap between the fixture and the outside of the cutter or holder, in mm. The illustration shows a side gap measured from the wider holder. This value is only saved with the setup; it does not change operation heights or toolpaths. The check of modelled vise jaws or clamps uses the Clearance gap beside them instead.",
             Some(FixtureClearance),
         ),
         (Target::Material, "name") => (
@@ -546,7 +546,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "holding") => (
-            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap. None models nothing; the Fixture note below is only a description.",
+            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview and refused at export. Parallels, bolts, the table and the machine body are not modelled. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut. None models nothing; the Fixture note below is only a description.",
             None,
         ),
         (Target::Setup, "holder") => (
@@ -566,7 +566,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "holding_gap") => (
-            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm.",
+            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. A move whose cutter or holder comes within it is warned of in the operation preview and refused at export.",
             None,
         ),
         (Target::Setup, "clamps") => (
@@ -618,7 +618,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Contour)),
         ),
         (_, "clearance") => (
-            "Height above stock top used for longer non-cutting moves, in mm. It must be at least as high as the retract plane; actual fixture clearance still needs verification.",
+            "Height above stock top used for longer non-cutting moves, in mm. It must be at least as high as the retract plane. Where the machine retracts to a clearance plane, export refuses a setup whose plane, the highest height its program reaches, is not above every modelled jaw and clamp and its gap; other fixture clearance still needs verification.",
             Some(Heights),
         ),
         (_, "retract") => (
@@ -718,7 +718,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "facing_link") => (
-            "Keep tool down feeds sideways between adjacent rows, then cuts back across the stock. Continue from previous end also feeds vertically down at the last X/Y for the next depth. Retract each pass lifts to clearance between rows. Applies to Both ways and the rectangular Facing preview; fixture collision checks are not implemented.",
+            "Keep tool down feeds sideways between adjacent rows, then cuts back across the stock. Continue from previous end also feeds vertically down at the last X/Y for the next depth. Retract each pass lifts to clearance between rows. Applies to Both ways and the rectangular Facing preview; fixtures are not avoided, and a move within the clearance gap of a modelled vise jaw or clamp is refused at export.",
             None,
         ),
         (_, "direction") => (
@@ -854,7 +854,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (_, "fixture") => (
-            "Workholding used in this setup. Describe a vise, soft jaws, clamps, chuck or custom fixture. Fixture solids and collision checking are planned.",
+            "Describes the workholding used in this setup: a vise, soft jaws, clamps, chuck or custom fixture. It is printed on the setup sheet and in the program header and is not checked; to have a vise's jaws or clamps checked, model them under Modelled workholding above.",
             None,
         ),
         (_, "reposition") => (
@@ -1812,10 +1812,14 @@ mod tests {
         ] {
             let body = field_help(key, "x", Target::Setup).body;
             assert_ne!(body, unknown, "{key}");
-            assert!(!body.contains("cutter"), "{key}: {body}");
+            // Only the texts that say what the check covers name the cutter.
+            if !matches!(key, "holding" | "holding_gap") {
+                assert!(!body.contains("cutter"), "{key}: {body}");
+            }
         }
-        // Nothing checks toolpaths against the modelled workholding yet, so no
-        // text of this page says it does or promises what the model leaves free.
+        // Only the texts about the setup's workholding and its gap say that
+        // toolpaths are checked against it; none promises what the model
+        // leaves free.
         for (target, key) in [
             (Target::Setup, "holding"),
             (Target::Setup, "holder"),
@@ -1833,13 +1837,64 @@ mod tests {
             (Target::Holder, "bite"),
         ] {
             let body = field_help(key, "x", target).body;
-            for claim in ["check", "refus", "toolpath", "free to cut", "safe"] {
+            for claim in ["free to cut", "safe"] {
                 assert!(!body.contains(claim), "{key}: {body}");
+            }
+            if !matches!(key, "holding" | "holding_gap") {
+                for claim in ["check", "refus", "toolpath"] {
+                    assert!(!body.contains(claim), "{key}: {body}");
+                }
             }
         }
         assert_eq!(
             field_help("holding_gap", "x", Target::Setup).body,
-            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm."
+            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. A move whose cutter or holder comes within it is warned of in the operation preview and refused at export."
+        );
+        // What the check is, and what it is not, in the field that chooses it.
+        let holding = field_help("holding", "x", Target::Setup).body;
+        for part in [
+            "every move is checked against them",
+            "the cutter from its tip up to its stickout at its cutting diameter",
+            "the tool holder above that at the holder diameter",
+            "a wider shank or a reduced neck is not modelled",
+            "warned of in the operation preview and refused at export",
+            "Parallels, bolts, the table and the machine body are not modelled",
+            "In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut",
+            "the Fixture note below is only a description",
+        ] {
+            assert!(holding.contains(part), "{part}: {holding}");
+        }
+        // The old fixture description and clearance are records only; the
+        // texts that said fixtures are never checked say what is.
+        let fixture = field_help("fixture", "x", Target::Setup).body;
+        assert!(
+            fixture.contains("is not checked") && fixture.contains("Modelled workholding"),
+            "{fixture}"
+        );
+        let clearance = field_help("clearance", "x", Target::Setup).body;
+        assert!(
+            clearance.contains("only saved with the setup")
+                && clearance.contains("uses the Clearance gap beside them instead")
+                && !clearance.contains("not connected yet"),
+            "{clearance}"
+        );
+        let heights = field_help("clearance", "x", Target::Operation).body;
+        assert!(
+            heights.contains("export refuses a setup whose plane")
+                && heights.contains("every modelled jaw and clamp and its gap"),
+            "{heights}"
+        );
+        let post = command(&Message::Page(crate::Page::Post), "x".into()).body;
+        for part in [
+            "in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included",
+            "parallels, bolts, the table, the machine body and other fixtures are not checked",
+        ] {
+            assert!(post.contains(part), "{part}: {post}");
+        }
+        let page = command(&Message::Page(Workholding), "x".into()).body;
+        assert!(
+            page.contains("checked as boxes with a clearance gap"),
+            "{page}"
         );
         assert!(
             field_help("vise_grip", "x", Target::Setup)

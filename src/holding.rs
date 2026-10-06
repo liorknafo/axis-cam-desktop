@@ -838,6 +838,31 @@ pub fn gathered<'a>(
     }
     (plans, failed)
 }
+/// Whether `setup` models a vise or clamps: the jaws or clamps are checked
+/// as boxes, which the texts about what is checked say only of such setups.
+pub fn modelled(setup: &Setup) -> bool {
+    matches!(get(&setup.p, "holding"), "Vise" | "Clamps")
+}
+/// How many of a job's setups model their workholding (`modelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// None of them, or there are no setups.
+    No,
+    Mixed,
+    Every,
+}
+pub fn held<'a>(setups: impl IntoIterator<Item = &'a Setup>) -> Held {
+    let (mut any, mut all) = (false, true);
+    for setup in setups {
+        any |= modelled(setup);
+        all &= modelled(setup);
+    }
+    match (any, all) {
+        (false, _) => Held::No,
+        (true, true) => Held::Every,
+        _ => Held::Mixed,
+    }
+}
 /// Whether a setup that holds its stock with a vise or clamps says where:
 /// a vise has its grip, clamps their positions. True for no workholding.
 pub fn placed(setup: &Setup) -> bool {
@@ -2074,6 +2099,27 @@ mod tests {
         // The check keeps the full depth: the same boxes still hit far below.
         let low = plan(3., &[([-40., 40., -50.], [40., 40., -50.])]);
         assert!(!hits(&low, &jaws, 2.).is_empty());
+    }
+    #[test]
+    fn only_a_vise_or_clamps_count_as_modelled_workholding() {
+        let with = |holding: &str| setup(&[("holding", holding)]);
+        for (holding, modelled_now) in [
+            ("Vise", true),
+            ("Clamps", true),
+            ("None", false),
+            ("", false),
+            ("Chuck", false),
+        ] {
+            assert_eq!(modelled(&with(holding)), modelled_now, "{holding}");
+        }
+        assert!(!modelled(&setup(&[])));
+        let (vise, none) = (with("Vise"), with("None"));
+        assert_eq!(held([]), Held::No);
+        assert_eq!(held([&none, &none]), Held::No);
+        assert_eq!(held([&vise]), Held::Every);
+        assert_eq!(held([&vise, &with("Clamps")]), Held::Every);
+        assert_eq!(held([&vise, &none]), Held::Mixed);
+        assert_eq!(held([&none, &vise]), Held::Mixed);
     }
     #[test]
     fn a_plane_not_above_the_box_and_its_gap_reads_in_work_coordinates() {

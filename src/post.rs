@@ -552,7 +552,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         coord(e.min[2] - d[2]),
         coord(e.max[2] - d[2])
     ));
-    w.line("(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)");
+    // The program is only written once its jaws or clamps have been checked.
+    w.line(if h.holding.is_some() {
+        "(Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)"
+    } else {
+        "(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)"
+    });
     if settings.tool_table && !settings.machine_home {
         w.note("Start with the spindle raised clear of the part and fixtures: the first tool change happens at the current height.");
     }
@@ -3234,6 +3239,32 @@ M2
         );
         // The comment text keeps ± readable.
         assert_eq!(comment("on ±Y"), "on +-Y");
+    }
+    #[test]
+    fn the_header_says_what_was_checked_of_the_workholding() {
+        let (mut doc, mesh) = pocket_job();
+        let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
+        let old = "(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
+        let held = "(Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
+        // Without modelled workholding the old note stands, whatever the
+        // setup's fixture description says.
+        let text = header(&doc);
+        assert!(text.contains(old) && !text.contains(held), "{text}");
+        doc.setups[0].p.insert("fixture".into(), "Vise".into());
+        assert!(header(&doc).contains(old));
+        // A vise or clamps: the jaws and clamps were checked, the rest was not.
+        for (kind, pairs) in [
+            ("Vise", vec![("vise_axis", "Y"), ("vise_grip", "8")]),
+            ("Clamp", vec![("clamps", "-X:0;+X:0")]),
+        ] {
+            hold(&mut doc, kind, &pairs);
+            let text = header(&doc);
+            assert!(text.contains(held) && !text.contains(old), "{kind}: {text}");
+            assert_comments_begin_with_app_words(&text);
+        }
+        // Back to None: the old note again.
+        doc.setups[0].p.insert("holding".into(), "None".into());
+        assert!(header(&doc).contains(old));
     }
     #[test]
     fn a_model_origin_header_locates_the_zero_from_the_part_and_the_stock_top() {

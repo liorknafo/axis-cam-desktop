@@ -1674,11 +1674,12 @@ impl App {
                         Ok(sim) => {
                             let plan = &sim.plan;
                             self.status = format!(
-                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; fixture and machine collisions are not checked. Export G-code from the NC program page.",
+                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} Export G-code from the NC program page.",
                                 plan.strategy.name(),
                                 plan.levels,
                                 plan.duration / 60.,
-                                sim.preceding
+                                sim.preceding,
+                                ui::fixtures(ui::Note::Preview, ui::modelled(self))
                             );
                             self.simulation = Some(sim);
                             self.progress = 0.;

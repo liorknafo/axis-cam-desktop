@@ -131,6 +131,9 @@ impl App {
                 108 => "85-planner-ready".into(),
                 109 => "86-materials".into(),
                 110 => "87-planner-timeline".into(),
+                111 => "88-workholding-vise".into(),
+                112 => "89-workholding-clamps".into(),
+                113 => "90-workholding-page".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -773,6 +776,39 @@ impl App {
                 self.page = Page::Ai;
                 vec![]
             }
+            111 => {
+                // The vise: setup 1 held by the starter vise, drawn round the
+                // stock with its controls in the setup editor. The layout is
+                // suggested from the operations' toolpaths.
+                self.planner = crate::Planner::Idle;
+                self.plan_timeline.clear();
+                self.stock = true;
+                self.camera = crate::viewport::Camera::default();
+                // The example's document starts with an empty library.
+                self.doc.adopt_holders();
+                self.holder_draft = crate::holder_draft(&self.doc);
+                vec![
+                    Message::Page(Page::Work),
+                    Message::SelectSetup(0),
+                    Message::SelectOp(0),
+                    Message::Edit(Target::Setup, "holding", "Vise".into()),
+                    Message::SetupEditor,
+                ]
+            }
+            112 => {
+                // Clamps, drawn the same way; the facing preview's toolpath
+                // comes within the gap of them, which its warning says in the
+                // inspector.
+                self.camera = crate::viewport::Camera::default();
+                vec![
+                    Message::Edit(Target::Setup, "holding", "Clamps".into()),
+                    Message::SelectOp(0),
+                    Message::Tab("Passes".into()),
+                    Message::Generate,
+                    Message::Scrub(0.5),
+                ]
+            }
+            113 => vec![Message::Page(Page::Workholding)],
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());
@@ -785,6 +821,37 @@ impl App {
         }
         if (87..=90).contains(&self.smoke_step) {
             self.paths = false;
+        }
+        match self.smoke_step {
+            111 => {
+                assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Vise");
+                assert_eq!(crate::ui::holding_boxes(self).len(), 2, "{}", self.status);
+                self.paths = false;
+                // The Workholding controls are far down the setup editor.
+                return iced::widget::operation::scroll_to(
+                    "inspector",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 1380. },
+                );
+            }
+            112 => {
+                assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Clamps");
+                assert!(
+                    !crate::ui::holding_boxes(self).is_empty(),
+                    "{}",
+                    self.status
+                );
+                assert!(
+                    crate::ui::holding_warning(self).is_some(),
+                    "no warning on screen 89: {}",
+                    self.status
+                );
+                // The warning is under the operation's fields: scroll to it.
+                return iced::widget::operation::scroll_to(
+                    "inspector",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 5000. },
+                );
+            }
+            _ => {}
         }
         if self.smoke_step >= 50 {
             // Screen 82 scrolls the planner's result to its end; a scrollable
@@ -2785,6 +2852,100 @@ mod tests {
             .iter()
             .map(|hit| crate::holding::message(a.operation().unwrap().name(), hit, 2., datum))
             .collect()
+    }
+    #[test]
+    fn the_status_and_the_notes_say_what_is_checked_only_where_workholding_is_modelled() {
+        use crate::ui::{Note, fixtures};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = clamped_app(&dir, "40");
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        assert!(a.playback_ready(), "{}", a.status);
+        assert!(
+            a.status.contains(
+                "Sampled removal; this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); parallels, bolts, the table and the machine body are not. Export G-code from the NC program page."
+            ),
+            "{}",
+            a.status
+        );
+        assert!(
+            !a.status.contains("fixture and machine collisions"),
+            "{}",
+            a.status
+        );
+        // Every note builds in the modelled state, on the tabs that carry them.
+        for op in [0, 1] {
+            let _ = a.update(Message::SelectOp(op));
+            for tab in ["Passes", "Linking", "Geometry", "Tool"] {
+                let _ = a.update(Message::Tab(tab.into()));
+                let _ = a.view();
+            }
+        }
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Generate);
+        // Workholding that cannot be checked is not claimed: the old wording.
+        let id = get(&a.doc.setups[0].p, "holder").to_string();
+        a.doc.workholding.retain(|h| h.id != id);
+        let _ = a.update(Message::Generate);
+        assert!(
+            a.status.contains(
+                "Sampled removal; fixture and machine collisions are not checked. Export G-code"
+            ),
+            "{}",
+            a.status
+        );
+        // None keeps the old wording too.
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        let _ = a.update(Message::Generate);
+        assert!(
+            a.status.contains("Sampled removal; fixture and machine collisions are not checked. Export G-code from the NC program page."),
+            "{}",
+            a.status
+        );
+        // The wording for a setup without modelled workholding is the old one
+        // of each note; the other names the vise jaws or clamps, no more.
+        assert_eq!(
+            fixtures(Note::Facing, false),
+            "Exact CAD faces and fixture or machine collision checks are not implemented; the moves can be exported as LinuxCNC G-code."
+        );
+        assert_eq!(
+            fixtures(Note::Pocket, false),
+            "No fixture or holder collision solver is connected."
+        );
+        assert_eq!(
+            fixtures(Note::Entry, false),
+            "Lead-in curves, fixture avoidance and collision checking are not implemented."
+        );
+        assert_eq!(
+            fixtures(Note::Separate, false),
+            "No lead arcs, stay-down links, fixture avoidance or holder collision checks are available."
+        );
+        assert_eq!(
+            fixtures(Note::Panel, false),
+            "Adaptive stock · no collision checking"
+        );
+        for note in [
+            Note::Preview,
+            Note::Facing,
+            Note::Pocket,
+            Note::Entry,
+            Note::Separate,
+            Note::Panel,
+        ] {
+            let held = fixtures(note, true);
+            assert_ne!(held, fixtures(note, false), "{note:?}");
+            assert!(
+                held.contains("vise jaws or clamps") || held.contains("jaws and clamps"),
+                "{note:?}: {held}"
+            );
+            for claim in ["safe", "no collision", "all fixtures"] {
+                assert!(!held.contains(claim), "{note:?}: {held}");
+            }
+        }
+        assert!(
+            fixtures(Note::Facing, true)
+                .contains("parallels, bolts, the table and the machine body are not")
+        );
     }
     #[test]
     fn the_operation_preview_warns_when_the_toolpath_comes_within_the_gap() {
@@ -5758,6 +5919,7 @@ mod tests {
     }
     #[test]
     fn the_preview_and_the_program_page_say_what_their_checks_leave_out() {
+        use crate::holding::Held;
         use crate::ui::{plan_check_lines, plan_not_checked, plan_work_zero_line, program_note};
         // The preview's check lines; the second names the machine limits
         // that speeds and feeds are held to.
@@ -5770,11 +5932,18 @@ mod tests {
                 "No gouging detected on the stock grid (coarse check)",
             ]
         );
-        // The note under the lines says what is not checked.
+        // The note under the lines says what is not checked: fixtures and
+        // clamps for a plan without modelled workholding, parallels, bolts,
+        // the table and the machine body when every setup has a vise or clamps.
         assert_eq!(
-            plan_not_checked(),
+            plan_not_checked(Held::No),
             "Not checked: cutting loads, tool deflection, fixtures, clamps and the machine body. Speeds and feeds are checked against the material's cutting data, which are starting points."
         );
+        assert_eq!(
+            plan_not_checked(Held::Every),
+            "Not checked: cutting loads, tool deflection, parallels, bolts, the table and the machine body. Vise jaws and clamps are checked as boxes with a clearance gap in every setup. Speeds and feeds are checked against the material's cutting data, which are starting points."
+        );
+        assert_eq!(plan_not_checked(Held::Mixed), plan_not_checked(Held::No));
         // The page beside the Plan button says the cutting data are sent.
         assert!(
             crate::ui::SENT_TO_OPENAI.contains(
@@ -5784,8 +5953,21 @@ mod tests {
         // The program page says what export repeats, and that the planner's
         // own checks covered the plan as applied, not later edits.
         assert_eq!(
-            program_note(),
+            program_note(Held::No),
             "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
+        );
+        let base = "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. ";
+        assert_eq!(
+            program_note(Held::Every),
+            format!(
+                "{base}Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked: preview each program in LinuxCNC and air-cut first."
+            )
+        );
+        assert_eq!(
+            program_note(Held::Mixed),
+            format!(
+                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups that model none: preview each program in LinuxCNC and air-cut first."
+            )
         );
         // The good plan's work-zero lines, with the values its check found:
         // setup 2's Model origin is located on the part and the stock top.
@@ -5817,6 +5999,11 @@ mod tests {
         assert_eq!(plan_holding_line(&preview.outcome.job, 0), None);
         assert_eq!(plan_holding_line(&preview.outcome.job, 1), None);
         assert_eq!(plan_holding_line(&preview.outcome.job, 2), None);
+        // Its note under the checks keeps the old wording.
+        assert_eq!(
+            crate::holding::held(&preview.outcome.job.setups),
+            crate::holding::Held::No
+        );
         // Setup 1 held by clamps with room round the part: its card names
         // them, and setup 2's the layout the plan check suggested.
         for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
@@ -5829,6 +6016,11 @@ mod tests {
             }
         });
         let job = &preview.outcome.job;
+        // Every setup of the plan models its clamps, so the note says so.
+        assert_eq!(
+            crate::holding::held(&job.setups),
+            crate::holding::Held::Every
+        );
         let checked = "Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not.";
         assert_eq!(
             plan_holding_line(job, 0).unwrap(),

@@ -481,7 +481,7 @@ impl Operation {
             ("coolant", "Flood"),
             ("boundary", "Selected geometry"),
             ("containment", "Tool inside boundary"),
-            ("clearance", "15"),
+            ("clearance", &CLEARANCE.to_string()),
             ("retract", "5"),
             ("top", "0"),
             ("bottom", "0"),

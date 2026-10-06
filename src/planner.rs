@@ -168,7 +168,7 @@ WORKHOLDING
 - The boxes are keep-out zones. The program grows each box by `gap` mm on every side and refuses any move, rapids and retracts included, that brings the cutter or the tool holder within `gap` of a box. A refused move comes back as a problem with the stage `workholding`, by setup and operation. Parallels, bolts, the table and the machine body are not checked.
 - The later setups (every setup after the first) get the same kind of workholding and library entry, laid out by the program once it has generated their toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
 - Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap` (finish them from a later setup), or move them to a setup where the sides are free.
-- `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. Give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
+- `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. The default `clearance` of 15 already covers a height below 15, so leave `clearance` null then. When the height is 15 or more, give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
 - A `workholding` problem names its place in the setup's work coordinates (X, Y and Z measured from the setup's work zero, Z up), not from the model's corner as the report's boxes are: convert before comparing.
 
 SPEEDS AND FEEDS
@@ -1061,6 +1061,8 @@ pub(crate) mod tests {
             "laid out by the program",
             "`clearance_above_stock_top`",
             "`clearance` greater than it",
+            "already covers a height below 15",
+            "When the height is 15 or more",
             "work coordinates (X, Y and Z measured from the setup's work zero",
             "It can only be raised, never below 15.",
             "above the jaws' top",
