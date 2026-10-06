@@ -35,8 +35,28 @@ pub struct PartReport {
     pub material: MaterialReport,
     pub machine: MachineReport,
     pub tools: Vec<ToolReport>,
+    /// Setup 1's modelled vise or clamps; absent without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workholding: Option<WorkholdingReport>,
     /// The first entry is setup 1's orientation.
     pub orientations: Vec<OrientationReport>,
+}
+/// Setup 1's vise or clamps as keep-out zones. Only their kind, size, place
+/// and clearance gap are told: never the library entry's name or notes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkholdingReport {
+    /// "Vise" or "Clamps".
+    pub kind: &'static str,
+    /// Each jaw or clamp as x0, y0, z0, x1, y1, z1 in setup 1's axes, measured
+    /// from the model's -X/-Y/bottom corner, without the gap. A jaw is shown
+    /// from the stock's bottom up.
+    pub boxes: Vec<[f32; 6]>,
+    /// The clearance every box is grown by for the check.
+    pub gap: f32,
+    /// How far above the stock top the highest box and its gap reach; absent
+    /// when none reaches above the stock top.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearance_above_stock_top: Option<f32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MachineReport {
@@ -946,7 +966,8 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
                 up_axis(setup1).is_none().then(|| {
                     "Setup 1 must be square to the part: use rotations that are multiples of 90°.".into()
                 })
-            }),
+            })
+            .or_else(|| holding_problem(doc, mesh)),
     };
     let material = material_report(doc).err();
     let tools = if doc.tools.is_empty() {
@@ -1004,6 +1025,9 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
     let first = up_axis(setup1)
         .ok_or("Setup 1 must be square to the part: use rotations that are multiples of 90°.")?;
     let stock = crate::stock::resolve(setup1, Some(mesh))?.stock;
+    if let Some(problem) = holding_problem(doc, Some(mesh)) {
+        return Err(problem);
+    }
     Ok((setup1, first, Volume::new(stock, Frame::new(setup1, mesh))))
 }
 /// The whole report, or the first reason planning cannot start. The part must
@@ -1041,6 +1065,54 @@ fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
 pub(crate) fn report_unchecked(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
     let (setup1, first, stock) = basics(doc, mesh)?;
     describe(doc, mesh, setup1, first, &stock)
+}
+/// The first thing wrong with setup 1's modelled workholding, said for the
+/// planner: the plan could never pass the export check of setup 1 with it.
+fn holding_problem(doc: &Document, mesh: Option<&Mesh>) -> Option<String> {
+    doc.holding_issues(0, mesh)
+        .into_iter()
+        .next()
+        .map(|issue| format!("Setup 1's workholding: {issue}"))
+}
+/// `v` rounded up to the hundredth, after dropping what the coordinates' own
+/// rounding (f32, about 1e-5 mm here) adds below the thousandth.
+fn up2(v: f32) -> f32 {
+    ((v * 1000.).round() / 10.).ceil() / 100.
+}
+/// Setup 1's workholding for the report, or None without it.
+fn workholding_report(
+    doc: &Document,
+    mesh: &Mesh,
+    setup1: &Setup,
+) -> Result<Option<WorkholdingReport>, String> {
+    let kind = match get(&setup1.p, "holding") {
+        "Vise" => "Vise",
+        "Clamps" => "Clamps",
+        _ => return Ok(None),
+    };
+    let resolved = crate::stock::resolve(setup1, Some(mesh))?;
+    let (stock, corner) = (resolved.stock, resolved.part.map_or([0.; 3], |p| p.min));
+    let boxes = doc.holding_boxes(setup1, stock)?;
+    let gap = crate::holding::gap(setup1)?;
+    let top = boxes
+        .iter()
+        .map(|b| b.bounds.max[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let needed = top + gap - stock.max[2];
+    Ok(Some(WorkholdingReport {
+        kind,
+        boxes: crate::holding::shown(&boxes, stock)
+            .iter()
+            .map(|b| {
+                let from_corner = |p: [f32; 3]| [0, 1, 2].map(|k| r2(p[k] - corner[k]));
+                let ([x0, y0, z0], [x1, y1, z1]) =
+                    (from_corner(b.bounds.min), from_corner(b.bounds.max));
+                [x0, y0, z0, x1, y1, z1]
+            })
+            .collect(),
+        gap: r2(gap),
+        clearance_above_stock_top: (needed > 0.).then(|| up2(needed)),
+    }))
 }
 fn describe(
     doc: &Document,
@@ -1086,6 +1158,7 @@ fn describe(
                 })
             })
             .collect(),
+        workholding: workholding_report(doc, mesh, setup1)?,
         orientations: order
             .into_iter()
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))
@@ -1107,6 +1180,98 @@ pub(crate) mod tests {
             .iter()
             .find(|p| (p.depth_below_top - depth).abs() < 0.01)
             .unwrap_or_else(|| panic!("no plane at depth {depth} in {}", o.up))
+    }
+    /// The example block with the starter clamp or vise on setup 1.
+    fn held(kind: &str, pairs: &[(&str, &str)]) -> (Document, Mesh) {
+        let (mut doc, mesh) = block();
+        crate::proposal::tests::hold(&mut doc, kind, pairs);
+        (doc, mesh)
+    }
+    #[test]
+    fn the_report_carries_setup_1s_clamps_gap_and_the_clearance_they_need() {
+        let (doc, mesh) = block();
+        assert_eq!(report(&doc, &mesh).unwrap().workholding, None);
+        // Without workholding the report is what it was.
+        assert!(
+            !serde_json::to_string(&report(&doc, &mesh).unwrap())
+                .unwrap()
+                .contains("workholding")
+        );
+        // The fixture's stock: the model is 120 x 80 x 40, with 4 mm above,
+        // 3 below and 2 on each side; the clamp reaches 48 mm out and 12 onto
+        // the stock, 20 wide at the middle of the side, 25 above the stock top.
+        let (mut doc, mesh) = held("Clamp", &[("clamps", "-X:0;+Y:10"), ("holding_gap", "3")]);
+        let r = report(&doc, &mesh).unwrap();
+        let w = r.workholding.as_ref().unwrap();
+        assert_eq!(w.kind, "Clamps");
+        assert_eq!(
+            w.boxes,
+            [
+                [-50., 30., 44., 10., 50., 69.],
+                [60., 70., 44., 80., 130., 69.]
+            ]
+        );
+        assert_eq!(w.gap, 3.);
+        // 69 + 3 - 44 above the stock top.
+        assert_eq!(w.clearance_above_stock_top, Some(28.));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(
+                "\"workholding\":{\"kind\":\"Clamps\",\"boxes\":[[-50.0,30.0,44.0,10.0,50.0,69.0],"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"gap\":3.0,\"clearance_above_stock_top\":28.0}"),
+            "{json}"
+        );
+        // The report holds no name, note or id of the library entry.
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        let holder = doc.workholding.iter_mut().find(|h| h.id == id).unwrap();
+        holder.p.insert("name".into(), "ZZ-SECRET-HOLDER".into());
+        holder.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        let json = serde_json::to_string(&report(&doc, &mesh).unwrap()).unwrap();
+        assert!(!json.contains("ZZ-SECRET") && !json.contains(&id), "{json}");
+    }
+    #[test]
+    fn a_vise_is_reported_as_two_jaws_from_the_stock_bottom_and_needs_no_clearance() {
+        // The jaws on the Y sides: 20 thick, 100 wide, up to 8 above the stock
+        // bottom (3 below the model's); no clearance is needed above the stock.
+        let (doc, mesh) = held("Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let w = report(&doc, &mesh).unwrap().workholding.unwrap();
+        assert_eq!(w.kind, "Vise");
+        assert_eq!(
+            w.boxes,
+            [
+                [10., -22., -3., 110., -2., 5.],
+                [10., 82., -3., 110., 102., 5.]
+            ]
+        );
+        assert_eq!((w.gap, w.clearance_above_stock_top), (2., None));
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(!json.contains("clearance_above_stock_top"), "{json}");
+    }
+    #[test]
+    fn workholding_that_cannot_be_modelled_stops_the_report_and_the_checklist() {
+        // The vise opens to 120 mm: the stock is 124 mm across X.
+        let (mut doc, mesh) = held("Vise", &[("vise_axis", "X"), ("vise_grip", "8")]);
+        let problem = "Setup 1's workholding: The stock is 124 mm across the jaws; this vise opens to 120 mm.";
+        assert_eq!(report(&doc, &mesh).unwrap_err(), problem);
+        let unmet: Vec<_> = preconditions(&doc, Some(&mesh))
+            .into_iter()
+            .filter(|p| !p.ok)
+            .map(|p| (p.label, p.hint))
+            .collect();
+        assert_eq!(
+            unmet,
+            [(
+                "Setup 1: 3-axis LinuxCNC machine and stock",
+                problem.to_string()
+            )]
+        );
+        doc.setups[0].p.insert("vise_axis".into(), "Y".into());
+        assert!(report(&doc, &mesh).is_ok());
+        assert!(preconditions(&doc, Some(&mesh)).iter().all(|p| p.ok));
     }
     #[test]
     fn the_example_block_reports_its_top_pocket_and_holes() {

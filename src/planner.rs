@@ -151,6 +151,7 @@ THE PART REPORT
 - A floor's `max_cutter_diameter` is the largest flat cutter that fits inside it. A plane's `holes` give the largest drill that fits (`diameter`), the opening diameter (`opening_diameter`, larger at a counterbore), the depth and whether the hole goes through.
 - `freeform_area` is the visible area that is neither horizontal nor vertical; only Parallel finishing follows it.
 - `truncated` true means the orientation has more planes or holes than are listed; only listed surfaces can be used.
+- `workholding`, when present, is setup 1's modelled vise or clamps (see WORKHOLDING).
 
 STRATEGIES (the only six)
 - Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only the model's outline. Face makes levels × passes strokes, at most 2,000: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`. For example, 4 mm of stock above the face of an 84 mm wide stock and a Ø10 mill at `stepover_percent` 5 need a `stepdown` of 0.4 mm or more.
@@ -161,6 +162,13 @@ STRATEGIES (the only six)
 - Drill, through holes: `through` may be true only in setup 1, and only when every hole the operation selects is a through hole in the report; use `hole_diameter` to select only those. Setups after the first rest on the face where a drill would exit, so drill through holes in setup 1, or set `through` false and list the exit in `unmachined`. With `through` true, `breakthrough` extends the drill below the hole; null means 1 mm. It is at most half the drill diameter plus 1 mm and never more than the stock below the model (`stock_margin[1]`).
 - Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm. On a 120 × 80 mm part with a Ø6 ball end mill this means a `surface_stepover` of about 0.6 mm or more with `tolerance` 0.02.
 - Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. It cuts that height ÷ `stepdown` layers, at most 300, but its moves (about layers × the outline's points) usually reach the move limit first: on a part of about 120 × 80 mm keep `stepdown` at or above about 0.5 mm (see RULES).
+
+WORKHOLDING
+- `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock) or `Clamps`. `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
+- The boxes are keep-out zones. The program grows each box by `gap` mm on every side and refuses any move, rapids and retracts included, that brings the cutter or the tool holder within `gap` of a box. A refused move comes back as a problem with the stage `workholding`, by setup and operation. Parallels, bolts, the table and the machine body are not checked.
+- The later setups (every setup after the first) get the same kind of workholding and library entry, laid out by the program once it has generated their toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
+- Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap` (finish them from a later setup), or move them to a setup where the sides are free.
+- `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. Give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
 
 SPEEDS AND FEEDS
 - `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
@@ -179,9 +187,10 @@ RULES
 - Order operations in a setup: Face, then Pocket, then Contour, then Drill, then finishing.
 - No tool tip may go deeper below the stock top than the tool's stickout.
 - Choose each operation's spindle speed and feed from the material's cutting data (see SPEEDS AND FEEDS), within the machine's limits.
-- Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, allowances and `bottom_offset` 0.
+- Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, `clearance` 15, allowances and `bottom_offset` 0.
 - For later setups choose the work zero: `Model origin` is accepted; the program tells the operator where it lies relative to the part, and to the stock top while no earlier setup has cut it. Prefer a stock-based zero when the stock it is touched off on is untouched. `Stock top center`: touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 10 mm below the top. `Stock top front-left`: touch off Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X and -Y sides between 5% and 15% of each side's length from the front-left corner, between 1 mm and 10 mm below the top. On stock under 40 mm tall the sides are touched within a quarter of its height below the top, and under 40 mm across the corner area is a quarter of the shorter top side. A stock-based zero is refused when earlier setups have cut the stock at one of those spots.
-- Give each setup a short `workholding` note. Clamps are not modelled, so say what must be kept clear.
+- Give each setup a short `workholding` note. The jaws or clamps in the report are modelled; say what else must be kept clear.
+- `clearance` is the height above the stock top, in mm, at which the tool travels between cuts: at least 5. Change it only for the reason given under WORKHOLDING.
 - List every feature you cannot machine with these tools and strategies in `unmachined`, with the reason. Do not leave it out silently, and do not add an operation that cannot work.
 - Put risks the operator should know about in `warnings`.
 - In the check report, `covered_other` lists the remaining surface by `facing` (+X, -X, +Y, -Y, top, bottom), named in setup 1's frame, which can differ from the orientation names when setup 1 is rotated.
@@ -1038,6 +1047,71 @@ pub(crate) mod tests {
             .find(|l| l.contains("`contour_mode` `outside`"))
             .unwrap();
         assert!(contour.contains("`stepdown` at most the flute length"));
+    }
+    #[test]
+    fn the_instructions_explain_the_workholding_boxes_and_the_gap() {
+        let text = instructions();
+        for needed in [
+            "\nWORKHOLDING\n- `workholding` in the part report, when present, describes",
+            "keep-out zones",
+            "grows each box by `gap` mm",
+            "from the model's -X/-Y/bottom corner",
+            "later setups",
+            "laid out by the program",
+            "`clearance_above_stock_top`",
+            "`clearance` greater than it",
+            "above the jaws' top",
+            "stage `workholding`",
+            "are not checked",
+        ] {
+            assert!(text.contains(needed), "{needed}");
+        }
+        // The old line that said clamps are not modelled is gone.
+        assert!(!text.contains("Clamps are not modelled"));
+    }
+    #[tokio::test]
+    async fn the_report_and_the_workholding_problems_carry_no_entry_name_or_note() {
+        use crate::proposal::tests::hold;
+        let (mut doc, mesh, _) = block();
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            doc.setups[0].p.insert(key.into(), "36".into());
+        }
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        for h in &mut doc.workholding {
+            h.p.insert("name".into(), "ZZ-SECRET-HOLDER".into());
+            h.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        }
+        doc.setups[0]
+            .p
+            .insert("notes".into(), "ZZ-SECRET-NOTES".into());
+        let report = analysis::report(&doc, &mesh).unwrap();
+        // Facing the whole stock runs through the clamps; facing the model's
+        // outline stays clear of them.
+        let through = good(&report);
+        let mut clear = good(&report);
+        for setup in &mut clear.setups {
+            setup.operations[0].facing_area = Some("model".into());
+        }
+        let script = Script::new(vec![json(&through), json(&clear), json(&clear)]);
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {}).await;
+        assert!(outcome.is_ok(), "{:?}", outcome.err());
+        let seen = script.seen.lock().unwrap();
+        // The report names the kind, the boxes and the gap, and that is all.
+        let part = &seen[0][1].1;
+        assert!(
+            part.contains("\"workholding\":{\"kind\":\"Clamps\",\"boxes\":[["),
+            "{part}"
+        );
+        assert!(part.contains("\"gap\":2.0"), "{part}");
+        assert!(seen[1][3].1.contains("\"stage\":\"workholding\""));
+        let all: String = seen
+            .iter()
+            .flatten()
+            .map(|(_, text)| text.as_str())
+            .collect();
+        for private in ["ZZ-SECRET-HOLDER", "ZZ-SECRET-NOTE", "ZZ-SECRET-NOTES"] {
+            assert!(!all.contains(private), "{private}");
+        }
     }
     #[test]
     fn the_instructions_explain_the_speed_and_feed_check() {

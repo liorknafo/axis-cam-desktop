@@ -6,9 +6,10 @@
 use crate::{
     analysis::{self, Index, PartReport},
     cam::Geometry,
+    holding,
     material::SpeedFeed,
     mesh::{Bounds, Mesh},
-    model::Document,
+    model::{Document, get},
     proposal::{self, Problem, Proposal},
     simulation::{Motion, Plan, Simulation},
     volume::Volume,
@@ -402,8 +403,8 @@ pub fn check(
 ) -> (CheckReport, Option<Document>) {
     match proposal::build(doc, mesh, report, proposal) {
         Ok(built) => {
-            let out = check_built(&built, mesh, report);
-            let job = out.passed.then_some(built);
+            let (out, laid) = run(&built, mesh, report);
+            let job = out.passed.then(|| laid.unwrap_or(built));
             (out, job)
         }
         Err(problems) => (
@@ -419,9 +420,55 @@ pub fn check(
         ),
     }
 }
-/// Runs the stages that follow building on a job, starting with the saved
-/// project's structure check, so tests can check jobs `build` would refuse.
+/// `run` without the job, so tests can check jobs `build` would refuse.
+#[cfg(test)]
 pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) -> CheckReport {
+    run(built, mesh, report).0
+}
+/// A copy of `built` in which every later setup that holds its stock with a
+/// vise or clamps but says nowhere has the layout the app suggests for the
+/// toolpaths `results` holds (`Request::layout`, as Suggest layout does), or
+/// None when no setup needed one. A setup whose layout cannot be suggested
+/// (its library entry is gone, its stock unknown) is left as it is: the
+/// workholding stage says why it cannot be modelled.
+fn laid_out(
+    built: &Document,
+    mesh: &Mesh,
+    results: &[Vec<(usize, Result<Simulation, String>)>],
+) -> Option<Document> {
+    let mut laid: Option<Document> = None;
+    for (si, setup) in built.setups.iter().enumerate().skip(1) {
+        if holding::placed(setup) {
+            continue;
+        }
+        let Ok(request) = holding::request(setup, built.holder(get(&setup.p, "holder"))) else {
+            continue;
+        };
+        let plans: Vec<&Plan> = results[si]
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().ok())
+            .map(|sim| &sim.plan)
+            .collect();
+        let Some(stock) = plans
+            .first()
+            .map(|plan| plan.stock)
+            .or_else(|| built.setup_stock(si, Some(mesh)))
+        else {
+            continue;
+        };
+        let layout = request.layout(stock, &plans);
+        holding::place(
+            &mut laid.get_or_insert_with(|| built.clone()).setups[si],
+            &layout,
+        );
+    }
+    laid
+}
+/// Runs the stages that follow building on a job, starting with the saved
+/// project's structure check. Returns the report and the copy of the job with
+/// the layouts suggested for its later setups (`laid_out`), whose workholding
+/// the check is of.
+fn run(built: &Document, mesh: &Mesh, report: &PartReport) -> (CheckReport, Option<Document>) {
     let mut out = CheckReport {
         passed: false,
         problems: vec![],
@@ -437,7 +484,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
             stage: "structure",
             message: format!("The plan builds a job the app cannot save: {error}"),
         });
-        return out;
+        return (out, None);
     }
     // Speeds and feeds against the material: reported beside the stages that
     // follow, so one round of feedback carries every problem.
@@ -519,8 +566,22 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
     out.total_minutes = (operations.iter().map(|o| o.minutes).sum::<f32>() * 10.).round() / 10.;
     out.operations = operations;
     out.problems = problems;
+    let mut laid = None;
     if out.problems.is_empty() {
-        let job = crate::post::post_simulated(built, mesh, &results);
+        // The workholding is checked as the plan will be applied: with the
+        // layouts the app suggests for the later setups.
+        laid = laid_out(built, mesh, &results);
+        let job_doc = laid.as_ref().unwrap_or(built);
+        let job = crate::post::post_simulated(job_doc, mesh, &results);
+        // Every workholding problem is reported once, as such: export finds
+        // the same messages, which are left out of its list.
+        let held: Vec<(usize, crate::post::Held)> = (0..job_doc.setups.len())
+            .flat_map(|si| {
+                crate::post::held(job_doc, mesh, si, &results[si])
+                    .into_iter()
+                    .map(move |h| (si, h))
+            })
+            .collect();
         let mut export: Vec<Problem> = job
             .errors
             .iter()
@@ -534,6 +595,12 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
         for setup in &job.setups {
             let ops = &built.setups[setup.setup].operations;
             for message in setup.result.as_ref().err().into_iter().flatten() {
+                if held
+                    .iter()
+                    .any(|(si, h)| *si == setup.setup && h.message == *message)
+                {
+                    continue;
+                }
                 // A message that starts with one operation's name is about it.
                 let named: Vec<usize> = (0..ops.len())
                     .filter(|i| message.starts_with(&format!("{}: ", ops[*i].name())))
@@ -546,7 +613,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
                 });
             }
         }
-        if export.is_empty() {
+        if export.is_empty() && held.is_empty() {
             out.zeros = built
                 .setups
                 .iter()
@@ -557,7 +624,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
                 })
                 .collect();
         }
-        if !job.ready() && export.is_empty() {
+        if !job.ready() && export.is_empty() && held.is_empty() {
             export.push(Problem {
                 setup: 0,
                 operation: None,
@@ -566,6 +633,12 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
             });
         }
         out.problems.extend(export);
+        out.problems.extend(held.into_iter().map(|(si, h)| Problem {
+            setup: si + 1,
+            operation: h.operation.map(|oi| oi + 1),
+            stage: "workholding",
+            message: proposal::clip(&h.message, 300),
+        }));
     }
     out.problems.extend(cutting);
     out.problems.extend(axis);
@@ -574,7 +647,7 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
         out.coverage = Some(coverage(stock, part, &geometries[0], report));
     }
     out.passed = out.problems.is_empty();
-    out
+    (out, laid)
 }
 
 #[cfg(test)]
@@ -1485,6 +1558,171 @@ mod tests {
             vec![
                 "The tool's centre line passes through 0.20 mm of the part at X 105.0, Y 38.0, 0.2 mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there."
             ]
+        );
+    }
+
+    /// The block with `margin` mm of stock round the part, held by the
+    /// starter clamps at `clamps` (each 60 mm long, reaching 12 mm onto the
+    /// stock and 25 mm above it), and `good` cut to the model's outline, which
+    /// keeps its tools clear of clamps that far out.
+    fn clamped(clamps: &str, margin: &str) -> (Document, Mesh, PartReport, Proposal) {
+        use crate::proposal::tests::hold;
+        let (mut doc, mesh, report) = block();
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            doc.setups[0].p.insert(key.into(), margin.into());
+        }
+        hold(&mut doc, "Clamp", &[("clamps", clamps)]);
+        let mut proposal = good(&report);
+        for setup in &mut proposal.setups {
+            setup.operations[0].facing_area = Some("model".into());
+        }
+        (doc, mesh, report, proposal)
+    }
+    #[test]
+    fn a_proposal_through_setup_1s_clamp_is_refused_once_at_stage_workholding() {
+        use crate::proposal::tests::hold;
+        let (mut doc, mesh, report) = block();
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        let (check, built) = check(&doc, &mesh, &report, &good(&report));
+        assert!(!check.passed && built.is_none());
+        // Each hit is reported once, under its own stage and operation. Setup
+        // 2 has the clamps the app suggested for its toolpaths: facing the
+        // whole stock runs through any place they can be.
+        assert_eq!(
+            stages(&check),
+            vec![
+                "workholding 1/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z-2.0 (within the 2 mm gap).",
+                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-6.0 (within the 2 mm gap).",
+                "workholding 1/Some(3): Contour by planner: the holder hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-38.0 (within the 2 mm gap).",
+                "workholding 1/Some(4): Drill by planner: the tool hits the clamp on +X (offset 0) at X48.0 Y-10.0 Z15.0 (within the 2 mm gap).",
+                "workholding 2/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z1.0 (within the 2 mm gap).",
+            ]
+        );
+        assert!(check.operations.len() == 6 && check.coverage.is_some());
+    }
+    #[test]
+    fn clamps_placed_clear_pass_and_the_returned_job_lays_out_the_later_setups() {
+        use crate::{holding, simulation};
+        let (doc, mesh, report, proposal) = clamped("-X:0;+X:0", "36");
+        let (check, job) = check(&doc, &mesh, &report, &proposal);
+        assert!(check.passed, "{:?}", stages(&check));
+        let job = job.unwrap();
+        let (first, second) = (&job.setups[0], &job.setups[1]);
+        // Setup 1 is the user's; setup 2 has the same entry and a layout.
+        assert_eq!(get(&first.p, "clamps"), "-X:0;+X:0");
+        assert_eq!(get(&second.p, "holding"), "Clamps");
+        assert_eq!(get(&second.p, "holder"), get(&first.p, "holder"));
+        let Ok(holding::Layout::Clamps { clamps, .. }) = holding::layout(second) else {
+            panic!("setup 2 has no readable clamps: {:?}", second.p)
+        };
+        assert!(clamps.len() >= 2, "{clamps:?}");
+        // The layout is what the suggestion makes of setup 2's own toolpaths.
+        let mut plans = vec![];
+        simulation::sequence(&job, &mesh, None, |si, _, r| {
+            if si == 1 {
+                plans.push(r.unwrap().plan);
+            }
+        });
+        let refs: Vec<&simulation::Plan> = plans.iter().collect();
+        let holder = job.holder(get(&second.p, "holder")).unwrap();
+        let again = holding::request(second, Some(holder))
+            .unwrap()
+            .layout(plans[0].stock, &refs);
+        assert_eq!(
+            holding::placement(&again),
+            vec![("clamps", get(&second.p, "clamps").to_string())]
+        );
+    }
+    #[test]
+    fn a_later_setup_keeps_a_placement_it_already_has() {
+        let (doc, mesh, report, proposal) = clamped("-X:0;+X:0", "36");
+        let mut job = proposal::build(&doc, &mesh, &report, &proposal).unwrap();
+        assert_eq!(get(&job.setups[1].p, "holding"), "Clamps");
+        assert_eq!(get(&job.setups[1].p, "clamps"), "");
+        job.setups[1].p.insert("clamps".into(), "-Y:0;+Y:0".into());
+        let (check, laid) = run(&job, &mesh, &report);
+        assert!(check.passed, "{:?}", stages(&check));
+        assert!(laid.is_none(), "nothing was suggested");
+    }
+    #[test]
+    fn a_vise_in_setup_1_gives_later_setups_jaws_on_the_axis_the_stock_fits() {
+        use crate::proposal::tests::hold;
+        let (mut doc, mesh, report) = block();
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        // No contour: the jaws would be in its way.
+        let mut proposal = good(&report);
+        proposal.setups[0].operations.remove(2);
+        for setup in &mut proposal.setups {
+            setup.operations[0].facing_area = Some("model".into());
+        }
+        let (check, job) = check(&doc, &mesh, &report, &proposal);
+        assert!(check.passed, "{:?}", stages(&check));
+        let second = &job.unwrap().setups[1];
+        assert_eq!(get(&second.p, "holding"), "Vise");
+        // The stock is 124 mm across X and the vise opens to 120.
+        assert_eq!(
+            [
+                get(&second.p, "vise_axis"),
+                get(&second.p, "vise_offset"),
+                get(&second.p, "vise_grip")
+            ],
+            ["Y", "0", "8"]
+        );
+    }
+    #[test]
+    fn the_clearance_plane_refusal_is_reported_once_per_setup_as_workholding() {
+        let (mut doc, mesh, report, proposal) = clamped("-X:0;+X:0", "36");
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_retract".into(), crate::model::POST_RETRACT[1].into());
+        let (refused, built) = check(&doc, &mesh, &report, &proposal);
+        assert!(!refused.passed && built.is_none());
+        let found = stages(&refused);
+        assert_eq!(found.len(), 2, "{found:?}");
+        // Setup 2's work zero is the model's top, 3 mm below its stock top
+        // (the stock left under the part in setup 1): its heights are 3 mm up.
+        for (found, (setup, plane, top)) in found
+            .iter()
+            .zip([(1, "Z15.0", "Z27.0"), (2, "Z18.0", "Z30.0")])
+        {
+            assert!(
+                found.starts_with(&format!(
+                    "workholding {setup}/None: The setup clearance plane ({plane}) is not above the clamp on "
+                )) && found.contains(&format!(
+                    "and its 2 mm gap ({top}). Raise the operations' clearance heights above {top}"
+                )),
+                "{found}"
+            );
+        }
+        // A plan that raises every clearance above the clamps and their gap
+        // (the report says by how much) passes in both setups.
+        let report = analysis::report(&doc, &mesh).unwrap();
+        assert_eq!(
+            report
+                .workholding
+                .as_ref()
+                .unwrap()
+                .clearance_above_stock_top,
+            Some(27.)
+        );
+        let mut raised = proposal.clone();
+        for op in raised.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            op.clearance = Some(27.5);
+        }
+        let (check, job) = check(&doc, &mesh, &report, &raised);
+        assert!(check.passed, "{:?}", stages(&check));
+        assert!(job.is_some());
+    }
+    #[test]
+    fn a_workholding_entry_that_is_gone_is_one_workholding_problem_and_no_export_problem() {
+        let (mut job, mesh, report) = good_job();
+        job.setups[0].p.insert("holding".into(), "Clamps".into());
+        job.setups[0].p.insert("clamps".into(), "-X:0".into());
+        job.setups[0].p.insert("holder".into(), "gone".into());
+        assert_eq!(
+            stages(&check_built(&job, &mesh, &report)),
+            vec!["workholding 1/None: Top: The workholding entry was deleted; choose another."]
         );
     }
 }

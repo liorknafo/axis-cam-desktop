@@ -3019,11 +3019,14 @@ mod tests {
         // above the stock bottom, which is within the gap of jaws that high.
         a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         apply_checked_plan(&mut a);
-        // The applied job's setup 1 keeps the vise; once it models none, the
-        // entry can be deleted.
+        // The applied job's setups all keep the vise (the planner copies
+        // setup 1's workholding to the later ones); once none of them models
+        // one, the entry can be deleted.
         let _ = a.update(Message::DeleteHolder(vise.clone()));
         assert!(a.doc.holder(&vise).is_some(), "{}", a.status);
-        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        for setup in &mut a.doc.setups {
+            setup.p.insert("holding".into(), "None".into());
+        }
         let _ = a.update(Message::DeleteHolder(vise.clone()));
         assert!(a.doc.holder(&vise).is_none(), "{}", a.status);
         let _ = a.update(Message::UndoPlan);
@@ -3058,7 +3061,9 @@ mod tests {
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         apply_checked_plan(&mut a);
-        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        for setup in &mut a.doc.setups {
+            setup.p.insert("holding".into(), "None".into());
+        }
         let _ = a.update(Message::DeleteHolder(vise.clone()));
         let _ = a.update(Message::NewHolder("Vise"));
         edit_holder(
@@ -4076,9 +4081,18 @@ mod tests {
         a
     }
     fn checked_preview(a: &App, view: bool) -> std::sync::Arc<crate::PlanPreview> {
+        checked_preview_of(a, view, |_| {})
+    }
+    /// `checked_preview` of the good plan as `edit` changes it.
+    fn checked_preview_of(
+        a: &App,
+        view: bool,
+        edit: impl FnOnce(&mut crate::proposal::Proposal),
+    ) -> std::sync::Arc<crate::PlanPreview> {
         let mesh = a.imported_mesh.as_ref().unwrap();
         let report = crate::analysis::report(&a.doc, mesh).unwrap();
-        let proposal = crate::proposal::tests::good(&report);
+        let mut proposal = crate::proposal::tests::good(&report);
+        edit(&mut proposal);
         let (check, job) = crate::plan_check::check(&a.doc, mesh, &report, &proposal);
         assert!(check.passed, "{:?}", check.problems);
         let job = job.unwrap();
@@ -5768,6 +5782,48 @@ mod tests {
         a.page = Page::Ai;
         let _ = a.view();
         a.page = Page::Post;
+        let _ = a.view();
+    }
+    #[test]
+    fn the_plan_card_shows_each_setups_modelled_workholding_and_what_is_checked_of_it() {
+        use crate::ui::plan_holding_line;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        // Without modelled workholding the cards say nothing of it.
+        let preview = checked_preview(&a, false);
+        assert_eq!(plan_holding_line(&preview.outcome.job, 0), None);
+        assert_eq!(plan_holding_line(&preview.outcome.job, 1), None);
+        assert_eq!(plan_holding_line(&preview.outcome.job, 2), None);
+        // Setup 1 held by clamps with room round the part: its card names
+        // them, and setup 2's the layout the plan check suggested.
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            a.doc.setups[0].p.insert(key.into(), "36".into());
+        }
+        crate::proposal::tests::hold(&mut a.doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        let preview = checked_preview_of(&a, false, |proposal| {
+            for setup in &mut proposal.setups {
+                setup.operations[0].facing_area = Some("model".into());
+            }
+        });
+        let job = &preview.outcome.job;
+        let checked = "Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not.";
+        assert_eq!(
+            plan_holding_line(job, 0).unwrap(),
+            format!(
+                "Modelled workholding: 2 \u{d7} Toe clamp 60 mm at -X 0, +X 0, gap 2 mm. {checked}"
+            )
+        );
+        let later = plan_holding_line(job, 1).unwrap();
+        assert!(
+            later.starts_with(
+                "Modelled workholding, laid out by the app from this setup's toolpaths: "
+            ) && later.contains(" \u{d7} Toe clamp 60 mm at ")
+                && later.ends_with(checked),
+            "{later}"
+        );
+        // The page builds with the lines.
+        a.planner = crate::Planner::Preview(preview);
+        a.page = Page::Ai;
         let _ = a.view();
     }
     #[test]

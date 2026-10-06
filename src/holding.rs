@@ -735,6 +735,102 @@ pub fn suggest_clamps(
     };
     chosen.iter().map(|c| (c.0, c.1)).collect()
 }
+/// What suggesting a layout for a setup starts from: the kind of workholding
+/// it has, the library entry it points at and its clearance gap.
+pub struct Request {
+    pub vise: bool,
+    /// The setup's `holder` key: the entry's id.
+    pub id: String,
+    pub holder: Holder,
+    pub gap: f32,
+}
+/// The `Request` for `setup`, whose library entry is `holder` (the one its
+/// `holder` key names, when the library has it), or why no layout can be
+/// suggested, as the status line says it.
+pub fn request(setup: &Setup, holder: Option<&Holder>) -> Result<Request, String> {
+    let (kind, vise) = match get(&setup.p, "holding") {
+        "Vise" => ("vise", true),
+        "Clamps" => ("clamp", false),
+        _ => return Err("Choose a vise or clamps for this setup first.".into()),
+    };
+    let gap = gap(setup)?;
+    let id = get(&setup.p, "holder").to_string();
+    let Some(holder) = holder else {
+        return Err(if id.is_empty() {
+            format!("Choose a {kind} from the library first.")
+        } else {
+            DELETED.into()
+        });
+    };
+    let probe = if vise {
+        Layout::Vise {
+            holder: id.clone(),
+            axis_y: false,
+            offset: 0.,
+            grip: 1.,
+            gap,
+        }
+    } else {
+        Layout::Clamps {
+            holder: id.clone(),
+            clamps: vec![],
+            gap,
+        }
+    };
+    if let Some(refused) = refusal(&probe, holder) {
+        return Err(refused);
+    }
+    Ok(Request {
+        vise,
+        id,
+        holder: holder.clone(),
+        gap,
+    })
+}
+impl Request {
+    /// The layout for a setup whose starting stock is `stock` and whose
+    /// operations make `plans` (`suggest_vise`, `suggest_clamps`).
+    pub fn layout(&self, stock: Bounds, plans: &[&Plan]) -> Layout {
+        let (holder, gap) = (self.id.clone(), self.gap);
+        if self.vise {
+            let (axis_y, grip) = suggest_vise(stock, &self.holder, plans, gap);
+            Layout::Vise {
+                holder,
+                axis_y,
+                offset: 0.,
+                grip,
+                gap,
+            }
+        } else {
+            Layout::Clamps {
+                holder,
+                clamps: suggest_clamps(stock, &self.holder, plans, gap),
+                gap,
+            }
+        }
+    }
+}
+/// Whether a setup that holds its stock with a vise or clamps says where:
+/// a vise has its grip, clamps their positions. True for no workholding.
+pub fn placed(setup: &Setup) -> bool {
+    let key = match get(&setup.p, "holding") {
+        "Vise" => "vise_grip",
+        "Clamps" => "clamps",
+        _ => return true,
+    };
+    !get(&setup.p, key).trim().is_empty()
+}
+/// Writes the placement of `layout` on `setup`; whether anything changed.
+pub fn place(setup: &mut Setup, layout: &Layout) -> bool {
+    let placement = placement(layout);
+    let changed = placement
+        .iter()
+        .any(|(key, value)| get(&setup.p, key) != value);
+    for (key, value) in placement {
+        setup.p.insert(key.into(), value);
+    }
+    changed
+}
 /// How many of `plans` have a move that comes within `gap` of `boxes`.
 pub fn clashes(plans: &[&Plan], boxes: &[HoldBox], gap: f32) -> usize {
     plans

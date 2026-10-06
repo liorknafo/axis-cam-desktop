@@ -24,14 +24,17 @@ pub fn machine_mm(m: &Machine, key: &str) -> f32 {
 #[derive(Default)]
 struct Problems {
     seen: HashSet<(Option<usize>, &'static str)>,
-    list: Vec<String>,
+    list: Vec<(Option<usize>, String)>,
 }
 impl Problems {
     /// Keep the first message for each operation and rule.
     fn add(&mut self, op: Option<usize>, rule: &'static str, message: String) {
         if self.seen.insert((op, rule)) {
-            self.list.push(message);
+            self.list.push((op, message));
         }
+    }
+    fn messages(self) -> Vec<String> {
+        self.list.into_iter().map(|(_, message)| message).collect()
     }
 }
 fn key(x: f32, y: f32) -> (i64, i64) {
@@ -193,7 +196,7 @@ pub fn check_setup(
             }
         }
     }
-    problems.list
+    problems.messages()
 }
 /// How far above the highest box a retract to the machine's Z home is checked
 /// to, in mm: the home height is not known, and it is above everything.
@@ -209,7 +212,8 @@ const HOME_CLEARANCE: f32 = 10_000.;
 /// retracts after the last operation belong to it. At the clearance plane the
 /// program's first rapid starts wherever the tool was, so the plane itself
 /// has to be above the highest box and its gap: one more problem, for the
-/// program. Messages are in work coordinates (`datum`).
+/// program. Messages are in work coordinates (`datum`), each with the index in
+/// `ops` of the operation it is about (None for the plane's).
 pub fn holding_problems(
     ops: &[OpState],
     plans: &[&Plan],
@@ -218,7 +222,7 @@ pub fn holding_problems(
     boxes: &[HoldBox],
     gap: f32,
     datum: [f32; 3],
-) -> Vec<String> {
+) -> Vec<(Option<usize>, String)> {
     // The highest box, the first of equals.
     let Some(highest) = boxes.iter().fold(None::<&HoldBox>, |best, b| {
         best.filter(|x| x.bounds.max[2] >= b.bounds.max[2])
@@ -575,6 +579,9 @@ mod tests {
         let settings = PostSettings::from_machine(&machine).unwrap();
         let blocks = blocks(ops, plans, &settings);
         holding_problems(ops, plans, &blocks, &settings, boxes, 2., [0., 0., 10.])
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
     }
     fn clearance() -> Machine {
         let mut machine = Machine::new(3);

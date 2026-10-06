@@ -1001,14 +1001,30 @@ pub(crate) struct Prepared {
     pub settings: PostSettings,
     pub offset: String,
 }
-/// Check and emit one setup from its `sequence` results (enabled operations only):
-/// one program, or one per run of the same tool in touch-off mode.
-pub(crate) fn prepare(
+/// One setup's enabled operations as export walks them: their states and
+/// simulations, the work zero they share and the programs they split into.
+struct Walk<'a> {
+    settings: PostSettings,
+    zero: [f32; 3],
+    stock: Bounds,
+    ops: Vec<OpState>,
+    /// The simulations of `ops`, in order.
+    simulations: Vec<&'a Simulation>,
+    /// The index in the setup of each of `ops`.
+    indexes: Vec<usize>,
+    /// The runs of `ops` that make one program each: touch-off mode splits
+    /// the setup at every change of tool.
+    groups: Vec<std::ops::Range<usize>>,
+}
+/// A setup's `Walk`, or why export cannot walk it: a setting, an operation
+/// that did not generate or cannot be posted, no work zero, or stock boxes
+/// that differ between its operations.
+fn walk<'a>(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
-    sims: &[(usize, Result<Simulation, String>)],
-) -> Result<Vec<Prepared>, Vec<String>> {
+    sims: &'a [(usize, Result<Simulation, String>)],
+) -> Result<Walk<'a>, Vec<String>> {
     let setup = &doc.setups[si];
     let offset = get(&setup.p, "offset").to_string();
     let mut errors = vec![];
@@ -1054,10 +1070,123 @@ pub(crate) fn prepare(
                 .into(),
         ]);
     }
-    let boxes = doc
-        .holding_boxes(setup, stock)
-        .map_err(|e| vec![format!("{}: {e}", setup.name())])?;
-    let gap = crate::holding::gap(setup).unwrap_or_default();
+    // Touch-off mode: one program per run of the same tool, touched off before it starts.
+    let mut groups: Vec<std::ops::Range<usize>> = vec![];
+    for k in 0..ops.len() {
+        match groups.last_mut() {
+            Some(g) if settings.tool_table || ops[g.start].tool_id == ops[k].tool_id => {
+                g.end = k + 1
+            }
+            _ => groups.push(k..k + 1),
+        }
+    }
+    Ok(Walk {
+        settings,
+        zero,
+        stock,
+        ops,
+        simulations,
+        indexes: sims.iter().map(|(oi, _)| *oi).collect(),
+        groups,
+    })
+}
+/// A workholding problem of one setup's programs: the operation it is about,
+/// an index in the setup's operations, and the message.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Held {
+    pub operation: Option<usize>,
+    pub message: String,
+}
+/// The jaws or clamps of setup `si` round the stock `walk` found, or the
+/// message that says why they cannot be modelled, named by the setup.
+fn holding_boxes(
+    doc: &Document,
+    si: usize,
+    stock: Bounds,
+) -> Result<Vec<crate::holding::HoldBox>, String> {
+    let setup = &doc.setups[si];
+    doc.holding_boxes(setup, stock)
+        .map_err(|e| format!("{}: {e}", setup.name()))
+}
+impl Walk<'_> {
+    /// The plans of the operations of `group`, one of `groups`.
+    fn plans(&self, group: &std::ops::Range<usize>) -> Vec<&Plan> {
+        self.simulations[group.clone()]
+            .iter()
+            .map(|s| &s.plan)
+            .collect()
+    }
+    /// What the program of `group`, whose `blocks` are emitted, does to
+    /// `boxes` (`post_check::holding_problems`).
+    fn held(
+        &self,
+        setup: &Setup,
+        group: &std::ops::Range<usize>,
+        blocks: &[Block],
+        boxes: &[crate::holding::HoldBox],
+    ) -> Vec<Held> {
+        let gap = crate::holding::gap(setup).unwrap_or_default();
+        crate::post_check::holding_problems(
+            &self.ops[group.clone()],
+            &self.plans(group),
+            blocks,
+            &self.settings,
+            boxes,
+            gap,
+            self.zero,
+        )
+        .into_iter()
+        .map(|(k, message)| Held {
+            operation: k.map(|k| self.indexes[group.start + k]),
+            message,
+        })
+        .collect()
+    }
+}
+/// Every workholding problem `prepare` finds for setup `si` from its
+/// `sequence` results, in every program (it stops at the first program with
+/// any problem): the messages are those of `prepare`. Empty when the setup
+/// cannot be walked, which `prepare` reports.
+pub(crate) fn held(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+) -> Vec<Held> {
+    let Ok(walk) = walk(doc, mesh, si, sims) else {
+        return vec![];
+    };
+    let boxes = match holding_boxes(doc, si, walk.stock) {
+        Ok(boxes) => boxes,
+        Err(message) => {
+            return vec![Held {
+                operation: None,
+                message,
+            }];
+        }
+    };
+    walk.groups
+        .iter()
+        .flat_map(|group| {
+            let blocks = blocks(&walk.ops[group.clone()], &walk.plans(group), &walk.settings);
+            walk.held(&doc.setups[si], group, &blocks, &boxes)
+        })
+        .collect()
+}
+/// Check and emit one setup from its `sequence` results (enabled operations only):
+/// one program, or one per run of the same tool in touch-off mode.
+pub(crate) fn prepare(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+) -> Result<Vec<Prepared>, Vec<String>> {
+    let setup = &doc.setups[si];
+    let offset = get(&setup.p, "offset").to_string();
+    let walk = walk(doc, mesh, si, sims)?;
+    let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
+    let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
+    let boxes = holding_boxes(doc, si, stock).map_err(|e| vec![e])?;
     let origin = get(&setup.p, "origin");
     if let (true, Some(volume), Some(frame)) = (
         origin == "Stock top center" || origin == "Stock top front-left",
@@ -1084,28 +1213,20 @@ pub(crate) fn prepare(
         }
     }
     let located = model_zero(setup, mesh, simulations[0]);
-    // Touch-off mode: one program per run of the same tool, touched off before it starts.
-    let mut groups: Vec<std::ops::Range<usize>> = vec![];
-    for k in 0..ops.len() {
-        match groups.last_mut() {
-            Some(g) if settings.tool_table || ops[g.start].tool_id == ops[k].tool_id => {
-                g.end = k + 1
-            }
-            _ => groups.push(k..k + 1),
-        }
-    }
     let count = groups.len();
     let mut out = vec![];
-    for (i, g) in groups.into_iter().enumerate() {
+    for (i, g) in groups.iter().enumerate() {
         let group_ops = &ops[g.clone()];
-        let group_sims = &simulations[g];
-        let plans: Vec<&Plan> = group_sims.iter().map(|s| &s.plan).collect();
+        let group_sims = &simulations[g.clone()];
+        let plans = walk.plans(g);
         let blocks = blocks(group_ops, &plans, &settings);
         let mut problems =
             crate::post_check::check_setup(setup, group_ops, group_sims, &blocks, &settings, zero);
-        problems.extend(crate::post_check::holding_problems(
-            group_ops, &plans, &blocks, &settings, &boxes, gap, zero,
-        ));
+        problems.extend(
+            walk.held(setup, g, &blocks, &boxes)
+                .into_iter()
+                .map(|h| h.message),
+        );
         if !problems.is_empty() {
             return Err(problems);
         }
@@ -2920,6 +3041,51 @@ M2
         );
         doc.setups[0].p.insert("vise_axis".into(), "Y".into());
         assert!(post_job(&doc, &mesh).ready());
+    }
+    /// The `sequence` results of every setup of `doc`.
+    fn results(doc: &Document, mesh: &Mesh) -> Vec<Vec<(usize, Result<Simulation, String>)>> {
+        let mut results = vec![vec![]; doc.setups.len()];
+        crate::simulation::sequence(doc, mesh, None, |si, oi, r| results[si].push((oi, r)));
+        results
+    }
+    #[test]
+    fn held_finds_the_problems_prepare_refuses_a_setup_with_and_the_operations_they_name() {
+        use crate::holding::DELETED;
+        let (mut doc, mesh) = fixture::job();
+        doc.adopt_holders();
+        // Only the Pocket is enabled; it is the second operation of the setup.
+        for (k, op) in doc.setups[0].operations.iter_mut().enumerate() {
+            op.enabled = k == 1;
+        }
+        assert!(held(&doc, &mesh, 0, &results(&doc, &mesh)[0]).is_empty());
+        // A clamp 40 mm onto the stock is in the pocket's way.
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0")]);
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        let entry = doc.workholding.iter_mut().find(|h| h.id == id).unwrap();
+        entry.p.insert("bite".into(), "40".into());
+        let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].operation, Some(1));
+        assert!(
+            found[0]
+                .message
+                .starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0")
+        );
+        // These are the messages export refuses the setup with.
+        assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
+        // A setup that cannot be modelled: the one line, for no operation.
+        doc.setups[0].p.insert("holder".into(), "gone".into());
+        let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);
+        assert_eq!(
+            found,
+            [Held {
+                operation: None,
+                message: format!("Top: {DELETED}")
+            }]
+        );
+        assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
+        // A setup export cannot walk has nothing to hold against.
+        assert!(held(&doc, &mesh, 0, &[]).is_empty());
     }
     #[test]
     fn at_the_clearance_plane_clamps_above_the_plane_refuse_the_setup() {

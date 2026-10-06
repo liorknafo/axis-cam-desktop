@@ -2764,7 +2764,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
 }
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
-pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
+pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
 fn planner_controls(app: &App) -> Element<'_, Message> {
     let checklist = app.plan_checklist();
     let ready = checklist.iter().all(|line| line.ok);
@@ -3003,6 +3003,21 @@ pub(crate) fn workholding_line(index: usize, note: &str) -> String {
         format!("Workholding (from the planner): {note}")
     }
 }
+/// A planned setup's modelled workholding on its card (`holding_text`: what
+/// holds the stock, where, with what gap), and what is checked of it. A later
+/// setup's was laid out by the plan check from its toolpaths. None without
+/// modelled workholding.
+pub(crate) fn plan_holding_line(job: &crate::model::Document, index: usize) -> Option<String> {
+    let text = job.holding_text(job.setups.get(index)?)?;
+    let by = if index == 0 {
+        ""
+    } else {
+        ", laid out by the app from this setup's toolpaths"
+    };
+    Some(format!(
+        "Modelled workholding{by}: {text} Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not."
+    ))
+}
 /// A planned setup's card title. Setup 1 keeps the user's name; a later
 /// setup's name was chosen by the planner and is labelled as its text, the
 /// way operation names are.
@@ -3142,6 +3157,9 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             .filter(|n| !n.is_empty())
         {
             card = card.push(muted(workholding_line(si, &clip(notes, 500))));
+        }
+        if let Some(line) = plan_holding_line(job, si) {
+            card = card.push(muted(line));
         }
         for (oi, o) in setup.operations.iter().enumerate() {
             let tool = job

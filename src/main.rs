@@ -738,49 +738,13 @@ impl App {
     fn suggest_layout(&mut self) -> bool {
         let si = self.doc.index();
         let setup = self.doc.setup();
-        let (kind, vise) = match get(&setup.p, "holding") {
-            "Vise" => ("vise", true),
-            "Clamps" => ("clamp", false),
-            _ => {
-                self.status = "Choose a vise or clamps for this setup first.".into();
-                return false;
-            }
-        };
-        let gap = match holding::gap(setup) {
-            Ok(gap) => gap,
+        let request = match holding::request(setup, self.doc.holder(get(&setup.p, "holder"))) {
+            Ok(request) => request,
             Err(error) => {
                 self.status = error;
                 return false;
             }
         };
-        let id = get(&setup.p, "holder").to_string();
-        let Some(holder) = self.doc.holder(&id).cloned() else {
-            self.status = if id.is_empty() {
-                format!("Choose a {kind} from the library first.")
-            } else {
-                holding::DELETED.into()
-            };
-            return false;
-        };
-        let probe = if vise {
-            holding::Layout::Vise {
-                holder: id.clone(),
-                axis_y: false,
-                offset: 0.,
-                grip: 1.,
-                gap,
-            }
-        } else {
-            holding::Layout::Clamps {
-                holder: id.clone(),
-                clamps: vec![],
-                gap,
-            }
-        };
-        if let Some(refused) = holding::refusal(&probe, &holder) {
-            self.status = refused;
-            return false;
-        }
         let (mut plans, mut failed) = (vec![], 0);
         let last = self.doc.setups[si]
             .operations
@@ -808,40 +772,18 @@ impl App {
             return false;
         };
         let refs: Vec<&simulation::Plan> = plans.iter().collect();
-        let layout = if vise {
-            let (axis_y, grip) = holding::suggest_vise(stock, &holder, &refs, gap);
-            holding::Layout::Vise {
-                holder: id,
-                axis_y,
-                offset: 0.,
-                grip,
-                gap,
-            }
-        } else {
-            holding::Layout::Clamps {
-                holder: id,
-                clamps: holding::suggest_clamps(stock, &holder, &refs, gap),
-                gap,
-            }
-        };
-        let suggested = holding::placement(&layout);
-        let p = &self.doc.setups[si].p;
-        let changed = suggested.iter().any(|(key, value)| get(p, key) != value);
-        if changed {
-            let p = &mut self.doc.setups[si].p;
-            for (key, value) in suggested {
-                p.insert(key.into(), value);
-            }
-        }
+        let layout = request.layout(stock, &refs);
+        let changed = holding::place(&mut self.doc.setups[si], &layout);
         let id = &self.doc.setups[si].id;
-        if !vise && self.clamps_draft.as_ref().is_some_and(|d| d.setup == *id) {
+        if !request.vise && self.clamps_draft.as_ref().is_some_and(|d| d.setup == *id) {
             self.clamps_draft = None;
         }
         // What is saved, to the hundredth, is what is checked and reported.
         let layout = holding::layout(&self.doc.setups[si]).unwrap_or(layout);
-        let boxes = holding::boxes(&layout, &holder, stock).unwrap_or_default();
+        let (holder, gap) = (&request.holder, request.gap);
+        let boxes = holding::boxes(&layout, holder, stock).unwrap_or_default();
         let clashing = holding::clashes(&refs, &boxes, gap);
-        let opening = holding::opening_issue(&layout, &holder, stock);
+        let opening = holding::opening_issue(&layout, holder, stock);
         let message = holding::summary(&layout, refs.len(), clashing, failed, opening.as_deref());
         if changed {
             self.touch();

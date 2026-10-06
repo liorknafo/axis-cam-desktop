@@ -31,6 +31,9 @@ const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
 pub const MAX_OPERATIONS: usize = 40;
 const MAX_SURFACES: usize = 500;
+/// The retract height of every operation the planner makes, mm above the
+/// stock top (`Operation::new`).
+const RETRACT: f32 = 5.;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +66,7 @@ pub struct ProposedOp {
     pub radial_allowance: Option<f32>,
     pub axial_allowance: Option<f32>,
     pub bottom_offset: Option<f32>,
+    pub clearance: Option<f32>,
     pub finish_passes: Option<u32>,
     pub facing_area: Option<String>,
     pub contour_mode: Option<String>,
@@ -137,6 +141,7 @@ pub fn schema() -> Value {
         "radial_allowance": optional(),
         "axial_allowance": optional(),
         "bottom_offset": optional(),
+        "clearance": optional(),
         "finish_passes": {"type": ["integer", "null"]},
         "facing_area": choice(&["stock", "model"], true),
         "contour_mode": choice(&["outside", "inside_floor"], true),
@@ -255,6 +260,7 @@ fn operation(
         ("radial_allowance", p.radial_allowance),
         ("axial_allowance", p.axial_allowance),
         ("bottom_offset", p.bottom_offset),
+        ("clearance", p.clearance),
         ("ramp_angle", p.ramp_angle),
         ("surface_stepover", p.surface_stepover),
         ("tolerance", p.tolerance),
@@ -275,6 +281,12 @@ fn operation(
         if value.is_some_and(|v| v < 0. && v.is_finite()) {
             wrong.push(format!("{field} cannot be negative."));
         }
+    }
+    // Rapids run at the clearance height, which is never below the retract.
+    if p.clearance.is_some_and(|v| v.is_finite() && v < RETRACT) {
+        wrong.push(format!(
+            "clearance cannot be less than {RETRACT} mm, the retract height."
+        ));
     }
     if p.rpm.is_finite() && !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
         wrong.push(format!(
@@ -426,6 +438,7 @@ fn operation(
     for (key, value) in [
         ("stepdown", p.stepdown),
         ("stepover", p.stepover_percent),
+        ("clearance", p.clearance),
         ("ramp_angle", p.ramp_angle),
         ("surface_stepover", p.surface_stepover),
         ("tolerance", p.tolerance),
@@ -602,10 +615,17 @@ pub fn build(
             }
             setup.p.insert("origin".into(), proposed.origin.clone());
             // The same workholding as setup 1 until the user says otherwise;
-            // the planner's advice for it is in the notes.
+            // the planner's advice for it is in the notes. A vise or clamps
+            // of setup 1 are carried without their position: the plan check
+            // lays them out for this setup's toolpaths.
             setup
                 .p
                 .insert("fixture".into(), get(&setup1.p, "fixture").into());
+            for key in ["holding", "holder", "holding_gap"] {
+                if let Some(value) = setup1.p.get(key) {
+                    setup.p.insert(key.into(), value.clone());
+                }
+            }
             setup
                 .p
                 .insert("reposition".into(), "Reclamp and probe origin".into());
@@ -670,6 +690,7 @@ pub(crate) mod tests {
             radial_allowance: None,
             axial_allowance: None,
             bottom_offset: None,
+            clearance: None,
             finish_passes: None,
             facing_area: None,
             contour_mode: None,
@@ -711,6 +732,27 @@ pub(crate) mod tests {
             .id
             .clone();
         assert!(doc.select_material(&starter));
+    }
+    /// Setup 1 held by the starter vise or clamp (`kind` "Vise" or "Clamp"), with
+    /// `pairs` set on the setup.
+    pub fn hold(doc: &mut Document, kind: &str, pairs: &[(&str, &str)]) {
+        doc.adopt_holders();
+        let id = doc
+            .workholding
+            .iter()
+            .find(|h| h.kind() == kind)
+            .unwrap()
+            .id
+            .clone();
+        let p = &mut doc.setups[0].p;
+        p.insert("holder".into(), id);
+        p.insert(
+            "holding".into(),
+            if kind == "Vise" { "Vise" } else { "Clamps" }.into(),
+        );
+        for (k, v) in pairs {
+            p.insert((*k).into(), (*v).into());
+        }
     }
     /// The fixture job with its part report: tools T1 flat Ø10, T2 ball Ø6, T3 drill Ø4.
     pub fn block() -> (Document, Mesh, PartReport) {
@@ -876,6 +918,60 @@ pub(crate) mod tests {
         assert_eq!(second.machine.id, first.machine.id);
         assert_eq!(built.active, first.id);
         assert!(built.validate_structure().is_ok());
+    }
+    #[test]
+    fn later_setups_copy_setup_1s_workholding_without_a_placement() {
+        let (mut doc, mesh, report) = block();
+        // Setup 1 without workholding: the later setup carries none either.
+        let built = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        for key in ["holding", "holder", "holding_gap"] {
+            assert!(!built.setups[1].p.contains_key(key), "{key}");
+        }
+        hold(
+            &mut doc,
+            "Clamp",
+            &[("clamps", "-X:0;+X:10"), ("holding_gap", "3.5")],
+        );
+        let built = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        let (first, second) = (&built.setups[0], &built.setups[1]);
+        assert_eq!(get(&first.p, "clamps"), "-X:0;+X:10");
+        for key in ["holding", "holder", "holding_gap"] {
+            assert!(!get(&first.p, key).is_empty());
+            assert_eq!(get(&second.p, key), get(&first.p, key), "{key}");
+        }
+        assert_eq!(get(&second.p, "holding"), "Clamps");
+        assert_eq!(get(&second.p, "holding_gap"), "3.5");
+        // No position: the app lays it out once the toolpaths are known.
+        for key in ["clamps", "vise_axis", "vise_offset", "vise_grip"] {
+            assert!(!second.p.contains_key(key), "{key}");
+        }
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let built = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        assert_eq!(get(&built.setups[1].p, "holding"), "Vise");
+        assert!(!built.setups[1].p.contains_key("vise_grip"));
+    }
+    #[test]
+    fn clearance_is_the_proposals_to_set_and_never_below_the_retract_height() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[1].clearance = Some(30.);
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        let clearance = |si: usize, oi: usize| get(&built.setups[si].operations[oi].p, "clearance");
+        assert_eq!(
+            (clearance(0, 1), clearance(0, 0), clearance(1, 0)),
+            ("30", "15", "15")
+        );
+        proposal.setups[0].operations[0].clearance = Some(5.);
+        assert!(build(&doc, &mesh, &report, &proposal).is_ok());
+        proposal.setups[0].operations[0].clearance = Some(4.9);
+        proposal.setups[1].operations[0].clearance = Some(f32::NAN);
+        assert_eq!(
+            messages(build(&doc, &mesh, &report, &proposal)),
+            [
+                "1/Some(1): clearance cannot be less than 5 mm, the retract height.",
+                "2/Some(1): clearance is not a finite number."
+            ]
+        );
     }
     #[test]
     fn operations_get_defaults_overrides_and_fixed_combinations() {
