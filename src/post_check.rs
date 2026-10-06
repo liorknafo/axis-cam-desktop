@@ -206,8 +206,10 @@ const HOME_CLEARANCE: f32 = 10_000.;
 /// clearance plane or, for the machine's Z home, far above every box), the
 /// approach after a tool change (across at the retract height from where the
 /// tip was; at the program's start only the point) and the descent. The
-/// retracts after the last operation belong to it. Messages are in work
-/// coordinates (`datum`).
+/// retracts after the last operation belong to it. At the clearance plane the
+/// program's first rapid starts wherever the tool was, so the plane itself
+/// has to be above the highest box and its gap: one more problem, for the
+/// program. Messages are in work coordinates (`datum`).
 pub fn holding_problems(
     ops: &[OpState],
     plans: &[&Plan],
@@ -217,14 +219,23 @@ pub fn holding_problems(
     gap: f32,
     datum: [f32; 3],
 ) -> Vec<String> {
-    if boxes.is_empty() {
+    // The highest box, the first of equals.
+    let Some(highest) = boxes.iter().fold(None::<&HoldBox>, |best, b| {
+        best.filter(|x| x.bounds.max[2] >= b.bounds.max[2])
+            .or(Some(b))
+    }) else {
         return vec![];
-    }
-    let top = boxes
-        .iter()
-        .map(|b| b.bounds.max[2])
-        .fold(f32::NEG_INFINITY, f32::max);
+    };
+    let top = highest.bounds.max[2];
     let plane = clearance_plane(blocks);
+    let mut problems = Problems::default();
+    // The program's first rapid starts from wherever the tool was, at the
+    // clearance plane: it has to clear every box and its gap (a tip exactly
+    // at the top and gap touches, as in the hits).
+    if !settings.machine_home && plane <= top + gap {
+        let message = crate::holding::plane_message(&highest.label, plane, gap, top, datum[2]);
+        problems.add(None, "plane", message);
+    }
     let high = if settings.machine_home {
         (top + gap + HOME_CLEARANCE).max(plane)
     } else {
@@ -265,7 +276,6 @@ pub fn holding_problems(
             _ => {}
         }
     }
-    let mut problems = Problems::default();
     for (k, path) in segments.iter().enumerate() {
         let plan = plans[k];
         let hits = crate::holding::hits_segments(
@@ -582,7 +592,7 @@ mod tests {
     /// A clamp on +X: footprint X30-50 Y-10-10, Z10-35.
     fn low_clamp() -> [HoldBox; 1] {
         [clamp_box(
-            "clamp on +X at 0",
+            "clamp on +X (offset 0)",
             [30., -10., 10.],
             [50., 10., 35.],
         )]
@@ -608,7 +618,7 @@ mod tests {
                 &low_clamp()
             ),
             [
-                "Face top: the tool hits the clamp on +X at 0 at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+                "Face top: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
             ]
         );
         assert!(walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &[]).is_empty());
@@ -617,7 +627,7 @@ mod tests {
     /// plans whose tool (thin holder, reach 5) works low beside it.
     fn overhang() -> ([HoldBox; 1], impl Fn([f32; 3], [f32; 3]) -> Plan) {
         let boxes = [clamp_box(
-            "clamp on +X at 0",
+            "clamp on +X (offset 0)",
             [30., -10., 40.],
             [50., 10., 60.],
         )];
@@ -647,19 +657,21 @@ mod tests {
                 &boxes
             ),
             [
-                "Second: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
+                "Second: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
             ]
         );
         // At the clearance plane the retract goes only as high as the highest
-        // move, 0 here: nothing is passed.
-        assert!(
+        // move, 0 here: nothing is passed, but a plane that low is refused.
+        assert_eq!(
             walk(
                 clearance(),
                 &[named("First"), named("Second")],
                 &[&a, &b],
                 &boxes
-            )
-            .is_empty()
+            ),
+            [
+                "The setup clearance plane (Z-10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z52.0). Raise the operations' clearance heights above Z52.0 or retract to machine home."
+            ]
         );
     }
     #[test]
@@ -674,7 +686,7 @@ mod tests {
         assert_eq!(
             walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &boxes),
             [
-                "Face top: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z52.0 (within the 2 mm gap)."
+                "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z52.0 (within the 2 mm gap)."
             ]
         );
     }
@@ -694,7 +706,7 @@ mod tests {
         assert_eq!(
             walk(Machine::new(3), &[named("Cut A"), other], &[&a, &b], &boxes),
             [
-                "Cut A: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
+                "Cut A: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z-7.0 (within the 2 mm gap)."
             ]
         );
     }
@@ -710,11 +722,13 @@ mod tests {
         };
         let ops = [named("Cut A"), other];
         // Neither operation reaches the clamp, but the rapid across at the
-        // clearance plane (20, the highest tip) goes through it at Z20.
+        // clearance plane (20, the highest tip, below the clamp's 37) goes
+        // through it at Z20; the plane itself is refused too.
         assert_eq!(
             walk(clearance(), &ops, &[&a, &b], &boxes),
             [
-                "Cut B: the tool hits the clamp on +X at 0 at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
+                "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home.",
+                "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
             ]
         );
         // Retracting to the machine's Z home goes over everything.
@@ -726,29 +740,105 @@ mod tests {
         let at_x = |x: f32| fixture::plan([x, 0., 20.], &[(Motion::Feed, [x, 0., 18.], 500.)]);
         let (a, b) = (at_x(0.), at_x(80.));
         let ops = [named("Cut A"), named("Cut B")];
-        for machine in [clearance(), Machine::new(3)] {
-            assert_eq!(
-                walk(machine, &ops, &[&a, &b], &boxes),
-                [
-                    "Cut B: the tool hits the clamp on +X at 0 at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
-                ]
-            );
-        }
+        let hit = "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap).";
+        assert_eq!(walk(Machine::new(3), &ops, &[&a, &b], &boxes), [hit]);
+        // At the clearance plane the plane is refused as well (20, below 37).
+        assert_eq!(
+            walk(clearance(), &ops, &[&a, &b], &boxes),
+            [
+                "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home.",
+                hit
+            ]
+        );
     }
     #[test]
     fn the_first_approach_is_a_point_not_a_sweep_from_the_origin() {
         // A clamp at the origin, the work far from it.
         let boxes = [clamp_box(
-            "clamp on -X at 0",
+            "clamp on -X (offset 0)",
             [-10., -10., 10.],
             [10., 10., 35.],
         )];
         let plan = fixture::plan([50., 50., 20.], &[(Motion::Feed, [60., 50., 20.], 500.)]);
-        for machine in [clearance(), Machine::new(3)] {
-            assert_eq!(
-                walk(machine, &[fixture::facing_op()], &[&plan], &boxes),
-                Vec::<String>::new()
+        let one = [fixture::facing_op()];
+        assert_eq!(
+            walk(Machine::new(3), &one, &[&plan], &boxes),
+            Vec::<String>::new()
+        );
+        // At the clearance plane (20, below the clamp's 37) only the plane is
+        // refused: no sweep from the origin through the clamp is invented.
+        assert_eq!(
+            walk(clearance(), &one, &[&plan], &boxes),
+            [
+                "The setup clearance plane (Z10.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home."
+            ]
+        );
+    }
+    #[test]
+    fn at_the_clearance_plane_it_must_be_above_every_box_and_its_gap() {
+        // The first rapid of a program starts wherever the tool was: the
+        // plane has to clear the highest box and its gap (37 for the clamp,
+        // 52 for the tall one), even when nothing is near.
+        let tall = clamp_box(
+            "clamp on -X (offset 0)",
+            [-50., -10., 10.],
+            [-30., 10., 50.],
+        );
+        let [low] = low_clamp();
+        let plan_at = |z: f32| fixture::plan([0., 0., z], &[(Motion::Feed, [5., 0., z], 500.)]);
+        let one = [fixture::facing_op()];
+        let refused = |z: f32, boxes: &[HoldBox]| walk(clearance(), &one, &[&plan_at(z)], boxes);
+        // A plane exactly at the top and the gap touches it: refused.
+        assert_eq!(
+            refused(37., std::slice::from_ref(&low)),
+            [
+                "The setup clearance plane (Z27.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home."
+            ]
+        );
+        assert!(refused(37.5, std::slice::from_ref(&low)).is_empty());
+        // The highest box is named, and the plane has to clear it.
+        let both = [low.clone(), tall];
+        assert_eq!(
+            refused(45., &both),
+            [
+                "The setup clearance plane (Z35.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z42.0). Raise the operations' clearance heights above Z42.0 or retract to machine home."
+            ]
+        );
+        assert!(refused(52.5, &both).is_empty());
+        // Equal tops name the first box.
+        let twin = clamp_box(
+            "clamp on -X (offset 0)",
+            [-50., -10., 10.],
+            [-30., 10., 35.],
+        );
+        assert!(
+            refused(30., &[low.clone(), twin])
+                .first()
+                .is_some_and(|m| m.contains("the clamp on +X"))
+        );
+        // Machine home goes over everything; so does no workholding.
+        let settings = |machine: Machine| walk(machine, &one, &[&plan_at(20.)], &both);
+        assert!(settings(Machine::new(3)).is_empty());
+        assert!(refused(20., &[]).is_empty());
+        // Every program of a touch-off job starts from an unknown position too.
+        let mut touch = clearance();
+        touch.p.insert(
+            "post_tool_length".into(),
+            crate::model::POST_TOOL_LENGTH[1].into(),
+        );
+        for tool in ["t1", "t2"] {
+            let op = OpState {
+                tool_id: tool.into(),
+                ..fixture::facing_op()
+            };
+            let found = walk(
+                touch.clone(),
+                &[op],
+                &[&plan_at(20.)],
+                std::slice::from_ref(&low),
             );
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].starts_with("The setup clearance plane (Z10.0) is not above"));
         }
     }
     #[test]
@@ -756,8 +846,12 @@ mod tests {
         // Two tall clamps; the holder (reach 18) comes within the gap of one
         // before the tool (reach 7) does.
         let boxes = [
-            clamp_box("clamp on +X at 0", [30., -10., 10.], [50., 10., 100.]),
-            clamp_box("clamp on -X at 0", [-50., -10., 10.], [-30., 10., 100.]),
+            clamp_box("clamp on +X (offset 0)", [30., -10., 10.], [50., 10., 100.]),
+            clamp_box(
+                "clamp on -X (offset 0)",
+                [-50., -10., 10.],
+                [-30., 10., 100.],
+            ),
         ];
         let plan = fixture::plan(
             [0., 0., 20.],
@@ -770,8 +864,8 @@ mod tests {
         assert_eq!(
             walk(Machine::new(3), &[fixture::facing_op()], &[&plan], &boxes),
             [
-                "Face top: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z10.0 (within the 2 mm gap).",
-                "Face top: the holder hits the clamp on +X at 0 at X14.0 Y0.0 Z10.0 (within the 2 mm gap).",
+                "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap).",
+                "Face top: the holder hits the clamp on +X (offset 0) at X14.0 Y0.0 Z10.0 (within the 2 mm gap).",
             ]
         );
     }
@@ -792,7 +886,9 @@ mod tests {
                 &[&wide, &narrow],
                 &boxes
             ),
-            ["Wide: the tool hits the clamp on +X at 0 at X24.0 Y0.0 Z10.0 (within the 2 mm gap)."]
+            [
+                "Wide: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap)."
+            ]
         );
     }
 }

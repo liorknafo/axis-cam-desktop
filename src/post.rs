@@ -510,7 +510,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         w.wrapped("Workholding: ", holding);
     }
     if !clean(get(&setup.p, "notes")).is_empty() {
-        w.wrapped("Workholding: ", get(&setup.p, "notes"));
+        w.wrapped("Setup notes: ", get(&setup.p, "notes"));
     }
     let mut listed = vec![];
     for op in ops {
@@ -2766,19 +2766,20 @@ M2
         let text = &setup_texts(&posted, 1)[0];
         assert!(
             text.contains(
-                "(Fixture: Vise)\n(Workholding: Flip about X; clamp on the machined walls.)\n"
+                "(Fixture: Vise)\n(Setup notes: Flip about X; clamp on the machined walls.)\n"
             ),
             "{text}"
         );
-        // Setup 1 has no notes, so no Workholding line.
-        assert!(!setup_texts(&posted, 0)[0].contains("Workholding"));
+        // Setup 1 has no notes and no modelled workholding: neither line.
+        let first = &setup_texts(&posted, 0)[0];
+        assert!(!first.contains("Workholding") && !first.contains("Setup notes"));
         // Long notes are cleaned and broken between words, never cut off.
         let words = "Clamp (soft jaws)\non the walls; keep ".repeat(12) + "the end.";
         job.setups[1].p.insert("notes".into(), words);
         let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
         let lines: Vec<&str> = text
             .lines()
-            .skip_while(|l| !l.starts_with("(Workholding: "))
+            .skip_while(|l| !l.starts_with("(Setup notes: "))
             .take_while(|l| !l.starts_with("(T1:"))
             .collect();
         assert!(lines.len() > 2, "{text}");
@@ -2792,13 +2793,13 @@ M2
                 .iter()
                 .all(|l| l[1..l.len() - 1].chars().all(|c| c != '(' && c != ')'))
         );
-        assert!(lines[0].starts_with("(Workholding: Clamp soft jaws on the walls; keep Clamp"));
+        assert!(lines[0].starts_with("(Setup notes: Clamp soft jaws on the walls; keep Clamp"));
         // Every later line names what it continues, so that none begins with
         // the note's own text.
         assert!(
             lines[1..]
                 .iter()
-                .all(|l| l.starts_with("(Workholding, continued: ")),
+                .all(|l| l.starts_with("(Setup notes, continued: ")),
             "{lines:?}"
         );
         // A word longer than a line is split over lines, not cut off.
@@ -2810,8 +2811,8 @@ M2
         let joined: String = text
             .lines()
             .filter_map(|l| {
-                l.strip_prefix("(Workholding: ")
-                    .or_else(|| l.strip_prefix("(Workholding, continued: "))
+                l.strip_prefix("(Setup notes: ")
+                    .or_else(|| l.strip_prefix("(Setup notes, continued: "))
             })
             .map(|l| l.strip_suffix(')').unwrap().replace(' ', ""))
             .collect();
@@ -2876,7 +2877,7 @@ M2
         // The clamp's inner face is X-22 in work coordinates; the rapids pass
         // it 15 mm above the stock top.
         assert!(
-            expected.starts_with("Pocket: the tool hits the clamp on -X at 0 at X-22.0 Y")
+            expected.starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0 Y")
                 && expected.ends_with(" Z15.0 (within the 2 mm gap)."),
             "{expected}"
         );
@@ -2921,6 +2922,53 @@ M2
         assert!(post_job(&doc, &mesh).ready());
     }
     #[test]
+    fn at_the_clearance_plane_clamps_above_the_plane_refuse_the_setup() {
+        let (mut doc, mesh) = pocket_job();
+        // Toe clamps on -X and +X, clear of the pocket's path (Z0-25 in work
+        // coordinates); the program's first rapid starts from wherever the
+        // tool was after the tool change, at the clearance plane (Z15).
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        assert!(post_job(&doc, &mesh).ready());
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_retract".into(), POST_RETRACT[1].into());
+        let refused = |plane: &str, limit: &str| {
+            format!(
+                "The setup clearance plane (Z{plane}) is not above the clamp on -X (offset 0) and its 2 mm gap (Z{limit}). Raise the operations' clearance heights above Z{limit} or retract to machine home."
+            )
+        };
+        let posted = post_job(&doc, &mesh);
+        assert!(!posted.ready());
+        assert_eq!(errors(&posted), [refused("15.0", "27.0")]);
+        // Touch-off mode: every program starts the same way.
+        let mut touch = doc.clone();
+        touch.setups[0]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        assert_eq!(errors(&post_job(&touch, &mesh)), [refused("15.0", "27.0")]);
+        // A plane under the clamp's top and gap is refused, one above it exports.
+        doc.setups[0].operations[0]
+            .p
+            .insert("clearance".into(), "26.5".into());
+        assert_eq!(errors(&post_job(&doc, &mesh)), [refused("26.5", "27.0")]);
+        doc.setups[0].operations[0]
+            .p
+            .insert("clearance".into(), "30".into());
+        let posted = post_job(&doc, &mesh);
+        assert!(posted.ready(), "{:?}", errors(&posted));
+        // Retracting to the machine's Z home needs no plane.
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_retract".into(), POST_RETRACT[0].into());
+        doc.setups[0].operations[0]
+            .p
+            .insert("clearance".into(), "15".into());
+        assert!(post_job(&doc, &mesh).ready());
+    }
+    #[test]
     fn the_header_and_the_setup_sheet_say_what_holds_the_stock() {
         let (mut doc, mesh) = pocket_job();
         let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
@@ -2936,7 +2984,7 @@ M2
         assert!(
             doc.setup_sheet(Some(&mesh)).contains("Fixture: Low profile clamps\n\nWorkholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.\n\nRotation:")
         );
-        // Four clamps, and the setup's own notes after them. A library name
+        // Four clamps, and the setup's own notes after them under their own lead word. A library name
         // with active-comment words and brackets is written as text.
         hold(
             &mut doc,
@@ -2952,7 +3000,7 @@ M2
             .insert("name".into(), "Toe (MSG,hello) clamp Ø60".into());
         let text = header(&doc);
         assert!(
-            text.contains("(Fixture: Low profile clamps)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Workholding: Soft jaws)\n(T1: "),
+            text.contains("(Fixture: Low profile clamps)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Setup notes: Soft jaws)\n(T1: "),
             "{text}"
         );
         assert_comments_begin_with_app_words(&text);
@@ -3007,7 +3055,7 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 33] = [
+    const COMMENT_STARTS: [&str; 35] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
         "Job, continued: ",
@@ -3025,6 +3073,8 @@ M2
         "Fixture, continued: ",
         "Workholding: ",
         "Workholding, continued: ",
+        "Setup notes: ",
+        "Setup notes, continued: ",
         "T#: ",
         "T#, continued: ",
         "Operation #: ",
@@ -3090,7 +3140,7 @@ M2
     fn no_comment_begins_with_text_from_the_user_or_the_model() {
         // The golden plan, emitted with user text that holds LinuxCNC's
         // active-comment words at every offset from 0 to 400 characters (the
-        // Workholding lines break near 187 and 363), and at offsets around
+        // notes and workholding lines break near 187 and 363), and at offsets around
         // those breaks in every other header the post writes: touch-off
         // program 1 and a later one, clearance retracts, with and without
         // Model origin, with and without the stock top.

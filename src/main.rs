@@ -233,6 +233,8 @@ pub struct ClampsDraft {
     pub over: String,
 }
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
+/// A heading and the lines of the box the inspector shows.
+pub type HoldingNote = Option<(String, Vec<String>)>;
 pub struct App {
     pub smoke_dir: Option<PathBuf>,
     pub smoke_step: usize,
@@ -246,6 +248,9 @@ pub struct App {
     pub audit_report: Vec<(String, bool, String)>,
     pub post: Option<std::sync::Arc<post::JobPost>>,
     pub post_busy: bool,
+    /// The workholding warning of the preview shown (`ui::holding_warning`)
+    /// and what it was worked out from.
+    holding_note: std::cell::RefCell<Option<(String, HoldingNote)>>,
     post_epoch: u64,
     pub settings: settings::Settings,
     settings_path: PathBuf,
@@ -506,6 +511,7 @@ impl App {
             audit_report: vec![],
             post: None,
             post_busy: false,
+            holding_note: std::cell::RefCell::new(None),
             post_epoch: 0,
             settings: settings::load(&settings_path),
             settings_path,

@@ -345,7 +345,7 @@ pub fn boxes(layout: &Layout, holder: &Holder, stock: Bounds) -> Result<Vec<Hold
                     (min[along], max[along]) = (c - w / 2., c + w / 2.);
                     (min[2], max[2]) = (stock.max[2], stock.max[2] + h);
                     HoldBox {
-                        label: format!("clamp on {} at {offset}", side.label()),
+                        label: format!("clamp on {} (offset {})", side.label(), mm(offset)),
                         bounds: Bounds { min, max },
                     }
                 })
@@ -517,10 +517,7 @@ pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
 /// A hit as a problem line: the operation, the part of the tool, the box and
 /// where, in work coordinates (`datum` is the work zero in the setup's frame).
 pub fn message(operation: &str, hit: &Hit, gap: f32, datum: [f32; 3]) -> String {
-    let at = |k: usize| match format!("{:.1}", hit.at[k] - datum[k]).as_str() {
-        "-0.0" => "0.0".to_string(),
-        v => v.to_string(),
-    };
+    let at = |k: usize| tenth(hit.at[k] - datum[k]);
     format!(
         "{operation}: the {} hits the {} at X{} Y{} Z{} (within the {} mm gap).",
         hit.part,
@@ -562,6 +559,41 @@ pub fn sentence(layout: &Layout, holder: &Holder) -> String {
             mm(*gap)
         ),
     }
+}
+/// `v` in work coordinates for a message: to 0.1 mm, never `-0.0`.
+fn tenth(v: f32) -> String {
+    match format!("{v:.1}").as_str() {
+        "-0.0" => "0.0".to_string(),
+        text => text.to_string(),
+    }
+}
+/// Why a clearance plane that is not above a box and its gap is refused: the
+/// first rapid of a program starts wherever the tool was, at that height.
+/// `top` is the box's top, the plane and `datum_z` are in the setup's frame;
+/// the heights are said in work coordinates.
+pub fn plane_message(label: &str, plane: f32, gap: f32, top: f32, datum_z: f32) -> String {
+    let limit = tenth(top + gap - datum_z);
+    format!(
+        "The setup clearance plane (Z{}) is not above the {label} and its {} mm gap (Z{limit}). Raise the operations' clearance heights above Z{limit} or retract to machine home.",
+        tenth(plane - datum_z),
+        mm(gap)
+    )
+}
+/// The boxes as the 3D view draws them: nothing lower than the bottom of
+/// `stock`. The jaws are modelled far below it for the check, which keeps
+/// them whole.
+pub fn shown(boxes: &[HoldBox], stock: Bounds) -> Vec<HoldBox> {
+    boxes
+        .iter()
+        .map(|b| {
+            let mut bounds = b.bounds;
+            bounds.min[2] = bounds.min[2].max(stock.min[2]);
+            HoldBox {
+                label: b.label.clone(),
+                bounds,
+            }
+        })
+        .collect()
 }
 /// The least grip a suggested vise is reduced to, in mm.
 const MIN_GRIP: f32 = 3.;
@@ -1161,22 +1193,22 @@ mod tests {
             of(&clamp_layout(&all), &clamp()),
             [
                 (
-                    "clamp on -X at 0".to_string(),
+                    "clamp on -X (offset 0)".to_string(),
                     [852., 290., 140.],
                     [912., 310., 165.]
                 ),
                 (
-                    "clamp on +X at 0".to_string(),
+                    "clamp on +X (offset 0)".to_string(),
                     [1088., 290., 140.],
                     [1148., 310., 165.]
                 ),
                 (
-                    "clamp on -Y at 0".to_string(),
+                    "clamp on -Y (offset 0)".to_string(),
                     [990., 152., 140.],
                     [1010., 212., 165.]
                 ),
                 (
-                    "clamp on +Y at 0".to_string(),
+                    "clamp on +Y (offset 0)".to_string(),
                     [990., 388., 140.],
                     [1010., 448., 165.]
                 ),
@@ -1839,13 +1871,13 @@ mod tests {
         );
         // The holder, a gap with decimals, and a hair below zero written as 0.0.
         let hit = Hit {
-            label: "clamp on -X at 0".into(),
+            label: "clamp on -X (offset 0)".into(),
             part: "holder",
             at: [-5., 0.04, 20.],
         };
         assert_eq!(
             message("Pocket 2", &hit, 1.5, [-5., 0.06, 20.]),
-            "Pocket 2: the holder hits the clamp on -X at 0 at X0.0 Y0.0 Z0.0 (within the 1.5 mm gap)."
+            "Pocket 2: the holder hits the clamp on -X (offset 0) at X0.0 Y0.0 Z0.0 (within the 1.5 mm gap)."
         );
     }
     #[test]
@@ -1892,5 +1924,42 @@ mod tests {
             "1 × Toe clamp 60 mm at +Y 10.5, gap 2 mm."
         );
         assert_eq!(sentence(&Layout::None, &clamp()), "");
+    }
+    #[test]
+    fn the_view_draws_jaws_down_to_the_stock_bottom_only() {
+        let stock = stock();
+        let jaws = boxes(&vise_layout(true, 0., 2.), &vise(), stock).unwrap();
+        assert_eq!(jaws[0].bounds.min[2], stock.min[2] - 100.);
+        let drawn = shown(&jaws, stock);
+        assert_eq!(drawn.len(), 2);
+        for (whole, cut) in jaws.iter().zip(&drawn) {
+            assert_eq!(cut.label, whole.label);
+            // Only the depth below the stock is left out.
+            assert_eq!(cut.bounds.min[2], stock.min[2]);
+            assert_eq!(cut.bounds.max, whole.bounds.max);
+            assert_eq!(cut.bounds.min[..2], whole.bounds.min[..2]);
+        }
+        // Clamps sit on the stock top and are drawn whole.
+        let clamps = boxes(
+            &clamp_layout(&[(Side::MinusX, 0.), (Side::PlusY, 10.)]),
+            &clamp(),
+            stock,
+        )
+        .unwrap();
+        assert_eq!(shown(&clamps, stock), clamps);
+        // The check keeps the full depth: the same boxes still hit far below.
+        let low = plan(3., &[([-40., 40., -50.], [40., 40., -50.])]);
+        assert!(!hits(&low, &jaws, 2.).is_empty());
+    }
+    #[test]
+    fn a_plane_not_above_the_box_and_its_gap_reads_in_work_coordinates() {
+        assert_eq!(
+            plane_message("clamp on -X (offset 0)", 62.5, 2., 72.5, 47.5),
+            "The setup clearance plane (Z15.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home."
+        );
+        assert_eq!(
+            plane_message("vise jaw on +Y", 0., 0.5, 8.43, 0.),
+            "The setup clearance plane (Z0.0) is not above the vise jaw on +Y and its 0.5 mm gap (Z8.9). Raise the operations' clearance heights above Z8.9 or retract to machine home."
+        );
     }
 }

@@ -1130,21 +1130,16 @@ impl Document {
             None => Ok(vec![]),
         }
     }
-    /// Setup `setup`'s modelled workholding in a sentence, for the setup sheet
-    /// and the program header (`holding::sentence`); what is wrong with it
-    /// when it cannot be modelled; None without workholding.
+    /// `setup`'s modelled workholding in a sentence, for the setup sheet and
+    /// the program header (`holding::sentence`). None without workholding and
+    /// when its layout and library entry cannot be read, which
+    /// `holding_issues` says.
     pub fn holding_text(&self, setup: &Setup) -> Option<String> {
-        let layout = crate::holding::layout(setup);
-        if matches!(layout, Ok(crate::holding::Layout::None)) {
-            return None;
-        }
-        if let Some(issue) = self.holding_problems(setup, || None).into_iter().next() {
-            return Some(issue);
-        }
-        let (Ok(layout), Some(entry)) = (layout, self.holder(get(&setup.p, "holder"))) else {
-            return None;
-        };
-        Some(crate::holding::sentence(&layout, entry))
+        use crate::holding::{Layout, refusal, sentence};
+        let layout = crate::holding::layout(setup).ok()?;
+        let entry = self.holder(get(&setup.p, "holder"))?;
+        (layout != Layout::None && refusal(&layout, entry).is_none())
+            .then(|| sentence(&layout, entry))
     }
     /// After a setup's `holding` or `holder` changed: a vise or clamps setup
     /// points at a library entry of its kind (its own when it has one, else
@@ -1371,7 +1366,18 @@ impl Document {
             "# {}\n\nNative UI prototype — sample planning data, not machining instructions.\n\nMaterial: {}\n",
             self.title, self.material
         );
-        for setup in &self.setups {
+        for (i, setup) in self.setups.iter().enumerate() {
+            // What holds the stock, then what the editor and the export say is wrong with it.
+            let holding: String = [
+                self.holding_text(setup)
+                    .map(|text| format!("Workholding: {text}\n\n")),
+                self.holding_issues(i, mesh)
+                    .first()
+                    .map(|issue| format!("Workholding problem: {issue}\n\n")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             s += &format!(
                 "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\nFixture: {}\n\n{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\n{}\n\n",
                 setup.name(),
@@ -1381,9 +1387,7 @@ impl Document {
                 crate::stock::sheet_description(setup, mesh),
                 get(&setup.p, "origin"),
                 get(&setup.p, "fixture"),
-                self.holding_text(setup)
-                    .map(|text| format!("Workholding: {text}\n\n"))
-                    .unwrap_or_default(),
+                holding,
                 get(&setup.p, "rx"),
                 get(&setup.p, "ry"),
                 get(&setup.p, "rz"),
@@ -1981,7 +1985,10 @@ mod tests {
         );
         let boxes = doc.holding_boxes(doc.setup(), stock).unwrap();
         let labels: Vec<_> = boxes.iter().map(|b| b.label.as_str()).collect();
-        assert_eq!(labels, ["clamp on -X at 0", "clamp on +Y at 10"]);
+        assert_eq!(
+            labels,
+            ["clamp on -X (offset 0)", "clamp on +Y (offset 10)"]
+        );
         // Every refusal is the first line `holding_issues` shows, the opening included.
         set(
             &mut doc,
@@ -2038,12 +2045,11 @@ mod tests {
         assert!(!doc.setup_sheet(None).contains("Workholding"));
         assert_eq!(doc.holding_text(doc.setup()), None);
         let fixture = get(&doc.setup().p, "fixture").to_string();
-        let after = |doc: &Document, line: &str| {
+        // What follows the fixture line, up to the rotation.
+        let after = |doc: &Document, paragraphs: &str| {
             let sheet = doc.setup_sheet(None);
             assert!(
-                sheet.contains(&format!(
-                    "Fixture: {fixture}\n\nWorkholding: {line}\n\nRotation:"
-                )),
+                sheet.contains(&format!("Fixture: {fixture}\n\n{paragraphs}Rotation:")),
                 "{sheet}"
             );
         };
@@ -2064,7 +2070,7 @@ mod tests {
         );
         after(
             &doc,
-            "100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.",
+            "Workholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.\n\n",
         );
         set(
             &mut doc,
@@ -2076,17 +2082,59 @@ mod tests {
         );
         after(
             &doc,
-            "4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.",
+            "Workholding: 4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.\n\n",
         );
         assert_eq!(
             doc.holding_text(doc.setup()).as_deref(),
             Some("4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.")
         );
+        // A vise the stock does not fit in is described, and the editor's and
+        // the export's problem with it follows (the stock is 140 mm across X).
+        set(
+            &mut doc,
+            &[
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "140"),
+                ("stock_y", "100"),
+                ("stock_z", "40"),
+                ("holding", "Vise"),
+                ("holder", &vise),
+                ("vise_axis", "X"),
+            ],
+        );
+        after(
+            &doc,
+            "Workholding: 100 mm machine vise on ±X, grip 8 mm, offset 0 mm, gap 2 mm.\n\nWorkholding problem: The stock is 140 mm across the jaws; this vise opens to 120 mm.\n\n",
+        );
+        set(&mut doc, &[("vise_axis", "Y")]);
+        after(
+            &doc,
+            "Workholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.\n\n",
+        );
         // A setup that cannot be modelled says why, never what it would have been.
         set(&mut doc, &[("holder", "gone")]);
-        after(&doc, "The workholding entry was deleted; choose another.");
-        set(&mut doc, &[("holder", &clamp), ("clamps", "-Z:0")]);
-        after(&doc, "A clamp side must be -X, +X, -Y or +Y.");
+        after(
+            &doc,
+            "Workholding problem: The workholding entry was deleted; choose another.\n\n",
+        );
+        assert_eq!(doc.holding_text(doc.setup()), None);
+        set(
+            &mut doc,
+            &[
+                ("holding", "Clamps"),
+                ("holder", &clamp),
+                ("clamps", "-Z:0"),
+            ],
+        );
+        after(
+            &doc,
+            "Workholding problem: A clamp side must be -X, +X, -Y or +Y.\n\n",
+        );
+        set(&mut doc, &[("holder", &vise), ("clamps", "-X:0")]);
+        after(
+            &doc,
+            "Workholding problem: The chosen workholding entry is a vise, not a clamp.\n\n",
+        );
         set(&mut doc, &[("holding", "None")]);
         assert!(!doc.setup_sheet(None).contains("Workholding"));
     }

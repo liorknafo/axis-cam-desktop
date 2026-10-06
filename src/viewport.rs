@@ -128,7 +128,8 @@ pub struct Viewport<'a> {
     pub show_stock: bool,
     pub show_paths: bool,
     pub progress: Option<f32>,
-    /// The jaws or clamps of the setup, in its frame in mm; drawn with the stock.
+    /// The jaws or clamps of the setup, in its frame in mm; drawn with the
+    /// stock and part of the camera's fit.
     pub holding: Vec<crate::holding::HoldBox>,
 }
 struct Projector {
@@ -172,6 +173,16 @@ impl Viewport<'_> {
             for i in 0..3 {
                 bounds.min[i] = bounds.min[i].min(stock.min[i]);
                 bounds.max[i] = bounds.max[i].max(stock.max[i]);
+            }
+        }
+        if self.show_stock {
+            let scale = self.mesh.display_scale();
+            for hold in &self.holding {
+                let hold = hold.bounds.scaled(scale);
+                for i in 0..3 {
+                    bounds.min[i] = bounds.min[i].min(hold.min[i]);
+                    bounds.max[i] = bounds.max[i].max(hold.max[i]);
+                }
             }
         }
         if let Some(sim) = self.simulation {
@@ -1510,6 +1521,54 @@ mod tests {
         let (_, _, hidden) = v.pixels(&p, b, None);
         v.holding.clear();
         assert_eq!(v.pixels(&p, b, None).2, hidden);
+    }
+    #[test]
+    fn the_camera_fit_contains_the_drawn_workholding() {
+        use crate::holding::HoldBox;
+        let d = crate::model::Document::sample();
+        let mesh = crate::mesh::sample();
+        let scale = mesh.display_scale();
+        // A clamp reaching far beyond the stock's +X side.
+        let clamp = HoldBox {
+            label: "clamp on +X (offset 0)".into(),
+            bounds: crate::mesh::Bounds {
+                min: [200., -10., 45.],
+                max: [600., 10., 70.],
+            },
+        };
+        let mut v = Viewport {
+            setup: Some(d.setup()),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: true,
+            camera: Camera::default(),
+            picking: false,
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+        };
+        let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
+        let bounds = clamp.bounds;
+        let inside = |p: &Projector| {
+            box_vertices(bounds.scaled(scale)).iter().all(|point| {
+                let q = p.p(*point);
+                q.x >= 0. && q.x <= b.width && q.y >= 0. && q.y <= b.height
+            })
+        };
+        let without = v.projector(b);
+        assert!(!inside(&without));
+        v.holding = vec![clamp];
+        let with = v.projector(b);
+        assert!(inside(&with));
+        assert!(with.scale < without.scale);
+        // Hidden with the stock, the boxes do not move the camera.
+        v.show_stock = false;
+        let hidden = v.projector(b);
+        v.holding.clear();
+        let none = v.projector(b);
+        assert_eq!((hidden.scale, hidden.target), (none.scale, none.target));
     }
     #[test]
     fn camera_fit_contains_rotated_part_and_asymmetric_stock() {

@@ -2000,9 +2000,10 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
     )
 }
 /// The jaws or clamps the 3D view draws with the stock: the active setup's,
-/// round the stock of the preview shown or else the setup's own. None when
-/// the stock is hidden, the setup has no workholding or it cannot be modelled
-/// (the setup editor says why).
+/// round the stock of the preview shown or else the setup's own, from the
+/// stock's bottom up (`holding::shown`). None when the stock is hidden, the
+/// setup has no workholding or it cannot be modelled (the setup editor says
+/// why).
 pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
     let boxes = || {
         let setup = app
@@ -2013,28 +2014,54 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
             .active_simulation()
             .map(|sim| sim.plan.stock)
             .or_else(|| app.doc.setup_stock(app.doc.index(), app.part_mesh()))?;
-        app.doc.holding_boxes(setup, stock).ok()
+        let boxes = app.doc.holding_boxes(setup, stock).ok()?;
+        Some(crate::holding::shown(&boxes, stock))
     };
     boxes().unwrap_or_default()
 }
 /// The inspector's warning about the preview shown: a heading and a line for
 /// each place where the generated operation's own toolpath comes within the
-/// gap of the setup's jaws or clamps, in work coordinates (the setup's frame
-/// when the work zero cannot be told), or why that was not checked. None when
-/// there is nothing to say. It never blocks: the export refuses these hits
-/// too, and those of the links, approaches and retracts.
-pub(crate) fn holding_warning(app: &App) -> Option<(String, Vec<String>)> {
+/// gap of the setup's jaws or clamps, in work coordinates (in the setup's
+/// frame, said so, when the work zero cannot be told), or why that was not
+/// checked. None when there is nothing to say. It never blocks: the export
+/// refuses these hits too, and those of the links, approaches and retracts.
+/// Worked out once for a preview, its plan and the workholding, and kept in
+/// the app: the view asks on every frame.
+pub(crate) fn holding_warning(app: &App) -> crate::HoldingNote {
     let (sim, op, setup) = (
         app.active_simulation()?,
         app.operation()?,
         app.doc.active_setup()?,
     );
-    let plan = &sim.plan;
+    let key = format!(
+        "{}|{}|{:?}|{:?}",
+        sim.id,
+        op.name(),
+        setup.p,
+        app.doc.holder(get(&setup.p, "holder")).map(|h| &h.p)
+    );
+    if let Some((cached, note)) = &*app.holding_note.borrow()
+        && *cached == key
+    {
+        return note.clone();
+    }
+    let note = holding_note(app, &sim.plan, op.name(), setup);
+    *app.holding_note.borrow_mut() = Some((key, note.clone()));
+    note
+}
+/// `holding_warning` of the plan of the operation `name`, worked out.
+fn holding_note(
+    app: &App,
+    plan: &crate::simulation::Plan,
+    name: &str,
+    setup: &Setup,
+) -> crate::HoldingNote {
     let boxes = match app.doc.holding_boxes(setup, plan.stock) {
         Ok(boxes) => boxes,
         Err(error) => {
             return Some((
-                "Workholding is not checked for this operation".into(),
+                "Workholding cannot be checked; export will refuse this setup until it is fixed"
+                    .into(),
                 vec![error],
             ));
         }
@@ -2042,15 +2069,19 @@ pub(crate) fn holding_warning(app: &App) -> Option<(String, Vec<String>)> {
     let gap = crate::holding::gap(setup).unwrap_or_default();
     let datum = app
         .part_mesh()
-        .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok())
-        .unwrap_or_default();
+        .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok());
     let lines: Vec<String> = crate::holding::hits(plan, &boxes, gap)
         .iter()
-        .map(|hit| crate::holding::message(op.name(), hit, gap, datum))
+        .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
         .collect();
     (!lines.is_empty()).then(|| {
+        let frame = if datum.is_none() {
+            "; coordinates in the setup frame"
+        } else {
+            ""
+        };
         (
-            "Too close to the workholding (export will refuse this)".into(),
+            format!("Too close to the workholding (export will refuse this{frame})"),
             lines,
         )
     })
