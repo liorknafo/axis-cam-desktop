@@ -1937,6 +1937,11 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
     }
     if holding != "None" {
         c.push(field(p, "holding_gap", "Clearance gap · mm", t));
+        c.push(
+            btn("Suggest layout", Message::SuggestLayout, false)
+                .width(Fill)
+                .into(),
+        );
         let lines = holding_lines(app);
         if !lines.is_empty() {
             let heading = format!(

@@ -350,6 +350,9 @@ pub fn command(m: &Message, label: String) -> Help {
         DeleteHolder(_) => {
             "Remove this entry from the library. It cannot be deleted while a setup uses it: choose other workholding in that setup first."
         }
+        SuggestLayout => {
+            "Place this setup's vise jaws or clamps where its generated toolpaths stay farthest from them, and say how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again."
+        }
         SetOpTool(_) => {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview."
         }
@@ -1759,11 +1762,15 @@ mod tests {
             Message::EditHolder("h".into()),
             Message::SaveHolder,
             Message::DeleteHolder("h".into()),
+            Message::SuggestLayout,
             Message::Page(Workholding),
         ] {
             let body = command(&message, "x".into()).body;
             assert_ne!(body, generic, "{message:?}");
         }
+        let suggest = command(&Message::SuggestLayout, "x".into()).body;
+        assert!(suggest.contains("never changed"), "{suggest}");
+        assert!(suggest.contains("parallels, bolts, the table"), "{suggest}");
         let delete = command(&Message::DeleteHolder("h".into()), "x".into()).body;
         assert!(delete.contains("setup uses"), "{delete}");
         let unknown = field_help("zz", "x", Target::Holder).body;

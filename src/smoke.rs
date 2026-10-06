@@ -2010,11 +2010,12 @@ mod tests {
         assert_eq!(get(p, "holder"), vise);
         assert_eq!(get(p, "vise_grip"), "8");
         assert_eq!(get(p, "holding_gap"), "2");
+        // The first Vise also places the jaws (the example's stock is 150 x 104 mm: only the Y sides fit).
         assert_eq!(
             layout(a.doc.setup()),
             Ok(Layout::Vise {
                 holder: vise.clone(),
-                axis_y: false,
+                axis_y: true,
                 offset: 0.,
                 grip: 8.,
                 gap: 2.
@@ -2031,8 +2032,8 @@ mod tests {
                 gap: 2.
             })
         );
-        // Another vise from the library: its id is written; the grip the setup
-        // already has stays.
+        // Another vise from the library: its id is written and the jaws are
+        // placed again from its own grip (nothing in the example reaches them).
         let mut other = crate::holding::starters().remove(0);
         other.p.insert("name".into(), "Kurt".into());
         other.p.insert("grip".into(), "15".into());
@@ -2040,7 +2041,8 @@ mod tests {
         a.doc.workholding.push(other);
         let _ = a.update(Message::Edit(Target::Setup, "holder", other_id.clone()));
         assert_eq!(get(&a.doc.setup().p, "holder"), other_id);
-        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "15");
+        assert_eq!(get(&a.doc.setup().p, "vise_offset"), "0");
         // A setup without a grip takes the chosen vise's.
         edit_setup(&mut a, &[("vise_grip", "")]);
         let _ = a.update(Message::Edit(Target::Setup, "holder", vise.clone()));
@@ -2054,6 +2056,10 @@ mod tests {
         assert!(a.doc.holding_issues(0, None).is_empty());
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         assert_eq!(get(&a.doc.setup().p, "holder"), first_of(&a, "Clamp"));
+        // The first Clamps places them; without positions the setup says so.
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0;-Y:0;+Y:0");
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        a.doc.setup_mut().p.insert("clamps".into(), String::new());
         assert_eq!(
             a.doc.holding_issues(0, None),
             ["Place 1 to 8 clamps."],
@@ -2097,7 +2103,8 @@ mod tests {
         let mut a = holding_app(&dir);
         let clamp = first_of(&a, "Clamp");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
-        assert_eq!(a.clamps_field(), (String::new(), None));
+        // The first Clamps also places them: all four, at the middles.
+        assert_eq!(a.clamps_field(), ("-X:0;+X:0;-Y:0;+Y:0".into(), None));
         a.project_dirty = false;
         let _ = a.update(Message::SetClamps("-X:0;+X:0".into()));
         assert!(a.project_dirty);
@@ -2163,6 +2170,373 @@ mod tests {
             ["The clearance gap must be 0 or more."]
         );
     }
+    /// The plans Suggest layout works from: those of setup `si` that generate.
+    fn setup_plans(a: &App, si: usize) -> Vec<crate::simulation::Plan> {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let last = a.doc.setups[si]
+            .operations
+            .iter()
+            .rposition(|o| o.enabled)
+            .unwrap();
+        let mut plans = vec![];
+        crate::simulation::sequence(&a.doc, mesh, Some((si, last)), |s, _, result| {
+            if s == si
+                && let Ok(sim) = result
+            {
+                plans.push(sim.plan);
+            }
+        });
+        plans
+    }
+    const STOCK_ONLY: &str =
+        "No toolpaths were available to check, so only the stock was considered.";
+    #[test]
+    fn suggest_layout_needs_a_setup_workholding_and_a_usable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut blank = fresh_app(&dir);
+        let _ = blank.update(Message::SuggestLayout);
+        assert!(blank.status.contains("Create a setup"), "{}", blank.status);
+        let mut a = holding_app(&dir);
+        let refused = |a: &mut App, status: &str| {
+            let before = a.doc.setup().p.clone();
+            let _ = a.update(Message::SuggestLayout);
+            assert_eq!(a.status, status);
+            assert_eq!(a.doc.setup().p, before, "{status}");
+        };
+        refused(&mut a, "Choose a vise or clamps for this setup first.");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let vise = first_of(&a, "Vise");
+        let clamp = first_of(&a, "Clamp");
+        // The wrong kind of entry, a bad gap, an entry that is gone, none chosen.
+        a.doc.setup_mut().p.insert("holder".into(), clamp);
+        refused(
+            &mut a,
+            "The chosen workholding entry is a clamp, not a vise.",
+        );
+        a.doc.setup_mut().p.insert("holder".into(), vise.clone());
+        a.doc
+            .setup_mut()
+            .p
+            .insert("holding_gap".into(), "abc".into());
+        refused(&mut a, "The clearance gap must be 0 or more.");
+        a.doc.setup_mut().p.insert("holding_gap".into(), "2".into());
+        a.doc.setup_mut().p.insert("holder".into(), String::new());
+        refused(&mut a, "Choose a vise from the library first.");
+        a.doc.setup_mut().p.insert("holder".into(), vise);
+        a.doc.workholding.retain(|h| h.kind() != "Vise");
+        refused(&mut a, "The workholding entry was deleted; choose another.");
+    }
+    #[test]
+    fn choosing_a_vise_the_first_time_suggests_it_and_later_edits_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.project_dirty = false;
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        // The example's stock is 150 x 104 mm: only the Y sides fit the 120 mm opening. It has no toolpaths.
+        let p = &a.doc.setup().p;
+        assert_eq!(get(p, "vise_axis"), "Y");
+        assert_eq!(get(p, "vise_offset"), "0");
+        assert_eq!(get(p, "vise_grip"), "8");
+        assert_eq!(
+            a.status,
+            format!("Suggested: vise jaws on ±Y, grip 8 mm. {STOCK_ONLY}")
+        );
+        assert!(a.project_dirty);
+        // Edits to the offset, grip, gap and axis move nothing else and say nothing.
+        a.status = "Kept.".into();
+        edit_setup(
+            &mut a,
+            &[
+                ("vise_offset", "5"),
+                ("vise_grip", "6"),
+                ("holding_gap", "3"),
+                ("vise_axis", "X"),
+            ],
+        );
+        let p = &a.doc.setup().p;
+        assert_eq!(
+            [
+                get(p, "vise_axis"),
+                get(p, "vise_offset"),
+                get(p, "vise_grip"),
+                get(p, "holding_gap")
+            ],
+            ["X", "5", "6", "3"]
+        );
+        assert_eq!(a.status, "Kept.");
+        // None and Vise again: the setup has its placement, so it stays.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "X");
+        assert_eq!(get(&a.doc.setup().p, "vise_offset"), "5");
+        assert_eq!(a.status, "Kept.");
+        // Suggest layout always suggests: offset 0, the holder's grip, the clearer axis.
+        let _ = a.update(Message::SuggestLayout);
+        let p = &a.doc.setup().p;
+        assert_eq!(
+            [
+                get(p, "vise_axis"),
+                get(p, "vise_offset"),
+                get(p, "vise_grip")
+            ],
+            ["Y", "0", "8"]
+        );
+        assert_eq!(get(p, "holding_gap"), "3");
+        assert!(
+            a.status
+                .starts_with("Suggested: vise jaws on ±Y, grip 8 mm.")
+        );
+        // Another library vise places the jaws again, from its own grip.
+        let mut other = crate::holding::starters().remove(0);
+        other.p.insert("name".into(), "Kurt".into());
+        other.p.insert("grip".into(), "15".into());
+        let other_id = other.id.clone();
+        a.doc.workholding.push(other);
+        edit_setup(&mut a, &[("vise_offset", "9")]);
+        a.status = "Kept.".into();
+        let _ = a.update(Message::Edit(Target::Setup, "holder", other_id.clone()));
+        let p = &a.doc.setup().p;
+        assert_eq!(get(p, "holder"), other_id);
+        assert_eq!(
+            [
+                get(p, "vise_axis"),
+                get(p, "vise_offset"),
+                get(p, "vise_grip")
+            ],
+            ["Y", "0", "15"]
+        );
+        assert!(
+            a.status
+                .starts_with("Suggested: vise jaws on ±Y, grip 15 mm.")
+        );
+        // Choosing the same entry again changes nothing.
+        edit_setup(&mut a, &[("vise_offset", "9")]);
+        a.status = "Kept.".into();
+        let _ = a.update(Message::Edit(Target::Setup, "holder", other_id));
+        assert_eq!(get(&a.doc.setup().p, "vise_offset"), "9");
+        assert_eq!(a.status, "Kept.");
+    }
+    #[test]
+    fn choosing_clamps_the_first_time_suggests_them_and_the_typed_text_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0;-Y:0;+Y:0");
+        assert_eq!(
+            a.status,
+            format!("Suggested: 4 clamps on -X at 0, +X at 0, -Y at 0, +Y at 0. {STOCK_ONLY}")
+        );
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        // A text that does not read is dropped when the suggestion writes the positions.
+        let _ = a.update(Message::SetClamps("-X".into()));
+        assert!(a.clamps_draft.is_some());
+        let _ = a.update(Message::SuggestLayout);
+        assert!(a.clamps_draft.is_none());
+        assert_eq!(a.clamps_field(), ("-X:0;+X:0;-Y:0;+Y:0".to_string(), None));
+        // Typed positions are kept through None and Clamps and any other edit.
+        let _ = a.update(Message::SetClamps("+Y:5".into()));
+        a.status = "Kept.".into();
+        edit_setup(&mut a, &[("holding_gap", "3")]);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "+Y:5");
+        assert_eq!(a.status, "Kept.");
+        // A different clamp from the library suggests again.
+        let mut other = crate::holding::starters().remove(1);
+        other.p.insert("name".into(), "Strap".into());
+        other.p.insert("width".into(), "30".into());
+        let other_id = other.id.clone();
+        a.doc.workholding.push(other);
+        let _ = a.update(Message::Edit(Target::Setup, "holder", other_id.clone()));
+        assert_eq!(get(&a.doc.setup().p, "holder"), other_id);
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0;-Y:0;+Y:0");
+        assert!(
+            a.status.starts_with("Suggested: 4 clamps on "),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn suggest_layout_reads_the_generated_toolpaths_and_changes_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        let vise = first_of(&a, "Vise");
+        let operations = json(&a.doc.setups[0].operations);
+        let plans = setup_plans(&a, 0);
+        assert_eq!(plans.len(), 6);
+        let refs: Vec<&crate::simulation::Plan> = plans.iter().collect();
+        // The example block's stock is 124 x 84 mm: only the Y sides fit the vise.
+        let stock = plans[0].stock;
+        let holder = a.doc.holder(&vise).unwrap().clone();
+        let (axis_y, grip) = crate::holding::suggest_vise(stock, &holder, &refs, 2.);
+        assert!(axis_y);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let p = &a.doc.setup().p;
+        assert_eq!(get(p, "vise_axis"), "Y");
+        assert_eq!(get(p, "vise_offset"), "0");
+        assert_eq!(get(p, "vise_grip"), grip.to_string());
+        // The contour and the drilling run at the jaws' height beside the stock, whatever the grip.
+        let jaws = crate::holding::boxes(
+            &crate::holding::layout(a.doc.setup()).unwrap(),
+            &holder,
+            stock,
+        )
+        .unwrap();
+        let clashing = crate::holding::clashes(&refs, &jaws, 2.);
+        assert!(clashing > 0);
+        assert_eq!(
+            a.status,
+            format!(
+                "Suggested: vise jaws on ±Y, grip {grip} mm. {clashing} operations come within the gap; see the warnings."
+            )
+        );
+        assert_eq!(json(&a.doc.setups[0].operations), operations);
+        // With only the pocket, which stays above the jaws, every operation is clear.
+        for i in [0, 2, 3, 4, 5] {
+            a.doc.setups[0].operations[i].enabled = false;
+        }
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(
+            a.status,
+            "Suggested: vise jaws on ±Y, grip 8 mm. Every operation is clear of them."
+        );
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
+        // The gap is the setup's: a 100 mm gap reaches the pocket too, which is the one operation.
+        a.doc
+            .setup_mut()
+            .p
+            .insert("holding_gap".into(), "100".into());
+        let _ = a.update(Message::SuggestLayout);
+        assert!(
+            a.status
+                .ends_with("1 operation comes within the gap; see the warnings."),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn operations_that_cannot_be_generated_are_left_out_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let break_op = |a: &mut App, i: usize| {
+            a.doc.setups[0].operations[i].tool = "gone".into();
+        };
+        // The drilling cannot, so neither can what follows it, which needs its stock.
+        let mut a = planning_app(&dir);
+        break_op(&mut a, 3);
+        let vise = first_of(&a, "Vise");
+        let plans = setup_plans(&a, 0);
+        assert_eq!(plans.len(), 3);
+        let refs: Vec<&crate::simulation::Plan> = plans.iter().collect();
+        let holder = a.doc.holder(&vise).unwrap().clone();
+        let (axis_y, grip) = crate::holding::suggest_vise(plans[0].stock, &holder, &refs, 2.);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let p = &a.doc.setup().p;
+        assert_eq!(
+            [get(p, "vise_axis"), get(p, "vise_grip")],
+            [if axis_y { "Y" } else { "X" }, grip.to_string().as_str()]
+        );
+        assert!(
+            a.status.ends_with(
+                " 3 operations were not considered because they could not be generated."
+            ),
+            "{}",
+            a.status
+        );
+        // Only the last operation: one is left out.
+        let mut a = planning_app(&dir);
+        break_op(&mut a, 5);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert!(
+            a.status
+                .ends_with(" 1 operation was not considered because it could not be generated."),
+            "{}",
+            a.status
+        );
+        assert!(
+            a.status.starts_with("Suggested: vise jaws on ±Y, grip "),
+            "{}",
+            a.status
+        );
+        // The same operation disabled is not one that was left out.
+        a.doc.setups[0].operations[5].enabled = false;
+        let _ = a.update(Message::SuggestLayout);
+        assert!(!a.status.contains("not considered"), "{}", a.status);
+        // None generates: the stock alone decides, and the status says so.
+        let mut a = planning_app(&dir);
+        break_op(&mut a, 0);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(
+            a.status,
+            format!(
+                "Suggested: vise jaws on ±Y, grip 8 mm. {STOCK_ONLY} 6 operations were not considered because they could not be generated."
+            )
+        );
+    }
+    #[test]
+    fn suggest_layout_looks_at_the_active_setups_own_toolpaths() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, mesh) = crate::post::fixture::flipped_after(3);
+        doc.adopt_holders();
+        let mut a = planning_app(&dir);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        // Setup 1 only faces the flipped part high above the jaws; setup 0 also contours it beside them.
+        for (si, clear) in [(1, true), (0, false)] {
+            let _ = a.update(Message::SelectSetup(si));
+            let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+            let plans = setup_plans(&a, si);
+            let refs: Vec<&crate::simulation::Plan> = plans.iter().collect();
+            let holder = a
+                .doc
+                .holder(get(&a.doc.setup().p, "holder"))
+                .unwrap()
+                .clone();
+            let (axis_y, grip) = crate::holding::suggest_vise(plans[0].stock, &holder, &refs, 2.);
+            let p = &a.doc.setup().p;
+            assert_eq!(get(p, "vise_axis"), if axis_y { "Y" } else { "X" });
+            assert_eq!(get(p, "vise_grip"), grip.to_string());
+            assert_eq!(
+                a.status.ends_with("Every operation is clear of them."),
+                clear,
+                "setup {si}: {}",
+                a.status
+            );
+        }
+    }
+    #[test]
+    fn without_a_stock_nothing_is_suggested_or_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        // No part and a stock sized from it: the stock cannot be told.
+        a.doc.sample_model = false;
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let none = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.";
+        assert_eq!(a.status, none);
+        assert!(!a.doc.setup().p.contains_key("vise_axis"));
+        assert!(!a.doc.setup().p.contains_key("vise_offset"));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(a.status, none);
+        assert!(!a.doc.setup().p.contains_key("clamps"));
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(a.status, none);
+        // A box of the setup's own needs no part: 100 x 60 fits both ways, and the narrower is across Y.
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "100"),
+                ("stock_y", "60"),
+                ("stock_z", "30"),
+                ("holding", "Vise"),
+            ],
+        );
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "Y");
+        assert_eq!(
+            a.status,
+            format!("Suggested: vise jaws on ±Y, grip 8 mm. {STOCK_ONLY}")
+        );
+    }
     #[test]
     fn clamp_positions_need_a_setup() {
         let dir = tempfile::tempdir().unwrap();
@@ -2188,6 +2562,12 @@ mod tests {
         assert!(crate::ui::holding_lines(&a).is_empty());
         let _ = a.view();
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        // The suggestion puts the jaws on the Y sides, the only ones the vise opens wide enough for.
+        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "Y");
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        let _ = a.view();
+        // The jaws facing the X sides see 140 mm.
+        let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "X".into()));
         assert_eq!(
             crate::ui::holding_lines(&a),
             ["The stock is 140 mm across the jaws; this vise opens to 120 mm."]
@@ -2215,11 +2595,10 @@ mod tests {
         let vise = crate::holding::starters().remove(0);
         let id = vise.id.clone();
         a.doc.workholding.push(vise);
+        // Choosing another entry places the jaws again, replacing the offset that was no number.
         edit_setup(&mut a, &[("holder", &id)]);
-        assert_eq!(
-            crate::ui::holding_lines(&a),
-            ["The vise offset must be a number."]
-        );
+        assert_eq!(get(&a.doc.setup().p, "vise_offset"), "0");
+        assert!(crate::ui::holding_lines(&a).is_empty());
     }
     #[test]
     fn the_workholding_page_and_the_setup_editor_build_in_each_state() {

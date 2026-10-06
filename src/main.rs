@@ -136,6 +136,8 @@ pub enum Message {
     DeleteHolder(String),
     /// The text of the clamp positions field of the active setup.
     SetClamps(String),
+    /// Places the active setup's vise jaws or clamps away from its toolpaths.
+    SuggestLayout,
     SetOpTool(String),
     RestSource(String),
     StockSource(String),
@@ -720,6 +722,114 @@ impl App {
             .active_setup_mut()
             .and_then(|s| selected.and_then(|i| s.operations.get_mut(i)))
     }
+    /// Places the active setup's vise jaws or clamps where its generated
+    /// toolpaths stay clear of them, and says how the operations fare. The
+    /// setup's operations up to its last enabled one are generated as
+    /// Generate all does; those that cannot be are left out. Toolpaths are
+    /// never changed. Without toolpaths the stock alone decides; without a
+    /// stock nothing is written.
+    fn suggest_layout(&mut self) {
+        let si = self.doc.index();
+        let setup = self.doc.setup();
+        let (kind, vise) = match get(&setup.p, "holding") {
+            "Vise" => ("vise", true),
+            "Clamps" => ("clamp", false),
+            _ => {
+                self.status = "Choose a vise or clamps for this setup first.".into();
+                return;
+            }
+        };
+        let gap = match holding::gap(setup) {
+            Ok(gap) => gap,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let id = get(&setup.p, "holder").to_string();
+        let Some(holder) = self.doc.holder(&id).cloned() else {
+            self.status = if id.is_empty() {
+                format!("Choose a {kind} from the library first.")
+            } else {
+                holding::DELETED.into()
+            };
+            return;
+        };
+        let probe = if vise {
+            holding::Layout::Vise {
+                holder: id.clone(),
+                axis_y: false,
+                offset: 0.,
+                grip: 1.,
+                gap,
+            }
+        } else {
+            holding::Layout::Clamps {
+                holder: id.clone(),
+                clamps: vec![],
+                gap,
+            }
+        };
+        if let Some(refused) = holding::refusal(&probe, &holder) {
+            self.status = refused;
+            return;
+        }
+        let (mut plans, mut failed) = (vec![], 0);
+        let last = self.doc.setups[si]
+            .operations
+            .iter()
+            .rposition(|o| o.enabled);
+        if let (Some(mesh), Some(last)) = (
+            self.imported_mesh.as_ref().filter(|_| !self.is_sample()),
+            last,
+        ) {
+            simulation::sequence(&self.doc, mesh, Some((si, last)), |s, _, result| {
+                if s == si {
+                    match result {
+                        Ok(sim) => plans.push(sim.plan),
+                        Err(_) => failed += 1,
+                    }
+                }
+            });
+        }
+        let Some(stock) = plans
+            .first()
+            .map(|plan| plan.stock)
+            .or_else(|| self.doc.setup_stock(si, self.part_mesh()))
+        else {
+            self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
+            return;
+        };
+        let refs: Vec<&simulation::Plan> = plans.iter().collect();
+        let layout = if vise {
+            let (axis_y, grip) = holding::suggest_vise(stock, &holder, &refs, gap);
+            holding::Layout::Vise {
+                holder: id,
+                axis_y,
+                offset: 0.,
+                grip,
+                gap,
+            }
+        } else {
+            holding::Layout::Clamps {
+                holder: id,
+                clamps: holding::suggest_clamps(stock, &holder, &refs, gap),
+                gap,
+            }
+        };
+        let boxes = holding::boxes(&layout, &holder, stock).unwrap_or_default();
+        let clashing = holding::clashes(&refs, &boxes, gap);
+        let message = holding::summary(&layout, refs.len(), clashing, failed);
+        let p = &mut self.doc.setups[si].p;
+        for (key, value) in holding::placement(&layout) {
+            p.insert(key.into(), value);
+        }
+        if !vise {
+            self.clamps_draft = None;
+        }
+        self.touch();
+        self.status = message;
+    }
     fn touch(&mut self) {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -1247,6 +1357,7 @@ impl App {
                     | Message::Flip(_)
                     | Message::StockSource(_)
                     | Message::SetClamps(_)
+                    | Message::SuggestLayout
                     | Message::Plan
             )
         {
@@ -1392,11 +1503,25 @@ impl App {
                     if matches!(k, "holding" | "holder" | "vise_axis") && shown == v {
                         return Task::none();
                     }
+                    let holder = get(&self.doc.setup().p, "holder").to_string();
                     self.doc.setup_mut().p.insert(k.into(), v);
                     if matches!(k, "holding" | "holder") {
                         self.doc.settle_holding(self.doc.index());
                     }
-                    self.touch()
+                    self.touch();
+                    // Only the first Vise or Clamps and a different library
+                    // entry place the jaws or clamps; later edits are kept.
+                    let p = &self.doc.setup().p;
+                    let placed = |key| !get(p, key).trim().is_empty();
+                    let suggest = match (k, get(p, "holding")) {
+                        ("holding", "Vise") => !placed("vise_axis"),
+                        ("holding", "Clamps") => !placed("clamps"),
+                        ("holder", "Vise" | "Clamps") => get(p, "holder") != holder,
+                        _ => false,
+                    };
+                    if suggest {
+                        self.suggest_layout();
+                    }
                 }
                 Target::Machine => {
                     self.machine_draft.p.insert(k.into(), v.clone());
@@ -1939,6 +2064,7 @@ impl App {
                     }
                 }
             }
+            Message::SuggestLayout => self.suggest_layout(),
             Message::SetClamps(text) => match holding::check_clamps(self.doc.setup(), &text) {
                 Ok(()) => {
                     self.clamps_draft = None;
