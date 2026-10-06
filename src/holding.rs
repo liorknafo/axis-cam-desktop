@@ -140,31 +140,40 @@ pub fn clamps_text(clamps: &[(Side, f32)]) -> String {
         .collect::<Vec<_>>()
         .join(";")
 }
+/// A number typed into a field: surrounding spaces are ignored.
+fn number(text: &str) -> Option<f32> {
+    text.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+}
 pub fn layout(setup: &Setup) -> Result<Layout, String> {
     let p = &setup.p;
-    let gap = match get(p, "holding_gap").trim() {
-        "" => 2.,
-        _ => num(p, "holding_gap")
+    let gap = || match get(p, "holding_gap").trim() {
+        "" => Ok(2.),
+        text => number(text)
             .filter(|g| *g >= 0.)
-            .ok_or("The clearance gap must be 0 or more.")?,
+            .ok_or("The clearance gap must be 0 or more."),
     };
     let holder = get(p, "holder").to_string();
     match get(p, "holding") {
         "" | "None" => Ok(Layout::None),
         "Vise" => {
-            let grip = num(p, "vise_grip")
+            let grip = number(get(p, "vise_grip"))
                 .filter(|g| *g > 0.)
                 .ok_or("The vise grip must be a positive number.")?;
             let offset = match get(p, "vise_offset").trim() {
                 "" => 0.,
-                _ => num(p, "vise_offset").ok_or("The vise offset must be a number.")?,
+                text => number(text).ok_or("The vise offset must be a number.")?,
+            };
+            let axis_y = match get(p, "vise_axis").trim() {
+                "" | "X" => false,
+                "Y" => true,
+                _ => return Err("The vise axis must be X or Y.".into()),
             };
             Ok(Layout::Vise {
                 holder,
-                axis_y: get(p, "vise_axis") == "Y",
+                axis_y,
                 offset,
                 grip,
-                gap,
+                gap: gap()?,
             })
         }
         "Clamps" => {
@@ -174,12 +183,7 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
                     .split_once(':')
                     .ok_or("Write each clamp as side:offset, for example -X:0.")?;
                 let side = Side::parse(side).ok_or("A clamp side must be -X, +X, -Y or +Y.")?;
-                let offset = offset
-                    .trim()
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|v| v.is_finite())
-                    .ok_or("A clamp offset must be a number.")?;
+                let offset = number(offset).ok_or("A clamp offset must be a number.")?;
                 clamps.push((side, offset));
             }
             if clamps.is_empty() || clamps.len() > MAX_CLAMPS {
@@ -188,7 +192,7 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
             Ok(Layout::Clamps {
                 holder,
                 clamps,
-                gap,
+                gap: gap()?,
             })
         }
         other => Err(format!("\"{other}\" is not a workholding choice.")),
@@ -200,14 +204,36 @@ pub struct HoldBox {
     pub bounds: Bounds,
 }
 /// The jaws or clamps of `layout`, in the frame of `stock` (the setup's
-/// starting stock box). Without the clearance gap.
-pub fn boxes(layout: &Layout, holder: &Holder, stock: Bounds) -> Vec<HoldBox> {
+/// starting stock box). Without the clearance gap. Refuses a holder of the
+/// other kind or one whose dimensions are not usable.
+pub fn boxes(layout: &Layout, holder: &Holder, stock: Bounds) -> Result<Vec<HoldBox>, String> {
+    let want = match layout {
+        Layout::None => None,
+        Layout::Vise { .. } => Some("Vise"),
+        Layout::Clamps { .. } => Some("Clamp"),
+    };
+    if let Some(want) = want {
+        if holder.kind() != want && KINDS.contains(&holder.kind()) {
+            return Err(format!(
+                "The chosen workholding entry is a {}, not a {}.",
+                holder.kind().to_lowercase(),
+                want.to_lowercase()
+            ));
+        }
+        let issues = holder.issues();
+        if !issues.is_empty() {
+            return Err(format!(
+                "The chosen workholding entry needs fixing: {}",
+                issues.join(" ")
+            ));
+        }
+    }
     let n = |k| num(&holder.p, k).unwrap_or(0.);
     let centre = [
         (stock.min[0] + stock.max[0]) / 2.,
         (stock.min[1] + stock.max[1]) / 2.,
     ];
-    match layout {
+    Ok(match layout {
         Layout::None => vec![],
         Layout::Vise {
             axis_y,
@@ -268,64 +294,128 @@ pub fn boxes(layout: &Layout, holder: &Holder, stock: Bounds) -> Vec<HoldBox> {
                 })
                 .collect()
         }
-    }
+    })
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub label: String,
     /// "tool" (cutter and shank, tip to stickout) or "holder" (above the stickout).
     pub part: &'static str,
+    /// The tip where the move first comes within reach of the box: where it
+    /// enters the box's footprint, or its closest point if it never does.
     pub at: [f32; 3],
 }
-/// Distance in XY from `p` to the rectangle of `b`.
-fn xy_distance(b: &Bounds, p: [f32; 3]) -> f32 {
-    let dx = (b.min[0] - p[0]).max(0.).max(p[0] - b.max[0]);
-    let dy = (b.min[1] - p[1]).max(0.).max(p[1] - b.max[1]);
-    dx.hypot(dy)
+/// The parameters in 0..=1 at which `a + (b - a) t` lies within `lo..=hi`.
+fn within(a: f64, b: f64, lo: f64, hi: f64) -> Option<(f64, f64)> {
+    let d = b - a;
+    let (t0, t1) = if d == 0. {
+        if !(lo..=hi).contains(&a) {
+            return None;
+        }
+        (0., 1.)
+    } else {
+        let (x, y) = ((lo - a) / d, (hi - a) / d);
+        (x.min(y).max(0.), x.max(y).min(1.))
+    };
+    (t0 <= t1).then_some((t0, t1))
 }
-/// Moves of `plan` whose tool or holder comes within `gap` of a box. The
-/// tool is a vertical cylinder of the cutter radius from the tip to the tip
-/// plus the stickout, the holder one of the holder radius from there
-/// upward. Moves are sampled every 1 mm (at least both ends, at most 2 000
-/// samples); one hit per box and part.
-pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
-    let mut out: Vec<Hit> = vec![];
-    for m in &plan.moves {
-        let length = (0..3)
-            .map(|k| (m.to[k] - m.from[k]).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        let steps = (length.ceil() as usize).clamp(1, 2000);
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let tip: [f32; 3] = std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t);
-            for b in boxes {
-                let parts = [
-                    ("tool", plan.radius, tip[2], tip[2] + plan.tool_length),
-                    (
-                        "holder",
-                        plan.holder_radius,
-                        tip[2] + plan.tool_length,
-                        f32::INFINITY,
-                    ),
-                ];
-                for (part, radius, low, high) in parts {
-                    let overlaps = low <= b.bounds.max[2] + gap && high >= b.bounds.min[2] - gap;
-                    if overlaps
-                        && xy_distance(&b.bounds, tip) <= radius + gap
-                        && !out.iter().any(|h| h.label == b.label && h.part == part)
-                    {
-                        out.push(Hit {
-                            label: b.label.clone(),
-                            part,
-                            at: tip,
-                        });
-                    }
-                }
+/// The least XY distance between the segment `p`-`q` and the rectangle of
+/// `b`, and where along the segment (0..=1) it is first reached. The
+/// distance is 0 where the segment touches the rectangle, otherwise it is
+/// found between an end of the segment and the rectangle or between a
+/// corner of the rectangle and the segment.
+fn xy_closest(b: &Bounds, p: [f64; 2], q: [f64; 2]) -> (f64, f64) {
+    let (lo, hi) = (b.min.map(f64::from), b.max.map(f64::from));
+    let crossing = within(p[0], q[0], lo[0], hi[0])
+        .zip(within(p[1], q[1], lo[1], hi[1]))
+        .map(|(x, y)| (x.0.max(y.0), x.1.min(y.1)))
+        .filter(|(from, to)| from <= to);
+    if let Some((from, _)) = crossing {
+        return (0., from);
+    }
+    let outside = |c: [f64; 2]| {
+        let dx = (lo[0] - c[0]).max(0.).max(c[0] - hi[0]);
+        let dy = (lo[1] - c[1]).max(0.).max(c[1] - hi[1]);
+        dx.hypot(dy)
+    };
+    let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+    let length2 = dx * dx + dy * dy;
+    let corners = [
+        [lo[0], lo[1]],
+        [lo[0], hi[1]],
+        [hi[0], lo[1]],
+        [hi[0], hi[1]],
+    ]
+    .map(|c| {
+        let s = match length2 {
+            0. => 0.,
+            _ => (((c[0] - p[0]) * dx + (c[1] - p[1]) * dy) / length2).clamp(0., 1.),
+        };
+        ((c[0] - (p[0] + dx * s)).hypot(c[1] - (p[1] + dy * s)), s)
+    });
+    [(outside(p), 0.), (outside(q), 1.)]
+        .into_iter()
+        .chain(corners)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .unwrap_or((f64::INFINITY, 0.))
+}
+/// Straight `segments` (tip positions, start to end) whose tool or holder
+/// comes within `gap` of a box. The tool is a vertical cylinder of the
+/// cutter `radius` from the tip up by `stickout`, the holder one of
+/// `holder_radius` from there upward. Exact: for each segment the stretch
+/// where the part's height overlaps the box (grown by `gap`) is found, and
+/// the XY distance from that stretch to the box's footprint is compared with
+/// the radius plus `gap`. One hit per box and part, the first segment's.
+pub fn hits_segments(
+    segments: &[([f32; 3], [f32; 3])],
+    radius: f32,
+    stickout: f32,
+    holder_radius: f32,
+    boxes: &[HoldBox],
+    gap: f32,
+) -> Vec<Hit> {
+    let parts = [
+        ("tool", radius, 0., stickout),
+        ("holder", holder_radius, stickout, f32::INFINITY),
+    ];
+    let mut out = vec![];
+    for b in boxes {
+        for (part, part_radius, low, high) in parts {
+            let reach = f64::from(part_radius) + f64::from(gap);
+            let z = (
+                f64::from(b.bounds.min[2] - gap - high),
+                f64::from(b.bounds.max[2] + gap - low),
+            );
+            let found = segments.iter().find_map(|&(from, to)| {
+                let (from, to) = (from.map(f64::from), to.map(f64::from));
+                let tip = |t: f64| [0, 1, 2].map(|k| from[k] + (to[k] - from[k]) * t);
+                let (t0, t1) = within(from[2], to[2], z.0, z.1)?;
+                let (p, q) = (tip(t0), tip(t1));
+                let (distance, s) = xy_closest(&b.bounds, [p[0], p[1]], [q[0], q[1]]);
+                (distance <= reach).then(|| tip(t0 + (t1 - t0) * s).map(|v| v as f32))
+            });
+            if let Some(at) = found {
+                out.push(Hit {
+                    label: b.label.clone(),
+                    part,
+                    at,
+                });
             }
         }
     }
     out
+}
+/// `hits_segments` for the moves of `plan`.
+pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
+    let moves: Vec<_> = plan.moves.iter().map(|m| (m.from, m.to)).collect();
+    hits_segments(
+        &moves,
+        plan.radius,
+        plan.tool_length,
+        plan.holder_radius,
+        boxes,
+        gap,
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -471,7 +561,8 @@ mod tests {
             },
             &vise(),
             stock(),
-        );
+        )
+        .unwrap();
         assert_eq!(jaws.len(), 2);
         let front = jaws.iter().find(|b| b.label.contains("-Y")).unwrap();
         assert_eq!(front.bounds.max[1], -30.);
@@ -488,11 +579,12 @@ mod tests {
             },
             &clamp(),
             stock(),
-        );
+        )
+        .unwrap();
         assert_eq!(c[0].bounds.min, [-98., 0., 40.]);
         assert_eq!(c[0].bounds.max, [-38., 20., 65.]);
         assert!(c[0].label.contains("-X"));
-        assert!(boxes(&Layout::None, &vise(), stock()).is_empty());
+        assert!(boxes(&Layout::None, &vise(), stock()).unwrap().is_empty());
     }
     #[test]
     fn the_check_finds_tool_and_holder_hits_and_respects_the_gap() {
@@ -504,7 +596,8 @@ mod tests {
             },
             &clamp(),
             stock(),
-        );
+        )
+        .unwrap();
         // Clamp box: X -98..-38, Y -10..10, Z 40..65.
         // A Ø6 tool feeding at Z 41 across X -60..-30 at Y 0 cuts into the clamp.
         let into = hits(&plan(3., &[([-60., 0., 41.], [-30., 0., 41.])]), &c, 2.);
@@ -533,5 +626,288 @@ mod tests {
         // One hit per box and part, not per sample.
         let long = hits(&plan(3., &[([-90., 0., 41.], [-40., 0., 41.])]), &c, 2.);
         assert_eq!(long.len(), 1);
+    }
+    fn vise_layout(axis_y: bool, offset: f32, gap: f32) -> Layout {
+        Layout::Vise {
+            holder: String::new(),
+            axis_y,
+            offset,
+            grip: 8.,
+            gap,
+        }
+    }
+    fn clamp_layout(clamps: &[(Side, f32)]) -> Layout {
+        Layout::Clamps {
+            holder: String::new(),
+            clamps: clamps.to_vec(),
+            gap: 2.,
+        }
+    }
+    fn near(a: [f32; 3], b: [f32; 3]) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 1e-3)
+    }
+    #[test]
+    fn layouts_trim_numbers_check_the_axis_and_ignore_the_gap_without_workholding() {
+        assert_eq!(
+            layout(&setup(&[
+                ("holding", "Vise"),
+                ("holder", "v1"),
+                ("vise_offset", " 5"),
+                ("vise_grip", " 8 "),
+                ("holding_gap", " 3 ")
+            ]))
+            .unwrap(),
+            Layout::Vise {
+                holder: "v1".into(),
+                axis_y: false,
+                offset: 5.,
+                grip: 8.,
+                gap: 3.
+            }
+        );
+        assert_eq!(
+            layout(&setup(&[
+                ("holding", "Clamps"),
+                ("holder", "c1"),
+                ("clamps", " -X : 0 ; +Y: 4 "),
+                ("holding_gap", " 4")
+            ]))
+            .unwrap(),
+            Layout::Clamps {
+                holder: "c1".into(),
+                clamps: vec![(Side::MinusX, 0.), (Side::PlusY, 4.)],
+                gap: 4.
+            }
+        );
+        let axis = |a: &str| {
+            layout(&setup(&[
+                ("holding", "Vise"),
+                ("vise_grip", "8"),
+                ("vise_axis", a),
+            ]))
+        };
+        assert!(matches!(axis(""), Ok(Layout::Vise { axis_y: false, .. })));
+        assert!(matches!(axis("X"), Ok(Layout::Vise { axis_y: false, .. })));
+        assert!(matches!(axis("Y"), Ok(Layout::Vise { axis_y: true, .. })));
+        assert!(axis("Z").is_err());
+        assert!(axis("XY").is_err());
+        assert_eq!(
+            layout(&setup(&[("holding_gap", "abc")])).unwrap(),
+            Layout::None
+        );
+        assert_eq!(
+            layout(&setup(&[("holding", "None"), ("holding_gap", "-3")])).unwrap(),
+            Layout::None
+        );
+        assert!(
+            layout(&setup(&[
+                ("holding", "Vise"),
+                ("vise_grip", "8"),
+                ("holding_gap", "abc")
+            ]))
+            .is_err()
+        );
+        assert!(
+            layout(&setup(&[
+                ("holding", "Clamps"),
+                ("clamps", "-X:0"),
+                ("holding_gap", "-1")
+            ]))
+            .is_err()
+        );
+    }
+    #[test]
+    fn boxes_refuse_a_holder_of_the_wrong_kind_or_with_issues() {
+        let jaws = vise_layout(true, 0., 2.);
+        let clamps = clamp_layout(&[(Side::MinusX, 0.)]);
+        assert_eq!(
+            boxes(&jaws, &clamp(), stock()).unwrap_err(),
+            "The chosen workholding entry is a clamp, not a vise."
+        );
+        assert_eq!(
+            boxes(&clamps, &vise(), stock()).unwrap_err(),
+            "The chosen workholding entry is a vise, not a clamp."
+        );
+        let mut unfinished = vise();
+        unfinished.p.remove("jaw_thickness");
+        assert!(
+            boxes(&jaws, &unfinished, stock())
+                .unwrap_err()
+                .contains("jaw thickness")
+        );
+        assert!(boxes(&clamps, &Holder::new("Clamp", "Empty"), stock()).is_err());
+        let mut odd = vise();
+        odd.p.insert("kind".into(), "Table".into());
+        assert!(boxes(&jaws, &odd, stock()).is_err());
+        assert!(
+            boxes(&Layout::None, &Holder::new("Clamp", "x"), stock())
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn boxes_follow_a_stock_away_from_the_origin() {
+        let stock = Bounds {
+            min: [900., 200., 100.],
+            max: [1100., 400., 140.],
+        };
+        let of = |layout: &Layout, holder: &Holder| -> Vec<(String, [f32; 3], [f32; 3])> {
+            boxes(layout, holder, stock)
+                .unwrap()
+                .into_iter()
+                .map(|b| (b.label, b.bounds.min, b.bounds.max))
+                .collect()
+        };
+        // Vise along X (jaws on -X and +X): centre Y 300 + offset 5, jaw 100 wide and 20 thick, Z 100 - 100 up to 100 + grip 8.
+        assert_eq!(
+            of(&vise_layout(false, 5., 2.), &vise()),
+            [
+                (
+                    "vise jaw on -X".to_string(),
+                    [880., 255., 0.],
+                    [900., 355., 108.]
+                ),
+                (
+                    "vise jaw on +X".to_string(),
+                    [1100., 255., 0.],
+                    [1120., 355., 108.]
+                ),
+            ]
+        );
+        // Vise along Y: centre X 1000 + 5.
+        assert_eq!(
+            of(&vise_layout(true, 5., 2.), &vise()),
+            [
+                (
+                    "vise jaw on -Y".to_string(),
+                    [955., 180., 0.],
+                    [1055., 200., 108.]
+                ),
+                (
+                    "vise jaw on +Y".to_string(),
+                    [955., 400., 0.],
+                    [1055., 420., 108.]
+                ),
+            ]
+        );
+        // Clamps (60 long, 20 wide, 25 high, bite 12) on all four sides at offset 0, on the stock top (Z 140).
+        let all = [
+            (Side::MinusX, 0.),
+            (Side::PlusX, 0.),
+            (Side::MinusY, 0.),
+            (Side::PlusY, 0.),
+        ];
+        assert_eq!(
+            of(&clamp_layout(&all), &clamp()),
+            [
+                (
+                    "clamp on -X at 0".to_string(),
+                    [852., 290., 140.],
+                    [912., 310., 165.]
+                ),
+                (
+                    "clamp on +X at 0".to_string(),
+                    [1088., 290., 140.],
+                    [1148., 310., 165.]
+                ),
+                (
+                    "clamp on -Y at 0".to_string(),
+                    [990., 152., 140.],
+                    [1010., 212., 165.]
+                ),
+                (
+                    "clamp on +Y at 0".to_string(),
+                    [990., 388., 140.],
+                    [1010., 448., 165.]
+                ),
+            ]
+        );
+    }
+    #[test]
+    fn a_move_crossing_a_box_hits_even_when_both_ends_are_clear() {
+        let c = boxes(&clamp_layout(&[(Side::MinusX, 0.)]), &clamp(), stock()).unwrap();
+        // X -120 and -20 are 22 and 18 mm from the clamp (X -98..-38), well outside Ø6 + gap 2.
+        let across = hits(&plan(3., &[([-120., 0., 41.], [-20., 0., 41.])]), &c, 2.);
+        assert_eq!(across.len(), 1);
+        assert_eq!(across[0].part, "tool");
+        // The hit is where the tool first comes within reach: the clamp's near face at X -98 (the path crosses the box).
+        assert!(near(across[0].at, [-98., 0., 41.]), "{:?}", across[0].at);
+    }
+    #[test]
+    fn a_long_move_through_a_thin_clamp_is_not_missed() {
+        let mut thin = clamp();
+        thin.p.insert("width".into(), "1".into());
+        let c = boxes(&clamp_layout(&[(Side::MinusX, 0.)]), &thin, stock()).unwrap();
+        // Clamp Y -0.5..0.5; a Ø0.4 tool with gap 0 reaches Y +-0.7. This 3 000 mm move along Y has 1.5 mm between the
+        // old samples (-0.75 and 0.75), which both fall outside.
+        let through = hits(
+            &plan(0.2, &[([-60., -1500.75, 41.], [-60., 1499.25, 41.])]),
+            &c,
+            0.,
+        );
+        assert_eq!(through.len(), 1);
+        assert!(
+            near(through[0].at, [-60., -0.5, 41.]),
+            "{:?}",
+            through[0].at
+        );
+        // The same move 1 mm to the side of the clamp's X range misses it.
+        assert!(
+            hits(
+                &plan(0.2, &[([-30., -1500.75, 41.], [-30., 1499.25, 41.])]),
+                &c,
+                0.
+            )
+            .is_empty()
+        );
+    }
+    #[test]
+    fn a_diagonal_clip_of_a_jaw_corner_hits_only_within_reach() {
+        let jaws = boxes(&vise_layout(true, 0., 0.), &vise(), stock()).unwrap();
+        // The -Y jaw is X -50..50, Y -50..-30, Z -100..8; its corner (50, -30). A tool tip at Z 5 (Ø6, gap 0)
+        // moving along the diagonal (1, -1), 60 mm long, whose nearest point to the corner is `d` mm out along
+        // (1, 1) and lies half a millimetre from the nearest 1 mm sample on either side.
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        let diagonal = |d: f32| {
+            let c = [50. + d * k, -30. + d * k];
+            plan(
+                3.,
+                &[(
+                    [c[0] - 30.5 * k, c[1] + 30.5 * k, 5.],
+                    [c[0] + 29.5 * k, c[1] - 29.5 * k, 5.],
+                )],
+            )
+        };
+        let clip = hits(&diagonal(2.98), &jaws, 0.);
+        assert_eq!(clip.len(), 1);
+        assert_eq!(clip[0].part, "tool");
+        assert!(clip[0].label.contains("-Y"));
+        assert!(hits(&diagonal(3.08), &jaws, 0.).is_empty());
+    }
+    #[test]
+    fn slopes_and_plunges_are_checked_exactly() {
+        let c = boxes(&clamp_layout(&[(Side::MinusX, 0.)]), &clamp(), stock()).unwrap();
+        // Diving across the clamp: the tool is low enough while it is over the clamp.
+        let dive = hits(&plan(3., &[([-100., 0., 100.], [-20., 0., 41.])]), &c, 2.);
+        assert_eq!(dive.len(), 1);
+        assert_eq!(dive[0].part, "tool");
+        // The same dive from higher up gets low enough only after the tool has passed the clamp.
+        assert!(hits(&plan(3., &[([-100., 0., 300.], [-20., 0., 41.])]), &c, 2.).is_empty());
+        // A straight plunge into the clamp is a hit at the Z where the tool tip is 2 mm above its top (65).
+        let plunge = hits_segments(&[([-60., 0., 100.], [-60., 0., 41.])], 3., 30., 16., &c, 2.);
+        assert_eq!(plunge.len(), 1);
+        assert!(near(plunge[0].at, [-60., 0., 67.]), "{:?}", plunge[0].at);
+        // The same plunge beside the clamp is clear.
+        assert!(
+            hits_segments(
+                &[([-60., 40., 100.], [-60., 40., 0.])],
+                3.,
+                30.,
+                16.,
+                &c,
+                2.
+            )
+            .is_empty()
+        );
     }
 }
