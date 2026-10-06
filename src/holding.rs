@@ -122,14 +122,6 @@ impl Side {
     fn parse(s: &str) -> Option<Self> {
         Side::ALL.into_iter().find(|side| side.label() == s.trim())
     }
-    fn opposite(self) -> Self {
-        match self {
-            Side::MinusX => Side::PlusX,
-            Side::PlusX => Side::MinusX,
-            Side::MinusY => Side::PlusY,
-            Side::PlusY => Side::MinusY,
-        }
-    }
 }
 /// A setup's modelled workholding, read from its parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -422,13 +414,44 @@ fn xy_closest(b: &Bounds, p: [f64; 2], q: [f64; 2]) -> (f64, f64) {
         .min_by(|x, y| x.0.total_cmp(&y.0))
         .unwrap_or((f64::INFINITY, 0.))
 }
-/// Straight `segments` (tip positions, start to end) whose tool or holder
-/// comes within `gap` of a box. The tool is a vertical cylinder of the
+/// The parts of a tool that can touch workholding: (name, radius, lowest and
+/// highest height above the tip). The tool is a vertical cylinder of the
 /// cutter `radius` from the tip up by `stickout`, the holder one of
-/// `holder_radius` from there upward. Exact: for each segment the stretch
-/// where the part's height overlaps the box (grown by `gap`) is found, and
-/// the XY distance from that stretch to the box's footprint is compared with
-/// the radius plus `gap`. One hit per box and part, the first segment's.
+/// `holder_radius` from there upward.
+fn parts(radius: f32, stickout: f32, holder_radius: f32) -> [(&'static str, f32, f32, f32); 2] {
+    [
+        ("tool", radius, 0., stickout),
+        ("holder", holder_radius, stickout, f32::INFINITY),
+    ]
+}
+/// For a tip moving straight from `from` to `to`, a part of a tool occupying
+/// heights `low..=high` above the tip and the box `b` grown by `gap`: the
+/// stretch of the move where the part's heights overlap the box, as the least
+/// XY distance from it to the box's footprint and the tip where that is first
+/// reached. None when the heights never overlap.
+fn closest(
+    b: &Bounds,
+    from: [f64; 3],
+    to: [f64; 3],
+    low: f32,
+    high: f32,
+    gap: f32,
+) -> Option<(f64, [f64; 3])> {
+    let z = (
+        f64::from(b.min[2] - gap - high),
+        f64::from(b.max[2] + gap - low),
+    );
+    let tip = |t: f64| [0, 1, 2].map(|k| from[k] + (to[k] - from[k]) * t);
+    let (t0, t1) = within(from[2], to[2], z.0, z.1)?;
+    let (p, q) = (tip(t0), tip(t1));
+    let (distance, s) = xy_closest(b, [p[0], p[1]], [q[0], q[1]]);
+    Some((distance, tip(t0 + (t1 - t0) * s)))
+}
+/// Straight `segments` (tip positions, start to end) whose tool or holder
+/// comes within `gap` of a box. Exact: for each segment the stretch where the
+/// part's height overlaps the box (grown by `gap`) is found, and the XY
+/// distance from that stretch to the box's footprint is compared with the
+/// radius plus `gap`. One hit per box and part, the first segment's.
 pub fn hits_segments(
     segments: &[([f32; 3], [f32; 3])],
     radius: f32,
@@ -437,25 +460,14 @@ pub fn hits_segments(
     boxes: &[HoldBox],
     gap: f32,
 ) -> Vec<Hit> {
-    let parts = [
-        ("tool", radius, 0., stickout),
-        ("holder", holder_radius, stickout, f32::INFINITY),
-    ];
     let mut out = vec![];
     for b in boxes {
-        for (part, part_radius, low, high) in parts {
+        for (part, part_radius, low, high) in parts(radius, stickout, holder_radius) {
             let reach = f64::from(part_radius) + f64::from(gap);
-            let z = (
-                f64::from(b.bounds.min[2] - gap - high),
-                f64::from(b.bounds.max[2] + gap - low),
-            );
             let found = segments.iter().find_map(|&(from, to)| {
                 let (from, to) = (from.map(f64::from), to.map(f64::from));
-                let tip = |t: f64| [0, 1, 2].map(|k| from[k] + (to[k] - from[k]) * t);
-                let (t0, t1) = within(from[2], to[2], z.0, z.1)?;
-                let (p, q) = (tip(t0), tip(t1));
-                let (distance, s) = xy_closest(&b.bounds, [p[0], p[1]], [q[0], q[1]]);
-                (distance <= reach).then(|| tip(t0 + (t1 - t0) * s).map(|v| v as f32))
+                let (distance, at) = closest(&b.bounds, from, to, low, high, gap)?;
+                (distance <= reach).then(|| at.map(|v| v as f32))
             });
             if let Some(at) = found {
                 out.push(Hit {
@@ -467,6 +479,25 @@ pub fn hits_segments(
         }
     }
     out
+}
+/// By how much the moves of `plan` keep clear of the box `b`: for each move
+/// and each part of the tool, the distance `hits_segments` finds (XY, from
+/// the stretch whose heights overlap the box grown by `gap`, to the box's
+/// footprint) less the part's radius and `gap`; the least of them. Positive
+/// exactly when there is no hit; infinite when no move reaches the box's
+/// heights.
+fn margin(plan: &Plan, b: &Bounds, gap: f32) -> f32 {
+    let mut least = f64::INFINITY;
+    for (_, radius, low, high) in parts(plan.radius, plan.tool_length, plan.holder_radius) {
+        let reach = f64::from(radius) + f64::from(gap);
+        for m in &plan.moves {
+            let (from, to) = (m.from.map(f64::from), m.to.map(f64::from));
+            if let Some((distance, _)) = closest(b, from, to, low, high, gap) {
+                least = least.min(distance - reach);
+            }
+        }
+    }
+    least as f32
 }
 /// `hits_segments` for the moves of `plan`.
 pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
@@ -482,45 +513,34 @@ pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
 }
 /// The least grip a suggested vise is reduced to, in mm.
 const MIN_GRIP: f32 = 3.;
-/// How far the cutter's edge stays from `footprint` (a box seen from above)
-/// along the stretches of the `plans`' moves whose tip is at or below `top`;
-/// infinite when no move is.
-fn clearance(plans: &[&Plan], footprint: &Bounds, top: f32) -> f32 {
-    let mut least = f32::INFINITY;
-    for plan in plans {
-        for m in &plan.moves {
-            let (from, to) = (m.from.map(f64::from), m.to.map(f64::from));
-            let Some((t0, t1)) = within(from[2], to[2], f64::NEG_INFINITY, f64::from(top)) else {
-                continue;
-            };
-            let tip = |t: f64| [0, 1].map(|k| from[k] + (to[k] - from[k]) * t);
-            let (distance, _) = xy_closest(footprint, tip(t0), tip(t1));
-            least = least.min(distance as f32 - plan.radius);
-        }
-    }
-    least
-}
+/// The most margin that counts when ranking clamp spots, in mm: spots clear
+/// by this much are equally good.
+const CLEAR_ENOUGH: f32 = 10.;
 /// The vise jaws' axis (true: jaws on the Y sides) and grip for the `plans`
 /// of a setup whose stock is `stock`, at offset 0. Each axis tries the
-/// holder's grip, then 1 mm less at a time down to 3 mm, for the first at
-/// which no move comes within `gap` of the jaws (`hits`); the axis clear at
-/// the larger grip wins.
-/// With neither clear the grip is 3 mm and the axis whose jaws are farther
-/// from the moves wins. Only the axes whose width across the jaws fits the
-/// vise's opening are tried, when one does. A tie goes to the axis the stock
-/// is narrower across.
+/// holder's grip, then 1 mm less at a time down to 3 mm (all in hundredths of
+/// a millimetre, as stored), for the first at which no move comes within
+/// `gap` of the jaws (`hits`); the axis clear at the larger grip wins. With
+/// neither clear the grip is 3 mm and the axis whose jaws keep the larger
+/// margin (`margin`: the cutter and the holder both counted) wins. Only the
+/// axes whose width across the jaws fits the vise's opening are tried, when
+/// one does. A tie goes to the axis the stock is narrower across.
 pub fn suggest_vise(stock: Bounds, holder: &Holder, plans: &[&Plan], gap: f32) -> (bool, f32) {
-    let start = num(&holder.p, "grip")
-        .filter(|g| *g > 0.)
-        .unwrap_or(MIN_GRIP);
-    // The grips to try: the holder's, then 1 mm less at a time while above 3 mm, then 3 mm itself.
-    let steps = ((start - MIN_GRIP).max(0.).ceil() as usize).saturating_add(1);
+    // Grips in hundredths of a millimetre, as the setup stores them: the holder's, then 1 mm less at a
+    // time while above 3 mm, then 3 mm itself. (The 0.05 forgives the f32 of a decimal such as 3.29.)
+    let holder_grip = num(&holder.p, "grip").filter(|g| *g > 0.);
+    let hundredths = (f64::from(holder_grip.unwrap_or(MIN_GRIP)) * 100. + 0.05)
+        .floor()
+        .max(1.);
+    let start = (hundredths / 100.) as f32;
+    let steps = (((hundredths - 300.) / 100.).max(0.).ceil() as usize).saturating_add(1);
     let grip_at = |k: usize| {
-        if k + 1 < steps {
-            start - k as f32
+        let hundredths = if k + 1 < steps {
+            hundredths - 100. * k as f64
         } else {
-            start.min(MIN_GRIP)
-        }
+            hundredths.min(300.)
+        };
+        (hundredths / 100.) as f32
     };
     let layout = |axis_y, grip| Layout::Vise {
         holder: String::new(),
@@ -560,7 +580,7 @@ pub fn suggest_vise(stock: Bounds, holder: &Holder, plans: &[&Plan], gap: f32) -
         let grip = grip_at(steps - 1);
         let nearest = jaws(axis_y, grip)
             .iter()
-            .map(|j| clearance(plans, &j.bounds, j.bounds.max[2] + gap))
+            .flat_map(|j| plans.iter().map(|plan| margin(plan, &j.bounds, gap)))
             .fold(f32::INFINITY, f32::min);
         (axis_y, grip, false, nearest)
     };
@@ -572,14 +592,15 @@ pub fn suggest_vise(stock: Bounds, holder: &Holder, plans: &[&Plan], gap: f32) -
         })
         .map_or((false, start), |(axis_y, grip, ..)| (axis_y, grip))
 }
-/// The clamps for the `plans` of a setup whose stock is `stock`: 4, or 2 when
-/// the stock is shorter than 3 clamp widths along both axes. The candidates
-/// are the middle and the quarter points of each side; a candidate's score is
-/// how far the cutter's edge stays from the clamp (grown by `gap`) over the
-/// moves whose tip is below the clamp's top plus `gap`, infinite for none.
-/// Greedy, one clamp per side: the best candidate, the best on the opposite
-/// side, then the best on the remaining sides and again the opposite one.
-/// Ties keep the middle. In the order of `Side::ALL`.
+/// The clamps for the `plans` of a setup whose stock is `stock`: one on each
+/// side, or on two opposite sides when the stock is shorter than 3 clamp
+/// widths along both axes. The candidates are the middle and the quarter
+/// points of each side; a candidate's score is its `margin` over the moves of
+/// all plans (the cutter and the holder both counted), at most
+/// `CLEAR_ENOUGH`, so that spots clear by that much tie and the middle wins.
+/// Each side takes its best candidate; for two clamps the pair of opposite
+/// sides (-X and +X, then -Y and +Y) whose worse clamp scores better is kept,
+/// the first on a tie. In the order of `Side::ALL`.
 pub fn suggest_clamps(
     stock: Bounds,
     holder: &Holder,
@@ -588,11 +609,6 @@ pub fn suggest_clamps(
 ) -> Vec<(Side, f32)> {
     let [x, y, _] = stock.dimensions();
     let width = num(&holder.p, "width").unwrap_or(0.);
-    let count = if x < 3. * width && y < 3. * width {
-        2
-    } else {
-        4
-    };
     let score = |side, offset| {
         let layout = Layout::Clamps {
             holder: String::new(),
@@ -600,53 +616,40 @@ pub fn suggest_clamps(
             gap,
         };
         let placed = boxes(&layout, holder, stock).unwrap_or_default();
-        placed.iter().fold(f32::INFINITY, |least, c| {
-            let b = c.bounds;
-            let grown = Bounds {
-                min: [b.min[0] - gap, b.min[1] - gap, b.min[2]],
-                max: [b.max[0] + gap, b.max[1] + gap, b.max[2]],
-            };
-            least.min(clearance(plans, &grown, b.max[2] + gap))
-        })
+        placed
+            .iter()
+            .flat_map(|c| plans.iter().map(|plan| margin(plan, &c.bounds, gap)))
+            .fold(CLEAR_ENOUGH, f32::min)
     };
-    let candidates: Vec<(Side, f32, f32)> = Side::ALL
-        .into_iter()
-        .flat_map(|side| {
-            let length = if matches!(side, Side::MinusX | Side::PlusX) {
-                y
-            } else {
-                x
-            };
-            let quarter = (length / 4. * 100.).round() / 100.;
-            [0., -quarter, quarter]
-                .into_iter()
-                .map(move |offset| (side, offset))
-        })
-        .map(|(side, offset)| (side, offset, score(side, offset)))
-        .collect();
-    let mut chosen: Vec<(Side, f32)> = vec![];
-    while chosen.len() < count {
-        let allowed: Vec<Side> = match chosen.last() {
-            Some(&(last, _)) if chosen.len() % 2 == 1 => vec![last.opposite()],
-            _ => Side::ALL
-                .into_iter()
-                .filter(|side| !chosen.iter().any(|c| c.0 == *side))
-                .collect(),
+    let best = Side::ALL.map(|side| {
+        let length = if matches!(side, Side::MinusX | Side::PlusX) {
+            y
+        } else {
+            x
         };
-        let best = candidates.iter().filter(|c| allowed.contains(&c.0)).fold(
-            None::<&(Side, f32, f32)>,
-            |best, c| match best {
+        let quarter = (length / 4. * 100.).round() / 100.;
+        [0., -quarter, quarter]
+            .into_iter()
+            .map(|offset| (side, offset, score(side, offset)))
+            .fold(None::<(Side, f32, f32)>, |best, c| match best {
                 Some(b) if b.2 >= c.2 => Some(b),
                 _ => Some(c),
-            },
-        );
-        let Some(&(side, offset, _)) = best else {
-            break;
-        };
-        chosen.push((side, offset));
-    }
-    chosen.sort_by_key(|c| Side::ALL.iter().position(|side| *side == c.0));
-    chosen
+            })
+            .unwrap_or((side, 0., CLEAR_ENOUGH))
+    });
+    let chosen = if x < 3. * width && y < 3. * width {
+        let worst =
+            |pair: &[(Side, f32, f32)]| pair.iter().map(|c| c.2).fold(f32::INFINITY, f32::min);
+        let (x_sides, y_sides) = best.split_at(2);
+        if worst(y_sides) > worst(x_sides) {
+            y_sides
+        } else {
+            x_sides
+        }
+    } else {
+        &best[..]
+    };
+    chosen.iter().map(|c| (c.0, c.1)).collect()
 }
 /// How many of `plans` have a move that comes within `gap` of `boxes`.
 pub fn clashes(plans: &[&Plan], boxes: &[HoldBox], gap: f32) -> usize {
@@ -695,8 +698,15 @@ fn describe(layout: &Layout) -> String {
 /// The status line for a suggested `layout`: where it puts the jaws or
 /// clamps, how many of the `considered` operations come within the gap
 /// (`clashing`) and how many `left_out` could not be generated. Without
-/// operations only the stock decided, and it says so.
-pub fn summary(layout: &Layout, considered: usize, clashing: usize, left_out: usize) -> String {
+/// operations only the stock decided, and it says so. An `opening` issue, a
+/// stock too wide for the vise on either axis, is added.
+pub fn summary(
+    layout: &Layout,
+    considered: usize,
+    clashing: usize,
+    left_out: usize,
+    opening: Option<&str>,
+) -> String {
     let verdict = match (considered, clashing, left_out) {
         (0, ..) => "No toolpaths were available to check, so only the stock was considered.".into(),
         (_, 0, 0) => "Every operation is clear of them.".into(),
@@ -709,7 +719,11 @@ pub fn summary(layout: &Layout, considered: usize, clashing: usize, left_out: us
         1 => " 1 operation was not considered because it could not be generated.".into(),
         n => format!(" {n} operations were not considered because they could not be generated."),
     };
-    format!("Suggested: {}. {verdict}{skipped}", describe(layout))
+    let opening = opening.map(|issue| format!(" {issue}")).unwrap_or_default();
+    format!(
+        "Suggested: {}. {verdict}{opening}{skipped}",
+        describe(layout)
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -1509,11 +1523,11 @@ mod tests {
             suggest_clamps(square([59.9, 59.9]), &clamp(), &[], 2.).len(),
             2
         );
-        // The two stay on opposite sides whatever the moves do; the -X one leaves its crossed middle.
+        // The two stay on opposite sides: the X pair, hit by a lead along X through the -X middle, is passed
+        // over for the Y pair.
         let lead = plan(2., &[([-80., 0., 21.], [-20., 0., 21.])]);
         let chosen = suggest_clamps(square([50., 50.]), &clamp(), &[&lead], 2.);
-        assert_eq!(sides_of(&chosen), [Side::MinusX, Side::PlusX]);
-        assert_eq!(chosen[0].1, -12.5);
+        assert_eq!(sides_of(&chosen), [Side::MinusY, Side::PlusY]);
     }
     #[test]
     fn the_clashes_are_counted_per_plan() {
@@ -1561,6 +1575,142 @@ mod tests {
         assert!(placement(&Layout::None).is_empty());
     }
     #[test]
+    fn clamps_count_the_holder_as_the_exact_check_does() {
+        // Ø6 tool, stickout 30, holder Ø32, gap 2. A short move at Z 20 beside the -X clamp's middle and two
+        // moves at Z 39 along the +-Y sides: the holder, from Z 50, reaches the clamps' Z 40..65.
+        let moves = plan(
+            3.,
+            &[
+                ([-20.2, 0., 20.], [-10., 0., 20.]),
+                ([-26., 20., 39.], [-26., 30., 39.]),
+                ([-26., -20., 39.], [-26., -30., 39.]),
+            ],
+        );
+        let middle = boxes(&clamp_layout(&[(Side::MinusX, 0.)]), &clamp(), stock()).unwrap();
+        let held = hits(&moves, &middle, 2.);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].part, "holder");
+        let chosen = suggest_clamps(stock(), &clamp(), &[&moves], 2.);
+        assert_eq!(sides_of(&chosen), Side::ALL);
+        assert_eq!(chosen[0].1.abs(), 15., "{chosen:?}");
+        let placed = boxes(&clamp_layout(&chosen), &clamp(), stock()).unwrap();
+        assert!(hits(&moves, &placed, 2.).is_empty(), "{chosen:?}");
+    }
+    #[test]
+    fn two_clamps_take_the_pair_of_sides_that_is_clearer() {
+        let small = Bounds {
+            min: [-25., -25., 0.],
+            max: [25., 25., 20.],
+        };
+        // A contour 2 mm inside the +X side: both X clamps are hit, the Y clamps are not.
+        let contour = plan(3., &[([23., -10., 19.], [23., 10., 19.])]);
+        let chosen = suggest_clamps(small, &clamp(), &[&contour], 2.);
+        assert_eq!(sides_of(&chosen), [Side::MinusY, Side::PlusY]);
+        let placed = boxes(&clamp_layout(&chosen), &clamp(), small).unwrap();
+        assert!(hits(&contour, &placed, 2.).is_empty(), "{chosen:?}");
+        let x_pair = boxes(
+            &clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.)]),
+            &clamp(),
+            small,
+        )
+        .unwrap();
+        assert!(!hits(&contour, &x_pair, 2.).is_empty());
+        // The same contour near the Y side leaves the X pair.
+        let along = plan(3., &[([-10., 23., 19.], [10., 23., 19.])]);
+        let chosen = suggest_clamps(small, &clamp(), &[&along], 2.);
+        assert_eq!(sides_of(&chosen), [Side::MinusX, Side::PlusX]);
+    }
+    #[test]
+    fn the_vise_fallback_counts_the_holder_too() {
+        // Every grip is hit on both axes. A short tool (stickout 3) near the Y jaws has its Ø32 holder reach
+        // them (10 mm away, 16 + 2 needed); the Ø6 cutter, 3 mm from the X jaws, is 2 short of the 5 it needs.
+        // The holder's miss is the larger, so the X sides are kept, though the stock is narrower across Y.
+        let mut short = plan(
+            3.,
+            &[
+                ([-5., 20., 1.], [5., 20., 1.]),
+                ([5., -20., 1.], [-5., -20., 1.]),
+            ],
+        );
+        short.tool_length = 3.;
+        let cutter = plan(
+            3.,
+            &[
+                ([47., -10., 1.], [47., 10., 1.]),
+                ([-47., 10., 1.], [-47., -10., 1.]),
+            ],
+        );
+        assert_eq!(vise_for(stock(), &vise(), &[&short, &cutter]), (false, 3.));
+    }
+    #[test]
+    fn a_spot_clear_by_ten_millimetres_is_as_good_as_any_other() {
+        // A short move in the middle of the stock, 1 mm above its top, is 29 mm from the -X clamp's middle
+        // and a hair more from its quarter points: all of them clear by more than 10, so the middles stay.
+        let middle = plan(2., &[([-5., 0., 40.], [5., 0., 40.])]);
+        assert_eq!(
+            suggest_clamps(stock(), &clamp(), &[&middle], 2.),
+            [
+                (Side::MinusX, 0.),
+                (Side::PlusX, 0.),
+                (Side::MinusY, 0.),
+                (Side::PlusY, 0.)
+            ]
+        );
+    }
+    #[test]
+    fn the_grip_is_a_hundredth_of_a_millimetre_the_setup_can_store() {
+        // A grip of 8.456 is tried as 8.45, 7.45, ... The floor at Z 7.457 is cleared by 5.45 (+ gap 2 = 7.45),
+        // not by 6.45; stored as "5.45" it is the grip that was checked.
+        let mut fine = vise();
+        fine.p.insert("grip".into(), "8.456".into());
+        let floor = plan(3., &rectangle(47., 26., 7.457));
+        assert_eq!(vise_for(stock(), &fine, &[&floor]), (true, 5.45));
+        assert_eq!(
+            placement(&Layout::Vise {
+                holder: String::new(),
+                axis_y: true,
+                offset: 0.,
+                grip: 5.45,
+                gap: 2.
+            })[2],
+            ("vise_grip", "5.45".to_string())
+        );
+        // 8.1 stays 8.1: the f32 of 8.1 is a hair over, and 0.29 a hair under, their hundredths.
+        fine.p.insert("grip".into(), "8.1".into());
+        assert_eq!(vise_for(stock(), &fine, &[]), (true, 8.1));
+        fine.p.insert("grip".into(), "3.29".into());
+        assert_eq!(vise_for(stock(), &fine, &[]), (true, 3.29));
+    }
+    #[test]
+    fn a_positive_margin_is_exactly_no_hit() {
+        let mut short = plan(3., &[([-60., 20., 60.], [-30., 20., 60.])]);
+        short.tool_length = 3.;
+        let plans = [
+            plan(3., &[([-60., 0., 41.], [-30., 0., 41.])]),
+            plan(3., &[([-60., 17., 41.], [-30., 17., 41.])]),
+            plan(3., &[([-60., 0., 100.], [-30., 0., 100.])]),
+            plan(3., &[([-100., 0., 100.], [-20., 0., 41.])]),
+            plan(0.2, &[([-60., -1500.75, 41.], [-60., 1499.25, 41.])]),
+            plan(3., &[([-120., 0., 41.], [-20., 0., 41.])]),
+            short,
+        ];
+        let sets = [
+            boxes(&clamp_layout(&[(Side::MinusX, 0.)]), &clamp(), stock()).unwrap(),
+            boxes(&vise_layout(true, 0., 2.), &vise(), stock()).unwrap(),
+        ];
+        for plan in &plans {
+            for set in &sets {
+                for gap in [0., 2., 5.] {
+                    for b in set {
+                        let clear = hits(plan, std::slice::from_ref(b), gap).is_empty();
+                        let m = margin(plan, &b.bounds, gap);
+                        assert_eq!(m > 0., clear, "{} gap {gap}: margin {m}", b.label);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn the_summary_says_what_was_chosen_and_how_the_operations_fare() {
         let jaws = Layout::Vise {
             holder: "v".into(),
@@ -1569,7 +1719,8 @@ mod tests {
             grip: 8.,
             gap: 2.,
         };
-        let say = |considered, clashing, left_out| summary(&jaws, considered, clashing, left_out);
+        let say =
+            |considered, clashing, left_out| summary(&jaws, considered, clashing, left_out, None);
         assert_eq!(
             say(6, 0, 0),
             "Suggested: vise jaws on ±Y, grip 8 mm. Every operation is clear of them."
@@ -1590,6 +1741,20 @@ mod tests {
         assert_eq!(
             say(0, 0, 0),
             "Suggested: vise jaws on ±Y, grip 8 mm. No toolpaths were available to check, so only the stock was considered."
+        );
+        // A stock too wide for the opening is said after how the operations fare.
+        let wide = "The stock is 130 mm across the jaws; this vise opens to 120 mm.";
+        assert_eq!(
+            summary(&jaws, 6, 0, 0, Some(wide)),
+            format!(
+                "Suggested: vise jaws on ±Y, grip 8 mm. Every operation is clear of them. {wide}"
+            )
+        );
+        assert_eq!(
+            summary(&jaws, 5, 2, 1, Some(wide)),
+            format!(
+                "Suggested: vise jaws on ±Y, grip 8 mm. 2 operations come within the gap; see the warnings. {wide} 1 operation was not considered because it could not be generated."
+            )
         );
         assert!(say(0, 0, 4).ends_with(
             "only the stock was considered. 4 operations were not considered because they could not be generated."

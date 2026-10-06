@@ -2043,7 +2043,8 @@ mod tests {
         assert_eq!(get(&a.doc.setup().p, "holder"), other_id);
         assert_eq!(get(&a.doc.setup().p, "vise_grip"), "15");
         assert_eq!(get(&a.doc.setup().p, "vise_offset"), "0");
-        // A setup without a grip takes the chosen vise's.
+        // Choosing a vise again places the jaws from its own grip, whatever grip the setup had (settle_holding's
+        // default for an empty grip has its own model test).
         edit_setup(&mut a, &[("vise_grip", "")]);
         let _ = a.update(Message::Edit(Target::Setup, "holder", vise.clone()));
         assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
@@ -2509,7 +2510,9 @@ mod tests {
         let mut a = holding_app(&dir);
         // No part and a stock sized from it: the stock cannot be told.
         a.doc.sample_model = false;
+        a.project_dirty = false;
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert!(a.project_dirty, "the edit itself still counts");
         let none = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.";
         assert_eq!(a.status, none);
         assert!(!a.doc.setup().p.contains_key("vise_axis"));
@@ -2536,6 +2539,72 @@ mod tests {
             a.status,
             format!("Suggested: vise jaws on ±Y, grip 8 mm. {STOCK_ONLY}")
         );
+    }
+    #[test]
+    fn a_stock_too_wide_for_every_vise_axis_is_said_in_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "140"),
+                ("stock_y", "130"),
+                ("stock_z", "30"),
+            ],
+        );
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert_eq!(
+            a.status,
+            format!(
+                "Suggested: vise jaws on ±Y, grip 8 mm. {STOCK_ONLY} The stock is 130 mm across the jaws; this vise opens to 120 mm."
+            )
+        );
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            ["The stock is 130 mm across the jaws; this vise opens to 120 mm."]
+        );
+    }
+    #[test]
+    fn suggest_layout_writes_and_touches_only_what_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        // Pressing it again suggests the same: nothing is written and the project is not marked changed,
+        // but the status says what was suggested.
+        a.project_dirty = false;
+        a.status = "Kept.".into();
+        let _ = a.update(Message::SuggestLayout);
+        assert!(!a.project_dirty);
+        assert_eq!(
+            a.status,
+            format!("Suggested: vise jaws on ±Y, grip 8 mm. {STOCK_ONLY}")
+        );
+        // Once the offset differs it is written again.
+        edit_setup(&mut a, &[("vise_offset", "5")]);
+        a.project_dirty = false;
+        let _ = a.update(Message::SuggestLayout);
+        assert!(a.project_dirty);
+        assert_eq!(get(&a.doc.setup().p, "vise_offset"), "0");
+    }
+    #[test]
+    fn suggesting_clamps_leaves_another_setups_typed_text_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SetClamps("-X".into()));
+        assert!(a.clamps_draft.is_some());
+        // The duplicate is the active setup, with the same clamps; suggesting for it is not about the draft.
+        let _ = a.update(Message::DuplicateSetup);
+        let _ = a.update(Message::SuggestLayout);
+        assert!(a.status.starts_with("Suggested: 4 clamps"), "{}", a.status);
+        assert!(a.clamps_draft.is_some());
+        let _ = a.update(Message::SelectSetup(0));
+        assert_eq!(a.clamps_field().0, "-X");
+        // Suggesting for the setup the text was typed in drops it, even when the positions stay as they were.
+        let _ = a.update(Message::SuggestLayout);
+        assert!(a.clamps_draft.is_none());
+        assert_eq!(a.clamps_field().0, "-X:0;+X:0;-Y:0;+Y:0");
     }
     #[test]
     fn clamp_positions_need_a_setup() {

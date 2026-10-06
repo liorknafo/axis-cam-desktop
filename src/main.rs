@@ -727,8 +727,9 @@ impl App {
     /// setup's operations up to its last enabled one are generated as
     /// Generate all does; those that cannot be are left out. Toolpaths are
     /// never changed. Without toolpaths the stock alone decides; without a
-    /// stock nothing is written.
-    fn suggest_layout(&mut self) {
+    /// stock nothing is written. Whether the setup changed (and was marked
+    /// so): nothing is written or marked when the suggestion is what it has.
+    fn suggest_layout(&mut self) -> bool {
         let si = self.doc.index();
         let setup = self.doc.setup();
         let (kind, vise) = match get(&setup.p, "holding") {
@@ -736,14 +737,14 @@ impl App {
             "Clamps" => ("clamp", false),
             _ => {
                 self.status = "Choose a vise or clamps for this setup first.".into();
-                return;
+                return false;
             }
         };
         let gap = match holding::gap(setup) {
             Ok(gap) => gap,
             Err(error) => {
                 self.status = error;
-                return;
+                return false;
             }
         };
         let id = get(&setup.p, "holder").to_string();
@@ -753,7 +754,7 @@ impl App {
             } else {
                 holding::DELETED.into()
             };
-            return;
+            return false;
         };
         let probe = if vise {
             holding::Layout::Vise {
@@ -772,7 +773,7 @@ impl App {
         };
         if let Some(refused) = holding::refusal(&probe, &holder) {
             self.status = refused;
-            return;
+            return false;
         }
         let (mut plans, mut failed) = (vec![], 0);
         let last = self.doc.setups[si]
@@ -798,7 +799,7 @@ impl App {
             .or_else(|| self.doc.setup_stock(si, self.part_mesh()))
         else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
-            return;
+            return false;
         };
         let refs: Vec<&simulation::Plan> = plans.iter().collect();
         let layout = if vise {
@@ -817,18 +818,30 @@ impl App {
                 gap,
             }
         };
-        let boxes = holding::boxes(&layout, &holder, stock).unwrap_or_default();
-        let clashing = holding::clashes(&refs, &boxes, gap);
-        let message = holding::summary(&layout, refs.len(), clashing, failed);
-        let p = &mut self.doc.setups[si].p;
-        for (key, value) in holding::placement(&layout) {
-            p.insert(key.into(), value);
+        let suggested = holding::placement(&layout);
+        let p = &self.doc.setups[si].p;
+        let changed = suggested.iter().any(|(key, value)| get(p, key) != value);
+        if changed {
+            let p = &mut self.doc.setups[si].p;
+            for (key, value) in suggested {
+                p.insert(key.into(), value);
+            }
         }
-        if !vise {
+        let id = &self.doc.setups[si].id;
+        if !vise && self.clamps_draft.as_ref().is_some_and(|d| d.setup == *id) {
             self.clamps_draft = None;
         }
-        self.touch();
+        // What is saved, to the hundredth, is what is checked and reported.
+        let layout = holding::layout(&self.doc.setups[si]).unwrap_or(layout);
+        let boxes = holding::boxes(&layout, &holder, stock).unwrap_or_default();
+        let clashing = holding::clashes(&refs, &boxes, gap);
+        let opening = holding::opening_issue(&layout, &holder, stock);
+        let message = holding::summary(&layout, refs.len(), clashing, failed, opening.as_deref());
+        if changed {
+            self.touch();
+        }
         self.status = message;
+        changed
     }
     fn touch(&mut self) {
         if !self.is_sample() {
@@ -1508,7 +1521,6 @@ impl App {
                     if matches!(k, "holding" | "holder") {
                         self.doc.settle_holding(self.doc.index());
                     }
-                    self.touch();
                     // Only the first Vise or Clamps and a different library
                     // entry place the jaws or clamps; later edits are kept.
                     let p = &self.doc.setup().p;
@@ -1519,8 +1531,8 @@ impl App {
                         ("holder", "Vise" | "Clamps") => get(p, "holder") != holder,
                         _ => false,
                     };
-                    if suggest {
-                        self.suggest_layout();
+                    if !suggest || !self.suggest_layout() {
+                        self.touch()
                     }
                 }
                 Target::Machine => {
@@ -2064,7 +2076,9 @@ impl App {
                     }
                 }
             }
-            Message::SuggestLayout => self.suggest_layout(),
+            Message::SuggestLayout => {
+                self.suggest_layout();
+            }
             Message::SetClamps(text) => match holding::check_clamps(self.doc.setup(), &text) {
                 Ok(()) => {
                     self.clamps_draft = None;
