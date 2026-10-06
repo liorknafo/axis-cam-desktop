@@ -5690,6 +5690,29 @@ mod tests {
             lines(5)[1],
             "8000 rpm · 1000 mm/min · coolant Flood · stepdown 3 mm"
         );
+        // A raised travel height is listed after the other values, whatever
+        // the strategy; the default, set or not, is not.
+        let mut raised = ops[0].clone();
+        raised.p.insert("clearance".into(), "30".into());
+        let line = crate::ui::operation_lines(&raised, "T1", 1., "")[1].clone();
+        assert!(
+            line.ends_with(" · bottom offset 0.5 mm · clearance 30 mm"),
+            "{line}"
+        );
+        raised.p.insert("clearance".into(), "22.5".into());
+        assert!(
+            crate::ui::operation_lines(&raised, "T1", 1., "")[1].ends_with(" · clearance 22.5 mm")
+        );
+        raised.p.insert("clearance".into(), "15".into());
+        assert_eq!(
+            crate::ui::operation_lines(&raised, "T1", 1., "")[1],
+            lines(0)[1]
+        );
+        let mut drilled = ops[3].clone();
+        drilled.p.insert("clearance".into(), "40".into());
+        assert!(
+            crate::ui::operation_lines(&drilled, "T3", 1., "")[1].ends_with(" · clearance 40 mm")
+        );
         // Face says which area it faces; coolant shows the value that runs.
         let mut face = ops[0].clone();
         face.p.insert("boundary".into(), "Model silhouette".into());

@@ -2906,6 +2906,10 @@ pub(crate) fn operation_lines(
         }
         _ => {}
     }
+    // The travel height the planner may raise above the default.
+    if value("clearance") != crate::model::CLEARANCE {
+        push(format!("clearance {} mm", n(value("clearance"))));
+    }
     [
         format!("{strategy} · “{}” · {tool} · {minutes:.1} min", op.name()),
         values.join(" · "),

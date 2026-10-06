@@ -1144,9 +1144,9 @@ impl Walk<'_> {
     }
 }
 /// Every workholding problem `prepare` finds for setup `si` from its
-/// `sequence` results, in every program (it stops at the first program with
-/// any problem): the messages are those of `prepare`. Empty when the setup
-/// cannot be walked, which `prepare` reports.
+/// `sequence` results, in every program (`prepare` stops at the first program
+/// with any problem), each once: the messages are those of `prepare`. Empty
+/// when the setup cannot be walked, which `prepare` reports.
 pub(crate) fn held(
     doc: &Document,
     mesh: &Mesh,
@@ -1165,13 +1165,22 @@ pub(crate) fn held(
             }];
         }
     };
-    walk.groups
-        .iter()
-        .flat_map(|group| {
-            let blocks = blocks(&walk.ops[group.clone()], &walk.plans(group), &walk.settings);
-            walk.held(&doc.setups[si], group, &blocks, &boxes)
-        })
-        .collect()
+    // Nothing to hold against: no program need be walked.
+    if boxes.is_empty() {
+        return vec![];
+    }
+    // Every program of a touch-off setup starts the same way: what two of
+    // them say alike (the clearance plane's problem) is said once.
+    let mut found: Vec<Held> = vec![];
+    for group in &walk.groups {
+        let blocks = blocks(&walk.ops[group.clone()], &walk.plans(group), &walk.settings);
+        for problem in walk.held(&doc.setups[si], group, &blocks, &boxes) {
+            if !found.contains(&problem) {
+                found.push(problem);
+            }
+        }
+    }
+    found
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
@@ -3086,6 +3095,56 @@ M2
         assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
         // A setup export cannot walk has nothing to hold against.
         assert!(held(&doc, &mesh, 0, &[]).is_empty());
+    }
+    #[test]
+    fn a_touch_off_setup_reports_the_clearance_plane_once_not_once_per_program() {
+        let (mut doc, mesh) = fixture::job();
+        doc.adopt_holders();
+        // The Pocket and the Drill use two tools: two programs in touch-off
+        // mode, each starting at the clearance plane (Z15) under the clamps.
+        for op in &mut doc.setups[0].operations {
+            op.enabled = ["Pocket", "Drilling"].contains(&op.name());
+        }
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        let machine = &mut doc.setups[0].machine.p;
+        machine.insert("post_retract".into(), POST_RETRACT[1].into());
+        machine.insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        let sims = results(&doc, &mesh);
+        let programs = walk(&doc, &mesh, 0, &sims[0]).unwrap().groups.len();
+        assert_eq!(programs, 2);
+        let found = held(&doc, &mesh, 0, &sims[0]);
+        let plane: Vec<_> = found
+            .iter()
+            .filter(|h| h.message.starts_with("The setup clearance plane (Z15.0)"))
+            .collect();
+        assert_eq!(plane.len(), 1, "{found:?}");
+        assert_eq!(plane[0].operation, None);
+        // Nothing is said twice, and the order is the programs' order.
+        for (i, h) in found.iter().enumerate() {
+            assert!(!found[..i].contains(h), "{h:?}");
+        }
+        // Where the programs differ their problems differ, and all stay, in
+        // the programs' order: the Pocket's plane at Z20, the Drill's at Z15.
+        let pocket = doc.setups[0]
+            .operations
+            .iter_mut()
+            .find(|o| o.name() == "Pocket")
+            .unwrap();
+        pocket.p.insert("clearance".into(), "20".into());
+        let sims = results(&doc, &mesh);
+        let found = held(&doc, &mesh, 0, &sims[0]);
+        let planes: Vec<_> = found.iter().filter(|h| h.operation.is_none()).collect();
+        assert_eq!(planes.len(), 2, "{found:?}");
+        assert!(
+            planes[0]
+                .message
+                .starts_with("The setup clearance plane (Z20.0)")
+        );
+        assert!(
+            planes[1]
+                .message
+                .starts_with("The setup clearance plane (Z15.0)")
+        );
     }
     #[test]
     fn at_the_clearance_plane_clamps_above_the_plane_refuse_the_setup() {

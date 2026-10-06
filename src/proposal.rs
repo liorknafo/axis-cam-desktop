@@ -4,7 +4,7 @@
 use crate::{
     analysis::{self, OrientationReport, PartReport, PlaneReport},
     mesh::Mesh,
-    model::{Document, Operation, Setup, Strategy, Tool, get, num},
+    model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num},
     surface::Selection,
 };
 use serde::{Deserialize, Serialize};
@@ -31,9 +31,6 @@ const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
 pub const MAX_OPERATIONS: usize = 40;
 const MAX_SURFACES: usize = 500;
-/// The retract height of every operation the planner makes, mm above the
-/// stock top (`Operation::new`).
-const RETRACT: f32 = 5.;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,10 +279,12 @@ fn operation(
             wrong.push(format!("{field} cannot be negative."));
         }
     }
-    // Rapids run at the clearance height, which is never below the retract.
-    if p.clearance.is_some_and(|v| v.is_finite() && v < RETRACT) {
+    // Every planned operation travels at the default height or above it: a
+    // plan never takes away the margin the default leaves over what the app
+    // does not check (bolts, clamps it does not model).
+    if p.clearance.is_some_and(|v| v.is_finite() && v < CLEARANCE) {
         wrong.push(format!(
-            "clearance cannot be less than {RETRACT} mm, the retract height."
+            "clearance can only raise the default of {CLEARANCE} mm."
         ));
     }
     if p.rpm.is_finite() && !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
@@ -951,8 +950,11 @@ pub(crate) mod tests {
         assert!(!built.setups[1].p.contains_key("vise_grip"));
     }
     #[test]
-    fn clearance_is_the_proposals_to_set_and_never_below_the_retract_height() {
+    fn clearance_is_the_proposals_to_raise_and_never_below_the_default() {
         let (doc, mesh, report) = block();
+        // The default the proposal's null stands for is the app's own.
+        let fresh = Operation::new(Strategy::Face, String::new());
+        assert_eq!(num(&fresh.p, "clearance"), Some(CLEARANCE));
         let mut proposal = good(&report);
         proposal.setups[0].operations[1].clearance = Some(30.);
         let built = build(&doc, &mesh, &report, &proposal).unwrap();
@@ -961,17 +963,47 @@ pub(crate) mod tests {
             (clearance(0, 1), clearance(0, 0), clearance(1, 0)),
             ("30", "15", "15")
         );
-        proposal.setups[0].operations[0].clearance = Some(5.);
+        // The default itself is accepted; anything under it is not, down to
+        // the retract height and below.
+        proposal.setups[0].operations[0].clearance = Some(15.);
         assert!(build(&doc, &mesh, &report, &proposal).is_ok());
-        proposal.setups[0].operations[0].clearance = Some(4.9);
+        for low in [14.9, 5., 0.] {
+            proposal.setups[0].operations[0].clearance = Some(low);
+            assert_eq!(
+                messages(build(&doc, &mesh, &report, &proposal)),
+                ["1/Some(1): clearance can only raise the default of 15 mm."],
+                "{low}"
+            );
+        }
+        proposal.setups[0].operations[0].clearance = Some(14.9);
         proposal.setups[1].operations[0].clearance = Some(f32::NAN);
         assert_eq!(
             messages(build(&doc, &mesh, &report, &proposal)),
             [
-                "1/Some(1): clearance cannot be less than 5 mm, the retract height.",
+                "1/Some(1): clearance can only raise the default of 15 mm.",
                 "2/Some(1): clearance is not a finite number."
             ]
         );
+    }
+    #[test]
+    fn a_proposal_without_the_clearance_key_still_parses_with_none() {
+        let (_, _, report) = block();
+        let text = serde_json::to_string(&good(&report)).unwrap();
+        assert!(text.contains("\"clearance\":null"), "{text}");
+        // What an earlier version of the schema produced: no such key.
+        let old = text.replace("\"clearance\":null,", "");
+        assert!(!old.contains("clearance"), "{old}");
+        let parsed = parse(&old).unwrap();
+        assert!(
+            parsed
+                .setups
+                .iter()
+                .flat_map(|s| &s.operations)
+                .all(|o| o.clearance.is_none())
+        );
+        assert_eq!(parsed, good(&report));
+        // A key that is not in the schema is still refused.
+        assert!(parse(&text.replace("\"clearance\":null", "\"clearence\":null")).is_err());
     }
     #[test]
     fn operations_get_defaults_overrides_and_fixed_combinations() {

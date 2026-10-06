@@ -745,7 +745,7 @@ impl App {
                 return false;
             }
         };
-        let (mut plans, mut failed) = (vec![], 0);
+        let mut generated: Vec<Option<simulation::Plan>> = vec![];
         let last = self.doc.setups[si]
             .operations
             .iter()
@@ -756,23 +756,15 @@ impl App {
         ) {
             simulation::sequence(&self.doc, mesh, Some((si, last)), |s, _, result| {
                 if s == si {
-                    match result {
-                        Ok(sim) => plans.push(sim.plan),
-                        Err(_) => failed += 1,
-                    }
+                    generated.push(result.ok().map(|sim| sim.plan));
                 }
             });
         }
-        let Some(stock) = plans
-            .first()
-            .map(|plan| plan.stock)
-            .or_else(|| self.doc.setup_stock(si, self.part_mesh()))
-        else {
+        let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
+        let Some((stock, layout)) = request.suggest(&self.doc, self.part_mesh(), si, &refs) else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
             return false;
         };
-        let refs: Vec<&simulation::Plan> = plans.iter().collect();
-        let layout = request.layout(stock, &refs);
         let changed = holding::place(&mut self.doc.setups[si], &layout);
         let id = &self.doc.setups[si].id;
         if !request.vise && self.clamps_draft.as_ref().is_some_and(|d| d.setup == *id) {

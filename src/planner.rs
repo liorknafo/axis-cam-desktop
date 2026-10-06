@@ -169,6 +169,7 @@ WORKHOLDING
 - The later setups (every setup after the first) get the same kind of workholding and library entry, laid out by the program once it has generated their toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
 - Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap` (finish them from a later setup), or move them to a setup where the sides are free.
 - `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. Give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
+- A `workholding` problem names its place in the setup's work coordinates (X, Y and Z measured from the setup's work zero, Z up), not from the model's corner as the report's boxes are: convert before comparing.
 
 SPEEDS AND FEEDS
 - `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
@@ -190,7 +191,7 @@ RULES
 - Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, `clearance` 15, allowances and `bottom_offset` 0.
 - For later setups choose the work zero: `Model origin` is accepted; the program tells the operator where it lies relative to the part, and to the stock top while no earlier setup has cut it. Prefer a stock-based zero when the stock it is touched off on is untouched. `Stock top center`: touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 10 mm below the top. `Stock top front-left`: touch off Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X and -Y sides between 5% and 15% of each side's length from the front-left corner, between 1 mm and 10 mm below the top. On stock under 40 mm tall the sides are touched within a quarter of its height below the top, and under 40 mm across the corner area is a quarter of the shorter top side. A stock-based zero is refused when earlier setups have cut the stock at one of those spots.
 - Give each setup a short `workholding` note. The jaws or clamps in the report are modelled; say what else must be kept clear.
-- `clearance` is the height above the stock top, in mm, at which the tool travels between cuts: at least 5. Change it only for the reason given under WORKHOLDING.
+- `clearance` is the height above the stock top, in mm, at which the tool travels between cuts: 15 when null. It can only be raised, never below 15. Raise it only for the reason given under WORKHOLDING.
 - List every feature you cannot machine with these tools and strategies in `unmachined`, with the reason. Do not leave it out silently, and do not add an operation that cannot work.
 - Put risks the operator should know about in `warnings`.
 - In the check report, `covered_other` lists the remaining surface by `facing` (+X, -X, +Y, -Y, top, bottom), named in setup 1's frame, which can differ from the orientation names when setup 1 is rotated.
@@ -1060,6 +1061,8 @@ pub(crate) mod tests {
             "laid out by the program",
             "`clearance_above_stock_top`",
             "`clearance` greater than it",
+            "work coordinates (X, Y and Z measured from the setup's work zero",
+            "It can only be raised, never below 15.",
             "above the jaws' top",
             "stage `workholding`",
             "are not checked",

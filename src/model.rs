@@ -469,6 +469,9 @@ pub fn post_setting_issues(p: &Fields) -> Vec<String> {
     }
     e
 }
+/// The height above the stock top at which a new operation's tool travels
+/// between cuts, mm (the "clearance" `Operation::new` starts with).
+pub const CLEARANCE: f32 = 15.;
 impl Operation {
     pub fn new(s: Strategy, tool: String) -> Self {
         let mut p = fields(&[

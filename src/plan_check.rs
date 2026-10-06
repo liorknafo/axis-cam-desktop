@@ -444,19 +444,14 @@ fn laid_out(
         let Ok(request) = holding::request(setup, built.holder(get(&setup.p, "holder"))) else {
             continue;
         };
-        let plans: Vec<&Plan> = results[si]
-            .iter()
-            .filter_map(|(_, result)| result.as_ref().ok())
-            .map(|sim| &sim.plan)
-            .collect();
-        let Some(stock) = plans
-            .first()
-            .map(|plan| plan.stock)
-            .or_else(|| built.setup_stock(si, Some(mesh)))
-        else {
+        let (plans, _) = holding::gathered(
+            results[si]
+                .iter()
+                .map(|(_, result)| result.as_ref().ok().map(|sim| &sim.plan)),
+        );
+        let Some((_, layout)) = request.suggest(built, Some(mesh), si, &plans) else {
             continue;
         };
-        let layout = request.layout(stock, &plans);
         holding::place(
             &mut laid.get_or_insert_with(|| built.clone()).setups[si],
             &layout,
@@ -1625,9 +1620,10 @@ mod tests {
         });
         let refs: Vec<&simulation::Plan> = plans.iter().collect();
         let holder = job.holder(get(&second.p, "holder")).unwrap();
-        let again = holding::request(second, Some(holder))
+        let (_, again) = holding::request(second, Some(holder))
             .unwrap()
-            .layout(plans[0].stock, &refs);
+            .suggest(&job, Some(&mesh), 1, &refs)
+            .unwrap();
         assert_eq!(
             holding::placement(&again),
             vec![("clamps", get(&second.p, "clamps").to_string())]
@@ -1713,6 +1709,32 @@ mod tests {
         let (check, job) = check(&doc, &mesh, &report, &raised);
         assert!(check.passed, "{:?}", stages(&check));
         assert!(job.is_some());
+    }
+    #[test]
+    fn a_very_large_clearance_is_refused_by_the_exports_z_travel_check() {
+        let (doc, mesh, report) = block();
+        let with = |clearance: f32| {
+            let mut proposal = good(&report);
+            proposal.setups[0].operations[0].clearance = Some(clearance);
+            check(&doc, &mesh, &report, &proposal)
+        };
+        // A raised travel height within the machine's Z travel (300 mm) passes.
+        let (raised, job) = with(60.);
+        assert!(raised.passed, "{:?}", stages(&raised));
+        assert_eq!(
+            get(&job.unwrap().setups[0].operations[0].p, "clearance"),
+            "60"
+        );
+        // One that takes the program past it is refused, as export does.
+        let (refused, job) = with(400.);
+        assert!(!refused.passed && job.is_none());
+        let found = stages(&refused);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("export 1/None: The program spans ")
+                && found[0].ends_with(" mm in Z, more than the machine's Z travel of 300.000 mm."),
+            "{found:?}"
+        );
     }
     #[test]
     fn a_workholding_entry_that_is_gone_is_one_workholding_problem_and_no_export_problem() {

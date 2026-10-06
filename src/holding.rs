@@ -2,8 +2,8 @@
 //! setup, and whether a toolpath comes too close to them. Toolpaths are
 //! never changed; moves that hit are reported.
 use crate::material::NAME_LIMIT;
-use crate::mesh::Bounds;
-use crate::model::{Fields, Setup, fields, get, id, num};
+use crate::mesh::{Bounds, Mesh};
+use crate::model::{Document, Fields, Setup, fields, get, id, num};
 use crate::simulation::Plan;
 use serde::{Deserialize, Serialize};
 
@@ -788,11 +788,23 @@ pub fn request(setup: &Setup, holder: Option<&Holder>) -> Result<Request, String
     })
 }
 impl Request {
-    /// The layout for a setup whose starting stock is `stock` and whose
-    /// operations make `plans` (`suggest_vise`, `suggest_clamps`).
-    pub fn layout(&self, stock: Bounds, plans: &[&Plan]) -> Layout {
+    /// The layout for setup `si` of `doc` whose operations make `plans`
+    /// (`suggest_vise`, `suggest_clamps`), with the stock it starts from: the
+    /// first plan's, else the setup's own (`Document::setup_stock`, which needs
+    /// the part `mesh` for a later setup). None when that stock is not known.
+    pub fn suggest(
+        &self,
+        doc: &Document,
+        mesh: Option<&Mesh>,
+        si: usize,
+        plans: &[&Plan],
+    ) -> Option<(Bounds, Layout)> {
+        let stock = plans
+            .first()
+            .map(|plan| plan.stock)
+            .or_else(|| doc.setup_stock(si, mesh))?;
         let (holder, gap) = (self.id.clone(), self.gap);
-        if self.vise {
+        let layout = if self.vise {
             let (axis_y, grip) = suggest_vise(stock, &self.holder, plans, gap);
             Layout::Vise {
                 holder,
@@ -807,8 +819,24 @@ impl Request {
                 clamps: suggest_clamps(stock, &self.holder, plans, gap),
                 gap,
             }
+        };
+        Some((stock, layout))
+    }
+}
+/// One setup's generated operations (a plan each, None for one that did not
+/// generate) as a suggestion takes them: the plans there are, and how many
+/// operations are left out.
+pub fn gathered<'a>(
+    operations: impl IntoIterator<Item = Option<&'a Plan>>,
+) -> (Vec<&'a Plan>, usize) {
+    let (mut plans, mut failed) = (vec![], 0);
+    for plan in operations {
+        match plan {
+            Some(plan) => plans.push(plan),
+            None => failed += 1,
         }
     }
+    (plans, failed)
 }
 /// Whether a setup that holds its stock with a vise or clamps says where:
 /// a vise has its grip, clamps their positions. True for no workholding.
@@ -2057,5 +2085,35 @@ mod tests {
             plane_message("vise jaw on +Y", 0., 0.5, 8.43, 0.),
             "The setup clearance plane (Z0.0) is not above the vise jaw on +Y and its 0.5 mm gap (Z8.9). Raise the operations' clearance heights above Z8.9 or retract to machine home."
         );
+    }
+    #[test]
+    fn gathered_and_suggest_take_a_setups_plans_and_fall_back_to_its_stock() {
+        let a = plan(5., &[([0., 0., 5.], [10., 0., 5.])]);
+        let b = plan(5., &[([0., 0., 5.], [0., 10., 5.])]);
+        let (plans, failed) = gathered([Some(&a), None, Some(&b), None, None]);
+        assert_eq!((plans.len(), failed), (2, 3));
+        assert!(std::ptr::eq(plans[0], &a) && std::ptr::eq(plans[1], &b));
+        assert_eq!(gathered([]).0.len() + gathered([]).1, 0);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        doc.adopt_holders();
+        let id = doc
+            .workholding
+            .iter()
+            .find(|h| h.kind() == "Clamp")
+            .unwrap()
+            .id
+            .clone();
+        doc.setups[0].p.insert("holding".into(), "Clamps".into());
+        doc.setups[0].p.insert("holder".into(), id.clone());
+        let request = request(&doc.setups[0], doc.holder(&id)).unwrap();
+        // The first plan's stock when there are plans, else the setup's own.
+        let (stock, layout) = request.suggest(&doc, Some(&mesh), 0, &[&a]).unwrap();
+        assert_eq!(stock, a.stock);
+        assert!(matches!(layout, Layout::Clamps { .. }));
+        let (own, _) = request.suggest(&doc, Some(&mesh), 0, &[]).unwrap();
+        assert_eq!(Some(own), doc.setup_stock(0, Some(&mesh)));
+        assert_ne!(own, a.stock);
+        // Neither: this document has no second setup.
+        assert!(request.suggest(&doc, None, 1, &[]).is_none());
     }
 }
