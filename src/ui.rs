@@ -3490,7 +3490,7 @@ pub(crate) fn timeline_rows(
     finished: bool,
 ) -> Vec<TimelineRow> {
     use crate::planner::{Progress, StepResult};
-    let received = app.plan_received.load(std::sync::atomic::Ordering::Relaxed);
+    let received = app.plan_stream.lock().map_or(0, |t| t.chars().count());
     let request = |stage| {
         matches!(
             stage,

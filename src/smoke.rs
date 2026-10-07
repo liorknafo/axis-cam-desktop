@@ -743,8 +743,7 @@ impl App {
                     (Checking(1), 29, Some(22), Some(smoke_problems(2))),
                     (Repairing(2), 22, None, None),
                 ]);
-                self.plan_received
-                    .store(1840, std::sync::atomic::Ordering::Relaxed);
+                *self.plan_stream.lock().unwrap() = "x".repeat(1840);
                 vec![]
             }
             108 => {
@@ -3659,9 +3658,13 @@ mod tests {
                 client
                     .respond(&crate::openai::Request {
                         model: "gpt-6.1-sol".into(),
-                        messages: vec![(crate::openai::Role::User, "Part.".into())],
+                        messages: vec![crate::openai::Item::text(
+                            crate::openai::Role::User,
+                            "Part.",
+                        )],
                         schema_name: "plan",
                         schema: serde_json::json!({"type": "object"}),
+                        ..Default::default()
                     })
                     .await
             })
@@ -4731,16 +4734,13 @@ mod tests {
             Some(StepResult::Unreadable("oops".into()))
         );
         let _ = a.view();
-        // Try again: the old timeline and count are gone.
-        let counted = a.plan_received.clone();
-        counted.store(900, std::sync::atomic::Ordering::Relaxed);
+        // Try again: the old timeline and text are gone.
+        let streamed = a.plan_stream.clone();
+        *streamed.lock().unwrap() = "x".repeat(900);
         let _ = a.update(Message::Plan);
         assert!(a.plan_timeline.is_empty());
-        assert!(!std::sync::Arc::ptr_eq(&counted, &a.plan_received));
-        assert_eq!(
-            a.plan_received.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert!(!std::sync::Arc::ptr_eq(&streamed, &a.plan_stream));
+        assert_eq!(*a.plan_stream.lock().unwrap(), "");
     }
     /// Timeline steps `(stage, began, ended, result)`, the times in seconds
     /// before `now`; None for an open step.
@@ -4804,8 +4804,7 @@ mod tests {
                 (Extending(3), 7, None, None),
             ],
         );
-        a.plan_received
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+        *a.plan_stream.lock().unwrap() = "x".into();
         let rows = crate::ui::timeline_rows(&a, now, false);
         let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
         // A step that ended reads in the past tense; the open one as it runs.
@@ -4838,8 +4837,7 @@ mod tests {
         assert_eq!(rows[5].notes, ["did not pass"]);
         // Only the open request shows what has streamed in so far.
         assert_eq!(rows[6].notes, ["received 1 character"]);
-        a.plan_received
-            .store(1840, std::sync::atomic::Ordering::Relaxed);
+        *a.plan_stream.lock().unwrap() = "x".repeat(1840);
         let rows = crate::ui::timeline_rows(&a, now, false);
         assert_eq!(rows[6].notes, ["received 1840 characters"]);
         assert!(
@@ -5086,8 +5084,8 @@ mod tests {
         let mut a = signed_in_planning_app(&dir);
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
-        let count = |a: &App| a.plan_received.load(std::sync::atomic::Ordering::Relaxed);
-        // The run's backend counts into the App's own counter, as Plan sets it up.
+        let count = |a: &App| a.plan_stream.lock().unwrap().chars().count();
+        // The run's backend streams into the App's own text, as Plan sets it up.
         let fake = Fake::start(|_| Resp::answer("{}")).await;
         let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
         let session = crate::session::sample();
@@ -5101,13 +5099,12 @@ mod tests {
         let backend = OpenAiBackend::new(
             std::sync::Arc::new(client),
             "gpt-6.1-sol".into(),
-            a.plan_received.clone(),
+            a.plan_stream.clone(),
         );
         let conversation = [(Role::User, "Plan.".to_string())];
         send(&mut a, epoch, Stage(Analyzing));
         send(&mut a, epoch, Stage(Asking(1)));
-        a.plan_received
-            .store(1200, std::sync::atomic::Ordering::Relaxed);
+        *a.plan_stream.lock().unwrap() = "x".repeat(1200);
         // The App does not touch the count when a stage starts, for a check
         // or for the next request: only the client's attempts reset it.
         send(&mut a, epoch, Stage(Checking(1)));

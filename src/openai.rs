@@ -5,13 +5,7 @@ use crate::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 pub const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
 /// The most one request may take in total: a planning reply can stream for
@@ -31,6 +25,9 @@ pub enum ApiError {
     Refused(String),
     /// The plan route does not support a requested feature.
     Unsupported(String),
+    /// HTTP 400 without a code that means more: the request itself was
+    /// refused, for example a message or picture the API cannot take.
+    BadRequest(String),
     Other(String),
 }
 impl ApiError {
@@ -47,9 +44,11 @@ impl ApiError {
                 format!("Your ChatGPT plan cannot be used in this app. {}", clip(m))
             }
             Self::Refused(m) => format!("The model declined the request: {}", clip(m)),
-            Self::SignedOut(m) | Self::Unavailable(m) | Self::Unsupported(m) | Self::Other(m) => {
-                clip(m)
-            }
+            Self::SignedOut(m)
+            | Self::Unavailable(m)
+            | Self::Unsupported(m)
+            | Self::BadRequest(m)
+            | Self::Other(m) => clip(m),
         }
     }
 }
@@ -74,6 +73,11 @@ fn api_error(status: u16, body: &Value) -> ApiError {
         _ if status == 401 => {
             ApiError::SignedOut("Your ChatGPT sign-in was rejected. Sign in again.".into())
         }
+        _ if status == 400 => ApiError::BadRequest(if message.is_empty() {
+            "OpenAI returned HTTP 400.".into()
+        } else {
+            message
+        }),
         _ if message.is_empty() && status == 0 => {
             ApiError::Other("OpenAI reported an error.".into())
         }
@@ -87,27 +91,102 @@ pub enum Role {
     User,
     Assistant,
 }
-#[derive(Debug, Clone)]
+/// One piece of a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    Text(String),
+    /// A PNG picture; `alt` says what it shows and is not sent.
+    Image {
+        png: Arc<Vec<u8>>,
+        alt: String,
+    },
+}
+/// A function call the model made, as the API names its parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    /// The JSON text the model wrote.
+    pub arguments: String,
+}
+/// One entry of the conversation sent as the request's input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Message(Role, Vec<Part>),
+    Call(ToolCall),
+    Output { call_id: String, output: String },
+}
+impl Item {
+    pub fn text(role: Role, text: impl Into<String>) -> Self {
+        Self::Message(role, vec![Part::Text(text.into())])
+    }
+    /// A message's role and its text parts joined with "\n"; None otherwise.
+    pub fn as_text(&self) -> Option<(Role, String)> {
+        let Self::Message(role, parts) = self else {
+            return None;
+        };
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.as_str()),
+                Part::Image { .. } => None,
+            })
+            .collect();
+        Some((*role, texts.join("\n")))
+    }
+}
+/// A function the model may call. Its parameters are a strict JSON Schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tool {
+    pub name: &'static str,
+    pub description: String,
+    pub parameters: Value,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    /// The tools stay in the request, but the model may not call them.
+    None,
+}
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     pub model: String,
-    pub messages: Vec<(Role, String)>,
+    pub messages: Vec<Item>,
     pub schema_name: &'static str,
     pub schema: Value,
+    pub tools: Vec<Tool>,
+    pub tool_choice: ToolChoice,
 }
 impl Request {
     /// `structured` asks the API to enforce the schema. Without it the schema
     /// is restated in the instructions; replies are validated locally either way.
     fn body(&self, structured: bool) -> Value {
+        use base64::Engine;
+        let role_name = |role: &Role| match role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
         let mut input: Vec<Value> = self
             .messages
             .iter()
-            .map(|(role, text)| {
-                let role = match role {
-                    Role::System => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                };
-                json!({"role": role, "content": text})
+            .map(|item| match item {
+                // A lone text is sent as a string: an assistant message may
+                // not use `input_text` parts.
+                Item::Message(role, parts) => match parts.as_slice() {
+                    [Part::Text(text)] => json!({"role": role_name(role), "content": text}),
+                    parts => json!({"role": role_name(role), "content": parts.iter().map(|part| match part {
+                        Part::Text(text) => json!({"type": "input_text", "text": text}),
+                        Part::Image { png, .. } => json!({
+                            "type": "input_image",
+                            "image_url": format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.as_slice())),
+                            "detail": "high",
+                        }),
+                    }).collect::<Vec<_>>()}),
+                },
+                Item::Call(call) => json!({"type": "function_call", "call_id": call.call_id, "name": call.name, "arguments": call.arguments}),
+                Item::Output { call_id, output } => json!({"type": "function_call_output", "call_id": call_id, "output": output}),
             })
             .collect();
         let mut body = json!({"model": self.model, "store": false, "stream": true});
@@ -124,6 +203,22 @@ impl Request {
                 self.schema
             )}));
         }
+        if !self.tools.is_empty() {
+            body["tools"] = self
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function", "name": t.name, "description": t.description,
+                        "parameters": t.parameters, "strict": true,
+                    })
+                })
+                .collect();
+            body["tool_choice"] = json!(match self.tool_choice {
+                ToolChoice::Auto => "auto",
+                ToolChoice::None => "none",
+            });
+        }
         body["input"] = Value::Array(input);
         body
     }
@@ -133,6 +228,8 @@ pub struct Reply {
     pub text: String,
     /// Whether the API enforced the schema.
     pub structured: bool,
+    /// The functions the model called, in order.
+    pub calls: Vec<ToolCall>,
 }
 /// The most the parser buffers while waiting for an event to end.
 const MAX_SSE_BUFFER: usize = 16 * 1024 * 1024;
@@ -194,27 +291,41 @@ impl SseParser {
         Ok(sse_event(&std::mem::take(&mut self.buffer)))
     }
 }
-/// The most reply text (output and refusal) one request may stream.
+/// The most reply text (output, refusal and call arguments) one request may
+/// stream.
 const MAX_REPLY: usize = 4 * 1024 * 1024;
-/// Folds response events into the reply text or the first error.
+/// The most function calls one reply keeps.
+const MAX_CALLS: usize = 16;
+/// A function call item as the API sends it; its item `id` is not kept.
+fn call(item: &Value) -> Option<ToolCall> {
+    Some(ToolCall {
+        call_id: item["call_id"].as_str()?.into(),
+        name: item["name"].as_str()?.into(),
+        arguments: item["arguments"].as_str().unwrap_or("").into(),
+    })
+}
+/// Folds response events into the reply text and calls or the first error.
 #[derive(Default)]
 struct Accumulator {
     text: String,
     refusal: String,
+    calls: Vec<ToolCall>,
     done: bool,
     error: Option<ApiError>,
 }
 impl Accumulator {
-    /// Folds in one event; returns the characters of reply text it streamed.
-    fn apply(&mut self, event: &Value) -> usize {
-        let mut streamed = 0;
+    /// Folds in one event; returns the reply text it streamed.
+    fn apply<'a>(&mut self, event: &'a Value) -> &'a str {
+        let mut streamed = "";
         match event["type"].as_str().unwrap_or("") {
             "response.output_text.delta" => {
-                let delta = event["delta"].as_str().unwrap_or("");
-                self.text += delta;
-                streamed = delta.chars().count();
+                streamed = event["delta"].as_str().unwrap_or("");
+                self.text += streamed;
             }
             "response.refusal.delta" => self.refusal += event["delta"].as_str().unwrap_or(""),
+            "response.output_item.done" if event["item"]["type"] == "function_call" => {
+                self.calls.extend(call(&event["item"]));
+            }
             "response.completed" => {
                 if self.text.is_empty() {
                     let parts = event["response"]["output"]
@@ -227,6 +338,14 @@ impl Accumulator {
                             self.text += part["text"].as_str().unwrap_or("");
                         }
                     }
+                }
+                if self.calls.is_empty() {
+                    let output = event["response"]["output"].as_array().into_iter().flatten();
+                    self.calls.extend(
+                        output
+                            .filter(|item| item["type"] == "function_call")
+                            .filter_map(call),
+                    );
                 }
                 self.done = true;
             }
@@ -253,15 +372,18 @@ impl Accumulator {
             }
             _ => {}
         }
-        if self.text.len() + self.refusal.len() > MAX_REPLY {
+        self.calls.truncate(MAX_CALLS);
+        let arguments: usize = self.calls.iter().map(|c| c.arguments.len()).sum();
+        if self.text.len() + self.refusal.len() + arguments > MAX_REPLY {
             self.text = String::new();
             self.refusal = String::new();
+            self.calls = Vec::new();
             self.error
                 .get_or_insert(ApiError::Other("The reply was too large.".into()));
         }
         streamed
     }
-    fn finish(self) -> Result<String, ApiError> {
+    fn finish(self) -> Result<(String, Vec<ToolCall>), ApiError> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -273,7 +395,7 @@ impl Accumulator {
                 "The reply ended before it was complete.".into(),
             ));
         }
-        Ok(self.text)
+        Ok((self.text, self.calls))
     }
 }
 /// Runs a store call on the blocking pool: the Keychain can wait on a prompt.
@@ -606,37 +728,44 @@ impl Client {
             .collect())
     }
     pub async fn respond(&self, request: &Request) -> Result<Reply, ApiError> {
-        self.respond_counting(request, &AtomicUsize::new(0)).await
+        self.respond_streaming(request, &std::sync::Mutex::default())
+            .await
     }
-    /// `respond` that counts the characters of reply text as they stream in:
-    /// `received` is set to 0 when each attempt starts, so it always holds
-    /// the length of the reply being streamed.
-    pub async fn respond_counting(
+    /// `respond` that collects the reply text as it streams in: `stream` is
+    /// cleared when each attempt starts, so it always holds the text of the
+    /// reply being streamed.
+    pub async fn respond_streaming(
         &self,
         request: &Request,
-        received: &AtomicUsize,
+        stream: &std::sync::Mutex<String>,
     ) -> Result<Reply, ApiError> {
-        match self.attempt(request, true, received).await {
-            Err(ApiError::Unsupported(_)) => self.attempt(request, false, received).await,
+        match self.attempt(request, true, stream).await {
+            Err(ApiError::Unsupported(_)) => self.attempt(request, false, stream).await,
             other => other,
         }
     }
-    /// `respond_counting` without the structured attempt, for a caller that
+    /// `respond_streaming` without the structured attempt, for a caller that
     /// already knows the plan route refuses it.
-    pub async fn respond_plain_counting(
+    pub async fn respond_plain_streaming(
         &self,
         request: &Request,
-        received: &AtomicUsize,
+        stream: &std::sync::Mutex<String>,
     ) -> Result<Reply, ApiError> {
-        self.attempt(request, false, received).await
+        self.attempt(request, false, stream).await
     }
     async fn attempt(
         &self,
         request: &Request,
         structured: bool,
-        received: &AtomicUsize,
+        text_stream: &std::sync::Mutex<String>,
     ) -> Result<Reply, ApiError> {
-        received.store(0, Ordering::Relaxed);
+        // A poisoned lock only means a reader panicked; the text is still good.
+        let lock = || {
+            text_stream
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        lock().clear();
         let url = format!("{}/responses", self.endpoints.api);
         let body = request.body(structured);
         let response = self
@@ -659,7 +788,7 @@ impl Client {
                 }
             };
             for event in parser.push(&chunk) {
-                received.fetch_add(reply.apply(&event), Ordering::Relaxed);
+                lock().push_str(reply.apply(&event));
             }
             // The reply is complete, or too large to keep: do not wait for
             // the server to close the connection.
@@ -668,20 +797,24 @@ impl Client {
             }
         }
         if let Some(event) = parser.finish()? {
-            received.fetch_add(reply.apply(&event), Ordering::Relaxed);
+            lock().push_str(reply.apply(&event));
         }
-        let text = reply.finish();
-        if matches!(text, Err(ApiError::SignedOut(_))) {
+        let finished = reply.finish();
+        if matches!(finished, Err(ApiError::SignedOut(_))) {
             self.forget().await;
         }
-        text.map(|text| Reply { text, structured })
+        finished.map(|(text, calls)| Reply {
+            text,
+            structured,
+            calls,
+        })
     }
     /// One tiny request that proves plan tokens, streaming and replies work.
     pub async fn check(&self, model: &str) -> Result<String, ApiError> {
         let reply = self
             .respond(&Request {
                 model: model.into(),
-                messages: vec![(Role::User, "Reply with ok set to true.".into())],
+                messages: vec![Item::text(Role::User, "Reply with ok set to true.")],
                 schema_name: "connection_check",
                 schema: json!({
                     "type": "object",
@@ -689,6 +822,7 @@ impl Client {
                     "required": ["ok"],
                     "additionalProperties": false,
                 }),
+                ..Default::default()
             })
             .await?;
         match serde_json::from_str::<Value>(&reply.text) {
@@ -752,9 +886,13 @@ mod tests {
     fn request() -> Request {
         Request {
             model: "gpt-6.1-sol".into(),
-            messages: vec![(Role::System, "Plan.".into()), (Role::User, "Part.".into())],
+            messages: vec![
+                Item::text(Role::System, "Plan."),
+                Item::text(Role::User, "Part."),
+            ],
             schema_name: "plan",
             schema: json!({"type": "object"}),
+            ..Default::default()
         }
     }
     #[test]
@@ -773,6 +911,7 @@ mod tests {
             ),
             (ApiError::Unsupported(hostile.clone()), ""),
             (ApiError::Other(hostile.clone()), ""),
+            (ApiError::BadRequest(hostile.clone()), ""),
         ] {
             let message = error.message();
             assert!(
@@ -866,7 +1005,8 @@ mod tests {
             reply,
             Reply {
                 text: "{\"ok\":true}".into(),
-                structured: true
+                structured: true,
+                calls: vec![]
             }
         );
         let sent = &r.fake.seen("/v1/responses")[0];
@@ -902,7 +1042,8 @@ mod tests {
             reply,
             Reply {
                 text: "{}".into(),
-                structured: false
+                structured: false,
+                calls: vec![]
             }
         );
         let sent = r.fake.seen("/v1/responses");
@@ -1344,7 +1485,7 @@ mod tests {
         assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
     }
     #[tokio::test]
-    async fn respond_counting_adds_the_streamed_characters_and_each_call_starts_at_zero() {
+    async fn respond_streaming_holds_the_streamed_text_and_each_call_starts_empty() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let r = rig(sample(), move |_| {
@@ -1361,32 +1502,31 @@ mod tests {
             Resp::sse(&events)
         })
         .await;
-        // Characters, not bytes; a count left from an earlier reply is cleared.
-        let received = AtomicUsize::new(7);
+        // A text left from an earlier reply is cleared.
+        let stream = std::sync::Mutex::new("old".to_string());
         let reply = r
             .client
-            .respond_counting(&request(), &received)
+            .respond_streaming(&request(), &stream)
             .await
             .unwrap();
-        assert_eq!(reply.text.chars().count(), 2003);
-        assert!(reply.text.len() > 2003);
-        assert_eq!(received.load(Ordering::SeqCst), 2003);
+        assert_eq!(reply.text, format!("{{{}é}}", "x".repeat(2000)));
+        assert_eq!(*stream.lock().unwrap(), reply.text);
         r.client
-            .respond_counting(&request(), &received)
+            .respond_streaming(&request(), &stream)
             .await
             .unwrap();
-        assert_eq!(received.load(Ordering::SeqCst), 2);
-        received.store(9, Ordering::SeqCst);
+        assert_eq!(*stream.lock().unwrap(), "{}");
+        *stream.lock().unwrap() = "old".into();
         r.client
-            .respond_plain_counting(&request(), &received)
+            .respond_plain_streaming(&request(), &stream)
             .await
             .unwrap();
-        assert_eq!(received.load(Ordering::SeqCst), 2);
-        // `respond` counts into a counter of its own.
+        assert_eq!(*stream.lock().unwrap(), "{}");
+        // `respond` streams into a text of its own.
         assert_eq!(r.client.respond(&request()).await.unwrap().text, "{}");
     }
     #[tokio::test]
-    async fn the_count_grows_while_the_reply_is_still_streaming() {
+    async fn the_stream_grows_while_the_reply_is_still_arriving() {
         let r = rig(sample(), |_| Resp {
             cut_after_ms: Some(10_000),
             ..Resp::sse(&[
@@ -1396,21 +1536,159 @@ mod tests {
             ])
         })
         .await;
-        let received = AtomicUsize::new(0);
+        let stream = std::sync::Mutex::new(String::new());
         let request = request();
-        let mut call = Box::pin(r.client.respond_counting(&request, &received));
+        let mut call = Box::pin(r.client.respond_streaming(&request, &stream));
         let watch = async {
-            while received.load(Ordering::SeqCst) < 6 {
+            while stream.lock().unwrap().chars().count() < 6 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         };
         tokio::select! {
             _ = &mut call => panic!("the reply is not complete"),
             grown = tokio::time::timeout(Duration::from_secs(5), watch) => {
-                grown.expect("the count grows as the text streams");
+                grown.expect("the text grows as it streams");
             }
         }
-        assert_eq!(received.load(Ordering::SeqCst), 6);
+        assert_eq!(*stream.lock().unwrap(), "{\"a\":1");
+    }
+    #[tokio::test]
+    async fn images_tools_and_calls_are_sent_as_items() {
+        let r = rig(sample(), |_| Resp::answer("{}")).await;
+        let png = Arc::new(vec![1u8, 2, 3]);
+        let mut req = request();
+        req.messages.push(Item::Message(
+            Role::User,
+            vec![
+                Part::Text("Overview.".into()),
+                Part::Image {
+                    png: png.clone(),
+                    alt: "the part".into(),
+                },
+            ],
+        ));
+        req.messages.push(Item::Call(ToolCall {
+            call_id: "c1".into(),
+            name: "view_model".into(),
+            arguments: "{}".into(),
+        }));
+        req.messages.push(Item::Output {
+            call_id: "c1".into(),
+            output: "drawn".into(),
+        });
+        req.tools = vec![Tool {
+            name: "view_model",
+            description: "Draws.".into(),
+            parameters: json!({"type": "object"}),
+        }];
+        req.tool_choice = ToolChoice::None;
+        r.client.respond(&req).await.unwrap();
+        let body = r.fake.seen("/v1/responses")[0].json();
+        assert_eq!(
+            body["input"][0],
+            json!({"role": "system", "content": "Plan."})
+        );
+        assert_eq!(
+            body["input"][2]["content"][0],
+            json!({"type": "input_text", "text": "Overview."})
+        );
+        assert_eq!(
+            body["input"][2]["content"][1],
+            json!({"type": "input_image", "image_url": "data:image/png;base64,AQID", "detail": "high"})
+        );
+        assert_eq!(
+            body["input"][3],
+            json!({"type": "function_call", "call_id": "c1", "name": "view_model", "arguments": "{}"})
+        );
+        assert_eq!(
+            body["input"][4],
+            json!({"type": "function_call_output", "call_id": "c1", "output": "drawn"})
+        );
+        assert_eq!(
+            body["tools"][0],
+            json!({"type": "function", "name": "view_model", "description": "Draws.", "parameters": {"type": "object"}, "strict": true})
+        );
+        assert_eq!(body["tool_choice"], "none");
+        let plain = rig(sample(), |_| Resp::answer("{}")).await;
+        plain.client.respond(&request()).await.unwrap();
+        let body = plain.fake.seen("/v1/responses")[0].json();
+        assert!(body["tools"].is_null() && body["tool_choice"].is_null());
+    }
+    #[test]
+    fn a_messages_text_is_its_text_parts_joined_by_newlines() {
+        let message = Item::Message(
+            Role::User,
+            vec![
+                Part::Text("One.".into()),
+                Part::Image {
+                    png: Arc::new(vec![1]),
+                    alt: "a picture".into(),
+                },
+                Part::Text("Two.".into()),
+            ],
+        );
+        assert_eq!(message.as_text(), Some((Role::User, "One.\nTwo.".into())));
+        assert_eq!(
+            Item::text(Role::Assistant, "{}").as_text(),
+            Some((Role::Assistant, "{}".into()))
+        );
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "view_model".into(),
+            arguments: "{}".into(),
+        };
+        assert_eq!(Item::Call(call).as_text(), None);
+        let output = Item::Output {
+            call_id: "c1".into(),
+            output: "drawn".into(),
+        };
+        assert_eq!(output.as_text(), None);
+    }
+    #[tokio::test]
+    async fn function_calls_are_read_from_the_stream_or_the_final_event() {
+        let call = json!({"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "view_model", "arguments": "{\"angle\":\"top\"}"});
+        let streamed = rig(sample(), {
+            let call = call.clone();
+            move |_| {
+                Resp::sse(&[
+                    json!({"type": "response.output_item.done", "item": call}),
+                    json!({"type": "response.completed", "response": {"output": [call]}}),
+                ])
+            }
+        })
+        .await;
+        let reply = streamed.client.respond(&request()).await.unwrap();
+        assert_eq!(reply.text, "");
+        assert_eq!(
+            reply.calls,
+            vec![ToolCall {
+                call_id: "c1".into(),
+                name: "view_model".into(),
+                arguments: "{\"angle\":\"top\"}".into()
+            }]
+        );
+        let final_only = rig(sample(), move |_| {
+            Resp::sse(&[json!({"type": "response.completed", "response": {"output": [call]}})])
+        })
+        .await;
+        assert_eq!(
+            final_only
+                .client
+                .respond(&request())
+                .await
+                .unwrap()
+                .calls
+                .len(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn an_http_400_without_a_known_code_is_a_bad_request() {
+        let r = rig(sample(), |_| Resp::error(400, "invalid_value")).await;
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::BadRequest(_))
+        ));
     }
     /// An HTTP client that waits only a second and a half for data, far
     /// below its total limit, in place of the two minutes the app allows.

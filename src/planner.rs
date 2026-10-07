@@ -762,20 +762,20 @@ pub struct OpenAiBackend {
     /// Set once the plan route refused structured output: later requests of
     /// the run ask for plain JSON at once.
     plain: std::sync::atomic::AtomicBool,
-    /// Characters of the current reply streamed so far, for the page.
-    received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The text of the current reply streamed so far, for the page.
+    stream: std::sync::Arc<std::sync::Mutex<String>>,
 }
 impl OpenAiBackend {
     pub fn new(
         client: std::sync::Arc<crate::openai::Client>,
         model: String,
-        received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stream: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> Self {
         Self {
             client,
             model,
             plain: false.into(),
-            received,
+            stream,
         }
     }
 }
@@ -784,17 +784,21 @@ impl Backend for OpenAiBackend {
         use std::sync::atomic::Ordering;
         let request = crate::openai::Request {
             model: self.model.clone(),
-            messages: messages.to_vec(),
+            messages: messages
+                .iter()
+                .map(|(role, text)| crate::openai::Item::text(*role, text.as_str()))
+                .collect(),
             schema_name: "machining_plan",
             schema: proposal::schema(),
+            ..Default::default()
         };
         if self.plain.load(Ordering::Relaxed) {
-            let reply = self.client.respond_plain_counting(&request, &self.received);
+            let reply = self.client.respond_plain_streaming(&request, &self.stream);
             return reply.await.map(|r| r.text);
         }
         let reply = self
             .client
-            .respond_counting(&request, &self.received)
+            .respond_streaming(&request, &self.stream)
             .await?;
         if !reply.structured {
             self.plain.store(true, Ordering::Relaxed);
@@ -2743,11 +2747,11 @@ pub(crate) mod tests {
             store,
             session,
         );
-        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let backend = OpenAiBackend::new(
             std::sync::Arc::new(client),
             "gpt-6.1-sol".into(),
-            received.clone(),
+            stream.clone(),
         );
         let messages = vec![
             (Role::System, "Plan.".to_string()),
@@ -2755,12 +2759,12 @@ pub(crate) mod tests {
             (Role::Assistant, "{}".into()),
             (Role::User, "Fix it.".into()),
         ];
-        let count = || received.load(std::sync::atomic::Ordering::SeqCst);
+        let text = || stream.lock().unwrap().clone();
         assert_eq!(backend.reply(&messages).await.unwrap(), "{}");
-        assert_eq!(count(), 2, "the structured refusal streamed nothing");
-        received.store(40, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(text(), "{}", "the structured refusal streamed nothing");
+        *stream.lock().unwrap() = "x".repeat(40);
         assert_eq!(backend.reply(&messages).await.unwrap(), "{}");
-        assert_eq!(count(), 2, "the plain request starts the count again");
+        assert_eq!(text(), "{}", "the plain request starts the text again");
         let sent = fake.seen("/v1/responses");
         assert_eq!(
             sent.len(),

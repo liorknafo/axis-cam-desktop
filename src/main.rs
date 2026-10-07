@@ -319,8 +319,8 @@ pub struct App {
     /// The stages of the current or last run, with their times and results;
     /// kept after the run for the preview or the failure.
     pub plan_timeline: Vec<Step>,
-    /// Characters of the model's reply streamed so far in the current run.
-    pub plan_received: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The text of the model's reply streamed so far in the current run.
+    pub plan_stream: std::sync::Arc<std::sync::Mutex<String>>,
     /// Blocking stages still running, also those of cancelled runs.
     pub plan_busy: planner::Busy,
     /// Set by an edit that dropped a running plan or a preview, or by a
@@ -560,7 +560,7 @@ impl App {
             plan_account_epoch: 0,
             plan_model: String::new(),
             plan_timeline: vec![],
-            plan_received: Default::default(),
+            plan_stream: Default::default(),
             plan_camera: viewport::Camera::default(),
             plan_busy: planner::Busy::default(),
             plan_dropped: None,
@@ -1134,8 +1134,8 @@ impl App {
         self.plan_epoch = self.plan_epoch.wrapping_add(1);
         self.planner = Planner::Idle;
         self.plan_timeline.clear();
-        // The aborted run may still hold the old count.
-        self.plan_received = Default::default();
+        // The aborted run may still write to the old text.
+        self.plan_stream = Default::default();
     }
     /// Ends the timeline's open step, if any, now.
     fn end_plan_step(&mut self) {
@@ -2443,7 +2443,7 @@ impl App {
                 let backend = planner::OpenAiBackend::new(
                     client,
                     self.settings.model.clone(),
-                    self.plan_received.clone(),
+                    self.plan_stream.clone(),
                 );
                 let doc = self.doc.clone();
                 let busy = self.plan_busy.clone();

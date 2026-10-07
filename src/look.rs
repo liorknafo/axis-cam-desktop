@@ -372,6 +372,33 @@ pub fn overview(scene: &Scene) -> Result<Picture, String> {
     };
     render(scene, &args)
 }
+/// The `view_model` function as the model is offered it: every property is
+/// required and nullable ones may be null, as strict schemas demand.
+pub fn tool() -> crate::openai::Tool {
+    crate::openai::Tool {
+        name: NAME,
+        description: "Draws a picture of the part as the program sees it and returns it with a short description. Use it to check which faces the report's surface IDs are, where holes and pockets are, how the stock and the vise or clamps sit, and, after a proposal has been checked, what an operation's toolpaths and the stock left after it look like.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "orientation": {"type": ["string", "null"], "enum": ["+Z", "-Z", "+X", "-X", "+Y", "-Y", null],
+                    "description": "The report's orientation to draw the part in; null for setup 1's. Ignored when `operation` is set: an operation is drawn in its own setup."},
+                "angle": {"type": "string", "enum": ANGLES.map(|a| a.0)},
+                "focus_surfaces": {"type": "array", "items": {"type": "integer"}, "description": "Zoom to these surface IDs; empty for the whole part."},
+                "highlight_surfaces": {"type": "array", "items": {"type": "integer"}, "description": "Surface IDs drawn in blue."},
+                "show_stock": {"type": "boolean"},
+                "show_workholding": {"type": "boolean"},
+                "labels": {"type": "boolean", "description": "Tags with each listed plane's surface IDs and each hole's diameter."},
+                "operation": {"type": ["object", "null"], "properties": {"setup": {"type": "integer"}, "operation": {"type": "integer"}},
+                    "required": ["setup", "operation"], "additionalProperties": false,
+                    "description": "An operation of your latest checked proposal, counted from 1: its toolpaths and the stock left after it."},
+                "purpose": {"type": "string", "description": "A few words on why you look; shown to the user."}
+            },
+            "required": ["orientation", "angle", "focus_surfaces", "highlight_surfaces", "show_stock", "show_workholding", "labels", "operation", "purpose"],
+            "additionalProperties": false
+        }),
+    }
+}
 /// The most feed moves an operation view draws; more are sampled evenly.
 const MAX_SEGMENTS: usize = 20_000;
 /// The feed moves of the operation looked at, as 1.5 px lines wherever
@@ -665,6 +692,35 @@ mod tests {
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         (info.width, info.height, buf)
+    }
+    #[test]
+    fn the_tool_requires_every_argument_the_views_take() {
+        let tool = tool();
+        assert_eq!(tool.name, NAME);
+        let schema = &tool.parameters;
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = match v {
+                serde_json::Value::Object(map) => map.keys().cloned().collect(),
+                list => list
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|k| k.as_str().unwrap().into())
+                    .collect(),
+            };
+            keys.sort();
+            keys
+        };
+        let sent: serde_json::Value = serde_json::from_str(&args(serde_json::json!({}))).unwrap();
+        assert_eq!(keys(&schema["properties"]), keys(&sent));
+        assert_eq!(keys(&schema["required"]), keys(&sent));
+        let angles: Vec<&str> = schema["properties"]["angle"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(angles, ANGLES.map(|a| a.0));
     }
     #[test]
     fn a_scene_can_move_between_threads() {
