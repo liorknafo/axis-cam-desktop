@@ -177,18 +177,27 @@ pub struct Failure {
 /// the tests read it.
 #[cfg(test)]
 pub fn instructions() -> String {
-    instructions_with(false)
+    instructions_with(false, false)
 }
 /// What the model is told before it sees the part. Every limit the builder
 /// and the generators enforce is stated, so a correct plan passes first time.
-/// With `pictures`, a PICTURES section before RULES explains the overview,
-/// the view_model tool and its limits.
-pub fn instructions_with(pictures: bool) -> String {
+/// With `pictures`, a PICTURES section before RULES explains the overview;
+/// with `tool` too, the view_model tool and its limits.
+pub fn instructions_with(pictures: bool, tool: bool) -> String {
     let pictures = if pictures {
+        let (look, limits) = if tool {
+            (
+                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green).\n",
+                format!(
+                    "You get at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run. "
+                ),
+            )
+        } else {
+            ("", String::new())
+        };
         format!("PICTURES
 - After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (grey). Tags in white boxes give each listed plane's surface IDs (at most three, then \"…\") and each hole's `diameter` (as Ø6.0). The caption names the view and has a scale bar in mm; the triad shows +X (red), +Y (green), +Z (blue).
-- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green).
-- You get at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run. Older pictures are replaced by their descriptions. The pictures are drawn from the same model as the report; when they seem to disagree, the report's numbers are right.
+{look}- {limits}Older pictures are replaced by their descriptions. The pictures are drawn from the same model as the report; when they seem to disagree, the report's numbers are right.
 
 ")
     } else {
@@ -678,12 +687,11 @@ struct Sight {
 /// One planner request: sends the conversation, answers the model's calls
 /// for pictures, and returns the text of the first reply without calls.
 /// A refused send is made again without the tool, then without pictures.
-/// `scene` is borrowed mutably only so the future stays `Send`: a `Scene`
-/// holds a `Mesh`, which is not `Sync`.
 async fn ask(
     backend: &(impl Backend + Sync),
     sight: &mut Sight,
     conversation: &mut Vec<Item>,
+    // `&mut`: a shared borrow of the !Sync mesh would make the planner's future non-Send.
     scene: &mut look::Scene,
     busy: &Busy,
     request: usize,
@@ -699,7 +707,10 @@ async fn ask(
         } else {
             ToolChoice::Auto
         });
-        let mut messages = vec![Item::text(Role::System, instructions_with(sight.pictures))];
+        let mut messages = vec![Item::text(
+            Role::System,
+            instructions_with(sight.pictures, sight.tool),
+        )];
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
         let reply = match backend.reply(&messages, choice).await {
             Ok(reply) => reply,
@@ -3597,19 +3608,61 @@ pub(crate) mod tests {
     }
     #[test]
     fn the_pictures_section_comes_before_the_rules_only_with_pictures() {
-        let (plain, with) = (instructions(), instructions_with(true));
+        let plain = instructions();
+        assert_eq!(plain, instructions_with(false, true));
         assert!(!plain.contains("PICTURES") && !plain.contains("view_model"));
-        let (at, rules) = (
-            with.find("\nPICTURES\n").unwrap(),
-            with.find("\nRULES\n").unwrap(),
-        );
-        assert!(at < rules);
-        assert!(with.contains(&format!(
+        let limits = format!(
             "at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run"
-        )));
-        assert!(with.contains("the report's numbers are right"));
-        // Without the section the text is the same.
-        assert_eq!(with.replacen(&with[at + 1..rules + 1], "", 1), plain);
+        );
+        for tool in [true, false] {
+            let with = instructions_with(true, tool);
+            let (at, rules) = (
+                with.find("\nPICTURES\n").unwrap(),
+                with.find("\nRULES\n").unwrap(),
+            );
+            assert!(at < rules);
+            // The tool and its limits are explained only while it is offered.
+            assert_eq!(with.contains("view_model"), tool);
+            assert_eq!(with.contains(&limits), tool);
+            assert!(with.contains("overview picture drawn by the program"));
+            assert!(with.contains("the triad shows +X (red)"));
+            assert!(with.contains("the report's numbers are right"));
+            // Without the section the text is the same.
+            assert_eq!(with.replacen(&with[at + 1..rules + 1], "", 1), plain);
+        }
+    }
+    #[tokio::test]
+    async fn once_the_tool_is_refused_the_instructions_no_longer_offer_it() {
+        let (doc, mesh, report) = block();
+        let script = Script::calls(vec![
+            Err(ApiError::BadRequest("tools".into())),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        assert!(events.contains(&Event::Dropped(1, Dropped::Tool)));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Dropped(_, Dropped::Pictures)))
+        );
+        let turns = script.turns.lock().unwrap();
+        assert!(turns[0].0[0].as_text().unwrap().1.contains("view_model"));
+        for (items, tool) in &turns[1..] {
+            assert_eq!(*tool, None);
+            let system = items[0].as_text().unwrap().1;
+            assert!(system.contains("PICTURES"), "{system}");
+            assert!(system.contains("overview picture drawn by the program"));
+            assert!(!system.contains("view_model") && !system.contains("pictures per reply"));
+            // The overview itself is still sent, with its description.
+            assert!(matches!(&items[2], Item::Message(Role::User, parts)
+                if matches!(&parts[0], Part::Text(t) if t.starts_with("The program's overview picture: "))
+                    && matches!(&parts[1], Part::Image { .. })));
+        }
+        assert!(instructions_with(true, true).contains("view_model"));
     }
     #[tokio::test]
     async fn without_pictures_nothing_changes() {

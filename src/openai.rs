@@ -121,6 +121,7 @@ impl Item {
         Self::Message(role, vec![Part::Text(text.into())])
     }
     /// A message's role and its text parts joined with "\n"; None otherwise.
+    #[cfg(test)]
     pub fn as_text(&self) -> Option<(Role, String)> {
         let Self::Message(role, parts) = self else {
             return None;
