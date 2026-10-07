@@ -23,6 +23,8 @@ fn smoke_steps(steps: Vec<(Progress, u64, Option<u64>, Option<StepResult>)>) -> 
         })
         .collect()
 }
+/// The start of a reply being written, as the running screens show it.
+const SMOKE_REPLY: &str = "{\"summary\":\"Face the top, rough the pocket with T3, then turn the part over.\",\"setups\":[{\"orientation\":\"+Z\",\"name\":\"Top\",\"origin\":\"Stock top center\",\"workholding\":\"Vise\",\"operations\":[{\"strategy\":\"Face\",\"name\":\"Face top\",\"tool\":1";
 /// A failed check's result: two problem lines and `more` others.
 fn smoke_problems(more: usize) -> StepResult {
     StepResult::Problems {
@@ -135,6 +137,10 @@ impl App {
                 111 => "88-workholding-vise".into(),
                 112 => "89-workholding-clamps".into(),
                 113 => "90-workholding-page".into(),
+                // Iced draws the pictures of this screen from the second frame
+                // on (it uploads images of 2 MiB and more after the first),
+                // so it is captured twice: the second file replaces the first.
+                114 | 115 => "91-planner-pictures".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -744,7 +750,7 @@ impl App {
                     (Checking(1), 29, Some(22), Some(smoke_problems(2))),
                     (Repairing(2), 22, None, None),
                 ]);
-                *self.plan_stream.lock().unwrap() = "{\"summary\":\"Face the top, rough the pocket with T3, then turn the part over.\",\"setups\":[{\"orientation\":\"+Z\",\"name\":\"Top\",\"origin\":\"Stock top center\",\"workholding\":\"Vise\",\"operations\":[{\"strategy\":\"Face\",\"name\":\"Face top\",\"tool\":1".into();
+                *self.plan_stream.lock().unwrap() = SMOKE_REPLY.into();
                 vec![]
             }
             108 => {
@@ -773,6 +779,12 @@ impl App {
                     (Checking(2), 19, Some(7), Some(StepResult::Passed)),
                     (Previewing, 7, Some(4), None),
                 ]);
+                // The first request looked at two pictures: its row ends
+                // "· 2 looks".
+                self.plan_timeline[1].looks = vec![
+                    self.smoke_look("top", "Which face is the pocket floor"),
+                    self.smoke_look("iso_back_right", "The far side of the part"),
+                ];
                 self.page = Page::Ai;
                 vec![]
             }
@@ -809,6 +821,35 @@ impl App {
                 ]
             }
             113 => vec![Message::Page(Page::Workholding)],
+            114 => {
+                // The first request still going: the overview the run started
+                // from, the model's two looks (a picture and a view it could
+                // not get), then OpenAI refusing the tool, and the plan as far
+                // as it is written.
+                use Progress::*;
+                self.plan_model = self.settings.model.clone();
+                self.planner = crate::Planner::Running(Asking(1));
+                self.plan_timeline = smoke_steps(vec![
+                    (Analyzing, 41, Some(39), None),
+                    (Asking(1), 39, None, None),
+                ]);
+                self.plan_timeline[1].looks = vec![
+                    self.smoke_look("top", "Which face is the pocket floor"),
+                    self.smoke_failed_look(),
+                    crate::Shown {
+                        line: "OpenAI refused the picture tool; continuing with the overview only."
+                            .into(),
+                        warn: true,
+                        thumb: None,
+                    },
+                ];
+                self.plan_overview = Some(self.smoke_overview());
+                *self.plan_stream.lock().unwrap() = SMOKE_REPLY.into();
+                self.page = Page::Ai;
+                vec![]
+            }
+            // The same screen again, with its pictures uploaded.
+            115 => vec![],
             _ => {
                 assert!(self.active_simulation().is_some(), "{}", self.status);
                 assert!(self.doc.validate_structure().is_ok());
@@ -823,6 +864,14 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
+            // The overview's picture at the top of the visible part, so the
+            // lines of the open request fit under it.
+            115 => {
+                return iced::widget::operation::scroll_to(
+                    "planner-result",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 90. },
+                );
+            }
             111 => {
                 assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Vise");
                 assert_eq!(crate::ui::holding_boxes(self).len(), 2, "{}", self.status);
@@ -872,6 +921,78 @@ impl App {
             );
         }
         Task::none()
+    }
+    /// What the planner's pictures are drawn from: the imported part as the
+    /// planner reads it.
+    fn smoke_scene(&self) -> crate::look::Scene {
+        let mesh = self.imported_mesh.clone().expect("imported part");
+        let report = crate::analysis::report(&self.doc, &mesh).expect("part report");
+        crate::look::Scene {
+            doc: std::sync::Arc::new(self.doc.clone()),
+            mesh,
+            report: std::sync::Arc::new(report),
+            job: None,
+        }
+    }
+    /// A timeline picture as the run makes it: the PNG's handle, once.
+    fn smoke_shown(picture: &crate::look::Picture, line: String) -> crate::Shown {
+        crate::Shown {
+            line,
+            warn: false,
+            thumb: Some(iced::widget::image::Handle::from_bytes(
+                picture.png.to_vec(),
+            )),
+        }
+    }
+    /// The picture the first request carries, as the planner page shows it.
+    fn smoke_overview(&self) -> crate::Shown {
+        let picture = crate::look::overview(&self.smoke_scene()).expect("overview");
+        Self::smoke_shown(&picture, picture.description.clone())
+    }
+    /// The arguments of a `view_model` call that looks at the whole part
+    /// (or at `focus`, surface IDs) from `angle`.
+    fn smoke_arguments(angle: &str, purpose: &str, focus: &[usize]) -> String {
+        serde_json::json!({
+            "orientation": null,
+            "angle": angle,
+            "focus_surfaces": focus,
+            "highlight_surfaces": [],
+            "show_stock": true,
+            "show_workholding": true,
+            "labels": true,
+            "operation": null,
+            "purpose": purpose,
+        })
+        .to_string()
+    }
+    /// A look the model asked for with the `view_model` tool, as the
+    /// timeline shows it.
+    fn smoke_look(&self, angle: &str, purpose: &str) -> crate::Shown {
+        let arguments = Self::smoke_arguments(angle, purpose, &[]);
+        let picture = crate::look::draw(&self.smoke_scene(), &arguments)
+            .expect("a look at the imported part");
+        let line = crate::ui::look_line(&crate::planner::Look {
+            description: picture.description.clone(),
+            purpose: picture.purpose.clone(),
+            png: Some(picture.png.clone()),
+        });
+        Self::smoke_shown(&picture, line)
+    }
+    /// A look that cannot be drawn (a surface the part does not have), as
+    /// the timeline shows the sentence the model is told.
+    fn smoke_failed_look(&self) -> crate::Shown {
+        let arguments = Self::smoke_arguments("top", "Zoom to the slot", &[999_999]);
+        let message = crate::look::draw(&self.smoke_scene(), &arguments)
+            .expect_err("surface 999999 is not on the imported part");
+        crate::Shown {
+            line: crate::ui::look_line(&crate::planner::Look {
+                description: message,
+                purpose: String::new(),
+                png: None,
+            }),
+            warn: false,
+            thumb: None,
+        }
     }
     /// A checked plan for the imported block, as the planner shows it.
     fn smoke_plan_preview(&self) -> std::sync::Arc<crate::PlanPreview> {
