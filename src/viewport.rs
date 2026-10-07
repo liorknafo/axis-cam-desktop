@@ -132,10 +132,10 @@ pub struct Viewport<'a> {
     /// stock and part of the camera's fit.
     pub holding: Vec<crate::holding::HoldBox>,
 }
-struct Projector {
+pub(crate) struct Projector {
     camera: Camera,
     center: Point,
-    scale: f32,
+    pub(crate) scale: f32,
     target: [f32; 3],
 }
 impl Projector {
@@ -147,7 +147,31 @@ impl Projector {
             target: [0., 0., 15.],
         }
     }
-    fn p(&self, v: [f32; 3]) -> Point {
+    /// The camera fitted to `bounds` (display units) in a `size` frame: the
+    /// bounds' centre where the 3D view puts its target (centred across, a
+    /// touch below the middle), their bounding sphere filling the frame.
+    pub(crate) fn fit(camera: Camera, size: (f32, f32), bounds: crate::mesh::Bounds) -> Self {
+        let frame = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: size.0,
+            height: size.1,
+        };
+        let mut p = Projector::new(camera, frame);
+        p.target = std::array::from_fn(|i| bounds.min[i] + (bounds.max[i] - bounds.min[i]) / 2.);
+        // Fit the scene's bounding sphere once per scene/size/zoom. Its diameter
+        // is independent of yaw and pitch, so orbiting never changes zoom.
+        let diameter = bounds
+            .dimensions()
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+            .max(1.);
+        p.scale = (size.0 * 0.86).min(size.1 * 0.82) / diameter * camera.zoom;
+        p
+    }
+    pub(crate) fn p(&self, v: [f32; 3]) -> Point {
         let [x, y, z] = std::array::from_fn(|i| v[i] - self.target[i]);
         let (s, c) = self.camera.yaw.sin_cos();
         let (se, ce) = self.camera.pitch.sin_cos();
@@ -156,7 +180,7 @@ impl Projector {
             self.center.y - (-x * s * se - y * c * se + z * ce) * self.scale,
         )
     }
-    fn depth(&self, v: [f32; 3]) -> f32 {
+    pub(crate) fn depth(&self, v: [f32; 3]) -> f32 {
         let (s, c) = self.camera.yaw.sin_cos();
         let (se, ce) = self.camera.pitch.sin_cos();
         v[0] * s * ce + v[1] * c * ce + v[2] * se
@@ -164,6 +188,11 @@ impl Projector {
 }
 impl Viewport<'_> {
     fn projector(&self, b: Rectangle) -> Projector {
+        Projector::fit(self.camera, (b.width, b.height), self.scene_bounds())
+    }
+    /// What the camera must contain, in display units: the part, the stock,
+    /// the jaws or clamps and, when simulating, the stock and every move.
+    pub(crate) fn scene_bounds(&self) -> crate::mesh::Bounds {
         let mut bounds = Placement::new(self.mesh, self.setup).bounds;
         if self.show_stock
             && let Some(setup) = self.setup
@@ -175,7 +204,7 @@ impl Viewport<'_> {
                 bounds.max[i] = bounds.max[i].max(stock.max[i]);
             }
         }
-        if self.show_stock {
+        if !self.holding.is_empty() {
             let scale = self.mesh.display_scale();
             for hold in &self.holding {
                 let hold = hold.bounds.scaled(scale);
@@ -214,19 +243,7 @@ impl Viewport<'_> {
                 }
             }
         }
-        let mut p = Projector::new(self.camera, b);
-        p.target = std::array::from_fn(|i| bounds.min[i] + (bounds.max[i] - bounds.min[i]) / 2.);
-        // Fit the scene's bounding sphere once per scene/size/zoom. Its diameter
-        // is independent of yaw and pitch, so orbiting never changes zoom.
-        let diameter = bounds
-            .dimensions()
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            .sqrt()
-            .max(1.);
-        p.scale = (b.width * 0.86).min(b.height * 0.82) / diameter * self.camera.zoom;
-        p
+        bounds
     }
     fn transformed(&self) -> Vec<Face> {
         let placement = Placement::new(self.mesh, self.setup);
@@ -289,6 +306,20 @@ impl Viewport<'_> {
             .min(1.5);
         let w = (bounds.width * ratio).ceil().max(1.) as u32;
         let h = (bounds.height * ratio).ceil().max(1.) as u32;
+        let (rgba, _) = self.render(p, (w, h), ratio, hovered, &[]);
+        (w, h, rgba)
+    }
+    /// The scene drawn into a `w` × `h` frame whose points are the
+    /// projector's times `ratio`: RGBA (alpha 0 where nothing was drawn) and
+    /// the part's depth buffer. `marked` surfaces take the selection tint.
+    pub(crate) fn render(
+        &self,
+        p: &Projector,
+        (w, h): (u32, u32),
+        ratio: f32,
+        hovered: Option<usize>,
+        marked: &[usize],
+    ) -> (Vec<u8>, Vec<f32>) {
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
         // Remaining stock is the simulated solid. Do not overlay the finished
@@ -311,7 +342,7 @@ impl Viewport<'_> {
                             .is_some_and(|s| s.matches(self.mesh) && s.ids.contains(&f))
                     }
                 })
-            });
+            }) || face.feature.is_some_and(|f| marked.contains(&f));
             let color = if face.feature.is_some() && face.feature == hovered {
                 [242, 190, 93, 255]
             } else if selected {
@@ -373,6 +404,7 @@ impl Viewport<'_> {
                 }
             }
         }
+        let part_depths = depths.clone();
         if let Some(simulation) = self.simulation {
             self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
         } else if self.show_stock
@@ -386,7 +418,7 @@ impl Viewport<'_> {
             });
             raster_stock(&mut rgba, &depths, w, h, projected, ratio, p.scale);
         }
-        if self.show_stock {
+        if !self.holding.is_empty() {
             let scale = self.mesh.display_scale();
             for hold in &self.holding {
                 let projected = box_vertices(hold.bounds.scaled(scale)).map(|v| {
@@ -459,7 +491,7 @@ impl Viewport<'_> {
                 }
             }
         }
-        (w, h, rgba)
+        (rgba, part_depths)
     }
     fn raster_simulation(
         &self,
@@ -1339,6 +1371,75 @@ fn paths(s: Strategy) -> Vec<Vec<[f32; 3]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// FNV-1a over the pixels, to pin the drawing across the refactor.
+    fn digest(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325, |h, b| {
+            (h ^ *b as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+    #[test]
+    fn the_viewport_draws_the_same_pixels_after_the_split() {
+        let (doc, mesh) = crate::post::fixture::job();
+        let setup = doc.setups.first();
+        let view = Viewport {
+            setup,
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 400.,
+            height: 300.,
+        };
+        let p = view.projector(bounds);
+        let (w, h, rgba) = view.pixels(&p, bounds, None);
+        assert_eq!((w, h), (600, 450));
+        assert_eq!(digest(&rgba), 11316679358304618149);
+    }
+    #[test]
+    fn render_tints_marked_surfaces_and_returns_the_part_depths() {
+        let (doc, mesh) = crate::post::fixture::job();
+        let view = Viewport {
+            setup: doc.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+        };
+        let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
+        let tint = [92, 168, 223, 255];
+        let tinted = |rgba: &[u8]| rgba.chunks(4).filter(|px| **px == tint).count();
+        let (plain, depths) = view.render(&p, (300, 200), 1., None, &[]);
+        assert_eq!(tinted(&plain), 0);
+        let features: Vec<usize> = mesh.faces.iter().filter_map(|f| f.feature).collect();
+        let (marked, _) = view.render(&p, (300, 200), 1., None, &features);
+        assert!(tinted(&marked) > 0);
+        // The same pixels are drawn, and the depths are the part's: finite
+        // exactly where a pixel was drawn.
+        assert_eq!(plain.len(), marked.len());
+        assert_eq!(depths.len(), 300 * 200);
+        let drawn = |rgba: &[u8]| rgba.chunks(4).map(|px| px[3] > 0).collect::<Vec<_>>();
+        assert_eq!(drawn(&plain), drawn(&marked));
+        assert_eq!(
+            depths.iter().map(|d| d.is_finite()).collect::<Vec<_>>(),
+            drawn(&plain)
+        );
+    }
     #[test]
     fn full_resolution_tiles_stay_below_async_upload_limit_and_preserve_pixels() {
         for (width, height) in [(1, 1), (512, 512), (513, 517), (1600, 1200)] {
@@ -1466,7 +1567,7 @@ mod tests {
         assert!(transparent[index + 3] > 0 && transparent[index + 3] < 128);
     }
     #[test]
-    fn workholding_is_drawn_as_grey_translucent_boxes_with_the_stock_only() {
+    fn workholding_is_drawn_as_grey_translucent_boxes() {
         use crate::holding::HoldBox;
         let d = crate::model::Document::sample();
         let mesh = crate::mesh::sample();
@@ -1516,11 +1617,11 @@ mod tests {
             .count();
         assert!(changed > 0 && changed < (w * h) as usize / 4, "{changed}");
         assert_eq!(plain[..4], drawn[..4]);
-        // Without the stock the boxes are not drawn either.
+        // The list alone decides: the view passes none when the stock is hidden.
         v.show_stock = false;
-        let (_, _, hidden) = v.pixels(&p, b, None);
+        let (_, _, listed) = v.pixels(&p, b, None);
         v.holding.clear();
-        assert_eq!(v.pixels(&p, b, None).2, hidden);
+        assert_ne!(v.pixels(&p, b, None).2, listed);
     }
     #[test]
     fn the_camera_fit_contains_the_drawn_workholding() {
@@ -1563,12 +1664,12 @@ mod tests {
         let with = v.projector(b);
         assert!(inside(&with));
         assert!(with.scale < without.scale);
-        // Hidden with the stock, the boxes do not move the camera.
+        // The list alone decides: the view passes none when the stock is hidden.
         v.show_stock = false;
-        let hidden = v.projector(b);
+        let listed = v.projector(b);
         v.holding.clear();
         let none = v.projector(b);
-        assert_eq!((hidden.scale, hidden.target), (none.scale, none.target));
+        assert!(listed.scale < none.scale);
     }
     #[test]
     fn camera_fit_contains_rotated_part_and_asymmetric_stock() {
