@@ -11,6 +11,8 @@ pub struct Settings {
     pub client_id: String,
     pub model: String,
     pub plan_notice_shown: bool,
+    /// The AI planner may not show the model pictures of the part.
+    pub plan_pictures_off: bool,
 }
 pub fn path(state_path: &Path) -> PathBuf {
     state_path.with_file_name("settings.json")
@@ -76,6 +78,23 @@ mod tests {
         std::fs::write(&file, b"not json").unwrap();
         let recovered = load(&file);
         assert!(recovered.client_id.is_empty() && valid_host_id(&recovered.host_id));
+    }
+    #[test]
+    fn pictures_are_on_unless_turned_off_and_the_choice_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(!load(&path).plan_pictures_off);
+        let mut s = load(&path);
+        s.plan_pictures_off = true;
+        save(&path, &s).unwrap();
+        assert!(load(&path).plan_pictures_off);
+        // Settings saved before the field existed read as pictures on.
+        std::fs::write(
+            &path,
+            br#"{"host_id":"urn:uuid:3b241101-e2bb-4255-8caf-4136c566a962","model":"gpt-6.1-sol"}"#,
+        )
+        .unwrap();
+        assert!(!load(&path).plan_pictures_off);
     }
     const V4: &str = "3f2b8c1e-9d4a-4e6f-a1b2-0c9d8e7f6a5b";
     fn saved_with(host_id: &str) -> (tempfile::TempDir, PathBuf) {

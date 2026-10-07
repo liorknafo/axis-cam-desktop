@@ -2771,6 +2771,15 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
 pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
+pub(crate) const PICTURES_SENT: &str = " With the box below ticked, pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels, are sent too, and, when the model asks, pictures of its own toolpaths.";
+/// What the page beside the Plan button says is sent to OpenAI.
+pub(crate) fn sent_to_openai(pictures: bool) -> String {
+    let mut text = SENT_TO_OPENAI.to_string();
+    if pictures {
+        text.push_str(PICTURES_SENT);
+    }
+    text
+}
 fn planner_controls(app: &App) -> Element<'_, Message> {
     let checklist = app.plan_checklist();
     let ready = checklist.iter().all(|line| line.ok);
@@ -2787,7 +2796,14 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
         }
         c = c.push(row![mark, item].spacing(8));
     }
-    c = c.push(muted(SENT_TO_OPENAI));
+    let pictures = !app.settings.plan_pictures_off;
+    c = c.push(muted(sent_to_openai(pictures)));
+    c = c.push(
+        checkbox(pictures)
+            .label("Let the AI see pictures of the part")
+            .on_toggle(Message::PlanPictures)
+            .text_size(13),
+    );
     if !ready {
         c = c.push(muted(
             "Plan becomes available when every item above is met.",

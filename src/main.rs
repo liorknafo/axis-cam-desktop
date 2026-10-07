@@ -196,6 +196,8 @@ pub enum Message {
     /// The first value is the `account_epoch` of the client that asked.
     ConnectionChecked(u64, Result<String, openai::ApiError>),
     PlanNoticeDismissed,
+    /// Whether the AI planner may show the model pictures of the part.
+    PlanPictures(bool),
     OpenUrl(&'static str),
     ConfirmDeleteSetup(bool),
     Close(iced::window::Id),
@@ -2507,7 +2509,7 @@ impl App {
                     client,
                     self.settings.model.clone(),
                     self.plan_stream.clone(),
-                    true,
+                    !self.settings.plan_pictures_off,
                 );
                 let doc = self.doc.clone();
                 let busy = self.plan_busy.clone();
@@ -2983,6 +2985,10 @@ impl App {
             }
             Message::PlanNoticeDismissed => {
                 self.settings.plan_notice_shown = true;
+                self.save_settings();
+            }
+            Message::PlanPictures(on) => {
+                self.settings.plan_pictures_off = !on;
                 self.save_settings();
             }
             Message::OpenUrl(url) => {

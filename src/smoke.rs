@@ -6847,6 +6847,37 @@ mod tests {
         assert_eq!(reopened.account, crate::Account::SignedOut);
     }
     #[test]
+    fn the_disclosure_names_pictures_only_when_they_are_on() {
+        use crate::ui::sent_to_openai;
+        assert!(sent_to_openai(true).contains("pictures the app draws of the part"));
+        assert!(!sent_to_openai(false).contains("pictures"));
+        assert!(sent_to_openai(true).contains("The CAD file"));
+        assert_eq!(sent_to_openai(false), crate::ui::SENT_TO_OPENAI);
+        assert_eq!(
+            sent_to_openai(true),
+            format!("{}{}", crate::ui::SENT_TO_OPENAI, crate::ui::PICTURES_SENT)
+        );
+    }
+    #[test]
+    fn the_pictures_choice_is_saved_and_shown_on_the_planner_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let file = dir.path().join("settings.json");
+        a.page = Page::Ai;
+        let _ = a.view(); // pictures on, the default
+        assert!(!a.settings.plan_pictures_off);
+        let _ = a.update(Message::PlanPictures(false));
+        assert!(a.settings.plan_pictures_off);
+        assert!(crate::settings::load(&file).plan_pictures_off);
+        let _ = a.view(); // pictures off
+        let _ = a.update(Message::PlanPictures(true));
+        assert!(!a.settings.plan_pictures_off);
+        assert!(!crate::settings::load(&file).plan_pictures_off);
+        let _ = a.update(Message::PlanPictures(false));
+        let reopened = App::from_workspace(dir.path().join("workspace.json"), None);
+        assert!(reopened.settings.plan_pictures_off);
+    }
+    #[test]
     fn account_messages_drive_the_panel_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = fresh_app(&dir);
