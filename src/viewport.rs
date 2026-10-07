@@ -311,7 +311,10 @@ impl Viewport<'_> {
     }
     /// The scene drawn into a `w` × `h` frame whose points are the
     /// projector's times `ratio`: RGBA (alpha 0 where nothing was drawn) and
-    /// the part's depth buffer. `marked` surfaces take the selection tint.
+    /// the depth buffer of the opaque things drawn (the part, or the
+    /// simulated stock and the tool). `marked` surfaces take the selection
+    /// tint and keep it under the stock's box, so a picture shows them
+    /// plainly.
     pub(crate) fn render(
         &self,
         p: &Projector,
@@ -322,6 +325,9 @@ impl Viewport<'_> {
     ) -> (Vec<u8>, Vec<f32>) {
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+        // The pixels where a marked surface is nearest; empty without any.
+        let cells = if marked.is_empty() { 0 } else { w * h };
+        let mut plain = vec![false; cells as usize];
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
         for face in if self.simulation.is_some() && self.show_stock {
@@ -343,10 +349,12 @@ impl Viewport<'_> {
                     }
                 })
             }) || face.feature.is_some_and(|f| marked.contains(&f));
-            let color = if face.feature.is_some() && face.feature == hovered {
+            let hover = face.feature.is_some() && face.feature == hovered;
+            let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
+            let color = if hover {
                 [242, 190, 93, 255]
             } else if selected {
-                [92, 168, 223, 255]
+                SELECTED
             } else {
                 [
                     (light * 0.80 * 255.) as u8,
@@ -398,13 +406,15 @@ impl Viewport<'_> {
                             if z > depths[index] {
                                 depths[index] = z;
                                 rgba[index * 4..index * 4 + 4].copy_from_slice(&color);
+                                if let Some(plain) = plain.get_mut(index) {
+                                    *plain = kept;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        let part_depths = depths.clone();
         if let Some(simulation) = self.simulation {
             self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
         } else if self.show_stock
@@ -417,6 +427,9 @@ impl Viewport<'_> {
                 (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
             });
             raster_stock(&mut rgba, &depths, w, h, projected, ratio, p.scale);
+            for (index, _) in plain.iter().enumerate().filter(|(_, kept)| **kept) {
+                rgba[index * 4..index * 4 + 4].copy_from_slice(&SELECTED);
+            }
         }
         if !self.holding.is_empty() {
             let scale = self.mesh.display_scale();
@@ -491,7 +504,7 @@ impl Viewport<'_> {
                 }
             }
         }
-        (rgba, part_depths)
+        (rgba, depths)
     }
     fn raster_simulation(
         &self,
@@ -1070,6 +1083,8 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
     }
     pixel[3] = (output * 255.).round() as u8;
 }
+/// The tint of an operation's surfaces and of marked ones.
+const SELECTED: [u8; 4] = [92, 168, 223, 255];
 /// How a translucent box is painted: the tint of its top and bottom, of its
 /// X sides and of its Y sides, its edges (seen, and behind something), and
 /// how opaque it is over empty space and over the part.
@@ -1406,7 +1421,7 @@ mod tests {
         assert_eq!(digest(&rgba), 11316679358304618149);
     }
     #[test]
-    fn render_tints_marked_surfaces_and_returns_the_part_depths() {
+    fn render_tints_marked_surfaces_and_returns_the_depths() {
         let (doc, mesh) = crate::post::fixture::job();
         let view = Viewport {
             setup: doc.setups.first(),
@@ -1429,6 +1444,14 @@ mod tests {
         let features: Vec<usize> = mesh.faces.iter().filter_map(|f| f.feature).collect();
         let (marked, _) = view.render(&p, (300, 200), 1., None, &features);
         assert!(tinted(&marked) > 0);
+        // Under the stock's box they keep the plain tint.
+        let stocked = Viewport {
+            show_stock: true,
+            holding: vec![],
+            ..view
+        };
+        let (under, _) = stocked.render(&p, (300, 200), 1., None, &features);
+        assert_eq!(tinted(&under), tinted(&marked));
         // The same pixels are drawn, and the depths are the part's: finite
         // exactly where a pixel was drawn.
         assert_eq!(plain.len(), marked.len());
@@ -1438,6 +1461,28 @@ mod tests {
         assert_eq!(
             depths.iter().map(|d| d.is_finite()).collect::<Vec<_>>(),
             drawn(&plain)
+        );
+        // With the simulated stock shown the part is not drawn: the depths
+        // are the stock's and the tool's.
+        let (doc, mesh, report) = crate::proposal::tests::block();
+        let good = crate::proposal::tests::good(&report);
+        let job = crate::proposal::build(&doc, &mesh, &report, &good).unwrap();
+        let sim =
+            crate::planner::view_after(&job, &mesh, 0, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        let view = Viewport {
+            setup: job.setups.first(),
+            simulation: Some(&sim),
+            show_stock: true,
+            mesh: &mesh,
+            ..view
+        };
+        let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
+        let (rgba, depths) = view.render(&p, (300, 200), 1., None, &[]);
+        assert!(depths.iter().any(|d| d.is_finite()));
+        assert_eq!(
+            depths.iter().map(|d| d.is_finite()).collect::<Vec<_>>(),
+            drawn(&rgba)
         );
     }
     #[test]

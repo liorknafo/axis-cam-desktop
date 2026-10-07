@@ -393,9 +393,10 @@ fn cutting_data_problems(built: &Document) -> Vec<Problem> {
 fn unchecked(why: &str) -> String {
     format!("Speeds and feeds could not be checked: {why}")
 }
-/// Runs every stage on a proposal. Returns the report and, when the plan
-/// passes, the job it describes.
-pub fn check(
+/// Runs every stage on a proposal. Returns the report and the job it built
+/// (with the layouts suggested for its later setups), whether or not the
+/// plan passed; None when the proposal could not be built.
+pub fn evaluate(
     doc: &Document,
     mesh: &Mesh,
     report: &PartReport,
@@ -404,8 +405,7 @@ pub fn check(
     match proposal::build(doc, mesh, report, proposal) {
         Ok(built) => {
             let (out, laid) = run(&built, mesh, report);
-            let job = out.passed.then(|| laid.unwrap_or(built));
-            (out, job)
+            (out, Some(laid.unwrap_or(built)))
         }
         Err(problems) => (
             CheckReport {
@@ -419,6 +419,17 @@ pub fn check(
             None,
         ),
     }
+}
+/// `evaluate` that keeps the job only when the plan passed.
+pub fn check(
+    doc: &Document,
+    mesh: &Mesh,
+    report: &PartReport,
+    proposal: &Proposal,
+) -> (CheckReport, Option<Document>) {
+    let (out, job) = evaluate(doc, mesh, report, proposal);
+    let job = job.filter(|_| out.passed);
+    (out, job)
 }
 /// `run` without the job, so tests can check jobs `build` would refuse.
 #[cfg(test)]
@@ -658,6 +669,16 @@ mod tests {
             .iter()
             .map(|p| format!("{} {}/{:?}: {}", p.stage, p.setup, p.operation, p.message))
             .collect()
+    }
+    #[test]
+    fn evaluate_keeps_the_job_of_a_failing_plan() {
+        let (doc, mesh, report) = crate::proposal::tests::block();
+        let mut slow = crate::proposal::tests::good(&report);
+        slow.setups[0].operations[0].rpm = 100.;
+        let (check, job) = evaluate(&doc, &mesh, &report, &slow);
+        assert!(!check.passed && job.is_some());
+        let (check, job) = super::check(&doc, &mesh, &report, &slow);
+        assert!(!check.passed && job.is_none());
     }
     #[test]
     fn a_side_up_setup_after_a_contour_is_located_without_the_cut_stock_top() {

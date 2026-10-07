@@ -577,7 +577,7 @@ pub async fn plan(
         busy,
         progress,
         analysis::report,
-        plan_check::check,
+        plan_check::evaluate,
     )
     .await
 }
@@ -815,6 +815,16 @@ pub(crate) fn final_view_at(
 ) -> Option<crate::simulation::Simulation> {
     let si = job.setups.len().checked_sub(1)?;
     let oi = job.setups[si].operations.iter().rposition(|o| o.enabled)?;
+    view_after(job, mesh, si, oi, detail)
+}
+/// The stock after operation `oi` of setup `si` of `job`, meshed at `detail`.
+pub(crate) fn view_after(
+    job: &Document,
+    mesh: &Mesh,
+    si: usize,
+    oi: usize,
+    detail: crate::stock_surface::Detail,
+) -> Option<crate::simulation::Simulation> {
     let mut sim = crate::simulation::prepare(job, mesh, si, oi).ok()?;
     sim.seek(1.);
     let volume = sim.volume.as_ref()?;
