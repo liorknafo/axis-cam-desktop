@@ -858,6 +858,10 @@ pub struct Document {
     /// The selected library material's id; `material` keeps its name.
     #[serde(default)]
     pub material_id: String,
+    /// The starter set (`material::STARTER_SET`) the library has been
+    /// given; 0 for a library saved before sets were counted.
+    #[serde(default)]
+    pub starter_materials: u32,
     /// The workholding library: vises and clamps, carried to new projects
     /// like tools.
     #[serde(default)]
@@ -878,6 +882,7 @@ impl Default for Document {
             material: String::new(),
             materials: vec![],
             material_id: String::new(),
+            starter_materials: 0,
             workholding: vec![],
             file: None,
             sample_model: false,
@@ -973,13 +978,28 @@ impl Document {
         self.material = name;
         true
     }
-    /// Gives a document with an empty library the starter materials and links
-    /// a legacy material name to the library. Returns the note to show, if any.
+    /// Gives a document with an empty library the starter materials, brings an
+    /// older library up to the current starter set once, and links a legacy
+    /// material name to the library. Returns the note to show, if any.
     pub fn adopt_materials(&mut self) -> Option<String> {
         let shown = |name: &str| crate::proposal::clip(name, crate::material::NAME_LIMIT);
         if self.materials.is_empty() {
             self.materials = crate::material::starters();
+        } else if self.starter_materials < 2 {
+            for m in crate::material::starters()
+                .into_iter()
+                .filter(|m| crate::material::ADDED_IN_SET_2.contains(&m.name()))
+            {
+                if !self
+                    .materials
+                    .iter()
+                    .any(|x| crate::material::same_name(x.name(), m.name()))
+                {
+                    self.materials.push(m);
+                }
+            }
         }
+        self.starter_materials = crate::material::STARTER_SET;
         if !self.material_id.is_empty() && self.selected_material().is_none() {
             self.material_id.clear();
         }
@@ -1643,7 +1663,7 @@ mod tests {
             ..Default::default()
         };
         let note = doc.adopt_materials().unwrap();
-        assert_eq!(doc.materials.len(), 9);
+        assert_eq!(doc.materials.len(), 15);
         assert!(note.contains("linked to the library"), "{note}");
         assert_eq!(doc.selected_material().unwrap().name(), "Aluminium 6061-T6");
         assert_eq!(doc.material, "Aluminium 6061-T6");
@@ -1651,7 +1671,7 @@ mod tests {
             doc.adopt_materials().is_none(),
             "a second call changes nothing"
         );
-        assert_eq!(doc.materials.len(), 9);
+        assert_eq!(doc.materials.len(), 15);
 
         let mut odd = Document {
             material: "Inconel 718".into(),
@@ -1659,12 +1679,12 @@ mod tests {
         };
         let note = odd.adopt_materials().unwrap();
         assert!(note.contains("without cutting data"), "{note}");
-        assert_eq!(odd.materials.len(), 10);
+        assert_eq!(odd.materials.len(), 16);
         assert!(odd.selected_material().unwrap().cutting_data().is_none());
 
         let mut none = Document::default();
         assert!(none.adopt_materials().is_none());
-        assert_eq!(none.materials.len(), 9);
+        assert_eq!(none.materials.len(), 15);
         assert!(none.material_id.is_empty());
 
         let mut stale = none.clone();
@@ -1725,6 +1745,7 @@ mod tests {
         let mut doc = Document {
             materials: vec![Material::new("Édelstahl 1.4301")],
             material: "  édelstahl 1.4301 ".into(),
+            starter_materials: 2,
             ..Default::default()
         };
         let note = doc.adopt_materials().unwrap();
@@ -1770,6 +1791,7 @@ mod tests {
         use crate::material::Material;
         let mut doc = Document {
             materials: vec![Material::new("Titanium Gr5")],
+            starter_materials: 2,
             ..Default::default()
         };
         assert!(doc.adopt_materials().is_none());
@@ -1791,6 +1813,44 @@ mod tests {
         doc.materials.push(blank);
         doc.material_id.clear();
         assert!(doc.selected_material().is_none());
+    }
+    #[test]
+    fn an_existing_library_gets_the_new_alloys_once() {
+        let mut doc = Document {
+            materials: vec![crate::material::Material::new("My alloy")],
+            ..Document::default()
+        };
+        assert!(doc.adopt_materials().is_none());
+        let names: Vec<_> = doc.materials.iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(names.len(), 7, "{names:?}");
+        assert!(names.contains(&"Aluminium 6082-T6".to_string()));
+        assert!(!names.contains(&"Aluminium 6061-T6".to_string()));
+        assert_eq!(doc.starter_materials, crate::material::STARTER_SET);
+        // Deleted after the addition: it does not come back.
+        doc.materials.retain(|m| m.name() != "Aluminium 6063-T6");
+        doc.adopt_materials();
+        assert!(
+            !doc.materials
+                .iter()
+                .any(|m| m.name() == "Aluminium 6063-T6")
+        );
+        // A name the user already has (any case) is not added twice.
+        let mut mine = Document {
+            materials: vec![crate::material::Material::new("aluminium 5083-h111")],
+            ..Document::default()
+        };
+        mine.adopt_materials();
+        assert_eq!(
+            mine.materials
+                .iter()
+                .filter(|m| crate::material::same_name(m.name(), "Aluminium 5083-H111"))
+                .count(),
+            1
+        );
+        // An empty library gets all fifteen and the current set.
+        let mut empty = Document::default();
+        empty.adopt_materials();
+        assert_eq!((empty.materials.len(), empty.starter_materials), (15, 2));
     }
     fn doc_with_holding(pairs: &[(&str, &str)]) -> Document {
         let mut doc = Document::sample();

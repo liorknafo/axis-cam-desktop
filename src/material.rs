@@ -28,6 +28,18 @@ pub fn same_name(a: &str, b: &str) -> bool {
 pub const NAME_LIMIT: usize = 60;
 pub const STARTER_NOTE: &str =
     "Starting point for carbide tools: adjust to your machine and your tool maker's data.";
+/// The starter set a library has been given: 1 is the first nine, 2 adds
+/// six common aluminium alloys. A library is brought up to it once.
+pub const STARTER_SET: u32 = 2;
+/// The starters set 2 added, by name.
+pub const ADDED_IN_SET_2: [&str; 6] = [
+    "Aluminium 6082-T6",
+    "Aluminium 6063-T6",
+    "Aluminium 5083-H111",
+    "Aluminium 5052-H32",
+    "Aluminium 1050A-H14",
+    "Cast aluminium plate (MIC-6)",
+];
 /// Every cutting-data key prefix: the surface speed, then each chip-load band.
 fn bases() -> impl Iterator<Item = &'static str> {
     std::iter::once("vc").chain(BANDS.iter().map(|(k, _)| *k))
@@ -215,7 +227,7 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
 }
 /// The starter library (spec table "Starter materials").
 pub fn starters() -> Vec<Material> {
-    let rows: [(&str, &str, &str, (f32, f32), [(f32, f32); 5], &str); 9] = [
+    let rows: [(&str, &str, &str, (f32, f32), [(f32, f32); 5], &str); 15] = [
         (
             "Aluminium 6061-T6",
             "Aluminium",
@@ -342,6 +354,90 @@ pub fn starters() -> Vec<Material> {
             ],
             "Dust extraction; no coolant.",
         ),
+        (
+            "Aluminium 6082-T6",
+            "Aluminium",
+            "95 HB",
+            (150., 300.),
+            [
+                (0.010, 0.030),
+                (0.020, 0.050),
+                (0.030, 0.080),
+                (0.050, 0.100),
+                (0.060, 0.120),
+            ],
+            "Flood or mist; clear chips. The common European plate and bar alloy; machines like 6061.",
+        ),
+        (
+            "Aluminium 6063-T6",
+            "Aluminium",
+            "73 HB",
+            (150., 300.),
+            [
+                (0.010, 0.030),
+                (0.020, 0.050),
+                (0.030, 0.080),
+                (0.050, 0.100),
+                (0.060, 0.120),
+            ],
+            "Flood or mist; cheap extrusion alloy, softer and gummier than 6061: sharp, polished tools.",
+        ),
+        (
+            "Aluminium 5083-H111",
+            "Aluminium",
+            "75 HB",
+            (120., 250.),
+            [
+                (0.010, 0.025),
+                (0.020, 0.045),
+                (0.030, 0.070),
+                (0.040, 0.090),
+                (0.050, 0.110),
+            ],
+            "Flood; gummy plate alloy: sharp, polished tools and clear chips.",
+        ),
+        (
+            "Aluminium 5052-H32",
+            "Aluminium",
+            "60 HB",
+            (120., 250.),
+            [
+                (0.010, 0.025),
+                (0.020, 0.045),
+                (0.030, 0.070),
+                (0.040, 0.090),
+                (0.050, 0.110),
+            ],
+            "Flood; gummy sheet alloy: sharp, polished tools and clear chips.",
+        ),
+        (
+            "Aluminium 1050A-H14",
+            "Aluminium",
+            "34 HB",
+            (100., 250.),
+            [
+                (0.010, 0.025),
+                (0.015, 0.040),
+                (0.025, 0.060),
+                (0.035, 0.080),
+                (0.045, 0.100),
+            ],
+            "Flood with lubricant; very soft and gummy: sharp, polished one- or two-flute tools.",
+        ),
+        (
+            "Cast aluminium plate (MIC-6)",
+            "Aluminium",
+            "65 HB",
+            (150., 300.),
+            [
+                (0.010, 0.030),
+                (0.020, 0.050),
+                (0.030, 0.080),
+                (0.050, 0.100),
+                (0.060, 0.120),
+            ],
+            "Mist or air; stable cast tooling plate that stays flat.",
+        ),
     ];
     rows.into_iter()
         .map(|(name, group, hardness, vc, fz, note)| {
@@ -378,7 +474,7 @@ mod tests {
     #[test]
     fn starters_are_valid_and_complete() {
         let all = starters();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 15);
         for m in &all {
             assert!(m.issues().is_empty(), "{}: {:?}", m.name(), m.issues());
             assert!(m.cutting_data().is_some(), "{}", m.name());
@@ -386,11 +482,33 @@ mod tests {
             assert!(GROUPS.contains(&get(&m.p, "group")));
         }
         let mut names: Vec<_> = all.iter().map(|m| m.name().to_lowercase()).collect();
+        names.sort();
         names.dedup();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 15);
         let data = alu().cutting_data().unwrap();
         assert_eq!(data.vc, (150., 300.));
         assert_eq!(data.fz[1], (0.02, 0.05));
+    }
+    #[test]
+    fn the_second_starter_set_is_six_common_aluminium_alloys() {
+        let all = starters();
+        for name in ADDED_IN_SET_2 {
+            let m = all.iter().find(|m| m.name() == name).expect(name);
+            assert_eq!(get(&m.p, "group"), "Aluminium", "{name}");
+        }
+        let alloy = |name: &str| {
+            all.iter()
+                .find(|m| m.name() == name)
+                .unwrap()
+                .cutting_data()
+                .unwrap()
+        };
+        assert_eq!(alloy("Aluminium 6082-T6").vc, (150., 300.));
+        assert_eq!(alloy("Aluminium 5083-H111").vc, (120., 250.));
+        assert_eq!(alloy("Aluminium 1050A-H14").fz[0], (0.010, 0.025));
+        // The first nine come first, in their old order.
+        assert_eq!(all[0].name(), "Aluminium 6061-T6");
+        assert_eq!(all[8].name(), "MDF");
     }
     #[test]
     fn cutting_data_must_be_complete_positive_and_ordered() {

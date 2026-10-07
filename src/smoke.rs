@@ -1178,7 +1178,7 @@ mod tests {
         crate::storage::save(&project, &legacy).unwrap();
         let (doc, notes) = crate::storage::load_reporting(&project).unwrap();
         assert_eq!(notes, [linked]);
-        assert_eq!(doc.materials.len(), 9);
+        assert_eq!(doc.materials.len(), 15);
         assert_eq!(doc.selected_material().unwrap().name(), "Brass C360");
         // Open: the status carries the note.
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
@@ -1241,7 +1241,7 @@ mod tests {
             b.status,
             "Choose New project, Open, or Continue your previous project."
         );
-        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 10));
+        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 16));
         assert!(!b.dirty);
         // A workspace that needed no migration starts clean, and so does a blank one.
         let c = App::from_workspace(path, None);
@@ -1264,13 +1264,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         // A blank workspace starts with the starter materials.
-        assert_eq!(a.doc.materials.len(), 9);
+        assert_eq!(a.doc.materials.len(), 15);
         let user = crate::material::Material::new("Titanium Gr5");
         assert!(user.issues().is_empty());
         let titanium = user.id.clone();
         a.doc.materials.push(user);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 10);
+        assert_eq!(a.doc.materials.len(), 16);
         assert!(a.doc.material_id.is_empty() && a.doc.material.is_empty());
         // The user's own copy of a starter, renamed in another case and
         // edited, is kept; no starter is added next to it.
@@ -1292,8 +1292,8 @@ mod tests {
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(names.len(), 10);
-        assert_eq!(unique.len(), 10, "{names:?}");
+        assert_eq!(names.len(), 16);
+        assert_eq!(unique.len(), 16, "{names:?}");
         assert!(a.doc.materials.iter().any(|m| m.id == titanium));
         assert_eq!(a.doc.material_id, mine);
         assert_eq!(
@@ -1311,15 +1311,15 @@ mod tests {
         );
         // Opening it again, and a new project, add nothing more.
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 10);
+        assert_eq!(a.doc.materials.len(), 16);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 10);
+        assert_eq!(a.doc.materials.len(), 16);
         assert!(a.doc.material_id.is_empty());
         // An example opened from a library without the user's edits links
         // its material to the starter.
         let mut fresh = App::from_workspace(dir.path().join("other").join("workspace.json"), None);
         let _ = fresh.update(Message::OpenSample);
-        assert_eq!(fresh.doc.materials.len(), 9);
+        assert_eq!(fresh.doc.materials.len(), 15);
         assert_eq!(
             fresh.doc.selected_material().unwrap().name(),
             "Aluminium 6061-T6"
@@ -1341,6 +1341,7 @@ mod tests {
                 Material::new(" édelstahl 304 "),
                 Material::new(" aluminium 6061-t6 "),
             ],
+            starter_materials: 2,
             ..Document::default()
         };
         let (doc, status) = crate::merge_sample(&user);
@@ -1359,11 +1360,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 6061-T6");
-        assert_eq!(a.doc.materials.len(), 8);
+        assert_eq!(a.doc.materials.len(), 14);
         let _ = a.update(Message::OpenSample);
         // The deleted starter is not brought back with its data: the example's
         // material is added to the library without cutting data, and says so.
-        assert_eq!(a.doc.materials.len(), 9);
+        assert_eq!(a.doc.materials.len(), 15);
         let selected = a.doc.selected_material().unwrap();
         assert_eq!(selected.name(), "Aluminium 6061-T6");
         assert!(selected.cutting_data().is_none());
@@ -1375,8 +1376,25 @@ mod tests {
         // New project and a second Explore example keep that entry once.
         let _ = a.update(Message::NewProject);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 9);
+        assert_eq!(a.doc.materials.len(), 15);
         assert!(a.status.contains("linked to the library"), "{}", a.status);
+    }
+    #[test]
+    fn a_deleted_new_alloy_does_not_come_back_in_a_new_project_or_the_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.doc.materials.retain(|m| m.name() != "Aluminium 5052-H32");
+        let _ = a.update(Message::NewProject);
+        assert_eq!(a.doc.materials.len(), 14);
+        let _ = a.update(Message::OpenSample);
+        assert_eq!(a.doc.materials.len(), 14);
+        assert!(
+            !a.doc
+                .materials
+                .iter()
+                .any(|m| m.name() == "Aluminium 5052-H32")
+        );
+        assert_eq!(a.doc.starter_materials, crate::material::STARTER_SET);
     }
     #[test]
     fn the_first_save_on_an_empty_library_gets_a_tool_number() {

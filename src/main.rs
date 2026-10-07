@@ -1342,6 +1342,7 @@ impl App {
                     machines: self.doc.machines.clone(),
                     tools: self.doc.tools.clone(),
                     materials: self.doc.materials.clone(),
+                    starter_materials: self.doc.starter_materials,
                     workholding: self.doc.workholding.clone(),
                     ..Document::default()
                 };
@@ -3118,6 +3119,7 @@ fn merge_sample(user: &Document) -> (Document, String) {
             }
         }
     }
+    doc.starter_materials = user.starter_materials;
     let material_note = doc.adopt_materials();
     let starter_holders = holding::starters();
     for h in &user.workholding {
