@@ -221,16 +221,17 @@ pub fn partial(text: &str) -> Draft {
         }
         body = &body[..end];
     }
-    let mut end = body.len();
+    let (mut end, mut delimited) = (body.len(), false);
     for _ in 0..64 {
-        let (candidate, boundary) = closed(&body[..end]);
+        let (candidate, boundary) = closed(&body[..end], delimited);
         if let Some(candidate) = candidate
             && let Ok(value) = serde_json::from_str::<Value>(&candidate)
         {
             return Draft::of(&value, true);
         }
         match boundary {
-            Some(b) if b < end => end = b,
+            // A cut at a comma or bracket leaves a text that ends in a delimiter.
+            Some(b) if b < end => (end, delimited) = (b, true),
             _ => break,
         }
     }
@@ -241,10 +242,15 @@ pub fn partial(text: &str) -> Draft {
 }
 /// `prefix` closed into JSON (None when it ends inside a number, literal or
 /// key), and where to cut it back to: before its last `,`, or just after its
-/// last `{` or `[`, outside strings.
-fn closed(prefix: &str) -> (Option<String>, Option<usize>) {
+/// last `{` or `[`, outside strings. A `,` or whitespace after the last value
+/// ends it, and so does `delimited`, which says the caller already cut
+/// `prefix` at a comma or bracket; only a value with nothing after it may still
+/// be growing. A trailing `,` is dropped.
+fn closed(prefix: &str, delimited: bool) -> (Option<String>, Option<usize>) {
     let mut stack = vec![];
-    let (mut in_string, mut escaped, mut boundary) = (false, false, None);
+    let (mut in_string, mut escaped) = (false, false);
+    // The last two cut points outside strings, the latest last.
+    let (mut before, mut boundary) = (None, None);
     for (i, c) in prefix.char_indices() {
         if in_string {
             match (escaped, c) {
@@ -259,7 +265,7 @@ fn closed(prefix: &str) -> (Option<String>, Option<usize>) {
             '"' => in_string = true,
             '{' | '[' => {
                 stack.push(if c == '{' { '}' } else { ']' });
-                boundary = Some(i + 1);
+                (before, boundary) = (boundary, Some(i + 1));
                 if stack.len() > PARTIAL_DEPTH {
                     return (None, None);
                 }
@@ -267,7 +273,7 @@ fn closed(prefix: &str) -> (Option<String>, Option<usize>) {
             '}' | ']' => {
                 stack.pop();
             }
-            ',' => boundary = Some(i),
+            ',' => (before, boundary) = (boundary, Some(i)),
             _ => {}
         }
     }
@@ -281,11 +287,21 @@ fn closed(prefix: &str) -> (Option<String>, Option<usize>) {
             }
         }
         out.push('"');
-    } else if out
-        .trim_end()
-        .ends_with(|c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
-    {
-        return (None, boundary);
+    } else {
+        let kept = out.trim_end().len();
+        let mut finished = delimited || kept < out.len();
+        out.truncate(kept);
+        if out.ends_with(',') {
+            out.pop();
+            let kept = out.trim_end().len();
+            out.truncate(kept);
+            (boundary, finished) = (before, true);
+        }
+        if !finished
+            && out.ends_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+        {
+            return (None, boundary);
+        }
     }
     out.extend(stack.iter().rev());
     (Some(out), boundary)
@@ -1625,12 +1641,48 @@ pub(crate) mod tests {
     fn a_reply_cut_anywhere_reads_as_far_as_it_has_come() {
         let (_, _, report) = block();
         let full = serde_json::to_string(&good(&report)).unwrap();
-        let mut last_ops = 0;
+        let summary = good(&report).summary;
+        let summary_end = full.find("\",\"setups\"").unwrap() + 1;
+        let rpm_at = full.find("\"rpm\":").unwrap();
+        let rpm_end = rpm_at + full[rpm_at..].find(',').unwrap() + 1;
+        // What each operation has shown so far, by setup and operation.
+        let mut seen: std::collections::HashMap<(usize, usize), DraftOp> = Default::default();
+        let (mut last_setups, mut last_ops) = (0, 0);
         for end in (0..=full.len()).filter(|i| full.is_char_boundary(*i)) {
             let draft = partial(&full[..end]);
             let ops: usize = draft.setups.iter().map(|s| s.operations.len()).sum();
-            assert!(ops + 1 >= last_ops, "at {end}: {ops} after {last_ops}");
-            last_ops = ops;
+            assert!(draft.setups.len() >= last_setups, "at {end}: setups left");
+            assert!(ops >= last_ops, "at {end}: {ops} after {last_ops}");
+            (last_setups, last_ops) = (draft.setups.len(), ops);
+            if let Some(shown) = &draft.summary {
+                assert!(summary.starts_with(shown), "at {end}: {shown:?}");
+            }
+            if end >= summary_end {
+                assert_eq!(draft.summary.as_deref(), Some(summary.as_str()), "at {end}");
+            }
+            if end >= rpm_end {
+                assert_eq!(draft.setups[0].operations[0].rpm, Some(8000.), "at {end}");
+            }
+            for (s, setup) in draft.setups.iter().enumerate() {
+                for (o, op) in setup.operations.iter().enumerate() {
+                    let before = seen.entry((s, o)).or_default();
+                    for (was, now, what) in [
+                        (
+                            before.tool.map(|v| v as f64),
+                            op.tool.map(|v| v as f64),
+                            "tool",
+                        ),
+                        (before.rpm, op.rpm, "rpm"),
+                        (before.feed, op.feed, "feed"),
+                    ] {
+                        assert!(
+                            was.is_none() || was == now,
+                            "at {end}: {what} {was:?} -> {now:?}"
+                        );
+                    }
+                    *before = op.clone();
+                }
+            }
         }
         let done = partial(&full);
         assert!(!done.writing);
@@ -1671,5 +1723,52 @@ pub(crate) mod tests {
         let draft = partial(&huge);
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
         assert!(draft.summary.is_some());
+    }
+    #[test]
+    fn a_long_array_of_numbers_keeps_everything_before_it() {
+        let (_, _, report) = block();
+        let mut proposal = good(&report);
+        proposal.setups[0].operations[1].surfaces = (1000..1500).collect();
+        let full = serde_json::to_string(&proposal).unwrap();
+        let start = full.find("[1000,1001,").unwrap();
+        let end = start + full[start..].find(']').unwrap();
+        for at in start..=end {
+            let draft = partial(&full[..at]);
+            let place = format!("at {at}: {}", &full[at - 6..at]);
+            assert_eq!(
+                draft.summary.as_deref(),
+                Some("Top side, then the underside."),
+                "{place}"
+            );
+            assert_eq!(draft.setups.len(), 1, "{place}");
+            let ops = &draft.setups[0].operations;
+            assert_eq!(ops.len(), 2, "{place}");
+            assert_eq!(ops[0].rpm, Some(8000.), "{place}");
+            assert_eq!(ops[1].tool, Some(1), "{place}");
+            assert!(draft.writing, "{place}");
+        }
+        // Cut just after a digit, and just after a comma.
+        for at in [start + 5, start + 6] {
+            assert_eq!(partial(&full[..at]).setups[0].operations.len(), 2);
+        }
+    }
+    #[test]
+    fn a_finished_number_shows_at_its_comma_and_one_being_written_hides_only_itself() {
+        let head = r#"{"summary":"s","setups":[{"name":"Top","operations":[{"strategy":"Face","tool":2,"surfaces":[3],"rpm":8000,"#;
+        let op = |text: String| partial(&text).setups[0].operations[0].clone();
+        let after_comma = op(head.to_string());
+        assert_eq!((after_comma.tool, after_comma.rpm), (Some(2), Some(8000.)));
+        let writing = op(format!("{head}\"feed\":5"));
+        assert_eq!((writing.tool, writing.rpm), (Some(2), Some(8000.)));
+        assert_eq!(writing.feed, None);
+        assert_eq!(op(format!("{head}\"feed\":5,")).feed, Some(5.));
+        // Whitespace after a number ends it as well.
+        assert_eq!(op(format!("{head} \"feed\": 7\n")).feed, Some(7.));
+        assert_eq!(op(format!("{head} \"feed\": ")).feed, None);
+        // Spaces inside a string are kept.
+        assert_eq!(
+            partial("{\"summary\": \"a  ").summary.as_deref(),
+            Some("a  ")
+        );
     }
 }
