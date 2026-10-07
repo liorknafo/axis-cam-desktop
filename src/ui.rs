@@ -3487,12 +3487,18 @@ fn step_summary(result: &crate::planner::StepResult) -> String {
 const DRAFT_SETUPS: usize = 6;
 /// What the model has written of its reply so far, as timeline lines.
 pub(crate) fn draft_lines(draft: &crate::proposal::Draft) -> Vec<String> {
-    if draft.summary.is_none() && draft.setups.is_empty() {
+    // A summary whose opening quote has just arrived is not written yet.
+    let summary = draft
+        .summary
+        .as_deref()
+        .map(|summary| clip(summary, 300))
+        .filter(|summary| !summary.is_empty());
+    if summary.is_none() && draft.setups.is_empty() {
         return vec!["Thinking: the model has not started writing yet.".into()];
     }
     let mut lines = vec![];
-    if let Some(summary) = &draft.summary {
-        lines.push(format!("Plan: {}", clip(summary, 300)));
+    if let Some(summary) = summary {
+        lines.push(format!("Plan: {summary}"));
     }
     let last = draft.setups.len().saturating_sub(1);
     for (i, setup) in draft.setups.iter().enumerate().take(DRAFT_SETUPS) {
@@ -3617,16 +3623,17 @@ pub(crate) fn timeline_rows(
                 }
             }
             if finished {
-                // The one line says what the request saw and what was refused;
-                // the lines themselves are shown only while the run goes.
-                let seen = step.looks.iter().filter(|l| l.thumb.is_some()).count();
-                if seen > 0 {
-                    text = format!("{text} · {}", plural(seen, "look"));
-                }
+                // The one line says what was refused and ends with what the
+                // request saw; the lines themselves are shown only while the
+                // run goes.
                 for refusal in step.looks.iter().filter(|l| l.warn) {
                     // "OpenAI refused pictures; continuing with text only."
                     let said = refusal.line.split(';').next().unwrap_or(&refusal.line);
                     text = format!("{text} · {said}");
+                }
+                let seen = step.looks.iter().filter(|l| l.thumb.is_some()).count();
+                if seen > 0 {
+                    text = format!("{text} · {}", plural(seen, "look"));
                 }
             }
             let mark = match (step.ended, &step.result) {

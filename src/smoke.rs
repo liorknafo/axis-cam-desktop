@@ -5134,6 +5134,30 @@ mod tests {
         );
     }
     #[test]
+    fn a_summary_not_yet_written_is_still_thinking() {
+        use crate::proposal::partial;
+        let thinking = vec!["Thinking: the model has not started writing yet.".to_string()];
+        // The summary's opening quote has arrived and nothing more.
+        assert_eq!(partial("{\"summary\":\"").summary.as_deref(), Some(""));
+        assert_eq!(
+            crate::ui::draft_lines(&partial("{\"summary\":\"")),
+            thinking
+        );
+        assert_eq!(
+            crate::ui::draft_lines(&partial("{\"summary\":\" \\n  ")),
+            thinking
+        );
+        // Once a word has, it is the plan; a setup shows without an empty plan.
+        assert_eq!(
+            crate::ui::draft_lines(&partial("{\"summary\":\"Fa")),
+            ["Plan: Fa"]
+        );
+        assert_eq!(
+            crate::ui::draft_lines(&partial("{\"summary\":\"\",\"setups\":[{")),
+            ["Setup 1"]
+        );
+    }
+    #[test]
     fn a_draft_shows_six_setups_and_counts_the_rest() {
         use crate::proposal::{Draft, DraftSetup};
         let setups = |n: usize| -> Vec<DraftSetup> {
@@ -5256,10 +5280,11 @@ mod tests {
         a.record_plan_event(Event::Stage(Progress::Checking(1)));
         let _ = a.view();
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), true);
+        assert!(rows[0].text.ends_with("· 1 look"), "{}", rows[0].text);
         assert!(
             rows[0]
                 .text
-                .ends_with("· 1 look · OpenAI refused pictures · OpenAI refused the picture tool"),
+                .ends_with("· OpenAI refused pictures · OpenAI refused the picture tool · 1 look"),
             "{}",
             rows[0].text
         );
@@ -5298,6 +5323,8 @@ mod tests {
         a.record_plan_event(Event::Stage(Progress::Checking(2)));
         a.record_plan_event(Event::Checked(2, StepResult::Passed));
         a.record_plan_event(Event::Stage(Progress::Extending(3)));
+        a.record_plan_event(Event::Dropped(3, Dropped::Pictures));
+        a.record_plan_event(Event::Looked(3, picture("+Z up, side")));
         a.record_plan_event(Event::Stage(Progress::Checking(3)));
         a.record_plan_event(Event::Checked(3, StepResult::Passed));
         let now = std::time::Instant::now();
@@ -5311,7 +5338,8 @@ mod tests {
         assert_eq!(tail(1), ["passed"]);
         assert_eq!(tail(2), ["2 looks"]);
         assert_eq!(tail(3), ["passed"]);
-        assert!(tail(4).is_empty());
+        // The count is last, after what was refused.
+        assert_eq!(tail(4), ["OpenAI refused pictures", "1 look"]);
         // The same rows while the run goes: the lines, not the summary.
         let rows = crate::ui::timeline_rows(&a, now, false);
         assert_eq!(rows[0].looks.len(), 1);
