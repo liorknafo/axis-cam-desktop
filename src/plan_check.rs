@@ -1678,15 +1678,15 @@ mod tests {
         assert_eq!(found.len(), 2, "{found:?}");
         // Setup 2's work zero is the model's top, 3 mm below its stock top
         // (the stock left under the part in setup 1): its heights are 3 mm up.
-        for (found, (setup, plane, top)) in found
+        for (found, (setup, plane, top, over)) in found
             .iter()
-            .zip([(1, "Z15.0", "Z27.0"), (2, "Z18.0", "Z30.0")])
+            .zip([(1, "Z15.0", "Z27.0", "27.0"), (2, "Z18.0", "Z30.0", "27.0")])
         {
             assert!(
                 found.starts_with(&format!(
                     "workholding {setup}/None: The setup clearance plane ({plane}) is not above the clamp on "
                 )) && found.contains(&format!(
-                    "and its 2 mm gap ({top}). Raise the operations' clearance heights above {top}"
+                    "and its 2 mm gap ({top}). Raise the operations' clearance above {over} mm over the stock top ({top}), or retract to machine home."
                 )),
                 "{found}"
             );

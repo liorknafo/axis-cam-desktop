@@ -37,6 +37,8 @@ pub struct Face {
     pub feature: Option<usize>,
     pub tone: f32,
 }
+/// How many angle sets `Mesh::rotated_bounds` keeps.
+const ROTATED_BOUNDS_KEPT: usize = 8;
 #[derive(Debug, Clone)]
 pub struct Mesh {
     pub faces: Vec<Face>,
@@ -48,18 +50,23 @@ pub struct Mesh {
     pub units: &'static str,
     /// Display-space position of the source file's (0,0,0).
     pub origin: [f32; 3],
-    rotated_bounds: RefCell<Option<([f32; 3], Bounds)>>,
+    rotated_bounds: RefCell<Vec<([f32; 3], Bounds)>>,
 }
 impl Mesh {
     /// The preview normalization is uniform; use the same factor for mm stock.
     pub fn display_scale(&self) -> f32 {
         140. / self.dimensions.into_iter().fold(0., f32::max)
     }
+    /// The bounds of the part turned by `angles`. The last few angle sets
+    /// asked are kept, since the setups of a job ask in turn.
     pub fn rotated_bounds(&self, angles: [f32; 3]) -> Bounds {
-        if let Some((previous, bounds)) = *self.rotated_bounds.borrow()
-            && previous == angles
+        if let Some((_, bounds)) = self
+            .rotated_bounds
+            .borrow()
+            .iter()
+            .find(|(a, _)| *a == angles)
         {
-            return bounds;
+            return *bounds;
         }
         let mut bounds = Bounds {
             min: [f32::INFINITY; 3],
@@ -72,7 +79,11 @@ impl Mesh {
                 bounds.max[i] = bounds.max[i].max(v);
             }
         }
-        *self.rotated_bounds.borrow_mut() = Some((angles, bounds));
+        let mut kept = self.rotated_bounds.borrow_mut();
+        if kept.len() == ROTATED_BOUNDS_KEPT {
+            kept.remove(0);
+        }
+        kept.push((angles, bounds));
         bounds
     }
 }
@@ -260,7 +271,7 @@ pub(crate) fn normalize(tris: Vec<[[f32; 3]; 3]>) -> Result<Mesh, String> {
         sampled: false,
         units: "source units",
         origin,
-        rotated_bounds: RefCell::new(None),
+        rotated_bounds: RefCell::new(vec![]),
     })
 }
 pub fn sample() -> Mesh {
@@ -294,7 +305,7 @@ pub fn sample() -> Mesh {
         sampled: false,
         units: "mm",
         origin: [0., 0., 0.],
-        rotated_bounds: RefCell::new(None),
+        rotated_bounds: RefCell::new(vec![]),
     }
 }
 fn box_faces(out: &mut Vec<Face>, a: [f32; 3], b: [f32; 3], feature: Option<usize>, tone: f32) {
@@ -494,6 +505,47 @@ mod tests {
         let bad = dir.path().join("bad.step");
         std::fs::write(&bad, "this is not STEP").unwrap();
         assert!(load(&bad).is_err());
+    }
+    fn tilted() -> Mesh {
+        normalize(vec![
+            [[0., 0., 0.], [30., 0., 0.], [0., 20., 10.]],
+            [[30., 0., 0.], [30., 20., 5.], [0., 20., 10.]],
+        ])
+        .unwrap()
+    }
+    #[test]
+    fn rotated_bounds_keep_several_angle_sets_and_stay_correct() {
+        let mesh = tilted();
+        let (a, b) = ([0.; 3], [0., 0., 30.]);
+        let fresh = |angles| tilted().rotated_bounds(angles);
+        // Two angle sets asked in turn, as setup 1 and a later setup are,
+        // both stay cached and give what a mesh with no cache gives.
+        for _ in 0..3 {
+            for angles in [a, b] {
+                assert_eq!(mesh.rotated_bounds(angles), fresh(angles), "{angles:?}");
+            }
+        }
+        assert_ne!(fresh(a), fresh(b));
+        assert_eq!(mesh.rotated_bounds.borrow().len(), 2);
+        // More angle sets than the cache holds: the oldest go, the answers
+        // stay right, and an angle set that was dropped is worked out again.
+        let many: Vec<[f32; 3]> = (0..20)
+            .map(|k| [k as f32 * 7., 0., k as f32 * 13.])
+            .collect();
+        for angles in many.iter().chain(&many).chain([&a, &b]) {
+            assert_eq!(mesh.rotated_bounds(*angles), fresh(*angles), "{angles:?}");
+            assert!(mesh.rotated_bounds.borrow().len() <= 8);
+        }
+    }
+    #[test]
+    fn a_mesh_keeps_its_own_rotated_bounds() {
+        let small = tilted();
+        let big = normalize(vec![[[0., 0., 0.], [50., 0., 0.], [0., 40., 25.]]]).unwrap();
+        let angles = [0., 0., 30.];
+        let (first, second) = (small.rotated_bounds(angles), big.rotated_bounds(angles));
+        assert_ne!(first, second);
+        assert_eq!(small.rotated_bounds(angles), first);
+        assert_eq!(big.rotated_bounds(angles), second);
     }
     #[test]
     fn normalize_remembers_the_source_origin() {

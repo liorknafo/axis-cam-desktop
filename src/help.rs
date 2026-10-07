@@ -546,7 +546,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "holding") => (
-            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut. None models nothing; the Fixture note below is only a description.",
+            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description.",
             None,
         ),
         (Target::Setup, "holder") => (
@@ -558,7 +558,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "vise_offset") => (
-            "Shifts the jaws along their length from the middle of the stock, in mm: toward +Y for jaws on the X sides, toward +X for jaws on the Y sides. 0 centres them.",
+            "Shifts the jaws along their length from the middle of the stock, in mm: toward +Y for jaws on the X sides, toward +X for jaws on the Y sides. 0 centres them. The jaws must still overlap the stock along their length: an offset of half the stock's length plus half the jaw width or more shows an issue.",
             None,
         ),
         (Target::Setup, "vise_grip") => (
@@ -570,7 +570,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "clamps") => (
-            "Where the clamps sit, written side:offset and separated by semicolons, for example -X:0; +X:20. The sides are -X, +X, -Y and +Y of the stock; the offset, in mm, moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides). Place 1 to 8 clamps. The text is saved only when every clamp reads correctly; what is wrong is shown under the field.",
+            "Where the clamps sit, written side:offset and separated by semicolons, for example -X:0; +X:20. The sides are -X, +X, -Y and +Y of the stock; the offset, in mm, moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides), and no more than half that side's length. Place 1 to 8 clamps. The text is saved only when every clamp reads correctly; what is wrong is shown under the field.",
             None,
         ),
         (_, "name") => (
@@ -1859,11 +1859,21 @@ mod tests {
             "a wider shank or a reduced neck is not modelled",
             "warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included",
             "Parallels, bolts, the table and the machine body are not modelled",
-            "In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut",
+            "In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them",
             "the Fixture note below is only a description",
         ] {
             assert!(holding.contains(part), "{part}: {holding}");
         }
+        let offset = field_help("vise_offset", "x", Target::Setup).body;
+        assert!(
+            offset.contains("must still overlap the stock along their length"),
+            "{offset}"
+        );
+        let clamps = field_help("clamps", "x", Target::Setup).body;
+        assert!(
+            clamps.contains("no more than half that side's length"),
+            "{clamps}"
+        );
         // The old fixture description and clearance are records only; the
         // texts that said fixtures are never checked say what is.
         let fixture = field_help("fixture", "x", Target::Setup).body;

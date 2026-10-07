@@ -13,14 +13,26 @@ pub struct Frame {
 }
 impl Frame {
     pub fn new(setup: &Setup, mesh: &Mesh) -> Self {
-        let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
         let placement = Placement::new(mesh, Some(setup));
         Self {
-            basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|p| rotation(p, angles)),
             shift: placement
                 .transform([0.; 3])
                 .map(|v| v / mesh.display_scale()),
+            ..Self::axes(setup)
         }
+    }
+    /// The axes of `setup`'s frame, which its rotation alone gives, at no shift.
+    fn axes(setup: &Setup) -> Self {
+        let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+        Self {
+            basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|p| rotation(p, angles)),
+            shift: [0.; 3],
+        }
+    }
+    /// Whether the frame of `later` is square to that of `first`, from their
+    /// rotations alone (`square_to`): no part is needed.
+    pub fn setups_square(first: &Setup, later: &Setup) -> bool {
+        Self::axes(first).square_to(Self::axes(later))
     }
     fn map(self, p: [f32; 3]) -> [f32; 3] {
         std::array::from_fn(|k| {

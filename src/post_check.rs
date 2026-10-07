@@ -237,7 +237,9 @@ pub fn holding_problems(
     // clearance plane: it has to clear every box and its gap (a tip exactly
     // at the top and gap touches, as in the hits).
     if !settings.machine_home && plane <= top + gap {
-        let message = crate::holding::plane_message(&highest.label, plane, gap, top, datum[2]);
+        let stock_top = plans.first().map_or(datum[2], |plan| plan.stock.max[2]);
+        let message =
+            crate::holding::plane_message(&highest.label, plane, gap, top, datum[2], stock_top);
         problems.add(None, "plane", message);
     }
     let high = if settings.machine_home {
@@ -677,7 +679,7 @@ mod tests {
                 &boxes
             ),
             [
-                "The setup clearance plane (Z-10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z52.0). Raise the operations' clearance heights above Z52.0 or retract to machine home."
+                "The setup clearance plane (Z-10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z52.0). Raise the operations' clearance above 52.0 mm over the stock top (Z52.0), or retract to machine home."
             ]
         );
     }
@@ -734,7 +736,7 @@ mod tests {
         assert_eq!(
             walk(clearance(), &ops, &[&a, &b], &boxes),
             [
-                "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home.",
+                "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home.",
                 "Cut B: the tool hits the clamp on +X (offset 0) at X30.0 Y0.0 Z10.0 (within the 2 mm gap)."
             ]
         );
@@ -753,7 +755,7 @@ mod tests {
         assert_eq!(
             walk(clearance(), &ops, &[&a, &b], &boxes),
             [
-                "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home.",
+                "The setup clearance plane (Z10.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home.",
                 hit
             ]
         );
@@ -777,7 +779,7 @@ mod tests {
         assert_eq!(
             walk(clearance(), &one, &[&plan], &boxes),
             [
-                "The setup clearance plane (Z10.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home."
+                "The setup clearance plane (Z10.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home."
             ]
         );
     }
@@ -799,7 +801,7 @@ mod tests {
         assert_eq!(
             refused(37., std::slice::from_ref(&low)),
             [
-                "The setup clearance plane (Z27.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home."
+                "The setup clearance plane (Z27.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home."
             ]
         );
         assert!(refused(37.5, std::slice::from_ref(&low)).is_empty());
@@ -808,7 +810,7 @@ mod tests {
         assert_eq!(
             refused(45., &both),
             [
-                "The setup clearance plane (Z35.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z42.0). Raise the operations' clearance heights above Z42.0 or retract to machine home."
+                "The setup clearance plane (Z35.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z42.0). Raise the operations' clearance above 42.0 mm over the stock top (Z42.0), or retract to machine home."
             ]
         );
         assert!(refused(52.5, &both).is_empty());

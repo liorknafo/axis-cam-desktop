@@ -2737,6 +2737,28 @@ mod tests {
         assert!(crate::ui::holding_lines(&a).is_empty());
     }
     #[test]
+    fn the_setup_editor_says_a_later_setup_not_square_to_setup_1_cannot_model_its_workholding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.index(), 1);
+        let _ = a.update(Message::SetupEditor);
+        for rz in ["90", "180"] {
+            edit_setup(&mut a, &[("rz", rz)]);
+            assert!(crate::ui::holding_lines(&a).is_empty(), "rz {rz}");
+            let _ = a.view();
+        }
+        edit_setup(&mut a, &[("rz", "30")]);
+        assert_eq!(crate::ui::holding_lines(&a), [crate::holding::NOT_SQUARE]);
+        let _ = a.view();
+        // The 3D view draws no boxes for it, and setup 1 is as it was.
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        let _ = a.update(Message::SelectSetup(0));
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        let _ = a.view();
+    }
+    #[test]
     fn the_workholding_page_and_the_setup_editor_build_in_each_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
@@ -3147,7 +3169,7 @@ mod tests {
         assert_eq!(crate::ui::holding_warning(&a), None);
         // Moved clear of the pocket, the clamp is not in the way.
         let _ = a.update(Message::Generate);
-        a.doc.setups[0].p.insert("clamps".into(), "-X:50".into());
+        a.doc.setups[0].p.insert("clamps".into(), "-X:42".into());
         assert_eq!(crate::ui::holding_warning(&a), None);
         let _ = a.view();
         // A setup that cannot be modelled says the check did not run, with the editor's line.
@@ -3346,6 +3368,82 @@ mod tests {
         assert_eq!(back.name(), "100 mm machine vise (restored)");
         assert!(back.issues().is_empty());
         assert!(a.doc.holder_name_issues(back).is_empty());
+        assert!(
+            a.status
+                .ends_with(" 100 mm machine vise (restored) is back in the workholding library."),
+            "{}",
+            a.status
+        );
+    }
+    #[test]
+    fn apply_brings_back_a_workholding_entry_deleted_after_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let vise = first_of(&a, "Vise");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        // A low grip, as in the undo test: the plan's contour cuts down to
+        // 3 mm above the stock bottom.
+        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
+        let show = |a: &mut App| {
+            let preview = checked_preview(a, false);
+            let _ = a.update(Message::Plan);
+            let epoch = a.plan_epoch;
+            let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
+            assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        };
+        show(&mut a);
+        // The entry is gone from the library when the plan is applied. (The
+        // Workholding page touches the job when it deletes one, which
+        // discards the preview; this is an entry lost some other way.)
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        a.doc.workholding.retain(|h| h.id != vise);
+        assert!(a.doc.holder(&vise).is_none());
+        let _ = a.update(Message::ApplyPlan);
+        assert!(a.undo.is_some(), "{}", a.status);
+        assert_eq!(
+            a.doc.workholding.iter().filter(|h| h.id == vise).count(),
+            1,
+            "the vise is back once, with its own id"
+        );
+        assert!(a.doc.setups.iter().all(|s| get(&s.p, "holder") == vise));
+        for si in 0..a.doc.setups.len() {
+            assert!(a.doc.holding_issues(si, None).is_empty(), "setup {si}");
+        }
+        assert!(a.doc.validate_structure().is_ok());
+        assert!(
+            a.status
+                .ends_with(" 100 mm machine vise is back in the workholding library."),
+            "{}",
+            a.status
+        );
+        // Undo keeps what Apply brought back, and says nothing more of it.
+        let _ = a.update(Message::UndoPlan);
+        assert_eq!(a.doc.workholding.iter().filter(|h| h.id == vise).count(), 1);
+        // An entry that was not deleted is not added again, and a name that
+        // another entry has taken since is made new.
+        let mut a = signed_in_planning_app(&dir);
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
+        let count = a.doc.workholding.len();
+        show(&mut a);
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(a.doc.workholding.len(), count);
+        assert!(!a.status.contains("workholding library"), "{}", a.status);
+        let mut a = signed_in_planning_app(&dir);
+        let vise = first_of(&a, "Vise");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
+        show(&mut a);
+        a.doc.setups[0].p.insert("holding".into(), "None".into());
+        a.doc.workholding.retain(|h| h.id != vise);
+        let mut taken = crate::holding::starters().remove(0);
+        taken.p.insert("name".into(), "100 MM machine vise".into());
+        a.doc.workholding.push(taken);
+        let _ = a.update(Message::ApplyPlan);
+        let back = a.doc.holder(&vise).unwrap();
+        assert_eq!(back.name(), "100 mm machine vise (restored)");
+        assert!(a.doc.holder_name_issues(back).is_empty());
+        assert!(a.doc.validate_structure().is_ok());
         assert!(
             a.status
                 .ends_with(" 100 mm machine vise (restored) is back in the workholding library."),
@@ -6043,7 +6141,7 @@ mod tests {
         );
         assert_eq!(
             plan_not_checked(Held::Every),
-            "Not checked: cutting loads, tool deflection, parallels, bolts, the table and the machine body. Vise jaws and clamps are checked as boxes with a clearance gap in every setup. Speeds and feeds are checked against the material's cutting data, which are starting points."
+            "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
         );
         assert_eq!(plan_not_checked(Held::Mixed), plan_not_checked(Held::No));
         // The page beside the Plan button says the cutting data are sent.
@@ -6062,13 +6160,13 @@ mod tests {
         assert_eq!(
             program_note(Held::Every),
             format!(
-                "{base}Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked: preview each program in LinuxCNC and air-cut first."
+                "{base}Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
             )
         );
         assert_eq!(
             program_note(Held::Mixed),
             format!(
-                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked: preview each program in LinuxCNC and air-cut first."
+                "{base}Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked; retracts to machine home are assumed to clear everything: preview each program in LinuxCNC and air-cut first."
             )
         );
         // The good plan's work-zero lines, with the values its check found:

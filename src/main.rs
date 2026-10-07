@@ -1463,12 +1463,10 @@ impl App {
                     }
                     // Only the first Vise or Clamps and a different library
                     // entry place the jaws or clamps; later edits are kept.
-                    let p = &self.doc.setup().p;
-                    let placed = |key| !get(p, key).trim().is_empty();
-                    let suggest = match (k, get(p, "holding")) {
-                        ("holding", "Vise") => !placed("vise_axis"),
-                        ("holding", "Clamps") => !placed("clamps"),
-                        ("holder", "Vise" | "Clamps") => get(p, "holder") != holder,
+                    let setup = self.doc.setup();
+                    let suggest = match (k, get(&setup.p, "holding")) {
+                        ("holding", "Vise" | "Clamps") => !holding::placed(setup),
+                        ("holder", "Vise" | "Clamps") => get(&setup.p, "holder") != holder,
                         _ => false,
                     };
                     if !suggest || !self.suggest_layout() {
@@ -2555,12 +2553,17 @@ impl App {
                 }
                 self.undo = Some(self.doc.clone());
                 self.planner = Planner::Idle;
+                // A workholding entry the plan's setups use that was deleted
+                // since the preview comes back, as Undo does it.
+                let restored = self.doc.restore_holders(&job, &job.setups);
                 self.doc.setups = job.setups;
                 self.doc.active = job.active;
                 self.stop_selection();
                 self.page = Page::Work;
                 self.touch();
-                self.status = "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC program.".into();
+                self.status = format!(
+                    "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC program.{restored}"
+                );
             }
             Message::UndoPlan => {
                 if self.undo.is_none() {
@@ -2621,22 +2624,7 @@ impl App {
                 }
                 // The same for a workholding entry a restored setup uses; its
                 // name is made new when another entry has taken it.
-                for id in before
-                    .setups
-                    .iter()
-                    .filter(|s| matches!(get(&s.p, "holding"), "Vise" | "Clamps"))
-                    .map(|s| get(&s.p, "holder"))
-                {
-                    if let (None, Some(entry)) = (self.doc.holder(id), before.holder(id)) {
-                        let mut entry = entry.clone();
-                        if !self.doc.holder_name_issues(&entry).is_empty() {
-                            let name = proposal::clip(entry.name(), material::NAME_LIMIT - 11);
-                            entry.p.insert("name".into(), format!("{name} (restored)"));
-                        }
-                        status += &format!(" {} is back in the workholding library.", entry.name());
-                        self.doc.workholding.push(entry);
-                    }
-                }
+                status += &self.doc.restore_holders(&before, &before.setups);
                 self.doc.setups = before.setups;
                 self.doc.active = before.active;
                 self.stop_selection();

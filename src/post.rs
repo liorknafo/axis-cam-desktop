@@ -127,6 +127,8 @@ fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
         _ => None,
     }
 }
+/// What the header says of the retracts the jaws and clamps check leaves out.
+const MACHINE_HOME: &str = "Retracts to machine home are assumed to clear everything.";
 /// What the header says last of what was not checked.
 const SOFT_LIMITS: &str =
     "LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.";
@@ -557,7 +559,8 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     ));
     // The program is only written once its jaws or clamps have been checked.
     if h.holding.is_some() {
-        w.note("Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap.");
+        w.note("Not checked: parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps were checked as boxes with a clearance gap.");
+        w.note(MACHINE_HOME);
         w.note(SOFT_LIMITS);
     } else {
         w.line(format!(
@@ -3023,7 +3026,7 @@ M2
             "{expected}"
         );
         // Moved along the side, clear of the pocket, it exports again.
-        doc.setups[0].p.insert("clamps".into(), "-X:50".into());
+        doc.setups[0].p.insert("clamps".into(), "-X:42".into());
         assert!(post_job(&doc, &mesh).ready());
     }
     #[test]
@@ -3061,6 +3064,76 @@ M2
         );
         doc.setups[0].p.insert("vise_axis".into(), "Y".into());
         assert!(post_job(&doc, &mesh).ready());
+    }
+    #[test]
+    fn a_later_setup_not_square_to_setup_1_is_refused_for_its_workholding_at_export() {
+        use crate::holding::NOT_SQUARE;
+        let (mut doc, mesh) = pocket_job();
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0")]);
+        let mut later = doc.setups[0].duplicate("G55");
+        later.p.insert("name".into(), "Turned".into());
+        later.p.insert("origin".into(), "Model origin".into());
+        doc.setups.push(later);
+        // A quarter or half turn keeps the jaws and clamps on the stock's faces.
+        for rz in ["90", "180", "270"] {
+            doc.setups[1].p.insert("rz".into(), rz.into());
+            let posted = post_job(&doc, &mesh);
+            assert!(posted.ready(), "rz {rz}: {:?}", errors(&posted));
+        }
+        // Another angle: the real vise or clamps would turn with the stock.
+        doc.setups[1].p.insert("rz".into(), "30".into());
+        let posted = post_job(&doc, &mesh);
+        assert!(!posted.ready());
+        assert_eq!(errors(&posted), [format!("Turned: {NOT_SQUARE}")]);
+        assert_eq!(doc.holding_issues(1, Some(&mesh)), [NOT_SQUARE]);
+        // Choosing None for that setup exports it again.
+        doc.setups[1].p.insert("holding".into(), "None".into());
+        assert!(post_job(&doc, &mesh).ready());
+    }
+    #[test]
+    fn headless_export_refuses_a_clamp_hit_with_the_export_message() {
+        use crate::holding;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut doc, mesh) = pocket_job();
+        // Reaching 40 mm onto the stock the clamp is in the pocket's way.
+        hold(&mut doc, "Clamp", &[("clamps", "-X:0")]);
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        doc.workholding
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .p
+            .insert("bite".into(), "40".into());
+        let mut plans = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| plans.push(r.unwrap().plan));
+        let boxes = doc.holding_boxes(&doc.setups[0], plans[0].stock).unwrap();
+        let hit = &holding::hits(&plans[0], &boxes, 2.)[0];
+        let datum = datum(&doc.setups[0], plans[0].stock, &mesh).unwrap();
+        let expected = holding::message("Pocket", hit, 2., datum);
+        let project = dir.path().join("job.axis.json");
+        crate::storage::save(&project, &doc).unwrap();
+        let out = dir.path().join("out");
+        let error = crate::export_gcode(
+            Some(&project.to_string_lossy().into_owned()),
+            Some(&out.to_string_lossy().into_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error, format!("Nothing was written. Top: {expected}"));
+        assert!(!out.exists(), "nothing was written");
+        // With the toe clamp's own bite it is clear of the pocket: it exports.
+        doc.workholding
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .p
+            .insert("bite".into(), "12".into());
+        crate::storage::save(&project, &doc).unwrap();
+        let message = crate::export_gcode(
+            Some(&project.to_string_lossy().into_owned()),
+            Some(&out.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
     }
     /// The `sequence` results of every setup of `doc`.
     fn results(doc: &Document, mesh: &Mesh) -> Vec<Vec<(usize, Result<Simulation, String>)>> {
@@ -3171,7 +3244,7 @@ M2
             .insert("post_retract".into(), POST_RETRACT[1].into());
         let refused = |plane: &str, limit: &str| {
             format!(
-                "The setup clearance plane (Z{plane}) is not above the clamp on -X (offset 0) and its 2 mm gap (Z{limit}). Raise the operations' clearance heights above Z{limit} or retract to machine home."
+                "The setup clearance plane (Z{plane}) is not above the clamp on -X (offset 0) and its 2 mm gap (Z{limit}). Raise the operations' clearance above {limit} mm over the stock top (Z{limit}), or retract to machine home."
             )
         };
         let posted = post_job(&doc, &mesh);
@@ -3251,7 +3324,7 @@ M2
         let (mut doc, mesh) = pocket_job();
         let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
         let old = "(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
-        let held = "(Not checked: parallels, bolts, the table and the machine body. Vise jaws and clamps were checked as boxes with a clearance gap.)\n(LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
+        let held = "(Not checked: parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps were checked as boxes with a clearance gap.)\n(Retracts to machine home are assumed to clear everything.)\n(LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)\n";
         // Without modelled workholding the old note stands, whatever the
         // setup's fixture description says.
         let text = header(&doc);
@@ -3320,7 +3393,7 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 36] = [
+    const COMMENT_STARTS: [&str; 37] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
         "Job, continued: ",
@@ -3350,6 +3423,7 @@ M2
         "Suppressed, continued: ",
         "Extents: ",
         "Not checked: ",
+        MACHINE_HOME,
         SOFT_LIMITS,
         "Start with the spindle raised clear of the part and fixtures: ",
         "Before starting: ",

@@ -14,6 +14,10 @@ const JAW_DEPTH: f32 = 100.;
 pub const MAX_CLAMPS: usize = 8;
 /// What a setup's issues say when the library entry it points at is gone.
 pub const DELETED: &str = "The workholding entry was deleted; choose another.";
+/// What a later setup's issues say when its frame is turned from setup 1's by
+/// other than a multiple of 90 degrees: the stock carried into it is no box
+/// the jaws or clamps could sit on.
+pub const NOT_SQUARE: &str = "This setup is not square to setup 1, so its vise or clamps cannot be modelled. Choose None, or square the setup.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Holder {
@@ -277,6 +281,40 @@ pub fn opening_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option<
             mm(opening)
         )
     })
+}
+/// Where `layout` puts its jaws or clamps against `stock`, the setup's starting
+/// stock box in millimetres: the jaws overlap the stock along their axis, and
+/// each clamp's centre is within its side. The first that is not.
+pub fn position_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option<String> {
+    let length = stock.dimensions();
+    match layout {
+        Layout::None => None,
+        Layout::Vise { axis_y, offset, .. } => {
+            let along = length[usize::from(!*axis_y)] / 2. + num(&holder.p, "jaw_width")? / 2.;
+            (offset.abs() >= along).then(|| {
+                format!(
+                    "The vise offset of {} mm puts the jaws beside the stock, not on it. Keep it under {} mm either way.",
+                    mm(*offset),
+                    mm(along)
+                )
+            })
+        }
+        Layout::Clamps { clamps, .. } => clamps.iter().find_map(|&(side, offset)| {
+            let side_length = match side {
+                Side::MinusX | Side::PlusX => length[1],
+                Side::MinusY | Side::PlusY => length[0],
+            };
+            (offset.abs() > side_length / 2. + 0.005).then(|| {
+                format!(
+                    "The clamp on {} is at offset {} mm, beyond its {} mm side. Keep the offset within ±{} mm.",
+                    side.label(),
+                    mm(offset),
+                    mm(side_length),
+                    mm(side_length / 2.)
+                )
+            })
+        }),
+    }
 }
 /// The jaws or clamps of `layout`, in the frame of `stock` (the setup's
 /// starting stock box). Without the clearance gap. Refuses a holder of the
@@ -569,14 +607,23 @@ fn tenth(v: f32) -> String {
 }
 /// Why a clearance plane that is not above a box and its gap is refused: the
 /// first rapid of a program starts wherever the tool was, at that height.
-/// `top` is the box's top, the plane and `datum_z` are in the setup's frame;
-/// the heights are said in work coordinates.
-pub fn plane_message(label: &str, plane: f32, gap: f32, top: f32, datum_z: f32) -> String {
+/// `top` is the box's top, the plane, `datum_z` and `stock_top` are in the
+/// setup's frame; the heights are said in work coordinates, and the least
+/// clearance as the operation's field takes it, above the stock top.
+pub fn plane_message(
+    label: &str,
+    plane: f32,
+    gap: f32,
+    top: f32,
+    datum_z: f32,
+    stock_top: f32,
+) -> String {
     let limit = tenth(top + gap - datum_z);
     format!(
-        "The setup clearance plane (Z{}) is not above the {label} and its {} mm gap (Z{limit}). Raise the operations' clearance heights above Z{limit} or retract to machine home.",
+        "The setup clearance plane (Z{}) is not above the {label} and its {} mm gap (Z{limit}). Raise the operations' clearance above {} mm over the stock top (Z{limit}), or retract to machine home.",
         tenth(plane - datum_z),
-        mm(gap)
+        mm(gap),
+        tenth(top + gap - stock_top)
     )
 }
 /// The boxes as the 3D view draws them: nothing lower than the bottom of
@@ -868,10 +915,12 @@ pub fn held_of(flags: impl IntoIterator<Item = bool>) -> Held {
     }
 }
 /// Whether a setup that holds its stock with a vise or clamps says where:
-/// a vise has its grip, clamps their positions. True for no workholding.
+/// a vise has its axis (the grip alone is no placement: choosing a vise
+/// fills it in from the library entry), clamps their positions. True for no
+/// workholding.
 pub fn placed(setup: &Setup) -> bool {
     let key = match get(&setup.p, "holding") {
-        "Vise" => "vise_grip",
+        "Vise" => "vise_axis",
         "Clamps" => "clamps",
         _ => return true,
     };
@@ -926,7 +975,7 @@ fn describe(layout: &Layout) -> String {
             clamps.len(),
             clamps
                 .iter()
-                .map(|(side, offset)| format!("{} at {offset}", side.label()))
+                .map(|(side, offset)| format!("{} at {}", side.label(), mm(*offset)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -2126,14 +2175,83 @@ mod tests {
         assert_eq!(held([&none, &vise]), Held::Mixed);
     }
     #[test]
+    fn a_setup_is_placed_by_the_key_the_first_vise_or_clamps_writes() {
+        let with = |pairs: &[(&str, &str)]| placed(&setup(pairs));
+        // No workholding says nothing to place.
+        assert!(with(&[]));
+        assert!(with(&[("holding", "None")]));
+        // The grip alone is not a placement: choosing a vise fills it in
+        // from the library entry before the jaws are laid out.
+        let grip = [("holding", "Vise"), ("vise_grip", "8")];
+        assert!(!with(&grip));
+        assert!(!with(&[("holding", "Vise")]));
+        assert!(with(&[("holding", "Vise"), ("vise_axis", "Y")]));
+        // What `place` writes counts, for a vise and for clamps.
+        for layout in [
+            Layout::Vise {
+                holder: "v".into(),
+                axis_y: false,
+                offset: 0.,
+                grip: 8.,
+                gap: 2.,
+            },
+            Layout::Clamps {
+                holder: "c".into(),
+                clamps: vec![(Side::MinusX, 0.)],
+                gap: 2.,
+            },
+        ] {
+            let mut s = setup(&[(
+                "holding",
+                if matches!(layout, Layout::Vise { .. }) {
+                    "Vise"
+                } else {
+                    "Clamps"
+                },
+            )]);
+            assert!(!placed(&s));
+            assert!(place(&mut s, &layout));
+            assert!(placed(&s));
+        }
+        assert!(!with(&[("holding", "Clamps")]));
+        assert!(!with(&[("holding", "Clamps"), ("clamps", "  ")]));
+        assert!(with(&[("holding", "Clamps"), ("clamps", "-X:0")]));
+    }
+    #[test]
+    fn a_suggestion_says_its_offsets_like_the_other_texts() {
+        let clamps = Layout::Clamps {
+            holder: "c".into(),
+            clamps: vec![
+                (Side::MinusY, 1.234),
+                (Side::PlusY, -0.),
+                (Side::PlusX, 12.5),
+            ],
+            gap: 2.,
+        };
+        assert_eq!(
+            describe(&clamps),
+            "3 clamps on -Y at 1.23, +Y at 0, +X at 12.5"
+        );
+        assert!(
+            summary(&clamps, 0, 0, 0, None)
+                .starts_with("Suggested: 3 clamps on -Y at 1.23, +Y at 0, +X at 12.5.")
+        );
+    }
+    #[test]
     fn a_plane_not_above_the_box_and_its_gap_reads_in_work_coordinates() {
         assert_eq!(
-            plane_message("clamp on -X (offset 0)", 62.5, 2., 72.5, 47.5),
-            "The setup clearance plane (Z15.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance heights above Z27.0 or retract to machine home."
+            plane_message("clamp on -X (offset 0)", 62.5, 2., 72.5, 47.5, 47.5),
+            "The setup clearance plane (Z15.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home."
         );
         assert_eq!(
-            plane_message("vise jaw on +Y", 0., 0.5, 8.43, 0.),
-            "The setup clearance plane (Z0.0) is not above the vise jaw on +Y and its 0.5 mm gap (Z8.9). Raise the operations' clearance heights above Z8.9 or retract to machine home."
+            plane_message("vise jaw on +Y", 0., 0.5, 8.43, 0., 0.),
+            "The setup clearance plane (Z0.0) is not above the vise jaw on +Y and its 0.5 mm gap (Z8.9). Raise the operations' clearance above 8.9 mm over the stock top (Z8.9), or retract to machine home."
+        );
+        // The work zero is not always the stock top: 3 mm below it, the
+        // height is 3 mm less than the Z the clearance plane has to pass.
+        assert_eq!(
+            plane_message("clamp on +X (offset 0)", 15., 2., 30., 3., 3. + 7.),
+            "The setup clearance plane (Z12.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z29.0). Raise the operations' clearance above 22.0 mm over the stock top (Z29.0), or retract to machine home."
         );
     }
     #[test]

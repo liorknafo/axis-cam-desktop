@@ -1031,6 +1031,30 @@ impl Document {
             self.workholding = crate::holding::starters();
         }
     }
+    /// Brings back the library entries the modelled `setups` use that this
+    /// library has lost and `from` still has, each with its own id; a name
+    /// another entry has taken since is made new. Says which came back, a
+    /// sentence each, to end a status.
+    pub fn restore_holders(&mut self, from: &Document, setups: &[Setup]) -> String {
+        let mut said = String::new();
+        for id in setups
+            .iter()
+            .filter(|s| crate::holding::modelled(s))
+            .map(|s| get(&s.p, "holder"))
+        {
+            if let (None, Some(entry)) = (self.holder(id), from.holder(id)) {
+                let mut entry = entry.clone();
+                if !self.holder_name_issues(&entry).is_empty() {
+                    let name =
+                        crate::proposal::clip(entry.name(), crate::material::NAME_LIMIT - 11);
+                    entry.p.insert("name".into(), format!("{name} (restored)"));
+                }
+                said += &format!(" {} is back in the workholding library.", entry.name());
+                self.workholding.push(entry);
+            }
+        }
+        said
+    }
     /// The starting stock box of setup `setup` in that setup's frame, in
     /// millimetres: the first setup's own stock, and for a later one the first
     /// setup's stock carried into its frame, as the simulation does (its own
@@ -1059,8 +1083,9 @@ impl Document {
     }
     /// What is wrong with setup `setup`'s modelled workholding: its library
     /// entry (none chosen, gone), then its layout, then the entry not fitting
-    /// the layout, and for a vise the stock being wider across the jaws than
-    /// the vise opens (when the stock can be told: `setup_stock`).
+    /// the layout, then (when the stock can be told: `setup_stock`) a vise
+    /// opening less than the stock is wide across the jaws and jaws or clamps
+    /// placed off the stock, and last a later setup not square to setup 1.
     pub fn holding_issues(&self, setup: usize, mesh: Option<&crate::mesh::Mesh>) -> Vec<String> {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
@@ -1073,7 +1098,7 @@ impl Document {
         s: &Setup,
         stock: impl FnOnce() -> Option<crate::mesh::Bounds>,
     ) -> Vec<String> {
-        use crate::holding::{DELETED, layout, opening_issue, refusal};
+        use crate::holding::{DELETED, NOT_SQUARE, layout, opening_issue, position_issue, refusal};
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
@@ -1096,16 +1121,26 @@ impl Document {
         } else if !kind.is_empty() && entry.is_none() {
             issues.push(DELETED.into());
         }
+        // The jaws and clamps are boxes along the axes of setup 1's frame, which
+        // a later setup turned from it by another angle does not share.
+        let square = self
+            .setups
+            .first()
+            .is_none_or(|first| crate::volume::Frame::setups_square(first, s));
         match (layout(s), entry) {
             (Err(error), _) => issues.push(error),
             (Ok(layout), Some(entry)) if !kind.is_empty() => {
                 if let Some(refused) = refusal(&layout, entry) {
                     issues.push(refused);
-                } else if let Some(stock) = stock() {
+                } else if square && let Some(stock) = stock() {
                     issues.extend(opening_issue(&layout, entry, stock));
+                    issues.extend(position_issue(&layout, entry, stock));
                 }
             }
             _ => {}
+        }
+        if !kind.is_empty() && !square {
+            issues.push(NOT_SQUARE.into());
         }
         issues
     }
@@ -1114,7 +1149,8 @@ impl Document {
     /// workholding. Refuses with the first line `holding_issues` shows for
     /// it, so that the editor and the export agree: an entry that is gone or
     /// not chosen, a layout that does not read, an entry that does not fit,
-    /// a stock wider than the vise opens.
+    /// a stock wider than the vise opens, jaws or clamps off the stock, a
+    /// setup not square to setup 1.
     pub fn holding_boxes(
         &self,
         setup: &Setup,
@@ -2287,6 +2323,178 @@ mod tests {
         assert_eq!(issues(&doc, 1), [wide]);
         // Without the part the later setup's frame is not known: no opinion.
         assert!(doc.holding_issues(1, None).is_empty());
+    }
+    /// `two_setup_doc` with a vise that opens wide on both setups.
+    fn two_vises(rz: &str) -> Document {
+        let mut doc = two_setup_doc();
+        let vise = starter(&doc, "Vise");
+        for h in doc.workholding.iter_mut().filter(|h| h.id == vise) {
+            h.p.insert("max_opening".into(), "300".into());
+        }
+        for s in &mut doc.setups {
+            for (k, v) in [("holding", "Vise"), ("vise_grip", "8")] {
+                s.p.insert(k.into(), v.into());
+            }
+            s.p.insert("holder".into(), vise.clone());
+        }
+        doc.setups[1].p.insert("rz".into(), rz.into());
+        doc
+    }
+    #[test]
+    fn a_later_setup_not_square_to_setup_1_cannot_model_its_workholding() {
+        use crate::holding::NOT_SQUARE;
+        let mesh = crate::mesh::sample();
+        assert_eq!(
+            NOT_SQUARE,
+            "This setup is not square to setup 1, so its vise or clamps cannot be modelled. Choose None, or square the setup."
+        );
+        // A quarter turn about Z, in either direction, a half turn and none
+        // keep the axes parallel: the jaws turn with the stock.
+        for rz in ["0", "90", "180", "270", "-90", "360"] {
+            let doc = two_vises(rz);
+            let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
+            assert!(doc.holding_issues(1, Some(&mesh)).is_empty(), "rz {rz}");
+            assert_eq!(doc.holding_boxes(&doc.setups[1], stock).unwrap().len(), 2);
+        }
+        // Any other angle: the jaws would be on the box round the turned stock.
+        let mut doc = two_vises("30");
+        let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
+        assert_eq!(doc.holding_issues(1, Some(&mesh)), [NOT_SQUARE]);
+        // The angles tell it, with or without the part.
+        assert_eq!(doc.holding_issues(1, None), [NOT_SQUARE]);
+        assert_eq!(
+            doc.holding_boxes(&doc.setups[1], stock),
+            Err(NOT_SQUARE.to_string())
+        );
+        // Setup 1 is square to itself, and the check is relative to it.
+        assert!(doc.holding_issues(0, Some(&mesh)).is_empty());
+        doc.setups[0].p.insert("rz".into(), "30".into());
+        assert!(doc.holding_issues(1, Some(&mesh)).is_empty());
+        // A tilt is not square either; clamps are refused alike; None says nothing.
+        let mut tilted = two_vises("90");
+        tilted.setups[1].p.insert("rx".into(), "45".into());
+        assert_eq!(tilted.holding_issues(1, None), [NOT_SQUARE]);
+        let clamp = starter(&tilted, "Clamp");
+        for (k, v) in [
+            ("holding", "Clamps"),
+            ("holder", clamp.as_str()),
+            ("clamps", "-X:0"),
+        ] {
+            tilted.setups[1].p.insert(k.into(), v.into());
+        }
+        assert_eq!(tilted.holding_issues(1, None), [NOT_SQUARE]);
+        tilted.setups[1].p.insert("holding".into(), "None".into());
+        assert!(tilted.holding_issues(1, None).is_empty());
+    }
+    #[test]
+    fn an_offset_must_leave_the_jaws_on_the_stock_and_each_clamp_on_its_side() {
+        let mut doc = doc_with_holding(&[
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "140"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+        ]);
+        let (vise, clamp) = (starter(&doc, "Vise"), starter(&doc, "Clamp"));
+        let set = |doc: &mut Document, pairs: &[(&str, &str)]| {
+            for (k, v) in pairs {
+                doc.setup_mut().p.insert((*k).into(), (*v).into());
+            }
+        };
+        let stock = doc.setup_stock(0, None).unwrap();
+        // Jaws on the Y sides run along X: the stock is 140 long there and
+        // the jaws 100 wide, so they overlap it at offsets under 120 mm.
+        set(
+            &mut doc,
+            &[
+                ("holding", "Vise"),
+                ("holder", &vise),
+                ("vise_grip", "8"),
+                ("vise_axis", "Y"),
+            ],
+        );
+        for offset in ["-119.9", "0", "119.9", "  60 "] {
+            set(&mut doc, &[("vise_offset", offset)]);
+            assert!(doc.holding_issues(0, None).is_empty(), "{offset}");
+        }
+        let beside = "The vise offset of 120 mm puts the jaws beside the stock, not on it. Keep it under 120 mm either way.";
+        for offset in ["120", "-120", "300"] {
+            set(&mut doc, &[("vise_offset", offset)]);
+            let issues = doc.holding_issues(0, None);
+            assert_eq!(issues.len(), 1, "{offset}");
+            assert!(issues[0].starts_with("The vise offset of "), "{issues:?}");
+            assert!(issues[0].ends_with("Keep it under 120 mm either way."));
+            assert_eq!(
+                doc.holding_boxes(doc.setup(), stock),
+                Err(issues[0].clone())
+            );
+        }
+        set(&mut doc, &[("vise_offset", "120")]);
+        assert_eq!(doc.holding_issues(0, None), [beside]);
+        // The jaws on the X sides run along Y (100 long): under 100 mm.
+        set(
+            &mut doc,
+            &[
+                ("vise_axis", "X"),
+                ("stock_x", "110"),
+                ("vise_offset", "99"),
+            ],
+        );
+        assert!(doc.holding_issues(0, None).is_empty());
+        set(&mut doc, &[("vise_offset", "100")]);
+        assert_eq!(
+            doc.holding_issues(0, None),
+            [
+                "The vise offset of 100 mm puts the jaws beside the stock, not on it. Keep it under 100 mm either way."
+            ]
+        );
+        // A clamp's centre stays within its side: ±X clamps move along Y
+        // (100 long), ±Y clamps along X (140).
+        set(
+            &mut doc,
+            &[
+                ("stock_x", "140"),
+                ("holding", "Clamps"),
+                ("holder", &clamp),
+                ("clamps", "-X:50;+X:-50;+Y:70;-Y:-70"),
+            ],
+        );
+        assert!(doc.holding_issues(0, None).is_empty());
+        for (clamps, issue) in [
+            (
+                "-X:0;+X:50.1",
+                "The clamp on +X is at offset 50.1 mm, beyond its 100 mm side. Keep the offset within ±50 mm.",
+            ),
+            (
+                "-Y:-70.5",
+                "The clamp on -Y is at offset -70.5 mm, beyond its 140 mm side. Keep the offset within ±70 mm.",
+            ),
+            (
+                "+Y:1000;-X:0",
+                "The clamp on +Y is at offset 1000 mm, beyond its 140 mm side. Keep the offset within ±70 mm.",
+            ),
+        ] {
+            set(&mut doc, &[("clamps", clamps)]);
+            assert_eq!(doc.holding_issues(0, None), [issue], "{clamps}");
+            assert_eq!(
+                doc.holding_boxes(doc.setup(), stock),
+                Err(issue.to_string())
+            );
+        }
+        // The stock is the one the other checks use: a later setup's is the
+        // first setup's turned, so a clamp that fits setup 1 may not fit it.
+        let mesh = crate::mesh::sample();
+        let mut two = two_setup_doc();
+        let clamp = starter(&two, "Clamp");
+        for s in &mut two.setups {
+            for (k, v) in [("holding", "Clamps"), ("clamps", "-X:60")] {
+                s.p.insert(k.into(), v.into());
+            }
+            s.p.insert("holder".into(), clamp.clone());
+        }
+        // Setup 1 is 140 x 100: -X moves along Y, 60 is off the 100 side.
+        assert_eq!(two.holding_issues(0, Some(&mesh)).len(), 1);
+        // Setup 2 is 100 x 140: -X moves along Y, 140 long, 60 is on it.
+        assert!(two.holding_issues(1, Some(&mesh)).is_empty());
     }
     #[test]
     fn a_missing_entry_comes_first_and_says_where_to_add_one() {
