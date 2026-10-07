@@ -8,7 +8,10 @@ use crate::{
     viewport::{Camera, Projector, Viewport},
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+mod canvas;
+use canvas::{Canvas, INK};
 
 /// The tool's name in requests.
 pub const NAME: &str = "view_model";
@@ -51,7 +54,9 @@ const ANGLES: [(&str, &str, f32, f32); 9] = [
 #[derive(Clone)]
 pub struct Scene {
     pub doc: Arc<Document>,
-    pub mesh: Arc<Mesh>,
+    /// Owned: `Mesh` caches through a `RefCell`, so an `Arc<Mesh>` could
+    /// not move between threads.
+    pub mesh: Mesh,
     pub report: Arc<PartReport>,
     /// The latest proposal's built job, for `operation` views.
     pub job: Option<Arc<Document>>,
@@ -126,7 +131,7 @@ pub(crate) struct View {
 impl View {
     /// The view `args` ask for, or one sentence on why it cannot be drawn.
     pub(crate) fn new(scene: &Scene, args: &Args) -> Result<Self, String> {
-        let mesh = &*scene.mesh;
+        let mesh = &scene.mesh;
         let surfaces = mesh.surfaces.len();
         if let Some(bad) = args
             .focus_surfaces
@@ -306,7 +311,7 @@ fn focus_bounds(mesh: &Mesh, setup: &Setup, ids: &[usize]) -> Option<Bounds> {
 /// The picture `args` ask for: the scene, the tags and the caption.
 fn render(scene: &Scene, args: &Args) -> Result<Picture, String> {
     let view = View::new(scene, args)?;
-    let mesh = &*scene.mesh;
+    let mesh = &scene.mesh;
     let job = scene.job.as_deref();
     let operation = view
         .operation
@@ -330,6 +335,7 @@ fn render(scene: &Scene, args: &Args) -> Result<Picture, String> {
     let (rgba, depths) =
         viewport.render(&view.projector, (w, h), 1., None, &args.highlight_surfaces);
     let mut canvas = Canvas::over(&rgba, w, h, true);
+    draw_toolpaths(&mut canvas, &view, &depths);
     // Tags go on before the caption strip is added, so none reaches into it.
     let tags = if args.labels {
         draw_tags(&mut canvas, scene, &view, &depths)
@@ -366,10 +372,52 @@ pub fn overview(scene: &Scene) -> Result<Picture, String> {
     };
     render(scene, &args)
 }
+/// The most feed moves an operation view draws; more are sampled evenly.
+const MAX_SEGMENTS: usize = 20_000;
+/// The feed moves of the operation looked at, as 1.5 px lines wherever
+/// nothing drawn is nearer (the viewport itself shows only the last ones).
+fn draw_toolpaths(canvas: &mut Canvas, view: &View, depths: &[f32]) {
+    let Some(sim) = &view.sim else {
+        return;
+    };
+    let feeds: Vec<_> = sim
+        .plan
+        .moves
+        .iter()
+        .filter(|m| m.motion == crate::simulation::Motion::Feed)
+        .collect();
+    let n = feeds.len().min(MAX_SEGMENTS);
+    let scale = sim.plan.display_scale;
+    let (w, h) = (canvas.w as usize, canvas.h as usize);
+    for m in (0..n).map(|i| feeds[i * feeds.len() / n]) {
+        let a = view.screen(m.from.map(|v| v * scale));
+        let b = view.screen(m.to.map(|v| v * scale));
+        let steps = ((b.0 - a.0).hypot(b.1 - a.1).ceil() as usize).clamp(1, 4000);
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let (x, y) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
+                continue;
+            }
+            // The viewport's tolerance for its depth-tested lines; the
+            // depths are those of the frame before it was flipped.
+            let z = a.2 + (b.2 - a.2) * t;
+            if z + 0.05 >= depths[y as usize * w + (w - 1 - x as usize)] {
+                canvas.disc((x, y), 0.75, [34, 114, 176]);
+            }
+        }
+    }
+}
 /// The report's tags for the drawn orientation where their points can be
 /// seen: each plane's surface IDs, largest plane first, then the diameters
-/// of its holes. A tag that would overlap one already drawn is skipped.
-/// Returns the texts drawn, in order.
+/// of its holes at their centres. A tag that would overlap one already
+/// drawn is skipped. Returns the texts drawn, in order.
+///
+/// Unlike the design's "centre of its bbox", a plane's tag sits on the
+/// plane itself (`plane_anchors`): the centre of a plane around a pocket
+/// lies over the pocket, where its tag would float and hide the floor's.
+/// It goes at the first of its anchors that is in the picture, seen and
+/// clear of the tags already drawn.
 fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) -> Vec<String> {
     let Some(o) = scene
         .report
@@ -379,9 +427,10 @@ fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) ->
     else {
         return vec![];
     };
-    let mesh = &*scene.mesh;
+    let mesh = &scene.mesh;
     let scale = mesh.display_scale();
-    let model = Placement::new(mesh, Some(&view.setup)).bounds;
+    let placement = Placement::new(mesh, Some(&view.setup));
+    let model = placement.bounds;
     // Report positions are mm from the model's -X/-Y corner and its top.
     let at = |x: f32, y: f32, depth: f32| {
         [
@@ -390,7 +439,8 @@ fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) ->
             model.max[2] - depth * scale,
         ]
     };
-    let planes = o.planes.iter().map(|plane| {
+    let anchors = plane_anchors(mesh, &placement, &o.planes);
+    let planes = o.planes.iter().zip(anchors).map(|(plane, anchors)| {
         let ids: Vec<String> = plane
             .surfaces
             .iter()
@@ -398,44 +448,89 @@ fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) ->
             .map(usize::to_string)
             .collect();
         let more = if plane.surfaces.len() > 3 { "…" } else { "" };
-        let [x0, y0, x1, y1] = plane.bbox;
-        (
-            at((x0 + x1) / 2., (y0 + y1) / 2., plane.depth_below_top),
-            format!("{}{more}", ids.join(",")),
-        )
+        let z = model.max[2] - plane.depth_below_top * scale;
+        let mut points: Vec<[f32; 3]> = anchors.iter().map(|[x, y]| [*x, *y, z]).collect();
+        if points.is_empty() {
+            let [x0, y0, x1, y1] = plane.bbox;
+            points.push(at((x0 + x1) / 2., (y0 + y1) / 2., plane.depth_below_top));
+        }
+        (points, format!("{}{more}", ids.join(",")))
     });
     let holes = o.planes.iter().flat_map(|plane| {
         plane.holes.iter().map(|hole| {
             (
-                at(hole.center[0], hole.center[1], plane.depth_below_top),
+                vec![at(hole.center[0], hole.center[1], plane.depth_below_top)],
                 format!("Ø{:.1}", hole.diameter),
             )
         })
     });
     let (w, h) = (canvas.w as usize, canvas.h as usize);
     let (mut drawn, mut texts): (Vec<[i32; 4]>, Vec<String>) = (vec![], vec![]);
-    for (point, text) in planes.chain(holes) {
-        let (x, y, z) = view.screen(point);
-        if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
+    for (points, text) in planes.chain(holes) {
+        let free = |&(x, y, z): &(f32, f32, f32)| {
+            if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
+                return false;
+            }
+            // The depths are those of the frame before it was flipped.
+            if z + 0.5 < depths[y as usize * w + (w - 1 - x as usize)] {
+                return false;
+            }
+            let rect = Canvas::tag_rect((x, y), &text);
+            !drawn
+                .iter()
+                .any(|r| r[0] < rect[2] && rect[0] < r[2] && r[1] < rect[3] && rect[1] < r[3])
+        };
+        let Some((x, y, _)) = points.iter().map(|p| view.screen(*p)).find(free) else {
             continue;
-        }
-        // The depths are those of the frame before it was flipped.
-        let nearest = depths[y as usize * w + (w - 1 - x as usize)];
-        if z + 0.5 < nearest {
-            continue;
-        }
-        let rect = Canvas::tag_rect((x, y), &text);
-        let overlaps =
-            |r: &[i32; 4]| r[0] < rect[2] && rect[0] < r[2] && r[1] < rect[3] && rect[1] < r[3];
-        if drawn.iter().any(overlaps) {
-            continue;
-        }
+        };
         if let Some(rect) = canvas.tag((x, y), &text) {
             drawn.push(rect);
             texts.push(text);
         }
     }
     texts
+}
+/// The most anchors a plane's tag tries.
+const ANCHORS: usize = 8;
+/// Where each plane's tag may go, best first: the centroids (x, y in display
+/// units, in `placement`'s frame) of the largest triangles of the plane's
+/// faces, largest first; empty for a plane without any.
+fn plane_anchors(
+    mesh: &Mesh,
+    placement: &Placement,
+    planes: &[analysis::PlaneReport],
+) -> Vec<Vec<[f32; 2]>> {
+    let owner: HashMap<usize, usize> = planes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, p)| p.surfaces.iter().map(move |id| (*id, i)))
+        .collect();
+    let mut triangles: Vec<Vec<(f32, [f32; 2])>> = vec![vec![]; planes.len()];
+    for face in &mesh.faces {
+        let Some(&i) = face.feature.and_then(|id| owner.get(&id)) else {
+            continue;
+        };
+        let p: Vec<[f32; 3]> = face
+            .points
+            .iter()
+            .map(|q| placement.transform(*q))
+            .collect();
+        // The face as a fan of triangles; planes are flat, so the area seen
+        // from above is the area.
+        for (b, c) in p.iter().skip(1).zip(p.iter().skip(2)) {
+            let a = p[0];
+            let area = ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.;
+            let centroid = [(a[0] + b[0] + c[0]) / 3., (a[1] + b[1] + c[1]) / 3.];
+            triangles[i].push((area, centroid));
+        }
+    }
+    triangles
+        .into_iter()
+        .map(|mut t| {
+            t.sort_by(|a, b| b.0.total_cmp(&a.0));
+            t.into_iter().take(ANCHORS).map(|(_, c)| c).collect()
+        })
+        .collect()
 }
 /// The words for the view's up axis.
 fn up_words(view: &View) -> &'static str {
@@ -539,257 +634,16 @@ fn describe(view: &View, args: &Args, tags: &[String]) -> String {
     )
 }
 
-/// The viewport's background, under everything a picture draws.
-const BACKGROUND: [u8; 3] = [239, 243, 247];
-const INK: [u8; 3] = [40, 46, 54];
-/// A 5 × 7 glyph per character, one byte a row, bit 4 the leftmost pixel.
-fn glyph(c: char) -> Option<[u8; 7]> {
-    Some(match c {
-        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        '2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
-        '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
-        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
-        'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
-        'D' => [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
-        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
-        'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
-        'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
-        'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        'J' => [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
-        'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
-        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
-        'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
-        'N' => [0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11],
-        'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
-        'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
-        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
-        'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
-        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-        'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
-        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A],
-        'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
-        'Y' => [0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04],
-        'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
-        ' ' => [0; 7],
-        '+' => [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00],
-        '-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
-        '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C],
-        ',' => [0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08],
-        ':' => [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
-        '/' => [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00],
-        '(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
-        ')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
-        'Ø' => [0x0D, 0x12, 0x15, 0x15, 0x15, 0x09, 0x16],
-        '×' => [0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00],
-        '%' => [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03],
-        '…' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x15],
-        '·' => [0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x00],
-        '?' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04],
-        _ => return None,
-    })
-}
-/// An opaque RGB picture being drawn.
-pub(crate) struct Canvas {
-    pub w: u32,
-    pub h: u32,
-    pub rgb: Vec<u8>,
-}
-impl Canvas {
-    #[cfg(test)]
-    fn blank(w: u32, h: u32) -> Self {
-        Self {
-            w,
-            h,
-            rgb: BACKGROUND.repeat((w * h) as usize),
-        }
-    }
-    #[cfg(test)]
-    fn at(&self, x: u32, y: u32) -> [u8; 3] {
-        let i = ((y * self.w + x) * 3) as usize;
-        [self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]
-    }
-    /// `rgba` laid over the background; mirrored left to right when `flip`.
-    pub(crate) fn over(rgba: &[u8], w: u32, h: u32, flip: bool) -> Self {
-        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let sx = if flip { w - 1 - x } else { x };
-                let i = ((y * w + sx) * 4) as usize;
-                let a = rgba[i + 3] as f32 / 255.;
-                for k in 0..3 {
-                    rgb.push(
-                        (rgba[i + k] as f32 * a + BACKGROUND[k] as f32 * (1. - a)).round() as u8,
-                    );
-                }
-            }
-        }
-        Self { w, h, rgb }
-    }
-    fn put(&mut self, x: i32, y: i32, color: [u8; 3]) {
-        if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h {
-            let i = ((y as u32 * self.w + x as u32) * 3) as usize;
-            self.rgb[i..i + 3].copy_from_slice(&color);
-        }
-    }
-    pub(crate) fn fill(&mut self, [x0, y0, x1, y1]: [i32; 4], color: [u8; 3]) {
-        for y in y0..y1 {
-            for x in x0..x1 {
-                self.put(x, y, color);
-            }
-        }
-    }
-    pub(crate) fn line(&mut self, a: (f32, f32), b: (f32, f32), color: [u8; 3], width: f32) {
-        let steps = ((b.0 - a.0).hypot(b.1 - a.1).ceil() as usize).clamp(1, 4000);
-        // Floored so a hairline's disc still covers a pixel centre on each step.
-        let r = (width / 2.).max(0.75);
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let (x, y) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
-            for yy in (y - r).floor() as i32..=(y + r).ceil() as i32 {
-                for xx in (x - r).floor() as i32..=(x + r).ceil() as i32 {
-                    if (xx as f32 + 0.5 - x).powi(2) + (yy as f32 + 0.5 - y).powi(2) <= r * r {
-                        self.put(xx, yy, color);
-                    }
-                }
-            }
-        }
-    }
-    pub(crate) fn text_width(text: &str, scale: u32) -> u32 {
-        (text.chars().count() as u32 * 6).saturating_sub(1) * scale
-    }
-    /// `text` in capitals from its top-left corner; unknown characters as "?".
-    pub(crate) fn text(&mut self, x: i32, y: i32, text: &str, scale: u32, color: [u8; 3]) {
-        let s = scale as i32;
-        for (n, c) in text.chars().flat_map(char::to_uppercase).enumerate() {
-            let rows = glyph(c).unwrap_or_else(|| glyph('?').unwrap());
-            for (row, bits) in rows.iter().enumerate() {
-                for col in 0..5 {
-                    if bits & (0x10 >> col) != 0 {
-                        let (px, py) = (x + (n as i32 * 6 + col) * s, y + row as i32 * s);
-                        self.fill([px, py, px + s, py + s], color);
-                    }
-                }
-            }
-        }
-    }
-    /// Where `tag` puts the box for `text` centred on `center`.
-    fn tag_rect(center: (f32, f32), text: &str) -> [i32; 4] {
-        let (w, h) = (Self::text_width(text, 2) as i32 + 8, 14 + 8);
-        let x0 = center.0.round() as i32 - w / 2;
-        let y0 = center.1.round() as i32 - h / 2;
-        [x0, y0, x0 + w, y0 + h]
-    }
-    /// A label box centred on `center`; None when it would leave the picture.
-    pub(crate) fn tag(&mut self, center: (f32, f32), text: &str) -> Option<[i32; 4]> {
-        let rect = Self::tag_rect(center, text);
-        let [x0, y0, ..] = rect;
-        if x0 < 0 || y0 < 0 || rect[2] > self.w as i32 || rect[3] > self.h as i32 {
-            return None;
-        }
-        self.fill(rect, INK);
-        self.fill([x0 + 1, y0 + 1, rect[2] - 1, rect[3] - 1], [255, 255, 255]);
-        self.text(x0 + 4, y0 + 4, text, 2, INK);
-        Some(rect)
-    }
-    pub(crate) fn png(&self) -> Vec<u8> {
-        let mut out = vec![];
-        let mut encoder = png::Encoder::new(&mut out, self.w, self.h);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("PNG header");
-        writer.write_image_data(&self.rgb).expect("PNG data");
-        drop(writer);
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn every_character_a_tag_or_caption_uses_has_a_glyph() {
-        for c in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ +-.,:/()Ø×%…·".chars() {
-            assert!(glyph(c).is_some(), "{c}");
-        }
-        assert!(glyph('ä').is_none());
-        // Lower case is drawn as capitals; anything else as "?".
-        let mut a = Canvas::blank(40, 20);
-        let mut b = Canvas::blank(40, 20);
-        a.text(0, 0, "ab", 1, [0, 0, 0]);
-        b.text(0, 0, "AB", 1, [0, 0, 0]);
-        assert_eq!(a.rgb, b.rgb);
-    }
-    #[test]
-    fn a_tag_is_drawn_centred_and_refused_at_the_edge() {
-        let mut c = Canvas::blank(200, 100);
-        let rect = c.tag((100., 50.), "12").unwrap();
-        assert!(rect[0] < 100 && rect[2] > 100 && rect[1] < 50 && rect[3] > 50);
-        // Ink strictly inside the 1 px border can only be the text.
-        let inked = (rect[0] + 2..rect[2] - 2)
-            .any(|x| (rect[1] + 2..rect[3] - 2).any(|y| c.at(x as u32, y as u32) == INK));
-        assert!(inked, "the text is drawn inside the box");
-        assert!(c.tag((2., 50.), "12").is_none());
-    }
-    #[test]
-    fn text_draws_the_glyph_pixels() {
-        let mut c = Canvas::blank(40, 20);
-        c.text(0, 0, "1", 1, INK);
-        // '1' is [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E], bit 4 leftmost.
-        assert_eq!(c.at(2, 0), INK);
-        assert_eq!(c.at(0, 0), BACKGROUND);
-        for x in 1..=3 {
-            assert_eq!(c.at(x, 6), INK);
-        }
-        let mut t = Canvas::blank(40, 20);
-        t.text(0, 0, "AB", 1, INK);
-        assert_ne!(t.rgb, Canvas::blank(40, 20).rgb);
-        let mut unknown = Canvas::blank(40, 20);
-        unknown.text(0, 0, "ä", 1, INK);
-        let mut question = Canvas::blank(40, 20);
-        question.text(0, 0, "?", 1, INK);
-        assert_ne!(question.rgb, Canvas::blank(40, 20).rgb);
-        assert_eq!(unknown.rgb, question.rgb);
-    }
-    #[test]
-    fn a_hairline_is_drawn_without_gaps() {
-        let mut h = Canvas::blank(80, 70);
-        h.line((10., 10.), (60., 10.), INK, 1.);
-        let row = (0..80).filter(|&x| h.at(x, 10) == INK).count();
-        assert!(row >= 45, "{row} pixels in row 10");
-        let mut d = Canvas::blank(80, 70);
-        d.line((10., 10.), (60., 40.), INK, 1.);
-        for x in 10..=60 {
-            assert!((0..70).any(|y| d.at(x, y) == INK), "column {x} has a gap");
-        }
-    }
-    #[test]
-    fn composite_flips_and_fills_the_background() {
-        // A 2 × 1 frame: left pixel red and opaque, right pixel empty.
-        let rgba = [255, 0, 0, 255, 0, 0, 0, 0];
-        let c = Canvas::over(&rgba, 2, 1, true);
-        assert_eq!(c.at(0, 0), [239, 243, 247]);
-        assert_eq!(c.at(1, 0), [255, 0, 0]);
-        let png = c.png();
-        assert_eq!(&png[1..4], b"PNG");
-    }
     use crate::proposal::tests::{block, good};
     use std::sync::Arc;
     fn scene() -> Scene {
         let (doc, mesh, report) = block();
         Scene {
             doc: Arc::new(doc),
-            mesh: Arc::new(mesh),
+            mesh,
             report: Arc::new(report),
             job: None,
         }
@@ -811,6 +665,11 @@ mod tests {
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         (info.width, info.height, buf)
+    }
+    #[test]
+    fn a_scene_can_move_between_threads() {
+        fn assert_send<T: Send + 'static>() {}
+        assert_send::<Scene>();
     }
     #[test]
     fn the_overview_is_a_labelled_768_pixel_png_of_setup_1() {
@@ -836,6 +695,30 @@ mod tests {
             "{}",
             picture.description
         );
+    }
+    #[test]
+    fn the_pocket_floor_is_tagged_where_it_can_be_seen() {
+        let s = scene();
+        let floor = s.report.orientations[0]
+            .planes
+            .iter()
+            .find(|p| p.kind == "floor")
+            .unwrap();
+        let id = floor.surfaces[0].to_string();
+        let tagged = |p: &Picture| {
+            let (_, tags) = p.description.split_once("tags: ").unwrap();
+            tags.split(", ")
+                .any(|t| t.split(',').any(|n| n.trim_end_matches('…') == id))
+        };
+        let picture = overview(&s).unwrap();
+        assert!(tagged(&picture), "{}", picture.description);
+        // From the front the floor is behind the pocket's front wall.
+        let front = draw(
+            &s,
+            &args(serde_json::json!({"angle": "front", "show_stock": false})),
+        )
+        .unwrap();
+        assert!(!tagged(&front), "{}", front.description);
     }
     #[test]
     fn a_top_view_keeps_x_right_and_y_up() {
@@ -947,7 +830,7 @@ mod tests {
         );
     }
     #[test]
-    fn an_operation_of_the_latest_proposal_can_be_looked_at() {
+    fn an_operation_of_the_latest_proposal_is_drawn_with_its_toolpaths() {
         let mut s = scene();
         let (_, job) = crate::plan_check::evaluate(&s.doc, &s.mesh, &s.report, &good(&s.report));
         s.job = job.map(Arc::new);
@@ -961,6 +844,13 @@ mod tests {
             "{}",
             picture.description
         );
+        let feed = decode(&picture.png)
+            .2
+            .chunks(3)
+            .filter(|p| p == &[34, 114, 176])
+            .count();
+        // Every pass, not only the last one the viewport draws (~600 px).
+        assert!(feed >= 2000, "{feed} pixels of toolpath");
         let out = draw(
             &s,
             &args(serde_json::json!({"operation": {"setup": 1, "operation": 99}})),

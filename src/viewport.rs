@@ -427,6 +427,9 @@ impl Viewport<'_> {
                 (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
             });
             raster_stock(&mut rgba, &depths, w, h, projected, ratio, p.scale);
+            // Only the planner's pictures mark surfaces (the app passes
+            // none, so its view is unchanged): the model asked to see them,
+            // so the translucent box must not dim them.
             for (index, _) in plain.iter().enumerate().filter(|(_, kept)| **kept) {
                 rgba[index * 4..index * 4 + 4].copy_from_slice(&SELECTED);
             }
