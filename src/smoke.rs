@@ -5250,18 +5250,83 @@ mod tests {
         // An event for a request that is not on the timeline joins nothing.
         a.record_plan_event(Event::Dropped(3, Dropped::Tool));
         assert_eq!(a.plan_timeline[0].looks.len(), 4);
-        // Finished: one line, ending in the pictures looked at (not errors),
-        // and the request is marked for the refusal it met.
+        // Finished: one line, ending in the pictures looked at (not errors)
+        // and in what was refused, and no look lines under it; the request is
+        // marked for the refusal it met.
         a.record_plan_event(Event::Stage(Progress::Checking(1)));
         let _ = a.view();
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), true);
-        assert!(rows[0].text.ends_with("· 1 look"), "{}", rows[0].text);
+        assert!(
+            rows[0]
+                .text
+                .ends_with("· 1 look · OpenAI refused pictures · OpenAI refused the picture tool"),
+            "{}",
+            rows[0].text
+        );
         assert_eq!(rows[0].mark, crate::ui::Mark::Warn);
+        assert!(
+            rows.iter()
+                .all(|r| r.looks.is_empty() && r.notes.is_empty())
+        );
+        // The run going on lists them still.
+        let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
         assert_eq!(rows[0].looks.len(), 4);
-        assert_eq!(rows[1].looks.len(), 0);
+        assert!(!rows[0].text.contains("look"), "{}", rows[0].text);
         // A new run starts without them.
         a.drop_plan();
         assert!(a.plan_overview.is_none() && a.plan_timeline.is_empty());
+    }
+    #[test]
+    fn a_finished_line_says_what_was_refused_and_how_many_pictures_were_seen() {
+        use crate::planner::{Dropped, Event, Look, Progress, StepResult};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.page = Page::Ai;
+        a.plan_model = "gpt-6.1-sol".into();
+        let picture = |text: &str| Look {
+            description: text.into(),
+            purpose: String::new(),
+            png: Some(std::sync::Arc::new(vec![1])),
+        };
+        a.record_plan_event(Event::Stage(Progress::Asking(1)));
+        a.record_plan_event(Event::Dropped(1, Dropped::Tool));
+        a.record_plan_event(Event::Stage(Progress::Checking(1)));
+        a.record_plan_event(Event::Checked(1, StepResult::Passed));
+        a.record_plan_event(Event::Stage(Progress::Repairing(2)));
+        a.record_plan_event(Event::Looked(2, picture("+Z up, top")));
+        a.record_plan_event(Event::Looked(2, picture("+Z up, front")));
+        a.record_plan_event(Event::Stage(Progress::Checking(2)));
+        a.record_plan_event(Event::Checked(2, StepResult::Passed));
+        a.record_plan_event(Event::Stage(Progress::Extending(3)));
+        a.record_plan_event(Event::Stage(Progress::Checking(3)));
+        a.record_plan_event(Event::Checked(3, StepResult::Passed));
+        let now = std::time::Instant::now();
+        let rows = crate::ui::timeline_rows(&a, now, true);
+        let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
+        // What follows the step and its time.
+        let tail = |i: usize| text[i].split(" · ").skip(2).collect::<Vec<_>>();
+        assert_eq!(tail(0), ["OpenAI refused the picture tool"]);
+        assert_eq!(text.len(), 6);
+        assert!(rows.iter().all(|r| r.looks.is_empty()));
+        assert_eq!(tail(1), ["passed"]);
+        assert_eq!(tail(2), ["2 looks"]);
+        assert_eq!(tail(3), ["passed"]);
+        assert!(tail(4).is_empty());
+        // The same rows while the run goes: the lines, not the summary.
+        let rows = crate::ui::timeline_rows(&a, now, false);
+        assert_eq!(rows[0].looks.len(), 1);
+        assert!(rows[0].looks[0].warn);
+        assert_eq!(rows[2].looks.len(), 2);
+        assert!(rows.iter().all(|r| !r.text.contains("refused")));
+        assert!(rows.iter().all(|r| !r.text.contains(" look")));
+        // Both finished views build.
+        a.planner = crate::Planner::Failed(crate::planner::Failure {
+            message: "No plan.".into(),
+            problems: vec![],
+            api: None,
+            requests: 3,
+        });
+        let _ = a.view();
     }
     #[tokio::test]
     async fn a_new_requests_row_starts_at_zero_because_the_client_resets_the_count() {

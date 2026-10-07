@@ -3432,8 +3432,9 @@ pub(crate) struct TimelineRow {
     /// Under it: what the model has written while a request runs, or how its
     /// check went. Empty in the finished view, which puts a summary in `text`.
     pub notes: Vec<String>,
-    /// Under the notes: the pictures the request's model looked at, and the
-    /// refusals it met.
+    /// Under the notes, while the run goes: the pictures the request's model
+    /// looked at, and the refusals it met. Empty in the finished view, which
+    /// counts them in `text`.
     pub looks: Vec<crate::Shown>,
 }
 /// A step that has ended, in the past tense; `stage_text` words the one that
@@ -3548,8 +3549,8 @@ pub(crate) fn look_line(look: &crate::planner::Look) -> String {
 /// The timeline's rows as of `now`. While the run goes (`finished` false) a
 /// check's problems and an unreadable reply's error are listed under their
 /// row, and the open request shows what the model has written; a finished
-/// run's rows are one line each, ending in a short summary and the number of
-/// pictures looked at. A step that ended without the result it should have
+/// run's rows are one line each, ending in a short summary, the number of
+/// pictures looked at and what OpenAI refused. A step that ended without the result it should have
 /// gets the warning mark and says why (see `lost`).
 pub(crate) fn timeline_rows(
     app: &App,
@@ -3616,9 +3617,16 @@ pub(crate) fn timeline_rows(
                 }
             }
             if finished {
+                // The one line says what the request saw and what was refused;
+                // the lines themselves are shown only while the run goes.
                 let seen = step.looks.iter().filter(|l| l.thumb.is_some()).count();
                 if seen > 0 {
                     text = format!("{text} · {}", plural(seen, "look"));
+                }
+                for refusal in step.looks.iter().filter(|l| l.warn) {
+                    // "OpenAI refused pictures; continuing with text only."
+                    let said = refusal.line.split(';').next().unwrap_or(&refusal.line);
+                    text = format!("{text} · {said}");
                 }
             }
             let mark = match (step.ended, &step.result) {
@@ -3635,7 +3643,7 @@ pub(crate) fn timeline_rows(
                 mark,
                 text,
                 notes,
-                looks: step.looks.clone(),
+                looks: if finished { vec![] } else { step.looks.clone() },
             }
         })
         .collect()
