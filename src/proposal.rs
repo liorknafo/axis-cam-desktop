@@ -172,6 +172,154 @@ pub fn parse(text: &str) -> Result<Proposal, String> {
     serde_json::from_str(text.trim())
         .map_err(|e| format!("The proposal is not valid JSON for the schema: {e}"))
 }
+/// One operation of a reply still arriving; a field not yet written is `None`.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DraftOp {
+    pub strategy: Option<String>,
+    pub name: Option<String>,
+    pub tool: Option<u64>,
+    pub rpm: Option<f64>,
+    pub feed: Option<f64>,
+}
+/// One setup of a reply still arriving.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DraftSetup {
+    pub name: Option<String>,
+    pub orientation: Option<String>,
+    pub operations: Vec<DraftOp>,
+}
+/// What a reply says so far.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Draft {
+    pub summary: Option<String>,
+    pub setups: Vec<DraftSetup>,
+    /// The text is not a whole JSON object yet.
+    pub writing: bool,
+}
+/// The most of a reply the timeline reads; plans are far shorter.
+const PARTIAL_LIMIT: usize = 256 * 1024;
+/// Nesting deeper than a proposal's is not read.
+const PARTIAL_DEPTH: usize = 8;
+/// The proposal as far as `text` has come: text before the first `{` is
+/// skipped, a string cut short is closed, and a key, number or literal cut
+/// short is left out with its member.
+pub fn partial(text: &str) -> Draft {
+    let Some(start) = text.find('{') else {
+        return Draft::default();
+    };
+    let mut body = &text[start..];
+    if let Some(Ok(value)) = serde_json::Deserializer::from_str(body)
+        .into_iter::<Value>()
+        .next()
+    {
+        return Draft::of(&value, false);
+    }
+    if body.len() > PARTIAL_LIMIT {
+        let mut end = PARTIAL_LIMIT;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body = &body[..end];
+    }
+    let mut end = body.len();
+    for _ in 0..64 {
+        let (candidate, boundary) = closed(&body[..end]);
+        if let Some(candidate) = candidate
+            && let Ok(value) = serde_json::from_str::<Value>(&candidate)
+        {
+            return Draft::of(&value, true);
+        }
+        match boundary {
+            Some(b) if b < end => end = b,
+            _ => break,
+        }
+    }
+    Draft {
+        writing: true,
+        ..Draft::default()
+    }
+}
+/// `prefix` closed into JSON (None when it ends inside a number, literal or
+/// key), and where to cut it back to: before its last `,`, or just after its
+/// last `{` or `[`, outside strings.
+fn closed(prefix: &str) -> (Option<String>, Option<usize>) {
+    let mut stack = vec![];
+    let (mut in_string, mut escaped, mut boundary) = (false, false, None);
+    for (i, c) in prefix.char_indices() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => {
+                stack.push(if c == '{' { '}' } else { ']' });
+                boundary = Some(i + 1);
+                if stack.len() > PARTIAL_DEPTH {
+                    return (None, None);
+                }
+            }
+            '}' | ']' => {
+                stack.pop();
+            }
+            ',' => boundary = Some(i),
+            _ => {}
+        }
+    }
+    let mut out = prefix.to_string();
+    if in_string {
+        // Drop an escape cut short: a lone backslash or a \u without 4 digits.
+        if let Some(at) = out.rfind('\\') {
+            let tail = &out[at..];
+            if escaped || (tail.starts_with("\\u") && tail.len() < 6) {
+                out.truncate(at);
+            }
+        }
+        out.push('"');
+    } else if out
+        .trim_end()
+        .ends_with(|c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+    {
+        return (None, boundary);
+    }
+    out.extend(stack.iter().rev());
+    (Some(out), boundary)
+}
+impl Draft {
+    fn of(value: &Value, writing: bool) -> Self {
+        let text = |v: &Value| v.as_str().map(String::from);
+        Draft {
+            summary: text(&value["summary"]),
+            setups: value["setups"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|s| DraftSetup {
+                    name: text(&s["name"]),
+                    orientation: text(&s["orientation"]),
+                    operations: s["operations"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|o| DraftOp {
+                            strategy: text(&o["strategy"]),
+                            name: text(&o["name"]),
+                            tool: o["tool"].as_u64(),
+                            rpm: o["rpm"].as_f64(),
+                            feed: o["feed"].as_f64(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            writing,
+        }
+    }
+}
 /// Invisible characters that can reorder or hide text (Unicode category Cf).
 fn format_character(c: char) -> bool {
     matches!(c, '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}' | '\u{180e}'
@@ -1472,5 +1620,56 @@ pub(crate) mod tests {
     fn whitespace_in_model_text_becomes_a_space() {
         assert_eq!(clip("a\nb", 60), "a b");
         assert_eq!(clip("a\tb\r\nc\u{85}d\u{2028}e", 60), "a b c d e");
+    }
+    #[test]
+    fn a_reply_cut_anywhere_reads_as_far_as_it_has_come() {
+        let (_, _, report) = block();
+        let full = serde_json::to_string(&good(&report)).unwrap();
+        let mut last_ops = 0;
+        for end in (0..=full.len()).filter(|i| full.is_char_boundary(*i)) {
+            let draft = partial(&full[..end]);
+            let ops: usize = draft.setups.iter().map(|s| s.operations.len()).sum();
+            assert!(ops + 1 >= last_ops, "at {end}: {ops} after {last_ops}");
+            last_ops = ops;
+        }
+        let done = partial(&full);
+        assert!(!done.writing);
+        assert_eq!(
+            done.summary.as_deref(),
+            Some("Top side, then the underside.")
+        );
+        assert_eq!(done.setups.len(), 2);
+        let cut = partial(&full[..full.find("then").unwrap()]);
+        assert_eq!(cut.summary.as_deref(), Some("Top side, "));
+        assert!(cut.writing && cut.setups.is_empty());
+        // A number being written is not shown until it ends.
+        let at = full.find("\"rpm\":").unwrap() + 7;
+        let draft = partial(&full[..at]);
+        assert_eq!(draft.setups[0].operations[0].rpm, None);
+    }
+    #[test]
+    fn text_before_the_json_and_a_fence_are_skipped() {
+        let draft = partial(
+            "Here is the plan:\n```json\n{\"summary\": \"Face it\", \"setups\": [{\"name\": \"Top\"",
+        );
+        assert_eq!(draft.summary.as_deref(), Some("Face it"));
+        assert_eq!(draft.setups[0].name.as_deref(), Some("Top"));
+        assert_eq!(partial("thinking…"), Draft::default());
+        let done = partial("```json\n{\"summary\": \"x\", \"setups\": []}\n```");
+        assert!(!done.writing);
+    }
+    #[test]
+    fn partial_is_bounded_and_never_panics() {
+        let deep = "{\"setups\":".to_string() + &"[".repeat(100_000);
+        let _ = partial(&deep);
+        let escape = "{\"summary\":\"a\\";
+        assert_eq!(partial(escape).summary.as_deref(), Some("a"));
+        let unicode = "{\"summary\":\"a\\u00";
+        assert_eq!(partial(unicode).summary.as_deref(), Some("a"));
+        let huge = format!("{{\"summary\":\"{}", "x".repeat(4 << 20));
+        let started = std::time::Instant::now();
+        let draft = partial(&huge);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(draft.summary.is_some());
     }
 }
