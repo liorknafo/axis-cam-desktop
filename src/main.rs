@@ -1176,6 +1176,7 @@ impl App {
                     step.ended.get_or_insert_with(Instant::now);
                 }
             }
+            Event::Overview(_) | Event::Looked(..) | Event::Dropped(..) => {}
         }
     }
     /// The planner's checklist: what must be in place before Plan is offered.
@@ -2444,6 +2445,7 @@ impl App {
                     client,
                     self.settings.model.clone(),
                     self.plan_stream.clone(),
+                    true,
                 );
                 let doc = self.doc.clone();
                 let busy = self.plan_busy.clone();

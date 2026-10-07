@@ -5077,7 +5077,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_requests_row_starts_at_zero_because_the_client_resets_the_count() {
         use crate::fake_openai::{Fake, Resp};
-        use crate::openai::Role;
+        use crate::openai::{Item, Role};
         use crate::planner::{Backend, Event::*, OpenAiBackend, Progress::*};
         use crate::session::SessionStore;
         let dir = tempfile::tempdir().unwrap();
@@ -5100,8 +5100,9 @@ mod tests {
             std::sync::Arc::new(client),
             "gpt-6.1-sol".into(),
             a.plan_stream.clone(),
+            true,
         );
-        let conversation = [(Role::User, "Plan.".to_string())];
+        let conversation = [Item::text(Role::User, "Plan.")];
         send(&mut a, epoch, Stage(Analyzing));
         send(&mut a, epoch, Stage(Asking(1)));
         *a.plan_stream.lock().unwrap() = "x".repeat(1200);
@@ -5113,7 +5114,7 @@ mod tests {
             assert_eq!(count(&a), 1200, "{request:?}");
         }
         // The next request's attempt starts at zero and counts its own reply.
-        assert_eq!(backend.reply(&conversation).await.unwrap(), "{}");
+        assert_eq!(backend.reply(&conversation, None).await.unwrap().text, "{}");
         assert_eq!(count(&a), 2);
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
         assert_eq!(rows.last().unwrap().notes, ["received 2 characters"]);
