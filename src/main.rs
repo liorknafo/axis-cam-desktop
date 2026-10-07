@@ -6,6 +6,7 @@ mod choice_help;
 mod fake_openai;
 mod help;
 mod holding;
+mod look;
 mod material;
 mod mesh;
 mod model;
