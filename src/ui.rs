@@ -3429,9 +3429,12 @@ pub(crate) struct TimelineRow {
     pub mark: Mark,
     /// The step and how long it took (so far, while it runs).
     pub text: String,
-    /// Under it: the characters received while a request runs, or how its
+    /// Under it: what the model has written while a request runs, or how its
     /// check went. Empty in the finished view, which puts a summary in `text`.
     pub notes: Vec<String>,
+    /// Under the notes: the pictures the request's model looked at, and the
+    /// refusals it met.
+    pub looks: Vec<crate::Shown>,
 }
 /// A step that has ended, in the past tense; `stage_text` words the one that
 /// is running.
@@ -3479,23 +3482,98 @@ fn step_summary(result: &crate::planner::StepResult) -> String {
         StepResult::Unreadable(_) => "reply could not be read".into(),
     }
 }
+/// The most setups a draft lists; the rest are counted.
+const DRAFT_SETUPS: usize = 6;
+/// What the model has written of its reply so far, as timeline lines.
+pub(crate) fn draft_lines(draft: &crate::proposal::Draft) -> Vec<String> {
+    if draft.summary.is_none() && draft.setups.is_empty() {
+        return vec!["Thinking: the model has not started writing yet.".into()];
+    }
+    let mut lines = vec![];
+    if let Some(summary) = &draft.summary {
+        lines.push(format!("Plan: {}", clip(summary, 300)));
+    }
+    let last = draft.setups.len().saturating_sub(1);
+    for (i, setup) in draft.setups.iter().enumerate().take(DRAFT_SETUPS) {
+        let mut parts = vec![format!("Setup {}", i + 1)];
+        if let Some(up) = &setup.orientation {
+            parts.push(format!("{} up", clip(up, 4)));
+        }
+        let n = setup.operations.len();
+        for (k, op) in setup.operations.iter().enumerate() {
+            let mut words = format!(
+                "{} \"{}\"",
+                clip(op.strategy.as_deref().unwrap_or("…"), 20),
+                clip(op.name.as_deref().unwrap_or("…"), 40)
+            );
+            if let Some(t) = op.tool {
+                words += &format!(" T{t}");
+            }
+            // The operation still being written also shows the numbers so far.
+            if draft.writing && i == last && k + 1 == n {
+                if let Some(rpm) = op.rpm {
+                    words += &format!(", {rpm:.0} rpm");
+                }
+                if let Some(feed) = op.feed {
+                    words += &format!(", {feed:.0} mm/min");
+                }
+                words = format!("writing: {words}");
+            }
+            parts.push(words);
+        }
+        lines.push(parts.join(" · "));
+    }
+    if draft.setups.len() > DRAFT_SETUPS {
+        let more = draft.setups.len() - DRAFT_SETUPS;
+        lines.push(format!(
+            "and {more} more setup{}",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    lines
+}
+/// A picture the model looked at as one line; a look with no picture is an
+/// error sentence and reads bare.
+pub(crate) fn look_line(look: &crate::planner::Look) -> String {
+    match (&look.png, look.purpose.is_empty()) {
+        (Some(_), false) => format!(
+            "Looked: {} — \"{}\"",
+            clip(&look.description, 200),
+            clip(&look.purpose, 120)
+        ),
+        (Some(_), true) => format!("Looked: {}", clip(&look.description, 200)),
+        (None, _) => clip(&look.description, 300),
+    }
+}
 /// The timeline's rows as of `now`. While the run goes (`finished` false) a
 /// check's problems and an unreadable reply's error are listed under their
-/// row; a finished run's rows are one line each, ending in a short summary.
-/// A step that ended without the result it should have gets the warning mark
-/// and says why (see `lost`).
+/// row, and the open request shows what the model has written; a finished
+/// run's rows are one line each, ending in a short summary and the number of
+/// pictures looked at. A step that ended without the result it should have
+/// gets the warning mark and says why (see `lost`).
 pub(crate) fn timeline_rows(
     app: &App,
     now: std::time::Instant,
     finished: bool,
 ) -> Vec<TimelineRow> {
     use crate::planner::{Progress, StepResult};
-    let received = app.plan_stream.lock().map_or(0, |t| t.chars().count());
     let request = |stage| {
         matches!(
             stage,
             Progress::Asking(_) | Progress::Repairing(_) | Progress::Extending(_)
         )
+    };
+    let open_request = |step: &crate::Step| step.ended.is_none() && request(step.stage);
+    // Read the text only while a request is open, and not for longer than
+    // the parse takes: the reply goes on streaming into it.
+    let draft = if app.plan_timeline.iter().any(open_request) {
+        let text = app
+            .plan_stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        draft_lines(&crate::proposal::partial(&text))
+    } else {
+        vec![]
     };
     app.plan_timeline
         .iter()
@@ -3512,8 +3590,8 @@ pub(crate) fn timeline_rows(
             };
             let mut text = format!("{head} · {:.0} s", took.as_secs_f32());
             let mut notes = vec![];
-            if step.ended.is_none() && request(step.stage) {
-                notes.push(format!("received {}", plural(received, "character")));
+            if open_request(step) {
+                notes.extend(draft.iter().cloned());
             }
             match (&step.result, finished) {
                 (None, true) => {
@@ -3537,15 +3615,28 @@ pub(crate) fn timeline_rows(
                     notes.push(format!("The reply could not be read: {}", clip(why, 300)))
                 }
             }
+            if finished {
+                let seen = step.looks.iter().filter(|l| l.thumb.is_some()).count();
+                if seen > 0 {
+                    text = format!("{text} · {}", plural(seen, "look"));
+                }
+            }
             let mark = match (step.ended, &step.result) {
                 (None, _) => Mark::Open,
                 (Some(_), Some(StepResult::Problems { .. } | StepResult::Unreadable(_))) => {
                     Mark::Warn
                 }
                 (Some(_), None) if lost.is_some() => Mark::Warn,
+                // A refusal is worth a mark when nothing else is said of the row.
+                (Some(_), None) if step.looks.iter().any(|l| l.warn) => Mark::Warn,
                 (Some(_), _) => Mark::Done,
             };
-            TimelineRow { mark, text, notes }
+            TimelineRow {
+                mark,
+                text,
+                notes,
+                looks: step.looks.clone(),
+            }
         })
         .collect()
 }
@@ -3565,6 +3656,21 @@ fn timeline_view<'a>(app: &App, finished: bool) -> Option<Column<'a, Message>> {
         let mut item = column![text(row.text).size(13)].spacing(2);
         for line in row.notes {
             item = item.push(muted(line));
+        }
+        for look in row.looks {
+            let line = if look.warn {
+                text(look.line).size(12).color(WARN)
+            } else {
+                muted(look.line)
+            };
+            item = item.push(match look.thumb {
+                Some(handle) => Element::from(
+                    row![widget::image(handle).width(120), line]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                ),
+                None => line.into(),
+            });
         }
         c = c.push(row![mark, item].spacing(8));
     }
@@ -3610,6 +3716,13 @@ fn plan_result(app: &App) -> Element<'_, Message> {
         .into(),
         Planner::Running(stage) => {
             let mut c = column![bold(running_text(app, *stage), 20)].spacing(14);
+            if let Some(overview) = &app.plan_overview {
+                let mut picture = column![bold("The AI starts with this picture", 15)].spacing(6);
+                if let Some(handle) = &overview.thumb {
+                    picture = picture.push(widget::image(handle.clone()).width(240));
+                }
+                c = c.push(picture.push(muted(overview.line.clone())));
+            }
             if let Some(rows) = timeline_view(app, false) {
                 c = c.push(rows);
             }

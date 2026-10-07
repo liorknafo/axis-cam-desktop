@@ -306,22 +306,25 @@ fn closed(prefix: &str, delimited: bool) -> (Option<String>, Option<usize>) {
     out.extend(stack.iter().rev());
     (Some(out), boundary)
 }
+/// The objects among the elements of the array `value`: only those are setups
+/// or operations, so a reply of `[1,1,1,…` makes none.
+fn objects(value: &Value) -> impl Iterator<Item = &Value> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item.is_object())
+}
 impl Draft {
     fn of(value: &Value, writing: bool) -> Self {
         let text = |v: &Value| v.as_str().map(String::from);
         Draft {
             summary: text(&value["summary"]),
-            setups: value["setups"]
-                .as_array()
-                .into_iter()
-                .flatten()
+            setups: objects(&value["setups"])
                 .map(|s| DraftSetup {
                     name: text(&s["name"]),
                     orientation: text(&s["orientation"]),
-                    operations: s["operations"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
+                    operations: objects(&s["operations"])
                         .map(|o| DraftOp {
                             strategy: text(&o["strategy"]),
                             name: text(&o["name"]),
@@ -1709,6 +1712,18 @@ pub(crate) mod tests {
         assert_eq!(partial("thinking…"), Draft::default());
         let done = partial("```json\n{\"summary\": \"x\", \"setups\": []}\n```");
         assert!(!done.writing);
+    }
+    #[test]
+    fn only_objects_are_setups_and_operations() {
+        let draft =
+            partial(r#"{"setups":[1,2,{"name":"A","operations":[3,{"strategy":"Face"},"x",null]}"#);
+        assert_eq!(draft.setups.len(), 1);
+        assert_eq!(draft.setups[0].name.as_deref(), Some("A"));
+        assert_eq!(draft.setups[0].operations.len(), 1);
+        let hostile = format!("{{\"setups\":[{}", "1,".repeat(5000));
+        assert!(partial(&hostile).setups.is_empty());
+        let hostile = format!("{{\"setups\":[{{\"operations\":[{}", "[],".repeat(5000));
+        assert!(partial(&hostile).setups[0].operations.is_empty());
     }
     #[test]
     fn partial_is_bounded_and_never_panics() {

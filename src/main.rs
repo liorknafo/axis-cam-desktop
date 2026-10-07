@@ -225,6 +225,17 @@ pub struct Step {
     /// How the reply of this request fared: on the checking step, or on the
     /// request step when the reply could not be read.
     pub result: Option<planner::StepResult>,
+    /// The pictures the model looked at in this request, and what OpenAI
+    /// refused of it.
+    pub looks: Vec<Shown>,
+}
+/// One picture of the timeline, or a line about one: what it says, whether it
+/// is a warning, and the picture's handle, made once when the event arrived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shown {
+    pub line: String,
+    pub warn: bool,
+    pub thumb: Option<iced::widget::image::Handle>,
 }
 /// Clamp positions typed over a setup's `over` that `holding::layout` refuses.
 #[derive(Debug, Clone, PartialEq)]
@@ -321,6 +332,8 @@ pub struct App {
     pub plan_timeline: Vec<Step>,
     /// The text of the model's reply streamed so far in the current run.
     pub plan_stream: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The picture the current run's first request carries.
+    pub plan_overview: Option<Shown>,
     /// Blocking stages still running, also those of cancelled runs.
     pub plan_busy: planner::Busy,
     /// Set by an edit that dropped a running plan or a preview, or by a
@@ -561,6 +574,7 @@ impl App {
             plan_model: String::new(),
             plan_timeline: vec![],
             plan_stream: Default::default(),
+            plan_overview: None,
             plan_camera: viewport::Camera::default(),
             plan_busy: planner::Busy::default(),
             plan_dropped: None,
@@ -1134,6 +1148,7 @@ impl App {
         self.plan_epoch = self.plan_epoch.wrapping_add(1);
         self.planner = Planner::Idle;
         self.plan_timeline.clear();
+        self.plan_overview = None;
         // The aborted run may still write to the old text.
         self.plan_stream = Default::default();
     }
@@ -1143,10 +1158,26 @@ impl App {
             step.ended.get_or_insert_with(Instant::now);
         }
     }
+    /// The latest step of request `n`, of whichever kind.
+    fn request_step(&mut self, n: usize) -> Option<&mut Step> {
+        use planner::Progress;
+        self.plan_timeline.iter_mut().rev().find(|step| {
+            matches!(step.stage,
+                Progress::Asking(at) | Progress::Repairing(at) | Progress::Extending(at)
+                if at == n)
+        })
+    }
     /// Adds a run's event to the timeline: a stage ends the open step and
-    /// starts its own; a result joins the step of its request and ends it.
+    /// starts its own; a result joins the step of its request and ends it; a
+    /// picture or a refusal joins the request it came with.
     fn record_plan_event(&mut self, event: planner::Event) {
         use planner::{Event, Progress, StepResult};
+        // A picture's handle is made once, here, not on every frame.
+        let thumb = |look: &planner::Look| {
+            look.png
+                .as_ref()
+                .map(|png| iced::widget::image::Handle::from_bytes(png.to_vec()))
+        };
         match event {
             Event::Stage(stage) => {
                 self.end_plan_step();
@@ -1155,28 +1186,59 @@ impl App {
                     started: Instant::now(),
                     ended: None,
                     result: None,
+                    looks: vec![],
                 });
                 self.planner = Planner::Running(stage);
             }
             Event::Checked(n, result) => {
                 let reply = matches!(result, StepResult::Unreadable(_));
-                let found = self
-                    .plan_timeline
-                    .iter_mut()
-                    .rev()
-                    .find(|step| match step.stage {
-                        Progress::Checking(at) => !reply && at == n,
-                        Progress::Asking(at)
-                        | Progress::Repairing(at)
-                        | Progress::Extending(at) => reply && at == n,
-                        _ => false,
-                    });
+                let found = if reply {
+                    self.request_step(n)
+                } else {
+                    self.plan_timeline
+                        .iter_mut()
+                        .rev()
+                        .find(|step| step.stage == Progress::Checking(n))
+                };
                 if let Some(step) = found {
                     step.result = Some(result);
                     step.ended.get_or_insert_with(Instant::now);
                 }
             }
-            Event::Overview(_) | Event::Looked(..) | Event::Dropped(..) => {}
+            Event::Overview(look) => {
+                self.plan_overview = Some(Shown {
+                    line: look.description.clone(),
+                    warn: false,
+                    thumb: thumb(&look),
+                });
+            }
+            Event::Looked(n, look) => {
+                let shown = Shown {
+                    line: ui::look_line(&look),
+                    warn: false,
+                    thumb: thumb(&look),
+                };
+                if let Some(step) = self.request_step(n) {
+                    step.looks.push(shown);
+                }
+            }
+            Event::Dropped(n, what) => {
+                let line = match what {
+                    planner::Dropped::Tool => {
+                        "OpenAI refused the picture tool; continuing with the overview only."
+                    }
+                    planner::Dropped::Pictures => {
+                        "OpenAI refused pictures; continuing with text only."
+                    }
+                };
+                if let Some(step) = self.request_step(n) {
+                    step.looks.push(Shown {
+                        line: line.into(),
+                        warn: true,
+                        thumb: None,
+                    });
+                }
+            }
         }
     }
     /// The planner's checklist: what must be in place before Plan is offered.

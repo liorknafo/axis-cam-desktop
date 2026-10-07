@@ -19,6 +19,7 @@ fn smoke_steps(steps: Vec<(Progress, u64, Option<u64>, Option<StepResult>)>) -> 
             started: ago(began).unwrap_or(now),
             ended: ended.and_then(ago),
             result,
+            looks: vec![],
         })
         .collect()
 }
@@ -743,7 +744,7 @@ impl App {
                     (Checking(1), 29, Some(22), Some(smoke_problems(2))),
                     (Repairing(2), 22, None, None),
                 ]);
-                *self.plan_stream.lock().unwrap() = "x".repeat(1840);
+                *self.plan_stream.lock().unwrap() = "{\"summary\":\"Face the top, rough the pocket with T3, then turn the part over.\",\"setups\":[{\"orientation\":\"+Z\",\"name\":\"Top\",\"origin\":\"Stock top center\",\"workholding\":\"Vise\",\"operations\":[{\"strategy\":\"Face\",\"name\":\"Face top\",\"tool\":1".into();
                 vec![]
             }
             108 => {
@@ -4764,11 +4765,12 @@ mod tests {
                 started: ago(began),
                 ended: ended.map(ago),
                 result,
+                looks: vec![],
             })
             .collect()
     }
     #[test]
-    fn running_rows_list_each_steps_problems_and_stream_count_under_it() {
+    fn running_rows_list_each_steps_problems_and_the_draft_under_it() {
         use crate::planner::{Progress::*, StepResult};
         use crate::ui::Mark::*;
         let dir = tempfile::tempdir().unwrap();
@@ -4835,16 +4837,28 @@ mod tests {
         );
         assert_eq!(rows[4].notes, ["passed"]);
         assert_eq!(rows[5].notes, ["did not pass"]);
-        // Only the open request shows what has streamed in so far.
-        assert_eq!(rows[6].notes, ["received 1 character"]);
-        *a.plan_stream.lock().unwrap() = "x".repeat(1840);
-        let rows = crate::ui::timeline_rows(&a, now, false);
-        assert_eq!(rows[6].notes, ["received 1840 characters"]);
-        assert!(
-            rows[..6]
-                .iter()
-                .all(|r| r.notes.iter().all(|n| !n.starts_with("received")))
+        // Only the open request shows what has streamed in so far; text that
+        // is no JSON yet is still thinking.
+        assert_eq!(
+            rows[6].notes,
+            ["Thinking: the model has not started writing yet."]
         );
+        *a.plan_stream.lock().unwrap() =
+            r#"{"summary":"Face it","setups":[{"orientation":"+Z","operations":[{"strategy":"Face","name":"Face top","tool":1,"rpm":8000,"feed":12"#
+                .into();
+        let rows = crate::ui::timeline_rows(&a, now, false);
+        assert_eq!(
+            rows[6].notes,
+            [
+                "Plan: Face it",
+                "Setup 1 · +Z up · writing: Face \"Face top\" T1, 8000 rpm"
+            ]
+        );
+        assert!(rows[..6].iter().all(|r| {
+            r.notes
+                .iter()
+                .all(|n| !n.starts_with("Plan:") && !n.starts_with("Thinking"))
+        }));
         // An open check says nothing yet.
         a.plan_timeline[6].stage = Checking(3);
         assert!(crate::ui::timeline_rows(&a, now, false)[6].notes.is_empty());
@@ -5074,6 +5088,181 @@ mod tests {
         a.planner = crate::Planner::Preview(checked_preview(&a, false));
         let _ = a.view();
     }
+    #[test]
+    fn the_draft_reads_as_plan_and_setup_lines() {
+        use crate::proposal::{Draft, DraftOp, DraftSetup};
+        let op = |s: &str, n: &str, t, rpm, feed| DraftOp {
+            strategy: Some(s.into()),
+            name: Some(n.into()),
+            tool: Some(t),
+            rpm,
+            feed,
+        };
+        let draft = Draft {
+            summary: Some("Face the top,\nthen pocket.".into()),
+            setups: vec![
+                DraftSetup {
+                    name: Some("Top".into()),
+                    orientation: Some("+Z".into()),
+                    operations: vec![
+                        op("Face", "Face top", 1, Some(8000.), Some(1200.)),
+                        op("Pocket", "Main pocket", 3, Some(9000.), None),
+                    ],
+                },
+                DraftSetup {
+                    name: Some("Bottom".into()),
+                    orientation: Some("-Z".into()),
+                    operations: vec![op("Contour", "Outside", 2, Some(9000.), Some(1200.))],
+                },
+            ],
+            writing: true,
+        };
+        assert_eq!(
+            crate::ui::draft_lines(&draft),
+            vec![
+                "Plan: Face the top, then pocket.".to_string(),
+                "Setup 1 · +Z up · Face \"Face top\" T1 · Pocket \"Main pocket\" T3".into(),
+                "Setup 2 · -Z up · writing: Contour \"Outside\" T2, 9000 rpm, 1200 mm/min".into(),
+            ]
+        );
+        assert_eq!(
+            crate::ui::draft_lines(&Draft {
+                writing: true,
+                ..Draft::default()
+            }),
+            vec!["Thinking: the model has not started writing yet.".to_string()]
+        );
+    }
+    #[test]
+    fn a_draft_shows_six_setups_and_counts_the_rest() {
+        use crate::proposal::{Draft, DraftSetup};
+        let setups = |n: usize| -> Vec<DraftSetup> {
+            (1..=n)
+                .map(|i| DraftSetup {
+                    name: Some(format!("S{i}")),
+                    ..DraftSetup::default()
+                })
+                .collect()
+        };
+        let lines = |n| {
+            crate::ui::draft_lines(&Draft {
+                summary: Some("Plan.".into()),
+                setups: setups(n),
+                writing: true,
+            })
+        };
+        let six = lines(6);
+        assert_eq!(six.len(), 7, "the plan and six setups: {six:?}");
+        assert_eq!(six[6], "Setup 6");
+        let ten = lines(10);
+        assert_eq!(ten.len(), 8, "{ten:?}");
+        assert_eq!(ten[6], "Setup 6");
+        assert_eq!(ten[7], "and 4 more setups");
+        assert_eq!(lines(7)[7], "and 1 more setup");
+    }
+    #[test]
+    fn a_look_reads_as_one_line() {
+        let look = crate::planner::Look {
+            description: "+Z up, top, zoomed on 12, 14; stock shown; tags: 12".into(),
+            purpose: "is the pocket open on −Y?".into(),
+            png: Some(std::sync::Arc::new(vec![])),
+        };
+        assert_eq!(
+            crate::ui::look_line(&look),
+            "Looked: +Z up, top, zoomed on 12, 14; stock shown; tags: 12 — \"is the pocket open on −Y?\""
+        );
+        let bare = crate::planner::Look {
+            purpose: String::new(),
+            ..look
+        };
+        assert_eq!(
+            crate::ui::look_line(&bare),
+            "Looked: +Z up, top, zoomed on 12, 14; stock shown; tags: 12"
+        );
+        let error = crate::planner::Look {
+            description: "Surface 99 is not a surface of this part.".into(),
+            purpose: String::new(),
+            png: None,
+        };
+        assert_eq!(
+            crate::ui::look_line(&error),
+            "Surface 99 is not a surface of this part."
+        );
+    }
+    #[test]
+    fn the_running_request_shows_the_draft_looks_and_drops() {
+        use crate::planner::{Dropped, Event, Look, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.page = Page::Ai;
+        a.planner = crate::Planner::Running(Progress::Asking(1));
+        a.record_plan_event(Event::Overview(Look {
+            description: "+Z up, isometric; stock shown; tags: none".into(),
+            purpose: String::new(),
+            png: Some(std::sync::Arc::new(vec![1])),
+        }));
+        let overview = a.plan_overview.as_ref().unwrap();
+        assert!(overview.thumb.is_some() && !overview.warn);
+        a.record_plan_event(Event::Stage(Progress::Asking(1)));
+        a.record_plan_event(Event::Looked(
+            1,
+            Look {
+                description: "+Z up, top, whole part; stock shown; tags: none".into(),
+                purpose: "overview".into(),
+                png: Some(std::sync::Arc::new(vec![1])),
+            },
+        ));
+        a.record_plan_event(Event::Looked(
+            1,
+            Look {
+                description: "Surface 99 is not a surface of this part.".into(),
+                purpose: String::new(),
+                png: None,
+            },
+        ));
+        a.record_plan_event(Event::Dropped(1, Dropped::Pictures));
+        *a.plan_stream.lock().unwrap() = "{\"summary\":\"Face it\",\"setups\":[".into();
+        let _ = a.view();
+        let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
+        let row = rows.last().unwrap();
+        assert_eq!(row.notes, vec!["Plan: Face it".to_string()]);
+        assert_eq!(row.looks.len(), 3);
+        assert!(row.looks[0].line.starts_with("Looked: "));
+        assert!(row.looks[0].thumb.is_some() && !row.looks[0].warn);
+        // An error sentence is shown bare, without a picture.
+        assert_eq!(
+            row.looks[1].line,
+            "Surface 99 is not a surface of this part."
+        );
+        assert!(row.looks[1].thumb.is_none() && !row.looks[1].warn);
+        assert!(row.looks[2].warn && row.looks[2].thumb.is_none());
+        assert_eq!(
+            row.looks[2].line,
+            "OpenAI refused pictures; continuing with text only."
+        );
+        // A refused tool says so too.
+        a.record_plan_event(Event::Dropped(1, Dropped::Tool));
+        let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
+        assert_eq!(
+            rows.last().unwrap().looks[3].line,
+            "OpenAI refused the picture tool; continuing with the overview only."
+        );
+        // An event for a request that is not on the timeline joins nothing.
+        a.record_plan_event(Event::Dropped(3, Dropped::Tool));
+        assert_eq!(a.plan_timeline[0].looks.len(), 4);
+        // Finished: one line, ending in the pictures looked at (not errors),
+        // and the request is marked for the refusal it met.
+        a.record_plan_event(Event::Stage(Progress::Checking(1)));
+        let _ = a.view();
+        let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), true);
+        assert!(rows[0].text.ends_with("· 1 look"), "{}", rows[0].text);
+        assert_eq!(rows[0].mark, crate::ui::Mark::Warn);
+        assert_eq!(rows[0].looks.len(), 4);
+        assert_eq!(rows[1].looks.len(), 0);
+        // A new run starts without them.
+        a.drop_plan();
+        assert!(a.plan_overview.is_none() && a.plan_timeline.is_empty());
+    }
     #[tokio::test]
     async fn a_new_requests_row_starts_at_zero_because_the_client_resets_the_count() {
         use crate::fake_openai::{Fake, Resp};
@@ -5117,7 +5306,10 @@ mod tests {
         assert_eq!(backend.reply(&conversation, None).await.unwrap().text, "{}");
         assert_eq!(count(&a), 2);
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
-        assert_eq!(rows.last().unwrap().notes, ["received 2 characters"]);
+        assert_eq!(
+            rows.last().unwrap().notes,
+            ["Thinking: the model has not started writing yet."]
+        );
         // An event of an older run leaves the count alone.
         send(&mut a, epoch.wrapping_sub(1), Stage(Repairing(2)));
         assert_eq!(count(&a), 2);
