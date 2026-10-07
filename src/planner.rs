@@ -681,7 +681,8 @@ struct Sight {
     pictures: bool,
     /// The view_model tool is offered; off once OpenAI refused it.
     tool: bool,
-    /// Pictures drawn for the model so far, the overview aside.
+    /// Views the model asked for that were drawn or failed to draw, the
+    /// overview aside.
     shown: usize,
 }
 /// One planner request: sends the conversation, answers the model's calls
@@ -750,6 +751,9 @@ async fn ask(
             } else if sight.shown >= MAX_PICTURES_PER_RUN {
                 Err("No more pictures in this run; reply with the proposal.".into())
             } else {
+                // A view that cannot be drawn counts against the limits too.
+                here += 1;
+                sight.shown += 1;
                 let (scene, arguments) = (scene.clone(), call.arguments.clone());
                 blocking(busy, move || look::draw(&scene, &arguments))
                     .await
@@ -758,8 +762,6 @@ async fn ask(
             conversation.push(Item::Call(call.clone()));
             match answer {
                 Ok(picture) => {
-                    here += 1;
-                    sight.shown += 1;
                     conversation.push(Item::Output {
                         call_id: call.call_id,
                         output: picture.description.clone(),
@@ -3479,7 +3481,7 @@ pub(crate) mod tests {
         assert!(looks[0].png.is_some() && looks[1].png.is_none());
     }
     #[tokio::test]
-    async fn pictures_are_limited_per_request_and_old_ones_are_not_resent() {
+    async fn pictures_are_limited_per_request_and_the_next_request_may_look_again() {
         let (doc, mesh, report) = block();
         let many = |from: usize| {
             calls(
@@ -3605,6 +3607,176 @@ pub(crate) mod tests {
             i.as_text()
                 .is_some_and(|(_, t)| t.contains("(Picture not sent: "))
         }));
+    }
+    #[tokio::test]
+    async fn pictures_that_cannot_be_drawn_count_against_the_limits() {
+        let (doc, mesh, report) = block();
+        let unknown = (0..MAX_PICTURES_PER_REQUEST)
+            .map(|i| {
+                look_call(
+                    &format!("x{i}"),
+                    serde_json::json!({"focus_surfaces": [99999]}),
+                )
+            })
+            .collect();
+        let script = Script::calls(vec![
+            calls(unknown),
+            calls(vec![look_call("more", serde_json::json!({}))]),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        plan(&script, doc, mesh, &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        let turns = script.turns.lock().unwrap();
+        assert_eq!(
+            turns[1].1,
+            Some(ToolChoice::None),
+            "six failed views use up the request"
+        );
+        let output = turns[2].0.iter().find_map(|i| match i {
+            Item::Output { call_id, output } if call_id == "more" => Some(output.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            output,
+            Some("No more pictures for this request; reply with the proposal.")
+        );
+        assert_eq!(turns[2].1, Some(ToolChoice::None));
+        // The next planner request may look again.
+        assert_eq!(turns[3].1, Some(ToolChoice::Auto));
+    }
+    #[tokio::test]
+    async fn after_the_runs_last_picture_the_tool_may_not_be_called() {
+        let (doc, mesh, report) = block();
+        let script = Script::calls(vec![
+            calls(vec![look_call("late", serde_json::json!({}))]),
+            text(&good(&report)),
+        ]);
+        let mut sight = Sight {
+            pictures: true,
+            tool: true,
+            shown: MAX_PICTURES_PER_RUN,
+        };
+        let mut scene = look::Scene {
+            doc: Arc::new(doc),
+            mesh,
+            report: Arc::new(report.clone()),
+            job: None,
+        };
+        let mut conversation = vec![Item::text(Role::User, "Part.")];
+        let mut events = vec![];
+        let text = ask(
+            &script,
+            &mut sight,
+            &mut conversation,
+            &mut scene,
+            &Busy::default(),
+            1,
+            &mut |e| events.push(e),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, serde_json::to_string(&good(&report)).unwrap());
+        let turns = script.turns.lock().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(
+            turns
+                .iter()
+                .all(|(_, tool)| *tool == Some(ToolChoice::None))
+        );
+        assert_eq!(
+            conversation[1..],
+            [
+                Item::Call(look_call("late", serde_json::json!({}))),
+                Item::Output {
+                    call_id: "late".into(),
+                    output: "No more pictures in this run; reply with the proposal.".into()
+                },
+            ]
+        );
+        assert_eq!(
+            sight.shown, MAX_PICTURES_PER_RUN,
+            "a refused call is not counted"
+        );
+        assert!(matches!(&events[..], [Event::Looked(1, l)] if l.png.is_none()));
+    }
+    #[test]
+    fn only_the_last_eight_images_are_resent_and_the_rest_become_text() {
+        let image = |i: usize| Part::Image {
+            png: Arc::new(vec![i as u8]),
+            alt: format!("p{i}"),
+        };
+        let message =
+            |range: std::ops::Range<usize>| Item::Message(Role::User, range.map(image).collect());
+        let call = ToolCall {
+            call_id: "c".into(),
+            name: look::NAME.into(),
+            arguments: "{\"angle\":\"top\"}".into(),
+        };
+        let conversation = vec![
+            Item::text(Role::User, "Part."),
+            message(0..3),
+            Item::Call(call),
+            Item::Output {
+                call_id: "c".into(),
+                output: "Top view.".into(),
+            },
+            message(3..6),
+            message(6..10),
+        ];
+        // Every image part, in order, as sent.
+        let images = |sent: &[Item]| -> Vec<Part> {
+            [1, 4, 5]
+                .iter()
+                .flat_map(|&k| match &sent[k] {
+                    Item::Message(Role::User, parts) => parts.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let sent = outgoing(&conversation, true, true);
+        assert_eq!(sent.len(), conversation.len());
+        assert_eq!(sent[..1], conversation[..1]);
+        assert_eq!(
+            sent[2..4],
+            conversation[2..4],
+            "calls stay while the tool is on"
+        );
+        let parts = images(&sent);
+        assert_eq!(parts.len(), 10);
+        for (i, part) in parts.iter().enumerate() {
+            if i < 2 {
+                assert_eq!(
+                    *part,
+                    Part::Text(format!("(Earlier picture, not resent: p{i})"))
+                );
+            } else {
+                assert_eq!(*part, image(i), "{i}");
+            }
+        }
+        // Pictures off: every image becomes its description.
+        let parts = images(&outgoing(&conversation, false, true));
+        for (i, part) in parts.iter().enumerate() {
+            assert_eq!(*part, Part::Text(format!("(Picture not sent: p{i})")));
+        }
+        // Tool off: the call and its output become plain text.
+        let sent = outgoing(&conversation, true, false);
+        assert_eq!(
+            sent[2],
+            Item::text(
+                Role::Assistant,
+                "(Asked for a picture: {\"angle\":\"top\"})"
+            )
+        );
+        assert_eq!(
+            sent[3],
+            Item::text(Role::User, "(Picture tool answered: Top view.)")
+        );
+        assert_eq!(
+            images(&sent)[2..],
+            images(&outgoing(&conversation, true, true))[2..]
+        );
     }
     #[test]
     fn the_pictures_section_comes_before_the_rules_only_with_pictures() {
