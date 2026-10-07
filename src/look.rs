@@ -113,7 +113,8 @@ impl Canvas {
     }
     pub(crate) fn line(&mut self, a: (f32, f32), b: (f32, f32), color: [u8; 3], width: f32) {
         let steps = ((b.0 - a.0).hypot(b.1 - a.1).ceil() as usize).clamp(1, 4000);
-        let r = (width / 2.).max(0.5);
+        // Floored so a hairline's disc still covers a pixel centre on each step.
+        let r = (width / 2.).max(0.75);
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
             let (x, y) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
@@ -192,9 +193,43 @@ mod tests {
         let mut c = Canvas::blank(200, 100);
         let rect = c.tag((100., 50.), "12").unwrap();
         assert!(rect[0] < 100 && rect[2] > 100 && rect[1] < 50 && rect[3] > 50);
-        let dark = (rect[0]..rect[2]).any(|x| c.at(x as u32, 50) == [40, 46, 54]);
-        assert!(dark, "the text is drawn inside the box");
+        // Ink strictly inside the 1 px border can only be the text.
+        let inked = (rect[0] + 2..rect[2] - 2)
+            .any(|x| (rect[1] + 2..rect[3] - 2).any(|y| c.at(x as u32, y as u32) == INK));
+        assert!(inked, "the text is drawn inside the box");
         assert!(c.tag((2., 50.), "12").is_none());
+    }
+    #[test]
+    fn text_draws_the_glyph_pixels() {
+        let mut c = Canvas::blank(40, 20);
+        c.text(0, 0, "1", 1, INK);
+        // '1' is [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E], bit 4 leftmost.
+        assert_eq!(c.at(2, 0), INK);
+        assert_eq!(c.at(0, 0), BACKGROUND);
+        for x in 1..=3 {
+            assert_eq!(c.at(x, 6), INK);
+        }
+        let mut t = Canvas::blank(40, 20);
+        t.text(0, 0, "AB", 1, INK);
+        assert_ne!(t.rgb, Canvas::blank(40, 20).rgb);
+        let mut unknown = Canvas::blank(40, 20);
+        unknown.text(0, 0, "ä", 1, INK);
+        let mut question = Canvas::blank(40, 20);
+        question.text(0, 0, "?", 1, INK);
+        assert_ne!(question.rgb, Canvas::blank(40, 20).rgb);
+        assert_eq!(unknown.rgb, question.rgb);
+    }
+    #[test]
+    fn a_hairline_is_drawn_without_gaps() {
+        let mut h = Canvas::blank(80, 70);
+        h.line((10., 10.), (60., 10.), INK, 1.);
+        let row = (0..80).filter(|&x| h.at(x, 10) == INK).count();
+        assert!(row >= 45, "{row} pixels in row 10");
+        let mut d = Canvas::blank(80, 70);
+        d.line((10., 10.), (60., 40.), INK, 1.);
+        for x in 10..=60 {
+            assert!((0..70).any(|y| d.at(x, y) == INK), "column {x} has a gap");
+        }
     }
     #[test]
     fn composite_flips_and_fills_the_background() {
