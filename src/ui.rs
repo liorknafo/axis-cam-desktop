@@ -4,6 +4,7 @@ use crate::{
     holding::Held,
     material::SpeedFeed,
     model::*,
+    planner::Dropped,
     viewport::{self, Viewport},
 };
 use iced::{
@@ -2772,6 +2773,24 @@ const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
 pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
 pub(crate) const PICTURES_SENT: &str = " With the box below ticked, pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels, are sent too, and, when the model asks, pictures of its own toolpaths.";
+/// What the timeline says when OpenAI refused a request carrying `what`
+/// and the run sends it again without: the line under the request while
+/// the run goes, and the words that end the request's line when it is
+/// over. Any 400 counts as a refusal, so neither names a cause.
+pub(crate) fn refusal(what: Dropped) -> (&'static str, &'static str) {
+    match what {
+        Dropped::Tool => (
+            "OpenAI refused the request; sending it again without the picture tool.",
+            "sent again without the picture tool",
+        ),
+        Dropped::Pictures => (
+            "OpenAI refused the request; sending it again without pictures.",
+            "sent again without pictures",
+        ),
+    }
+}
+/// The pictures checkbox's hover help.
+pub(crate) const PICTURES_HELP: &str = "Ticked, the planner also sends OpenAI pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels: an overview with the first request, and the views the model asks for, its own toolpaths among them. Unticked, it sends text only. The CAD file is never sent. A run keeps the choice it started with: the box cannot be changed until the run is over.";
 /// What the page beside the Plan button says is sent to OpenAI.
 pub(crate) fn sent_to_openai(pictures: bool) -> String {
     let mut text = SENT_TO_OPENAI.to_string();
@@ -2798,12 +2817,16 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
     }
     let pictures = !app.settings.plan_pictures_off;
     c = c.push(muted(sent_to_openai(pictures)));
-    c = c.push(
+    // A run keeps the choice it started with, so the box waits for it.
+    let running = matches!(app.planner, crate::Planner::Running(_));
+    c = c.push(help::wrap(
         checkbox(pictures)
             .label("Let the AI see pictures of the part")
-            .on_toggle(Message::PlanPictures)
+            .on_toggle_maybe((!running).then_some(Message::PlanPictures))
             .text_size(13),
-    );
+        Help::text("Pictures for the AI planner", PICTURES_HELP),
+        widget::tooltip::Position::Top,
+    ));
     if !ready {
         c = c.push(muted(
             "Plan becomes available when every item above is met.",
@@ -3639,12 +3662,15 @@ pub(crate) fn timeline_rows(
                 }
             }
             if finished {
-                // The one line says what was refused and ends with what the
-                // request saw; the lines themselves are shown only while the
-                // run goes.
-                for refusal in step.looks.iter().filter(|l| l.warn) {
-                    // "OpenAI refused pictures; continuing with text only."
-                    let said = refusal.line.split(';').next().unwrap_or(&refusal.line);
+                // The one line says what the request was sent again without
+                // and ends with what it saw; the lines themselves are shown
+                // only while the run goes.
+                for warning in step.looks.iter().filter(|l| l.warn) {
+                    let said = [Dropped::Tool, Dropped::Pictures]
+                        .map(refusal)
+                        .into_iter()
+                        .find(|(line, _)| *line == warning.line)
+                        .map_or(warning.line.as_str(), |(_, short)| short);
                     text = format!("{text} · {said}");
                 }
                 let seen = step.looks.iter().filter(|l| l.thumb.is_some()).count();

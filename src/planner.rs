@@ -177,14 +177,22 @@ pub struct Failure {
 /// the tests read it.
 #[cfg(test)]
 pub fn instructions() -> String {
-    instructions_with(false, false)
+    instructions_with(false, false, false)
 }
 /// What the model is told before it sees the part. Every limit the builder
 /// and the generators enforce is stated, so a correct plan passes first time.
-/// With `pictures`, a PICTURES section before RULES explains the overview;
-/// with `tool` too, the view_model tool and its limits.
-pub fn instructions_with(pictures: bool, tool: bool) -> String {
+/// With `pictures`, a PICTURES section before RULES explains the pictures:
+/// with `overview`, the overview the conversation carries; with `tool`, the
+/// view_model tool and its limits.
+pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
     let pictures = if pictures {
+        // Without its overview (it could not be drawn) the section does not
+        // promise one.
+        let first = if overview {
+            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (grey)."
+        } else {
+            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (grey)."
+        };
         let (look, limits) = if tool {
             (
                 "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green).\n",
@@ -196,7 +204,7 @@ pub fn instructions_with(pictures: bool, tool: bool) -> String {
             ("", String::new())
         };
         format!("PICTURES
-- After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (grey). Tags in white boxes give each listed plane's surface IDs (at most three, then \"…\") and each hole's `diameter` (as Ø6.0). The caption names the view and has a scale bar in mm; the triad shows +X (red), +Y (green), +Z (blue).
+- {first} Tags in white boxes give each listed plane's surface IDs (at most three, then \"…\") and each hole's `diameter` (as Ø6.0). The caption names the view and has a scale bar in mm; the triad shows +X (red), +Y (green), +Z (blue).
 {look}- {limits}Older pictures are replaced by their descriptions. The pictures are drawn from the same model as the report; when they seem to disagree, the report's numbers are right.
 
 ")
@@ -684,6 +692,8 @@ struct Sight {
     /// Views the model asked for that were drawn or failed to draw, the
     /// overview aside.
     shown: usize,
+    /// The conversation carries the overview: it was drawn.
+    overview: bool,
 }
 /// One planner request: sends the conversation, answers the model's calls
 /// for pictures, and returns the text of the first reply without calls.
@@ -710,7 +720,7 @@ async fn ask(
         });
         let mut messages = vec![Item::text(
             Role::System,
-            instructions_with(sight.pictures, sight.tool),
+            instructions_with(sight.pictures, sight.tool, sight.overview),
         )];
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
         let reply = match backend.reply(&messages, choice).await {
@@ -884,6 +894,7 @@ where
         pictures: backend.pictures(),
         tool: backend.pictures(),
         shown: 0,
+        overview: false,
     };
     if sight.pictures {
         let s = scene.clone();
@@ -907,6 +918,7 @@ where
                     },
                 ],
             ));
+            sight.overview = true;
         }
     }
     let mut best: Option<Outcome> = None;
@@ -3451,6 +3463,14 @@ pub(crate) mod tests {
         let (first, tool) = &turns[0];
         assert_eq!(*tool, Some(ToolChoice::Auto));
         assert!(first[0].as_text().unwrap().1.contains("PICTURES"));
+        // The instructions promise the overview the run drew and sends.
+        assert!(
+            first[0]
+                .as_text()
+                .unwrap()
+                .1
+                .contains("overview picture drawn by the program")
+        );
         assert!(
             matches!(&first[2], Item::Message(Role::User, parts) if parts.iter().any(|p| matches!(p, Part::Image { .. })))
         );
@@ -3657,6 +3677,7 @@ pub(crate) mod tests {
             pictures: true,
             tool: true,
             shown: MAX_PICTURES_PER_RUN,
+            overview: false,
         };
         let mut scene = look::Scene {
             doc: Arc::new(doc),
@@ -3781,13 +3802,13 @@ pub(crate) mod tests {
     #[test]
     fn the_pictures_section_comes_before_the_rules_only_with_pictures() {
         let plain = instructions();
-        assert_eq!(plain, instructions_with(false, true));
+        assert_eq!(plain, instructions_with(false, true, true));
         assert!(!plain.contains("PICTURES") && !plain.contains("view_model"));
         let limits = format!(
             "at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run"
         );
-        for tool in [true, false] {
-            let with = instructions_with(true, tool);
+        for (tool, overview) in [(true, true), (false, true), (true, false), (false, false)] {
+            let with = instructions_with(true, tool, overview);
             let (at, rules) = (
                 with.find("\nPICTURES\n").unwrap(),
                 with.find("\nRULES\n").unwrap(),
@@ -3796,7 +3817,10 @@ pub(crate) mod tests {
             // The tool and its limits are explained only while it is offered.
             assert_eq!(with.contains("view_model"), tool);
             assert_eq!(with.contains(&limits), tool);
-            assert!(with.contains("overview picture drawn by the program"));
+            // The overview is promised only when the conversation has it.
+            assert_eq!(with.contains("overview"), overview, "{tool} {overview}");
+            assert!(with.contains("stock (amber, see-through)"));
+            assert!(with.contains("vise or clamps (grey)"));
             assert!(with.contains("the triad shows +X (red)"));
             assert!(with.contains("the report's numbers are right"));
             // Without the section the text is the same.
@@ -3834,7 +3858,7 @@ pub(crate) mod tests {
                 if matches!(&parts[0], Part::Text(t) if t.starts_with("The program's overview picture: "))
                     && matches!(&parts[1], Part::Image { .. })));
         }
-        assert!(instructions_with(true, true).contains("view_model"));
+        assert!(instructions_with(true, true, true).contains("view_model"));
     }
     #[tokio::test]
     async fn without_pictures_nothing_changes() {

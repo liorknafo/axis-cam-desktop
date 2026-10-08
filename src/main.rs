@@ -1225,14 +1225,7 @@ impl App {
                 }
             }
             Event::Dropped(n, what) => {
-                let line = match what {
-                    planner::Dropped::Tool => {
-                        "OpenAI refused the picture tool; continuing with the overview only."
-                    }
-                    planner::Dropped::Pictures => {
-                        "OpenAI refused pictures; continuing with text only."
-                    }
-                };
+                let (line, _) = ui::refusal(what);
                 if let Some(step) = self.request_step(n) {
                     step.looks.push(Shown {
                         line: line.into(),
@@ -1242,6 +1235,20 @@ impl App {
                 }
             }
         }
+    }
+    /// The backend a run started now talks to: through `client`, with the
+    /// chosen model, streaming into the timeline's text, and with pictures
+    /// unless they are turned off. The run keeps them as they are now.
+    pub(crate) fn plan_backend(
+        &self,
+        client: std::sync::Arc<openai::Client>,
+    ) -> planner::OpenAiBackend {
+        planner::OpenAiBackend::new(
+            client,
+            self.settings.model.clone(),
+            self.plan_stream.clone(),
+            !self.settings.plan_pictures_off,
+        )
     }
     /// The planner's checklist: what must be in place before Plan is offered.
     pub fn plan_checklist(&self) -> Vec<analysis::Precondition> {
@@ -2505,12 +2512,7 @@ impl App {
                 self.plan_model = self.settings.model.clone();
                 self.planner = Planner::Running(planner::Progress::Analyzing);
                 self.status = "Planning. Nothing changes until you apply a plan.".into();
-                let backend = planner::OpenAiBackend::new(
-                    client,
-                    self.settings.model.clone(),
-                    self.plan_stream.clone(),
-                    !self.settings.plan_pictures_off,
-                );
+                let backend = self.plan_backend(client);
                 let doc = self.doc.clone();
                 let busy = self.plan_busy.clone();
                 let run = iced::stream::channel(16, async move |sender: PlanSender| {
@@ -2987,9 +2989,13 @@ impl App {
                 self.settings.plan_notice_shown = true;
                 self.save_settings();
             }
+            // A run keeps the choice it started with; the box is disabled
+            // while it goes, and so is this.
             Message::PlanPictures(on) => {
-                self.settings.plan_pictures_off = !on;
-                self.save_settings();
+                if !matches!(self.planner, Planner::Running(_)) {
+                    self.settings.plan_pictures_off = !on;
+                    self.save_settings();
+                }
             }
             Message::OpenUrl(url) => {
                 if let Err(e) = oauth::open_browser(url) {

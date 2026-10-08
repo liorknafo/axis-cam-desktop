@@ -837,8 +837,7 @@ impl App {
                     self.smoke_look("top", "Which face is the pocket floor"),
                     self.smoke_failed_look(),
                     crate::Shown {
-                        line: "OpenAI refused the picture tool; continuing with the overview only."
-                            .into(),
+                        line: crate::ui::refusal(crate::planner::Dropped::Tool).0.into(),
                         warn: true,
                         thumb: None,
                     },
@@ -5383,14 +5382,14 @@ mod tests {
         assert!(row.looks[2].warn && row.looks[2].thumb.is_none());
         assert_eq!(
             row.looks[2].line,
-            "OpenAI refused pictures; continuing with text only."
+            "OpenAI refused the request; sending it again without pictures."
         );
         // A refused tool says so too.
         a.record_plan_event(Event::Dropped(1, Dropped::Tool));
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
         assert_eq!(
             rows.last().unwrap().looks[3].line,
-            "OpenAI refused the picture tool; continuing with the overview only."
+            "OpenAI refused the request; sending it again without the picture tool."
         );
         // An event for a request that is not on the timeline joins nothing.
         a.record_plan_event(Event::Dropped(3, Dropped::Tool));
@@ -5403,9 +5402,9 @@ mod tests {
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), true);
         assert!(rows[0].text.ends_with("· 1 look"), "{}", rows[0].text);
         assert!(
-            rows[0]
-                .text
-                .ends_with("· OpenAI refused pictures · OpenAI refused the picture tool · 1 look"),
+            rows[0].text.ends_with(
+                "· sent again without pictures · sent again without the picture tool · 1 look"
+            ),
             "{}",
             rows[0].text
         );
@@ -5453,20 +5452,20 @@ mod tests {
         let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
         // What follows the step and its time.
         let tail = |i: usize| text[i].split(" · ").skip(2).collect::<Vec<_>>();
-        assert_eq!(tail(0), ["OpenAI refused the picture tool"]);
+        assert_eq!(tail(0), ["sent again without the picture tool"]);
         assert_eq!(text.len(), 6);
         assert!(rows.iter().all(|r| r.looks.is_empty()));
         assert_eq!(tail(1), ["passed"]);
         assert_eq!(tail(2), ["2 looks"]);
         assert_eq!(tail(3), ["passed"]);
         // The count is last, after what was refused.
-        assert_eq!(tail(4), ["OpenAI refused pictures", "1 look"]);
+        assert_eq!(tail(4), ["sent again without pictures", "1 look"]);
         // The same rows while the run goes: the lines, not the summary.
         let rows = crate::ui::timeline_rows(&a, now, false);
         assert_eq!(rows[0].looks.len(), 1);
         assert!(rows[0].looks[0].warn);
         assert_eq!(rows[2].looks.len(), 2);
-        assert!(rows.iter().all(|r| !r.text.contains("refused")));
+        assert!(rows.iter().all(|r| !r.text.contains("sent again")));
         assert!(rows.iter().all(|r| !r.text.contains(" look")));
         // Both finished views build.
         a.planner = crate::Planner::Failed(crate::planner::Failure {
@@ -6997,6 +6996,91 @@ mod tests {
         let _ = a.update(Message::PlanPictures(false));
         let reopened = App::from_workspace(dir.path().join("workspace.json"), None);
         assert!(reopened.settings.plan_pictures_off);
+    }
+    #[test]
+    fn the_pictures_choice_is_fixed_while_a_run_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let file = dir.path().join("settings.json");
+        a.page = Page::Ai;
+        let _ = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        let _ = a.view(); // the box disabled
+        let _ = a.update(Message::PlanPictures(false));
+        assert!(!a.settings.plan_pictures_off);
+        assert!(!crate::settings::load(&file).plan_pictures_off);
+        // Once the run is over the box is the user's again.
+        let _ = a.update(Message::PlanCancel);
+        let _ = a.update(Message::PlanPictures(false));
+        assert!(a.settings.plan_pictures_off);
+        assert!(crate::settings::load(&file).plan_pictures_off);
+        // Its hover help says what is sent, what never is, and that a run
+        // keeps its choice.
+        let help = crate::ui::PICTURES_HELP;
+        assert!(
+            help.contains("pictures the app draws of the part"),
+            "{help}"
+        );
+        assert!(help.contains("The CAD file is never sent."), "{help}");
+        assert!(
+            help.contains("A run keeps the choice it started with"),
+            "{help}"
+        );
+    }
+    #[tokio::test]
+    async fn a_run_sends_pictures_and_the_tool_only_as_the_box_was_when_it_started() {
+        use crate::fake_openai::{Fake, Resp};
+        use crate::session::SessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let report = crate::analysis::report(&a.doc, &mesh).unwrap();
+        let plan = serde_json::to_string(&crate::proposal::tests::good(&report)).unwrap();
+        let fake = Fake::start(move |_| Resp::answer(&plan)).await;
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        let client = std::sync::Arc::new(crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        ));
+        for off in [true, false] {
+            let _ = a.update(Message::PlanPictures(!off));
+            assert_eq!(a.settings.plan_pictures_off, off);
+            // The backend `Plan` starts the run with; the box changed after
+            // that does not reach the run.
+            let backend = a.plan_backend(client.clone());
+            let _ = a.update(Message::PlanPictures(off));
+            fake.requests.lock().unwrap().clear();
+            let outcome = crate::planner::plan(
+                &backend,
+                a.doc.clone(),
+                mesh.clone(),
+                &crate::planner::Busy::default(),
+                |_| {},
+            )
+            .await;
+            assert!(outcome.is_ok(), "{:?}", outcome.err().map(|f| f.message));
+            let sent = fake.seen("/v1/responses");
+            assert!(!sent.is_empty());
+            let tools = sent.iter().filter(|r| !r.json()["tools"].is_null()).count();
+            let images = sent
+                .iter()
+                .filter(|r| r.body.contains("\"input_image\""))
+                .count();
+            if off {
+                assert_eq!((tools, images), (0, 0), "pictures off: no tool, no picture");
+                assert!(sent.iter().all(|r| !r.body.contains("PICTURES")));
+            } else {
+                assert_eq!(
+                    (tools, images),
+                    (sent.len(), sent.len()),
+                    "the overview and the tool in every request"
+                );
+            }
+        }
     }
     #[test]
     fn account_messages_drive_the_panel_state() {
