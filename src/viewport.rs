@@ -131,6 +131,11 @@ pub struct Viewport<'a> {
     /// The jaws or clamps of the setup, in its frame in mm; drawn with the
     /// stock and part of the camera's fit.
     pub holding: Vec<crate::holding::HoldBox>,
+    /// The box a later setup starts from, in its frame in mm, when the setup
+    /// editor knows it (`App::known_stock`): drawn as the stock, and said in
+    /// the label, where the setup's own box would be the original block's.
+    /// None for the first setup and when it is not known.
+    pub leftover: Option<crate::mesh::Bounds>,
 }
 pub(crate) struct Projector {
     camera: Camera,
@@ -245,14 +250,34 @@ impl Viewport<'_> {
         }
         bounds
     }
+    /// The stock the view shows for its setup: the box a later setup starts
+    /// from when that is known (`leftover`), else the setup's own.
+    fn resolved_stock(&self) -> Option<stock::ResolvedStock> {
+        let setup = self.setup?;
+        match self.leftover {
+            Some(stock) => Some(stock::ResolvedStock {
+                part: None,
+                stock,
+                display_scale: self.mesh.display_scale(),
+            }),
+            None => stock::resolve(setup, Some(self.mesh)).ok(),
+        }
+    }
+    /// Whether `setup`'s stock is the real one, to be drawn without a
+    /// simulation: the first setup's, the example's and a later setup's whose
+    /// box is known. Otherwise it is the original block, which is not drawn.
+    fn stock_is_known(&self, setup: &Setup) -> bool {
+        self.sample
+            || self.leftover.is_some()
+            || crate::model::get(&setup.p, "stock_source") == "fresh"
+    }
     /// `scene_bounds` box by box: the part's first, then the stock's, each
     /// jaw's or clamp's and, when simulating, the simulated stock's and the
     /// reach of every move's cutter. Pictures fit to their projected corners.
     pub(crate) fn scene_boxes(&self) -> Vec<crate::mesh::Bounds> {
         let mut boxes = vec![Placement::new(self.mesh, self.setup).bounds];
         if self.show_stock
-            && let Some(setup) = self.setup
-            && let Ok(stock) = stock::resolve(setup, Some(self.mesh))
+            && let Some(stock) = self.resolved_stock()
         {
             boxes.push(stock.stock.scaled(stock.display_scale));
         }
@@ -467,8 +492,8 @@ impl Viewport<'_> {
             self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
         } else if self.show_stock
             && let Some(setup) = self.setup
-            && (self.sample || crate::model::get(&setup.p, "stock_source") == "fresh")
-            && let Ok(stock) = stock::resolve(setup, Some(self.mesh))
+            && self.stock_is_known(setup)
+            && let Some(stock) = self.resolved_stock()
         {
             let projected = box_vertices(stock.stock.scaled(stock.display_scale)).map(|v| {
                 let q = p.p(v);
@@ -983,7 +1008,7 @@ impl canvas::Program<Event> for Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
-        let key = format!("{key}|{:?}", self.holding);
+        let key = format!("{key}|{:?}|{:?}", self.holding, self.leftover);
         let mut cached = state.raster.borrow_mut();
         if cached.as_ref().is_none_or(|(previous, _)| *previous != key) {
             *cached = Some((key, self.raster(&p, bounds, hovered)));
@@ -998,7 +1023,7 @@ impl canvas::Program<Event> for Viewport<'_> {
         let mut frame = Frame::new(renderer, bounds.size());
         if self.show_stock
             && let Some(setup) = self.setup
-            && let Ok(stock) = stock::resolve(setup, Some(self.mesh))
+            && let Some(stock) = self.resolved_stock()
         {
             let d = self
                 .simulation
@@ -1015,10 +1040,7 @@ impl canvas::Program<Event> for Viewport<'_> {
                 Color::from_rgb8(185, 128, 41),
             );
             frame.fill_text(Text {
-                content: if !self.sample
-                    && self.simulation.is_none()
-                    && crate::model::get(&setup.p, "stock_source") != "fresh"
-                {
+                content: if self.simulation.is_none() && !self.stock_is_known(setup) {
                     "Remaining stock · generate preview".into()
                 } else {
                     format!("Stock  {:.1} × {:.1} × {:.1} mm", d[0], d[1], d[2])
@@ -1459,6 +1481,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1470,6 +1493,77 @@ mod tests {
         let (w, h, rgba) = view.pixels(&p, bounds, None);
         assert_eq!((w, h), (600, 450));
         assert_eq!(digest(&rgba), 11316679358304618149);
+    }
+    #[test]
+    fn a_later_setups_known_box_is_drawn_as_its_stock_and_otherwise_none_is() {
+        let (doc, mesh) = crate::post::fixture::flipped_after(1);
+        let setup = &doc.setups[1];
+        assert_ne!(crate::model::get(&setup.p, "stock_source"), "fresh");
+        let own = stock::resolve(setup, Some(&mesh)).unwrap().stock;
+        // A box 4 mm shorter than the original block, as a facing leaves it.
+        let mut left = own;
+        left.min[2] += 4.;
+        let view = |show_stock, leftover| Viewport {
+            setup: Some(setup),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            show_stock,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover,
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 400.,
+            height: 300.,
+        };
+        let p = Projector::fit(
+            Camera::default(),
+            (400., 300.),
+            view(true, Some(left)).scene_bounds(),
+        );
+        let pixels = |v: &Viewport| v.pixels(&p, bounds, None).2;
+        // Not known: the original block is not drawn, as before.
+        assert_eq!(pixels(&view(true, None)), pixels(&view(false, None)));
+        // Known: the box is drawn, and is the one the camera fits.
+        let drawn = pixels(&view(true, Some(left)));
+        assert_ne!(drawn, pixels(&view(false, Some(left))));
+        assert_ne!(drawn, pixels(&view(true, None)));
+        let scale = mesh.display_scale();
+        assert_eq!(
+            view(true, Some(left)).scene_boxes().last(),
+            Some(&left.scaled(scale))
+        );
+        assert_eq!(
+            view(true, None).scene_boxes().last(),
+            Some(&own.scaled(scale))
+        );
+        // Hidden with the stock switched off.
+        assert!(
+            !view(false, Some(left))
+                .scene_boxes()
+                .contains(&left.scaled(scale))
+        );
+        // The first setup draws its own stock whether or not a box is passed
+        // for it, since its source is "fresh".
+        let first = Viewport {
+            setup: Some(&doc.setups[0]),
+            ..view(true, None)
+        };
+        assert_eq!(crate::model::get(&doc.setups[0].p, "stock_source"), "fresh");
+        assert_ne!(
+            pixels(&first),
+            pixels(&Viewport {
+                show_stock: false,
+                ..view(true, None)
+            })
+        );
     }
     #[test]
     fn render_tints_marked_surfaces_and_returns_the_depths() {
@@ -1486,6 +1580,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
         let tint = [92, 168, 223, 255];
@@ -1614,6 +1709,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
         let reference = v.projector(b);
@@ -1692,6 +1788,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let p = v.projector(b);
@@ -1745,6 +1842,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
         let bounds = clamp.bounds;
@@ -1785,6 +1883,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
         let p = v.projector(b);
@@ -1826,6 +1925,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let p = v.projector(b);
@@ -1858,6 +1958,7 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);

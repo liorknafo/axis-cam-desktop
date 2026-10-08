@@ -717,6 +717,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                 None
             },
             holding: holding_boxes(app),
+            leftover: leftover_view(app),
         })
         .width(Fill)
         .height(Fill)
@@ -2045,6 +2046,21 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
     };
     boxes().unwrap_or_default()
 }
+/// The box the 3D view draws as the stock of the active setup when it is a
+/// later setup whose box the earlier setups left has been worked out for the
+/// job as it is (`App::known_stock`): in its frame, in mm. None for the first
+/// setup, the example (which draws its own) and a box not worked out or out of
+/// date, where the view draws what it always did.
+pub(crate) fn leftover_view(app: &App) -> Option<crate::mesh::Bounds> {
+    let si = app.doc.index();
+    if si == 0 || app.is_sample() {
+        return None;
+    }
+    match app.known_stock(si) {
+        (Some(stock), true) => Some(stock),
+        _ => None,
+    }
+}
 /// The inspector's warning about the preview shown: a heading and a line for
 /// each place where the generated operation's own toolpath comes within the
 /// gap of the setup's jaws or clamps, in work coordinates (in the setup's
@@ -2804,7 +2820,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
 }
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
-pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
+pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes), and on correction rounds the app's check report. The CAD file, file paths, the project title and your setup names are not sent.";
 pub(crate) const PICTURES_SENT: &str = " With the box below ticked, pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels, are sent too, and, when the model asks, pictures of its own toolpaths.";
 /// What the timeline says when OpenAI refused a request carrying `what`
 /// and the run sends it again without: the line under the request while
@@ -3457,6 +3473,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             show_paths: false,
             progress: None,
             holding: vec![],
+            leftover: None,
         })
         .width(Fill)
         .height(380)

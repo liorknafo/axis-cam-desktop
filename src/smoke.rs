@@ -854,8 +854,8 @@ impl App {
             116 => {
                 // Setup 1 only faces the 10 mm above the part; setup 2 turns
                 // the part over and is held in the starter vise. The setup
-                // editor shows the stock setup 2 starts from, and the jaws
-                // start at its bottom.
+                // editor shows the stock setup 2 starts from, in the panel
+                // and drawn, and the jaws start at its bottom.
                 use crate::model::{Setup, Strategy};
                 // The run's last check of the earlier screens: the operation
                 // of the Workholding screens is still previewed.
@@ -970,6 +970,8 @@ impl App {
                 assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Vise");
                 assert_eq!(crate::ui::holding_boxes(self).len(), 2, "{}", self.status);
                 assert!(crate::ui::stock_note(self).is_none());
+                // The 3D view draws that box as the stock.
+                assert_eq!(crate::ui::leftover_view(self), Some(stock));
             }
             // The overview's picture at the top of the visible part, so the
             // lines of the open request fit under it.
@@ -3211,6 +3213,50 @@ mod tests {
             .unwrap()
             .plan
             .stock
+    }
+    #[test]
+    fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        // Not worked out yet: the 3D view is given no box for setup 2.
+        assert_eq!(crate::ui::leftover_view(&a), None);
+        let _ = a.view();
+        // Worked out: the box setup 1's facing left, 4 mm shorter, which is
+        // what the jaws are drawn on and what the stock box is drawn as.
+        let _ = a.refresh_left_stock();
+        let left = simulated_stock(&a);
+        assert!((left.dimensions()[2] - (nominal.dimensions()[2] - 4.)).abs() < 0.01);
+        assert_eq!(crate::ui::leftover_view(&a), Some(left));
+        let jaws = crate::ui::holding_boxes(&a);
+        assert!(
+            jaws.iter()
+                .all(|b| (b.bounds.max[2] - (left.min[2] + 8.)).abs() < 0.01)
+        );
+        let _ = a.view();
+        // An edit of an earlier operation makes it out of date: no box again.
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "bottom", "1".into()));
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupEditor);
+        assert_eq!(crate::ui::leftover_view(&a), None);
+        let _ = a.view();
+        // Editing the vise keeps it (and the box) current once it is worked
+        // out again; setup 1 never gets one, as it draws its own stock.
+        let _ = a.refresh_left_stock();
+        assert!(crate::ui::leftover_view(&a).is_some());
+        let _ = a.update(Message::Edit(Target::Setup, "vise_grip", "6".into()));
+        assert!(crate::ui::leftover_view(&a).is_some());
+        let _ = a.update(Message::SelectSetup(0));
+        assert_eq!(crate::ui::leftover_view(&a), None);
+        let _ = a.view();
+        // The example is not simulated and draws its own stock.
+        let mut sample = app();
+        sample.doc = Document::sample();
+        assert!(sample.is_sample());
+        assert_eq!(crate::ui::leftover_view(&sample), None);
     }
     #[test]
     fn the_setup_editor_says_the_stock_is_the_original_until_the_earlier_setups_are_simulated() {
@@ -7567,6 +7613,12 @@ mod tests {
         assert!(!sent_to_openai(false).contains("pictures"));
         assert!(sent_to_openai(true).contains("The CAD file"));
         assert_eq!(sent_to_openai(false), crate::ui::SENT_TO_OPENAI);
+        // The library's sizes go whatever the pictures choice, and only sizes.
+        for pictures in [true, false] {
+            assert!(sent_to_openai(pictures).contains(
+                "the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes)"
+            ));
+        }
         assert_eq!(
             sent_to_openai(true),
             format!("{}{}", crate::ui::SENT_TO_OPENAI, crate::ui::PICTURES_SENT)
