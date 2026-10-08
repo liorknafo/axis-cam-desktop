@@ -133,7 +133,7 @@ pub fn offered(pictures: bool) -> Vec<Tool> {
     });
     tools.push(Tool {
         name: CHECK_HOLDING,
-        description: "Whether a vise or clamps from `workholding_library` can hold the stock a setup of the latest checked draft or answer starts from: the layout the program would suggest for the setup's toolpaths (the vise's jaw sides and grip, or the clamps' sides and offsets), `holds`, and the `problems`, empty when it holds.".into(),
+        description: "Whether a vise or clamps from `workholding_library` can hold the stock a setup of the latest checked draft or answer starts from: the layout the program would suggest for the setup's toolpaths (the vise's jaw sides and grip, or the clamps' sides and offsets), `holds`, and the `problems` the check would report at the stage `workholding` for that setup with that `holder` (the entry refused, stock it cannot hold, moves within its gap), empty when it holds.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -185,7 +185,7 @@ pub fn instructions(pictures: bool) -> String {
 - Before you answer you may call these functions. A reply of yours with calls is one round, and a reply allows at most {MAX_TOOL_ROUNDS} rounds; after that, reply with the proposal. An answer is JSON text, or one sentence when the call cannot be answered.
 {view}- `check_plan` (`proposal`, a full proposal in the schema of your reply): checks the draft as your answer will be checked, which takes some seconds, and answers with the same check report: `passed`, `problems` by setup and operation, `operations`, `coverage`, `total_minutes`, and `stocks`, the stock before each setup (as `stock_after`). The draft becomes the latest draft: `stock_after`, `check_holding` and the operation views read it, as they read your answer once it has been checked. At most {MAX_CHECKS_PER_REQUEST} per reply and {MAX_CHECKS_PER_RUN} in the run.
 - `stock_after` (`setup`, a setup number of the latest draft): the stock that setup starts from, in its axes: `size`, `box_from_part_corner` [x0, y0, z0, x1, y1, z1] from the model's -X/-Y/bottom corner, how much the earlier setups `removed` whole from each side (top, bottom, -X, +X, -Y, +Y, mm) and `by` which operations. Needs a checked draft or answer. No limit.
-- `check_holding` (`setup`, and `holder`, a `number` from `workholding_library`): whether that entry can hold the stock that setup starts from: the layout the program would suggest for the setup's toolpaths (a vise's `jaws_on` sides and `grip`, or the `clamps`' sides and offsets), `holds`, and the `problems`, empty when it holds. Needs a checked draft or answer. No limit.
+- `check_holding` (`setup`, and `holder`, a `number` from `workholding_library`): whether that entry can hold the stock that setup starts from: the layout the program would suggest for the setup's toolpaths (a vise's `jaws_on` sides and `grip`, or the `clamps`' sides and offsets), `holds`, and the `problems` your answer would get at the stage `workholding` for that setup with that `holder` (the entry refused, stock it cannot hold, moves within its gap), empty when it holds. Needs a checked draft or answer. No limit.
 - `cutting_data` (`tool`, a number from `tools`): the rpm range from the material's surface speed and the machine's maximum rpm, a recommended rpm, and at that rpm the feed range (mm/min) from the chip-load band of the tool's diameter and its flutes, with a recommended feed and the band. No limit.
 - `surface_info` (`surface`, an ID from `planes`): every orientation whose planes list the surface, with the plane's kind, depth, area, bbox, `max_cutter_diameter` and holes, and the surface's own area (`surface_area`, mm²) and `mean_normal` in setup 1's frame. No limit.
 
@@ -362,6 +362,13 @@ struct ClampAt {
     side: &'static str,
     offset: f32,
 }
+/// A problem as the check report gives a workholding one: the operation it
+/// is about, counted from 1, or null for the whole setup.
+#[derive(Serialize)]
+struct HoldingProblem {
+    operation: Option<usize>,
+    message: String,
+}
 #[derive(Serialize)]
 struct Holding {
     setup: usize,
@@ -373,13 +380,74 @@ struct Holding {
     #[serde(skip_serializing_if = "Option::is_none")]
     clamps: Option<Vec<ClampAt>>,
     holds: bool,
-    problems: Vec<String>,
+    problems: Vec<HoldingProblem>,
 }
-/// Whether library entry `holder` could hold the stock setup `setup` of the
-/// latest draft starts from: the layout the program suggests for the setup's
-/// toolpaths, as Suggest layout and the plan check do, and the holding
-/// checks on it (the opening, then `holding::holdable`) with what the
-/// earlier setups cut away.
+
+/// What the plan check's workholding stage says of setup `si` of `job` (one
+/// of the latest draft's setups with another holder laid out), from that
+/// setup's toolpaths in `start`: the entry or its layout refused, a stock it
+/// cannot hold (`holding::holdable`, with what the earlier setups cut away),
+/// and every move within the gap of a jaw or clamp (`post::held`, which the
+/// plan check runs). When the setup's programs cannot be made, which the plan
+/// check reports at its export stage, the refusals and `holdable` alone.
+/// Each as (operation index, message).
+fn workholding(
+    job: &crate::model::Document,
+    mesh: &crate::mesh::Mesh,
+    si: usize,
+    start: &CheckedSetup,
+) -> Vec<(Option<usize>, String)> {
+    use crate::simulation::Simulation;
+    // The setup's simulations as the sequence made them, for the export's
+    // walk: the first knows the stock the earlier setups left.
+    let sims: Vec<(usize, Result<Simulation, String>)> = start
+        .operations
+        .iter()
+        .zip(&start.plans)
+        .enumerate()
+        .map(|(k, (&oi, plan))| {
+            let mut sim = Simulation::new(plan.clone());
+            if k == 0 {
+                sim.initial_volume = start.before.as_deref().cloned();
+                sim.frame = Some(start.frame);
+            }
+            (oi, Ok(sim))
+        })
+        .collect();
+    if let Some(found) = crate::post::held_walked(job, mesh, si, &sims) {
+        return found
+            .into_iter()
+            .map(|h| (h.operation, h.message))
+            .collect();
+    }
+    let setup = &job.setups[si];
+    let named = |message: String| (None, format!("{}: {message}", setup.name()));
+    if let Err(refused) = job.holding_boxes(setup, start.stock) {
+        return vec![named(refused)];
+    }
+    let (Ok(layout), Some(entry)) = (
+        holding::layout(setup),
+        job.holder(crate::model::get(&setup.p, "holder")),
+    ) else {
+        return vec![];
+    };
+    let removed = start
+        .before
+        .as_deref()
+        .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
+    let names = |s, o| holding::operation_name(job, s, o);
+    holding::holdable(si, &layout, entry, start.stock, removed.as_ref(), &names)
+        .into_iter()
+        .map(named)
+        .collect()
+}
+
+/// Whether library entry `holder` could hold setup `setup` of the latest
+/// draft: the layout the program suggests for the setup's toolpaths, as
+/// Suggest layout and the plan check do, and the problems the plan check's
+/// workholding stage would report for that setup with it (`workholding`), so
+/// that it holds exactly when a draft with that `holder` has no workholding
+/// problem there.
 fn check_holding(arguments: &str, state: &ToolState) -> Answer {
     if state.checked.is_none() {
         return Answer::sentence(NO_DRAFT);
@@ -392,8 +460,7 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
         Ok(found) => found,
         Err(answer) => return answer,
     };
-    let job = &checked.job;
-    let library = analysis::library(job);
+    let library = analysis::library(&checked.job);
     let Some(entry) = args.holder.checked_sub(1).and_then(|i| library.get(i)) else {
         return Answer::sentence(format!(
             "workholding {} is not in workholding_library.",
@@ -401,42 +468,31 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
         ));
     };
     let (si, vise) = (args.setup - 1, entry.kind() == "Vise");
-    // The setup as it would be with that entry, not yet placed.
-    let mut setup = job.setups[si].clone();
+    // The job with that entry on the setup, laid out as the plan check lays
+    // out a later setup's holder: for its toolpaths, on the box it starts from.
+    let mut job = (*checked.job).clone();
+    let setup = &mut job.setups[si];
     setup.p.insert(
         "holding".into(),
         if vise { "Vise" } else { "Clamps" }.into(),
     );
     setup.p.insert("holder".into(), entry.id.clone());
     let plans: Vec<&crate::simulation::Plan> = start.plans.iter().collect();
-    // The box the setup starts from, which its toolpaths were generated on.
     let stock = start.stock;
-    let (layout, found) = match holding::request(&setup, Some(entry)) {
-        Err(refused) => (None, vec![refused]),
-        Ok(request) => {
-            let (_, layout) = request
-                .suggest_on(&plans, || Some(stock))
-                .expect("the stock is given");
-            let removed = start
-                .before
-                .as_deref()
-                .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
-            let names = |s, o| holding::operation_name(job, s, o);
-            let mut found: Vec<String> = holding::opening_issue(&layout, entry, stock)
-                .into_iter()
-                .collect();
-            found.extend(holding::holdable(
-                si,
-                &layout,
-                entry,
-                stock,
-                removed.as_ref(),
-                &names,
-            ));
-            (Some(layout), found)
-        }
-    };
-    let found: Vec<String> = found.iter().map(|m| clip(m, 300)).collect();
+    let layout = holding::request(setup, Some(entry))
+        .ok()
+        .and_then(|request| request.suggest_on(&plans, || Some(stock)))
+        .map(|(_, layout)| layout);
+    if let Some(layout) = &layout {
+        holding::place(setup, layout);
+    }
+    let found: Vec<HoldingProblem> = workholding(&job, &state.scene.mesh, si, start)
+        .into_iter()
+        .map(|(operation, message)| HoldingProblem {
+            operation: operation.map(|oi| oi + 1),
+            message: clip(&message, 300),
+        })
+        .collect();
     let verdict = if found.is_empty() {
         "holds".to_string()
     } else {
@@ -988,30 +1044,50 @@ mod tests {
     fn check_holding_tests_a_library_entry_on_the_stock_before_a_setup() {
         let (mut s, output, line) = checked();
         let mut said = format!("{output}\n{line}\n");
-        // Clamps bite on the 3 mm left under the part, which setup 1 kept.
+        // Clamps bite on the 3 mm left under the part, which setup 1 kept,
+        // but setup 2's Face runs over the whole stock top, where they sit:
+        // the plan check's workholding stage refuses it, and so does this.
         let a = call("check_holding", json!({"setup": 2, "holder": 2}), &mut s);
         let out = json_of(&a);
         assert_eq!(
             (&out["setup"], &out["holder"], &out["kind"]),
             (&json!(2), &json!(2), &json!("Clamp"))
         );
-        assert_eq!(out["holds"], true, "{out}");
-        assert_eq!(out["problems"], json!([]));
+        assert_eq!(out["holds"], false, "{out}");
+        let problems = out["problems"].as_array().unwrap();
+        assert!(
+            problems.iter().any(|p| p["operation"] == 1
+                && p["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Face by planner: the tool hits the clamp on ")),
+            "{out}"
+        );
         assert_eq!(out["stock_size"], json!([124., 84., 45.]));
         let clamps = out["clamps"].as_array().unwrap();
         assert!(clamps.len() >= 2, "{out}");
         let sides: Vec<&str> = clamps.iter().map(|c| c["side"].as_str().unwrap()).collect();
         assert!(clamps.iter().all(|c| c["offset"].is_number()));
         assert!(out.get("vise").is_none());
+        let counted = |n: usize| {
+            if n == 1 {
+                "1 problem".to_string()
+            } else {
+                format!("{n} problems")
+            }
+        };
         assert_eq!(
             a.line,
             format!(
-                "Clamp 2 for setup 2: holds (clamps on {})",
+                "Clamp 2 for setup 2: {} (clamps on {})",
+                counted(problems.len()),
                 sides.join(", ")
             )
         );
         said += &format!("{}\n{}\n", a.output, a.line);
-        // A vise that opens too little for the stock.
+        // A vise that opens too little for the stock: refused as the plan
+        // check refuses it, before anything else, under the draft's own name
+        // for the setup.
         let a = call("check_holding", json!({"setup": 2, "holder": 3}), &mut s);
         let out = json_of(&a);
         assert_eq!(out["holds"], false);
@@ -1023,18 +1099,15 @@ mod tests {
         assert!(vise["jaws_on"] == "±X" || vise["jaws_on"] == "±Y", "{out}");
         assert!(vise["grip"].as_f64().unwrap() > 0.);
         assert_eq!(
-            out["problems"][0],
-            format!("The stock is {across} mm across the jaws; this vise opens to 60 mm.")
+            out["problems"],
+            json!([{
+                "operation": null,
+                "message": format!("Underside: The stock is {across} mm across the jaws; this vise opens to 60 mm.")
+            }])
         );
-        let problems = out["problems"].as_array().unwrap().len();
-        let counted = if problems == 1 {
-            "1 problem".to_string()
-        } else {
-            format!("{problems} problems")
-        };
         assert_eq!(
             a.line,
-            format!("Vise 3 for setup 2: {counted} (opens 60, needs {across})")
+            format!("Vise 3 for setup 2: 1 problem (opens 60, needs {across})")
         );
         said += &format!("{}\n{}\n", a.output, a.line);
         // The starter vise opens wide enough, but setup 1's Contour took the
@@ -1043,10 +1116,9 @@ mod tests {
         let out = json_of(&a);
         assert_eq!(out["holds"], false);
         assert!(
-            out["problems"][0]
-                .as_str()
-                .unwrap()
-                .starts_with("Setup 2 cannot be held in the vise: setup 1, operation 3 "),
+            out["problems"][0]["message"].as_str().unwrap().starts_with(
+                "Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 "
+            ),
             "{out}"
         );
         said += &format!("{}\n{}\n", a.output, a.line);
@@ -1072,6 +1144,76 @@ mod tests {
         );
         // Sizes and numbers only: no entry's name or notes.
         assert!(!said.contains("ZZ-SECRET"), "{said}");
+    }
+
+    /// The workholding problems `check_plan` reports for setup `setup`, as
+    /// (operation, message).
+    fn workholding_of(report: &Value, setup: usize) -> Vec<(Value, Value)> {
+        report["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["stage"] == "workholding" && p["setup"] == setup)
+            .map(|p| (p["operation"].clone(), p["message"].clone()))
+            .collect()
+    }
+    /// `check_holding`'s problems as (operation, message).
+    fn holding_of(answer: &Value) -> Vec<(Value, Value)> {
+        answer["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["operation"].clone(), p["message"].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn check_holding_agrees_with_the_plan_checks_workholding_stage() {
+        // Clamps where setup 2's Face runs: check_holding on the draft, then
+        // the draft with clamp 2 for setup 2, checked.
+        let (mut s, _, _) = checked();
+        let held = json_of(&call(
+            "check_holding",
+            json!({"setup": 2, "holder": 2}),
+            &mut s,
+        ));
+        let mut clamped = facing_draft(&s.scene.report);
+        clamped.setups[1].holder = Some(2);
+        let mut fresh = library_state();
+        let report = json_of(&call(
+            "check_plan",
+            json!({ "proposal": clamped }),
+            &mut fresh,
+        ));
+        let refused = workholding_of(&report, 2);
+        assert!(!refused.is_empty(), "{report}");
+        assert_eq!(held["holds"], false);
+        assert_eq!(holding_of(&held), refused, "the same problems");
+        // A vise on uncut sides, faced only where the part is: it holds, and
+        // the plan check with that vise has no workholding problem there.
+        let mut clear = crate::proposal::tests::good(&s.scene.report);
+        clear.setups[0].operations.remove(2);
+        for setup in &mut clear.setups {
+            setup.operations[0].facing_area = Some("model".into());
+        }
+        let mut s = library_state();
+        let report = json_of(&call("check_plan", json!({ "proposal": clear }), &mut s));
+        assert_eq!(report["passed"], true, "{report}");
+        let held = json_of(&call(
+            "check_holding",
+            json!({"setup": 2, "holder": 1}),
+            &mut s,
+        ));
+        assert_eq!(held["holds"], true, "{held}");
+        assert_eq!(held["problems"], json!([]));
+        clear.setups[1].holder = Some(1);
+        let mut fresh = library_state();
+        let report = json_of(&call(
+            "check_plan",
+            json!({ "proposal": clear }),
+            &mut fresh,
+        ));
+        assert_eq!(workholding_of(&report, 2), vec![], "{report}");
     }
 
     #[test]

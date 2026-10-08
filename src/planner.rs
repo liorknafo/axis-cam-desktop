@@ -4515,8 +4515,21 @@ pub(crate) mod tests {
                     .as_str()
             )
         );
+        // Setup 2's Face runs over the whole stock top, where clamps would
+        // sit: the plan check would refuse them, and so does check_holding.
         let held: serde_json::Value = serde_json::from_str(outputs[1].1).unwrap();
-        assert_eq!(held["holds"], true, "{held}");
+        assert_eq!(held["holds"], false, "{held}");
+        assert!(
+            held["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("the tool hits the clamp on")),
+            "{held}"
+        );
         let checked: serde_json::Value = serde_json::from_str(outputs[2].1).unwrap();
         assert_eq!(checked["passed"], false);
         assert_eq!(outputs[3], ("d", no_draft));
@@ -4534,7 +4547,9 @@ pub(crate) mod tests {
             "Stock before setup 2: 124 × 84 × 43 mm; bottom cut 4 mm by setup 1"
         );
         assert!(
-            lines[1].starts_with("Clamp 2 for setup 2: holds (clamps on "),
+            lines[1].starts_with("Clamp 2 for setup 2: ")
+                && lines[1].contains(" problem")
+                && lines[1].contains(" (clamps on "),
             "{}",
             lines[1]
         );

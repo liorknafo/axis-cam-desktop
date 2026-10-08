@@ -182,8 +182,10 @@ pub struct CheckedSetup {
     /// The stock the earlier setups left, cells and cuts; None for setup 1
     /// and when nothing before it was cut.
     pub before: Option<Arc<Volume>>,
-    /// The setup's generated toolpaths.
+    /// The setup's generated toolpaths, and the operation (an index in the
+    /// setup's operations) each is of.
     pub plans: Vec<Plan>,
+    pub operations: Vec<usize>,
     pub summary: StockSummary,
 }
 /// What a checked proposal leaves for the planner's tools: the job, with the
@@ -710,10 +712,10 @@ fn checked_setups(
 ) -> Vec<CheckedSetup> {
     let mut setups = vec![];
     for (si, (sims, start)) in results.into_iter().zip(starts).enumerate() {
-        let plans: Vec<Plan> = sims
+        let (operations, plans): (Vec<usize>, Vec<Plan>) = sims
             .into_iter()
-            .filter_map(|(_, result)| result.ok().map(|sim| sim.plan))
-            .collect();
+            .filter_map(|(oi, result)| result.ok().map(|sim| (oi, sim.plan)))
+            .unzip();
         let known = if si == 0 {
             plans
                 .first()
@@ -738,6 +740,7 @@ fn checked_setups(
             part,
             before,
             plans,
+            operations,
             summary,
         });
     }

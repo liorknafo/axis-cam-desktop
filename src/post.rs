@@ -1195,16 +1195,24 @@ pub(crate) fn held(
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Vec<Held> {
-    let Ok(walk) = walk(doc, mesh, si, sims) else {
-        return vec![];
-    };
+    held_walked(doc, mesh, si, sims).unwrap_or_default()
+}
+/// `held`, or None when the setup cannot be walked (its programs cannot be
+/// made), so that nothing of its workholding was checked.
+pub(crate) fn held_walked(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+) -> Option<Vec<Held>> {
+    let walk = walk(doc, mesh, si, sims).ok()?;
     let boxes = match holding_boxes(doc, si, walk.stock) {
         Ok(boxes) => boxes,
         Err(message) => {
-            return vec![Held {
+            return Some(vec![Held {
                 operation: None,
                 message,
-            }];
+            }]);
         }
     };
     let mut found: Vec<Held> = unholdable(doc, mesh, si, &walk)
@@ -1216,7 +1224,7 @@ pub(crate) fn held(
         .collect();
     // Nothing to hold against: no program need be walked.
     if boxes.is_empty() {
-        return found;
+        return Some(found);
     }
     // Every program of a touch-off setup starts the same way: what two of
     // them say alike (the clearance plane's problem) is said once.
@@ -1228,7 +1236,7 @@ pub(crate) fn held(
             }
         }
     }
-    found
+    Some(found)
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
