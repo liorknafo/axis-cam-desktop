@@ -227,7 +227,7 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
             (
                 "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green).\n",
                 format!(
-                    "You get at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run. "
+                    "You get at most {MAX_PICTURES_PER_REQUEST} pictures per request (the part report, or a check report the program sends back) and {MAX_PICTURES_PER_RUN} in the run. "
                 ),
             )
         } else {
@@ -4012,7 +4012,7 @@ pub(crate) mod tests {
         assert!(!plain.contains("PICTURES") && !plain.contains("view_model"));
         assert!(!plain.contains("TOOLS") && !plain.contains("cutting_data"));
         let limits = format!(
-            "at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run"
+            "at most {MAX_PICTURES_PER_REQUEST} pictures per request (the part report, or a check report the program sends back) and {MAX_PICTURES_PER_RUN} in the run"
         );
         for (tool, overview) in [(true, true), (false, true), (true, false), (false, false)] {
             let with = instructions_with(true, tool, overview);
@@ -4070,7 +4070,7 @@ pub(crate) mod tests {
             let system = items[0].as_text().unwrap().1;
             assert!(system.contains("PICTURES"), "{system}");
             assert!(system.contains("overview picture drawn by the program"));
-            assert!(!system.contains("view_model") && !system.contains("pictures per reply"));
+            assert!(!system.contains("view_model") && !system.contains("pictures per request"));
             // The overview itself is still sent, with its description.
             assert!(matches!(&items[2], Item::Message(Role::User, parts)
                 if matches!(&parts[0], Part::Text(t) if t.starts_with("The program's overview picture: "))
@@ -4367,10 +4367,19 @@ pub(crate) mod tests {
         let tools = section(&text, "TOOLS");
         assert!(tools.contains("`cutting_data`") && tools.contains("`surface_info`"));
         assert!(!text.contains("view_model") && !text.contains("PICTURES"));
-        assert!(tools.contains(&format!("at most {MAX_TOOL_ROUNDS} rounds")));
+        assert!(tools.contains(&format!(
+            "a request allows at most {MAX_TOOL_ROUNDS} rounds"
+        )));
+        // One word for one thing: a request is what the program sends, a
+        // reply what the model sends back.
+        assert!(
+            tools
+                .contains("A request is the part report, or a check report the program sends back")
+        );
+        assert!(!text.contains("per reply") && !text.contains("a reply allows"));
         assert!(tools.contains("No limit"));
         let checks = format!(
-            "At most {} per reply and {} in the run",
+            "At most {} per request and {} in the run",
             planner_tools::MAX_CHECKS_PER_REQUEST,
             planner_tools::MAX_CHECKS_PER_RUN
         );
@@ -4406,7 +4415,7 @@ pub(crate) mod tests {
         let tools = section(&text, "TOOLS");
         assert!(tools.contains("`view_model`"));
         assert!(tools.contains(&format!(
-            "At most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run"
+            "At most {MAX_PICTURES_PER_REQUEST} pictures per request and {MAX_PICTURES_PER_RUN} in the run"
         )));
         // The section sits before the rules, after the speeds and feeds.
         let at = |title: &str| text.find(&format!("\n{title}\n")).unwrap();

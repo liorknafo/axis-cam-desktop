@@ -7781,10 +7781,14 @@ mod tests {
         assert!(sent_to_openai(true).contains("The CAD file"));
         assert_eq!(sent_to_openai(false), crate::ui::SENT_TO_OPENAI);
         // The library's sizes go whatever the pictures choice, and only sizes.
+        // So do the check reports and the tools' answers, which the model
+        // gets whenever it asks, not only after an answer that failed.
         for pictures in [true, false] {
-            assert!(sent_to_openai(pictures).contains(
-                "the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes)"
+            let text = sent_to_openai(pictures);
+            assert!(text.contains(
+                "the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes), and the app's check reports and tool answers while the model works."
             ));
+            assert!(!text.contains("correction rounds"), "{text}");
         }
         assert_eq!(
             sent_to_openai(true),
