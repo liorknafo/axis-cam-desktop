@@ -343,7 +343,15 @@ mod tests {
     }
     fn face(v: &mut Volume, f: Frame, z: f32, ys: &[f32], flute: f32) {
         for &y in ys {
-            v.cut([-15., y, z], [15., y, z], 2.5, flute, CutterShape::Flat, f);
+            v.cut(
+                [-15., y, z],
+                [15., y, z],
+                2.5,
+                flute,
+                CutterShape::Flat,
+                f,
+                (0, 0),
+            );
         }
     }
     #[test]
@@ -361,7 +369,15 @@ mod tests {
     #[test]
     fn removed_follows_the_tool_path_from_its_tip_to_its_flute_top() {
         let (mut v, f, _, mut s, mesh) = fixture();
-        v.cut([-5., -5., 8.], [5., 5., 8.], 1., 3., CutterShape::Flat, f);
+        v.cut(
+            [-5., -5., 8.],
+            [5., 5., 8.],
+            1.,
+            3.,
+            CutterShape::Flat,
+            f,
+            (0, 0),
+        );
         let removed = Removed::new(&v, f);
         // Inside the cut's box, but 5.7 mm from its diagonal path.
         assert!(in_any(&removal_boxes(&v, f), [4., -4., 9.]));
@@ -443,6 +459,7 @@ mod tests {
             10.,
             CutterShape::Ball,
             f,
+            (0, 0),
         );
         v.cut(
             [-15., 0., 8.],
@@ -451,6 +468,7 @@ mod tests {
             10.,
             CutterShape::Flat,
             f,
+            (0, 0),
         );
         assert_eq!(RestStock::new(&v, f).top(b, 2., 12.), 12.);
         face(&mut v, f, 8., &[-10., -6., -2., 2., 6., 10.], 10.);

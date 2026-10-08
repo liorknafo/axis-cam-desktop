@@ -1170,6 +1170,7 @@ mod tests {
                 80.,
                 CutterShape::Flat,
                 frame,
+                (0, 0),
             );
             setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
                 &volume, frame,

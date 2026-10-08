@@ -44,11 +44,16 @@ pub struct Cut {
     pub flute: f32,
     pub shape: CutterShape,
     pub frame: Frame,
+    /// Setup and operation (both from 0, in document order) whose move made
+    /// this cut. Cuts of different operations never merge.
+    pub source: (u16, u16),
 }
 impl Cut {
-    /// Merge playback fragments only when their union is the same straight sweep.
+    /// Merge playback fragments only when their union is the same straight
+    /// sweep and both come from the same operation.
     pub fn extend(&mut self, next: &Self) -> bool {
-        if self.radius != next.radius
+        if self.source != next.source
+            || self.radius != next.radius
             || self.flute != next.flute
             || self.shape != next.shape
             || self.frame != next.frame
@@ -246,6 +251,21 @@ mod tests {
             flute: 12.,
             shape,
             frame: frame(),
+            source: (0, 0),
+        }
+    }
+    #[test]
+    fn cuts_merge_only_within_one_operation() {
+        let mut first = cut([0., 0., 3.], [2., 0., 3.], CutterShape::Flat);
+        let mut next = cut([2., 0., 3.], [4., 0., 3.], CutterShape::Flat);
+        assert!(first.extend(&next));
+        assert_eq!(first.b, [4., 0., 3.]);
+        assert_eq!(first.source, (0, 0));
+        for other in [(0, 1), (1, 0), (1, 1)] {
+            let mut first = cut([0., 0., 3.], [2., 0., 3.], CutterShape::Flat);
+            next.source = other;
+            assert!(!first.extend(&next), "{other:?}");
+            assert_eq!(first.b, [2., 0., 3.], "{other:?}");
         }
     }
     #[test]
@@ -416,13 +436,22 @@ mod tests {
                 12.,
                 CutterShape::Flat,
                 f,
+                (0, 0),
             );
         }
         assert_eq!(v.cuts.len(), 1);
         assert!(initial.cuts.is_empty());
         let inherited = v.clone();
         assert!(Arc::ptr_eq(&v.cuts, &inherited.cuts));
-        v.cut([5., 0., 3.], [5., 5., 3.], 3., 12., CutterShape::Flat, f);
+        v.cut(
+            [5., 0., 3.],
+            [5., 5., 3.],
+            3.,
+            12.,
+            CutterShape::Flat,
+            f,
+            (0, 0),
+        );
         assert_eq!(v.cuts.len(), 2);
         assert_eq!(inherited.cuts.len(), 1);
     }

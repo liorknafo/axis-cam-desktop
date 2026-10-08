@@ -1044,8 +1044,16 @@ mod tests {
         let at = [b.max[0] - 15., (b.min[1] + b.max[1]) / 2., b.max[2] - 8.];
         let frame = stock.frame;
         let flat = crate::simulation::CutterShape::Flat;
-        stock.cut([at[0], at[1], b.max[2] + 5.], at, 5., 25., flat, frame);
-        stock.cut(at, [at[0] + 4., at[1], at[2]], 5., 25., flat, frame);
+        stock.cut(
+            [at[0], at[1], b.max[2] + 5.],
+            at,
+            5.,
+            25.,
+            flat,
+            frame,
+            (0, 0),
+        );
+        stock.cut(at, [at[0] + 4., at[1], at[2]], 5., 25., flat, frame, (0, 0));
         let (cells, bounds) = part.gouged(&stock);
         assert!(cells >= 20, "{cells}");
         assert!(bounds[0][0] > b.max[0] - 25. && bounds[1][2] <= b.max[2]);

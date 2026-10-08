@@ -2441,7 +2441,7 @@ M2
         let after = |path: &[([f32; 3], [f32; 3])]| {
             let mut volume = Volume::new(stock, frame);
             for &(a, b) in path {
-                volume.cut(a, b, 3., 5., CutterShape::Flat, frame);
+                volume.cut(a, b, 3., 5., CutterShape::Flat, frame, (0, 0));
             }
             [true, false].map(|center| stock_zero_cut(stock, &volume, frame, center))
         };
@@ -2505,7 +2505,7 @@ M2
             .collect();
         let mut volume = Volume::new(stock, frame);
         for &(a, b) in &arc {
-            volume.cut(a, b, 3., 40., CutterShape::Flat, frame);
+            volume.cut(a, b, 3., 40., CutterShape::Flat, frame, (0, 0));
         }
         let corner = [stock.min[0] + 1., stock.min[1] + 0.6, stock.max[2] - 0.01];
         assert!(

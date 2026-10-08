@@ -127,6 +127,7 @@ impl Volume {
     pub fn transformed_bounds(&self, to: Frame) -> Bounds {
         self.frame.transfer_bounds(self.bounds, to)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn cut(
         &mut self,
         a: [f32; 3],
@@ -135,6 +136,7 @@ impl Volume {
         flute: f32,
         shape: CutterShape,
         current: Frame,
+        source: (u16, u16),
     ) {
         let lo = [
             a[0].min(b[0]) - radius,
@@ -169,6 +171,7 @@ impl Volume {
             flute,
             shape,
             frame: current,
+            source,
         };
         let cuts = std::sync::Arc::make_mut(&mut self.cuts);
         if !cuts.last_mut().is_some_and(|last| last.extend(&cut)) {
@@ -316,7 +319,15 @@ mod tests {
             },
             a,
         );
-        stock.cut([0., 0., 8.], [0., 0., 2.], 2., 20., CutterShape::Flat, a);
+        stock.cut(
+            [0., 0., 8.],
+            [0., 0., 2.],
+            2.,
+            20.,
+            CutterShape::Flat,
+            a,
+            (0, 0),
+        );
         let before = stock.occupied.clone();
         let count = stock.remaining;
         let _rotated = stock.transformed_bounds(b);
@@ -355,16 +366,49 @@ mod tests {
             let mut steps = direct.clone();
             let start = [-8., 0., 8.];
             let end = [8., 0., 2.];
-            direct.cut(start, end, 2., 15., shape, a);
+            direct.cut(start, end, 2., 15., shape, a, (0, 0));
             for j in 0..20 {
                 let p = |j: usize| {
                     std::array::from_fn(|k| start[k] + (end[k] - start[k]) * j as f32 / 20.)
                 };
-                steps.cut(p(j), p(j + 1), 2., 15., shape, a);
+                steps.cut(p(j), p(j + 1), 2., 15., shape, a, (0, 0));
             }
             assert_eq!(direct.occupied, steps.occupied);
             assert!(direct.removed_volume() > 0.);
         }
+    }
+    #[test]
+    fn cuts_record_their_operation_and_never_merge_across_operations() {
+        let (a, _) = frames();
+        let mut v = Volume::new(
+            Bounds {
+                min: [-10., -10., 0.],
+                max: [10., 10., 10.],
+            },
+            a,
+        );
+        let mut x = -8.;
+        for source in [(0, 0), (0, 0), (0, 1), (0, 1), (1, 1)] {
+            v.cut(
+                [x, 0., 6.],
+                [x + 2., 0., 6.],
+                1.,
+                5.,
+                CutterShape::Flat,
+                a,
+                source,
+            );
+            x += 2.;
+        }
+        // Collinear consecutive moves of one operation merge, but the next
+        // operation always starts a new cut, even when its first move
+        // continues the same straight line.
+        let sources: Vec<_> = v.cuts.iter().map(|c| c.source).collect();
+        assert_eq!(sources, [(0, 0), (0, 1), (1, 1)]);
+        assert_eq!(v.cuts[0].a, [-8., 0., 6.]);
+        assert_eq!(v.cuts[0].b, [-4., 0., 6.]);
+        assert_eq!(v.cuts[1].b, [0., 0., 6.]);
+        assert_eq!(v.cuts[2].b, [2., 0., 6.]);
     }
     #[test]
     fn finite_cutter_does_not_erase_stock_above_its_flutes() {

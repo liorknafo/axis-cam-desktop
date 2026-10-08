@@ -521,6 +521,9 @@ pub struct Simulation {
     pub initial_volume: Option<crate::volume::Volume>,
     pub frame: Option<crate::volume::Frame>,
     pub preceding: usize,
+    /// Setup and operation (from 0, document order) this simulation plays.
+    /// Stamped on every cut it makes; `(0, 0)` outside a sequence.
+    pub source: (u16, u16),
     pub stock_epoch: u64,
     pub stock_surface: Option<std::sync::Arc<crate::stock_surface::SurfaceMesh>>,
     pub stock_surface_version: u64,
@@ -544,6 +547,7 @@ impl Simulation {
             initial_volume: None,
             frame: None,
             preceding: 0,
+            source: (0, 0),
             stock_epoch: 0,
             stock_surface: None,
             stock_surface_version: 0,
@@ -598,6 +602,7 @@ impl Simulation {
                         self.plan.flute_length,
                         self.plan.shape,
                         frame,
+                        self.source,
                     );
                 }
             }
@@ -615,6 +620,10 @@ impl Simulation {
     }
 }
 
+/// A setup or operation position as stored in `Cut::source`.
+fn index(i: usize) -> u16 {
+    u16::try_from(i).unwrap_or(u16::MAX)
+}
 /// Build stock in document order. No failed enabled operation is silently skipped.
 /// The continuous cutter history and volume estimate stay attached to the same part across setup rotations/translations.
 pub fn sequence(
@@ -682,7 +691,7 @@ pub fn sequence_with(
             let result=plan.and_then(|plan| {
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
-                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.preceding=preceding;
+                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.preceding=preceding;sim.source=(index(si),index(oi));
                 if let Some((previous,stock))=&grid {if *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}}
                 Ok(sim)
             });
@@ -1445,6 +1454,59 @@ mod cumulative_tests {
             changed.volume.as_ref().unwrap().occupied,
             stepped.volume.as_ref().unwrap().occupied
         );
+    }
+    #[test]
+    fn cuts_remember_the_setup_and_operation_that_made_them() {
+        let (doc, mesh) = fixture();
+        // Setup 1 has two operations and setup 2 one; each is simulated in
+        // document order and hands its volume to the next.
+        let mut seen = vec![];
+        sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |_, _, result| {
+                result.unwrap();
+            },
+            |si, oi, volume| {
+                seen.push((
+                    (si as u16, oi as u16),
+                    volume.cuts.iter().map(|c| c.source).collect::<Vec<_>>(),
+                ));
+            },
+        );
+        assert_eq!(seen.len(), 3);
+        let mut sources = vec![];
+        for (operation, cuts) in &seen {
+            // The volume after an operation holds everything cut so far; only
+            // the newest cuts belong to that operation.
+            assert_eq!(cuts.last(), Some(operation), "{operation:?}");
+            assert!(cuts.windows(2).all(|w| w[0] <= w[1]), "{cuts:?}");
+            sources = cuts.clone();
+        }
+        sources.dedup();
+        assert_eq!(sources, [(0, 0), (0, 1), (1, 0)]);
+        // A preview of the last operation starts from the inherited cuts and
+        // adds its own while playing.
+        let mut preview = prepare(&doc, &mesh, 1, 0).unwrap();
+        assert_eq!(preview.source, (1, 0));
+        let inherited = preview.volume.as_ref().unwrap().cuts.len();
+        assert!(
+            preview
+                .volume
+                .as_ref()
+                .unwrap()
+                .cuts
+                .iter()
+                .all(|c| c.source != (1, 0))
+        );
+        preview.seek(1.);
+        let cuts = &preview.volume.as_ref().unwrap().cuts;
+        assert!(cuts.len() > inherited);
+        assert!(cuts[inherited..].iter().all(|c| c.source == (1, 0)));
+        // Rewinding drops the preview's own cuts again.
+        preview.seek(0.);
+        assert_eq!(preview.volume.as_ref().unwrap().cuts.len(), inherited);
     }
     #[test]
     fn every_move_records_the_rate_its_timing_uses() {
