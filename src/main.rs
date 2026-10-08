@@ -15,6 +15,7 @@ mod oauth;
 mod openai;
 mod plan_check;
 mod planner;
+mod planner_tools;
 mod pocket;
 mod post;
 mod post_check;

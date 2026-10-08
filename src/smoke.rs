@@ -5879,7 +5879,14 @@ mod tests {
             assert_eq!(count(&a), 1200, "{request:?}");
         }
         // The next request's attempt starts at zero and counts its own reply.
-        assert_eq!(backend.reply(&conversation, None).await.unwrap().text, "{}");
+        assert_eq!(
+            backend
+                .reply(&conversation, &[], crate::openai::ToolChoice::Auto)
+                .await
+                .unwrap()
+                .text,
+            "{}"
+        );
         assert_eq!(count(&a), 2);
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
         assert_eq!(
@@ -7444,14 +7451,37 @@ mod tests {
                 .iter()
                 .filter(|r| r.body.contains("\"input_image\""))
                 .count();
+            // The tools every request offers, by name.
+            let names = |r: &crate::fake_openai::Req| -> Vec<String> {
+                r.json()["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t["name"].as_str().unwrap().to_string())
+                    .collect()
+            };
             if off {
-                assert_eq!((tools, images), (0, 0), "pictures off: no tool, no picture");
+                // The part tools need no pictures: offered, without view_model.
+                assert_eq!(
+                    (tools, images),
+                    (sent.len(), 0),
+                    "pictures off: the tools, no picture"
+                );
+                assert!(
+                    sent.iter()
+                        .all(|r| names(r) == ["cutting_data", "surface_info"])
+                );
                 assert!(sent.iter().all(|r| !r.body.contains("PICTURES")));
+                assert!(sent.iter().all(|r| !r.body.contains("view_model")));
             } else {
                 assert_eq!(
                     (tools, images),
                     (sent.len(), sent.len()),
-                    "the overview and the tool in every request"
+                    "the overview and the tools in every request"
+                );
+                assert!(
+                    sent.iter()
+                        .all(|r| { names(r) == ["view_model", "cutting_data", "surface_info"] })
                 );
             }
         }

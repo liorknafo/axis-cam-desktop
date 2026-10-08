@@ -68,6 +68,20 @@ pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
         .filter(|h| crate::holding::KINDS.contains(&h.kind()))
         .collect()
 }
+/// The number, counted as `library` is, of the entry that holds `setup1`: None
+/// when setup 1 models no vise or clamps or its entry is not in the library.
+/// Only setup 1 may name it as its `holder`, and a later setup's `holder` of
+/// null shares it.
+pub fn own_entry(doc: &Document, setup1: &Setup) -> Option<usize> {
+    crate::holding::modelled(setup1)
+        .then(|| {
+            library(doc)
+                .iter()
+                .position(|h| h.id == get(&setup1.p, "holder"))
+        })
+        .flatten()
+        .map(|i| i + 1)
+}
 fn library_report(doc: &Document) -> Vec<LibraryEntry> {
     library(doc)
         .into_iter()
@@ -93,6 +107,10 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
 pub struct WorkholdingReport {
     /// "Vise" or "Clamps".
     pub kind: &'static str,
+    /// The `workholding_library` number of setup 1's entry, which a later
+    /// setup's `holder` of null shares; absent when setup 1 has no entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<usize>,
     /// Each jaw or clamp as x0, y0, z0, x1, y1, z1 in setup 1's axes, measured
     /// from the model's -X/-Y/bottom corner, without the gap. A jaw is shown
     /// from the stock's bottom up.
@@ -1147,6 +1165,7 @@ fn workholding_report(
     let needed = top + gap - stock.max[2];
     Ok(Some(WorkholdingReport {
         kind,
+        number: own_entry(doc, setup1),
         boxes: crate::holding::shown(&boxes, stock)
             .iter()
             .map(|b| {
@@ -1264,7 +1283,7 @@ pub(crate) mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(
             json.contains(
-                "\"workholding\":{\"kind\":\"Clamps\",\"boxes\":[[-50.0,30.0,44.0,10.0,50.0,69.0],"
+                "\"workholding\":{\"kind\":\"Clamps\",\"number\":2,\"boxes\":[[-50.0,30.0,44.0,10.0,50.0,69.0],"
             ),
             "{json}"
         );
@@ -1279,6 +1298,49 @@ pub(crate) mod tests {
         holder.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
         let json = serde_json::to_string(&report(&doc, &mesh).unwrap()).unwrap();
         assert!(!json.contains("ZZ-SECRET") && !json.contains(&id), "{json}");
+    }
+    #[test]
+    fn the_reports_workholding_gives_the_library_number_of_setup_1s_entry() {
+        // Setup 1's vise counts among the usable entries only, so an entry
+        // of a kind the planner cannot use before it does not move it.
+        let (mut doc, mesh) = held("Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        doc.workholding
+            .insert(0, crate::holding::Holder::new("Magnet", "Magnet"));
+        let r = report(&doc, &mesh).unwrap();
+        assert_eq!(r.workholding.as_ref().unwrap().number, Some(1));
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["workholding"]["number"], 1);
+        let own = &r.workholding_library[0];
+        assert_eq!((own.number, own.kind), (1, "Vise"));
+        assert_eq!(own_entry(&doc, &doc.setups[0]), Some(1));
+        // The starter clamp is the second entry.
+        let (doc, mesh) = held("Clamp", &[("clamps", "-X:0;+Y:10")]);
+        let r = report(&doc, &mesh).unwrap();
+        assert_eq!(r.workholding.as_ref().unwrap().number, Some(2));
+        assert_eq!(r.workholding_library[1].kind, "Clamp");
+        // No holding on setup 1: no `workholding`, so no number to read.
+        let (doc, mesh) = block();
+        let r = report(&doc, &mesh).unwrap();
+        assert_eq!(own_entry(&doc, &doc.setups[0]), None);
+        assert!(r.workholding.is_none());
+        assert!(
+            !serde_json::to_string(&r)
+                .unwrap()
+                .contains("\"number\":1,\"boxes\"")
+        );
+        // Holding modelled, but the entry is not in the library: no number.
+        let (mut doc, _) = held("Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        doc.setups[0].p.insert("holder".into(), "gone".into());
+        assert_eq!(own_entry(&doc, &doc.setups[0]), None);
+        let none = WorkholdingReport {
+            kind: "Vise",
+            number: own_entry(&doc, &doc.setups[0]),
+            boxes: vec![],
+            gap: 2.,
+            clearance_above_stock_top: None,
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(!json.contains("number"), "{json}");
     }
     #[test]
     fn the_report_lists_the_workholding_library_by_number_in_sizes_only() {

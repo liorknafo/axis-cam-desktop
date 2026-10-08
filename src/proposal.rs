@@ -3,7 +3,6 @@
 //! job; the model's free text is displayed or stored as notes.
 use crate::{
     analysis::{self, OrientationReport, PartReport, PlaneReport},
-    holding,
     mesh::Mesh,
     model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num},
     surface::Selection,
@@ -724,14 +723,7 @@ pub fn build(
     // The entries a proposal's `holder` counts over, as the report numbers
     // them, and the number of setup 1's own, which only setup 1 may name.
     let library = analysis::library(doc);
-    let own = holding::modelled(setup1)
-        .then(|| {
-            library
-                .iter()
-                .position(|h| h.id == get(&setup1.p, "holder"))
-        })
-        .flatten()
-        .map(|i| i + 1);
+    let own = analysis::own_entry(doc, setup1);
     let mut setups: Vec<Setup> = vec![];
     for (si, proposed) in proposal.setups.iter().take(MAX_SETUPS).enumerate() {
         let mut wrong = |operation: Option<usize>, message: String| {

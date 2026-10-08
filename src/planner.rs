@@ -6,8 +6,9 @@ use crate::{
     look,
     mesh::Mesh,
     model::Document,
-    openai::{ApiError, Item, Part, Reply, Role, ToolChoice},
+    openai::{ApiError, Item, Part, Reply, Role, Tool, ToolChoice},
     plan_check::{self, CheckReport},
+    planner_tools::{self, ToolState},
     proposal::{self, Problem, Proposal},
 };
 use std::{future::Future, sync::Arc};
@@ -21,19 +22,19 @@ pub const MAX_PICTURES_PER_RUN: usize = 20;
 /// The most recent pictures sent as images; older ones are sent as their
 /// descriptions. The overview counts here.
 pub const KEPT_PICTURES: usize = 8;
-/// Replies with calls for pictures one planner request accepts before it
-/// fails.
-pub const MAX_TOOL_ROUNDS: usize = 8;
+/// Replies with tool calls one planner request accepts before it fails.
+pub const MAX_TOOL_ROUNDS: usize = 16;
 
 /// Anything that can answer a conversation: the OpenAI client, or a script
 /// in tests.
 pub trait Backend {
-    /// One send of the conversation. `tool`: None when the view_model tool
-    /// is not offered, otherwise how the model may use it.
+    /// One send of the conversation with the planner tools it offers, none
+    /// when `tools` is empty, and how the model may use them.
     fn reply(
         &self,
         messages: &[Item],
-        tool: Option<ToolChoice>,
+        tools: &[Tool],
+        choice: ToolChoice,
     ) -> impl Future<Output = Result<Reply, ApiError>> + Send;
     /// Whether this run may show the model pictures.
     fn pictures(&self) -> bool {
@@ -79,7 +80,7 @@ pub struct Look {
 /// What a run stops sending after OpenAI refused a request carrying it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dropped {
-    /// The view_model tool; the pictures already sent stay.
+    /// Every planner tool; the pictures already sent stay.
     Tool,
     /// Every picture: each is sent as its description.
     Pictures,
@@ -186,7 +187,7 @@ fn holding_rules(tools: bool) -> String {
     format!("PLANNING THE HOLDING
 - Decide, before you plan any operation, how every setup is held and what stock it starts from. A later setup starts from the stock the earlier setups left, not from the whole block: a faced top makes the flipped stock shorter, and cut sides make it narrower. A holder that does not fit that stock, or has nothing to grip on it, makes the plan fail.
 - `workholding_library` lists the vises and clamps you may choose from, by `number` from 1, with their sizes in mm and no names. A `Vise` has `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening` (the widest stock it opens to across its jaws) and `grip` (how far up from the stock's bottom the jaws hold it). A `Clamp` has `length`, `width`, `height` and `bite` (how far it reaches onto the stock top).
-- Each setup's `holder` is a `number` from `workholding_library`, or null. Setup 1 is held by the user's own entry: its `holder` is null (or that entry's number) and cannot be changed. For a later setup null means setup 1's entry; choose another `number` when the stock it starts from suits another holder better, for example clamps when the earlier setups took the material a vise would grip, or a vise that opens wider. The program lays the chosen holder out (a vise's axis and grip, the clamps' sides and positions) for the setup's toolpaths: you choose only the entry.
+- Each setup's `holder` is a `number` from `workholding_library`, or null. Setup 1 is held by the user's own entry, whose `number` is given in the report's `workholding` (which is absent when setup 1 models no vise or clamps): its `holder` is null or that `number` and cannot be changed. For a later setup null means the same holder as setup 1 when setup 1 has an entry, and no modelled holding when it has none; choose a `number` when the stock it starts from suits another holder better, for example clamps when the earlier setups took the material a vise would grip, or a vise that opens wider. The program lays the chosen holder out (a vise's axis and grip, the clamps' sides and positions) for the setup's toolpaths: you choose only the entry.
 - A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material on the stock's bottom to rest on (at least half of it), stock at least 1 mm above the grip, and a width across the jaws within `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it). A part cut free of the material the holder grips cannot be held either.
 - Leave that material in the earlier setups, and finish it in a later setup that no longer needs it: for example stop an outside Contour above the grip with `bottom_offset`, or do not cut the sides a vise will grip, and do not face away the top a flipped setup will rest on. Order the setups so that each starts from stock its holder can hold.
 - A setup its holder cannot hold comes back as a problem with the stage `workholding` on that setup; it names the earlier operation that removed the material. Change that operation, the order of the setups or the `holder`.{tools}
@@ -201,10 +202,18 @@ pub fn instructions() -> String {
 }
 /// What the model is told before it sees the part. Every limit the builder
 /// and the generators enforce is stated, so a correct plan passes first time.
-/// With `pictures`, a PICTURES section before RULES explains the pictures:
-/// with `overview`, the overview the conversation carries; with `tool`, the
-/// view_model tool and its limits.
+/// With `tool` (the planner tools are offered), a TOOLS section lists them
+/// with their limits, `view_model` only with `pictures`, and PLANNING THE
+/// HOLDING names the tools that test a draft's holding. With `pictures`, a
+/// PICTURES section before RULES explains the pictures: with `overview`, the
+/// overview the conversation carries; with `tool`, the view_model tool and its
+/// limits.
 pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
+    let tools = if tool {
+        planner_tools::instructions(pictures)
+    } else {
+        String::new()
+    };
     let pictures = if pictures {
         // Without its overview (it could not be drawn) the section does not
         // promise one.
@@ -231,8 +240,7 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
     } else {
         String::new()
     };
-    // The planner tools are not offered yet; their rules join in with them.
-    let holding = holding_rules(false);
+    let holding = holding_rules(tool);
     let (per_setup, total) = (proposal::MAX_SETUP_OPERATIONS, proposal::MAX_OPERATIONS);
     let samples = format!(
         "{},{:03}",
@@ -248,7 +256,7 @@ THE PART REPORT
 - A floor's `max_cutter_diameter` is the largest flat cutter that fits inside it. A plane's `holes` give the largest drill that fits (`diameter`), the opening diameter (`opening_diameter`, larger at a counterbore), the depth and whether the hole goes through.
 - `freeform_area` is the visible area that is neither horizontal nor vertical; only Parallel finishing follows it.
 - `truncated` true means the orientation has more planes or holes than are listed; only listed surfaces can be used.
-- `workholding`, when present, is setup 1's modelled vise or clamps (see WORKHOLDING).
+- `workholding`, when present, is setup 1's modelled vise or clamps, with its `number` in `workholding_library` (see WORKHOLDING).
 - `workholding_library` lists the vises and clamps you may choose from, by `number`, with their sizes (see PLANNING THE HOLDING).
 
 STRATEGIES (the only six)
@@ -276,7 +284,7 @@ WORKHOLDING
 - When even the machine's maximum rpm (`machine.max_rpm`) gives a tool less than the minimum surface speed, running at that maximum rpm counts as in range. When the minimum chip load needs more than the machine's maximum feed (`machine.max_feed`), running at that maximum feed counts as in range. A value above the material's maximum is never excused, and rounding gets 1% of slack on each limit.
 - Plunge and ramp feeds are not checked. Plans with a spindle speed or feed outside the material's cutting data are refused: each such operation comes back as a problem with the stage `cutting data`, together with the generation, export, tool-axis and gouge problems.
 
-{pictures}RULES
+{tools}{pictures}RULES
 - Use only tool numbers from `tools` and surface IDs from the chosen orientation's `planes`. Never invent either.
 - Every setup needs at least one operation. At most {per_setup} operations per setup and {total} in total. Spindle speed is at least 100 rpm and feed at least 1 mm/min, both within the machine's maximums.
 - Every number must be finite.
@@ -660,8 +668,16 @@ fn anonymized(doc: &Document) -> Document {
 }
 /// The conversation as it is sent: images beyond the `KEPT_PICTURES` most
 /// recent, or all of them once pictures are off, become their description;
-/// once the tool is gone, its calls and outputs become plain text.
+/// once the tools are gone, their calls and outputs become plain text.
 fn outgoing(conversation: &[Item], pictures: bool, tool: bool) -> Vec<Item> {
+    // The tool each call named, to word its output.
+    let called: std::collections::HashMap<&str, &str> = conversation
+        .iter()
+        .filter_map(|item| match item {
+            Item::Call(call) => Some((call.call_id.as_str(), call.name.as_str())),
+            _ => None,
+        })
+        .collect();
     let total = conversation
         .iter()
         .map(|i| match i {
@@ -697,11 +713,21 @@ fn outgoing(conversation: &[Item], pictures: bool, tool: bool) -> Vec<Item> {
             ),
             Item::Call(call) if !tool => Item::text(
                 Role::Assistant,
-                format!("(Asked for a picture: {})", call.arguments),
+                if call.name == look::NAME {
+                    format!("(Asked for a picture: {})", call.arguments)
+                } else {
+                    format!("(Called {}: {})", call.name, call.arguments)
+                },
             ),
-            Item::Output { output, .. } if !tool => {
-                Item::text(Role::User, format!("(Picture tool answered: {output})"))
-            }
+            Item::Output { call_id, output } if !tool => Item::text(
+                Role::User,
+                match called.get(call_id.as_str()) {
+                    Some(&name) if name != look::NAME => {
+                        format!("({name} answered: {output})")
+                    }
+                    _ => format!("(Picture tool answered: {output})"),
+                },
+            ),
             other => other.clone(),
         })
         .collect()
@@ -710,43 +736,44 @@ fn outgoing(conversation: &[Item], pictures: bool, tool: bool) -> Vec<Item> {
 struct Sight {
     /// Pictures are sent as images; off once OpenAI refused them.
     pictures: bool,
-    /// The view_model tool is offered; off once OpenAI refused it.
+    /// The planner tools are offered; off once OpenAI refused them.
     tool: bool,
-    /// Views the model asked for that were drawn or failed to draw, the
-    /// overview aside.
-    shown: usize,
     /// The conversation carries the overview: it was drawn.
     overview: bool,
 }
-/// One planner request: sends the conversation, answers the model's calls
-/// for pictures, and returns the text of the first reply without calls.
-/// A refused send is made again without the tool, then without pictures.
+/// One planner request: sends the conversation, answers the model's tool
+/// calls, and returns the text of the first reply without calls. A refused
+/// send is made again without the tools, then without pictures.
 async fn ask(
     backend: &(impl Backend + Sync),
     sight: &mut Sight,
     conversation: &mut Vec<Item>,
     // `&mut`: a shared borrow of the !Sync mesh would make the planner's future non-Send.
-    scene: &mut look::Scene,
+    state: &mut ToolState,
     busy: &Busy,
     request: usize,
     progress: &mut (impl FnMut(Event) + Send),
 ) -> Result<String, ApiError> {
-    let mut here = 0;
+    state.next_request();
     let mut rounds = 0;
     loop {
-        // Past a limit the tool stays offered, but may not be called.
-        let limited = here >= MAX_PICTURES_PER_REQUEST || sight.shown >= MAX_PICTURES_PER_RUN;
-        let choice = sight.tool.then_some(if limited {
+        // Once the rounds are used up the tools stay offered, but may not be called.
+        let choice = if rounds >= MAX_TOOL_ROUNDS {
             ToolChoice::None
         } else {
             ToolChoice::Auto
-        });
+        };
+        let tools = if sight.tool {
+            planner_tools::offered(sight.pictures)
+        } else {
+            vec![]
+        };
         let mut messages = vec![Item::text(
             Role::System,
             instructions_with(sight.pictures, sight.tool, sight.overview),
         )];
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
-        let reply = match backend.reply(&messages, choice).await {
+        let reply = match backend.reply(&messages, &tools, choice).await {
             Ok(reply) => reply,
             Err(ApiError::Unsupported(_) | ApiError::BadRequest(_))
                 if sight.tool || sight.pictures =>
@@ -769,61 +796,48 @@ async fn ask(
         rounds += 1;
         if rounds > MAX_TOOL_ROUNDS {
             return Err(ApiError::Other(
-                "The model kept asking for pictures without replying with a plan.".into(),
+                "The model kept calling tools without replying with a plan.".into(),
             ));
         }
         let mut pictures = vec![];
         for call in reply.calls {
-            let answer = if call.name != look::NAME {
-                Err(format!(
-                    "There is no tool named {}.",
-                    proposal::clip(&call.name, 40)
-                ))
-            } else if here >= MAX_PICTURES_PER_REQUEST {
-                Err("No more pictures for this request; reply with the proposal.".into())
-            } else if sight.shown >= MAX_PICTURES_PER_RUN {
-                Err("No more pictures in this run; reply with the proposal.".into())
-            } else {
-                // A view that cannot be drawn counts against the limits too.
-                here += 1;
-                sight.shown += 1;
-                let (scene, arguments) = (scene.clone(), call.arguments.clone());
-                blocking(busy, move || look::draw(&scene, &arguments))
-                    .await
-                    .unwrap_or_else(|_| Err("The picture could not be drawn.".into()))
+            // The tool works on a copy, so a call that panics leaves the run's
+            // state as it was; a view that cannot be drawn counts against the
+            // picture limits (see `planner_tools::answer`).
+            let (name, arguments, mut copy) =
+                (call.name.clone(), call.arguments.clone(), state.clone());
+            let answer = blocking(busy, move || {
+                let answer = planner_tools::answer(&name, &arguments, &mut copy);
+                (answer, copy)
+            })
+            .await;
+            let answer = match answer {
+                Ok((answer, copy)) => {
+                    *state = copy;
+                    answer
+                }
+                Err(_) => planner_tools::crashed(&call.name),
             };
             conversation.push(Item::Call(call.clone()));
-            match answer {
-                Ok(picture) => {
-                    conversation.push(Item::Output {
-                        call_id: call.call_id,
-                        output: picture.description.clone(),
-                    });
-                    progress(Event::Looked(
-                        request,
-                        Look {
-                            description: picture.description.clone(),
-                            purpose: picture.purpose.clone(),
-                            png: Some(picture.png.clone()),
-                        },
-                    ));
-                    pictures.push(picture);
-                }
-                Err(message) => {
-                    conversation.push(Item::Output {
-                        call_id: call.call_id,
-                        output: message.clone(),
-                    });
-                    progress(Event::Looked(
-                        request,
-                        Look {
-                            description: message,
-                            purpose: String::new(),
-                            png: None,
-                        },
-                    ));
-                }
-            }
+            conversation.push(Item::Output {
+                call_id: call.call_id,
+                output: answer.output,
+            });
+            // A line of the timeline: the picture with the model's reason, or
+            // a sentence with no picture.
+            progress(Event::Looked(
+                request,
+                Look {
+                    description: answer.line,
+                    purpose: answer
+                        .picture
+                        .as_ref()
+                        .map(|p| p.purpose.clone())
+                        .unwrap_or_default(),
+                    png: answer.picture.as_ref().map(|p| p.png.clone()),
+                },
+            ));
+            pictures.extend(answer.picture);
         }
         // One message holds this round's pictures, each after its description.
         if !pictures.is_empty() {
@@ -907,20 +921,20 @@ where
     let part = serde_json::to_string(&report).map_err(|e| fail(e.to_string(), vec![], None, 0))?;
     // The system message is added to each send, as the pictures allow.
     let mut conversation = vec![Item::text(Role::User, part)];
-    let mut scene = look::Scene {
+    let mut state = ToolState::new(look::Scene {
         doc: Arc::new(doc.clone()),
         mesh: mesh.clone(),
         report: Arc::new(report.clone()),
         job: None,
-    };
+    });
+    // The tools are offered with or without pictures.
     let mut sight = Sight {
         pictures: backend.pictures(),
-        tool: backend.pictures(),
-        shown: 0,
+        tool: true,
         overview: false,
     };
     if sight.pictures {
-        let s = scene.clone();
+        let s = state.scene.clone();
         // Without its overview the run goes on: the report is what counts.
         if let Ok(Ok(picture)) = blocking(busy, move || look::overview(&s)).await {
             progress(Event::Overview(Look {
@@ -957,7 +971,7 @@ where
             backend,
             &mut sight,
             &mut conversation,
-            &mut scene,
+            &mut state,
             busy,
             request,
             &mut progress,
@@ -1024,7 +1038,7 @@ where
             }
         };
         // Operation views draw this proposal's job, passed or not.
-        scene.job = job.clone().map(Arc::new);
+        state.scene.job = job.clone().map(Arc::new);
         progress(Event::Checked(request, StepResult::of(&check)));
         let next = feedback(&check);
         if let (true, Some(mut job)) = (check.passed, job) {
@@ -1116,15 +1130,20 @@ impl OpenAiBackend {
     }
 }
 impl Backend for OpenAiBackend {
-    async fn reply(&self, messages: &[Item], tool: Option<ToolChoice>) -> Result<Reply, ApiError> {
+    async fn reply(
+        &self,
+        messages: &[Item],
+        tools: &[Tool],
+        choice: ToolChoice,
+    ) -> Result<Reply, ApiError> {
         use std::sync::atomic::Ordering;
         let request = crate::openai::Request {
             model: self.model.clone(),
             messages: messages.to_vec(),
             schema_name: "machining_plan",
             schema: proposal::schema(),
-            tools: tool.map(|_| vec![look::tool()]).unwrap_or_default(),
-            tool_choice: tool.unwrap_or_default(),
+            tools: tools.to_vec(),
+            tool_choice: choice,
         };
         if self.plain.load(Ordering::Relaxed) {
             let reply = self.client.respond_plain_streaming(&request, &self.stream);
@@ -1195,8 +1214,11 @@ pub(crate) mod tests {
         replies: Mutex<std::collections::VecDeque<Result<Reply, ApiError>>>,
         /// Each send's messages as role and text; calls and outputs are skipped.
         pub seen: Mutex<Vec<Vec<(Role, String)>>>,
-        /// Each send's items and how the tool was offered.
+        /// Each send's items and how the tools were offered: None when
+        /// there were none.
         pub turns: Mutex<Vec<(Vec<Item>, Option<ToolChoice>)>>,
+        /// The names of the tools each send offered.
+        pub offered: Mutex<Vec<Vec<&'static str>>>,
         pictures: bool,
     }
     impl Script {
@@ -1213,16 +1235,25 @@ pub(crate) mod tests {
                 replies: Mutex::new(replies.collect()),
                 seen: Mutex::new(vec![]),
                 turns: Mutex::new(vec![]),
+                offered: Mutex::new(vec![]),
                 pictures: false,
             }
         }
-        /// Replies that may call the tool, with pictures on.
+        /// Replies that may call the tools, with pictures on.
         pub fn calls(replies: Vec<Result<Reply, ApiError>>) -> Self {
+            Self {
+                pictures: true,
+                ..Self::calling(replies)
+            }
+        }
+        /// Replies that may call the tools, with pictures off.
+        pub fn calling(replies: Vec<Result<Reply, ApiError>>) -> Self {
             Self {
                 replies: Mutex::new(replies.into()),
                 seen: Mutex::new(vec![]),
                 turns: Mutex::new(vec![]),
-                pictures: true,
+                offered: Mutex::new(vec![]),
+                pictures: false,
             }
         }
     }
@@ -1230,11 +1261,20 @@ pub(crate) mod tests {
         async fn reply(
             &self,
             messages: &[Item],
-            tool: Option<ToolChoice>,
+            tools: &[Tool],
+            choice: ToolChoice,
         ) -> Result<Reply, ApiError> {
             let texts = messages.iter().filter_map(Item::as_text).collect();
             self.seen.lock().unwrap().push(texts);
-            self.turns.lock().unwrap().push((messages.to_vec(), tool));
+            let offered = (!tools.is_empty()).then_some(choice);
+            self.turns
+                .lock()
+                .unwrap()
+                .push((messages.to_vec(), offered));
+            self.offered
+                .lock()
+                .unwrap()
+                .push(tools.iter().map(|t| t.name).collect());
             self.replies
                 .lock()
                 .unwrap()
@@ -1546,7 +1586,7 @@ pub(crate) mod tests {
         // The report names the kind, the boxes and the gap, and that is all.
         let part = &seen[0][1].1;
         assert!(
-            part.contains("\"workholding\":{\"kind\":\"Clamps\",\"boxes\":[["),
+            part.contains("\"workholding\":{\"kind\":\"Clamps\",\"number\":2,\"boxes\":[["),
             "{part}"
         );
         assert!(part.contains("\"gap\":2.0"), "{part}");
@@ -3197,10 +3237,18 @@ pub(crate) mod tests {
             Item::text(Role::User, "Fix it."),
         ];
         let text = || stream.lock().unwrap().clone();
-        assert_eq!(backend.reply(&messages, None).await.unwrap().text, "{}");
+        assert_eq!(
+            backend
+                .reply(&messages, &[], ToolChoice::Auto)
+                .await
+                .unwrap()
+                .text,
+            "{}"
+        );
         assert_eq!(text(), "{}", "the structured refusal streamed nothing");
         *stream.lock().unwrap() = "x".repeat(40);
-        let reply = backend.reply(&messages, Some(ToolChoice::None));
+        let tools = planner_tools::offered(true);
+        let reply = backend.reply(&messages, &tools, ToolChoice::None);
         assert_eq!(reply.await.unwrap().text, "{}");
         assert_eq!(text(), "{}", "the plain request starts the text again");
         let sent = fake.seen("/v1/responses");
@@ -3209,10 +3257,16 @@ pub(crate) mod tests {
             3,
             "the second reply skips the structured attempt"
         );
-        // The tool is offered only when asked for, with its choice.
+        // The tools are offered only when given, all of them, with their choice.
         assert!(sent[0].json()["tools"].is_null() && sent[1].json()["tools"].is_null());
         let offered = sent[2].json();
-        assert_eq!(offered["tools"][0]["name"], crate::look::NAME);
+        let names: Vec<&str> = offered["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, [crate::look::NAME, "cutting_data", "surface_info"]);
         assert_eq!(offered["tool_choice"], "none");
         let first = sent[0].json();
         assert_eq!(first["model"], "gpt-6.1-sol");
@@ -3517,6 +3571,13 @@ pub(crate) mod tests {
             arguments: args.to_string(),
         }
     }
+    fn cutting_call(id: &str, tool: u32) -> ToolCall {
+        ToolCall {
+            call_id: id.into(),
+            name: planner_tools::CUTTING_DATA.into(),
+            arguments: serde_json::json!({ "tool": tool }).to_string(),
+        }
+    }
     fn calls(calls: Vec<ToolCall>) -> Result<Reply, ApiError> {
         Ok(Reply {
             text: String::new(),
@@ -3609,8 +3670,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let turns = script.turns.lock().unwrap();
-        // After 4 + 2 pictures the per-request limit is reached.
-        assert_eq!(turns[2].1, Some(ToolChoice::None));
+        // After 4 + 2 pictures the per-request limit is reached: the other
+        // tools stay open, so the tools are still offered to be called.
+        assert_eq!(turns[2].1, Some(ToolChoice::Auto));
         let outputs: Vec<_> = turns[2]
             .0
             .iter()
@@ -3658,7 +3720,7 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(
-            failure.message.contains("kept asking for pictures"),
+            failure.message.contains("kept calling tools"),
             "{}",
             failure.message
         );
@@ -3737,49 +3799,49 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let turns = script.turns.lock().unwrap();
-        assert_eq!(
-            turns[1].1,
-            Some(ToolChoice::None),
-            "six failed views use up the request"
-        );
+        assert_eq!(turns[1].1, Some(ToolChoice::Auto));
         let output = turns[2].0.iter().find_map(|i| match i {
             Item::Output { call_id, output } if call_id == "more" => Some(output.as_str()),
             _ => None,
         });
         assert_eq!(
             output,
-            Some("No more pictures for this request; reply with the proposal.")
+            Some("No more pictures for this request; reply with the proposal."),
+            "six failed views use up the request"
         );
-        assert_eq!(turns[2].1, Some(ToolChoice::None));
+        assert_eq!(turns[2].1, Some(ToolChoice::Auto));
         // The next planner request may look again.
         assert_eq!(turns[3].1, Some(ToolChoice::Auto));
     }
     #[tokio::test]
-    async fn after_the_runs_last_picture_the_tool_may_not_be_called() {
+    async fn after_the_runs_last_picture_view_model_is_refused_and_the_other_tools_stay_open() {
         let (doc, mesh, report) = block();
         let script = Script::calls(vec![
-            calls(vec![look_call("late", serde_json::json!({}))]),
+            calls(vec![
+                look_call("late", serde_json::json!({})),
+                cutting_call("data", 3),
+            ]),
             text(&good(&report)),
         ]);
         let mut sight = Sight {
             pictures: true,
             tool: true,
-            shown: MAX_PICTURES_PER_RUN,
             overview: false,
         };
-        let mut scene = look::Scene {
+        let mut state = ToolState::new(look::Scene {
             doc: Arc::new(doc),
             mesh,
             report: Arc::new(report.clone()),
             job: None,
-        };
+        });
+        state.pictures_run = MAX_PICTURES_PER_RUN;
         let mut conversation = vec![Item::text(Role::User, "Part.")];
         let mut events = vec![];
         let text = ask(
             &script,
             &mut sight,
             &mut conversation,
-            &mut scene,
+            &mut state,
             &Busy::default(),
             1,
             &mut |e| events.push(e),
@@ -3787,15 +3849,17 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(text, serde_json::to_string(&good(&report)).unwrap());
+        // The tools stay offered, and may be called: a tool switched off
+        // would take cutting_data with it for the rest of the run.
         let turns = script.turns.lock().unwrap();
         assert_eq!(turns.len(), 2);
         assert!(
             turns
                 .iter()
-                .all(|(_, tool)| *tool == Some(ToolChoice::None))
+                .all(|(_, tool)| *tool == Some(ToolChoice::Auto))
         );
         assert_eq!(
-            conversation[1..],
+            conversation[1..3],
             [
                 Item::Call(look_call("late", serde_json::json!({}))),
                 Item::Output {
@@ -3804,11 +3868,21 @@ pub(crate) mod tests {
                 },
             ]
         );
+        assert!(
+            matches!(&conversation[4], Item::Output { call_id, output }
+                if call_id == "data" && output.contains("\"recommended\":11970")),
+            "{:?}",
+            conversation[4]
+        );
         assert_eq!(
-            sight.shown, MAX_PICTURES_PER_RUN,
+            state.pictures_run, MAX_PICTURES_PER_RUN,
             "a refused call is not counted"
         );
-        assert!(matches!(&events[..], [Event::Looked(1, l)] if l.png.is_none()));
+        assert!(
+            matches!(&events[..], [Event::Looked(1, a), Event::Looked(1, b)]
+                if a.png.is_none() && b.png.is_none()
+                    && b.description == "Cutting data for T3: 11 970 rpm, 1 260 mm/min")
+        );
     }
     #[test]
     fn only_the_last_eight_images_are_resent_and_the_rest_become_text() {
@@ -3890,8 +3964,9 @@ pub(crate) mod tests {
     #[test]
     fn the_pictures_section_comes_before_the_rules_only_with_pictures() {
         let plain = instructions();
-        assert_eq!(plain, instructions_with(false, true, true));
+        assert_eq!(plain, instructions_with(false, false, true));
         assert!(!plain.contains("PICTURES") && !plain.contains("view_model"));
+        assert!(!plain.contains("TOOLS") && !plain.contains("cutting_data"));
         let limits = format!(
             "at most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run"
         );
@@ -3911,8 +3986,19 @@ pub(crate) mod tests {
             assert!(with.contains("vise or clamps (grey)"));
             assert!(with.contains("the triad shows +X (red)"));
             assert!(with.contains("the report's numbers are right"));
-            // Without the section the text is the same.
-            assert_eq!(with.replacen(&with[at + 1..rules + 1], "", 1), plain);
+            // Without the section the text is the same as a run without
+            // pictures, but for the TOOLS section's line about the picture tool.
+            let without = with.replacen(&with[at + 1..rules + 1], "", 1);
+            assert_eq!(
+                without
+                    .lines()
+                    .filter(|l| !l.starts_with("- `view_model`"))
+                    .collect::<Vec<_>>(),
+                instructions_with(false, tool, overview)
+                    .lines()
+                    .collect::<Vec<_>>(),
+                "{tool} {overview}"
+            );
         }
     }
     #[tokio::test]
@@ -3949,14 +4035,397 @@ pub(crate) mod tests {
         assert!(instructions_with(true, true, true).contains("view_model"));
     }
     #[tokio::test]
-    async fn without_pictures_nothing_changes() {
+    async fn without_pictures_the_tools_are_still_offered_and_nothing_else_changes() {
         let (doc, mesh, report) = block();
         let script = Script::new(vec![json(&good(&report)), json(&good(&report))]);
         plan(&script, doc, mesh, &Busy::default(), |_| {})
             .await
             .unwrap();
         let turns = script.turns.lock().unwrap();
-        assert!(turns.iter().all(|(_, tool)| tool.is_none()));
+        // Before the tools, a run without pictures offered nothing; now it
+        // offers the tools that need no pictures, and not view_model.
+        assert!(
+            turns
+                .iter()
+                .all(|(_, tool)| *tool == Some(ToolChoice::Auto))
+        );
+        assert!(
+            script
+                .offered
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|names| names == &["cutting_data", "surface_info"])
+        );
         assert_eq!(turns[0].0.len(), 2, "system and part report only");
+        let system = turns[0].0[0].as_text().unwrap().1;
+        assert!(!system.contains("PICTURES") && !system.contains("view_model"));
+        assert!(system.contains("\nTOOLS\n") && system.contains("`cutting_data`"));
+        assert_eq!(system, instructions_with(false, true, false));
+    }
+    #[tokio::test]
+    async fn tool_calls_are_answered_with_json_and_each_gets_a_line_in_the_timeline() {
+        let (doc, mesh, report) = block();
+        let surface = report.orientations[0].planes[0].surfaces[0];
+        let surface_call = ToolCall {
+            call_id: "b".into(),
+            name: planner_tools::SURFACE_INFO.into(),
+            arguments: serde_json::json!({ "surface": surface }).to_string(),
+        };
+        let unknown = ToolCall {
+            call_id: "c".into(),
+            name: planner_tools::CUTTING_DATA.into(),
+            arguments: serde_json::json!({ "tool": 99 }).to_string(),
+        };
+        let script = Script::calling(vec![
+            calls(vec![cutting_call("a", 3), surface_call, unknown]),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        let mut events = vec![];
+        let outcome = plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        assert_eq!(outcome.requests, 2, "tool rounds are not planner requests");
+        let turns = script.turns.lock().unwrap();
+        let second = &turns[1].0;
+        let outputs: Vec<(&str, &str)> = second
+            .iter()
+            .filter_map(|item| match item {
+                Item::Output { call_id, output } => Some((call_id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 3);
+        let data: serde_json::Value = serde_json::from_str(outputs[0].1).unwrap();
+        assert_eq!(data["rpm"]["recommended"], 11970);
+        let info: serde_json::Value = serde_json::from_str(outputs[1].1).unwrap();
+        assert_eq!(info["surface"], surface);
+        assert_eq!(outputs[2].1, "The part report has no tool number 99.");
+        // No picture goes to the model: only the three answers follow the calls.
+        assert!(matches!(second.last(), Some(Item::Output { call_id, .. }) if call_id == "c"));
+        // One line each under the request, with no picture.
+        let looks: Vec<&Look> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Looked(1, look) => Some(look),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(looks.len(), 3);
+        assert!(
+            looks
+                .iter()
+                .all(|l| l.png.is_none() && l.purpose.is_empty())
+        );
+        assert_eq!(
+            looks[0].description,
+            "Cutting data for T3: 11 970 rpm, 1 260 mm/min"
+        );
+        assert!(
+            looks[1]
+                .description
+                .starts_with(&format!("Surface {surface}: "))
+        );
+        assert_eq!(
+            looks[2].description,
+            "The part report has no tool number 99."
+        );
+        // The timeline shows such a line bare, as it shows an error sentence.
+        assert_eq!(crate::ui::look_line(looks[0]), looks[0].description);
+    }
+    #[tokio::test]
+    async fn an_unknown_tool_is_answered_and_the_run_goes_on() {
+        let (doc, mesh, report) = block();
+        let nothing = ToolCall {
+            call_id: "x".into(),
+            name: "make_coffee".into(),
+            arguments: "{}".into(),
+        };
+        let script = Script::calling(vec![
+            calls(vec![nothing]),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        plan(&script, doc, mesh, &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        let turns = script.turns.lock().unwrap();
+        assert!(
+            turns[1]
+                .0
+                .iter()
+                .any(|i| matches!(i, Item::Output { call_id, output }
+            if call_id == "x" && output == "There is no tool named make_coffee."))
+        );
+    }
+    #[tokio::test]
+    async fn sixteen_tool_rounds_are_allowed_and_a_seventeenth_fails_the_request() {
+        assert_eq!(MAX_TOOL_ROUNDS, 16);
+        let (doc, mesh, report) = block();
+        let mut replies: Vec<_> = (0..MAX_TOOL_ROUNDS)
+            .map(|i| calls(vec![cutting_call(&i.to_string(), 3)]))
+            .collect();
+        replies.push(text(&good(&report)));
+        replies.push(text(&good(&report)));
+        let script = Script::calling(replies);
+        let outcome = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(outcome.requests, 2);
+        // Each of the sixteen rounds may call a tool; the send after the
+        // last may not, so the model has to answer.
+        let choices: Vec<_> = script.turns.lock().unwrap().iter().map(|t| t.1).collect();
+        let expected: Vec<_> = (0..MAX_TOOL_ROUNDS + 2)
+            .map(|n| {
+                Some(if n == MAX_TOOL_ROUNDS {
+                    ToolChoice::None
+                } else {
+                    ToolChoice::Auto
+                })
+            })
+            .collect();
+        assert_eq!(choices, expected);
+        // One round too many fails, and says so.
+        let replies = (0..=MAX_TOOL_ROUNDS)
+            .map(|i| calls(vec![cutting_call(&i.to_string(), 3)]))
+            .collect();
+        let script = Script::calling(replies);
+        let failure = plan(&script, doc, mesh, &Busy::default(), |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            failure.message.contains("kept calling tools"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(script.turns.lock().unwrap().len(), MAX_TOOL_ROUNDS + 1);
+    }
+    #[tokio::test]
+    async fn the_round_count_starts_again_with_each_planner_request() {
+        let (doc, mesh, report) = block();
+        // Sixteen rounds in the first request, sixteen in the second: the
+        // count is per planner request.
+        let round = |n: usize| calls(vec![cutting_call(&n.to_string(), 3)]);
+        let mut replies: Vec<_> = (0..MAX_TOOL_ROUNDS).map(round).collect();
+        replies.push(text(&good(&report)));
+        replies.extend((0..MAX_TOOL_ROUNDS).map(round));
+        replies.push(text(&good(&report)));
+        let script = Script::calling(replies);
+        let outcome = plan(&script, doc, mesh, &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(outcome.requests, 2);
+    }
+    #[tokio::test]
+    async fn a_refused_tool_request_drops_all_the_tools_and_their_instructions() {
+        // Without pictures: the request is sent again with no tools at all.
+        let (doc, mesh, report) = block();
+        let script = Script::calling(vec![
+            Err(ApiError::BadRequest("tools".into())),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        let drops: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Dropped(n, d) => Some((*n, *d)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drops, vec![(1, Dropped::Tool)]);
+        {
+            let offered = script.offered.lock().unwrap();
+            assert_eq!(offered[0], ["cutting_data", "surface_info"]);
+            assert!(
+                offered[1..].iter().all(|names| names.is_empty()),
+                "{offered:?}"
+            );
+            let turns = script.turns.lock().unwrap();
+            assert!(turns[1..].iter().all(|(_, tool)| tool.is_none()));
+            for (items, _) in &turns[1..] {
+                let system = items[0].as_text().unwrap().1;
+                assert!(!system.contains("TOOLS") && !system.contains("cutting_data"));
+                assert_eq!(system, instructions_with(false, false, false));
+            }
+        }
+        // With pictures: view_model goes with the others; the pictures stay.
+        let (doc, mesh, report) = block();
+        let script = Script::calls(vec![
+            Err(ApiError::Unsupported("tools".into())),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        assert!(events.contains(&Event::Dropped(1, Dropped::Tool)));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Dropped(_, Dropped::Pictures)))
+        );
+        let offered = script.offered.lock().unwrap();
+        assert_eq!(offered[0], [look::NAME, "cutting_data", "surface_info"]);
+        assert!(
+            offered[1..].iter().all(|names| names.is_empty()),
+            "{offered:?}"
+        );
+    }
+    #[tokio::test]
+    async fn a_second_refusal_drops_the_pictures_after_the_tools() {
+        let (doc, mesh, report) = block();
+        let script = Script::calls(vec![
+            Err(ApiError::BadRequest("tools".into())),
+            Err(ApiError::BadRequest("images".into())),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        let drops: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Dropped(n, d) => Some((*n, *d)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drops, vec![(1, Dropped::Tool), (1, Dropped::Pictures)]);
+    }
+    #[tokio::test]
+    async fn without_tools_or_pictures_a_refusal_is_the_requests_error() {
+        let (doc, mesh, _) = block();
+        let script = Script::calling(vec![
+            Err(ApiError::BadRequest("tools".into())),
+            Err(ApiError::BadRequest("still".into())),
+        ]);
+        let failure = plan(&script, doc, mesh, &Busy::default(), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(failure.api, Some(ApiError::BadRequest("still".into())));
+    }
+    #[test]
+    fn the_tools_section_lists_each_offered_tool_with_its_limits() {
+        // No tools offered, no section and no tool named.
+        let none = instructions_with(true, false, true);
+        assert!(!none.contains("\nTOOLS\n") && !none.contains("cutting_data"));
+        assert!(!none.contains("surface_info") && !none.contains("check_plan"));
+        // Without pictures: the part tools, not view_model.
+        let text = instructions_with(false, true, false);
+        let tools = section(&text, "TOOLS");
+        assert!(tools.contains("`cutting_data`") && tools.contains("`surface_info`"));
+        assert!(!text.contains("view_model") && !text.contains("PICTURES"));
+        assert!(tools.contains(&format!("at most {MAX_TOOL_ROUNDS} rounds")));
+        assert!(tools.contains("No limit"));
+        for needed in [
+            "`tool`",
+            "feed range",
+            "recommended rpm",
+            "`surface`",
+            "`surface_area`",
+            "`mean_normal`",
+            "setup 1's frame",
+        ] {
+            assert!(tools.contains(needed), "{needed}\n{tools}");
+        }
+        // With pictures: view_model too, with the picture limits.
+        let text = instructions_with(true, true, true);
+        let tools = section(&text, "TOOLS");
+        assert!(tools.contains("`view_model`"));
+        assert!(tools.contains(&format!(
+            "At most {MAX_PICTURES_PER_REQUEST} pictures per reply and {MAX_PICTURES_PER_RUN} in the run"
+        )));
+        // The section sits before the rules, after the speeds and feeds.
+        let at = |title: &str| text.find(&format!("\n{title}\n")).unwrap();
+        assert!(at("SPEEDS AND FEEDS") < at("TOOLS") && at("TOOLS") < at("RULES"));
+        // The holding rules name the tools that test a draft only with tools.
+        assert!(text.contains(holding_rules(true).trim_end()));
+        assert!(instructions_with(true, false, true).contains(holding_rules(false).trim_end()));
+        assert!(text.contains("`check_plan`") && !none.contains("`check_plan`"));
+    }
+    #[test]
+    fn a_null_holder_means_setup_1s_entry_or_no_modelled_holding() {
+        let text = instructions();
+        let holding = section(&text, "PLANNING THE HOLDING");
+        for needed in [
+            "whose `number` is given in the report's `workholding`",
+            "absent when setup 1 models no vise or clamps",
+            "null means the same holder as setup 1 when setup 1 has an entry",
+            "no modelled holding when it has none",
+        ] {
+            assert!(holding.contains(needed), "{needed}\n{holding}");
+        }
+        assert!(text.contains("with its `number` in `workholding_library`"));
+    }
+    #[tokio::test]
+    async fn the_report_names_setup_1s_library_number_in_its_workholding() {
+        use crate::proposal::tests::hold;
+        let (mut doc, mesh, _) = block();
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let script = Script::new(vec![json(&good(&report)), json(&good(&report))]);
+        let _ = plan(&script, doc.clone(), mesh.clone(), &Busy::default(), |_| {}).await;
+        let part = script.seen.lock().unwrap()[0][1].1.clone();
+        let sent: serde_json::Value = serde_json::from_str(&part).unwrap();
+        assert_eq!(sent["workholding"]["kind"], "Vise");
+        assert_eq!(sent["workholding"]["number"], 1);
+        assert_eq!(sent["workholding_library"][0]["number"], 1);
+        // Without holding on setup 1 there is no `workholding` and no number.
+        let (doc, mesh, report) = block();
+        let script = Script::new(vec![json(&good(&report)), json(&good(&report))]);
+        let _ = plan(&script, doc, mesh, &Busy::default(), |_| {}).await;
+        let sent: serde_json::Value =
+            serde_json::from_str(&script.seen.lock().unwrap()[0][1].1).unwrap();
+        assert!(sent.get("workholding").is_none());
+    }
+    #[test]
+    fn calls_and_outputs_of_any_tool_become_plain_text_once_the_tools_are_gone() {
+        let call = |id: &str, name: &str, arguments: &str| ToolCall {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
+        let conversation = vec![
+            Item::text(Role::User, "Part."),
+            Item::Call(call("a", look::NAME, "{\"angle\":\"top\"}")),
+            Item::Output {
+                call_id: "a".into(),
+                output: "Top view.".into(),
+            },
+            Item::Call(call("b", "cutting_data", "{\"tool\":3}")),
+            Item::Output {
+                call_id: "b".into(),
+                output: "{\"rpm\":1}".into(),
+            },
+        ];
+        let sent = outgoing(&conversation, true, true);
+        assert_eq!(sent, conversation, "calls stay while the tools are on");
+        let sent = outgoing(&conversation, true, false);
+        assert_eq!(
+            sent[1],
+            Item::text(
+                Role::Assistant,
+                "(Asked for a picture: {\"angle\":\"top\"})"
+            )
+        );
+        assert_eq!(
+            sent[2],
+            Item::text(Role::User, "(Picture tool answered: Top view.)")
+        );
+        assert_eq!(
+            sent[3],
+            Item::text(Role::Assistant, "(Called cutting_data: {\"tool\":3})")
+        );
+        assert_eq!(
+            sent[4],
+            Item::text(Role::User, "(cutting_data answered: {\"rpm\":1})")
+        );
     }
 }
