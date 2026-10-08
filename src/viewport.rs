@@ -171,6 +171,48 @@ impl Projector {
         p.scale = (size.0 * 0.86).min(size.1 * 0.82) / diameter * camera.zoom;
         p
     }
+    /// `fit` for a still picture: scaled and moved so that the box around
+    /// the projected corners of `boxes` is centred and fills `share` of the
+    /// frame's width or height. The 3D view keeps `fit`, so that orbiting
+    /// never changes its zoom.
+    pub(crate) fn filling(
+        camera: Camera,
+        size: (f32, f32),
+        boxes: &[crate::mesh::Bounds],
+        share: f32,
+    ) -> Self {
+        let mut all = boxes[0];
+        for b in &boxes[1..] {
+            all.min = std::array::from_fn(|k| all.min[k].min(b.min[k]));
+            all.max = std::array::from_fn(|k| all.max[k].max(b.max[k]));
+        }
+        let mut p = Self::fit(camera, size, all);
+        let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for b in boxes {
+            for corner in 0..8 {
+                let q = p.p(std::array::from_fn(|k| {
+                    if corner >> k & 1 == 1 {
+                        b.max[k]
+                    } else {
+                        b.min[k]
+                    }
+                }));
+                lo = [lo[0].min(q.x), lo[1].min(q.y)];
+                hi = [hi[0].max(q.x), hi[1].max(q.y)];
+            }
+        }
+        let k = (size.0 * share / (hi[0] - lo[0]).max(1.))
+            .min(size.1 * share / (hi[1] - lo[1]).max(1.));
+        // The box's middle goes to the frame's; every point keeps its offset
+        // from it, k times larger.
+        let middle = Point::new((lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.);
+        p.center = Point::new(
+            size.0 / 2. + (p.center.x - middle.x) * k,
+            size.1 / 2. + (p.center.y - middle.y) * k,
+        );
+        p.scale *= k;
+        p
+    }
     pub(crate) fn p(&self, v: [f32; 3]) -> Point {
         let [x, y, z] = std::array::from_fn(|i| v[i] - self.target[i]);
         let (s, c) = self.camera.yaw.sin_cos();
@@ -193,36 +235,39 @@ impl Viewport<'_> {
     /// What the camera must contain, in display units: the part, the stock,
     /// the jaws or clamps and, when simulating, the stock and every move.
     pub(crate) fn scene_bounds(&self) -> crate::mesh::Bounds {
-        let mut bounds = Placement::new(self.mesh, self.setup).bounds;
+        let mut boxes = self.scene_boxes().into_iter();
+        let mut bounds = boxes.next().expect("the part is always framed");
+        for b in boxes {
+            for i in 0..3 {
+                bounds.min[i] = bounds.min[i].min(b.min[i]);
+                bounds.max[i] = bounds.max[i].max(b.max[i]);
+            }
+        }
+        bounds
+    }
+    /// `scene_bounds` box by box: the part's first, then the stock's, each
+    /// jaw's or clamp's and, when simulating, the simulated stock's and the
+    /// reach of every move's cutter. Pictures fit to their projected corners.
+    pub(crate) fn scene_boxes(&self) -> Vec<crate::mesh::Bounds> {
+        let mut boxes = vec![Placement::new(self.mesh, self.setup).bounds];
         if self.show_stock
             && let Some(setup) = self.setup
             && let Ok(stock) = stock::resolve(setup, Some(self.mesh))
         {
-            let stock = stock.stock.scaled(stock.display_scale);
-            for i in 0..3 {
-                bounds.min[i] = bounds.min[i].min(stock.min[i]);
-                bounds.max[i] = bounds.max[i].max(stock.max[i]);
-            }
+            boxes.push(stock.stock.scaled(stock.display_scale));
         }
-        if !self.holding.is_empty() {
-            let scale = self.mesh.display_scale();
-            for hold in &self.holding {
-                let hold = hold.bounds.scaled(scale);
-                for i in 0..3 {
-                    bounds.min[i] = bounds.min[i].min(hold.min[i]);
-                    bounds.max[i] = bounds.max[i].max(hold.max[i]);
-                }
-            }
-        }
+        let scale = self.mesh.display_scale();
+        boxes.extend(self.holding.iter().map(|hold| hold.bounds.scaled(scale)));
         if let Some(sim) = self.simulation {
-            for k in 0..3 {
-                bounds.min[k] = bounds.min[k].min(sim.plan.stock.min[k] * sim.plan.display_scale);
-                bounds.max[k] = bounds.max[k].max(sim.plan.stock.max[k] * sim.plan.display_scale);
-            }
+            boxes.push(sim.plan.stock.scaled(sim.plan.display_scale));
             // Keep the whole cutter and motion inside a stable camera fit.
+            let mut reach = crate::mesh::Bounds {
+                min: [f32::INFINITY; 3],
+                max: [f32::NEG_INFINITY; 3],
+            };
             for point in sim.plan.moves.iter().flat_map(|m| [m.from, m.to]) {
                 for k in 0..3 {
-                    bounds.min[k] = bounds.min[k].min(
+                    reach.min[k] = reach.min[k].min(
                         (point[k]
                             - if k == 2 {
                                 0.
@@ -231,7 +276,7 @@ impl Viewport<'_> {
                             })
                             * sim.plan.display_scale,
                     );
-                    bounds.max[k] = bounds.max[k].max(
+                    reach.max[k] = reach.max[k].max(
                         (point[k]
                             + if k == 2 {
                                 sim.plan.tool_length + 8.
@@ -242,8 +287,11 @@ impl Viewport<'_> {
                     );
                 }
             }
+            if !sim.plan.moves.is_empty() {
+                boxes.push(reach);
+            }
         }
-        bounds
+        boxes
     }
     fn transformed(&self) -> Vec<Face> {
         let placement = Placement::new(self.mesh, self.setup);

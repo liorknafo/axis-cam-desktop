@@ -19,6 +19,11 @@ pub const NAME: &str = "view_model";
 pub const SIZE: u32 = 768;
 /// The strip along the bottom: the caption and the scale bar.
 const CAPTION: u32 = 44;
+/// The share of the picture's width or height, above the caption strip,
+/// that the box around what is framed fills.
+const FILL: f32 = 0.9;
+/// The corner box of the axis triad: no tag may cover it.
+const TRIAD: [i32; 4] = [0, 0, 86, 86];
 /// The most surfaces one list may name.
 const MAX_IDS: usize = 200;
 /// Each angle: name, words, yaw and pitch of `viewport::Camera`. The
@@ -259,9 +264,11 @@ impl View {
             progress: None,
             holding: holding.clone(),
         };
-        let bounds = focus_bounds(mesh, &setup, &args.focus_surfaces)
-            .unwrap_or_else(|| viewport.scene_bounds());
-        let projector = Projector::fit(camera, (SIZE as f32, (SIZE - CAPTION) as f32), bounds);
+        let boxes = focus_bounds(mesh, &setup, &args.focus_surfaces)
+            .map(|b| vec![b])
+            .unwrap_or_else(|| viewport.scene_boxes());
+        let frame = (SIZE as f32, (SIZE - CAPTION) as f32);
+        let projector = Projector::filling(camera, frame, &boxes, FILL);
         Ok(Self {
             setup,
             up,
@@ -310,7 +317,10 @@ fn focus_bounds(mesh: &Mesh, setup: &Setup, ids: &[usize]) -> Option<Bounds> {
 }
 /// The picture `args` ask for: the scene, the tags and the caption.
 fn render(scene: &Scene, args: &Args) -> Result<Picture, String> {
-    let view = View::new(scene, args)?;
+    Ok(paint(scene, args, &View::new(scene, args)?))
+}
+/// `view` drawn as `args` ask: the scene, the tags and the caption.
+fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
     let mesh = &scene.mesh;
     let job = scene.job.as_deref();
     let operation = view
@@ -335,21 +345,21 @@ fn render(scene: &Scene, args: &Args) -> Result<Picture, String> {
     let (rgba, depths) =
         viewport.render(&view.projector, (w, h), 1., None, &args.highlight_surfaces);
     let mut canvas = Canvas::over(&rgba, w, h, true);
-    draw_toolpaths(&mut canvas, &view, &depths);
+    draw_toolpaths(&mut canvas, view, &depths);
     // Tags go on before the caption strip is added, so none reaches into it.
     let tags = if args.labels {
-        draw_tags(&mut canvas, scene, &view, &depths)
+        draw_tags(&mut canvas, scene, view, &depths)
     } else {
         vec![]
     };
     canvas.rgb.resize((SIZE * SIZE * 3) as usize, 255);
     canvas.h = SIZE;
-    caption(&mut canvas, &view, mesh.display_scale());
-    Ok(Picture {
+    caption(&mut canvas, view, mesh.display_scale());
+    Picture {
         png: Arc::new(canvas.png()),
-        description: describe(&view, args, &tags),
+        description: describe(view, args, &tags),
         purpose: crate::proposal::clip(&args.purpose, 120),
-    })
+    }
 }
 /// The picture the `view_model` arguments ask for, or one sentence on why
 /// it cannot be drawn.
@@ -437,14 +447,15 @@ fn draw_toolpaths(canvas: &mut Canvas, view: &View, depths: &[f32]) {
 }
 /// The report's tags for the drawn orientation where their points can be
 /// seen: each plane's surface IDs, largest plane first, then the diameters
-/// of its holes at their centres. A tag that would overlap one already
-/// drawn is skipped. Returns the texts drawn, in order.
+/// of its holes at their centres. A tag that would leave the picture or
+/// overlap the triad's corner or a tag already drawn is skipped. Returns
+/// the texts drawn, in order.
 ///
 /// Unlike the design's "centre of its bbox", a plane's tag sits on the
 /// plane itself (`plane_anchors`): the centre of a plane around a pocket
 /// lies over the pocket, where its tag would float and hide the floor's.
-/// It goes at the first of its anchors that is in the picture, seen and
-/// clear of the tags already drawn.
+/// It goes at the first of its anchors where it is seen, inside the
+/// picture and clear of the triad and the tags already drawn (`spot`).
 fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) -> Vec<String> {
     let Some(o) = scene
         .report
@@ -491,31 +502,51 @@ fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) ->
             )
         })
     });
-    let (w, h) = (canvas.w as usize, canvas.h as usize);
-    let (mut drawn, mut texts): (Vec<[i32; 4]>, Vec<String>) = (vec![], vec![]);
+    let frame = (canvas.w as usize, canvas.h as usize);
+    // The triad is drawn later, over whatever is in its corner.
+    let mut drawn = vec![TRIAD];
+    let mut texts = vec![];
     for (points, text) in planes.chain(holes) {
-        let free = |&(x, y, z): &(f32, f32, f32)| {
-            if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
-                return false;
-            }
-            // The depths are those of the frame before it was flipped.
-            if z + 0.5 < depths[y as usize * w + (w - 1 - x as usize)] {
-                return false;
-            }
-            let rect = Canvas::tag_rect((x, y), &text);
-            !drawn
-                .iter()
-                .any(|r| r[0] < rect[2] && rect[0] < r[2] && r[1] < rect[3] && rect[1] < r[3])
-        };
-        let Some((x, y, _)) = points.iter().map(|p| view.screen(*p)).find(free) else {
+        let points = points.iter().map(|p| view.screen(*p));
+        let Some(at) = spot(points, &text, &drawn, frame, depths) else {
             continue;
         };
-        if let Some(rect) = canvas.tag((x, y), &text) {
+        if let Some(rect) = canvas.tag(at, &text) {
             drawn.push(rect);
             texts.push(text);
         }
     }
     texts
+}
+/// Where the tag reading `text` goes: the first of `points` (picture x, y
+/// and depth) that is in the `w` × `h` picture and not hidden behind what
+/// was drawn (`depths`, of the frame before it was flipped), and whose box
+/// lies inside the picture and clear of the `taken` boxes. None when no
+/// point will do.
+fn spot(
+    points: impl IntoIterator<Item = (f32, f32, f32)>,
+    text: &str,
+    taken: &[[i32; 4]],
+    (w, h): (usize, usize),
+    depths: &[f32],
+) -> Option<(f32, f32)> {
+    points
+        .into_iter()
+        .find(|&(x, y, z)| {
+            if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
+                return false;
+            }
+            if z + 0.5 < depths[y as usize * w + (w - 1 - x as usize)] {
+                return false;
+            }
+            let rect = Canvas::tag_rect((x, y), text);
+            let inside = rect[0] >= 0 && rect[1] >= 0 && rect[2] <= w as i32 && rect[3] <= h as i32;
+            inside
+                && !taken
+                    .iter()
+                    .any(|r| r[0] < rect[2] && rect[0] < r[2] && r[1] < rect[3] && rect[1] < r[3])
+        })
+        .map(|(x, y, _)| (x, y))
 }
 /// The most anchors a plane's tag tries.
 const ANCHORS: usize = 8;
@@ -564,7 +595,8 @@ fn up_words(view: &View) -> &'static str {
     view.up.unwrap_or("rotated setup")
 }
 /// The strip along the bottom (the view in words and a scale bar) and the
-/// axis triad in the top-left corner.
+/// axis triad in the top-left corner, inside `TRIAD`: 28 px axes from
+/// (40, 40) and their letters 9 px beyond.
 fn caption(canvas: &mut Canvas, view: &View, scale: f32) {
     let top = (SIZE - CAPTION) as i32;
     let size = SIZE as i32;
@@ -692,6 +724,134 @@ mod tests {
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         (info.width, info.height, buf)
+    }
+    /// The block with 36 mm of stock around it and a clamp on each side
+    /// in X, as setup 1's workholding.
+    fn clamped() -> Scene {
+        let (mut doc, mesh, _) = block();
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            doc.setups[0].p.insert(key.into(), "36".into());
+        }
+        crate::proposal::tests::hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        Scene {
+            doc: Arc::new(doc),
+            mesh,
+            report: Arc::new(report),
+            job: None,
+        }
+    }
+    /// The colour of a decoded picture's pixel at `(x, y)`.
+    fn pixel(rgb: &[u8], x: usize, y: usize) -> [u8; 3] {
+        let i = (y * SIZE as usize + x) * 3;
+        [rgb[i], rgb[i + 1], rgb[i + 2]]
+    }
+    #[test]
+    fn the_overview_fills_the_picture() {
+        for (name, s) in [("block", scene()), ("clamped", clamped())] {
+            // The overview's view without its tags, so only the scene counts;
+            // the triad's corner is left out too.
+            let picture = draw(&s, &args(serde_json::json!({"labels": false}))).unwrap();
+            assert!(
+                picture.description.contains("vise or clamps shown") == (name == "clamped"),
+                "{}",
+                picture.description
+            );
+            let (_, _, rgb) = decode(&picture.png);
+            let (w, h) = (SIZE as usize, (SIZE - CAPTION) as usize);
+            let (mut lo, mut hi) = ([usize::MAX; 2], [0; 2]);
+            for y in 0..h {
+                for x in 0..w {
+                    let triad = x < TRIAD[2] as usize && y < TRIAD[3] as usize;
+                    if !triad && pixel(&rgb, x, y) != [239, 243, 247] {
+                        lo = [lo[0].min(x), lo[1].min(y)];
+                        hi = [hi[0].max(x), hi[1].max(y)];
+                    }
+                }
+            }
+            let across = (hi[0] + 1 - lo[0]) as f32 / w as f32;
+            let down = (hi[1] + 1 - lo[1]) as f32 / h as f32;
+            assert!(
+                across >= 0.8 || down >= 0.8,
+                "{name}: the scene spans {across:.2} of the width and {down:.2} of the height"
+            );
+            // Inside the picture, with a margin on every side.
+            assert!(
+                lo[0] > 10 && lo[1] > 10 && hi[0] < w - 10 && hi[1] < h - 10,
+                "{name}: {lo:?} {hi:?}"
+            );
+        }
+    }
+    #[test]
+    fn no_tag_covers_the_triad() {
+        let s = scene();
+        let args = Args::parse(&args(serde_json::json!({}))).unwrap();
+        let mut view = View::new(&s, &args).unwrap();
+        // The part drawn small around the triad's centre (the frame is
+        // flipped after drawing), so that every tag's point is near it.
+        // The overview's angle, isometric front-left.
+        let (_, _, yaw, pitch) = ANGLES[5];
+        let camera = Camera {
+            yaw,
+            pitch,
+            zoom: 1.,
+            pan: [0., 0.],
+        };
+        let part = Placement::new(&s.mesh, Some(&view.setup)).bounds;
+        let corner = (2. * SIZE as f32 - 80., 80.);
+        view.projector = Projector::filling(camera, corner, &[part], 0.9);
+        let (x, y, _) = view.screen(std::array::from_fn(|k| (part.min[k] + part.max[k]) / 2.));
+        assert!(
+            (35. ..45.).contains(&x) && (35. ..45.).contains(&y),
+            "{x} {y}"
+        );
+        let picture = paint(&s, &args, &view);
+        // Tags are white boxes; nothing else above the caption strip is
+        // pure white.
+        let (_, _, rgb) = decode(&picture.png);
+        let covered = (0..TRIAD[3] as usize)
+            .flat_map(|y| (0..TRIAD[2] as usize).map(move |x| (x, y)))
+            .find(|&(x, y)| pixel(&rgb, x, y) == [255, 255, 255]);
+        assert_eq!(covered, None, "{}", picture.description);
+    }
+    #[test]
+    fn a_tag_goes_to_its_next_point_rather_than_cover_the_triad_or_leave_the_picture() {
+        let frame = (SIZE as usize, (SIZE - CAPTION) as usize);
+        let depths = vec![f32::NEG_INFINITY; frame.0 * frame.1];
+        let spot = |points: &[(f32, f32, f32)], taken: &[[i32; 4]]| {
+            spot(
+                points.iter().copied(),
+                "2562,2563,2566…",
+                taken,
+                frame,
+                &depths,
+            )
+        };
+        let inside = (400., 300., 0.);
+        // Inside the picture, but over the triad's corner.
+        let corner = (120., 60., 0.);
+        assert_eq!(spot(&[corner], &[]), Some((120., 60.)));
+        assert_eq!(spot(&[corner, inside], &[TRIAD]), Some((400., 300.)));
+        // Its point in the picture, its box not: at each edge.
+        for edge in [
+            (20., 300., 0.),
+            (750., 300., 0.),
+            (400., 5., 0.),
+            (400., 720., 0.),
+        ] {
+            assert_eq!(spot(&[edge, inside], &[]), Some((400., 300.)), "{edge:?}");
+        }
+        // Over a tag already drawn, or with no point left.
+        let drawn = Canvas::tag_rect((400., 300.), "12");
+        assert_eq!(spot(&[inside], &[drawn]), None);
+        assert_eq!(spot(&[(600., 500., 0.)], &[drawn]), Some((600., 500.)));
+        // Hidden behind what was drawn nearer.
+        let mut near = depths.clone();
+        near[300 * frame.0 + (frame.0 - 1 - 400)] = 10.;
+        assert_eq!(
+            super::spot([inside, (600., 500., 0.)], "12", &[], frame, &near),
+            Some((600., 500.))
+        );
     }
     #[test]
     fn the_tool_requires_every_argument_the_views_take() {
@@ -833,9 +993,12 @@ mod tests {
             ),
         )
         .unwrap();
+        // The whole part fills the picture already and the floor is most of
+        // its top, so it gains about 1.8 times the pixels.
+        let (near_px, whole_px) = (tinted(&near.png), tinted(&marked.png));
         assert!(
-            tinted(&near.png) > tinted(&marked.png) * 2,
-            "the focused surface fills more of the picture"
+            near_px * 2 > whole_px * 3,
+            "the focused surface fills more of the picture: {near_px} against {whole_px}"
         );
         assert!(
             near.description.contains("zoomed on "),
