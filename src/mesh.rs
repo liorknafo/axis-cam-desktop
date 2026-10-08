@@ -1,5 +1,9 @@
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
@@ -39,6 +43,23 @@ pub struct Face {
 }
 /// How many angle sets `Mesh::rotated_bounds` keeps.
 const ROTATED_BOUNDS_KEPT: usize = 8;
+/// The bounds `Mesh::rotated_bounds` worked out, by angle set. Behind a lock,
+/// so a mesh can be shared between threads (`Arc<Mesh>`); a copy of the mesh
+/// starts with a copy of them.
+#[derive(Debug, Default)]
+struct Kept(Mutex<Vec<([f32; 3], Bounds)>>);
+impl Kept {
+    /// The kept bounds, also after a thread panicked while holding them:
+    /// whatever it left is a list of correct bounds.
+    fn lock(&self) -> MutexGuard<'_, Vec<([f32; 3], Bounds)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+impl Clone for Kept {
+    fn clone(&self) -> Self {
+        Self(Mutex::new(self.lock().clone()))
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Mesh {
     pub faces: Vec<Face>,
@@ -50,7 +71,7 @@ pub struct Mesh {
     pub units: &'static str,
     /// Display-space position of the source file's (0,0,0).
     pub origin: [f32; 3],
-    rotated_bounds: RefCell<Vec<([f32; 3], Bounds)>>,
+    rotated_bounds: Kept,
 }
 impl Mesh {
     /// The preview normalization is uniform; use the same factor for mm stock.
@@ -62,7 +83,7 @@ impl Mesh {
     pub fn rotated_bounds(&self, angles: [f32; 3]) -> Bounds {
         if let Some((_, bounds)) = self
             .rotated_bounds
-            .borrow()
+            .lock()
             .iter()
             .find(|(a, _)| *a == angles)
         {
@@ -79,7 +100,7 @@ impl Mesh {
                 bounds.max[i] = bounds.max[i].max(v);
             }
         }
-        let mut kept = self.rotated_bounds.borrow_mut();
+        let mut kept = self.rotated_bounds.lock();
         if kept.len() == ROTATED_BOUNDS_KEPT {
             kept.remove(0);
         }
@@ -271,7 +292,7 @@ pub(crate) fn normalize(tris: Vec<[[f32; 3]; 3]>) -> Result<Mesh, String> {
         sampled: false,
         units: "source units",
         origin,
-        rotated_bounds: RefCell::new(vec![]),
+        rotated_bounds: Kept::default(),
     })
 }
 pub fn sample() -> Mesh {
@@ -305,7 +326,7 @@ pub fn sample() -> Mesh {
         sampled: false,
         units: "mm",
         origin: [0., 0., 0.],
-        rotated_bounds: RefCell::new(vec![]),
+        rotated_bounds: Kept::default(),
     }
 }
 fn box_faces(out: &mut Vec<Face>, a: [f32; 3], b: [f32; 3], feature: Option<usize>, tone: f32) {
@@ -526,7 +547,7 @@ mod tests {
             }
         }
         assert_ne!(fresh(a), fresh(b));
-        assert_eq!(mesh.rotated_bounds.borrow().len(), 2);
+        assert_eq!(mesh.rotated_bounds.lock().len(), 2);
         // More angle sets than the cache holds: the oldest go, the answers
         // stay right, and an angle set that was dropped is worked out again.
         let many: Vec<[f32; 3]> = (0..20)
@@ -534,7 +555,7 @@ mod tests {
             .collect();
         for angles in many.iter().chain(&many).chain([&a, &b]) {
             assert_eq!(mesh.rotated_bounds(*angles), fresh(*angles), "{angles:?}");
-            assert!(mesh.rotated_bounds.borrow().len() <= 8);
+            assert!(mesh.rotated_bounds.lock().len() <= 8);
         }
     }
     #[test]

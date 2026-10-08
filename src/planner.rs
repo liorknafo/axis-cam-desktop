@@ -301,6 +301,7 @@ WORKHOLDING
 - List every feature you cannot machine with these tools and strategies in `unmachined`, with the reason. Do not leave it out silently, and do not add an operation that cannot work.
 - Put risks the operator should know about in `warnings`.
 - In the check report, `covered_other` lists the remaining surface by `facing` (+X, -X, +Y, -Y, top, bottom), named in setup 1's frame, which can differ from the orientation names when setup 1 is rotated.
+- In the check report, `stocks` gives the stock each setup starts from, in that setup's axes: its `size`, its box from the model's -X/-Y/bottom corner (`box_from_part_corner`), how much the earlier setups `removed` whole from each side, and `by` which operations.
 - Reply with the JSON proposal only.")
 }
 fn feedback(check: &CheckReport) -> String {
@@ -537,7 +538,7 @@ fn name(text: &str) -> String {
 /// The model's free text, cleaned and bounded once, before anything keeps or
 /// shows it, and before the check builds the job from it. Returns how many
 /// warnings and unmachined entries were left out.
-fn tidy(mut p: Proposal) -> (Proposal, usize, usize) {
+pub(crate) fn tidy(mut p: Proposal) -> (Proposal, usize, usize) {
     use proposal::clip;
     p.summary = clip(&p.summary, 600);
     let more_warnings = p.warnings.len().saturating_sub(12);
@@ -647,7 +648,7 @@ fn bounded(mut problems: Vec<Problem>) -> Vec<Problem> {
 }
 /// The proposal without what models sometimes put around it: a Markdown
 /// code fence, or sentences before or after the outermost braces.
-fn json_object(text: &str) -> &str {
+pub(crate) fn json_object(text: &str) -> &str {
     match (text.find('{'), text.rfind('}')) {
         (Some(start), Some(end)) if start < end => &text[start..=end],
         _ => text,
@@ -801,20 +802,24 @@ async fn ask(
         }
         let mut pictures = vec![];
         for call in reply.calls {
-            // The tool works on a copy, so a call that panics leaves the run's
-            // state as it was; a view that cannot be drawn counts against the
-            // picture limits (see `planner_tools::answer`).
+            // The tool works on a copy of the state (which shares the part
+            // and the drafts), and a call that panics is caught there: the
+            // copy comes back as the tool left it, so a draft check or a view
+            // counts against its limits even when it fails (see
+            // `planner_tools::answer`).
             let (name, arguments, mut copy) =
                 (call.name.clone(), call.arguments.clone(), state.clone());
             let answer = blocking(busy, move || {
-                let answer = planner_tools::answer(&name, &arguments, &mut copy);
-                (answer, copy)
+                let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    planner_tools::answer(&name, &arguments, &mut copy)
+                }));
+                (answer.ok(), copy)
             })
             .await;
             let answer = match answer {
                 Ok((answer, copy)) => {
                     *state = copy;
-                    answer
+                    answer.unwrap_or_else(|| planner_tools::crashed(&call.name))
                 }
                 Err(_) => planner_tools::crashed(&call.name),
             };
@@ -874,13 +879,17 @@ pub async fn plan(
         busy,
         progress,
         analysis::report,
-        plan_check::evaluate,
+        plan_check::evaluate_full,
     )
     .await
 }
+/// What the plan check of `plan_with` returns: the report, the job it
+/// built and what the planner's tools read of it (`plan_check::evaluate_full`).
+type Checking = (CheckReport, Option<Document>, Option<plan_check::Checked>);
 /// `plan` with its two blocking stages given: the part report (`analyze`)
-/// and the plan check (`check`). Tests use it to hold a stage while it runs,
-/// or to make a check fail to run.
+/// and the plan check (`check`, which also returns what the planner's tools
+/// read of the checked job). Tests use it to hold a stage while it runs, or
+/// to make a check fail to run.
 async fn plan_with<A, C>(
     backend: &(impl Backend + Sync),
     doc: Document,
@@ -892,10 +901,7 @@ async fn plan_with<A, C>(
 ) -> Result<Outcome, Failure>
 where
     A: FnOnce(&Document, &Mesh) -> Result<PartReport, String> + Send + 'static,
-    C: Fn(&Document, &Mesh, &PartReport, &Proposal) -> (CheckReport, Option<Document>)
-        + Clone
-        + Send
-        + 'static,
+    C: Fn(&Document, &Mesh, &PartReport, &Proposal) -> Checking + Clone + Send + 'static,
 {
     let real = doc;
     let doc = anonymized(&real);
@@ -923,7 +929,7 @@ where
     let mut conversation = vec![Item::text(Role::User, part)];
     let mut state = ToolState::new(look::Scene {
         doc: Arc::new(doc.clone()),
-        mesh: mesh.clone(),
+        mesh: Arc::new(mesh.clone()),
         report: Arc::new(report.clone()),
         job: None,
     });
@@ -1024,7 +1030,7 @@ where
             check.clone(),
         );
         let checked = blocking(busy, move || check(&doc, &mesh, &part, &candidate)).await;
-        let (check, job) = match checked {
+        let (check, job, checked) = match checked {
             Ok(checked) => checked,
             // A check that could not run says nothing against a plan in hand.
             Err(_) if best.is_some() => break,
@@ -1037,8 +1043,10 @@ where
                 ));
             }
         };
-        // Operation views draw this proposal's job, passed or not.
+        // This answer is the latest draft now, passed or not: operation
+        // views draw its job, and `stock_after` and `check_holding` read it.
         state.scene.job = job.clone().map(Arc::new);
+        state.checked = checked.map(Arc::new);
         progress(Event::Checked(request, StepResult::of(&check)));
         let next = feedback(&check);
         if let (true, Some(mut job)) = (check.passed, job) {
@@ -1285,6 +1293,14 @@ pub(crate) mod tests {
             self.pictures
         }
     }
+    /// The tools offered with or without pictures, in order.
+    const PART_TOOLS: [&str; 5] = [
+        "check_plan",
+        "stock_after",
+        "check_holding",
+        "cutting_data",
+        "surface_info",
+    ];
     fn json(proposal: &Proposal) -> Result<String, ApiError> {
         Ok(serde_json::to_string(proposal).unwrap())
     }
@@ -2183,8 +2199,9 @@ pub(crate) mod tests {
                     coverage: None,
                     total_minutes: 0.,
                     zeros: vec![],
+                    stocks: vec![],
                 };
-                (report, None)
+                (report, None, None)
             },
         )
         .await
@@ -2228,8 +2245,9 @@ pub(crate) mod tests {
                     coverage: None,
                     total_minutes: 0.,
                     zeros: vec![],
+                    stocks: vec![],
                 };
-                (report, None)
+                (report, None, None)
             },
         )
         .await;
@@ -2255,9 +2273,10 @@ pub(crate) mod tests {
         mesh: &Mesh,
         report: &PartReport,
         proposal: &Proposal,
-    ) -> (CheckReport, Option<Document>) {
+    ) -> (CheckReport, Option<Document>, Option<plan_check::Checked>) {
         assert_ne!(proposal.summary, "boom", "the check fails to run");
-        plan_check::check(doc, mesh, report, proposal)
+        let (report, job) = plan_check::check(doc, mesh, report, proposal);
+        (report, job, None)
     }
     fn boom(report: &PartReport) -> Proposal {
         Proposal {
@@ -3266,7 +3285,8 @@ pub(crate) mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, [crate::look::NAME, "cutting_data", "surface_info"]);
+        assert_eq!(names[0], crate::look::NAME);
+        assert_eq!(names[1..], PART_TOOLS);
         assert_eq!(offered["tool_choice"], "none");
         let first = sent[0].json();
         assert_eq!(first["model"], "gpt-6.1-sol");
@@ -3445,8 +3465,9 @@ pub(crate) mod tests {
                     coverage: None,
                     total_minutes: 0.,
                     zeros: vec![],
+                    stocks: vec![],
                 };
-                (nothing, None)
+                (nothing, None, None)
             },
         );
         drop_while_held(run, &gate, &busy).await;
@@ -3467,7 +3488,7 @@ pub(crate) mod tests {
                 held.hold();
                 Err("held".into())
             },
-            plan_check::check,
+            plan_check::evaluate_full,
         );
         drop_while_held(run, &gate, &busy).await;
         assert!(
@@ -3830,7 +3851,7 @@ pub(crate) mod tests {
         };
         let mut state = ToolState::new(look::Scene {
             doc: Arc::new(doc),
-            mesh,
+            mesh: Arc::new(mesh),
             report: Arc::new(report.clone()),
             job: None,
         });
@@ -4055,7 +4076,7 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|names| names == &["cutting_data", "surface_info"])
+                .all(|names| names == &PART_TOOLS)
         );
         assert_eq!(turns[0].0.len(), 2, "system and part report only");
         let system = turns[0].0[0].as_text().unwrap().1;
@@ -4240,7 +4261,7 @@ pub(crate) mod tests {
         assert_eq!(drops, vec![(1, Dropped::Tool)]);
         {
             let offered = script.offered.lock().unwrap();
-            assert_eq!(offered[0], ["cutting_data", "surface_info"]);
+            assert_eq!(offered[0], PART_TOOLS);
             assert!(
                 offered[1..].iter().all(|names| names.is_empty()),
                 "{offered:?}"
@@ -4271,7 +4292,8 @@ pub(crate) mod tests {
                 .any(|e| matches!(e, Event::Dropped(_, Dropped::Pictures)))
         );
         let offered = script.offered.lock().unwrap();
-        assert_eq!(offered[0], [look::NAME, "cutting_data", "surface_info"]);
+        assert_eq!(offered[0][0], look::NAME);
+        assert_eq!(offered[0][1..], PART_TOOLS);
         assert!(
             offered[1..].iter().all(|names| names.is_empty()),
             "{offered:?}"
@@ -4324,6 +4346,11 @@ pub(crate) mod tests {
         assert!(!text.contains("view_model") && !text.contains("PICTURES"));
         assert!(tools.contains(&format!("at most {MAX_TOOL_ROUNDS} rounds")));
         assert!(tools.contains("No limit"));
+        let checks = format!(
+            "At most {} per reply and {} in the run",
+            planner_tools::MAX_CHECKS_PER_REQUEST,
+            planner_tools::MAX_CHECKS_PER_RUN
+        );
         for needed in [
             "`tool`",
             "feed range",
@@ -4332,9 +4359,25 @@ pub(crate) mod tests {
             "`surface_area`",
             "`mean_normal`",
             "setup 1's frame",
+            "- `check_plan` (`proposal`",
+            "- `stock_after` (`setup`",
+            "- `check_holding` (`setup`",
+            "`holder`",
+            "`stocks`",
+            "`box_from_part_corner`",
+            "`removed`",
+            "`by`",
+            "`holds`",
+            "`problems`",
+            "latest draft",
+            checks.as_str(),
         ] {
             assert!(tools.contains(needed), "{needed}\n{tools}");
         }
+        // Each tool on its line, in the order they are offered.
+        let at = |name: &str| tools.find(&format!("- `{name}`")).unwrap();
+        assert!(at("check_plan") < at("stock_after") && at("stock_after") < at("check_holding"));
+        assert!(at("check_holding") < at("cutting_data"));
         // With pictures: view_model too, with the picture limits.
         let text = instructions_with(true, true, true);
         let tools = section(&text, "TOOLS");
@@ -4349,6 +4392,12 @@ pub(crate) mod tests {
         assert!(text.contains(holding_rules(true).trim_end()));
         assert!(instructions_with(true, false, true).contains(holding_rules(false).trim_end()));
         assert!(text.contains("`check_plan`") && !none.contains("`check_plan`"));
+        // The check report's stocks are explained with or without tools.
+        let rules = section(&instructions(), "RULES");
+        assert!(
+            rules.contains("`stocks` gives the stock each setup starts from"),
+            "{rules}"
+        );
     }
     #[test]
     fn a_null_holder_means_setup_1s_entry_or_no_modelled_holding() {
@@ -4384,6 +4433,115 @@ pub(crate) mod tests {
         let sent: serde_json::Value =
             serde_json::from_str(&script.seen.lock().unwrap()[0][1].1).unwrap();
         assert!(sent.get("workholding").is_none());
+    }
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            call_id: id.into(),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+    #[tokio::test]
+    async fn the_planners_own_check_of_an_answer_becomes_the_latest_draft_for_the_tools() {
+        let (mut doc, mesh, _) = block();
+        doc.adopt_holders();
+        for holder in &mut doc.workholding {
+            holder.p.insert("name".into(), "ZZ-SECRET-HOLDER".into());
+            holder.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        }
+        doc.title = "ZZ-SECRET-TITLE".into();
+        doc.setups[0]
+            .p
+            .insert("name".into(), "ZZ-SECRET-SETUP".into());
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let mut bad = good(&report);
+        bad.setups[0].operations[0].tool = 9;
+        let no_draft = "Check a draft with check_plan first, or answer with a proposal.";
+        let script = Script::calling(vec![
+            // Checked by the planner: it passes, with faces still covered.
+            text(&good(&report)),
+            // The tools read the answer the planner checked.
+            calls(vec![
+                tool_call("a", "stock_after", serde_json::json!({"setup": 2})),
+                tool_call(
+                    "b",
+                    "check_holding",
+                    serde_json::json!({"setup": 2, "holder": 2}),
+                ),
+            ]),
+            // A draft that does not build is the latest draft now.
+            calls(vec![tool_call(
+                "c",
+                "check_plan",
+                serde_json::json!({ "proposal": bad }),
+            )]),
+            calls(vec![tool_call(
+                "d",
+                "stock_after",
+                serde_json::json!({"setup": 2}),
+            )]),
+            Ok(Reply {
+                text: "Not a plan.".into(),
+                structured: true,
+                calls: vec![],
+            }),
+        ]);
+        let mut events = vec![];
+        let outcome = plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        assert_eq!((outcome.requests, outcome.chosen), (2, 1));
+        // The feedback on the answer carries the stock before each setup.
+        let seen = script.seen.lock().unwrap();
+        assert!(seen[1][3].1.contains("\"stocks\":[{\"setup\":1,"));
+        let turns = script.turns.lock().unwrap();
+        let outputs: Vec<(&str, &str)> = turns
+            .last()
+            .unwrap()
+            .0
+            .iter()
+            .filter_map(|item| match item {
+                Item::Output { call_id, output } => Some((call_id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 4);
+        assert_eq!(
+            outputs[0],
+            (
+                "a",
+                serde_json::to_string(&outcome.check.stocks[1])
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        let held: serde_json::Value = serde_json::from_str(outputs[1].1).unwrap();
+        assert_eq!(held["holds"], true, "{held}");
+        let checked: serde_json::Value = serde_json::from_str(outputs[2].1).unwrap();
+        assert_eq!(checked["passed"], false);
+        assert_eq!(outputs[3], ("d", no_draft));
+        // One line each under request 2.
+        let lines: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Looked(2, look) => Some(look.description.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[0],
+            "Stock before setup 2: 124 × 84 × 43 mm; bottom cut 4 mm by setup 1"
+        );
+        assert!(
+            lines[1].starts_with("Clamp 2 for setup 2: holds (clamps on "),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(lines[2..], ["Checked a draft: 1 problem", no_draft]);
+        // No title, setup name, entry name or note in what the tools said.
+        let said = format!("{outputs:?} {lines:?}");
+        assert!(!said.contains("ZZ-SECRET"), "{said}");
     }
     #[test]
     fn calls_and_outputs_of_any_tool_become_plain_text_once_the_tools_are_gone() {

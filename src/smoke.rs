@@ -928,7 +928,7 @@ impl App {
         let report = crate::analysis::report(&self.doc, &mesh).expect("part report");
         crate::look::Scene {
             doc: std::sync::Arc::new(self.doc.clone()),
-            mesh,
+            mesh: std::sync::Arc::new(mesh),
             report: std::sync::Arc::new(report),
             job: None,
         }
@@ -7460,6 +7460,13 @@ mod tests {
                     .map(|t| t["name"].as_str().unwrap().to_string())
                     .collect()
             };
+            let part = [
+                "check_plan",
+                "stock_after",
+                "check_holding",
+                "cutting_data",
+                "surface_info",
+            ];
             if off {
                 // The part tools need no pictures: offered, without view_model.
                 assert_eq!(
@@ -7467,10 +7474,7 @@ mod tests {
                     (sent.len(), 0),
                     "pictures off: the tools, no picture"
                 );
-                assert!(
-                    sent.iter()
-                        .all(|r| names(r) == ["cutting_data", "surface_info"])
-                );
+                assert!(sent.iter().all(|r| names(r) == part));
                 assert!(sent.iter().all(|r| !r.body.contains("PICTURES")));
                 assert!(sent.iter().all(|r| !r.body.contains("view_model")));
             } else {
@@ -7481,7 +7485,7 @@ mod tests {
                 );
                 assert!(
                     sent.iter()
-                        .all(|r| { names(r) == ["view_model", "cutting_data", "surface_info"] })
+                        .all(|r| names(r)[0] == "view_model" && names(r)[1..] == part)
                 );
             }
         }

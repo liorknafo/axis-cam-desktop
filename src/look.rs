@@ -59,9 +59,9 @@ const ANGLES: [(&str, &str, f32, f32); 9] = [
 #[derive(Clone)]
 pub struct Scene {
     pub doc: Arc<Document>,
-    /// Owned: `Mesh` caches through a `RefCell`, so an `Arc<Mesh>` could
-    /// not move between threads.
-    pub mesh: Mesh,
+    /// Shared: a copy of the scene, as each planner tool call takes, does
+    /// not copy the part.
+    pub mesh: Arc<Mesh>,
     pub report: Arc<PartReport>,
     /// The latest proposal's built job, for `operation` views.
     pub job: Option<Arc<Document>>,
@@ -702,7 +702,7 @@ mod tests {
         let (doc, mesh, report) = block();
         Scene {
             doc: Arc::new(doc),
-            mesh,
+            mesh: Arc::new(mesh),
             report: Arc::new(report),
             job: None,
         }
@@ -736,7 +736,7 @@ mod tests {
         let report = crate::analysis::report(&doc, &mesh).unwrap();
         Scene {
             doc: Arc::new(doc),
-            mesh,
+            mesh: Arc::new(mesh),
             report: Arc::new(report),
             job: None,
         }

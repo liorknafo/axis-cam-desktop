@@ -12,9 +12,11 @@ use crate::{
     model::{Document, get},
     proposal::{self, Problem, Proposal},
     simulation::{Motion, Plan, Simulation},
-    volume::Volume,
+    stock::Placement,
+    volume::{Frame, Volume},
 };
 use serde::Serialize;
+use std::{cell::RefCell, sync::Arc};
 
 /// Removed part cells below this count are grid noise, not a gouge.
 const GOUGE_CELLS: usize = 3;
@@ -26,6 +28,10 @@ pub struct CheckReport {
     pub operations: Vec<OpResult>,
     pub coverage: Option<Coverage>,
     pub total_minutes: f32,
+    /// The stock before each setup, as far as the simulation got: none after
+    /// an operation that could not be generated, nor when the job was not
+    /// built.
+    pub stocks: Vec<StockSummary>,
     /// Per setup, for a Model-origin zero that passed the export stage: the
     /// part's box and the stock top in work coordinates (mm), which locate it
     /// on the preview; the stock top is None when an earlier setup has cut it
@@ -65,6 +71,209 @@ pub struct CoveredSide {
     pub facing: &'static str,
     pub area: f32,
     pub covered_percent: f32,
+}
+/// The stock a setup starts from, as the check report and the planner's
+/// `stock_after` tell it. Lengths in mm, in that setup's axes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StockSummary {
+    /// Counted from 1.
+    pub setup: usize,
+    pub size: [f32; 3],
+    /// x0, y0, z0, x1, y1, z1 from the model's -X/-Y/bottom corner.
+    pub box_from_part_corner: [f32; 6],
+    /// What the earlier setups took whole off each side of the original block.
+    pub removed: Sides,
+    /// The earlier operations whose cuts took those layers, the most first:
+    /// `setup 1, operation 3 (Contour "Outside")`.
+    pub by: Vec<String>,
+    /// For each side, in `SIDES` order, the setups (from 1) whose
+    /// operations took it; the timeline's line names them.
+    #[serde(skip)]
+    pub cut_by: [Vec<usize>; 6],
+}
+/// A length for each side of a setup's stock, in mm.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Sides {
+    pub top: f32,
+    pub bottom: f32,
+    #[serde(rename = "-X")]
+    pub minus_x: f32,
+    #[serde(rename = "+X")]
+    pub plus_x: f32,
+    #[serde(rename = "-Y")]
+    pub minus_y: f32,
+    #[serde(rename = "+Y")]
+    pub plus_y: f32,
+}
+impl Sides {
+    /// In `SIDES` order.
+    fn of(values: [f32; 6]) -> Self {
+        let [top, bottom, minus_x, plus_x, minus_y, plus_y] = values;
+        Self {
+            top,
+            bottom,
+            minus_x,
+            plus_x,
+            minus_y,
+            plus_y,
+        }
+    }
+    fn values(self) -> [f32; 6] {
+        [
+            self.top,
+            self.bottom,
+            self.minus_x,
+            self.plus_x,
+            self.minus_y,
+            self.plus_y,
+        ]
+    }
+}
+/// The sides of a setup's stock: the axis, whether it is the plus end, and
+/// its name.
+const SIDES: [(usize, bool, &str); 6] = [
+    (2, true, "top"),
+    (2, false, "bottom"),
+    (0, false, "-X"),
+    (0, true, "+X"),
+    (1, false, "-Y"),
+    (1, true, "+Y"),
+];
+/// `value` to two decimals, never -0.
+pub(crate) fn hundredths(value: f32) -> f32 {
+    (value * 100.).round() / 100. + 0.
+}
+/// `value` without trailing zeros, to two decimals: 12, 7.5, 0.25.
+pub(crate) fn plain(value: f32) -> String {
+    format!("{value:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+impl StockSummary {
+    /// The timeline's line: "Stock before setup 2: 124 × 84 × 43 mm; bottom
+    /// cut 4 mm by setup 1".
+    pub fn line(&self) -> String {
+        let [x, y, z] = self.size.map(plain);
+        let mut line = format!("Stock before setup {}: {x} × {y} × {z} mm", self.setup);
+        for (k, removed) in self.removed.values().into_iter().enumerate() {
+            if removed <= 0. {
+                continue;
+            }
+            line += &format!("; {} cut {} mm", SIDES[k].2, plain(removed));
+            let setups: Vec<String> = self.cut_by[k].iter().map(usize::to_string).collect();
+            line += &match setups.split_last() {
+                None => String::new(),
+                Some((only, [])) => format!(" by setup {only}"),
+                Some((last, rest)) => format!(" by setups {} and {last}", rest.join(", ")),
+            };
+        }
+        line
+    }
+}
+/// One setup of a checked job, as the planner's tools read it.
+pub struct CheckedSetup {
+    /// The box the setup starts from (mm, in its frame): setup 1's stock, or
+    /// what the earlier setups left of it (`simulation::leftover_box`).
+    pub stock: Bounds,
+    pub frame: Frame,
+    /// The part's bounds in that frame, mm.
+    pub part: Bounds,
+    /// The stock the earlier setups left, cells and cuts; None for setup 1
+    /// and when nothing before it was cut.
+    pub before: Option<Arc<Volume>>,
+    /// The setup's generated toolpaths.
+    pub plans: Vec<Plan>,
+    pub summary: StockSummary,
+}
+/// What a checked proposal leaves for the planner's tools: the job, with the
+/// layouts suggested for its later setups, and each setup whose starting
+/// stock the simulation knew, in order (up to an operation that could not be
+/// generated).
+pub struct Checked {
+    pub job: Arc<Document>,
+    pub setups: Vec<CheckedSetup>,
+}
+/// The `StockSummary` of setup `si` (from 0) of `job`, which starts from
+/// `stock`, the part's bounds being `part` (both mm, in the setup's `frame`),
+/// and the stock the earlier setups left `before` (None when nothing was
+/// cut: the original block is `stock` then). A side the box lost is sampled
+/// half-way into the lost layer, 6 × 6 points over the box's face, for the
+/// operations whose cuts removed them (`rest::Removed::by`).
+pub(crate) fn stock_summary(
+    job: &Document,
+    si: usize,
+    stock: Bounds,
+    part: Bounds,
+    frame: Frame,
+    before: Option<&Volume>,
+) -> StockSummary {
+    let original = before.map_or(stock, |v| v.transformed_bounds(frame));
+    let removed = before.map(|v| crate::rest::Removed::new(v, frame));
+    let mut lost = [0f32; 6];
+    let mut counts: Vec<((u16, u16), usize)> = vec![];
+    let mut cut_by: [Vec<usize>; 6] = Default::default();
+    // Six values over `lo..hi`, the ends inset by 1 % of the span.
+    let spread = |lo: f32, hi: f32| {
+        let inset = (hi - lo) * 0.01;
+        (0..6).map(move |i| lo + inset + (hi - lo - 2. * inset) * i as f32 / 5.)
+    };
+    for (k, &(axis, plus, _)) in SIDES.iter().enumerate() {
+        let depth = if plus {
+            original.max[axis] - stock.max[axis]
+        } else {
+            stock.min[axis] - original.min[axis]
+        };
+        lost[k] = hundredths(depth.max(0.));
+        let Some(removed) = removed.as_ref().filter(|_| lost[k] > 0.) else {
+            continue;
+        };
+        let at = if plus {
+            (stock.max[axis] + original.max[axis]) / 2.
+        } else {
+            (stock.min[axis] + original.min[axis]) / 2.
+        };
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        for a in spread(stock.min[u], stock.max[u]) {
+            for b in spread(stock.min[v], stock.max[v]) {
+                let mut p = [0.; 3];
+                (p[axis], p[u], p[v]) = (at, a, b);
+                let Some(source) = removed.by(p) else {
+                    continue;
+                };
+                match counts.iter_mut().find(|(s, _)| *s == source) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((source, 1)),
+                }
+                let setup = usize::from(source.0) + 1;
+                if !cut_by[k].contains(&setup) {
+                    cut_by[k].push(setup);
+                }
+            }
+        }
+        cut_by[k].sort_unstable();
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let by = counts
+        .iter()
+        .map(|&((s, o), _)| {
+            let numbered = format!("setup {}, operation {}", s + 1, o + 1);
+            match holding::operation_name(job, s, o) {
+                name if name.is_empty() => numbered,
+                name => format!("{numbered} ({name})"),
+            }
+        })
+        .collect();
+    let corner = |p: [f32; 3]| std::array::from_fn::<f32, 3, _>(|k| hundredths(p[k] - part.min[k]));
+    let (low, high) = (corner(stock.min), corner(stock.max));
+    StockSummary {
+        setup: si + 1,
+        size: stock.dimensions().map(hundredths),
+        box_from_part_corner: [low[0], low[1], low[2], high[0], high[1], high[2]],
+        removed: Sides::of(lost),
+        by,
+        cut_by,
+    }
 }
 /// Stock outside the part, by where it sits relative to the part's bounding box.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -402,10 +611,26 @@ pub fn evaluate(
     report: &PartReport,
     proposal: &Proposal,
 ) -> (CheckReport, Option<Document>) {
+    let (out, job, _) = evaluate_full(doc, mesh, report, proposal);
+    (out, job)
+}
+/// `evaluate`, also keeping what the planner's tools read of the job it
+/// built (`Checked`); None when the proposal could not be built.
+pub fn evaluate_full(
+    doc: &Document,
+    mesh: &Mesh,
+    report: &PartReport,
+    proposal: &Proposal,
+) -> (CheckReport, Option<Document>, Option<Checked>) {
     match proposal::build(doc, mesh, report, proposal) {
         Ok(built) => {
-            let (out, laid) = run(&built, mesh, report);
-            (out, Some(laid.unwrap_or(built)))
+            let (out, laid, setups) = run(&built, mesh, report);
+            let job = laid.unwrap_or(built);
+            let checked = Checked {
+                job: Arc::new(job.clone()),
+                setups,
+            };
+            (out, Some(job), Some(checked))
         }
         Err(problems) => (
             CheckReport {
@@ -414,8 +639,10 @@ pub fn evaluate(
                 operations: vec![],
                 coverage: None,
                 total_minutes: 0.,
+                stocks: vec![],
                 zeros: vec![],
             },
+            None,
             None,
         ),
     }
@@ -470,17 +697,69 @@ fn laid_out(
     }
     laid
 }
+/// The setups of `built` whose starting stock the sequence knew, in order,
+/// from their `results` and `starts` (the box each later setup began with and
+/// the stock the setups before it left, as `run` kept them): up to the first
+/// whose stock is not known, after an operation that could not be generated.
+/// Setup 1 starts from its own stock.
+fn checked_setups(
+    built: &Document,
+    mesh: &Mesh,
+    results: Vec<Vec<(usize, Result<Simulation, String>)>>,
+    starts: Vec<Option<(Bounds, Option<Arc<Volume>>)>>,
+) -> Vec<CheckedSetup> {
+    let mut setups = vec![];
+    for (si, (sims, start)) in results.into_iter().zip(starts).enumerate() {
+        let plans: Vec<Plan> = sims
+            .into_iter()
+            .filter_map(|(_, result)| result.ok().map(|sim| sim.plan))
+            .collect();
+        let known = if si == 0 {
+            plans
+                .first()
+                .map(|plan| plan.stock)
+                .or_else(|| built.setup_stock(0, Some(mesh)))
+                .map(|stock| (stock, None))
+        } else {
+            start
+        };
+        let Some((stock, before)) = known else {
+            break;
+        };
+        let setup = &built.setups[si];
+        let frame = Frame::new(setup, mesh);
+        let part = Placement::new(mesh, Some(setup))
+            .bounds
+            .scaled(1. / mesh.display_scale());
+        let summary = stock_summary(built, si, stock, part, frame, before.as_deref());
+        setups.push(CheckedSetup {
+            stock,
+            frame,
+            part,
+            before,
+            plans,
+            summary,
+        });
+    }
+    setups
+}
 /// Runs the stages that follow building on a job, starting with the saved
-/// project's structure check. Returns the report and the copy of the job with
+/// project's structure check. Returns the report, the copy of the job with
 /// the layouts suggested for its later setups (`laid_out`), whose workholding
-/// the check is of.
-fn run(built: &Document, mesh: &Mesh, report: &PartReport) -> (CheckReport, Option<Document>) {
+/// the check is of, and the setups whose starting stock it knew
+/// (`checked_setups`).
+fn run(
+    built: &Document,
+    mesh: &Mesh,
+    report: &PartReport,
+) -> (CheckReport, Option<Document>, Vec<CheckedSetup>) {
     let mut out = CheckReport {
         passed: false,
         problems: vec![],
         operations: vec![],
         coverage: None,
         total_minutes: 0.,
+        stocks: vec![],
         zeros: vec![],
     };
     if let Err(error) = built.validate_structure() {
@@ -490,7 +769,7 @@ fn run(built: &Document, mesh: &Mesh, report: &PartReport) -> (CheckReport, Opti
             stage: "structure",
             message: format!("The plan builds a job the app cannot save: {error}"),
         });
-        return (out, None);
+        return (out, None, vec![]);
     }
     // Speeds and feeds against the material: reported beside the stages that
     // follow, so one round of feedback carries every problem.
@@ -505,14 +784,17 @@ fn run(built: &Document, mesh: &Mesh, report: &PartReport) -> (CheckReport, Opti
     let mut axis = vec![];
     let mut part: Option<PartGrid> = None;
     let mut gouged = 0;
-    let mut last: Option<Volume> = None;
+    // The stock after the operations so far, and what each later setup
+    // started from: its box and that stock.
+    let last: RefCell<Option<Arc<Volume>>> = RefCell::new(None);
+    let mut starts: Vec<Option<(Bounds, Option<Arc<Volume>>)>> = vec![None; built.setups.len()];
     let mut operations = vec![];
     let mut problems = vec![];
     let mut gouges = vec![];
     // Kept for the export stage, so the job is not simulated twice.
     let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> =
         vec![vec![]; built.setups.len()];
-    crate::simulation::sequence_with(
+    crate::simulation::sequence_walk(
         built,
         mesh,
         None,
@@ -566,9 +848,15 @@ fn run(built: &Document, mesh: &Mesh, report: &PartReport) -> (CheckReport, Opti
                 });
             }
             gouged = count;
-            last = Some(stock.clone());
+            *last.borrow_mut() = Some(Arc::new(stock.clone()));
+        },
+        |si, start| {
+            if let Some(start) = start {
+                starts[si] = Some((start, last.borrow().clone()));
+            }
         },
     );
+    let last = last.into_inner();
     out.total_minutes = (operations.iter().map(|o| o.minutes).sum::<f32>() * 10.).round() / 10.;
     out.operations = operations;
     out.problems = problems;
@@ -653,7 +941,9 @@ fn run(built: &Document, mesh: &Mesh, report: &PartReport) -> (CheckReport, Opti
         out.coverage = Some(coverage(stock, part, &geometries[0], report));
     }
     out.passed = out.problems.is_empty();
-    (out, laid)
+    let setups = checked_setups(built, mesh, results, starts);
+    out.stocks = setups.iter().map(|s| s.summary.clone()).collect();
+    (out, laid, setups)
 }
 
 #[cfg(test)]
@@ -753,6 +1043,93 @@ mod tests {
                 .iter()
                 .any(|p| p.orientation == "+X" || p.orientation == "-Y")
         );
+        // The stock before each setup: setup 1's block, then the block less
+        // the 4 mm setup 1's Face took off its top, which is setup 2's
+        // bottom. The Contour stopped at the part's bottom, so the sides stay.
+        let stocks: Vec<String> = check
+            .stocks
+            .iter()
+            .map(|s| serde_json::to_string(s).unwrap())
+            .collect();
+        assert_eq!(
+            stocks,
+            [
+                r#"{"setup":1,"size":[124.0,84.0,47.0],"box_from_part_corner":[-2.0,-2.0,-3.0,122.0,82.0,44.0],"removed":{"top":0.0,"bottom":0.0,"-X":0.0,"+X":0.0,"-Y":0.0,"+Y":0.0},"by":[]}"#,
+                r#"{"setup":2,"size":[124.0,84.0,43.0],"box_from_part_corner":[-2.0,-2.0,0.0,122.0,82.0,43.0],"removed":{"top":0.0,"bottom":4.0,"-X":0.0,"+X":0.0,"-Y":0.0,"+Y":0.0},"by":["setup 1, operation 1 (Facing \"Face by planner\")"]}"#,
+            ]
+        );
+        assert_eq!(
+            check.stocks[1].line(),
+            "Stock before setup 2: 124 × 84 × 43 mm; bottom cut 4 mm by setup 1"
+        );
+    }
+    #[test]
+    fn the_stock_summary_names_each_side_cut_away_and_the_operations_that_did() {
+        use crate::{mesh, model::Machine, rest::RestStock, simulation::CutterShape};
+        let mesh = mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let setup = crate::model::Setup::new(Machine::new(3), "G54");
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let block = Bounds {
+            min: [-10., -10., 0.],
+            max: [10., 10., 12.],
+        };
+        let part = Bounds {
+            min: [-6., -6., 0.],
+            max: [6., 6., 8.],
+        };
+        let mut v = Volume::new(block, frame);
+        // Operation 1 faces 2 mm off the top; operation 3 cuts the -Y side
+        // through the whole height, 3.5 mm in.
+        for y in [-8., -4., 0., 4., 8.] {
+            v.cut(
+                [-15., y, 10.],
+                [15., y, 10.],
+                2.5,
+                3.,
+                CutterShape::Flat,
+                frame,
+                (0, 0),
+            );
+        }
+        v.cut(
+            [-15., -9., -0.5],
+            [15., -9., -0.5],
+            2.5,
+            15.,
+            CutterShape::Flat,
+            frame,
+            (0, 2),
+        );
+        let left = RestStock::new(&v, frame).left(part);
+        let summary = stock_summary(&Document::default(), 1, left, part, frame, Some(&v));
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            json["removed"],
+            serde_json::json!({"top": 2., "bottom": 0., "-X": 0., "+X": 0., "-Y": 3.5, "+Y": 0.})
+        );
+        // Without names in the document, the operations by number only.
+        assert_eq!(
+            json["by"],
+            serde_json::json!(["setup 1, operation 1", "setup 1, operation 3"])
+        );
+        assert_eq!(json["setup"], 2);
+        assert_eq!(json["size"], serde_json::json!([20., 16.5, 10.]));
+        assert_eq!(
+            json["box_from_part_corner"],
+            serde_json::json!([-4., -0.5, 0., 16., 16., 10.])
+        );
+        assert_eq!(
+            summary.line(),
+            "Stock before setup 2: 20 × 16.5 × 10 mm; top cut 2 mm by setup 1; -Y cut 3.5 mm by setup 1"
+        );
+        // With no earlier cuts nothing is removed and nobody is named.
+        let fresh = stock_summary(&Document::default(), 0, block, part, frame, None);
+        assert_eq!(
+            fresh.line(),
+            "Stock before setup 1: 20 × 20 × 12 mm",
+            "{fresh:?}"
+        );
+        assert!(fresh.by.is_empty());
     }
     #[test]
     fn speeds_and_feeds_outside_the_materials_data_are_refused_beside_the_other_problems() {
@@ -1692,7 +2069,7 @@ mod tests {
         assert_eq!(get(&job.setups[1].p, "holding"), "Clamps");
         assert_eq!(get(&job.setups[1].p, "clamps"), "");
         job.setups[1].p.insert("clamps".into(), "-Y:0;+Y:0".into());
-        let (check, laid) = run(&job, &mesh, &report);
+        let (check, laid, _) = run(&job, &mesh, &report);
         assert!(check.passed, "{:?}", stages(&check));
         assert!(laid.is_none(), "nothing was suggested");
     }

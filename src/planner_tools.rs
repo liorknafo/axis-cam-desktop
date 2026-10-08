@@ -2,44 +2,55 @@
 //! request, one registry for what is offered (`offered`) and how a call is
 //! answered (`answer`). Every answer is JSON text for the model and one line
 //! for the timeline; a call that cannot be answered gets one sentence for
-//! both. The tools read the part report and the part; they change nothing.
+//! both. The tools read the part report, the part and the latest checked
+//! draft; only `check_plan` changes which draft that is, and nothing else
+//! changes the job.
 use crate::{
     analysis::{self, PartReport, PlaneReport},
     cam::Geometry,
-    look, material,
+    holding, look, material,
     openai::Tool,
+    plan_check::{self, Checked, CheckedSetup, hundredths, plain},
     planner::{MAX_PICTURES_PER_REQUEST, MAX_PICTURES_PER_RUN, MAX_TOOL_ROUNDS},
-    proposal::clip,
+    proposal::{self, clip},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::sync::Arc;
 
+/// `check_plan` in requests.
+pub const CHECK_PLAN: &str = "check_plan";
+/// `stock_after` in requests.
+pub const STOCK_AFTER: &str = "stock_after";
+/// `check_holding` in requests.
+pub const CHECK_HOLDING: &str = "check_holding";
 /// `cutting_data` in requests.
 pub const CUTTING_DATA: &str = "cutting_data";
 /// `surface_info` in requests.
 pub const SURFACE_INFO: &str = "surface_info";
+/// Drafts `check_plan` checks within one planner request.
+pub const MAX_CHECKS_PER_REQUEST: usize = 3;
+/// Drafts `check_plan` checks in a whole run.
+pub const MAX_CHECKS_PER_RUN: usize = 8;
 /// The least spindle speed a plan may ask for (see RULES).
 const MIN_RPM: f64 = 100.;
+/// What `stock_after` and `check_holding` answer before any draft or answer
+/// was checked, or after a draft that could not be built.
+const NO_DRAFT: &str = "Check a draft with check_plan first, or answer with a proposal.";
 
-/// What a checked draft leaves for the tools that read it. Empty until the
-/// tools that check a draft arrive.
-#[allow(dead_code)]
-pub struct Checked {}
-
-/// What the tools remember within a run.
+/// What the tools remember within a run. Cheap to copy: the part, the job and
+/// the checked draft are shared.
 #[derive(Clone)]
 pub struct ToolState {
     /// What the pictures and the part tools read; its `job` is the latest
     /// checked proposal's.
     pub scene: look::Scene,
-    /// The latest checked draft.
-    #[allow(dead_code)]
+    /// The latest checked draft or answer: what `stock_after` and
+    /// `check_holding` read. None before the first, and after one that
+    /// could not be built.
     pub checked: Option<Arc<Checked>>,
     /// Drafts checked in this planner request and in the run.
-    #[allow(dead_code)]
     pub checks_here: usize,
-    #[allow(dead_code)]
     pub checks_run: usize,
     /// Views asked for, drawn or not, in this planner request and in the run.
     pub pictures_here: usize,
@@ -99,6 +110,41 @@ pub fn offered(pictures: bool) -> Vec<Tool> {
         tools.push(look::tool());
     }
     tools.push(Tool {
+        name: CHECK_PLAN,
+        description: format!("Checks a draft proposal as an answer is checked, which takes some seconds, and answers with the same check report: `passed`, the `problems` by setup and operation, `operations` with their minutes, `coverage`, `total_minutes`, and `stocks`, the stock before each setup. The draft becomes the latest for `stock_after`, `check_holding` and the operation views. At most {MAX_CHECKS_PER_REQUEST} per reply and {MAX_CHECKS_PER_RUN} in the run."),
+        parameters: json!({
+            "type": "object",
+            "properties": {"proposal": proposal::schema()},
+            "required": ["proposal"],
+            "additionalProperties": false
+        }),
+    });
+    tools.push(Tool {
+        name: STOCK_AFTER,
+        description: "The stock a setup of the latest checked draft or answer starts from, in that setup's axes: its `size`, its box from the model's -X/-Y/bottom corner, what the earlier setups `removed` whole from each side in mm, and `by` which operations.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "setup": {"type": "integer", "description": "A setup number of the latest draft, from 1."}
+            },
+            "required": ["setup"],
+            "additionalProperties": false
+        }),
+    });
+    tools.push(Tool {
+        name: CHECK_HOLDING,
+        description: "Whether a vise or clamps from `workholding_library` can hold the stock a setup of the latest checked draft or answer starts from: the layout the program would suggest for the setup's toolpaths (the vise's jaw sides and grip, or the clamps' sides and offsets), `holds`, and the `problems`, empty when it holds.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "setup": {"type": "integer", "description": "A setup number of the latest draft, from 1."},
+                "holder": {"type": "integer", "description": "A `number` from the part report's `workholding_library`."}
+            },
+            "required": ["setup", "holder"],
+            "additionalProperties": false
+        }),
+    });
+    tools.push(Tool {
         name: CUTTING_DATA,
         description: "The spindle speed and feed a tool can run at in the project's material: the rpm range from the material's surface speed and the machine's maximum, a recommended rpm (the middle of the range, rounded to 10), and at that rpm the feed range from the chip-load band of the tool's diameter and its flutes, clipped to the machine's maximum feed, with a recommended feed and the band used. Feeds are in mm/min.".into(),
         parameters: json!({
@@ -137,7 +183,10 @@ pub fn instructions(pictures: bool) -> String {
     };
     format!("TOOLS
 - Before you answer you may call these functions. A reply of yours with calls is one round, and a reply allows at most {MAX_TOOL_ROUNDS} rounds; after that, reply with the proposal. An answer is JSON text, or one sentence when the call cannot be answered.
-{view}- `cutting_data` (`tool`, a number from `tools`): the rpm range from the material's surface speed and the machine's maximum rpm, a recommended rpm, and at that rpm the feed range (mm/min) from the chip-load band of the tool's diameter and its flutes, with a recommended feed and the band. No limit.
+{view}- `check_plan` (`proposal`, a full proposal in the schema of your reply): checks the draft as your answer will be checked, which takes some seconds, and answers with the same check report: `passed`, `problems` by setup and operation, `operations`, `coverage`, `total_minutes`, and `stocks`, the stock before each setup (as `stock_after`). The draft becomes the latest draft: `stock_after`, `check_holding` and the operation views read it, as they read your answer once it has been checked. At most {MAX_CHECKS_PER_REQUEST} per reply and {MAX_CHECKS_PER_RUN} in the run.
+- `stock_after` (`setup`, a setup number of the latest draft): the stock that setup starts from, in its axes: `size`, `box_from_part_corner` [x0, y0, z0, x1, y1, z1] from the model's -X/-Y/bottom corner, how much the earlier setups `removed` whole from each side (top, bottom, -X, +X, -Y, +Y, mm) and `by` which operations. Needs a checked draft or answer. No limit.
+- `check_holding` (`setup`, and `holder`, a `number` from `workholding_library`): whether that entry can hold the stock that setup starts from: the layout the program would suggest for the setup's toolpaths (a vise's `jaws_on` sides and `grip`, or the `clamps`' sides and offsets), `holds`, and the `problems`, empty when it holds. Needs a checked draft or answer. No limit.
+- `cutting_data` (`tool`, a number from `tools`): the rpm range from the material's surface speed and the machine's maximum rpm, a recommended rpm, and at that rpm the feed range (mm/min) from the chip-load band of the tool's diameter and its flutes, with a recommended feed and the band. No limit.
 - `surface_info` (`surface`, an ID from `planes`): every orientation whose planes list the surface, with the plane's kind, depth, area, bbox, `max_cutter_diameter` and holes, and the surface's own area (`surface_area`, mm²) and `mean_normal` in setup 1's frame. No limit.
 
 ")
@@ -148,6 +197,9 @@ pub fn instructions(pictures: bool) -> String {
 pub fn answer(name: &str, arguments: &str, state: &mut ToolState) -> Answer {
     match name {
         look::NAME => view(arguments, state),
+        CHECK_PLAN => check_plan(arguments, state),
+        STOCK_AFTER => stock_after(arguments, state),
+        CHECK_HOLDING => check_holding(arguments, state),
         CUTTING_DATA => cutting_data(arguments, &state.scene.report),
         SURFACE_INFO => surface_info(arguments, &state.scene),
         other => Answer::sentence(format!("There is no tool named {}.", clip(other, 40))),
@@ -181,6 +233,264 @@ fn view(arguments: &str, state: &mut ToolState) -> Answer {
             picture: Some(picture),
         },
         Err(message) => Answer::sentence(message),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftArgs {
+    /// A proposal object; a proposal sent as text is read as an answer is.
+    proposal: serde_json::Value,
+}
+/// "1 problem", "3 problems".
+fn problems(n: usize) -> String {
+    if n == 1 {
+        "1 problem".into()
+    } else {
+        format!("{n} problems")
+    }
+}
+
+/// Checks a draft as the planner checks an answer, within the limits; the
+/// draft becomes the latest (`ToolState::checked` and the scene's job), or
+/// none when it could not be built. A draft that cannot be read is not
+/// counted.
+fn check_plan(arguments: &str, state: &mut ToolState) -> Answer {
+    if state.checks_here >= MAX_CHECKS_PER_REQUEST {
+        return Answer::sentence(
+            "No more draft checks for this request; answer with the proposal.",
+        );
+    }
+    if state.checks_run >= MAX_CHECKS_PER_RUN {
+        return Answer::sentence("No more draft checks in this run; answer with the proposal.");
+    }
+    let args: DraftArgs = match parse(CHECK_PLAN, arguments) {
+        Ok(args) => args,
+        Err(answer) => return answer,
+    };
+    let text = match args.proposal {
+        serde_json::Value::String(text) => text,
+        object => object.to_string(),
+    };
+    let draft = match proposal::parse(crate::planner::json_object(&text)) {
+        Ok(draft) => crate::planner::tidy(draft).0,
+        Err(error) => return Answer::sentence(clip(&error, 300)),
+    };
+    state.checks_here += 1;
+    state.checks_run += 1;
+    let scene = &state.scene;
+    let (report, job, checked) =
+        plan_check::evaluate_full(&scene.doc, &scene.mesh, &scene.report, &draft);
+    state.scene.job = job.map(Arc::new);
+    state.checked = checked.map(Arc::new);
+    let line = if report.passed {
+        "Checked a draft: passed".into()
+    } else {
+        format!("Checked a draft: {}", problems(report.problems.len()))
+    };
+    Answer {
+        output: serde_json::to_string(&report).expect("a check report serializes"),
+        line,
+        picture: None,
+    }
+}
+
+/// Setup `number` (from 1) of the latest checked draft, or the sentence that
+/// says why there is none: no draft, no such setup, or a stock the
+/// simulation did not get to.
+fn known_setup(state: &ToolState, number: usize) -> Result<(&Checked, &CheckedSetup), Answer> {
+    let checked = state
+        .checked
+        .as_deref()
+        .ok_or_else(|| Answer::sentence(NO_DRAFT))?;
+    if number == 0 || number > checked.job.setups.len() {
+        return Err(Answer::sentence(format!(
+            "The latest draft has no setup {number}."
+        )));
+    }
+    let setup = checked.setups.get(number - 1).ok_or_else(|| {
+        Answer::sentence(format!(
+            "The stock before setup {number} is not known: the check stopped before it; see the draft's problems."
+        ))
+    })?;
+    Ok((checked, setup))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupArgs {
+    setup: usize,
+}
+
+fn stock_after(arguments: &str, state: &ToolState) -> Answer {
+    if state.checked.is_none() {
+        return Answer::sentence(NO_DRAFT);
+    }
+    let args: SetupArgs = match parse(STOCK_AFTER, arguments) {
+        Ok(args) => args,
+        Err(answer) => return answer,
+    };
+    match known_setup(state, args.setup) {
+        Ok((_, setup)) => Answer {
+            output: serde_json::to_string(&setup.summary).expect("plain numbers serialize"),
+            line: setup.summary.line(),
+            picture: None,
+        },
+        Err(answer) => answer,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldingArgs {
+    setup: usize,
+    holder: usize,
+}
+/// A vise as the program would place it.
+#[derive(Serialize)]
+struct ViseAt {
+    /// "±X": the jaws on the -X and +X sides.
+    jaws_on: String,
+    grip: f32,
+    offset: f32,
+    max_opening: f32,
+    width_across_jaws: f32,
+}
+/// A clamp as the program would place it.
+#[derive(Serialize)]
+struct ClampAt {
+    side: &'static str,
+    offset: f32,
+}
+#[derive(Serialize)]
+struct Holding {
+    setup: usize,
+    holder: usize,
+    kind: &'static str,
+    stock_size: [f32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vise: Option<ViseAt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clamps: Option<Vec<ClampAt>>,
+    holds: bool,
+    problems: Vec<String>,
+}
+/// Whether library entry `holder` could hold the stock setup `setup` of the
+/// latest draft starts from: the layout the program suggests for the setup's
+/// toolpaths, as Suggest layout and the plan check do, and the holding
+/// checks on it (the opening, then `holding::holdable`) with what the
+/// earlier setups cut away.
+fn check_holding(arguments: &str, state: &ToolState) -> Answer {
+    if state.checked.is_none() {
+        return Answer::sentence(NO_DRAFT);
+    }
+    let args: HoldingArgs = match parse(CHECK_HOLDING, arguments) {
+        Ok(args) => args,
+        Err(answer) => return answer,
+    };
+    let (checked, start) = match known_setup(state, args.setup) {
+        Ok(found) => found,
+        Err(answer) => return answer,
+    };
+    let job = &checked.job;
+    let library = analysis::library(job);
+    let Some(entry) = args.holder.checked_sub(1).and_then(|i| library.get(i)) else {
+        return Answer::sentence(format!(
+            "workholding {} is not in workholding_library.",
+            args.holder
+        ));
+    };
+    let (si, vise) = (args.setup - 1, entry.kind() == "Vise");
+    // The setup as it would be with that entry, not yet placed.
+    let mut setup = job.setups[si].clone();
+    setup.p.insert(
+        "holding".into(),
+        if vise { "Vise" } else { "Clamps" }.into(),
+    );
+    setup.p.insert("holder".into(), entry.id.clone());
+    let plans: Vec<&crate::simulation::Plan> = start.plans.iter().collect();
+    // The box the setup starts from, which its toolpaths were generated on.
+    let stock = start.stock;
+    let (layout, found) = match holding::request(&setup, Some(entry)) {
+        Err(refused) => (None, vec![refused]),
+        Ok(request) => {
+            let (_, layout) = request
+                .suggest_on(&plans, || Some(stock))
+                .expect("the stock is given");
+            let removed = start
+                .before
+                .as_deref()
+                .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
+            let names = |s, o| holding::operation_name(job, s, o);
+            let mut found: Vec<String> = holding::opening_issue(&layout, entry, stock)
+                .into_iter()
+                .collect();
+            found.extend(holding::holdable(
+                si,
+                &layout,
+                entry,
+                stock,
+                removed.as_ref(),
+                &names,
+            ));
+            (Some(layout), found)
+        }
+    };
+    let found: Vec<String> = found.iter().map(|m| clip(m, 300)).collect();
+    let verdict = if found.is_empty() {
+        "holds".to_string()
+    } else {
+        problems(found.len())
+    };
+    let kind = if vise { "Vise" } else { "Clamp" };
+    let mut answer = Holding {
+        setup: args.setup,
+        holder: args.holder,
+        kind,
+        stock_size: stock.dimensions().map(hundredths),
+        vise: None,
+        clamps: None,
+        holds: found.is_empty(),
+        problems: found,
+    };
+    let mut line = format!("{kind} {} for setup {}: {verdict}", args.holder, args.setup);
+    match layout {
+        Some(holding::Layout::Vise {
+            axis_y,
+            offset,
+            grip,
+            ..
+        }) => {
+            let opening = crate::model::num(&entry.p, "max_opening").unwrap_or(0.);
+            let across = stock.dimensions()[usize::from(axis_y)];
+            line += &format!(" (opens {}, needs {})", plain(opening), plain(across));
+            answer.vise = Some(ViseAt {
+                jaws_on: format!("±{}", if axis_y { "Y" } else { "X" }),
+                grip: hundredths(grip),
+                offset: hundredths(offset),
+                max_opening: hundredths(opening),
+                width_across_jaws: hundredths(across),
+            });
+        }
+        Some(holding::Layout::Clamps { clamps, .. }) => {
+            let sides: Vec<&str> = clamps.iter().map(|(side, _)| side.label()).collect();
+            line += &format!(" (clamps on {})", sides.join(", "));
+            answer.clamps = Some(
+                clamps
+                    .iter()
+                    .map(|&(side, offset)| ClampAt {
+                        side: side.label(),
+                        offset: hundredths(offset),
+                    })
+                    .collect(),
+            );
+        }
+        _ => {}
+    }
+    Answer {
+        output: serde_json::to_string(&answer).expect("plain values serialize"),
+        line,
+        picture: None,
     }
 }
 
@@ -349,13 +659,6 @@ struct SurfaceInfo<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'static str>,
 }
-/// `value` without trailing zeros, to two decimals: 12, 7.5, 0.25.
-fn plain(value: f32) -> String {
-    format!("{value:.2}")
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
-}
 fn rounded(value: f64, places: i32) -> f64 {
     let scale = 10f64.powi(places);
     // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
@@ -449,7 +752,7 @@ mod tests {
         edit(&mut report);
         ToolState::new(look::Scene {
             doc: Arc::new(doc),
-            mesh,
+            mesh: Arc::new(mesh),
             report: Arc::new(report),
             job: None,
         })
@@ -519,12 +822,17 @@ mod tests {
     fn the_tools_are_offered_with_view_model_only_when_pictures_are_on() {
         let names =
             |pictures| -> Vec<&'static str> { offered(pictures).iter().map(|t| t.name).collect() };
-        assert_eq!(
-            names(true),
-            [look::NAME, "cutting_data", "surface_info"],
-            "view_model first"
-        );
-        assert_eq!(names(false), ["cutting_data", "surface_info"]);
+        let part = [
+            "check_plan",
+            "stock_after",
+            "check_holding",
+            "cutting_data",
+            "surface_info",
+        ];
+        let mut all = vec![look::NAME];
+        all.extend(part);
+        assert_eq!(names(true), all, "view_model first");
+        assert_eq!(names(false), part);
         for tool in offered(true) {
             assert!(!tool.description.is_empty(), "{}", tool.name);
             let mut objects = 0;
@@ -540,6 +848,342 @@ mod tests {
             by("surface_info").parameters["properties"]["surface"]["type"],
             "integer"
         );
+        // check_plan takes a whole proposal in the answer's own schema.
+        assert_eq!(
+            by("check_plan").parameters,
+            json!({
+                "type": "object",
+                "properties": {"proposal": crate::proposal::schema()},
+                "required": ["proposal"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            by("stock_after").parameters["properties"]["setup"]["type"],
+            "integer"
+        );
+        let holding = by("check_holding").parameters;
+        assert_eq!(holding["properties"]["setup"]["type"], "integer");
+        assert_eq!(holding["properties"]["holder"]["type"], "integer");
+    }
+
+    /// A draft for the example block: `good`, with setup 1's Face leaving
+    /// 2 of the 4 mm above the part, so 2 mm of setup 1's top is faced away.
+    fn facing_draft(report: &PartReport) -> crate::proposal::Proposal {
+        let mut draft = crate::proposal::tests::good(report);
+        draft.setups[0].operations[0].bottom_offset = Some(2.);
+        draft
+    }
+    /// The example block with the starter vise (1) and clamp (2) in its
+    /// library and a small vise (3) that opens to 60 mm, each with a name
+    /// and notes that must not reach the model. Setup 1 holds nothing.
+    fn library_state() -> ToolState {
+        let (mut doc, mesh, _) = block();
+        doc.adopt_holders();
+        let mut small = doc.workholding[0].clone();
+        small.id = crate::model::id();
+        small.p.insert("max_opening".into(), "60".into());
+        doc.workholding.push(small);
+        for holder in &mut doc.workholding {
+            holder.p.insert("name".into(), "ZZ-SECRET-HOLDER".into());
+            holder.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        }
+        let report = analysis::report(&doc, &mesh).unwrap();
+        assert_eq!(report.workholding_library.len(), 3);
+        ToolState::new(look::Scene {
+            doc: Arc::new(doc),
+            mesh: Arc::new(mesh),
+            report: Arc::new(report),
+            job: None,
+        })
+    }
+    /// `library_state` after `check_plan` of `facing_draft`, and that call's
+    /// output and line: checked once for all the tests that read it.
+    fn checked() -> (ToolState, String, String) {
+        static CHECKED: std::sync::OnceLock<(ToolState, String, String)> =
+            std::sync::OnceLock::new();
+        CHECKED
+            .get_or_init(|| {
+                let mut s = library_state();
+                let draft = facing_draft(&s.scene.report);
+                let a = call("check_plan", json!({ "proposal": draft }), &mut s);
+                (s, a.output, a.line)
+            })
+            .clone()
+    }
+    const NO_DRAFT: &str = "Check a draft with check_plan first, or answer with a proposal.";
+
+    #[test]
+    fn check_plan_answers_the_check_report_and_the_draft_becomes_the_latest() {
+        let (s, output, line) = checked();
+        let out: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(out["passed"], true, "{out}");
+        assert_eq!(out["problems"], json!([]));
+        assert_eq!(out["operations"].as_array().unwrap().len(), 6);
+        assert!(out["coverage"].is_object() && out["total_minutes"].as_f64().unwrap() > 0.);
+        assert_eq!(line, "Checked a draft: passed");
+        assert_eq!((s.checks_here, s.checks_run), (1, 1));
+        // The stock before each setup, in that setup's axes: setup 2 is
+        // turned over, so the 2 mm faced off setup 1's top is its bottom.
+        assert_eq!(
+            out["stocks"],
+            json!([
+                {
+                    "setup": 1, "size": [124., 84., 47.],
+                    "box_from_part_corner": [-2., -2., -3., 122., 82., 44.],
+                    "removed": {"top": 0., "bottom": 0., "-X": 0., "+X": 0., "-Y": 0., "+Y": 0.},
+                    "by": []
+                },
+                {
+                    "setup": 2, "size": [124., 84., 45.],
+                    "box_from_part_corner": [-2., -2., -2., 122., 82., 43.],
+                    "removed": {"top": 0., "bottom": 2., "-X": 0., "+X": 0., "-Y": 0., "+Y": 0.},
+                    "by": ["setup 1, operation 1 (Facing \"Face by planner\")"]
+                }
+            ])
+        );
+        // The draft is the latest: its setups for the other tools, its job
+        // for view_model's operation views.
+        let checked = s.checked.as_ref().expect("a checked draft");
+        assert_eq!(checked.job.setups.len(), 2);
+        assert_eq!(checked.setups.len(), 2);
+        let second = &checked.setups[1];
+        assert_eq!(second.plans.len(), 2);
+        assert_eq!(second.plans[0].stock, second.stock);
+        assert!(second.before.as_ref().is_some_and(|v| !v.cuts.is_empty()));
+        assert!(checked.setups[0].before.is_none());
+        assert_eq!(s.scene.job.as_ref().unwrap().setups.len(), 2);
+    }
+
+    #[test]
+    fn stock_after_tells_the_stock_before_a_setup_of_the_latest_draft() {
+        let (mut s, output, _) = checked();
+        let stocks = serde_json::from_str::<Value>(&output).unwrap()["stocks"].clone();
+        let a = call("stock_after", json!({"setup": 2}), &mut s);
+        assert!(a.picture.is_none());
+        assert_eq!(json_of(&a), stocks[1]);
+        assert_eq!(
+            a.line,
+            "Stock before setup 2: 124 × 84 × 45 mm; bottom cut 2 mm by setup 1"
+        );
+        let a = call("stock_after", json!({"setup": 1}), &mut s);
+        assert_eq!(json_of(&a), stocks[0]);
+        assert_eq!(a.line, "Stock before setup 1: 124 × 84 × 47 mm");
+        for setup in [0, 3] {
+            let a = call("stock_after", json!({ "setup": setup }), &mut s);
+            assert_eq!(a.output, format!("The latest draft has no setup {setup}."));
+            assert_eq!(a.line, a.output);
+        }
+        let a = answer("stock_after", r#"{"setup": 1, "x": 1}"#, &mut s);
+        assert!(
+            a.output
+                .starts_with("The stock_after arguments could not be read: "),
+            "{}",
+            a.output
+        );
+        assert_eq!((s.checks_here, s.checks_run), (1, 1), "nothing was checked");
+    }
+
+    #[test]
+    fn check_holding_tests_a_library_entry_on_the_stock_before_a_setup() {
+        let (mut s, output, line) = checked();
+        let mut said = format!("{output}\n{line}\n");
+        // Clamps bite on the 3 mm left under the part, which setup 1 kept.
+        let a = call("check_holding", json!({"setup": 2, "holder": 2}), &mut s);
+        let out = json_of(&a);
+        assert_eq!(
+            (&out["setup"], &out["holder"], &out["kind"]),
+            (&json!(2), &json!(2), &json!("Clamp"))
+        );
+        assert_eq!(out["holds"], true, "{out}");
+        assert_eq!(out["problems"], json!([]));
+        assert_eq!(out["stock_size"], json!([124., 84., 45.]));
+        let clamps = out["clamps"].as_array().unwrap();
+        assert!(clamps.len() >= 2, "{out}");
+        let sides: Vec<&str> = clamps.iter().map(|c| c["side"].as_str().unwrap()).collect();
+        assert!(clamps.iter().all(|c| c["offset"].is_number()));
+        assert!(out.get("vise").is_none());
+        assert_eq!(
+            a.line,
+            format!(
+                "Clamp 2 for setup 2: holds (clamps on {})",
+                sides.join(", ")
+            )
+        );
+        said += &format!("{}\n{}\n", a.output, a.line);
+        // A vise that opens too little for the stock.
+        let a = call("check_holding", json!({"setup": 2, "holder": 3}), &mut s);
+        let out = json_of(&a);
+        assert_eq!(out["holds"], false);
+        assert_eq!(out["kind"], "Vise");
+        let vise = &out["vise"];
+        assert_eq!(vise["max_opening"], 60.);
+        let across = vise["width_across_jaws"].as_f64().unwrap();
+        assert!(across == 84. || across == 124., "{out}");
+        assert!(vise["jaws_on"] == "±X" || vise["jaws_on"] == "±Y", "{out}");
+        assert!(vise["grip"].as_f64().unwrap() > 0.);
+        assert_eq!(
+            out["problems"][0],
+            format!("The stock is {across} mm across the jaws; this vise opens to 60 mm.")
+        );
+        let problems = out["problems"].as_array().unwrap().len();
+        let counted = if problems == 1 {
+            "1 problem".to_string()
+        } else {
+            format!("{problems} problems")
+        };
+        assert_eq!(
+            a.line,
+            format!("Vise 3 for setup 2: {counted} (opens 60, needs {across})")
+        );
+        said += &format!("{}\n{}\n", a.output, a.line);
+        // The starter vise opens wide enough, but setup 1's Contour took the
+        // sides its jaws would grip, and the problem names it.
+        let a = call("check_holding", json!({"setup": 2, "holder": 1}), &mut s);
+        let out = json_of(&a);
+        assert_eq!(out["holds"], false);
+        assert!(
+            out["problems"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("Setup 2 cannot be held in the vise: setup 1, operation 3 "),
+            "{out}"
+        );
+        said += &format!("{}\n{}\n", a.output, a.line);
+        // An entry or a setup the draft does not have.
+        for holder in [0, 9] {
+            let a = call(
+                "check_holding",
+                json!({"setup": 2, "holder": holder}),
+                &mut s,
+            );
+            assert_eq!(
+                a.output,
+                format!("workholding {holder} is not in workholding_library.")
+            );
+            assert_eq!(a.line, a.output);
+        }
+        let a = call("check_holding", json!({"setup": 5, "holder": 1}), &mut s);
+        assert_eq!(a.output, "The latest draft has no setup 5.");
+        let a = answer("check_holding", r#"{"setup": 2}"#, &mut s);
+        assert!(
+            a.output
+                .starts_with("The check_holding arguments could not be read: ")
+        );
+        // Sizes and numbers only: no entry's name or notes.
+        assert!(!said.contains("ZZ-SECRET"), "{said}");
+    }
+
+    #[test]
+    fn before_any_draft_stock_after_and_check_holding_say_so() {
+        let mut s = library_state();
+        for (name, arguments) in [
+            ("stock_after", json!({"setup": 1})),
+            ("check_holding", json!({"setup": 1, "holder": 1})),
+        ] {
+            let a = call(name, arguments, &mut s);
+            assert_eq!(a.output, NO_DRAFT);
+            assert_eq!(a.line, NO_DRAFT);
+            assert!(a.picture.is_none());
+        }
+    }
+
+    #[test]
+    fn check_plan_answers_a_draft_it_cannot_read_or_build_with_its_problems() {
+        let (mut s, _, _) = checked();
+        assert!(s.checked.is_some() && s.scene.job.is_some());
+        // Not a proposal: one sentence, nothing checked, the draft stays.
+        let a = call("check_plan", json!({"proposal": {"summary": 1}}), &mut s);
+        assert!(
+            a.output
+                .starts_with("The proposal is not valid JSON for the schema: "),
+            "{}",
+            a.output
+        );
+        assert!(a.output.chars().count() <= 300);
+        assert_eq!(a.line, a.output);
+        assert_eq!((s.checks_here, s.checks_run), (1, 1));
+        assert!(s.checked.is_some());
+        let a = answer("check_plan", r#"{"draft": {}}"#, &mut s);
+        assert!(
+            a.output
+                .starts_with("The check_plan arguments could not be read: ")
+        );
+        // A draft that does not build: its problems, and no latest draft.
+        let mut bad = crate::proposal::tests::good(&s.scene.report);
+        bad.setups[0].operations[0].tool = 9;
+        let a = call("check_plan", json!({ "proposal": bad }), &mut s);
+        let out = json_of(&a);
+        assert_eq!(out["passed"], false);
+        assert_eq!(
+            out["problems"],
+            json!([{
+                "setup": 1, "operation": 1, "stage": "structure",
+                "message": "T9 is not in the tool library."
+            }])
+        );
+        assert_eq!(out["stocks"], json!([]));
+        assert_eq!(a.line, "Checked a draft: 1 problem");
+        assert_eq!((s.checks_here, s.checks_run), (2, 2));
+        assert!(s.checked.is_none() && s.scene.job.is_none());
+        let a = call("stock_after", json!({"setup": 1}), &mut s);
+        assert_eq!(a.output, NO_DRAFT);
+        // A proposal sent as text, in a code fence, is read as an answer is.
+        let fenced = format!("```json\n{}\n```", serde_json::to_string(&bad).unwrap());
+        let a = call("check_plan", json!({ "proposal": fenced }), &mut s);
+        assert_eq!(a.line, "Checked a draft: 1 problem", "{}", a.output);
+        assert_eq!((s.checks_here, s.checks_run), (3, 3));
+    }
+
+    #[test]
+    fn check_plan_is_limited_per_request_and_per_run() {
+        let (mut s, _, _) = checked();
+        let mut bad = crate::proposal::tests::good(&s.scene.report);
+        bad.setups[0].operations[0].tool = 9;
+        let draft = json!({ "proposal": bad });
+        s.checks_here = MAX_CHECKS_PER_REQUEST;
+        let a = call("check_plan", draft.clone(), &mut s);
+        assert_eq!(
+            a.output,
+            "No more draft checks for this request; answer with the proposal."
+        );
+        assert_eq!(a.line, a.output);
+        // Not run: the latest draft and the counts are as they were.
+        assert!(s.checked.is_some());
+        assert_eq!(s.checks_run, 1);
+        s.next_request();
+        assert_eq!((s.checks_here, s.checks_run), (0, 1));
+        s.checks_run = MAX_CHECKS_PER_RUN;
+        let a = call("check_plan", draft.clone(), &mut s);
+        assert_eq!(
+            a.output,
+            "No more draft checks in this run; answer with the proposal."
+        );
+        assert!(s.checked.is_some());
+        assert_eq!((s.checks_here, s.checks_run), (0, MAX_CHECKS_PER_RUN));
+        assert_eq!((MAX_CHECKS_PER_REQUEST, MAX_CHECKS_PER_RUN), (3, 8));
+        // The limits are check_plan's alone.
+        let a = call("stock_after", json!({"setup": 2}), &mut s);
+        assert!(a.output.starts_with('{'));
+    }
+
+    #[test]
+    fn the_stock_before_a_setup_after_a_failed_generation_is_not_known() {
+        let mut s = library_state();
+        let mut failing = crate::proposal::tests::good(&s.scene.report);
+        // A stepdown longer than the flute cannot be generated.
+        failing.setups[0].operations[1].stepdown = Some(500.);
+        let a = call("check_plan", json!({ "proposal": failing }), &mut s);
+        let out = json_of(&a);
+        assert_eq!(out["passed"], false);
+        assert_eq!(out["stocks"].as_array().unwrap().len(), 1, "{out}");
+        let known = call("stock_after", json!({"setup": 1}), &mut s);
+        assert!(known.output.starts_with('{'), "{}", known.output);
+        let unknown = "The stock before setup 2 is not known: the check stopped before it; see the draft's problems.";
+        let a = call("stock_after", json!({"setup": 2}), &mut s);
+        assert_eq!(a.output, unknown);
+        let a = call("check_holding", json!({"setup": 2, "holder": 2}), &mut s);
+        assert_eq!(a.output, unknown);
     }
 
     #[test]
@@ -819,7 +1463,7 @@ mod tests {
         assert_eq!(report.orientations[0].up, "-Z");
         let mut s = ToolState::new(look::Scene {
             doc: Arc::new(doc),
-            mesh,
+            mesh: Arc::new(mesh),
             report: Arc::new(report),
             job: None,
         });
@@ -974,7 +1618,7 @@ mod tests {
         let surfaces = mesh.surfaces.len();
         let mut s = ToolState::new(look::Scene {
             doc: Arc::new(doc),
-            mesh,
+            mesh: Arc::new(mesh),
             report: Arc::new(report),
             job: None,
         });
