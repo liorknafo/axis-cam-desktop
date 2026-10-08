@@ -1401,6 +1401,7 @@ mod tests {
                     }
                     .into(),
                     workholding: String::new(),
+                    holder: None,
                     operations,
                 })
                 .collect(),
@@ -1657,6 +1658,32 @@ mod tests {
             holding::placement(&again),
             vec![("clamps", get(&second.p, "clamps").to_string())]
         );
+    }
+    #[test]
+    fn a_holder_the_proposal_names_for_a_later_setup_is_laid_out_for_its_toolpaths() {
+        let (mut doc, mesh, _, _) = clamped("-X:0;+X:0", "36");
+        // Entry 1 is the starter vise; open wide enough for the stock.
+        doc.workholding[0]
+            .p
+            .insert("max_opening".into(), "300".into());
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let mut proposal = good(&report);
+        for setup in &mut proposal.setups {
+            setup.operations[0].facing_area = Some("model".into());
+        }
+        proposal.setups[1].holder = Some(1);
+        let (check, job) = check(&doc, &mesh, &report, &proposal);
+        assert!(check.passed, "{:?}", stages(&check));
+        let job = job.unwrap();
+        // Setup 1 keeps the user's clamps; setup 2 has the vise it was given,
+        // placed by the program: the proposal gave no position.
+        assert_eq!(get(&job.setups[0].p, "holding"), "Clamps");
+        let second = &job.setups[1];
+        assert_eq!(get(&second.p, "holding"), "Vise");
+        assert_eq!(get(&second.p, "holder"), doc.workholding[0].id);
+        assert!(holding::placed(second), "{:?}", second.p);
+        assert!(!get(&second.p, "vise_axis").is_empty());
+        assert!(!get(&second.p, "vise_grip").is_empty());
     }
     #[test]
     fn a_later_setup_keeps_a_placement_it_already_has() {

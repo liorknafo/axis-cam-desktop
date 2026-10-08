@@ -37,7 +37,8 @@ impl Holder {
     pub fn kind(&self) -> &str {
         get(&self.p, "kind")
     }
-    fn keys(&self) -> &'static [&'static str] {
+    /// The numbers that size the entry, by kind.
+    pub fn keys(&self) -> &'static [&'static str] {
         if self.kind() == "Vise" {
             &[
                 "jaw_width",

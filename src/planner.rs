@@ -173,6 +173,26 @@ pub struct Failure {
     pub api: Option<ApiError>,
     pub requests: usize,
 }
+/// The PLANNING THE HOLDING section, with its blank line after it: how the
+/// planner is to hold every setup, which stock it starts from and what a holder
+/// needs of it. With `tools`, a last rule names the planner tools that test a
+/// draft's holding; they are named nowhere else while they are not offered.
+fn holding_rules(tools: bool) -> String {
+    let tools = if tools {
+        "\n- Before you answer, check a draft with `check_plan`: it reports the problems and the stock before each setup. Use `stock_after` to see what the earlier setups left of a setup's stock and `check_holding` to test a library entry on it, and decide the order of the setups and each `holder` with them."
+    } else {
+        ""
+    };
+    format!("PLANNING THE HOLDING
+- Decide, before you plan any operation, how every setup is held and what stock it starts from. A later setup starts from the stock the earlier setups left, not from the whole block: a faced top makes the flipped stock shorter, and cut sides make it narrower. A holder that does not fit that stock, or has nothing to grip on it, makes the plan fail.
+- `workholding_library` lists the vises and clamps you may choose from, by `number` from 1, with their sizes in mm and no names. A `Vise` has `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening` (the widest stock it opens to across its jaws) and `grip` (how far up from the stock's bottom the jaws hold it). A `Clamp` has `length`, `width`, `height` and `bite` (how far it reaches onto the stock top).
+- Each setup's `holder` is a `number` from `workholding_library`, or null. Setup 1 is held by the user's own entry: its `holder` is null (or that entry's number) and cannot be changed. For a later setup null means setup 1's entry; choose another `number` when the stock it starts from suits another holder better, for example clamps when the earlier setups took the material a vise would grip, or a vise that opens wider. The program lays the chosen holder out (a vise's axis and grip, the clamps' sides and positions) for the setup's toolpaths: you choose only the entry.
+- A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material on the stock's bottom to rest on (at least half of it), stock at least 1 mm above the grip, and a width across the jaws within `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it). A part cut free of the material the holder grips cannot be held either.
+- Leave that material in the earlier setups, and finish it in a later setup that no longer needs it: for example stop an outside Contour above the grip with `bottom_offset`, or do not cut the sides a vise will grip, and do not face away the top a flipped setup will rest on. Order the setups so that each starts from stock its holder can hold.
+- A setup its holder cannot hold comes back as a problem with the stage `workholding` on that setup; it names the earlier operation that removed the material. Change that operation, the order of the setups or the `holder`.{tools}
+
+")
+}
 /// What the model is told before it sees the part, without pictures, as
 /// the tests read it.
 #[cfg(test)]
@@ -211,6 +231,8 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
     } else {
         String::new()
     };
+    // The planner tools are not offered yet; their rules join in with them.
+    let holding = holding_rules(false);
     let (per_setup, total) = (proposal::MAX_SETUP_OPERATIONS, proposal::MAX_OPERATIONS);
     let samples = format!(
         "{},{:03}",
@@ -227,6 +249,7 @@ THE PART REPORT
 - `freeform_area` is the visible area that is neither horizontal nor vertical; only Parallel finishing follows it.
 - `truncated` true means the orientation has more planes or holes than are listed; only listed surfaces can be used.
 - `workholding`, when present, is setup 1's modelled vise or clamps (see WORKHOLDING).
+- `workholding_library` lists the vises and clamps you may choose from, by `number`, with their sizes (see PLANNING THE HOLDING).
 
 STRATEGIES (the only six)
 - Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only the model's outline. Face makes levels × passes strokes, at most 2,000: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`. For example, 4 mm of stock above the face of an 84 mm wide stock and a Ø10 mill at `stepover_percent` 5 need a `stepdown` of 0.4 mm or more.
@@ -241,12 +264,12 @@ STRATEGIES (the only six)
 WORKHOLDING
 - `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock) or `Clamps`. `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
 - The boxes are keep-out zones. The program grows each box by `gap` mm on every side and refuses any move, rapids and retracts included, that brings the cutter or the tool holder within `gap` of a box. A refused move comes back as a problem with the stage `workholding`, by setup and operation. Parallels, bolts, the table and the machine body are not checked.
-- The later setups (every setup after the first) get the same kind of workholding and library entry, laid out by the program once it has generated their toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
+- The later setups (every setup after the first) are held by the library entry their `holder` names, or by setup 1's own entry when it is null (see PLANNING THE HOLDING). That entry is laid out by the program once it has generated the setup's toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
 - Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap` (finish them from a later setup), or move them to a setup where the sides are free.
 - `clearance_above_stock_top` is present when a box and its gap reach above the stock top, and says how far. The default `clearance` of 15 already covers a height below 15, so leave `clearance` null then. When the height is 15 or more, give every operation a `clearance` greater than it: a machine that retracts to a clearance plane refuses a plan whose plane (the highest `clearance` in a setup) is not above the boxes and their gap, and rapids then pass over the boxes. Otherwise leave `clearance` null.
 - A `workholding` problem names its place in the setup's work coordinates (X, Y and Z measured from the setup's work zero, Z up), not from the model's corner as the report's boxes are: convert before comparing.
 
-SPEEDS AND FEEDS
+{holding}SPEEDS AND FEEDS
 - `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
 - The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter. Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
 - Drills are checked like end mills: a Drill's `feed` is divided by rpm × flutes in the same way and must give a chip load inside the band of the drill's diameter, so choose drill feeds inside those bands. A small drill needs a high rpm to reach the surface speed.
@@ -1435,6 +1458,64 @@ pub(crate) mod tests {
         // The old line that said clamps are not modelled is gone.
         assert!(!text.contains("Clamps are not modelled"));
     }
+    /// The text of the section called `title`: from its heading to the
+    /// blank line that ends it.
+    fn section(text: &str, title: &str) -> String {
+        let at = text
+            .find(&format!("\n{title}\n"))
+            .unwrap_or_else(|| panic!("no {title} section"))
+            + 1;
+        let end = text[at..].find("\n\n").map_or(text.len(), |n| at + n);
+        text[at..end].to_string()
+    }
+    #[test]
+    fn the_instructions_teach_planning_the_holding_before_any_operation() {
+        let text = instructions();
+        let at = |title: &str| text.find(&format!("\n{title}\n")).unwrap();
+        // After WORKHOLDING, which describes setup 1's boxes, and before the rules.
+        assert!(at("WORKHOLDING") < at("PLANNING THE HOLDING"));
+        assert!(at("PLANNING THE HOLDING") < at("SPEEDS AND FEEDS"));
+        let holding = section(&text, "PLANNING THE HOLDING");
+        for needed in [
+            "before you plan any operation",
+            "the stock the earlier setups left",
+            "a faced top makes the flipped stock shorter",
+            "cut sides make it narrower",
+            "`workholding_library`",
+            "`number`",
+            "`holder`",
+            "`max_opening`",
+            "`grip`",
+            "`bite`",
+            "null",
+            "Setup 1",
+            "material at both jaws",
+            "up to the grip",
+            "the bottom",
+            "at least 1 mm above the grip",
+            "material under each clamp's bite",
+            "`bottom_offset`",
+            "in a later setup",
+            "stage `workholding`",
+            "names the earlier operation",
+        ] {
+            assert!(holding.contains(needed), "{needed}\n{holding}");
+        }
+        // The tools are named only when they are offered.
+        for tool in ["check_plan", "stock_after", "check_holding"] {
+            assert!(!text.contains(tool), "{tool}");
+            assert!(holding_rules(true).contains(tool), "{tool}");
+            assert!(!holding_rules(false).contains(tool), "{tool}");
+        }
+        assert_eq!(holding_rules(false), format!("{holding}\n\n"));
+        // The report's key is explained, and WORKHOLDING no longer says every
+        // later setup gets setup 1's entry.
+        assert!(text.contains("- `workholding_library` lists"));
+        let workholding = section(&text, "WORKHOLDING");
+        assert!(!workholding.contains("get the same kind of workholding and library entry"));
+        assert!(workholding.contains("`holder`") && workholding.contains("null"));
+        assert!(workholding.contains("laid out by the program"));
+    }
     #[tokio::test]
     async fn the_report_and_the_workholding_problems_carry_no_entry_name_or_note() {
         use crate::proposal::tests::hold;
@@ -1469,6 +1550,12 @@ pub(crate) mod tests {
             "{part}"
         );
         assert!(part.contains("\"gap\":2.0"), "{part}");
+        // The library is told by number and size: both starters, no name.
+        assert!(
+            part.contains("\"workholding_library\":[{\"number\":1,\"kind\":\"Vise\",\"grip\":8.0,"),
+            "{part}"
+        );
+        assert!(part.contains("{\"number\":2,\"kind\":\"Clamp\","), "{part}");
         assert!(seen[1][3].1.contains("\"stage\":\"workholding\""));
         let all: String = seen
             .iter()
@@ -3010,6 +3097,7 @@ pub(crate) mod tests {
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise.".into(),
+                holder: None,
                 operations: vec![
                     proposal::tests::op("Face", 1, top),
                     proposal::tests::op("Contour", 1, vec![]),

@@ -11,6 +11,7 @@ use crate::{
 };
 use clipper2::{EndType, JoinType};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 /// Orientation name (the part axis that points up) and its setup rotation.
 pub const ORIENTATIONS: [(&str, [f32; 3]); 6] = [
@@ -35,11 +36,56 @@ pub struct PartReport {
     pub material: MaterialReport,
     pub machine: MachineReport,
     pub tools: Vec<ToolReport>,
+    /// The vises and clamps of the user's library a setup may be held by,
+    /// numbered from 1 in library order, by size only.
+    pub workholding_library: Vec<LibraryEntry>,
     /// Setup 1's modelled vise or clamps; absent without them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workholding: Option<WorkholdingReport>,
     /// The first entry is setup 1's orientation.
     pub orientations: Vec<OrientationReport>,
+}
+/// One vise or clamp of the library, told by number and size: never its name,
+/// notes or id. `proposal::build` finds the entry again by `number`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LibraryEntry {
+    /// Counts from 1 over `library`.
+    pub number: usize,
+    /// "Vise" or "Clamp", as the library names its kinds.
+    pub kind: &'static str,
+    /// A vise: `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening`,
+    /// `grip`. A clamp: `length`, `width`, `height`, `bite`. In mm, sorted by
+    /// name; a size the entry lacks is left out.
+    #[serde(flatten)]
+    pub sizes: BTreeMap<&'static str, f32>,
+}
+/// The library entries a setup may use, in library order: those of a kind the
+/// program models. The report numbers them from 1 and a proposal's `holder`
+/// counts the same way.
+pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
+    doc.workholding
+        .iter()
+        .filter(|h| crate::holding::KINDS.contains(&h.kind()))
+        .collect()
+}
+fn library_report(doc: &Document) -> Vec<LibraryEntry> {
+    library(doc)
+        .into_iter()
+        .enumerate()
+        .map(|(n, holder)| LibraryEntry {
+            number: n + 1,
+            kind: if holder.kind() == "Vise" {
+                "Vise"
+            } else {
+                "Clamp"
+            },
+            sizes: holder
+                .keys()
+                .iter()
+                .filter_map(|k| Some((*k, r2(num(&holder.p, k)?))))
+                .collect(),
+        })
+        .collect()
 }
 /// Setup 1's vise or clamps as keep-out zones. Only their kind, size, place
 /// and clearance gap are told: never the library entry's name or notes.
@@ -1158,6 +1204,7 @@ fn describe(
                 })
             })
             .collect(),
+        workholding_library: library_report(doc),
         workholding: workholding_report(doc, mesh, setup1)?,
         orientations: order
             .into_iter()
@@ -1191,11 +1238,11 @@ pub(crate) mod tests {
     fn the_report_carries_setup_1s_clamps_gap_and_the_clearance_they_need() {
         let (doc, mesh) = block();
         assert_eq!(report(&doc, &mesh).unwrap().workholding, None);
-        // Without workholding the report is what it was.
+        // Without workholding the report has no `workholding` of setup 1.
         assert!(
             !serde_json::to_string(&report(&doc, &mesh).unwrap())
                 .unwrap()
-                .contains("workholding")
+                .contains("\"workholding\"")
         );
         // The fixture's stock: the model is 120 x 80 x 40, with 4 mm above,
         // 3 below and 2 on each side; the clamp reaches 48 mm out and 12 onto
@@ -1232,6 +1279,68 @@ pub(crate) mod tests {
         holder.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
         let json = serde_json::to_string(&report(&doc, &mesh).unwrap()).unwrap();
         assert!(!json.contains("ZZ-SECRET") && !json.contains(&id), "{json}");
+    }
+    #[test]
+    fn the_report_lists_the_workholding_library_by_number_in_sizes_only() {
+        let (mut doc, mesh) = block();
+        // No library, no entries: the key is there and empty.
+        let r = report(&doc, &mesh).unwrap();
+        assert!(r.workholding_library.is_empty());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"workholding_library\":[]"), "{json}");
+        // The starters, then an entry of a kind the planner cannot use, then
+        // one more clamp: numbers count the usable entries from 1, in order.
+        doc.adopt_holders();
+        let mut magnet = crate::holding::Holder::new("Magnet", "ZZ-SECRET-MAGNET");
+        magnet
+            .p
+            .insert("notes".into(), "ZZ-SECRET-MAGNET-NOTE".into());
+        doc.workholding.insert(1, magnet);
+        let mut long = crate::holding::Holder::new("Clamp", "ZZ-SECRET-LONG");
+        for (k, v) in [
+            ("length", "80"),
+            ("width", "25"),
+            ("height", "30"),
+            ("bite", "15"),
+        ] {
+            long.p.insert(k.into(), v.into());
+        }
+        long.p.insert("notes".into(), "ZZ-SECRET-LONG-NOTE".into());
+        doc.workholding.push(long);
+        for h in &mut doc.workholding {
+            h.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        }
+        doc.workholding[0]
+            .p
+            .insert("name".into(), "ZZ-SECRET-VISE".into());
+        let r = report(&doc, &mesh).unwrap();
+        let numbers: Vec<_> = r
+            .workholding_library
+            .iter()
+            .map(|e| (e.number, e.kind))
+            .collect();
+        assert_eq!(numbers, [(1, "Vise"), (2, "Clamp"), (3, "Clamp")]);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(concat!(
+                "\"workholding_library\":[",
+                "{\"number\":1,\"kind\":\"Vise\",\"grip\":8.0,\"jaw_height\":30.0,",
+                "\"jaw_thickness\":20.0,\"jaw_width\":100.0,\"max_opening\":120.0},",
+                "{\"number\":2,\"kind\":\"Clamp\",\"bite\":12.0,\"height\":25.0,",
+                "\"length\":60.0,\"width\":20.0},",
+                "{\"number\":3,\"kind\":\"Clamp\",\"bite\":15.0,\"height\":30.0,",
+                "\"length\":80.0,\"width\":25.0}]"
+            )),
+            "{json}"
+        );
+        // Never a name, a note or an id.
+        assert!(!json.contains("ZZ-SECRET"), "{json}");
+        for h in &doc.workholding {
+            assert!(!json.contains(&h.id), "{json}");
+        }
+        // The planner's numbers are these entries, in this order.
+        let names: Vec<_> = library(&doc).iter().map(|h| h.kind()).collect();
+        assert_eq!(names, ["Vise", "Clamp", "Clamp"]);
     }
     #[test]
     fn a_vise_is_reported_as_two_jaws_from_the_stock_bottom_and_needs_no_clearance() {

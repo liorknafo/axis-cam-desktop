@@ -3,6 +3,7 @@
 //! job; the model's free text is displayed or stored as notes.
 use crate::{
     analysis::{self, OrientationReport, PartReport, PlaneReport},
+    holding,
     mesh::Mesh,
     model::{CLEARANCE, Document, Operation, Setup, Strategy, Tool, get, num},
     surface::Selection,
@@ -47,6 +48,9 @@ pub struct ProposedSetup {
     pub name: String,
     pub origin: String,
     pub workholding: String,
+    /// The `number` of the `workholding_library` entry that holds this setup,
+    /// or None: setup 1's own, which for a later setup is setup 1's.
+    pub holder: Option<usize>,
     pub operations: Vec<ProposedOp>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -159,6 +163,7 @@ pub fn schema() -> Value {
         "name": text(),
         "origin": choice(&ORIGINS, false),
         "workholding": text(),
+        "holder": {"type": ["integer", "null"]},
         "operations": {"type": "array", "items": operation},
     }));
     object(json!({
@@ -716,6 +721,17 @@ pub fn build(
             first.unwrap_or("?")
         ));
     }
+    // The entries a proposal's `holder` counts over, as the report numbers
+    // them, and the number of setup 1's own, which only setup 1 may name.
+    let library = analysis::library(doc);
+    let own = holding::modelled(setup1)
+        .then(|| {
+            library
+                .iter()
+                .position(|h| h.id == get(&setup1.p, "holder"))
+        })
+        .flatten()
+        .map(|i| i + 1);
     let mut setups: Vec<Setup> = vec![];
     for (si, proposed) in proposal.setups.iter().take(MAX_SETUPS).enumerate() {
         let mut wrong = |operation: Option<usize>, message: String| {
@@ -726,6 +742,26 @@ pub fn build(
                 message,
             })
         };
+        // Setup 1 is held by the user's own entry, so for it `holder` only
+        // says which that is; a later setup is held by the entry it names.
+        let holder = proposed.holder.and_then(|number| {
+            let Some(holder) = number.checked_sub(1).and_then(|i| library.get(i)) else {
+                wrong(
+                    None,
+                    format!("workholding {number} is not in workholding_library."),
+                );
+                return None;
+            };
+            if si == 0 && own != Some(number) {
+                let or = own.map(|n| format!(" or {n}")).unwrap_or_default();
+                wrong(
+                    None,
+                    format!("holder must be null{or}: setup 1's workholding is the user's."),
+                );
+                return None;
+            }
+            (si > 0).then_some(*holder)
+        });
         let Some(orientation) = report
             .orientations
             .iter()
@@ -780,10 +816,11 @@ pub fn build(
                 setup.p.insert((*key).into(), value.to_string());
             }
             setup.p.insert("origin".into(), proposed.origin.clone());
-            // The same workholding as setup 1 until the user says otherwise;
-            // the planner's advice for it is in the notes. A vise or clamps
-            // of setup 1 are carried without their position: the plan check
-            // lays them out for this setup's toolpaths.
+            // The workholding entry the proposal chose, or setup 1's own;
+            // the planner's advice for it is in the notes. Either is set
+            // without a position, which a new setup does not have: the plan
+            // check lays it out for this setup's toolpaths. The clearance gap
+            // is the user's, from setup 1.
             setup
                 .p
                 .insert("fixture".into(), get(&setup1.p, "fixture").into());
@@ -791,6 +828,15 @@ pub fn build(
                 if let Some(value) = setup1.p.get(key) {
                     setup.p.insert(key.into(), value.clone());
                 }
+            }
+            if let Some(holder) = holder {
+                let holding = if holder.kind() == "Vise" {
+                    "Vise"
+                } else {
+                    "Clamps"
+                };
+                setup.p.insert("holding".into(), holding.into());
+                setup.p.insert("holder".into(), holder.id.clone());
             }
             setup
                 .p
@@ -940,6 +986,7 @@ pub(crate) mod tests {
                     name: "Top".into(),
                     origin: "Stock top center".into(),
                     workholding: "Vise on the long sides.".into(),
+                    holder: None,
                     operations: vec![
                         op("Face", 1, ids(report, "+Z", 0.)),
                         op("Pocket", 1, ids(report, "+Z", 12.)),
@@ -952,6 +999,7 @@ pub(crate) mod tests {
                     name: "Underside".into(),
                     origin: "Model origin".into(),
                     workholding: "Flip about X; clamp on the machined walls.".into(),
+                    holder: None,
                     operations: vec![
                         op("Face", 1, ids(report, "-Z", 0.)),
                         op("Pocket", 1, ids(report, "-Z", 6.)),
@@ -1115,6 +1163,170 @@ pub(crate) mod tests {
         let built = build(&doc, &mesh, &report, &good(&report)).unwrap();
         assert_eq!(get(&built.setups[1].p, "holding"), "Vise");
         assert!(!built.setups[1].p.contains_key("vise_grip"));
+    }
+    /// The block held in setup 1 by the starter vise (library entry 1; the
+    /// clamp is entry 2), the report that lists them, and the two-setup plan.
+    fn with_library(pairs: &[(&str, &str)]) -> (Document, Mesh, PartReport, Proposal) {
+        let (mut doc, mesh, _) = block();
+        hold(&mut doc, "Vise", pairs);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let proposal = good(&report);
+        (doc, mesh, report, proposal)
+    }
+    #[test]
+    fn the_schema_asks_every_setup_for_its_holder_as_an_integer_or_null() {
+        let schema = schema();
+        let setup = &schema["properties"]["setups"]["items"];
+        assert_eq!(
+            setup["properties"]["holder"],
+            json!({"type": ["integer", "null"]})
+        );
+        assert!(
+            setup["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("holder"))
+        );
+        // A reply with a number reads back as one; a missing key reads as null.
+        let (_, _, report) = block();
+        let mut value = serde_json::to_value(good(&report)).unwrap();
+        assert_eq!(value["setups"][1]["holder"], Value::Null);
+        value["setups"][1]["holder"] = json!(2);
+        let parsed = parse(&value.to_string()).unwrap();
+        assert_eq!(parsed.setups[1].holder, Some(2));
+        assert_eq!(parsed.setups[0].holder, None);
+        value["setups"][1]["holder"] = json!(-1);
+        assert!(parse(&value.to_string()).is_err());
+    }
+    #[test]
+    fn a_later_setup_builds_with_the_library_entry_it_names() {
+        let (doc, mesh, report, mut proposal) = with_library(&[
+            ("vise_axis", "Y"),
+            ("vise_grip", "8"),
+            ("holding_gap", "3.5"),
+        ]);
+        let (vise, clamp) = (doc.workholding[0].id.clone(), doc.workholding[1].id.clone());
+        assert_eq!(get(&doc.setups[0].p, "holder"), vise);
+        // Entry 2 is a clamp: setup 2 is held by Clamps, with that entry,
+        // the user's clearance gap and no position yet.
+        proposal.setups[1].holder = Some(2);
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        let (first, second) = (&built.setups[0], &built.setups[1]);
+        assert_eq!(
+            (get(&first.p, "holding"), get(&first.p, "holder")),
+            ("Vise", vise.as_str())
+        );
+        assert_eq!(
+            (get(&second.p, "holding"), get(&second.p, "holder")),
+            ("Clamps", clamp.as_str())
+        );
+        assert_eq!(get(&second.p, "holding_gap"), "3.5");
+        for key in ["clamps", "vise_axis", "vise_offset", "vise_grip"] {
+            assert!(!second.p.contains_key(key), "{key}");
+        }
+        assert!(!crate::holding::placed(second));
+        // Null keeps setup 1's, as before; naming setup 1's own entry is the same.
+        for holder in [None, Some(1)] {
+            proposal.setups[1].holder = holder;
+            let built = build(&doc, &mesh, &report, &proposal).unwrap();
+            let second = &built.setups[1];
+            assert_eq!(
+                (get(&second.p, "holding"), get(&second.p, "holder")),
+                ("Vise", vise.as_str()),
+                "{holder:?}"
+            );
+            assert!(!second.p.contains_key("vise_axis"));
+        }
+    }
+    #[test]
+    fn a_later_setup_can_be_held_when_setup_1_is_not_and_can_switch_kind() {
+        // Setup 1 without workholding; the planner holds setup 2 with a vise.
+        let (mut doc, mesh, _) = block();
+        doc.adopt_holders();
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let mut proposal = good(&report);
+        proposal.setups[1].holder = Some(1);
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        assert!(!built.setups[0].p.contains_key("holding"));
+        assert_eq!(get(&built.setups[1].p, "holding"), "Vise");
+        assert_eq!(get(&built.setups[1].p, "holder"), doc.workholding[0].id);
+        assert!(!built.setups[1].p.contains_key("holding_gap"));
+        // Setup 1 clamped, setup 2 in a vise.
+        let (mut doc, mesh, _) = block();
+        crate::proposal::tests::hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:10")]);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let mut proposal = good(&report);
+        proposal.setups[1].holder = Some(1);
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        assert_eq!(get(&built.setups[0].p, "holding"), "Clamps");
+        assert_eq!(get(&built.setups[1].p, "holding"), "Vise");
+        assert_eq!(get(&built.setups[1].p, "holder"), doc.workholding[0].id);
+    }
+    #[test]
+    fn a_holder_that_is_not_in_the_library_or_not_setup_1s_is_refused() {
+        let (doc, mesh, report, mut proposal) =
+            with_library(&[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let problems = |proposal: &Proposal| {
+            build(&doc, &mesh, &report, proposal)
+                .unwrap_err()
+                .into_iter()
+                .map(|p| (p.setup, p.operation, p.stage, p.line()))
+                .collect::<Vec<_>>()
+        };
+        // Past the end of the library, and 0: the library counts from 1.
+        for number in [9, 0, 3] {
+            proposal.setups[1].holder = Some(number);
+            assert_eq!(
+                problems(&proposal),
+                [(
+                    2,
+                    None,
+                    "structure",
+                    format!("Setup 2: workholding {number} is not in workholding_library.")
+                )]
+            );
+        }
+        proposal.setups[1].holder = None;
+        // Setup 1 is the user's: null or its own entry, nothing else.
+        for ok in [None, Some(1)] {
+            proposal.setups[0].holder = ok;
+            assert!(build(&doc, &mesh, &report, &proposal).is_ok(), "{ok:?}");
+        }
+        proposal.setups[0].holder = Some(2);
+        assert_eq!(
+            problems(&proposal),
+            [(
+                1,
+                None,
+                "structure",
+                "Setup 1: holder must be null or 1: setup 1's workholding is the user's.".into()
+            )]
+        );
+        proposal.setups[0].holder = Some(9);
+        assert_eq!(
+            problems(&proposal),
+            [(
+                1,
+                None,
+                "structure",
+                "Setup 1: workholding 9 is not in workholding_library.".into()
+            )]
+        );
+        // Setup 1 with no workholding of its own has no entry to name.
+        let (mut doc, mesh, _) = block();
+        doc.adopt_holders();
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let mut proposal = good(&report);
+        proposal.setups[0].holder = Some(1);
+        let found: Vec<_> = build(&doc, &mesh, &report, &proposal)
+            .unwrap_err()
+            .iter()
+            .map(Problem::line)
+            .collect();
+        assert_eq!(
+            found,
+            ["Setup 1: holder must be null: setup 1's workholding is the user's."]
+        );
     }
     #[test]
     fn clearance_is_the_proposals_to_raise_and_never_below_the_default() {

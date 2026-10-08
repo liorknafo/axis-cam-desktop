@@ -1029,6 +1029,7 @@ impl App {
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise on the long sides.".into(),
+                holder: None,
                 operations: vec![
                     op("Face", plane(0.)),
                     op("Pocket", plane(12.)),
