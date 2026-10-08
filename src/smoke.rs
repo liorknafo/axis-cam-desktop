@@ -141,6 +141,8 @@ impl App {
                 // on (it uploads images of 2 MiB and more after the first),
                 // so it is captured twice: the second file replaces the first.
                 114 | 115 => "91-planner-pictures".into(),
+                116 => "92-flipped-setup-leftover-stock".into(),
+                117 => "93-planner-tool-lines".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -849,8 +851,93 @@ impl App {
             }
             // The same screen again, with its pictures uploaded.
             115 => vec![],
-            _ => {
+            116 => {
+                // Setup 1 only faces the 10 mm above the part; setup 2 turns
+                // the part over and is held in the starter vise. The setup
+                // editor shows the stock setup 2 starts from, and the jaws
+                // start at its bottom.
+                use crate::model::{Setup, Strategy};
+                // The run's last check of the earlier screens: the operation
+                // of the Workholding screens is still previewed.
                 assert!(self.active_simulation().is_some(), "{}", self.status);
+                self.planner = crate::Planner::Idle;
+                self.plan_timeline.clear();
+                self.plan_overview = None;
+                self.stock = true;
+                self.paths = false;
+                self.camera = crate::viewport::Camera::default();
+                self.doc.setups.truncate(1);
+                self.doc.setups[0]
+                    .operations
+                    .retain(|o| o.strategy == Strategy::Face);
+                let mut setup = Setup::new(self.doc.setups[0].machine.clone(), "G55");
+                setup.p.insert("name".into(), "Flipped underside".into());
+                setup.p.insert("rx".into(), "180".into());
+                let mesh = self.imported_mesh.as_ref().unwrap();
+                let place = crate::stock::Placement::new(mesh, Some(&setup));
+                let id = mesh
+                    .surfaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        (place.transform(s.center)[2] - place.bounds.max[2]).abs() < 0.001
+                    })
+                    .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+                    .unwrap()
+                    .0;
+                let mut face =
+                    crate::model::Operation::new(Strategy::Face, self.doc.tools[0].id.clone());
+                face.geometry.clear();
+                face.surfaces = Some(crate::surface::Selection {
+                    mesh_fingerprint: mesh.fingerprint.clone(),
+                    ids: vec![id],
+                });
+                face.p.insert("boundary".into(), "Stock silhouette".into());
+                face.p
+                    .insert("containment".into(), "Tool outside boundary".into());
+                setup.operations.push(face);
+                self.doc.setups.push(setup);
+                self.doc.sync_stock_sources();
+                // The smoke run's ticks only take screenshots, so the stock the
+                // earlier setups leave is worked out here, in line.
+                let _ = self.refresh_left_stock();
+                vec![
+                    Message::SelectSetup(1),
+                    Message::Edit(Target::Setup, "holding", "Vise".into()),
+                    Message::SetupEditor,
+                ]
+            }
+            117 => {
+                // The planner at its first request, going back to the plan:
+                // the tools the model has called, one line each, as the
+                // answers of the tools themselves read.
+                use Progress::*;
+                self.doc.setups.truncate(1);
+                self.doc.active = self.doc.setups[0].id.clone();
+                self.plan_model = self.settings.model.clone();
+                self.planner = crate::Planner::Running(Asking(1));
+                self.plan_timeline = smoke_steps(vec![
+                    (Analyzing, 52, Some(50), None),
+                    (Asking(1), 50, None, None),
+                ]);
+                self.plan_timeline[1].looks = self
+                    .smoke_tool_lines()
+                    .into_iter()
+                    .map(|line| crate::Shown {
+                        line: crate::ui::look_line(&crate::planner::Look {
+                            description: line,
+                            purpose: String::new(),
+                            png: None,
+                        }),
+                        warn: false,
+                        thumb: None,
+                    })
+                    .collect();
+                *self.plan_stream.lock().unwrap() = SMOKE_REPLY.into();
+                self.page = Page::Ai;
+                vec![]
+            }
+            _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.persist();
                 return iced::window::latest().and_then(iced::window::close);
@@ -863,6 +950,27 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
+            116 => {
+                // The stock setup 2 starts from is the one worked out, and the
+                // jaws are drawn round it.
+                let _ = self.refresh_left_stock();
+                let (stock, current) = self.known_stock(1);
+                let stock = stock.expect("setup 2's stock");
+                assert!(current, "the stock before setup 2 was not worked out");
+                let original = self.doc.setup_stock(1, self.part_mesh()).unwrap();
+                assert!(
+                    stock.dimensions()[2] < original.dimensions()[2] - 1.,
+                    "{stock:?} against {original:?}"
+                );
+                eprintln!(
+                    "Screen 92: setup 2 starts from {}, its original box is {}",
+                    crate::stock::dimensions_text(stock.dimensions()),
+                    crate::stock::dimensions_text(original.dimensions())
+                );
+                assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Vise");
+                assert_eq!(crate::ui::holding_boxes(self).len(), 2, "{}", self.status);
+                assert!(crate::ui::stock_note(self).is_none());
+            }
             // The overview's picture at the top of the visible part, so the
             // lines of the open request fit under it.
             115 => {
@@ -992,6 +1100,90 @@ impl App {
             warn: false,
             thumb: None,
         }
+    }
+    /// The timeline's lines for tool calls made on the imported part, in the
+    /// order a model might make them: it checks a draft of two setups, asks for
+    /// the stock before the second and for the starter vise on it, then looks
+    /// up the cutting data of its tool and a surface. Each is the line the
+    /// tool itself gives (`planner_tools::answer`).
+    fn smoke_tool_lines(&self) -> Vec<String> {
+        use crate::planner_tools::{self as tools, ToolState};
+        use crate::proposal::{Proposal, ProposedOp, ProposedSetup};
+        let scene = self.smoke_scene();
+        let report = scene.report.clone();
+        let plane = |up: &str, kind: &str| {
+            let orientation = report.orientations.iter().find(|o| o.up == up);
+            let found = orientation.and_then(|o| o.planes.iter().find(|p| p.kind == kind));
+            found.expect("plane").surfaces.clone()
+        };
+        let flat = report
+            .tools
+            .iter()
+            .find(|t| t.kind == "Flat end mill")
+            .expect("flat tool")
+            .number;
+        let op = |strategy: &str, surfaces: Vec<usize>| ProposedOp {
+            strategy: strategy.into(),
+            name: strategy.into(),
+            tool: flat,
+            surfaces,
+            rpm: 8000.,
+            feed: 800.,
+            coolant: "Flood".into(),
+            reason: "smoke".into(),
+            ..Default::default()
+        };
+        let up = report.orientations[0].up;
+        let floor = plane(up, "floor");
+        let proposal = Proposal {
+            summary:
+                "Face the top and clear the pocket, then turn the part over and face the underside."
+                    .into(),
+            setups: vec![
+                ProposedSetup {
+                    orientation: up.into(),
+                    name: "Top".into(),
+                    origin: "Stock top center".into(),
+                    workholding: "Vise on the long sides.".into(),
+                    holder: None,
+                    operations: vec![
+                        op("Face", plane(up, "top")),
+                        op("Pocket", floor.clone()),
+                        op("Contour", vec![]),
+                    ],
+                },
+                ProposedSetup {
+                    orientation: "-Z".into(),
+                    name: "Underside".into(),
+                    origin: "Model origin".into(),
+                    workholding: "Turn over; the vise on the long sides.".into(),
+                    holder: Some(1),
+                    operations: vec![op("Face", plane("-Z", "top"))],
+                },
+            ],
+            unmachined: vec![],
+            warnings: vec![],
+        };
+        let mut state = ToolState::new(scene);
+        [
+            (
+                tools::CHECK_PLAN,
+                serde_json::json!({ "proposal": proposal }),
+            ),
+            (tools::STOCK_AFTER, serde_json::json!({ "setup": 2 })),
+            (
+                tools::CHECK_HOLDING,
+                serde_json::json!({ "setup": 2, "holder": 1 }),
+            ),
+            (tools::CUTTING_DATA, serde_json::json!({ "tool": flat })),
+            (
+                tools::SURFACE_INFO,
+                serde_json::json!({ "surface": floor[0] }),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, arguments)| tools::answer(name, &arguments.to_string(), &mut state).line)
+        .collect()
     }
     /// A checked plan for the imported block, as the planner shows it.
     fn smoke_plan_preview(&self) -> std::sync::Arc<crate::PlanPreview> {
@@ -5752,7 +5944,7 @@ mod tests {
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), false);
         assert_eq!(
             rows.last().unwrap().looks[3].line,
-            "OpenAI refused the request; sending it again without the picture tool."
+            "OpenAI refused the request; sending it again without its tools."
         );
         // An event for a request that is not on the timeline joins nothing.
         a.record_plan_event(Event::Dropped(3, Dropped::Tool));
@@ -5765,9 +5957,9 @@ mod tests {
         let rows = crate::ui::timeline_rows(&a, std::time::Instant::now(), true);
         assert!(rows[0].text.ends_with("· 1 look"), "{}", rows[0].text);
         assert!(
-            rows[0].text.ends_with(
-                "· sent again without pictures · sent again without the picture tool · 1 look"
-            ),
+            rows[0]
+                .text
+                .ends_with("· sent again without pictures · sent again without tools · 1 look"),
             "{}",
             rows[0].text
         );
@@ -5783,6 +5975,27 @@ mod tests {
         // A new run starts without them.
         a.drop_plan();
         assert!(a.plan_overview.is_none() && a.plan_timeline.is_empty());
+    }
+    #[test]
+    fn the_tool_lines_of_the_smoke_timeline_are_the_tools_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = planning_app(&dir);
+        let lines = a.smoke_tool_lines();
+        // One line per call, each the sentence its tool gives; the stock
+        // before setup 2 is the one setup 1's facing left.
+        let starts = [
+            "Checked a draft: ",
+            "Stock before setup 2: ",
+            "Vise 1 for setup 2: ",
+            "Cutting data for T1: ",
+            "Surface ",
+        ];
+        assert_eq!(lines.len(), starts.len(), "{lines:?}");
+        for (line, start) in lines.iter().zip(starts) {
+            assert!(line.starts_with(start), "{line}");
+        }
+        assert!(lines[1].contains("; bottom cut "), "{}", lines[1]);
+        assert!(lines[4].contains(": floor "), "{}", lines[4]);
     }
     #[test]
     fn a_finished_line_says_what_was_refused_and_how_many_pictures_were_seen() {
@@ -5815,7 +6028,7 @@ mod tests {
         let text: Vec<_> = rows.iter().map(|r| r.text.as_str()).collect();
         // What follows the step and its time.
         let tail = |i: usize| text[i].split(" · ").skip(2).collect::<Vec<_>>();
-        assert_eq!(tail(0), ["sent again without the picture tool"]);
+        assert_eq!(tail(0), ["sent again without tools"]);
         assert_eq!(text.len(), 6);
         assert!(rows.iter().all(|r| r.looks.is_empty()));
         assert_eq!(tail(1), ["passed"]);

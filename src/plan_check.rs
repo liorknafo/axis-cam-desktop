@@ -2118,10 +2118,12 @@ mod tests {
         assert!(!check.passed && job.is_none());
         // Setup 1 holds; setup 2 does not. (Its bottom, also cut away by the
         // Contour and the Pocket, is the other problem.) Within the 300
-        // characters a message keeps, the advice comes before the names.
+        // characters a message keeps, the advice comes before the names. The
+        // band the jaws grip is setup 1's top, so the advice is not a
+        // `bottom_offset`, which keeps setup 1's bottom.
         let found = stages(&check);
         assert!(
-            found[0].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder. Setup 1, operation 3 is "),
+            found[0].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there and cut those sides in this setup instead (setup 2), or choose another holder. Setup 1, operation 3 is "),
             "{found:?}"
         );
         assert!(

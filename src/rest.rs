@@ -192,6 +192,20 @@ impl<'a> Removed<'a> {
     pub fn at(&self, p: [f32; 3]) -> bool {
         self.by(p).is_some()
     }
+    /// How far the current frame's up (+Z) points up in the frame of the
+    /// setup that made `source`'s cuts (the first cut of any operation when
+    /// None): 1 when the two setups face the same way, -1 when the current one
+    /// is turned over, about 0 when it is turned on its side. None without
+    /// cuts, or when no cut has that source.
+    pub fn up_in(&self, source: Option<(u16, u16)>) -> Option<f32> {
+        let cut = match source {
+            Some(source) => self.cuts.iter().find(|c| c.source == source)?,
+            None => self.cuts.first()?,
+        };
+        let origin = transfer([0.; 3], self.current, cut.frame);
+        let up = transfer([0., 0., 1.], self.current, cut.frame);
+        Some(up[2] - origin[2])
+    }
     /// The operation whose cut removed material at `p` (`at`), as its
     /// `Cut::source`: the first such cut's, in the order they were made.
     pub fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {

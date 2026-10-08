@@ -2813,8 +2813,8 @@ pub(crate) const PICTURES_SENT: &str = " With the box below ticked, pictures the
 pub(crate) fn refusal(what: Dropped) -> (&'static str, &'static str) {
     match what {
         Dropped::Tool => (
-            "OpenAI refused the request; sending it again without the picture tool.",
-            "sent again without the picture tool",
+            "OpenAI refused the request; sending it again without its tools.",
+            "sent again without tools",
         ),
         Dropped::Pictures => (
             "OpenAI refused the request; sending it again without pictures.",

@@ -1116,6 +1116,42 @@ fn missing(
         without
     }
 }
+/// The operations whose cuts removed the material at the `failed` samples,
+/// with how many each removed: the most first, equal counts by number.
+fn blamed(failed: &[[f32; 3]], removed: &crate::rest::Removed) -> Vec<((u16, u16), usize)> {
+    let mut counts: Vec<((u16, u16), usize)> = vec![];
+    for source in failed.iter().filter_map(|p| removed.by(*p)) {
+        match counts.iter_mut().find(|(s, _)| *s == source) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((source, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    counts
+}
+/// What to do about the jaws' band, `band` mm above the stock's bottom, that
+/// earlier cuts removed (the `failed` samples), by where the band lies in the
+/// frame of the setup that cut most of it: at that setup's bottom, material
+/// can be left with its `bottom_offset`; at its top, or on its side (when
+/// this setup is turned over or onto its side), that cannot, and the sides
+/// are cut in the setup that grips them, above the jaws. The bottom when it
+/// cannot be told.
+fn band_advice(
+    failed: &[[f32; 3]],
+    removed: &crate::rest::Removed,
+    setup: usize,
+    band: &str,
+) -> String {
+    let source = blamed(failed, removed).first().map(|(source, _)| *source);
+    match removed.up_in(source) {
+        Some(up) if up < 0.5 => format!(
+            "Leave at least {band} mm there and cut those sides in this setup instead (setup {setup}), or choose another holder."
+        ),
+        _ => format!(
+            "Leave at least {band} mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder."
+        ),
+    }
+}
 /// The earlier operations that removed the material at the `failed`
 /// samples: those whose cuts removed at least a quarter of them, the most
 /// first (the most alone when none does). Said twice: by number, "setup 1,
@@ -1127,14 +1163,7 @@ fn cause(
     removed: &crate::rest::Removed,
     names: &dyn Fn(u16, u16) -> String,
 ) -> (String, String) {
-    let mut counts: Vec<((u16, u16), usize)> = vec![];
-    for source in failed.iter().filter_map(|p| removed.by(*p)) {
-        match counts.iter_mut().find(|(s, _)| *s == source) {
-            Some((_, n)) => *n += 1,
-            None => counts.push((source, 1)),
-        }
-    }
-    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let counts = blamed(failed, removed);
     let mut named: Vec<(u16, u16)> = counts
         .iter()
         .filter(|(_, n)| n * 4 >= failed.len())
@@ -1287,8 +1316,9 @@ pub fn holdable(
             if !bare.is_empty() {
                 let band = mm(height.1 - height.0);
                 let (who, late) = cause(&failed, removed, names);
+                let advice = band_advice(&failed, removed, n, &band);
                 found.push(format!(
-                    "Setup {n} cannot be held in the vise: {who} removed the material the jaws grip on {} from 0 to {band} mm above the stock's bottom. Leave at least {band} mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.{late}",
+                    "Setup {n} cannot be held in the vise: {who} removed the material the jaws grip on {} from 0 to {band} mm above the stock's bottom. {advice}{late}",
                     sides(&bare),
                 ));
             }
@@ -2739,6 +2769,47 @@ mod tests {
         let left = RestStock::new(&v, f).left(PART);
         let removed = Removed::new(&v, f);
         assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names).is_empty());
+    }
+    #[test]
+    fn the_advice_for_the_jaws_band_depends_on_where_it_lies_in_the_earlier_setup() {
+        // The same outside contour of setup 1, down to 3 mm above its bottom.
+        let tips = [3., 8., 13., 18., 23., 28., 33., 38.];
+        let (mut v, f, flipped) = untouched();
+        slot(&mut v, f, [-60., 60.], &[-30., 30.], &tips, 5., (0, 2));
+        let on_side = Frame::new(
+            &setup(&[("rx", "90")]),
+            &crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap(),
+        );
+        // Which way up the later setup is, seen from setup 1.
+        assert_eq!(Removed::new(&v, f).up_in(Some((0, 2))), Some(1.));
+        assert_eq!(Removed::new(&v, flipped).up_in(Some((0, 2))), Some(-1.));
+        assert!(Removed::new(&v, on_side).up_in(None).unwrap().abs() < 1e-5);
+        assert_eq!(Removed::new(&v, f).up_in(Some((0, 5))), None);
+        let (empty, _, _) = untouched();
+        assert_eq!(Removed::new(&empty, f).up_in(None), None);
+        // Turned over, setup 2 grips what was setup 1's top, and the bottom
+        // offset (which keeps setup 1's bottom) does not help.
+        let part = f.transfer_bounds(PART, flipped);
+        let left = RestStock::new(&v, flipped).left(part);
+        assert_eq!(left, v.transformed_bounds(flipped));
+        let removed = Removed::new(&v, flipped);
+        let found = holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names);
+        assert_eq!(
+            found,
+            [
+                "Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there and cut those sides in this setup instead (setup 2), or choose another holder. Setup 1, operation 3 is Contour \"Outside\"."
+            ]
+        );
+        assert!(!found[0].contains("bottom_offset"));
+        // The same cut seen from a setup facing the same way keeps the old advice.
+        let left = RestStock::new(&v, f).left(PART);
+        let removed = Removed::new(&v, f);
+        let found = holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names);
+        assert!(
+            found[0].contains("(for example with `bottom_offset`)"),
+            "{found:?}"
+        );
+        assert!(!found[0].contains("cut those sides"));
     }
     #[test]
     fn the_stock_must_stand_a_millimetre_above_the_jaws() {
