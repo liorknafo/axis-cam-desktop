@@ -654,7 +654,12 @@ pub fn sequence_with(
         // the later setup's nominal bounding-box settings for generation.
         setup.p.insert("stock_source".into(), "fresh".into());
         if let Some(v) = &volume {
-            setup.preview_stock = Some(v.transformed_bounds(frame));
+            // The stock earlier setups left: the original block in this
+            // frame, less the layers their cuts provably removed whole.
+            let part = Placement::new(mesh, Some(&setup))
+                .bounds
+                .scaled(1. / mesh.display_scale());
+            setup.preview_stock = Some(crate::rest::RestStock::new(v, frame).left(part));
         } else if blocked.is_none() {
             match stock::resolve(&setup, Some(mesh)) {
                 Ok(s) => volume = Some(Volume::new(s.stock, frame)),
@@ -1394,12 +1399,20 @@ mod cumulative_tests {
             next.volume.as_ref().unwrap().occupied
         );
         assert_eq!(previous.removed_volume(), next.inherited_volume());
-        let expected = previous
+        let mut expected = previous
             .volume
             .as_ref()
             .unwrap()
             .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
-        assert_eq!(next.plan.stock, expected);
+        // Setup 1 faced 4 mm (its stock_top) off the top, which is now the
+        // bottom; the pocket is inside the part and trims no side.
+        expected.min[2] += 4.;
+        let stock = next.plan.stock;
+        assert!(
+            (0..3).all(|k| (stock.min[k] - expected.min[k]).abs() < 0.001
+                && (stock.max[k] - expected.max[k]).abs() < 0.001),
+            "{stock:?} {expected:?}"
+        );
         let prior = next.volume.as_ref().unwrap().occupied.clone();
         next.seek(1.);
         assert!(next.removed_volume() > next.inherited_volume());
@@ -1411,6 +1424,73 @@ mod cumulative_tests {
         assert_eq!(
             previous.volume.as_ref().unwrap().cuts,
             next.volume.as_ref().unwrap().cuts
+        );
+    }
+    #[test]
+    fn a_flipped_setup_starts_from_the_stock_the_facing_left() {
+        let (mut doc, mesh) = fixture();
+        // Setup 1 only faces 2 mm off the top; setup 2 is flipped.
+        doc.setups[0].p.insert("stock_top".into(), "2".into());
+        doc.setups[0].operations.truncate(1);
+        let first = stock::resolve(&doc.setups[0], Some(&mesh)).unwrap().stock;
+        let carried = crate::volume::Volume::new(first, Frame::new(&doc.setups[0], &mesh))
+            .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
+        let stock = prepare(&doc, &mesh, 1, 0).unwrap().plan.stock;
+        let close = |a: f32, b: f32| (a - b).abs() < 0.001;
+        assert!(
+            close(stock.dimensions()[2], first.dimensions()[2] - 2.),
+            "{stock:?} {first:?}"
+        );
+        assert!(
+            close(stock.min[2], carried.min[2] + 2.),
+            "{stock:?} {carried:?}"
+        );
+        for k in 0..3 {
+            assert!(close(stock.max[k], carried.max[k]), "{stock:?} {carried:?}");
+        }
+        for k in 0..2 {
+            assert!(close(stock.min[k], carried.min[k]), "{stock:?} {carried:?}");
+        }
+        // The vise grips from the new bottom up.
+        let vise = crate::holding::starters()
+            .into_iter()
+            .find(|h| h.kind() == "Vise")
+            .unwrap();
+        let layout = crate::holding::Layout::Vise {
+            holder: vise.id.clone(),
+            axis_y: false,
+            offset: 0.,
+            grip: 5.,
+            gap: 2.,
+        };
+        let jaws = crate::holding::boxes(&layout, &vise, stock).unwrap();
+        assert_eq!(jaws.len(), 2);
+        for jaw in jaws {
+            assert_eq!(jaw.bounds.max[2], stock.min[2] + 5., "{jaw:?}");
+            assert!(close(jaw.bounds.max[2], carried.min[2] + 7.), "{jaw:?}");
+        }
+    }
+    #[test]
+    fn the_facing_still_trims_the_flipped_stock_among_thousands_of_other_cuts() {
+        // Setup 1 faces 4 mm off the top, then pockets, contours to the
+        // part's underside and drills: thousands of cuts whose long flutes
+        // reach the faced layer. Setup 2 is flipped.
+        let (doc, mesh) = crate::post::fixture::flipped_after(4);
+        let first = stock::resolve(&doc.setups[0], Some(&mesh)).unwrap().stock;
+        let carried = crate::volume::Volume::new(first, Frame::new(&doc.setups[0], &mesh))
+            .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
+        let sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        assert!(sim.volume.as_ref().unwrap().cuts.len() > 10_000);
+        let stock = sim.plan.stock;
+        assert!(
+            (stock.min[2] - (carried.min[2] + 4.)).abs() < 0.001,
+            "{stock:?} {carried:?}"
+        );
+        // The 3 mm of stock below the part's underside is uncut all round,
+        // so the sides stay.
+        assert_eq!(
+            (stock.max, &stock.min[..2]),
+            (carried.max, &carried.min[..2])
         );
     }
     #[test]

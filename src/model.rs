@@ -1077,10 +1077,12 @@ impl Document {
     }
     /// The starting stock box of setup `setup` in that setup's frame, in
     /// millimetres: the first setup's own stock, and for a later one the first
-    /// setup's stock carried into its frame, as the simulation does (its own
-    /// stock keys are ignored). None when it cannot be told: the first
-    /// setup's stock cannot be resolved, a later setup needs the part `mesh`
-    /// (to place its frame) or has no valid rotation and translation.
+    /// setup's stock carried into its frame (its own stock keys are ignored),
+    /// which the simulation then trims by the layers earlier setups removed
+    /// (`rest::RestStock::left`); this cannot simulate. None when it cannot
+    /// be told: the first setup's stock cannot be resolved, a later setup
+    /// needs the part `mesh` (to place its frame) or has no valid rotation
+    /// and translation.
     pub fn setup_stock(
         &self,
         setup: usize,
@@ -2333,7 +2335,8 @@ mod tests {
         assert_eq!(dims(first), [140., 100., 40.]);
         let second = doc.setup_stock(1, Some(&mesh)).unwrap();
         assert_eq!(dims(second), [100., 140., 40.]);
-        // Exactly what the simulation hands the second setup.
+        // What the simulation hands the second setup before earlier cuts
+        // trim it.
         let carried = Volume::new(first, Frame::new(&doc.setups[0], &mesh))
             .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
         assert_eq!(second, carried);

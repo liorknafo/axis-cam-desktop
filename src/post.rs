@@ -2018,7 +2018,7 @@ M2
         assert!(second.contains("Part rotation X180"));
     }
     #[test]
-    fn stock_datums_are_refused_when_earlier_setups_cut_their_faces() {
+    fn stock_datums_sit_on_a_whole_faced_top_but_not_on_a_partly_cut_one() {
         let (mut doc, mesh) = fixture::job();
         let ops = doc.setups[0].operations.clone();
         doc.setups[0].operations.truncate(1);
@@ -2032,6 +2032,25 @@ M2
         }
         doc.setups.push(turned);
         doc.sync_stock_sources();
+        // Setup 1 faces the whole top 4 mm deep: setup 2 starts from the
+        // stock it left, whose top is the faced surface, so a stock-based
+        // zero is on the stock.
+        for origin in ["Stock top center", "Stock top front-left"] {
+            doc.setups[1].p.insert("origin".into(), origin.into());
+            let job = post_job(&doc, &mesh);
+            assert!(job.ready(), "{origin}: {:?}", errors(&job));
+            let text = &setup_texts(&job, 1)[0];
+            assert!(
+                text.contains("(Stock: 124.000 x 84.000 x 43.000 mm."),
+                "{text}"
+            );
+        }
+        // Faced only inside the part's top, the stock keeps a rim at full
+        // height: the top face is cut where a stock-based zero is touched.
+        let face = &mut doc.setups[0].operations[0];
+        face.p.insert("boundary".into(), "Selected geometry".into());
+        face.p
+            .insert("containment".into(), "Tool inside boundary".into());
         for origin in ["Stock top center", "Stock top front-left"] {
             doc.setups[1].p.insert("origin".into(), origin.into());
             let job = post_job(&doc, &mesh);
@@ -2409,20 +2428,21 @@ M2
             assert!(job.ready(), "D25 {origin}: {:?}", errors(&job));
         }
         // The small cube job: the Contour stops 5 mm below setup 2's top,
-        // below its 3.5 mm band (a quarter of the 14 mm stock).
+        // below its 3.2 mm band (a quarter of the 13 mm stock setup 1 left
+        // after facing 1 mm off its top, now setup 2's bottom).
         for origin in origins {
             let (doc, mesh) = cube_job("2", origin);
             let job = post_job(&doc, &mesh);
             assert!(job.ready(), "cube {origin}: {:?}", errors(&job));
             let text = &setup_texts(&job, 1)[0];
             assert!(
-                text.contains("(Stock: 34.000 x 24.000 x 14.000 mm."),
+                text.contains("(Stock: 34.000 x 24.000 x 13.000 mm."),
                 "{text}"
             );
             assert!(
                 comment_parts(text, "Work zero: ")
                     .join(" ")
-                    .ends_with(" between 1 mm and 3.5 mm below the top."),
+                    .ends_with(" between 1 mm and 3.2 mm below the top."),
                 "{text}"
             );
         }

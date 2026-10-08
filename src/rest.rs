@@ -217,6 +217,121 @@ impl RestStock {
         // hi always identifies a proven cap (or the original height).
         candidates[hi]
     }
+    /// The stock box a later setup starts from, in the current frame (mm):
+    /// the original block's box with each of its six sides moved in past
+    /// every layer earlier cuts provably removed whole (the same evidence and
+    /// proof as `top`). Sides are trimmed in a fixed order (top, bottom, -X,
+    /// +X, -Y, +Y), each against the box trimmed so far. Without proof a side
+    /// stays where it was, and when the work budget runs out it stops at the
+    /// deepest layer proven so far; it never moves into `part`, the part's
+    /// bounds in the current frame.
+    pub fn left(&self, part: Bounds) -> Bounds {
+        self.trimmed(part, 200_000)
+    }
+    /// `left` with `budget` units of `covered` work for each side.
+    fn trimmed(&self, part: Bounds, budget: usize) -> Bounds {
+        let mut b = self.extent;
+        if self.cuts.is_empty() {
+            return b;
+        }
+        // Across frames `contains` refuses a point on a capsule's face by a
+        // guard of 16 ulps of its largest coordinate there, so each face also
+        // offers a candidate this much short of it, toward the side.
+        let mut frames = vec![self.current];
+        for c in &self.cuts {
+            if !frames.contains(&c.cut.frame) {
+                frames.push(c.cut.frame);
+            }
+        }
+        let reach = frames
+            .iter()
+            .map(|&f| transformed(self.extent, self.current, f))
+            .flat_map(|e| e.min.into_iter().chain(e.max))
+            .map(f32::abs)
+            .fold(1., f32::max);
+        let margin = reach * f32::EPSILON * 64.;
+        // The evidence: each earlier operation's capsules alone, smallest
+        // first, then all of them together. A layer is usually removed whole
+        // by one operation (a facing, a contour), whose proof costs far less
+        // than one that wades through every other operation's long flutes.
+        let mut groups: Vec<((u16, u16), Vec<usize>)> = vec![];
+        for (id, c) in self.cuts.iter().enumerate() {
+            match groups.iter_mut().find(|(s, _)| *s == c.cut.source) {
+                Some((_, ids)) => ids.push(id),
+                None => groups.push((c.cut.source, vec![id])),
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = groups.into_iter().map(|(_, ids)| ids).collect();
+        groups.sort_by_key(Vec::len);
+        if groups.len() > 1 {
+            groups.push((0..self.cuts.len()).collect());
+        }
+        for (k, high) in [
+            (2, true),
+            (2, false),
+            (0, false),
+            (0, true),
+            (1, false),
+            (1, true),
+        ] {
+            let side = if high { b.max[k] } else { b.min[k] };
+            let toward = if high { margin } else { -margin };
+            // How far a candidate face lies inside the box from this side.
+            let depth = |v: f32| if high { side - v } else { v - side };
+            let mut candidates: Vec<f32> = self
+                .cuts
+                .iter()
+                .flat_map(|c| [c.bounds.min[k], c.bounds.max[k]])
+                .flat_map(|v| [v, v + toward])
+                .filter(|v| v.is_finite() && *v > b.min[k] && *v < b.max[k])
+                .collect();
+            // Deepest first; the side itself last, never tested.
+            candidates.sort_by(|x, y| depth(*y).total_cmp(&depth(*x)));
+            candidates.dedup();
+            candidates.push(side);
+            let slab = |v: f32| {
+                let mut s = b;
+                if high {
+                    s.min[k] = v;
+                } else {
+                    s.max[k] = v;
+                }
+                s
+            };
+            // Each group searches the candidates deeper than the deepest
+            // proven so far; the budget is shared by the side's groups.
+            let mut hi = candidates.len() - 1;
+            let mut budget = budget;
+            for ids in &groups {
+                // Slabs nest: when the thinnest is not covered, no deeper one is.
+                if hi == 0
+                    || budget == 0
+                    || !self.covered(slab(candidates[hi - 1]), ids, 0, &mut budget)
+                {
+                    continue;
+                }
+                hi -= 1;
+                let mut lo = 0;
+                while lo < hi && budget > 0 {
+                    let mid = lo + (hi - lo) / 2;
+                    if self.covered(slab(candidates[mid]), ids, 0, &mut budget) {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+            }
+            // hi always identifies a proven slab (or the side itself); a
+            // thinner slab, stopping at the part, is proven with it.
+            let v = candidates[hi];
+            if high {
+                b.max[k] = v.max(part.max[k]).min(b.max[k]);
+            } else {
+                b.min[k] = v.min(part.min[k]).max(b.min[k]);
+            }
+        }
+        b
+    }
     fn covered(&self, b: Bounds, ids: &[usize], depth: u8, budget: &mut usize) -> bool {
         if b.min[2] > b.max[2] {
             return true;
@@ -490,5 +605,108 @@ mod tests {
         for (x, y) in [(12.99, 0.), (0., -12.99), (0., 0.)] {
             assert!(!rest.beside(column(x, y)), "({x}, {y})");
         }
+    }
+    /// A part well inside the fixture's stock box.
+    const PART: Bounds = Bounds {
+        min: [-5., -5., 1.],
+        max: [5., 5., 6.],
+    };
+    fn near(a: Bounds, b: Bounds) -> bool {
+        (0..3).all(|k| (a.min[k] - b.min[k]).abs() < 0.001 && (a.max[k] - b.max[k]).abs() < 0.001)
+    }
+    /// Outside-contour passes along X with their centres at each `ys`, one at
+    /// each tip height of `levels`.
+    fn contour(v: &mut Volume, f: Frame, ys: &[f32], levels: &[f32]) {
+        for &z in levels {
+            face(v, f, z, ys, 5.);
+        }
+    }
+    #[test]
+    fn with_no_earlier_cuts_the_leftover_box_is_the_original_box() {
+        let (v, f, b, _, _) = fixture();
+        assert_eq!(RestStock::new(&v, f).left(PART), b);
+    }
+    #[test]
+    fn a_facing_pass_over_the_whole_top_lowers_the_top_to_its_depth() {
+        let (mut v, f, b, mut s, mesh) = fixture();
+        face(&mut v, f, 10., &[-10., -6., -2., 2., 6., 10.], 10.);
+        let left = RestStock::new(&v, f).left(PART);
+        let mut expected = b;
+        expected.max[2] = 10.;
+        assert!(near(left, expected), "{left:?}");
+        // Flipped, the faced top is the bottom: it moves up by the same 2 mm.
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let carried = v.transformed_bounds(flipped);
+        let part = f.transfer_bounds(PART, flipped);
+        let left = RestStock::new(&v, flipped).left(part);
+        let mut expected = carried;
+        expected.min[2] += 2.;
+        assert!(near(left, expected), "{left:?} {carried:?}");
+    }
+    #[test]
+    fn full_depth_side_contours_move_those_sides_in_by_the_removed_width() {
+        let (mut v, f, b, _, _) = fixture();
+        // Tool centres on the stock's ±Y faces, radius 2.5, tips from 2 mm
+        // below the stock's bottom up past its top.
+        contour(&mut v, f, &[-10., 10.], &[-2., 2., 6., 10.]);
+        let left = RestStock::new(&v, f).left(PART);
+        let mut expected = b;
+        expected.min[1] = -7.5;
+        expected.max[1] = 7.5;
+        assert!(near(left, expected), "{left:?}");
+    }
+    #[test]
+    fn side_contours_stopping_above_the_bottom_leave_the_sides() {
+        let (mut v, f, b, _, _) = fixture();
+        contour(&mut v, f, &[-10., 10.], &[6., 10.]);
+        assert_eq!(RestStock::new(&v, f).left(PART), b);
+    }
+    #[test]
+    fn ball_cuts_ramps_and_an_exhausted_budget_never_trim() {
+        let (mut ball, f, b, _, _) = fixture();
+        ball.cut(
+            [-15., 0., 10.],
+            [15., 0., 10.],
+            30.,
+            10.,
+            CutterShape::Ball,
+            f,
+            (0, 0),
+        );
+        assert_eq!(RestStock::new(&ball, f).left(PART), b);
+        let (mut ramp, f, b, _, _) = fixture();
+        ramp.cut(
+            [-15., 0., 10.],
+            [15., 0., 10.5],
+            30.,
+            10.,
+            CutterShape::Flat,
+            f,
+            (0, 0),
+        );
+        assert_eq!(RestStock::new(&ramp, f).left(PART), b);
+        let (mut faced, f, b, _, _) = fixture();
+        face(&mut faced, f, 10., &[-10., -6., -2., 2., 6., 10.], 10.);
+        contour(&mut faced, f, &[-10., 10.], &[-2., 2., 6., 10.]);
+        assert_eq!(RestStock::new(&faced, f).trimmed(PART, 0), b);
+    }
+    #[test]
+    fn the_leftover_box_never_reaches_into_the_part() {
+        let (mut v, f, b, _, _) = fixture();
+        face(&mut v, f, 8., &[-10., -6., -2., 2., 6., 10.], 10.);
+        contour(&mut v, f, &[-10., 10.], &[-2., 2., 6., 10.]);
+        // The part's top is above the facing; its -Y face is inside the
+        // band the -Y contour removed.
+        let part = Bounds {
+            min: [-5., -8.5, 1.],
+            max: [5., 5., 10.],
+        };
+        let left = RestStock::new(&v, f).left(part);
+        let expected = Bounds {
+            min: [b.min[0], -8.5, b.min[2]],
+            max: [b.max[0], 7.5, 10.],
+        };
+        assert!(near(left, expected), "{left:?}");
     }
 }
