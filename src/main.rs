@@ -842,8 +842,9 @@ impl App {
     /// toolpaths stay clear of them, and says how the operations fare. The
     /// setup's operations up to its last enabled one are generated as
     /// Generate all does; those that cannot be are left out. Toolpaths are
-    /// never changed. Without toolpaths the stock alone decides; without a
-    /// stock nothing is written. Whether the setup changed (and was marked
+    /// never changed. Without toolpaths the stock alone decides (that of a
+    /// later setup is the box the earlier setups left when that is known,
+    /// `known_stock`); without a stock nothing is written. Whether the setup changed (and was marked
     /// so): nothing is written or marked when the suggestion is what it has.
     fn suggest_layout(&mut self) -> bool {
         let si = self.doc.index();
@@ -871,7 +872,8 @@ impl App {
             });
         }
         let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
-        let Some((stock, layout)) = request.suggest(&self.doc, self.part_mesh(), si, &refs) else {
+        // Without toolpaths, the stock the earlier setups left when that is known.
+        let Some((stock, layout)) = request.suggest_on(&refs, || self.known_stock(si).0) else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
             return false;
         };

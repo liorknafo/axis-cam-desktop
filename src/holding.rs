@@ -854,10 +854,16 @@ impl Request {
         si: usize,
         plans: &[&Plan],
     ) -> Option<(Bounds, Layout)> {
-        let stock = plans
-            .first()
-            .map(|plan| plan.stock)
-            .or_else(|| doc.setup_stock(si, mesh))?;
+        self.suggest_on(plans, || doc.setup_stock(si, mesh))
+    }
+    /// `suggest`, the stock being the first plan's, else the one `otherwise`
+    /// tells (the box the setup starts from as far as the caller knows it).
+    pub fn suggest_on(
+        &self,
+        plans: &[&Plan],
+        otherwise: impl FnOnce() -> Option<Bounds>,
+    ) -> Option<(Bounds, Layout)> {
+        let stock = plans.first().map(|plan| plan.stock).or_else(otherwise)?;
         let (holder, gap) = (self.id.clone(), self.gap);
         let layout = if self.vise {
             let (axis_y, grip) = suggest_vise(stock, &self.holder, plans, gap);

@@ -3251,6 +3251,59 @@ mod tests {
         // The job is not done again for the same document.
         assert_eq!(a.refresh_left_stock().units(), 0);
     }
+    #[test]
+    fn suggest_layout_uses_the_stock_the_earlier_setups_left_when_it_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        // No toolpaths: the stock alone decides.
+        a.doc.setups[1].operations.clear();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        // The original box is 124 mm across X, which the 120 mm vise does not
+        // open to: the jaws go on ±Y, 8 mm up.
+        assert!(nominal.dimensions()[0] > 120. && nominal.dimensions()[1] < 120.);
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "Y");
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
+        // A box the earlier setups left that is only 70 mm across X and 6 mm tall.
+        let left = crate::mesh::Bounds {
+            min: [nominal.min[0], nominal.min[1], nominal.min[2]],
+            max: [nominal.min[0] + 70., nominal.max[1], nominal.min[2] + 6.],
+        };
+        let key = a.left_key().unwrap();
+        a.left_stock = crate::LeftStock {
+            key,
+            boxes: vec![None, Some(left)],
+        };
+        assert_eq!(a.known_stock(1), (Some(left), true));
+        // Not worked out for this job: the original box again.
+        a.left_stock.key = key.wrapping_add(1);
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "Y");
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
+        // Worked out: the narrower way across, and a grip that leaves 1 mm above the jaws.
+        a.left_stock.key = key;
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "X");
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "5");
+        assert_eq!(
+            a.status,
+            format!("Suggested: vise jaws on ±X, grip 5 mm. {STOCK_ONLY}")
+        );
+        // The editor agrees: nothing wrong with what was suggested, and the
+        // jaws are drawn on the box that was left.
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        let jaws = crate::ui::holding_boxes(&a);
+        assert_eq!(jaws.len(), 2);
+        assert!(
+            jaws.iter()
+                .all(|j| (j.bounds.max[2] - (left.min[2] + 5.)).abs() < 0.01)
+        );
+        // Clamps are placed on the same box: the sides the 70 mm leaves room for.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert!(a.status.starts_with("Suggested: "), "{}", a.status);
+        assert!(crate::ui::holding_lines(&a).is_empty());
+    }
     /// The fixture job with its first setup held by the starter clamp, on -X
     /// at `bite` mm onto the stock (12 reaches only the stock's edge, 40 the
     /// pocket), written on the setup directly so that nothing is suggested.
