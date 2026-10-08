@@ -1011,11 +1011,261 @@ pub fn summary(
         describe(layout)
     )
 }
+/// Why a vise with `layout` grips too much of `stock` (the setup's starting
+/// box, mm): it is not taller than the grip by 1 mm, so nothing stands
+/// above the jaws. None for clamps or no workholding.
+pub fn height_issue(layout: &Layout, stock: Bounds) -> Option<String> {
+    let Layout::Vise { grip, .. } = layout else {
+        return None;
+    };
+    let height = stock.dimensions()[2];
+    (height - grip < 1. - 0.005).then(|| {
+        format!(
+            "The stock is {} mm tall; the vise grips {} mm of it, which leaves less than 1 mm above the jaws.",
+            mm(height),
+            mm(*grip)
+        )
+    })
+}
+/// How the holding checks name operation `operation` of setup `setup` of
+/// `doc` (both from 0, as `stock_surface::Cut::source` stores them):
+/// "setup 1, operation 3 (Contour \"Outside\")". Numbered alone when `doc`
+/// has no such operation.
+pub fn operation_name(doc: &Document, setup: u16, operation: u16) -> String {
+    let (s, o) = (usize::from(setup), usize::from(operation));
+    let numbered = format!("setup {}, operation {}", s + 1, o + 1);
+    match doc.setups.get(s).and_then(|x| x.operations.get(o)) {
+        Some(op) => format!(
+            "{numbered} ({} \"{}\")",
+            op.strategy.name(),
+            op.name().trim()
+        ),
+        None => numbered,
+    }
+}
+/// How far inside the stock box the holding checks look for material, mm:
+/// just inside the face a jaw, the table or a clamp touches.
+const INSIDE: f32 = 0.05;
+/// `n` values spread evenly over `lo..=hi`, the ends inset by 1 % of the span.
+fn spread(lo: f32, hi: f32, n: usize) -> Vec<f32> {
+    let inset = (hi - lo) * 0.01;
+    let (a, b) = (lo + inset, hi - inset);
+    (0..n)
+        .map(|i| match n {
+            1 => (a + b) / 2.,
+            _ => a + (b - a) * i as f32 / (n - 1) as f32,
+        })
+        .collect()
+}
+/// The points of a rectangle on a face of the stock: `n` × `m` points
+/// spread over `first` and `second` (ranges on the axes `axes`), the third
+/// coordinate `at`. None when either range is empty.
+fn grid(
+    axes: [usize; 3],
+    first: (f32, f32),
+    second: (f32, f32),
+    at: f32,
+    (n, m): (usize, usize),
+) -> Option<Vec<[f32; 3]>> {
+    if first.0 >= first.1 || second.0 >= second.1 {
+        return None;
+    }
+    let mut points = vec![];
+    for u in spread(first.0, first.1, n) {
+        for v in spread(second.0, second.1, m) {
+            let mut p = [0.; 3];
+            (p[axes[0]], p[axes[1]], p[axes[2]]) = (u, v, at);
+            points.push(p);
+        }
+    }
+    Some(points)
+}
+/// `a..b` clipped to `lo..hi`.
+fn clip((a, b): (f32, f32), lo: f32, hi: f32) -> (f32, f32) {
+    (a.max(lo), b.min(hi))
+}
+/// The `points` without material: outside `stock` or removed by an earlier
+/// cut. Empty when at least `percent` % of them have material.
+fn missing(
+    points: &[[f32; 3]],
+    stock: Bounds,
+    removed: &crate::rest::Removed,
+    percent: usize,
+) -> Vec<[f32; 3]> {
+    let inside = |p: &[f32; 3]| (0..3).all(|k| p[k] >= stock.min[k] && p[k] <= stock.max[k]);
+    let without: Vec<[f32; 3]> = points
+        .iter()
+        .filter(|p| !inside(p) || removed.at(**p))
+        .copied()
+        .collect();
+    let with = points.len() - without.len();
+    if with * 100 >= points.len() * percent {
+        vec![]
+    } else {
+        without
+    }
+}
+/// The earlier operations that removed the material at the `failed`
+/// samples, in words: those whose cuts removed at least a quarter of them,
+/// the most first (the most alone when none does).
+fn cause(
+    failed: &[[f32; 3]],
+    removed: &crate::rest::Removed,
+    names: &dyn Fn(u16, u16) -> String,
+) -> String {
+    let mut counts: Vec<((u16, u16), usize)> = vec![];
+    for source in failed.iter().filter_map(|p| removed.by(*p)) {
+        match counts.iter_mut().find(|(s, _)| *s == source) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((source, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut named: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| n * 4 >= failed.len())
+        .map(|((s, o), _)| names(*s, *o))
+        .collect();
+    if named.is_empty() {
+        named.extend(counts.first().map(|((s, o), _)| names(*s, *o)));
+    }
+    match named.split_last() {
+        None => "earlier setups".into(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+/// Why `layout` with `holder` cannot hold `stock` (the starting box of setup
+/// `setup`, from 0, in mm) given the material earlier setups removed
+/// (`removed`, None for setup 1): stock not taller than the grip by 1 mm,
+/// too little material at a jaw, under the stock, or under a clamp's bite.
+/// Each message names the operations (`names(setup, operation)` gives
+/// "setup 1, operation 3 (Contour \"Outside\")") whose cuts removed most of
+/// the failed samples.
+///
+/// Material is looked for 0.05 mm inside the stock's faces, at points
+/// spread evenly with the ends inset by 1 % of the span: on each jaw's
+/// contact face across the jaw's width (on the stock) from the stock's
+/// bottom up to the grip, 12 × 4, at least 60 % of them; on the stock's
+/// bottom, 8 × 8, at least 50 %; under each clamp's bite on the stock's
+/// top, 6 along its width × 3 across the bite, at least 60 %. A point has
+/// material when it is inside `stock` and no earlier cut removed it.
+pub fn holdable(
+    setup: usize,
+    layout: &Layout,
+    holder: &Holder,
+    stock: Bounds,
+    removed: Option<&crate::rest::Removed>,
+    names: &dyn Fn(u16, u16) -> String,
+) -> Vec<String> {
+    let placed = match boxes(layout, holder, stock) {
+        Ok(placed) => placed,
+        Err(refused) => return vec![refused],
+    };
+    let mut found: Vec<String> = height_issue(layout, stock).into_iter().collect();
+    let Some(removed) = removed else {
+        return found;
+    };
+    let n = setup + 1;
+    match layout {
+        Layout::None => {}
+        Layout::Vise { axis_y, grip, .. } => {
+            let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
+            let axis = if *axis_y { "Y" } else { "X" };
+            // The jaws reach from far below the stock up to the grip.
+            let height = (stock.min[2], (stock.min[2] + grip).min(stock.max[2]));
+            let (mut sides, mut failed) = (vec![], vec![]);
+            for jaw in &placed {
+                let b = jaw.bounds;
+                let plus = b.min[across] >= stock.max[across];
+                let face = if plus {
+                    stock.max[across] - INSIDE
+                } else {
+                    stock.min[across] + INSIDE
+                };
+                let width = clip(
+                    (b.min[along], b.max[along]),
+                    stock.min[along],
+                    stock.max[along],
+                );
+                let Some(points) = grid([along, 2, across], width, height, face, (12, 4)) else {
+                    continue;
+                };
+                let lost = missing(&points, stock, removed, 60);
+                if !lost.is_empty() {
+                    sides.push(if plus { "+" } else { "-" });
+                    failed.extend(lost);
+                }
+            }
+            if !sides.is_empty() {
+                let band = mm(height.1 - height.0);
+                let sides = if sides.len() == 2 { "±" } else { sides[0] };
+                found.push(format!(
+                    "Setup {n} cannot be held in the vise: {} removed the material the jaws grip on {sides}{axis} from 0 to {band} mm above the stock's bottom. Leave at least {band} mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.",
+                    cause(&failed, removed, names),
+                ));
+            }
+            let bottom = grid(
+                [0, 1, 2],
+                (stock.min[0], stock.max[0]),
+                (stock.min[1], stock.max[1]),
+                stock.min[2] + INSIDE,
+                (8, 8),
+            );
+            let lost = missing(&bottom.unwrap_or_default(), stock, removed, 50);
+            if !lost.is_empty() {
+                found.push(format!(
+                    "Setup {n} cannot be held in the vise: {} removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder.",
+                    cause(&lost, removed, names)
+                ));
+            }
+        }
+        Layout::Clamps { clamps, .. } => {
+            let bite = num(&holder.p, "bite").unwrap_or(0.);
+            for (&(side, _), placed) in clamps.iter().zip(&placed) {
+                let (across, along) = match side {
+                    Side::MinusX | Side::PlusX => (0, 1),
+                    Side::MinusY | Side::PlusY => (1, 0),
+                };
+                let b = placed.bounds;
+                let width = clip(
+                    (b.min[along], b.max[along]),
+                    stock.min[along],
+                    stock.max[along],
+                );
+                let reach = clip(
+                    (b.min[across], b.max[across]),
+                    stock.min[across],
+                    stock.max[across],
+                );
+                let points = grid(
+                    [along, across, 2],
+                    width,
+                    reach,
+                    stock.max[2] - INSIDE,
+                    (6, 3),
+                );
+                let lost = missing(&points.unwrap_or_default(), stock, removed, 60);
+                if !lost.is_empty() {
+                    found.push(format!(
+                        "Setup {n} cannot be held by the {}: {} removed the stock under its bite. Leave the top there, {} mm in from the edge, and finish it in a later setup, move the clamp, or choose another holder.",
+                        placed.label,
+                        cause(&lost, removed, names),
+                        mm(bite)
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Machine, Setup};
-    use crate::simulation::{Motion, Move, Plan};
+    use crate::rest::{Removed, RestStock};
+    use crate::simulation::{CutterShape, Motion, Move, Plan};
+    use crate::volume::{Frame, Volume};
     fn stock() -> Bounds {
         Bounds {
             min: [-50., -30., 0.],
@@ -2283,5 +2533,285 @@ mod tests {
         assert_ne!(own, a.stock);
         // Neither: this document has no second setup.
         assert!(request.suggest(&doc, None, 1, &[]).is_none());
+    }
+    /// `stock()` uncut, in the frame of a setup 1 in which it sits as given,
+    /// and that frame turned upside down (rx 180).
+    fn untouched() -> (Volume, Frame, Frame) {
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = Frame::new(&setup(&[]), &mesh);
+        let flipped = Frame::new(&setup(&[("rx", "180")]), &mesh);
+        (Volume::new(stock(), frame), frame, flipped)
+    }
+    /// Flat Ø10 passes along X from `x[0]` to `x[1]`, one at each of `ys`
+    /// (the tool's centre) and each tip height of `tips`, with `flute` mm of
+    /// flute, made by operation `source`.
+    fn slot(
+        v: &mut Volume,
+        f: Frame,
+        x: [f32; 2],
+        ys: &[f32],
+        tips: &[f32],
+        flute: f32,
+        source: (u16, u16),
+    ) {
+        for &z in tips {
+            for &y in ys {
+                v.cut(
+                    [x[0], y, z],
+                    [x[1], y, z],
+                    5.,
+                    flute,
+                    CutterShape::Flat,
+                    f,
+                    source,
+                );
+            }
+        }
+    }
+    /// The earlier operations the tests' cuts come from, named as the export
+    /// names them.
+    fn names(setup: u16, operation: u16) -> String {
+        let name = match (setup, operation) {
+            (0, 0) => "Facing \"Rim\"",
+            (0, 1) => "Pocket \"Underside\"",
+            (0, 2) => "Contour \"Outside\"",
+            (0, 3) => "Contour \"Low\"",
+            _ => "Other \"Other\"",
+        };
+        format!("setup {}, operation {} ({name})", setup + 1, operation + 1)
+    }
+    /// The part inside `stock()` (3 mm of stock under it): the leftover box
+    /// never reaches into it.
+    const PART: Bounds = Bounds {
+        min: [-40., -20., 3.],
+        max: [40., 20., 37.],
+    };
+    /// The starter vise on ±Y at `grip`.
+    fn vise_gripping(grip: f32) -> Layout {
+        Layout::Vise {
+            holder: String::new(),
+            axis_y: true,
+            offset: 0.,
+            grip,
+            gap: 2.,
+        }
+    }
+    #[test]
+    fn jaws_gripping_where_an_outside_contour_went_down_cannot_hold() {
+        let (mut v, f, _) = untouched();
+        // An outside contour down to 3 mm above the stock's bottom, its passes
+        // over the ±Y faces: the 3 mm left under it keeps the stock's width.
+        let tips = [3., 8., 13., 18., 23., 28., 33., 38.];
+        slot(&mut v, f, [-60., 60.], &[-30., 30.], &tips, 5., (0, 2));
+        let left = RestStock::new(&v, f).left(PART);
+        assert_eq!(left, stock());
+        let removed = Removed::new(&v, f);
+        assert_eq!(
+            holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names),
+            [
+                "Setup 2 cannot be held in the vise: setup 1, operation 3 (Contour \"Outside\") removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder."
+            ]
+        );
+        // Gripping only the 3 mm it left, the vise holds.
+        assert!(holdable(1, &vise_gripping(3.), &vise(), left, Some(&removed), &names).is_empty());
+        // Jaws on ±X grip where it did not go.
+        let across_x = Layout::Vise {
+            holder: String::new(),
+            axis_y: false,
+            offset: 0.,
+            grip: 8.,
+            gap: 2.,
+        };
+        assert!(holdable(1, &across_x, &vise(), left, Some(&removed), &names).is_empty());
+        // Stopped 9 mm above the bottom (a bottom offset of 6 mm), it leaves
+        // the jaws' band whole: the vise holds.
+        let (mut v, f, _) = untouched();
+        let tips = [9., 14., 19., 24., 29., 34., 39.];
+        slot(&mut v, f, [-60., 60.], &[-30., 30.], &tips, 5., (0, 2));
+        let left = RestStock::new(&v, f).left(PART);
+        let removed = Removed::new(&v, f);
+        assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names).is_empty());
+    }
+    #[test]
+    fn the_stock_must_stand_a_millimetre_above_the_jaws() {
+        let short = Bounds {
+            min: [-50., -30., 0.],
+            max: [50., 30., 9.],
+        };
+        let said = "The stock is 9 mm tall; the vise grips 8.5 mm of it, which leaves less than 1 mm above the jaws.";
+        assert_eq!(
+            height_issue(&vise_gripping(8.5), short).as_deref(),
+            Some(said)
+        );
+        assert_eq!(
+            height_issue(&vise_gripping(12.), short).as_deref(),
+            Some(
+                "The stock is 9 mm tall; the vise grips 12 mm of it, which leaves less than 1 mm above the jaws."
+            )
+        );
+        // Exactly 1 mm above the jaws is enough; clamps hold from above.
+        assert_eq!(height_issue(&vise_gripping(8.), short), None);
+        assert_eq!(
+            height_issue(&clamp_layout(&[(Side::MinusX, 0.)]), short),
+            None
+        );
+        assert_eq!(height_issue(&Layout::None, short), None);
+        // Setup 1 has no earlier cuts: the height is all that is checked.
+        assert_eq!(
+            holdable(0, &vise_gripping(8.5), &vise(), short, None, &names),
+            [said]
+        );
+        assert!(holdable(0, &vise_gripping(8.), &vise(), short, None, &names).is_empty());
+        let clamps = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.)]);
+        assert!(holdable(0, &clamps, &clamp(), short, None, &names).is_empty());
+        // A later setup on uncut stock: the height alone again.
+        let (v, f, _) = untouched();
+        let removed = Removed::new(&v, f);
+        assert_eq!(
+            holdable(
+                1,
+                &vise_gripping(8.5),
+                &vise(),
+                short,
+                Some(&removed),
+                &names
+            ),
+            [said]
+        );
+        // An entry of the other kind cannot hold at all.
+        assert_eq!(
+            holdable(0, &vise_gripping(8.), &clamp(), stock(), None, &names),
+            ["The chosen workholding entry is a clamp, not a vise."]
+        );
+    }
+    #[test]
+    fn a_vise_needs_most_of_the_stocks_bottom_to_rest_on() {
+        let (mut v, f, flipped) = untouched();
+        // Setup 1 pockets 4 mm into the top over 90 of its 100 mm in X and 50
+        // of its 60 mm in Y; setup 2 is flipped onto that face.
+        let ys = [-20., -12., -4., 4., 12., 20.];
+        slot(&mut v, f, [-40., 40.], &ys, &[36.], 10., (0, 1));
+        let part = f.transfer_bounds(PART, flipped);
+        let left = RestStock::new(&v, flipped).left(part);
+        assert_eq!(left, v.transformed_bounds(flipped));
+        let removed = Removed::new(&v, flipped);
+        assert_eq!(
+            holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names),
+            [
+                "Setup 2 cannot be held in the vise: setup 1, operation 2 (Pocket \"Underside\") removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder."
+            ]
+        );
+        // A pocket over the middle 18 mm leaves enough to rest on.
+        let (mut v, f, flipped) = untouched();
+        slot(&mut v, f, [-40., 40.], &[-4., 4.], &[36.], 10., (0, 1));
+        let left = RestStock::new(&v, flipped).left(part);
+        let removed = Removed::new(&v, flipped);
+        assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names).is_empty());
+    }
+    #[test]
+    fn each_clamp_needs_the_stock_under_its_bite() {
+        let (mut v, f, _) = untouched();
+        // Setup 1 faces 2 mm off a rim along the ±X edges, 11 mm wide.
+        for x in [-50., -44., 44., 50.] {
+            v.cut(
+                [x, -40., 38.],
+                [x, 40., 38.],
+                5.,
+                10.,
+                CutterShape::Flat,
+                f,
+                (0, 0),
+            );
+        }
+        let left = RestStock::new(&v, f).left(PART);
+        assert_eq!(left, stock());
+        let removed = Removed::new(&v, f);
+        // The clamps on ±X bite 12 mm onto the stock, over the rim; the one
+        // on -Y bites where nothing was cut.
+        let clamps = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.), (Side::MinusY, 0.)]);
+        let said = |side: &str| {
+            format!(
+                "Setup 2 cannot be held by the clamp on {side} (offset 0): setup 1, operation 1 (Facing \"Rim\") removed the stock under its bite. Leave the top there, 12 mm in from the edge, and finish it in a later setup, move the clamp, or choose another holder."
+            )
+        };
+        assert_eq!(
+            holdable(1, &clamps, &clamp(), left, Some(&removed), &names),
+            [said("-X"), said("+X")]
+        );
+        // Moved along the side past the rim's end, the clamp on -X holds.
+        let (mut v, f, _) = untouched();
+        v.cut(
+            [-50., -40., 38.],
+            [-50., 0., 38.],
+            11.,
+            10.,
+            CutterShape::Flat,
+            f,
+            (0, 0),
+        );
+        let removed = Removed::new(&v, f);
+        let moved = clamp_layout(&[(Side::MinusX, -15.), (Side::MinusX, 18.)]);
+        assert_eq!(
+            holdable(1, &moved, &clamp(), stock(), Some(&removed), &names),
+            [said("-X").replace("(offset 0)", "(offset -15)")]
+        );
+    }
+    #[test]
+    fn the_cause_names_the_operations_behind_a_quarter_of_the_failed_samples_most_first() {
+        // The jaws on ±Y sample 0.08, 2.69, 5.31 and 7.92 mm above the bottom.
+        let (mut v, f, _) = untouched();
+        // Operation 4 takes the top two rows on -Y, the jaw's whole width;
+        // operation 3 the row below them on a third of it: 4 of the 28
+        // failed samples, too few to name.
+        slot(&mut v, f, [-60., 60.], &[-30.], &[5.], 40., (0, 3));
+        slot(&mut v, f, [-60., -20.], &[-30.], &[2.], 2., (0, 2));
+        let removed = Removed::new(&v, f);
+        let found = holdable(
+            1,
+            &vise_gripping(8.),
+            &vise(),
+            stock(),
+            Some(&removed),
+            &names,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with(
+                "Setup 2 cannot be held in the vise: setup 1, operation 4 (Contour \"Low\") removed the material the jaws grip on -Y from 0 to 8 mm"
+            ),
+            "{found:?}"
+        );
+        // Along the whole width it is 12 of 36: named after the larger.
+        slot(&mut v, f, [-20., 60.], &[-30.], &[2.], 2., (0, 2));
+        let removed = Removed::new(&v, f);
+        let found = holdable(
+            1,
+            &vise_gripping(8.),
+            &vise(),
+            stock(),
+            Some(&removed),
+            &names,
+        );
+        assert!(
+            found[0].starts_with(
+                "Setup 2 cannot be held in the vise: setup 1, operation 4 (Contour \"Low\") and setup 1, operation 3 (Contour \"Outside\") removed the material the jaws grip on -Y from 0 to 8 mm"
+            ),
+            "{found:?}"
+        );
+    }
+    #[test]
+    fn earlier_operations_are_named_by_their_setup_number_and_strategy() {
+        let (doc, _) = crate::post::fixture::job();
+        assert_eq!(
+            operation_name(&doc, 0, 2),
+            "setup 1, operation 3 (Contour \"Contour\")"
+        );
+        assert_eq!(
+            operation_name(&doc, 0, 0),
+            "setup 1, operation 1 (Facing \"Facing\")"
+        );
+        // One the document does not have is still numbered.
+        assert_eq!(operation_name(&doc, 2, 0), "setup 3, operation 1");
     }
 }

@@ -114,21 +114,30 @@ impl<'a> Removed<'a> {
     /// current frame. A point within 0.001 mm of a cut counts as removed,
     /// which keeps float error in the frame transforms on the safe side.
     pub fn at(&self, p: [f32; 3]) -> bool {
+        self.by(p).is_some()
+    }
+    /// The operation whose cut removed material at `p` (`at`), as its
+    /// `Cut::source`: the first such cut's, in the order they were made.
+    pub fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
         const GUARD: f32 = 0.001;
-        self.cuts.iter().zip(&self.boxes).any(|(cut, b)| {
-            (0..3).all(|k| p[k] >= b.min[k] - 2. * GUARD && p[k] <= b.max[k] + 2. * GUARD) && {
-                let q = transfer(p, self.current, cut.frame);
-                // Raised by the guard against a flute top raised twice as far.
-                crate::volume::swept(
-                    [q[0], q[1], q[2] + GUARD],
-                    cut.a,
-                    cut.b,
-                    cut.radius + GUARD,
-                    cut.flute + 2. * GUARD,
-                    cut.shape,
-                )
-            }
-        })
+        self.cuts
+            .iter()
+            .zip(&self.boxes)
+            .find(|(cut, b)| {
+                (0..3).all(|k| p[k] >= b.min[k] - 2. * GUARD && p[k] <= b.max[k] + 2. * GUARD) && {
+                    let q = transfer(p, self.current, cut.frame);
+                    // Raised by the guard against a flute top raised twice as far.
+                    crate::volume::swept(
+                        [q[0], q[1], q[2] + GUARD],
+                        cut.a,
+                        cut.b,
+                        cut.radius + GUARD,
+                        cut.flute + 2. * GUARD,
+                        cut.shape,
+                    )
+                }
+            })
+            .map(|(cut, _)| cut.source)
     }
 }
 impl RestStock {
@@ -510,6 +519,43 @@ mod tests {
         let removed = Removed::new(&v, flipped);
         assert!(removed.at(f.transfer([0.5, 0., 9.], flipped)));
         assert!(!removed.at(f.transfer([4., -4., 9.], flipped)));
+    }
+    #[test]
+    fn removed_says_which_operation_cut_a_point_first() {
+        let (mut v, f, _, mut s, mesh) = fixture();
+        // Setup 1's operation 3 cuts along y = -6, then setup 2's operation 1
+        // along x = 0, crossing it.
+        v.cut(
+            [-15., -6., 8.],
+            [15., -6., 8.],
+            2.,
+            3.,
+            CutterShape::Flat,
+            f,
+            (0, 2),
+        );
+        v.cut(
+            [0., -15., 8.],
+            [0., 15., 8.],
+            2.,
+            3.,
+            CutterShape::Flat,
+            f,
+            (1, 0),
+        );
+        let removed = Removed::new(&v, f);
+        assert_eq!(removed.by([8., -6., 9.]), Some((0, 2)));
+        assert_eq!(removed.by([0., 6., 9.]), Some((1, 0)));
+        // Where both cut, the first.
+        assert_eq!(removed.by([0., -6., 9.]), Some((0, 2)));
+        assert_eq!(removed.by([8., 6., 9.]), None);
+        assert!(!removed.at([8., 6., 9.]) && removed.at([0., 6., 9.]));
+        // The same seen from a flipped setup.
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let removed = Removed::new(&v, flipped);
+        assert_eq!(removed.by(f.transfer([0., 6., 9.], flipped)), Some((1, 0)));
+        assert_eq!(removed.by(f.transfer([8., 6., 9.], flipped)), None);
     }
     fn in_any(boxes: &[Bounds], p: [f32; 3]) -> bool {
         boxes

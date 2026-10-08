@@ -1695,6 +1695,36 @@ mod tests {
         );
     }
     #[test]
+    fn a_flipped_vise_setup_gripping_where_setup_1s_contour_went_is_refused() {
+        use crate::proposal::tests::hold;
+        let (mut doc, mesh, report) = block();
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let mut proposal = good(&report);
+        for setup in &mut proposal.setups {
+            setup.operations[0].facing_area = Some("model".into());
+        }
+        // The Contour keeps above setup 1's jaws (8 mm up and their 2 mm
+        // gap, less the 3 mm of stock under the part) but goes down from the
+        // top, which the flipped setup's jaws grip.
+        proposal.setups[0].operations[2].bottom_offset = Some(8.);
+        let (check, job) = check(&doc, &mesh, &report, &proposal);
+        assert!(!check.passed && job.is_none());
+        // Setup 1 holds; setup 2 does not, whole sentences within the 300
+        // characters a message keeps. (Its bottom, also cut away by the
+        // Contour and the Pocket, is the other problem.)
+        let found = stages(&check);
+        assert!(
+            found.contains(&"workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 (Contour \"Contour by planner\") removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.".to_string()),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|p| p.starts_with(
+                "workholding 2/None: Underside: Setup 2 cannot be held in the vise: "
+            ) && p.ends_with(", or choose another holder.")),
+            "{found:?}"
+        );
+    }
+    #[test]
     fn the_clearance_plane_refusal_is_reported_once_per_setup_as_workholding() {
         let (mut doc, mesh, report, proposal) = clamped("-X:0;+X:0", "36");
         doc.setups[0]

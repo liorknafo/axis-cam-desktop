@@ -1122,6 +1122,29 @@ fn holding_boxes(
     doc.holding_boxes(setup, stock)
         .map_err(|e| format!("{}: {e}", setup.name()))
 }
+/// Why the vise or clamps of setup `si` cannot hold the stock `walk` found,
+/// with what earlier setups cut away from it (`holding::holdable`; for setup
+/// 1 only its height counts), each named by the setup.
+fn unholdable(doc: &Document, si: usize, walk: &Walk) -> Vec<String> {
+    let setup = &doc.setups[si];
+    let (Ok(layout), Some(holder)) = (
+        crate::holding::layout(setup),
+        doc.holder(get(&setup.p, "holder")),
+    ) else {
+        return vec![];
+    };
+    let first = walk.simulations[0];
+    let removed = first
+        .initial_volume
+        .as_ref()
+        .zip(first.frame)
+        .map(|(volume, frame)| crate::rest::Removed::new(volume, frame));
+    let names = |s, o| crate::holding::operation_name(doc, s, o);
+    crate::holding::holdable(si, &layout, holder, walk.stock, removed.as_ref(), &names)
+        .into_iter()
+        .map(|message| format!("{}: {message}", setup.name()))
+        .collect()
+}
 impl Walk<'_> {
     /// The plans of the operations of `group`, one of `groups`.
     fn plans(&self, group: &std::ops::Range<usize>) -> Vec<&Plan> {
@@ -1159,8 +1182,9 @@ impl Walk<'_> {
 }
 /// Every workholding problem `prepare` finds for setup `si` from its
 /// `sequence` results, in every program (`prepare` stops at the first program
-/// with any problem), each once: the messages are those of `prepare`. Empty
-/// when the setup cannot be walked, which `prepare` reports.
+/// with any problem, and before them all at a stock the workholding cannot
+/// hold), each once: the messages are those of `prepare`. Empty when the
+/// setup cannot be walked, which `prepare` reports.
 pub(crate) fn held(
     doc: &Document,
     mesh: &Mesh,
@@ -1179,13 +1203,19 @@ pub(crate) fn held(
             }];
         }
     };
+    let mut found: Vec<Held> = unholdable(doc, si, &walk)
+        .into_iter()
+        .map(|message| Held {
+            operation: None,
+            message,
+        })
+        .collect();
     // Nothing to hold against: no program need be walked.
     if boxes.is_empty() {
-        return vec![];
+        return found;
     }
     // Every program of a touch-off setup starts the same way: what two of
     // them say alike (the clearance plane's problem) is said once.
-    let mut found: Vec<Held> = vec![];
     for group in &walk.groups {
         let blocks = blocks(&walk.ops[group.clone()], &walk.plans(group), &walk.settings);
         for problem in walk.held(&doc.setups[si], group, &blocks, &boxes) {
@@ -1210,6 +1240,10 @@ pub(crate) fn prepare(
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
     let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
     let boxes = holding_boxes(doc, si, stock).map_err(|e| vec![e])?;
+    let unholdable = unholdable(doc, si, &walk);
+    if !unholdable.is_empty() {
+        return Err(unholdable);
+    }
     let origin = get(&setup.p, "origin");
     if let (true, Some(volume), Some(frame)) = (
         origin == "Stock top center" || origin == "Stock top front-left",
@@ -3199,6 +3233,67 @@ M2
         assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
         // A setup export cannot walk has nothing to hold against.
         assert!(held(&doc, &mesh, 0, &[]).is_empty());
+    }
+    /// `fixture::job`'s Facing, Pocket, Contour and Drilling in setup 1, held
+    /// by nothing, then setup "Again" the same way up, drilling again, held
+    /// by the starter vise on ±Y at grip 8.
+    fn vise_after_the_contour() -> (Document, Mesh) {
+        let (mut doc, mesh) = fixture::job();
+        doc.adopt_holders();
+        doc.setups[0].operations.truncate(4);
+        let mut again = Setup::new(Machine::new(3), "G55");
+        again.p.insert("name".into(), "Again".into());
+        again.p.insert("origin".into(), "Model origin".into());
+        let mut drill = doc.setups[0].operations[3].clone();
+        drill.id = id();
+        again.operations.push(drill);
+        let vise = doc
+            .workholding
+            .iter()
+            .find(|h| h.kind() == "Vise")
+            .unwrap()
+            .id
+            .clone();
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", vise.as_str()),
+            ("vise_axis", "Y"),
+            ("vise_grip", "8"),
+            ("holding_gap", "2"),
+        ] {
+            again.p.insert(k.into(), v.into());
+        }
+        doc.setups.push(again);
+        doc.sync_stock_sources();
+        (doc, mesh)
+    }
+    #[test]
+    fn a_vise_gripping_where_an_earlier_contour_went_down_is_refused_naming_the_contour() {
+        let (mut doc, mesh) = vise_after_the_contour();
+        // The Contour went from the stock top down to the part's bottom, 3 mm
+        // above the stock's: of the 8 mm the jaws grip, 5 are air.
+        let said = "Again: Setup 2 cannot be held in the vise: setup 1, operation 3 (Contour \"Contour\") removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.";
+        let sims = results(&doc, &mesh);
+        assert_eq!(
+            held(&doc, &mesh, 1, &sims[1]),
+            [Held {
+                operation: None,
+                message: said.into()
+            }]
+        );
+        assert_eq!(
+            prepare(&doc, &mesh, 1, &sims[1]).err(),
+            Some(vec![said.into()])
+        );
+        assert_eq!(errors(&post_job(&doc, &mesh)), [said]);
+        // Stopped 6 mm higher it leaves the band whole: the job exports.
+        doc.setups[0].operations[2]
+            .p
+            .insert("bottom".into(), "6".into());
+        let sims = results(&doc, &mesh);
+        assert!(held(&doc, &mesh, 1, &sims[1]).is_empty());
+        let posted = post_job(&doc, &mesh);
+        assert!(posted.ready(), "{:?}", errors(&posted));
     }
     #[test]
     fn a_touch_off_setup_reports_the_clearance_plane_once_not_once_per_program() {

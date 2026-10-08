@@ -3438,10 +3438,7 @@ mod tests {
         let vise = first_of(&a, "Vise");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         assert_eq!(get(&a.doc.setups[0].p, "holder"), vise);
-        // The suggestion holds 3 mm; the plan's contour cuts down to 3 mm
-        // above the stock bottom, which is within the gap of jaws that high.
-        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
-        apply_checked_plan(&mut a);
+        apply_checked_plan_of(&mut a, held_in_a_vise);
         // The applied job's setups all keep the vise (the planner copies
         // setup 1's workholding to the later ones); once none of them models
         // one, the entry can be deleted.
@@ -3470,11 +3467,8 @@ mod tests {
         // An entry that was never deleted is not added again.
         let mut a = signed_in_planning_app(&dir);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
-        // A low grip, as above: the plan's facing covers the whole stock top,
-        // so clamps on the stock could not be clear of it.
-        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         let count = a.doc.workholding.len();
-        apply_checked_plan(&mut a);
+        apply_checked_plan_of(&mut a, held_in_a_vise);
         let _ = a.update(Message::UndoPlan);
         assert_eq!(a.doc.workholding.len(), count);
         assert!(!a.status.contains("workholding library"), "{}", a.status);
@@ -3482,8 +3476,7 @@ mod tests {
         let mut a = signed_in_planning_app(&dir);
         let vise = first_of(&a, "Vise");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
-        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
-        apply_checked_plan(&mut a);
+        apply_checked_plan_of(&mut a, held_in_a_vise);
         for setup in &mut a.doc.setups {
             setup.p.insert("holding".into(), "None".into());
         }
@@ -3519,11 +3512,8 @@ mod tests {
         let mut a = signed_in_planning_app(&dir);
         let vise = first_of(&a, "Vise");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
-        // A low grip, as in the undo test: the plan's contour cuts down to
-        // 3 mm above the stock bottom.
-        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         let show = |a: &mut App| {
-            let preview = checked_preview(a, false);
+            let preview = checked_preview_of(a, false, held_in_a_vise);
             let _ = a.update(Message::Plan);
             let epoch = a.plan_epoch;
             let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
@@ -3561,7 +3551,6 @@ mod tests {
         // another entry has taken since is made new.
         let mut a = signed_in_planning_app(&dir);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
-        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         let count = a.doc.workholding.len();
         show(&mut a);
         let _ = a.update(Message::ApplyPlan);
@@ -3570,7 +3559,6 @@ mod tests {
         let mut a = signed_in_planning_app(&dir);
         let vise = first_of(&a, "Vise");
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
-        a.doc.setups[0].p.insert("vise_grip".into(), "0.5".into());
         show(&mut a);
         a.doc.setups[0].p.insert("holding".into(), "None".into());
         a.doc.workholding.retain(|h| h.id != vise);
@@ -5564,7 +5552,18 @@ mod tests {
     }
     /// Plan, show the checked preview and apply it.
     fn apply_checked_plan(a: &mut App) {
-        let preview = checked_preview(a, false);
+        apply_checked_plan_of(a, |_| {});
+    }
+    /// The good plan for a job held in a vise: setup 2, flipped, gets the
+    /// same vise, whose jaws grip the faced top. Setup 1's Contour would cut
+    /// the stock's sides there from the top down, so it is left out.
+    fn held_in_a_vise(proposal: &mut crate::proposal::Proposal) {
+        let contour = proposal.setups[0].operations.remove(2);
+        assert_eq!(contour.strategy, "Contour");
+    }
+    /// `apply_checked_plan` of the good plan as `edit` changes it.
+    fn apply_checked_plan_of(a: &mut App, edit: impl FnOnce(&mut crate::proposal::Proposal)) {
+        let preview = checked_preview_of(a, false, edit);
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
         let _ = a.update(Message::PlanFinished(epoch, Ok(preview)));
