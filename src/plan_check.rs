@@ -689,7 +689,14 @@ fn laid_out(
                 .iter()
                 .map(|(_, result)| result.as_ref().ok().map(|sim| &sim.plan)),
         );
-        let Some((_, layout)) = request.suggest(built, Some(mesh), si, &plans) else {
+        // A vise closes on the band the earlier setups left, which the
+        // setup's first simulation starts from.
+        let bands = results[si]
+            .first()
+            .and_then(|(_, result)| result.as_ref().ok())
+            .and_then(|first| crate::post::bands(setup, mesh, first));
+        let Some((_, layout)) = request.suggest(built, Some(mesh), si, &plans, bands.as_ref())
+        else {
             continue;
         };
         holding::place(
@@ -2032,7 +2039,7 @@ mod tests {
         let holder = job.holder(get(&second.p, "holder")).unwrap();
         let (_, again) = holding::request(second, Some(holder))
             .unwrap()
-            .suggest(&job, Some(&mesh), 1, &refs)
+            .suggest(&job, Some(&mesh), 1, &refs, None)
             .unwrap();
         assert_eq!(
             holding::placement(&again),
@@ -2101,8 +2108,10 @@ mod tests {
             ["Y", "0", "8"]
         );
     }
-    #[test]
-    fn a_flipped_vise_setup_gripping_where_setup_1s_contour_went_is_refused() {
+    /// `good` with setup 1 held in the starter vise on ±Y at grip 8 (setup
+    /// 2 gets the same entry), both Faces on the model, and setup 1's
+    /// Contour stopping `bottom_offset` mm above the part's underside.
+    fn flipped_vise(bottom_offset: f32) -> (CheckReport, Option<Document>) {
         use crate::proposal::tests::hold;
         let (mut doc, mesh, report) = block();
         hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
@@ -2110,24 +2119,49 @@ mod tests {
         for setup in &mut proposal.setups {
             setup.operations[0].facing_area = Some("model".into());
         }
+        proposal.setups[0].operations[2].bottom_offset = Some(bottom_offset);
+        check(&doc, &mesh, &report, &proposal)
+    }
+    #[test]
+    fn a_flipped_vise_setup_grips_the_walls_setup_1s_contour_finished() {
         // The Contour keeps above setup 1's jaws (8 mm up and their 2 mm
-        // gap, less the 3 mm of stock under the part) but goes down from the
-        // top, which the flipped setup's jaws grip.
-        proposal.setups[0].operations[2].bottom_offset = Some(8.);
-        let (check, job) = check(&doc, &mesh, &report, &proposal);
+        // gap, less the 3 mm of stock under the part) and finishes the walls
+        // from the top down past the 8 mm the flipped setup's jaws grip: they
+        // close on those walls, below the stock left at the old bottom.
+        let (check, job) = flipped_vise(8.);
+        assert!(check.passed, "{:?}", stages(&check));
+        let second = &job.unwrap().setups[1];
+        assert_eq!(
+            [
+                get(&second.p, "holding"),
+                get(&second.p, "vise_axis"),
+                get(&second.p, "vise_grip")
+            ],
+            ["Vise", "Y", "8"]
+        );
+    }
+    #[test]
+    fn a_flipped_vise_setup_whose_band_setup_1_cut_in_part_is_refused() {
+        // The Contour goes only 5 mm down the walls from the top: the lower 5
+        // mm of the flipped setup's 8 mm band are cut beside the walls, the
+        // upper 3 mm not, so its jaws close on the stock's full width with
+        // half their face on air.
+        let (check, job) = flipped_vise(35.);
         assert!(!check.passed && job.is_none());
-        // Setup 1 holds; setup 2 does not. (Its bottom, also cut away by the
-        // Contour and the Pocket, is the other problem.) Within the 300
-        // characters a message keeps, the advice comes before the names. The
-        // band the jaws grip is setup 1's top, so the advice is not a
-        // `bottom_offset`, which keeps setup 1's bottom.
+        // Setup 1 holds; setup 2 does not. (Its bottom, cut away by the
+        // Contour round the walls and the Pocket, is the other problem.)
+        // Within the 300 characters a message keeps, the advice comes before
+        // the names. The band is setup 1's top, so the advice is neither a
+        // `bottom_offset`, which keeps setup 1's bottom, nor a cut in setup 2,
+        // whose jaws are there.
         let found = stages(&check);
         assert!(
-            found[0].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there and cut those sides in this setup instead (setup 2), or choose another holder. Setup 1, operation 3 is "),
+            found[0].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm of those sides uncut in setup 1, or cut them through all 8 mm there, or choose another holder. Setup 1, operation 3 is "),
             "{found:?}"
         );
         assert!(
-            found[1].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 and setup 1, operation 2 removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder. Setup 1, operation 3 is Contour \"Contour by planner\"; "),
+            found[1].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation ")
+                && found[1].contains(" removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder."),
             "{found:?}"
         );
         assert_eq!(found.len(), 2, "{found:?}");

@@ -1111,22 +1111,51 @@ pub(crate) struct Held {
     pub operation: Option<usize>,
     pub message: String,
 }
-/// The jaws or clamps of setup `si` round the stock `walk` found, or the
-/// message that says why they cannot be modelled, named by the setup.
+/// What tells the bands the vise of `setup` closes on (`holding::Bands`),
+/// from `first`, the setup's first simulation, which starts from the stock
+/// the earlier setups left, and the part `mesh`. None for setup 1 and
+/// whenever nothing was cut before: the jaws close on the whole box then.
+pub(crate) fn bands(
+    setup: &Setup,
+    mesh: &Mesh,
+    first: &Simulation,
+) -> Option<crate::holding::Bands> {
+    let (volume, frame) = first.initial_volume.as_ref().zip(first.frame)?;
+    (!volume.cuts.is_empty()).then(|| {
+        crate::holding::Bands::new(volume, frame, crate::simulation::part_box(setup, mesh))
+    })
+}
+/// What the vise or clamps of setup `si` hold: the stock `walk` found and,
+/// for a vise, the band its jaws close on (`holding::gripped`, from what the
+/// earlier setups left).
+fn gripped(doc: &Document, mesh: &Mesh, si: usize, walk: &Walk) -> crate::holding::Gripped {
+    let setup = &doc.setups[si];
+    let bands = bands(setup, mesh, walk.simulations[0]);
+    crate::holding::held_by(doc, setup, walk.stock, bands.as_ref())
+}
+/// The jaws or clamps of setup `si` round `held` (`gripped`), or the message
+/// that says why they cannot be modelled, named by the setup.
 fn holding_boxes(
     doc: &Document,
     si: usize,
-    stock: Bounds,
+    held: crate::holding::Gripped,
 ) -> Result<Vec<crate::holding::HoldBox>, String> {
     let setup = &doc.setups[si];
-    doc.holding_boxes(setup, stock)
+    doc.holding_boxes(setup, held)
         .map_err(|e| format!("{}: {e}", setup.name()))
 }
-/// Why the vise or clamps of setup `si` cannot hold the stock `walk` found,
-/// with what earlier setups cut away from it and whether they cut the part
-/// (`mesh`) free from what the jaws or clamps hold (`holding::holdable`; for
-/// setup 1 only its height counts), each named by the setup.
-fn unholdable(doc: &Document, mesh: &Mesh, si: usize, walk: &Walk) -> Vec<String> {
+/// Why the vise or clamps of setup `si` cannot hold `held` (`gripped`, the
+/// stock `walk` found), with what earlier setups cut away from it and
+/// whether they cut the part (`mesh`) free from what the jaws or clamps hold
+/// (`holding::holdable`; for setup 1 only its height counts), each named by
+/// the setup.
+fn unholdable(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    walk: &Walk,
+    held: crate::holding::Gripped,
+) -> Vec<String> {
     let setup = &doc.setups[si];
     let (Ok(layout), Some(holder)) = (
         crate::holding::layout(setup),
@@ -1135,16 +1164,14 @@ fn unholdable(doc: &Document, mesh: &Mesh, si: usize, walk: &Walk) -> Vec<String
         return vec![];
     };
     let first = walk.simulations[0];
-    let part = Placement::new(mesh, Some(setup))
-        .bounds
-        .scaled(1. / mesh.display_scale());
+    let part = crate::simulation::part_box(setup, mesh);
     let removed = first
         .initial_volume
         .as_ref()
         .zip(first.frame)
         .map(|(volume, frame)| crate::rest::Removed::new(volume, frame).with_part(part));
     let names = |s, o| crate::holding::operation_name(doc, s, o);
-    crate::holding::holdable(si, &layout, holder, walk.stock, removed.as_ref(), &names)
+    crate::holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
         .into_iter()
         .map(|message| format!("{}: {message}", setup.name()))
         .collect()
@@ -1206,7 +1233,8 @@ pub(crate) fn held_walked(
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Option<Vec<Held>> {
     let walk = walk(doc, mesh, si, sims).ok()?;
-    let boxes = match holding_boxes(doc, si, walk.stock) {
+    let held = gripped(doc, mesh, si, &walk);
+    let boxes = match holding_boxes(doc, si, held) {
         Ok(boxes) => boxes,
         Err(message) => {
             return Some(vec![Held {
@@ -1215,7 +1243,7 @@ pub(crate) fn held_walked(
             }]);
         }
     };
-    let mut found: Vec<Held> = unholdable(doc, mesh, si, &walk)
+    let mut found: Vec<Held> = unholdable(doc, mesh, si, &walk, held)
         .into_iter()
         .map(|message| Held {
             operation: None,
@@ -1251,8 +1279,9 @@ pub(crate) fn prepare(
     let walk = walk(doc, mesh, si, sims)?;
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
     let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
-    let boxes = holding_boxes(doc, si, stock).map_err(|e| vec![e])?;
-    let unholdable = unholdable(doc, mesh, si, &walk);
+    let held = gripped(doc, mesh, si, &walk);
+    let boxes = holding_boxes(doc, si, held).map_err(|e| vec![e])?;
+    let unholdable = unholdable(doc, mesh, si, &walk, held);
     if !unholdable.is_empty() {
         return Err(unholdable);
     }
@@ -2318,6 +2347,94 @@ M2
         underside.p.insert("origin".into(), origin.into());
         doc.sync_stock_sources();
         (doc, mesh)
+    }
+    /// The reviewer's probe: `fixture::flipped_after(keep)`, whose setup 1
+    /// contours the part's walls down to its underside and leaves the 3 mm
+    /// of stock under it whole, with setup 2 held in the starter vise (opens
+    /// to 120 mm, grip 8) on ±`axis`.
+    fn flipped_in_vise(keep: usize, axis: &str) -> (Document, Mesh) {
+        let (mut doc, mesh) = fixture::flipped_after(keep);
+        doc.adopt_holders();
+        let id = doc
+            .workholding
+            .iter()
+            .find(|h| h.kind() == "Vise")
+            .unwrap()
+            .id
+            .clone();
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", id.as_str()),
+            ("vise_axis", axis),
+            ("vise_offset", "0"),
+            ("vise_grip", "8"),
+        ] {
+            doc.setups[1].p.insert(k.into(), v.into());
+        }
+        (doc, mesh)
+    }
+    #[test]
+    fn a_flipped_setup_in_a_vise_closes_on_the_walls_setup_1_contoured() {
+        let near = |a: f32, lo: f32, hi: f32| a > lo && a < hi;
+        for keep in [3, 4] {
+            // The flipped stock keeps the 124 x 84 mm of the stock left under
+            // the part, but the jaws' 8 mm band is what setup 1's Contour
+            // went through: the walls, 120 x 80 mm and the 0.3 mm allowance
+            // the Contour leaves on them (and the 0.01 mm the band keeps
+            // short of a cut face), at any grip up to the part's height.
+            let (mut doc, mesh) = flipped_in_vise(keep, "Y");
+            let first = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+            let stock = first.plan.stock;
+            let [x, y, _] = stock.dimensions();
+            assert!(
+                near(x, 123.99, 124.01) && near(y, 83.99, 84.01),
+                "{stock:?}"
+            );
+            let bands = bands(&doc.setups[1], &mesh, &first).unwrap();
+            let vise = doc.holder(get(&doc.setups[1].p, "holder")).unwrap();
+            for (grip, axis_y) in [(8., true), (30., true), (8., false)] {
+                let layout = crate::holding::Layout::Vise {
+                    holder: vise.id.clone(),
+                    axis_y,
+                    offset: 0.,
+                    grip,
+                    gap: 2.,
+                };
+                let [x, y, z] = bands.at(stock, &layout, vise).dimensions();
+                // Across the jaws, and along them too: the walls.
+                assert!(
+                    near(x, 120.69, 120.73) && near(y, 80.69, 80.73),
+                    "{keep} {grip} {axis_y}: {x} {y}"
+                );
+                assert_eq!(z, stock.dimensions()[2]);
+            }
+            // On ±Y the vise holds: with a work zero on the model, both
+            // setups export and the plan check passes but for the drill's
+            // speed, which the fixture leaves low.
+            doc.setups[1]
+                .p
+                .insert("origin".into(), "Model origin".into());
+            let job = post_job(&doc, &mesh);
+            assert!(job.ready(), "{keep}: {:?}", errors(&job));
+            crate::proposal::tests::aluminium(&mut doc);
+            let report = crate::analysis::report(&doc, &mesh).unwrap();
+            let check = crate::plan_check::check_built(&doc, &mesh, &report);
+            assert!(
+                check.problems.iter().all(|p| p.stage == "cutting data"),
+                "{keep}: {:?}",
+                check.problems
+            );
+            // On ±X the walls are wider than the vise opens: refused for that
+            // alone.
+            let (mut doc, mesh) = flipped_in_vise(keep, "X");
+            doc.setups[1]
+                .p
+                .insert("origin".into(), "Model origin".into());
+            assert_eq!(
+                errors(&post_job(&doc, &mesh)),
+                ["Flipped: The stock is 120.71 mm across the jaws; this vise opens to 120 mm."]
+            );
+        }
     }
     #[test]
     fn side_touch_off_spots_lie_just_below_the_stock_top() {

@@ -650,10 +650,13 @@ pub fn sequence_with(
 /// whole, never into the part (`rest::RestStock::left`).
 pub fn leftover_box(volume: &crate::volume::Volume, setup: &Setup, mesh: &Mesh) -> Bounds {
     let frame = crate::volume::Frame::new(setup, mesh);
-    let part = Placement::new(mesh, Some(setup))
+    crate::rest::RestStock::new(volume, frame).left(part_box(setup, mesh))
+}
+/// The part's bounds in `setup`'s frame, in mm.
+pub fn part_box(setup: &Setup, mesh: &Mesh) -> Bounds {
+    Placement::new(mesh, Some(setup))
         .bounds
-        .scaled(1. / mesh.display_scale());
-    crate::rest::RestStock::new(volume, frame).left(part)
+        .scaled(1. / mesh.display_scale())
 }
 /// `sequence_with`, also telling `begin` as each setup begins, before its
 /// operations, the box it starts from (`leftover_box`): None for the first

@@ -2133,7 +2133,8 @@ fn holding_note(
 /// as far as it is known (`App::known_stock`).
 pub(crate) fn holding_lines(app: &App) -> Vec<String> {
     let si = app.doc.index();
-    app.doc.holding_issues_with(si, app.known_stock(si).0)
+    app.doc
+        .holding_issues_with(si, app.known_stock(si).0.map(Into::into))
 }
 /// What the setup editor says of a stock box it shows that is the original
 /// one.
@@ -3285,7 +3286,7 @@ pub(crate) fn held(app: &App) -> Held {
         crate::holding::modelled(setup)
             && app
                 .doc
-                .holding_issues_with(i, app.known_stock_in(left, i).0)
+                .holding_issues_with(i, app.known_stock_in(left, i).0.map(Into::into))
                 .is_empty()
     }))
 }

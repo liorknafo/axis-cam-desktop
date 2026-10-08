@@ -1156,7 +1156,7 @@ fn workholding_report(
     };
     let resolved = crate::stock::resolve(setup1, Some(mesh))?;
     let (stock, corner) = (resolved.stock, resolved.part.map_or([0.; 3], |p| p.min));
-    let boxes = doc.holding_boxes(setup1, stock)?;
+    let boxes = doc.holding_boxes(setup1, crate::holding::Gripped::whole(stock))?;
     let gap = crate::holding::gap(setup1)?;
     let top = boxes
         .iter()

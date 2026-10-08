@@ -9,6 +9,13 @@ use crate::{
     volume::{Frame, Volume},
 };
 
+/// The units of `covered` work `left` and `band` spend on each side.
+const BUDGET: usize = 200_000;
+/// How far short of a capsule's face, mm, `band` takes a candidate side:
+/// a slab whose face lies this far inside the removed material is proven
+/// with far fewer, larger boxes than one a hair inside it, and the jaws
+/// close at most this much outside a cut wall.
+const BAND_SLACK: f32 = 0.01;
 #[derive(Debug, Clone)]
 struct Capsule {
     cut: Cut,
@@ -303,7 +310,7 @@ impl RestStock {
         candidates.dedup();
         let ids: Vec<_> = (0..self.cuts.len()).collect();
         let (mut lo, mut hi) = (0, candidates.len() - 1);
-        let mut budget = 200_000usize;
+        let mut budget = BUDGET;
         while lo < hi && budget > 0 {
             let mid = lo + (hi - lo) / 2;
             region.min[2] = candidates[mid];
@@ -325,11 +332,91 @@ impl RestStock {
     /// deepest layer proven so far; it never moves into `part`, the part's
     /// bounds in the current frame.
     pub fn left(&self, part: Bounds) -> Bounds {
-        self.trimmed(part, 200_000)
+        self.trimmed(part, BUDGET)
     }
     /// `left` with `budget` units of `covered` work for each side.
     fn trimmed(&self, part: Bounds, budget: usize) -> Bounds {
-        let mut b = self.extent;
+        const SIX: [(usize, bool); 6] = [
+            (2, true),
+            (2, false),
+            (0, false),
+            (0, true),
+            (1, false),
+            (1, true),
+        ];
+        self.trim(self.extent, &SIX, part, budget, None)
+    }
+    /// What a vise's jaws close on in a later setup that starts from `stock`
+    /// (current frame, mm) and grips `grip` mm of it, the jaws closing along
+    /// axis `across` (0 for X, 1 for Y): `stock` with its sides moved in past
+    /// every layer of the band from its bottom up to the grip that earlier
+    /// cuts provably removed whole, the evidence and proof of `left` with
+    /// each slab reaching only over the band's heights. First the two sides
+    /// along the jaws, each slab as long as the box; then the two the jaws
+    /// close on, each slab only as long as the jaws' reach along them (`jaws`:
+    /// the jaws' offset from the middle of that box along them and their
+    /// width), where they can touch: material left beyond the jaws' ends,
+    /// such as the corners a small cutter cannot reach, does not hold them
+    /// open. Never into `part`; its heights are `stock`'s. A side stays where
+    /// nothing is proven, so material the proof cannot see keeps the band as
+    /// wide as it was.
+    pub fn band(
+        &self,
+        part: Bounds,
+        stock: Bounds,
+        grip: f32,
+        across: usize,
+        jaws: (f32, f32),
+    ) -> Bounds {
+        self.band_within(part, stock, grip, across, jaws, BUDGET)
+    }
+    /// `band` with `budget` units of `covered` work for each side.
+    fn band_within(
+        &self,
+        part: Bounds,
+        stock: Bounds,
+        grip: f32,
+        across: usize,
+        (offset, width): (f32, f32),
+        budget: usize,
+    ) -> Bounds {
+        let along = 1 - across;
+        let top = (stock.min[2] + grip).min(stock.max[2]);
+        // Nothing gripped, or a grip that is not a number.
+        if top.is_nan() || top <= stock.min[2] {
+            return stock;
+        }
+        let mut slab = stock;
+        slab.max[2] = top;
+        let sides = |k| [(k, false), (k, true)];
+        let mut band = self.trim(slab, &sides(along), part, budget, Some(BAND_SLACK));
+        let middle = (band.min[along] + band.max[along]) / 2. + offset;
+        let mut reach = band;
+        reach.min[along] = band.min[along].max(middle - width / 2.);
+        reach.max[along] = band.max[along].min(middle + width / 2.);
+        if reach.min[along] < reach.max[along] {
+            let closed = self.trim(reach, &sides(across), part, budget, Some(BAND_SLACK));
+            (band.min[across], band.max[across]) = (closed.min[across], closed.max[across]);
+        }
+        (band.min[2], band.max[2]) = (stock.min[2], stock.max[2]);
+        band
+    }
+    /// `start` (current frame, mm) with each of `sides` (axis, and whether
+    /// its high side), in order, moved in past every layer earlier cuts
+    /// provably removed whole, each slab tested against the box trimmed so
+    /// far: `budget` units of `covered` work for each side. Never into
+    /// `part`. The candidate depths are the capsules' faces and the part's;
+    /// with a `slack`, each capsule face is taken that many mm short of it,
+    /// toward the side, instead of on it and a hair short of it.
+    fn trim(
+        &self,
+        start: Bounds,
+        sides: &[(usize, bool)],
+        part: Bounds,
+        budget: usize,
+        slack: Option<f32>,
+    ) -> Bounds {
+        let mut b = start;
         if self.cuts.is_empty() {
             return b;
         }
@@ -365,24 +452,27 @@ impl RestStock {
         if groups.len() > 1 {
             groups.push((0..self.cuts.len()).collect());
         }
-        for (k, high) in [
-            (2, true),
-            (2, false),
-            (0, false),
-            (0, true),
-            (1, false),
-            (1, true),
-        ] {
+        for &(k, high) in sides {
             let side = if high { b.max[k] } else { b.min[k] };
             let toward = if high { margin } else { -margin };
             // How far a candidate face lies inside the box from this side.
             let depth = |v: f32| if high { side - v } else { v - side };
+            // The side never moves into the part: no slab past its face is
+            // worth proving, and the face itself is a candidate.
+            let face = if high { part.max[k] } else { part.min[k] };
+            let short = |v: f32| match slack {
+                Some(s) => [v + if high { s } else { -s }; 2],
+                None => [v, v + toward],
+            };
             let mut candidates: Vec<f32> = self
                 .cuts
                 .iter()
                 .flat_map(|c| [c.bounds.min[k], c.bounds.max[k]])
-                .flat_map(|v| [v, v + toward])
-                .filter(|v| v.is_finite() && *v > b.min[k] && *v < b.max[k])
+                .flat_map(short)
+                .chain([face])
+                .filter(|v| {
+                    v.is_finite() && *v > b.min[k] && *v < b.max[k] && depth(*v) <= depth(face)
+                })
                 .collect();
             // Deepest first; the side itself last, never tested.
             candidates.sort_by(|x, y| depth(*y).total_cmp(&depth(*x)));
@@ -461,7 +551,7 @@ impl RestStock {
             return true;
         }
         let mut overlap = Vec::new();
-        let mut span = [0_f32; 3];
+        let mut spans: [Vec<f32>; 3] = Default::default();
         for &id in ids {
             if *budget == 0 {
                 return false;
@@ -472,8 +562,8 @@ impl RestStock {
                 continue;
             }
             overlap.push(id);
-            for k in 0..3 {
-                span[k] = span[k].max(c.bounds.max[k] - c.bounds.min[k]);
+            for (k, spans) in spans.iter_mut().enumerate() {
+                spans.push(c.bounds.max[k] - c.bounds.min[k]);
             }
             if (0..3).all(|k| b.min[k] >= c.bounds.min[k] && b.max[k] <= c.bounds.max[k])
                 && points.iter().all(|&p| self.contains(c, p))
@@ -484,8 +574,31 @@ impl RestStock {
         if overlap.is_empty() || depth >= 24 {
             return false;
         }
-        // Split where the query exceeds a typical sweep's extent. A long
-        // facing stroke usually needs subdivision across its rows, not along X.
+        // A box whose centre lies inside the stock but in no capsule cannot be
+        // proven: the part of it round its centre would have to lie inside
+        // one. Said before splitting it, so that a slab reaching into
+        // material is given up at the first such box, not after proving all
+        // the rest of it.
+        let centre: [f32; 3] = std::array::from_fn(|k| (b.min[k] + b.max[k]) / 2.);
+        let at = transfer(centre, self.current, self.reference);
+        let in_stock = (0..3)
+            .all(|k| at[k] > self.bounds.min[k] + guard && at[k] < self.bounds.max[k] - guard);
+        if in_stock
+            && !overlap
+                .iter()
+                .any(|&id| self.contains(&self.cuts[id], centre))
+        {
+            return false;
+        }
+        // Split where the query exceeds a typical sweep's extent: the median
+        // of the overlapping sweeps', so that a few long strokes do not hide
+        // the short ones round a corner. A long facing stroke usually needs
+        // subdivision across its rows, not along X; a slab no taller than
+        // the flutes, none along Z.
+        let span: [f32; 3] = std::array::from_fn(|k| {
+            let mid = spans[k].len() / 2;
+            *spans[k].select_nth_unstable_by(mid, f32::total_cmp).1
+        });
         let k = (0..3)
             .max_by(|&a, &b_axis| {
                 ((b.max[a] - b.min[a]) / span[a].max(0.01))
@@ -896,6 +1009,124 @@ mod tests {
         face(&mut faced, f, 10., &[-10., -6., -2., 2., 6., 10.], 10.);
         contour(&mut faced, f, &[-10., 10.], &[-2., 2., 6., 10.]);
         assert_eq!(RestStock::new(&faced, f).trimmed(PART, 0), b);
+    }
+    /// Jaws centred along the sides, longer than the fixture's stock.
+    const LONG: (f32, f32) = (0., 100.);
+    #[test]
+    fn the_band_a_vise_grips_loses_the_sides_cut_through_all_its_heights() {
+        let (mut v, f, b, mut s, mesh) = fixture();
+        // Outside-contour passes on ±Y down to 2 mm above the stock's bottom
+        // (their flutes reach past the top): the 2 mm under them keep the
+        // box's width.
+        contour(&mut v, f, &[-10., 10.], &[2., 6., 10.]);
+        let rest = RestStock::new(&v, f);
+        assert_eq!(rest.left(PART), b);
+        // Gripping the 2 mm left, or 4 mm whose upper half alone was cut,
+        // the jaws close on the box's width.
+        assert_eq!(rest.band(PART, b, 2., 1, LONG), b);
+        assert_eq!(rest.band(PART, b, 4., 1, LONG), b);
+        // Turned over, the jaws grip what was the top, which the contour cut
+        // through on ±Y: the band is 2.5 mm narrower on each (less the
+        // 0.01 mm it keeps short of a cut face), as wide as ever across X,
+        // and as tall as the box.
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let part = f.transfer_bounds(PART, flipped);
+        let rest = RestStock::new(&v, flipped);
+        let stock = rest.left(part);
+        assert!(near(stock, v.transformed_bounds(flipped)), "{stock:?}");
+        let band = rest.band(part, stock, 8., 1, LONG);
+        let mut expected = stock;
+        expected.min[1] += 2.5 - BAND_SLACK;
+        expected.max[1] -= 2.5 - BAND_SLACK;
+        assert!(near(band, expected), "{band:?} {stock:?}");
+        // Gripping 11 mm reaches into the 2 mm the contour left: the box.
+        assert_eq!(rest.band(part, stock, 11., 1, LONG), stock);
+        // Neither a grip of nothing nor an exhausted budget narrows it.
+        assert_eq!(rest.band(part, stock, 0., 1, LONG), stock);
+        assert_eq!(rest.band_within(part, stock, 8., 1, LONG, 0), stock);
+    }
+    #[test]
+    fn the_jaws_close_on_what_lies_within_their_reach_along_the_sides() {
+        let (mut v, f, _, mut s, mesh) = fixture();
+        // Passes on ±Y that stop short of the stock's ±X faces, as a small
+        // cutter leaves the corners: turned over, the band's ±Y sides are cut
+        // through only between x = -6 and 6 (the passes' round ends reach
+        // 8.5 mm out on their centre lines, not beside them).
+        for z in [2., 6., 10.] {
+            for y in [-10., 10.] {
+                v.cut(
+                    [-6., y, z],
+                    [6., y, z],
+                    2.5,
+                    5.,
+                    CutterShape::Flat,
+                    f,
+                    (0, 0),
+                );
+            }
+        }
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let part = f.transfer_bounds(PART, flipped);
+        let rest = RestStock::new(&v, flipped);
+        let stock = v.transformed_bounds(flipped);
+        // Jaws 10 mm wide in the middle close on what the passes left; so do
+        // jaws moved 1 mm along, and the corners hold open jaws as long as
+        // the stock, or moved to reach them.
+        let across = |jaws| rest.band(part, stock, 8., 1, jaws).dimensions()[1];
+        let narrow = 15. + 2. * BAND_SLACK;
+        assert!(
+            (across((0., 10.)) - narrow).abs() < 0.001,
+            "{}",
+            across((0., 10.))
+        );
+        assert!((across((1., 10.)) - narrow).abs() < 0.001);
+        assert_eq!(across(LONG), stock.dimensions()[1]);
+        assert_eq!(across((6., 10.)), stock.dimensions()[1]);
+        // The sides along the jaws keep the box's length either way.
+        let band = rest.band(part, stock, 8., 1, (0., 10.));
+        assert_eq!((band.min[0], band.max[0]), (stock.min[0], stock.max[0]));
+        // Jaws beside the stock touch nothing: the box.
+        assert_eq!(rest.band(part, stock, 8., 1, (40., 10.)), stock);
+    }
+    #[test]
+    fn the_band_never_reaches_into_the_part_and_ball_cuts_never_narrow_it() {
+        let (mut v, f, _, mut s, mesh) = fixture();
+        contour(&mut v, f, &[-10., 10.], &[2., 6., 10.]);
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let rest = RestStock::new(&v, flipped);
+        let stock = v.transformed_bounds(flipped);
+        // A part reaching 9 mm out on Y: the band stops at it.
+        let wide = Bounds {
+            min: [-5., -9., 1.],
+            max: [5., 9., 6.],
+        };
+        let part = f.transfer_bounds(wide, flipped);
+        let band = rest.band(part, stock, 8., 1, LONG);
+        assert!(
+            (band.min[1] - part.min[1]).abs() < 0.001 && (band.max[1] - part.max[1]).abs() < 0.001,
+            "{band:?} {part:?}"
+        );
+        // Ball-end passes over the same sides prove nothing.
+        let (mut ball, f, _, _, _) = fixture();
+        for y in [-10., 10.] {
+            for z in [2., 6., 10.] {
+                ball.cut(
+                    [-15., y, z],
+                    [15., y, z],
+                    2.5,
+                    5.,
+                    CutterShape::Ball,
+                    f,
+                    (0, 0),
+                );
+            }
+        }
+        let rest = RestStock::new(&ball, flipped);
+        let part = f.transfer_bounds(PART, flipped);
+        assert_eq!(rest.band(part, stock, 8., 1, LONG), stock);
     }
     #[test]
     fn the_leftover_box_never_reaches_into_the_part() {

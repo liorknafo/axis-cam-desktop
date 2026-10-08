@@ -854,6 +854,9 @@ impl App {
             }
         };
         let mut generated: Vec<Option<simulation::Plan>> = vec![];
+        // What tells the bands a vise closes on: the setup's first simulation
+        // starts from the stock the earlier setups left.
+        let mut bands = None;
         let last = self.doc.setups[si]
             .operations
             .iter()
@@ -862,15 +865,23 @@ impl App {
             self.imported_mesh.as_ref().filter(|_| !self.is_sample()),
             last,
         ) {
+            let setup = &self.doc.setups[si];
             simulation::sequence(&self.doc, mesh, Some((si, last)), |s, _, result| {
                 if s == si {
+                    if generated.is_empty()
+                        && let Ok(first) = &result
+                    {
+                        bands = post::bands(setup, mesh, first);
+                    }
                     generated.push(result.ok().map(|sim| sim.plan));
                 }
             });
         }
         let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
         // Without toolpaths, the stock the earlier setups left when that is known.
-        let Some((stock, layout)) = request.suggest_on(&refs, || self.known_stock(si).0) else {
+        let Some((stock, layout)) =
+            request.suggest_on(&refs, || self.known_stock(si).0, bands.as_ref())
+        else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
             return false;
         };
@@ -882,9 +893,10 @@ impl App {
         // What is saved, to the hundredth, is what is checked and reported.
         let layout = holding::layout(&self.doc.setups[si]).unwrap_or(layout);
         let (holder, gap) = (&request.holder, request.gap);
-        let boxes = holding::boxes(&layout, holder, stock).unwrap_or_default();
+        let held = holding::gripped(&layout, holder, stock, bands.as_ref());
+        let boxes = holding::boxes(&layout, holder, held).unwrap_or_default();
         let clashing = holding::clashes(&refs, &boxes, gap);
-        let opening = holding::opening_issue(&layout, holder, stock);
+        let opening = holding::opening_issue(&layout, holder, held);
         let message = holding::summary(&layout, refs.len(), clashing, failed, opening.as_deref());
         if changed {
             self.touch();

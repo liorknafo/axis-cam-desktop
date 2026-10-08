@@ -241,11 +241,33 @@ impl View {
             });
             match stock {
                 // Only setup 1's orientation, or an operation's own setup,
-                // has its vise or clamps placed.
-                Some(stock) if operation.is_some() || up == first_up => doc
-                    .holding_boxes(&setup, stock)
-                    .map(|b| crate::holding::shown(&b, stock))
-                    .unwrap_or_default(),
+                // has its vise or clamps placed: a vise round the band it
+                // closes on, which the cuts of the setups before it tell.
+                Some(stock) if operation.is_some() || up == first_up => {
+                    let bands = sim.as_ref().zip(operation).and_then(|(sim, (si, _))| {
+                        let (volume, frame) = sim.initial_volume.as_ref().zip(sim.frame)?;
+                        let mut before = volume.clone();
+                        before.cuts = std::sync::Arc::new(
+                            volume
+                                .cuts
+                                .iter()
+                                .filter(|c| usize::from(c.source.0) + 1 < si)
+                                .cloned()
+                                .collect(),
+                        );
+                        (!before.cuts.is_empty()).then(|| {
+                            crate::holding::Bands::new(
+                                &before,
+                                frame,
+                                crate::simulation::part_box(&setup, mesh),
+                            )
+                        })
+                    });
+                    let held = crate::holding::held_by(doc, &setup, stock, bands.as_ref());
+                    doc.holding_boxes(&setup, held)
+                        .map(|b| crate::holding::shown(&b, stock))
+                        .unwrap_or_default()
+                }
                 _ => vec![],
             }
         } else {

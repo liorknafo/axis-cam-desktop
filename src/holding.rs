@@ -234,6 +234,102 @@ pub struct HoldBox {
     pub label: String,
     pub bounds: Bounds,
 }
+/// What a setup's workholding holds, in mm in the setup's frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gripped {
+    /// The box the setup starts from: clamps bite on its top, and it must
+    /// stand above a vise's jaws.
+    pub stock: Bounds,
+    /// What a vise's jaws close on: `stock` with its ±X and ±Y sides moved
+    /// in to the material from its bottom up to the grip, past what earlier
+    /// cuts provably removed there (`Bands::at`); `stock` itself for setup
+    /// 1, without earlier cuts, for clamps, and wherever the earlier cuts
+    /// are not known. Its heights are `stock`'s.
+    pub band: Bounds,
+}
+/// A box whose jaws close on the whole of it (`Gripped::whole`): setup 1's,
+/// or one whose earlier cuts are not known.
+impl From<Bounds> for Gripped {
+    fn from(stock: Bounds) -> Self {
+        Self::whole(stock)
+    }
+}
+impl Gripped {
+    /// `stock` whose jaws close on its whole box.
+    pub fn whole(stock: Bounds) -> Self {
+        Self { stock, band: stock }
+    }
+    /// The box a layout's jaws or clamps sit against: the band for a vise,
+    /// the stock for clamps.
+    fn on(&self, layout: &Layout) -> Bounds {
+        match layout {
+            Layout::Vise { .. } => self.band,
+            _ => self.stock,
+        }
+    }
+}
+/// What tells the band a later setup's vise closes on, at any grip: the
+/// cuts the earlier setups made, as `rest::RestStock` takes them for
+/// evidence, and the part's bounds, which no band reaches into (the setup's
+/// frame, mm).
+pub struct Bands {
+    rest: crate::rest::RestStock,
+    part: Bounds,
+}
+impl Bands {
+    /// The bands of a setup in `frame` whose stock the earlier setups left
+    /// as `volume`, the part's bounds being `part`.
+    pub fn new(volume: &crate::volume::Volume, frame: crate::volume::Frame, part: Bounds) -> Self {
+        Self {
+            rest: crate::rest::RestStock::new(volume, frame),
+            part,
+        }
+    }
+    /// What a vise placed as `layout`, with jaws as wide as `holder`'s,
+    /// closes on in `stock` (`rest::RestStock::band`: the band at its grip,
+    /// its sides across the jaws over their reach). `stock` for clamps or no
+    /// workholding.
+    pub fn at(&self, stock: Bounds, layout: &Layout, holder: &Holder) -> Bounds {
+        let Layout::Vise {
+            axis_y,
+            offset,
+            grip,
+            ..
+        } = layout
+        else {
+            return stock;
+        };
+        let width = num(&holder.p, "jaw_width").unwrap_or(0.);
+        self.rest.band(
+            self.part,
+            stock,
+            *grip,
+            usize::from(*axis_y),
+            (*offset, width),
+        )
+    }
+}
+/// What `layout`, with `holder`'s jaws, holds of `stock`: for a vise, the
+/// band it closes on as `bands` tells it (`Bands::at`; the whole box when
+/// they are not known), otherwise the box.
+pub fn gripped(layout: &Layout, holder: &Holder, stock: Bounds, bands: Option<&Bands>) -> Gripped {
+    match (layout, bands) {
+        (Layout::Vise { .. }, Some(bands)) => Gripped {
+            stock,
+            band: bands.at(stock, layout, holder),
+        },
+        _ => Gripped::whole(stock),
+    }
+}
+/// What `setup`'s vise or clamps, with their entry in `doc`'s library, hold
+/// of `stock` (`gripped`): the whole box when its layout does not read or
+/// the entry is not there, which `Document::holding_issues` says.
+pub fn held_by(doc: &Document, setup: &Setup, stock: Bounds, bands: Option<&Bands>) -> Gripped {
+    match (layout(setup), doc.holder(get(&setup.p, "holder"))) {
+        (Ok(layout), Some(holder)) => gripped(&layout, holder, stock, bands),
+        _ => Gripped::whole(stock),
+    }
+}
 /// Why `holder` cannot serve `layout`: it is of the other kind or its
 /// dimensions are not usable. None for no workholding.
 pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
@@ -267,13 +363,13 @@ fn mm(v: f32) -> String {
         text => text.into(),
     }
 }
-/// The vise's maximum opening is less than the stock is wide across the jaws.
-/// `stock` is the setup's starting stock box in millimetres.
-pub fn opening_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option<String> {
+/// The vise's maximum opening is less than the material it closes on is
+/// wide across the jaws: the band of `held`, the stock the setup starts from.
+pub fn opening_issue(layout: &Layout, holder: &Holder, held: impl Into<Gripped>) -> Option<String> {
     let Layout::Vise { axis_y, .. } = layout else {
         return None;
     };
-    let across = stock.dimensions()[usize::from(*axis_y)];
+    let across = held.into().band.dimensions()[usize::from(*axis_y)];
     let opening = num(&holder.p, "max_opening").filter(|v| *v > 0.)?;
     (across > opening + 0.005).then(|| {
         format!(
@@ -283,11 +379,16 @@ pub fn opening_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option<
         )
     })
 }
-/// Where `layout` puts its jaws or clamps against `stock`, the setup's starting
-/// stock box in millimetres: the jaws overlap the stock along their axis, and
-/// each clamp's centre is within its side. The first that is not.
-pub fn position_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option<String> {
-    let length = stock.dimensions();
+/// Where `layout` puts its jaws or clamps against `held`, the stock the setup
+/// starts from: the jaws overlap the band they close on along their axis,
+/// and each clamp's centre is within its side of the stock. The first that
+/// is not.
+pub fn position_issue(
+    layout: &Layout,
+    holder: &Holder,
+    held: impl Into<Gripped>,
+) -> Option<String> {
+    let length = held.into().on(layout).dimensions();
     match layout {
         Layout::None => None,
         Layout::Vise { axis_y, offset, .. } => {
@@ -317,13 +418,21 @@ pub fn position_issue(layout: &Layout, holder: &Holder, stock: Bounds) -> Option
         }),
     }
 }
-/// The jaws or clamps of `layout`, in the frame of `stock` (the setup's
-/// starting stock box). Without the clearance gap. Refuses a holder of the
-/// other kind or one whose dimensions are not usable (`refusal`).
-pub fn boxes(layout: &Layout, holder: &Holder, stock: Bounds) -> Result<Vec<HoldBox>, String> {
+/// The jaws or clamps of `layout`, in the frame of `held` (the stock the
+/// setup starts from): the jaws on the faces of the band they close on,
+/// centred on it along their axis, from far below the stock's bottom up to
+/// the grip; the clamps on the stock's sides and top. Without the clearance
+/// gap. Refuses a holder of the other kind or one whose dimensions are not
+/// usable (`refusal`).
+pub fn boxes(
+    layout: &Layout,
+    holder: &Holder,
+    held: impl Into<Gripped>,
+) -> Result<Vec<HoldBox>, String> {
     if let Some(refused) = refusal(layout, holder) {
         return Err(refused);
     }
+    let stock = held.into().on(layout);
     let n = |k| num(&holder.p, k).unwrap_or(0.);
     let centre = [
         (stock.min[0] + stock.max[0]) / 2.,
@@ -649,17 +758,25 @@ const MIN_GRIP: f32 = 3.;
 /// by this much are equally good.
 const CLEAR_ENOUGH: f32 = 10.;
 /// The vise jaws' axis (true: jaws on the Y sides) and grip for the `plans`
-/// of a setup whose stock is `stock`, at offset 0. Each axis tries the
-/// holder's grip (at most the stock's height less 1 mm, so that something
-/// stands above the jaws, but not cut below 3 mm for that), then 1 mm less at
-/// a time down to 3 mm (all in hundredths of
-/// a millimetre, as stored), for the first at which no move comes within
-/// `gap` of the jaws (`hits`); the axis clear at the larger grip wins. With
-/// neither clear the grip is 3 mm and the axis whose jaws keep the larger
-/// margin (`margin`: the cutter and the holder both counted) wins. Only the
-/// axes whose width across the jaws fits the vise's opening are tried, when
-/// one does. A tie goes to the axis the stock is narrower across.
-pub fn suggest_vise(stock: Bounds, holder: &Holder, plans: &[&Plan], gap: f32) -> (bool, f32) {
+/// of a setup whose stock is `stock`, at offset 0, the jaws closing on the
+/// band at each grip that `bands` tells (`gripped`; the whole box when the
+/// earlier cuts are not known). Each axis tries the holder's grip (at most
+/// the stock's height less 1 mm, so that something stands above the jaws,
+/// but not cut below 3 mm for that), then 1 mm less at a time down to 3 mm
+/// (all in hundredths of a millimetre, as stored), for the first at which no
+/// move comes within `gap` of the jaws (`hits`); the axis clear at the
+/// larger grip wins. With neither clear the grip is 3 mm and the axis whose
+/// jaws keep the larger margin (`margin`: the cutter and the holder both
+/// counted) wins. Only the axes whose band at the first grip tried fits the
+/// vise's opening across the jaws are tried, when one does. A tie goes to
+/// the axis that band is narrower across.
+pub fn suggest_vise(
+    stock: Bounds,
+    bands: Option<&Bands>,
+    holder: &Holder,
+    plans: &[&Plan],
+    gap: f32,
+) -> (bool, f32) {
     // Grips in hundredths of a millimetre, as the setup stores them: the holder's, then 1 mm less at a
     // time while above 3 mm, then 3 mm itself. (The 0.05 forgives the f32 of a decimal such as 3.29.)
     let holder_grip = num(&holder.p, "grip").filter(|g| *g > 0.);
@@ -689,9 +806,22 @@ pub fn suggest_vise(stock: Bounds, holder: &Holder, plans: &[&Plan], gap: f32) -
         grip,
         gap,
     };
-    let jaws = |axis_y, grip| boxes(&layout(axis_y, grip), holder, stock).unwrap_or_default();
-    let fits = |axis_y| opening_issue(&layout(axis_y, start), holder, stock).is_none();
-    let across = |axis_y: bool| stock.dimensions()[usize::from(axis_y)];
+    // The band of each axis and grip, worked out once.
+    let found: std::cell::RefCell<Vec<((bool, f32), Gripped)>> = Default::default();
+    let held = |axis_y: bool, grip: f32| {
+        let key = (axis_y, grip);
+        if let Some(&(_, held)) = found.borrow().iter().find(|(k, _)| *k == key) {
+            return held;
+        }
+        let held = gripped(&layout(axis_y, grip), holder, stock, bands);
+        found.borrow_mut().push((key, held));
+        held
+    };
+    let jaws =
+        |axis_y, grip| boxes(&layout(axis_y, grip), holder, held(axis_y, grip)).unwrap_or_default();
+    let fits =
+        |axis_y| opening_issue(&layout(axis_y, start), holder, held(axis_y, start)).is_none();
+    let across = |axis_y: bool| held(axis_y, start).band.dimensions()[usize::from(axis_y)];
     let mut axes = vec![false, true];
     if axes.iter().any(|a| fits(*a)) {
         axes.retain(|a| fits(*a));
@@ -755,7 +885,7 @@ pub fn suggest_clamps(
             clamps: vec![(side, offset)],
             gap,
         };
-        let placed = boxes(&layout, holder, stock).unwrap_or_default();
+        let placed = boxes(&layout, holder, Gripped::whole(stock)).unwrap_or_default();
         placed
             .iter()
             .flat_map(|c| plans.iter().map(|plan| margin(plan, &c.bounds, gap)))
@@ -847,15 +977,17 @@ impl Request {
     /// The layout for setup `si` of `doc` whose operations make `plans`
     /// (`suggest_vise`, `suggest_clamps`), with the stock it starts from: the
     /// first plan's, else the setup's own (`Document::setup_stock`, which needs
-    /// the part `mesh` for a later setup). None when that stock is not known.
+    /// the part `mesh` for a later setup). A vise closes on the bands `bands`
+    /// tells (None: the whole box). None when that stock is not known.
     pub fn suggest(
         &self,
         doc: &Document,
         mesh: Option<&Mesh>,
         si: usize,
         plans: &[&Plan],
+        bands: Option<&Bands>,
     ) -> Option<(Bounds, Layout)> {
-        self.suggest_on(plans, || doc.setup_stock(si, mesh))
+        self.suggest_on(plans, || doc.setup_stock(si, mesh), bands)
     }
     /// `suggest`, the stock being the first plan's, else the one `otherwise`
     /// tells (the box the setup starts from as far as the caller knows it).
@@ -863,11 +995,12 @@ impl Request {
         &self,
         plans: &[&Plan],
         otherwise: impl FnOnce() -> Option<Bounds>,
+        bands: Option<&Bands>,
     ) -> Option<(Bounds, Layout)> {
         let stock = plans.first().map(|plan| plan.stock).or_else(otherwise)?;
         let (holder, gap) = (self.id.clone(), self.gap);
         let layout = if self.vise {
-            let (axis_y, grip) = suggest_vise(stock, &self.holder, plans, gap);
+            let (axis_y, grip) = suggest_vise(stock, bands, &self.holder, plans, gap);
             Layout::Vise {
                 holder,
                 axis_y,
@@ -1130,22 +1263,19 @@ fn blamed(failed: &[[f32; 3]], removed: &crate::rest::Removed) -> Vec<((u16, u16
     counts
 }
 /// What to do about the jaws' band, `band` mm above the stock's bottom, that
-/// earlier cuts removed (the `failed` samples), by where the band lies in the
-/// frame of the setup that cut most of it: at that setup's bottom, material
-/// can be left with its `bottom_offset`; at its top, or on its side (when
-/// this setup is turned over or onto its side), that cannot, and the sides
-/// are cut in the setup that grips them, above the jaws. The bottom when it
-/// cannot be told.
-fn band_advice(
-    failed: &[[f32; 3]],
-    removed: &crate::rest::Removed,
-    setup: usize,
-    band: &str,
-) -> String {
+/// earlier cuts removed in part (the `failed` samples), by where the band
+/// lies in the frame of the setup that cut most of it. At that setup's
+/// bottom, material can be left with its `bottom_offset` and finished later.
+/// At its top, or on its side (when this setup is turned over or onto its
+/// side), the band cannot be cut in the setup that grips it: that setup
+/// leaves the sides whole there, or cuts them through the whole band so the
+/// jaws close on what stands inside. The bottom when it cannot be told.
+fn band_advice(failed: &[[f32; 3]], removed: &crate::rest::Removed, band: &str) -> String {
     let source = blamed(failed, removed).first().map(|(source, _)| *source);
-    match removed.up_in(source) {
-        Some(up) if up < 0.5 => format!(
-            "Leave at least {band} mm there and cut those sides in this setup instead (setup {setup}), or choose another holder."
+    match (removed.up_in(source), source) {
+        (Some(up), Some((earlier, _))) if up < 0.5 => format!(
+            "Leave at least {band} mm of those sides uncut in setup {}, or cut them through all {band} mm there, or choose another holder.",
+            earlier + 1
         ),
         _ => format!(
             "Leave at least {band} mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder."
@@ -1233,37 +1363,39 @@ fn freed(
 }
 /// The advice of a message that says the part was cut free.
 const JOIN: &str = "Leave material joining them (for example a `bottom_offset` above the stock's bottom, or a skin under the part) and cut it free in the last setup.";
-/// Why `layout` with `holder` cannot hold `stock` (the starting box of setup
-/// `setup`, from 0, in mm) given the material earlier setups removed
-/// (`removed`, None for setup 1): stock not taller than the grip by 1 mm,
-/// too little material at a jaw, under the stock, or under a clamp's bite,
-/// or (when `removed` knows the part: `Removed::with_part`) a jaw's or
-/// clamp's material cut free from the part. Each message names the
-/// operations whose cuts removed most of the failed samples, by number in
-/// its sentence and, after its advice, by name (`names(setup, operation)`
-/// gives "Contour \"Outside\"").
+/// Why `layout` with `holder` cannot hold `held` (the stock setup `setup`,
+/// from 0, starts from, and the band a vise closes on, in mm) given the
+/// material earlier setups removed (`removed`, None for setup 1): stock not
+/// taller than the grip by 1 mm, too little material at a jaw, under the
+/// band, or under a clamp's bite, or (when `removed` knows the part:
+/// `Removed::with_part`) a jaw's or clamp's material cut free from the
+/// part. Each message names the operations whose cuts removed most of the
+/// failed samples, by number in its sentence and, after its advice, by name
+/// (`names(setup, operation)` gives "Contour \"Outside\"").
 ///
-/// Material is looked for 0.05 mm inside the stock's faces, at points
-/// spread evenly with the ends inset by 1 % of the span: on each jaw's
-/// contact face across the jaw's width (on the stock) from the stock's
+/// Material is looked for 0.05 mm inside the faces, at points spread evenly
+/// with the ends inset by 1 % of the span: on each jaw's contact face, the
+/// band's face, across the jaw's width (on the band) from the stock's
 /// bottom up to the grip, 12 × 4, at least 60 % of them; on the stock's
-/// bottom, 8 × 8, at least 50 %; under each clamp's bite on the stock's
-/// top, 6 along its width × 3 across the bite, at least 60 %. A point has
-/// material when it is inside `stock` and no earlier cut removed it. A jaw
-/// or clamp with material enough is cut free when none of its points' voxels
-/// is joined to the part (`freed`).
+/// bottom under the band, 8 × 8, at least 50 %; under each clamp's bite on
+/// the stock's top, 6 along its width × 3 across the bite, at least 60 %. A
+/// point has material when it is inside the band (the stock for clamps) and
+/// no earlier cut removed it. A jaw or clamp with material enough is cut
+/// free when none of its points' voxels is joined to the part (`freed`).
 pub fn holdable(
     setup: usize,
     layout: &Layout,
     holder: &Holder,
-    stock: Bounds,
+    held: impl Into<Gripped>,
     removed: Option<&crate::rest::Removed>,
     names: &dyn Fn(u16, u16) -> String,
 ) -> Vec<String> {
-    let placed = match boxes(layout, holder, stock) {
+    let held = held.into();
+    let placed = match boxes(layout, holder, held) {
         Ok(placed) => placed,
         Err(refused) => return vec![refused],
     };
+    let stock = held.stock;
     let mut found: Vec<String> = height_issue(layout, stock).into_iter().collect();
     let Some(removed) = removed else {
         return found;
@@ -1274,35 +1406,36 @@ pub fn holdable(
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let axis = if *axis_y { "Y" } else { "X" };
-            // The jaws reach from far below the stock up to the grip.
+            // The jaws close on the band, from far below the stock up to the grip.
+            let band = held.band;
             let height = (stock.min[2], (stock.min[2] + grip).min(stock.max[2]));
             let (mut bare, mut failed) = (vec![], vec![]);
             let (mut loose, mut between) = (vec![], vec![]);
             for jaw in &placed {
                 let b = jaw.bounds;
-                let plus = b.min[across] >= stock.max[across];
+                let plus = b.min[across] >= band.max[across];
                 let face = if plus {
-                    stock.max[across] - INSIDE
+                    band.max[across] - INSIDE
                 } else {
-                    stock.min[across] + INSIDE
+                    band.min[across] + INSIDE
                 };
                 let width = clip(
                     (b.min[along], b.max[along]),
-                    stock.min[along],
-                    stock.max[along],
+                    band.min[along],
+                    band.max[along],
                 );
                 let Some(points) = grid([along, 2, across], width, height, face, (12, 4)) else {
                     continue;
                 };
                 let sign = if plus { "+" } else { "-" };
-                let lost = missing(&points, stock, removed, 60);
+                let lost = missing(&points, band, removed, 60);
                 if !lost.is_empty() {
                     bare.push(sign);
                     failed.extend(lost);
                     continue;
                 }
                 // Toward the part: inward from the jaw.
-                let step = (stock.max[across] - stock.min[across]) / 192.;
+                let step = (band.max[across] - band.min[across]) / 192.;
                 let step = if plus { -step } else { step };
                 if let Some(cut) = freed(&points, removed, across, step) {
                     loose.push(sign);
@@ -1316,7 +1449,7 @@ pub fn holdable(
             if !bare.is_empty() {
                 let band = mm(height.1 - height.0);
                 let (who, late) = cause(&failed, removed, names);
-                let advice = band_advice(&failed, removed, n, &band);
+                let advice = band_advice(&failed, removed, &band);
                 found.push(format!(
                     "Setup {n} cannot be held in the vise: {who} removed the material the jaws grip on {} from 0 to {band} mm above the stock's bottom. {advice}{late}",
                     sides(&bare),
@@ -1329,14 +1462,15 @@ pub fn holdable(
                     sides(&loose),
                 ));
             }
+            // What rests on the table: the bottom of the material between the jaws.
             let bottom = grid(
                 [0, 1, 2],
-                (stock.min[0], stock.max[0]),
-                (stock.min[1], stock.max[1]),
+                (band.min[0], band.max[0]),
+                (band.min[1], band.max[1]),
                 stock.min[2] + INSIDE,
                 (8, 8),
             );
-            let lost = missing(&bottom.unwrap_or_default(), stock, removed, 50);
+            let lost = missing(&bottom.unwrap_or_default(), band, removed, 50);
             if !lost.is_empty() {
                 let (who, late) = cause(&lost, removed, names);
                 found.push(format!(
@@ -1988,7 +2122,7 @@ mod tests {
             .collect()
     }
     fn vise_for(stock: Bounds, holder: &Holder, plans: &[&Plan]) -> (bool, f32) {
-        suggest_vise(stock, holder, plans, 2.)
+        suggest_vise(stock, None, holder, plans, 2.)
     }
     fn near_the_x_sides() -> Plan {
         plan(
@@ -2662,14 +2796,14 @@ mod tests {
         doc.setups[0].p.insert("holder".into(), id.clone());
         let request = request(&doc.setups[0], doc.holder(&id)).unwrap();
         // The first plan's stock when there are plans, else the setup's own.
-        let (stock, layout) = request.suggest(&doc, Some(&mesh), 0, &[&a]).unwrap();
+        let (stock, layout) = request.suggest(&doc, Some(&mesh), 0, &[&a], None).unwrap();
         assert_eq!(stock, a.stock);
         assert!(matches!(layout, Layout::Clamps { .. }));
-        let (own, _) = request.suggest(&doc, Some(&mesh), 0, &[]).unwrap();
+        let (own, _) = request.suggest(&doc, Some(&mesh), 0, &[], None).unwrap();
         assert_eq!(Some(own), doc.setup_stock(0, Some(&mesh)));
         assert_ne!(own, a.stock);
         // Neither: this document has no second setup.
-        assert!(request.suggest(&doc, None, 1, &[]).is_none());
+        assert!(request.suggest(&doc, None, 1, &[], None).is_none());
     }
     /// `stock()` uncut, in the frame of a setup 1 in which it sits as given,
     /// and that frame turned upside down (rx 180).
@@ -2743,9 +2877,17 @@ mod tests {
         slot(&mut v, f, [-60., 60.], &[-30., 30.], &tips, 5., (0, 2));
         let left = RestStock::new(&v, f).left(PART);
         assert_eq!(left, stock());
+        // The jaws' band keeps that width too: its lower 3 mm are whole.
+        let held = gripped(
+            &vise_gripping(8.),
+            &vise(),
+            left,
+            Some(&Bands::new(&v, f, PART)),
+        );
+        assert_eq!(held, Gripped::whole(left));
         let removed = Removed::new(&v, f);
         assert_eq!(
-            holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names),
+            holdable(1, &vise_gripping(8.), &vise(), held, Some(&removed), &names),
             [
                 "Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder. Setup 1, operation 3 is Contour \"Outside\"."
             ]
@@ -2771,8 +2913,65 @@ mod tests {
         assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names).is_empty());
     }
     #[test]
+    fn a_turned_over_vise_closes_on_the_walls_setup_1s_outside_contour_finished() {
+        // The same outside contour of setup 1, down to 3 mm above its bottom,
+        // its passes' flutes overlapping as a real cutter's do: it takes 5 mm
+        // off each Y side.
+        let tips = [3., 8., 13., 18., 23., 28., 33., 38.];
+        let (mut v, f, flipped) = untouched();
+        slot(&mut v, f, [-60., 60.], &[-30., 30.], &tips, 10., (0, 2));
+        // Turned over, setup 2's stock keeps its width, for the 3 mm the
+        // contour left at what is now its top...
+        let part = f.transfer_bounds(PART, flipped);
+        let left = RestStock::new(&v, flipped).left(part);
+        assert_eq!(left, v.transformed_bounds(flipped));
+        // ...but the jaws grip what was setup 1's top, which the contour cut
+        // through: they close on its walls, 50 mm apart (and the 0.01 mm the
+        // band keeps short of a cut face), from the stock's bottom up.
+        let bands = Bands::new(&v, flipped, part);
+        let layout = vise_gripping(8.);
+        let held = gripped(&layout, &vise(), left, Some(&bands));
+        assert_eq!(held.stock, left);
+        assert!(
+            (held.band.dimensions()[1] - 50.02).abs() < 0.001
+                && held.band.dimensions()[0] == left.dimensions()[0]
+                && (held.band.min[2], held.band.max[2]) == (left.min[2], left.max[2]),
+            "{held:?}"
+        );
+        let jaws = boxes(&layout, &vise(), held).unwrap();
+        let minus = jaws.iter().find(|j| j.label.contains("-Y")).unwrap();
+        let plus = jaws.iter().find(|j| j.label.contains("+Y")).unwrap();
+        assert_eq!(
+            (minus.bounds.max[1], plus.bounds.min[1]),
+            (held.band.min[1], held.band.max[1])
+        );
+        assert!(jaws.iter().all(|j| j.bounds.max[2] == left.min[2] + 8.));
+        // There is material at both jaws and under them: it holds.
+        let removed = Removed::new(&v, flipped).with_part(part);
+        assert!(holdable(1, &layout, &vise(), held, Some(&removed), &names).is_empty());
+        // A vise opening to 55 mm takes the walls, not the whole box.
+        let mut narrow = vise();
+        narrow.p.insert("max_opening".into(), "55".into());
+        assert_eq!(opening_issue(&layout, &narrow, held), None);
+        assert_eq!(
+            opening_issue(&layout, &narrow, left).as_deref(),
+            Some("The stock is 60 mm across the jaws; this vise opens to 55 mm.")
+        );
+        // Gripping 38 mm, down into the 3 mm the contour left whole (37 mm
+        // above the bottom), the band is the box's width again.
+        assert_eq!(
+            gripped(&vise_gripping(38.), &vise(), left, Some(&bands)).band,
+            left
+        );
+        // The suggestion puts that vise's jaws on the walls, which it opens to.
+        let (axis_y, grip) = suggest_vise(left, Some(&bands), &narrow, &[], 2.);
+        assert_eq!((axis_y, grip), (true, 8.));
+        let suggested = vise_gripping(grip);
+        let on = gripped(&suggested, &narrow, left, Some(&bands));
+        assert_eq!(opening_issue(&suggested, &narrow, on), None);
+    }
+    #[test]
     fn the_advice_for_the_jaws_band_depends_on_where_it_lies_in_the_earlier_setup() {
-        // The same outside contour of setup 1, down to 3 mm above its bottom.
         let tips = [3., 8., 13., 18., 23., 28., 33., 38.];
         let (mut v, f, flipped) = untouched();
         slot(&mut v, f, [-60., 60.], &[-30., 30.], &tips, 5., (0, 2));
@@ -2787,21 +2986,58 @@ mod tests {
         assert_eq!(Removed::new(&v, f).up_in(Some((0, 5))), None);
         let (empty, _, _) = untouched();
         assert_eq!(Removed::new(&empty, f).up_in(None), None);
-        // Turned over, setup 2 grips what was setup 1's top, and the bottom
-        // offset (which keeps setup 1's bottom) does not help.
+        // Setup 1's contour goes only 5 mm down from its top. Turned over,
+        // setup 2's jaws grip 8 mm of what was that top: the lower 5 mm of
+        // their band is cut on ±Y, the upper 3 mm is not, so they close on
+        // the box's width, half on air. The bottom offset (which keeps setup
+        // 1's bottom) does not help, and setup 2 cannot cut its jaws' band:
+        // setup 1 leaves those sides whole there, or cuts them through it.
+        let (mut shallow, _, _) = untouched();
+        slot(
+            &mut shallow,
+            f,
+            [-60., 60.],
+            &[-30., 30.],
+            &[35., 38.],
+            5.,
+            (0, 2),
+        );
         let part = f.transfer_bounds(PART, flipped);
-        let left = RestStock::new(&v, flipped).left(part);
-        assert_eq!(left, v.transformed_bounds(flipped));
-        let removed = Removed::new(&v, flipped);
-        let found = holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names);
+        let left = RestStock::new(&shallow, flipped).left(part);
+        assert_eq!(left, shallow.transformed_bounds(flipped));
+        let held = gripped(
+            &vise_gripping(8.),
+            &vise(),
+            left,
+            Some(&Bands::new(&shallow, flipped, part)),
+        );
+        assert_eq!(held.band, left);
+        let removed = Removed::new(&shallow, flipped);
+        let found = holdable(1, &vise_gripping(8.), &vise(), held, Some(&removed), &names);
         assert_eq!(
             found,
             [
-                "Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there and cut those sides in this setup instead (setup 2), or choose another holder. Setup 1, operation 3 is Contour \"Outside\"."
+                "Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm of those sides uncut in setup 1, or cut them through all 8 mm there, or choose another holder. Setup 1, operation 3 is Contour \"Outside\"."
             ]
         );
-        assert!(!found[0].contains("bottom_offset"));
-        // The same cut seen from a setup facing the same way keeps the old advice.
+        assert!(!found[0].contains("bottom_offset") && !found[0].contains("this setup"));
+        // Cut through those 8 mm (11 mm down), the jaws close on the walls.
+        slot(
+            &mut shallow,
+            f,
+            [-60., 60.],
+            &[-30., 30.],
+            &[29., 32.],
+            5.,
+            (0, 2),
+        );
+        let bands = Bands::new(&shallow, flipped, part);
+        let held = gripped(&vise_gripping(8.), &vise(), left, Some(&bands));
+        assert!(held.band.dimensions()[1] < 50.1, "{held:?}");
+        let removed = Removed::new(&shallow, flipped);
+        assert!(holdable(1, &vise_gripping(8.), &vise(), held, Some(&removed), &names).is_empty());
+        // The full-depth cut seen from a setup facing the same way keeps the
+        // old advice: the band is at setup 1's bottom.
         let left = RestStock::new(&v, f).left(PART);
         let removed = Removed::new(&v, f);
         let found = holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names);
@@ -3070,7 +3306,7 @@ mod tests {
             max: [50., 30., z],
         };
         for (z, grip) in [(40., 8.), (9., 8.), (6., 5.), (6.25, 5.25), (4.5, 3.5)] {
-            let (axis_y, suggested) = suggest_vise(tall(z), &vise(), &[], 2.);
+            let (axis_y, suggested) = suggest_vise(tall(z), None, &vise(), &[], 2.);
             assert_eq!(suggested, grip, "{z} mm tall");
             let layout = Layout::Vise {
                 holder: String::new(),
@@ -3082,11 +3318,11 @@ mod tests {
             assert_eq!(height_issue(&layout, tall(z)), None, "{z} mm tall");
         }
         // Never below the least grip a suggestion makes, however thin.
-        assert_eq!(suggest_vise(tall(3.5), &vise(), &[], 2.).1, 3.);
-        assert_eq!(suggest_vise(tall(1.), &vise(), &[], 2.).1, 3.);
+        assert_eq!(suggest_vise(tall(3.5), None, &vise(), &[], 2.).1, 3.);
+        assert_eq!(suggest_vise(tall(1.), None, &vise(), &[], 2.).1, 3.);
         // A holder gripping less than that keeps its own grip.
         let mut low = vise();
         low.p.insert("grip".into(), "2".into());
-        assert_eq!(suggest_vise(tall(1.), &low, &[], 2.).1, 2.);
+        assert_eq!(suggest_vise(tall(1.), None, &low, &[], 2.).1, 2.);
     }
 }

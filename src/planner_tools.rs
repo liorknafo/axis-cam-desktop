@@ -422,7 +422,8 @@ fn workholding(
     }
     let setup = &job.setups[si];
     let named = |message: String| (None, format!("{}: {message}", setup.name()));
-    if let Err(refused) = job.holding_boxes(setup, start.stock) {
+    let held = holding::held_by(job, setup, start.stock, bands(start).as_ref());
+    if let Err(refused) = job.holding_boxes(setup, held) {
         return vec![named(refused)];
     }
     let (Ok(layout), Some(entry)) = (
@@ -436,12 +437,18 @@ fn workholding(
         .as_deref()
         .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
     let names = |s, o| holding::operation_name(job, s, o);
-    holding::holdable(si, &layout, entry, start.stock, removed.as_ref(), &names)
+    holding::holdable(si, &layout, entry, held, removed.as_ref(), &names)
         .into_iter()
         .map(named)
         .collect()
 }
 
+/// What tells the bands the vise of a checked setup closes on: the stock the
+/// earlier setups left it. None for setup 1 and when nothing was cut.
+fn bands(start: &CheckedSetup) -> Option<holding::Bands> {
+    let before = start.before.as_deref().filter(|v| !v.cuts.is_empty())?;
+    Some(holding::Bands::new(before, start.frame, start.part))
+}
 /// Whether library entry `holder` could hold setup `setup` of the latest
 /// draft: the layout the program suggests for the setup's toolpaths, as
 /// Suggest layout and the plan check do, and the problems the plan check's
@@ -478,10 +485,10 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
     );
     setup.p.insert("holder".into(), entry.id.clone());
     let plans: Vec<&crate::simulation::Plan> = start.plans.iter().collect();
-    let stock = start.stock;
+    let (stock, bands) = (start.stock, bands(start));
     let layout = holding::request(setup, Some(entry))
         .ok()
-        .and_then(|request| request.suggest_on(&plans, || Some(stock)))
+        .and_then(|request| request.suggest_on(&plans, || Some(stock), bands.as_ref()))
         .map(|(_, layout)| layout);
     if let Some(layout) = &layout {
         holding::place(setup, layout);
@@ -510,15 +517,20 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
         problems: found,
     };
     let mut line = format!("{kind} {} for setup {}: {verdict}", args.holder, args.setup);
-    match layout {
-        Some(holding::Layout::Vise {
-            axis_y,
-            offset,
-            grip,
-            ..
-        }) => {
+    match &layout {
+        Some(
+            vise @ holding::Layout::Vise {
+                axis_y,
+                offset,
+                grip,
+                ..
+            },
+        ) => {
+            let (axis_y, offset, grip) = (*axis_y, *offset, *grip);
             let opening = crate::model::num(&entry.p, "max_opening").unwrap_or(0.);
-            let across = stock.dimensions()[usize::from(axis_y)];
+            // The jaws close on the band at the grip, not the whole box.
+            let band = holding::gripped(vise, entry, stock, bands.as_ref()).band;
+            let across = band.dimensions()[usize::from(axis_y)];
             line += &format!(" (opens {}, needs {})", plain(opening), plain(across));
             answer.vise = Some(ViseAt {
                 jaws_on: format!("±{}", if axis_y { "Y" } else { "X" }),
@@ -1087,7 +1099,9 @@ mod tests {
         said += &format!("{}\n{}\n", a.output, a.line);
         // A vise that opens too little for the stock: refused as the plan
         // check refuses it, before anything else, under the draft's own name
-        // for the setup.
+        // for the setup. Its jaws would close on the walls setup 1's
+        // Contour finished, not on the 84 mm the stock left under the part
+        // keeps: the narrower axis.
         let a = call("check_holding", json!({"setup": 2, "holder": 3}), &mut s);
         let out = json_of(&a);
         assert_eq!(out["holds"], false);
@@ -1095,8 +1109,8 @@ mod tests {
         let vise = &out["vise"];
         assert_eq!(vise["max_opening"], 60.);
         let across = vise["width_across_jaws"].as_f64().unwrap();
-        assert!(across == 84. || across == 124., "{out}");
-        assert!(vise["jaws_on"] == "±X" || vise["jaws_on"] == "±Y", "{out}");
+        assert!(across > 80. && across < 80.2, "{out}");
+        assert_eq!(vise["jaws_on"], "±Y", "{out}");
         assert!(vise["grip"].as_f64().unwrap() > 0.);
         assert_eq!(
             out["problems"],
@@ -1110,16 +1124,20 @@ mod tests {
             format!("Vise 3 for setup 2: 1 problem (opens 60, needs {across})")
         );
         said += &format!("{}\n{}\n", a.output, a.line);
-        // The starter vise opens wide enough, but setup 1's Contour took the
-        // sides its jaws would grip, and the problem names it.
+        // The starter vise opens wide enough for those walls, which setup
+        // 1's Contour finished through all of its grip: it holds.
         let a = call("check_holding", json!({"setup": 2, "holder": 1}), &mut s);
         let out = json_of(&a);
-        assert_eq!(out["holds"], false);
-        assert!(
-            out["problems"][0]["message"].as_str().unwrap().starts_with(
-                "Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 "
-            ),
+        assert_eq!(out["holds"], true, "{out}");
+        assert_eq!(out["problems"], json!([]));
+        assert_eq!(
+            out["vise"]["width_across_jaws"].as_f64(),
+            Some(across),
             "{out}"
+        );
+        assert_eq!(
+            a.line,
+            format!("Vise 1 for setup 2: holds (opens 120, needs {across})")
         );
         said += &format!("{}\n{}\n", a.output, a.line);
         // An entry or a setup the draft does not have.

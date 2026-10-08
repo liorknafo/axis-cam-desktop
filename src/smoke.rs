@@ -2769,7 +2769,7 @@ mod tests {
         // The example block's stock is 124 x 84 mm: only the Y sides fit the vise.
         let stock = plans[0].stock;
         let holder = a.doc.holder(&vise).unwrap().clone();
-        let (axis_y, grip) = crate::holding::suggest_vise(stock, &holder, &refs, 2.);
+        let (axis_y, grip) = crate::holding::suggest_vise(stock, None, &holder, &refs, 2.);
         assert!(axis_y);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         let p = &a.doc.setup().p;
@@ -2829,7 +2829,7 @@ mod tests {
         assert_eq!(plans.len(), 3);
         let refs: Vec<&crate::simulation::Plan> = plans.iter().collect();
         let holder = a.doc.holder(&vise).unwrap().clone();
-        let (axis_y, grip) = crate::holding::suggest_vise(plans[0].stock, &holder, &refs, 2.);
+        let (axis_y, grip) = crate::holding::suggest_vise(plans[0].stock, None, &holder, &refs, 2.);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         let p = &a.doc.setup().p;
         assert_eq!(
@@ -2892,7 +2892,13 @@ mod tests {
                 .holder(get(&a.doc.setup().p, "holder"))
                 .unwrap()
                 .clone();
-            let (axis_y, grip) = crate::holding::suggest_vise(plans[0].stock, &holder, &refs, 2.);
+            // The flipped setup's vise closes on the band setup 0 left it.
+            let mesh = a.imported_mesh.as_ref().unwrap();
+            let first = crate::simulation::prepare(&a.doc, mesh, si, 0).unwrap();
+            let bands = crate::post::bands(&a.doc.setups[si], mesh, &first);
+            assert_eq!(bands.is_some(), si == 1);
+            let (axis_y, grip) =
+                crate::holding::suggest_vise(plans[0].stock, bands.as_ref(), &holder, &refs, 2.);
             let p = &a.doc.setup().p;
             assert_eq!(get(p, "vise_axis"), if axis_y { "Y" } else { "X" });
             assert_eq!(get(p, "vise_grip"), grip.to_string());
@@ -3328,19 +3334,19 @@ mod tests {
         assert!(!crate::ui::holding_lines(&a).is_empty());
         assert_eq!(
             crate::ui::holding_lines(&a),
-            a.doc.holding_issues_with(1, Some(left))
+            a.doc.holding_issues_with(1, Some(left.into()))
         );
         assert!(crate::ui::holding_boxes(&a).is_empty());
         let _ = a.view();
         assert_eq!(
-            a.doc.holding_issues_with(1, Some(nominal)),
+            a.doc.holding_issues_with(1, Some(nominal.into())),
             Vec::<String>::new()
         );
         // The same grip on the original box is fine.
         assert_eq!(a.doc.holding_issues(1, Some(&mesh)), Vec::<String>::new());
         // The export-side height rule agrees with the editor.
         assert_eq!(
-            a.doc.holding_issues_with(1, Some(left)),
+            a.doc.holding_issues_with(1, Some(left.into())),
             [crate::holding::height_issue(
                 &crate::holding::layout(&a.doc.setups[1]).unwrap(),
                 left

@@ -1109,32 +1109,36 @@ impl Document {
     /// opening less than the stock is wide across the jaws, jaws or clamps
     /// placed off the stock and a vise gripping all but the last millimetre
     /// of the stock's height, and last a later setup not square to setup 1.
-    /// What earlier setups cut away is checked by the export
-    /// (`holding::holdable`), which simulates them.
+    /// The jaws close on the whole box here; what earlier setups cut away is
+    /// checked by the export (`holding::holdable`), which simulates them.
     pub fn holding_issues(&self, setup: usize, mesh: Option<&crate::mesh::Mesh>) -> Vec<String> {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
-        self.holding_problems(s, || self.setup_stock(setup, mesh))
+        self.holding_problems(s, || {
+            self.setup_stock(setup, mesh)
+                .map(crate::holding::Gripped::whole)
+        })
     }
-    /// `holding_issues` with the starting stock box of `setup` told by the
-    /// caller (mm, in that setup's frame; None when it is not known) instead
-    /// of `setup_stock`: the editor passes the box the earlier setups left.
+    /// `holding_issues` with the stock `setup` starts from told by the caller
+    /// (mm, in that setup's frame; None when it is not known) instead of
+    /// `setup_stock`, with the band its vise closes on: the editor passes the
+    /// box the earlier setups left and that band.
     pub fn holding_issues_with(
         &self,
         setup: usize,
-        stock: Option<crate::mesh::Bounds>,
+        held: Option<crate::holding::Gripped>,
     ) -> Vec<String> {
         let Some(s) = self.setups.get(setup) else {
             return vec![];
         };
-        self.holding_problems(s, || stock)
+        self.holding_problems(s, || held)
     }
-    /// `holding_issues` of `s`, the stock being told by `stock` when needed.
+    /// `holding_issues` of `s`, the stock being told by `held` when needed.
     fn holding_problems(
         &self,
         s: &Setup,
-        stock: impl FnOnce() -> Option<crate::mesh::Bounds>,
+        held: impl FnOnce() -> Option<crate::holding::Gripped>,
     ) -> Vec<String> {
         use crate::holding::{
             DELETED, NOT_SQUARE, height_issue, layout, opening_issue, position_issue, refusal,
@@ -1172,10 +1176,10 @@ impl Document {
             (Ok(layout), Some(entry)) if !kind.is_empty() => {
                 if let Some(refused) = refusal(&layout, entry) {
                     issues.push(refused);
-                } else if square && let Some(stock) = stock() {
-                    issues.extend(opening_issue(&layout, entry, stock));
-                    issues.extend(position_issue(&layout, entry, stock));
-                    issues.extend(height_issue(&layout, stock));
+                } else if square && let Some(held) = held() {
+                    issues.extend(opening_issue(&layout, entry, held));
+                    issues.extend(position_issue(&layout, entry, held));
+                    issues.extend(height_issue(&layout, held.stock));
                 }
             }
             _ => {}
@@ -1185,20 +1189,22 @@ impl Document {
         }
         issues
     }
-    /// The jaws or clamps of `setup` round its starting stock box `stock` (in
-    /// the setup's frame, mm), without the clearance gap; none without
-    /// workholding. Refuses with the first line `holding_issues` shows for
-    /// it, so that the editor and the export agree: an entry that is gone or
-    /// not chosen, a layout that does not read, an entry that does not fit,
-    /// a stock wider than the vise opens, jaws or clamps off the stock, a
-    /// stock not standing 1 mm above the jaws, a setup not square to setup 1.
+    /// The jaws or clamps of `setup` round `held`, the stock it starts from
+    /// and the band its vise closes on (in the setup's frame, mm), without
+    /// the clearance gap; none without workholding. Refuses with the first
+    /// line `holding_issues` shows for it, so that the editor and the export
+    /// agree: an entry that is gone or not chosen, a layout that does not
+    /// read, an entry that does not fit, a band wider than the vise opens,
+    /// jaws or clamps off the stock, a stock not standing 1 mm above the
+    /// jaws, a setup not square to setup 1.
     pub fn holding_boxes(
         &self,
         setup: &Setup,
-        stock: crate::mesh::Bounds,
+        held: impl Into<crate::holding::Gripped>,
     ) -> Result<Vec<crate::holding::HoldBox>, String> {
+        let held = held.into();
         if let Some(issue) = self
-            .holding_problems(setup, || Some(stock))
+            .holding_problems(setup, || Some(held))
             .into_iter()
             .next()
         {
@@ -1206,7 +1212,7 @@ impl Document {
         }
         let layout = crate::holding::layout(setup)?;
         match self.holder(get(&setup.p, "holder")) {
-            Some(entry) => crate::holding::boxes(&layout, entry, stock),
+            Some(entry) => crate::holding::boxes(&layout, entry, held),
             None => Ok(vec![]),
         }
     }
@@ -2091,7 +2097,7 @@ mod tests {
         // The setup's own box is what `holding_issues` takes.
         assert!(doc.holding_issues(0, None).is_empty());
         assert_eq!(
-            doc.holding_issues_with(0, Some(own)),
+            doc.holding_issues_with(0, Some(own.into())),
             doc.holding_issues(0, None)
         );
         // A box wider across the jaws than the vise opens, or too low for the grip.
@@ -2100,7 +2106,7 @@ mod tests {
             ..own
         };
         assert_eq!(
-            doc.holding_issues_with(0, Some(wide)),
+            doc.holding_issues_with(0, Some(wide.into())),
             ["The stock is 130 mm across the jaws; this vise opens to 120 mm."]
         );
         let low = crate::mesh::Bounds {
@@ -2108,7 +2114,7 @@ mod tests {
             ..own
         };
         assert_eq!(
-            doc.holding_issues_with(0, Some(low)),
+            doc.holding_issues_with(0, Some(low.into())),
             [
                 "The stock is 8.5 mm tall; the vise grips 8 mm of it, which leaves less than 1 mm above the jaws."
             ]
@@ -2118,7 +2124,7 @@ mod tests {
         doc.setup_mut().p.insert("holder".into(), "gone".into());
         assert_eq!(doc.holding_issues_with(0, None), [crate::holding::DELETED]);
         // An unknown setup has none.
-        assert!(doc.holding_issues_with(9, Some(wide)).is_empty());
+        assert!(doc.holding_issues_with(9, Some(wide.into())).is_empty());
     }
     #[test]
     fn holding_boxes_refuse_with_the_first_line_the_editor_shows() {
