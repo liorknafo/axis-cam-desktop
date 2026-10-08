@@ -2028,9 +2028,10 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
 }
 /// The jaws or clamps the 3D view draws with the stock: the active setup's,
 /// round the stock of the preview shown or else the box the setup starts from
-/// as far as it is known (`App::known_stock`), from the stock's bottom up
-/// (`holding::shown`). None when the stock is hidden, the setup has no
-/// workholding or it cannot be modelled (the setup editor says why).
+/// as far as it is known (`App::known_stock`), a vise's on the band it closes
+/// on (`held_of`), from the stock's bottom up (`holding::shown`). None when the
+/// stock is hidden, the setup has no workholding or it cannot be modelled
+/// (the setup editor says why).
 pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
     let boxes = || {
         let setup = app
@@ -2041,10 +2042,18 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
             .active_simulation()
             .map(|sim| sim.plan.stock)
             .or_else(|| app.known_stock(app.doc.index()).0)?;
-        let boxes = app.doc.holding_boxes(setup, stock).ok()?;
+        let boxes = app.doc.holding_boxes(setup, held_of(app, stock)).ok()?;
         Some(crate::holding::shown(&boxes, stock))
     };
     boxes().unwrap_or_default()
+}
+/// What the active setup's workholding holds of `stock`, the box it starts
+/// from: with the band its vise closes on when the editor knows it for that
+/// box (`App::known_held`), else the whole box.
+fn held_of(app: &App, stock: crate::mesh::Bounds) -> crate::holding::Gripped {
+    app.known_held(app.doc.index())
+        .filter(|held| held.stock == stock)
+        .unwrap_or(crate::holding::Gripped::whole(stock))
 }
 /// The box the 3D view draws as the stock of the active setup when it is a
 /// later setup whose box the earlier setups left has been worked out for the
@@ -2098,7 +2107,7 @@ fn holding_note(
     name: &str,
     setup: &Setup,
 ) -> crate::HoldingNote {
-    let boxes = match app.doc.holding_boxes(setup, plan.stock) {
+    let boxes = match app.doc.holding_boxes(setup, held_of(app, plan.stock)) {
         Ok(boxes) => boxes,
         Err(error) => {
             return Some((
@@ -2129,12 +2138,32 @@ fn holding_note(
     })
 }
 /// What is wrong with the active setup's workholding, as the setup editor
-/// lists it under the controls, the stock being the box the setup starts from
-/// as far as it is known (`App::known_stock`).
+/// lists it under the controls (`holding_lines_in`).
 pub(crate) fn holding_lines(app: &App) -> Vec<String> {
-    let si = app.doc.index();
-    app.doc
-        .holding_issues_with(si, app.known_stock(si).0.map(Into::into))
+    holding_lines_in(app, app.left_boxes(), app.current_checks(), app.doc.index())
+}
+/// What is wrong with setup `si`'s workholding as the editor knows it, in
+/// the export's order: `Document::holding_issues_with` on the box the setup
+/// starts from and the band its vise closes on (`App::known_held_in`, from
+/// `left` and `checks`), and when that finds nothing, what the holding
+/// checks found the earlier setups cut away, once they are worked out for
+/// the job as it is (`checks`).
+pub(crate) fn holding_lines_in(
+    app: &App,
+    left: Option<&[Option<crate::mesh::Bounds>]>,
+    checks: Option<&[Option<crate::SetupHolding>]>,
+    si: usize,
+) -> Vec<String> {
+    let held = app.known_held_in(left, checks, si);
+    let issues = app.doc.holding_issues_with(si, held);
+    if !issues.is_empty() {
+        return issues;
+    }
+    checks
+        .and_then(|c| c.get(si)?.as_ref())
+        .filter(|c| Some(c.held) == held)
+        .map(|c| c.problems.clone())
+        .unwrap_or_default()
 }
 /// What the setup editor says of a stock box it shows that is the original
 /// one.
@@ -3279,15 +3308,12 @@ pub(crate) fn fixture_note(app: &App, note: Note) -> String {
     format!("{before}{}", fixtures(note, modelled(app)))
 }
 /// How many of the job's setups have their vise or clamps checked: those that
-/// model them and have nothing wrong with how (`holding_issues`).
+/// model them and have nothing wrong with how, as the setup editor lists it
+/// (`holding_lines_in`).
 pub(crate) fn held(app: &App) -> Held {
-    let left = app.left_boxes();
+    let (left, checks) = (app.left_boxes(), app.current_checks());
     crate::holding::held_of(app.doc.setups.iter().enumerate().map(|(i, setup)| {
-        crate::holding::modelled(setup)
-            && app
-                .doc
-                .holding_issues_with(i, app.known_stock_in(left, i).0.map(Into::into))
-                .is_empty()
+        crate::holding::modelled(setup) && holding_lines_in(app, left, checks, i).is_empty()
     }))
 }
 /// Whether the active setup's vise or clamps are checked: it models them and

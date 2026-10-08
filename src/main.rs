@@ -181,9 +181,9 @@ pub enum Message {
     Exported(PathBuf),
     ExportError(String),
     PostChecked(u64, std::sync::Arc<post::JobPost>),
-    /// The stock each setup starts from, worked out for the job with this
-    /// fingerprint.
-    LeftStock(u64, Vec<Option<mesh::Bounds>>),
+    /// The stock each setup starts from and its holding checks, each worked
+    /// out for the job with its fingerprint.
+    LeftStock(Box<(LeftStock, HoldingChecks)>),
     ExportGcode,
     /// None when no folder was chosen.
     GcodeExported(Option<Result<(PathBuf, usize), String>>),
@@ -261,10 +261,36 @@ pub type HoldingNote = Option<(String, Vec<String>)>;
 /// whose fingerprint is `key` (`App::left_key`): one entry per setup, None for
 /// the first, which starts from its own stock, and for one after an operation
 /// or setup that failed. Only good for the job it was worked out for.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct LeftStock {
     pub key: u64,
     pub boxes: Vec<Option<mesh::Bounds>>,
+    /// The stock the earlier setups left each setup, cells and cuts, from
+    /// which its holding checks are made: None where `boxes` is, and where
+    /// nothing was cut before it.
+    pub before: Vec<Option<std::sync::Arc<volume::Volume>>>,
+}
+/// What the holding checks found for each setup of a job, worked out with
+/// `LeftStock` (`holding_checks`) for the job and its workholding whose
+/// fingerprint is `key` (`App::holding_key`): one entry per setup, None for
+/// the first and wherever `LeftStock` knows no box. Only good for the job
+/// and the workholding it was worked out for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HoldingChecks {
+    pub key: u64,
+    pub setups: Vec<Option<SetupHolding>>,
+}
+/// The holding checks of a later setup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupHolding {
+    /// The box it starts from and the band its vise closes on
+    /// (`holding::gripped`; the box itself for clamps or no workholding).
+    pub held: holding::Gripped,
+    /// What `holding::holdable` finds of its vise or clamps on what the
+    /// earlier setups left, as the export does: empty when it holds, and
+    /// when its workholding has a problem `Document::holding_issues_with`
+    /// says first.
+    pub problems: Vec<String>,
 }
 /// Setup settings that decide how the setup is held and nothing the earlier
 /// setups' cuts leave behind: an edit of one keeps the stock worked out.
@@ -308,13 +334,32 @@ fn left_fingerprint(doc: &Document, mesh: &mesh::Mesh) -> Option<u64> {
     mesh.fingerprint.hash(&mut hasher);
     Some(hasher.finish())
 }
+/// A fingerprint of what the holding checks of `doc` depend on beyond the
+/// stock (`left`, its `left_fingerprint`): how each setup is held and the
+/// workholding library. None when it cannot be written.
+fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    left.hash(&mut hasher);
+    let mut out = HashWriter(&mut hasher);
+    for setup in &doc.setups {
+        let held: Vec<_> = HOLDING_KEYS.iter().map(|k| get(&setup.p, k)).collect();
+        serde_json::to_writer(&mut out, &held).ok()?;
+    }
+    serde_json::to_writer(&mut out, &doc.workholding).ok()?;
+    Some(hasher.finish())
+}
 /// The box each setup of `doc` starts from when the earlier ones are
 /// simulated on `mesh` (`simulation::sequence_walk`, as the simulation itself
-/// gives it to the setup's operations): None for the first setup, and for a
-/// setup after an operation or setup that failed. A setup without an enabled
-/// operation has its box too.
-fn leftover_boxes(doc: &Document, mesh: &mesh::Mesh) -> Vec<Option<mesh::Bounds>> {
+/// gives it to the setup's operations), and the stock they left it: None for
+/// the first setup, and for a setup after an operation or setup that failed.
+/// A setup without an enabled operation has its box too. For the job whose
+/// fingerprint is `key`.
+fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
     let mut boxes = vec![None; doc.setups.len()];
+    let mut before = vec![None; doc.setups.len()];
+    // The stock after the last operation so far.
+    let last: std::cell::RefCell<Option<std::sync::Arc<volume::Volume>>> = Default::default();
     // The last setup's boxes are known before its first operation: when it has
     // one, nothing needs simulating after that. When it has none, the setups
     // before it are simulated whole, for its box.
@@ -327,10 +372,54 @@ fn leftover_boxes(doc: &Document, mesh: &mesh::Mesh) -> Vec<Option<mesh::Bounds>
         mesh,
         stop,
         |_, _, _| {},
-        |_, _, _| {},
-        |si, stock| boxes[si] = stock,
+        |_, _, stock| *last.borrow_mut() = Some(std::sync::Arc::new(stock.clone())),
+        |si, stock| {
+            boxes[si] = stock;
+            if stock.is_some() {
+                before[si] = last.borrow().clone();
+            }
+        },
     );
-    boxes
+    LeftStock { key, boxes, before }
+}
+/// The holding checks of each later setup of `doc` whose box `left` knows,
+/// as the export makes them (`post::held_walked`): the band its vise closes
+/// on, and, when `Document::holding_issues_with` finds nothing wrong with
+/// its workholding on that, what `holding::holdable` finds on the stock the
+/// earlier setups left and the part `mesh`. For the job and workholding
+/// whose fingerprint is `key`.
+fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64) -> HoldingChecks {
+    let names = |s, o| holding::operation_name(doc, s, o);
+    let setups = doc
+        .setups
+        .iter()
+        .enumerate()
+        .map(|(si, setup)| {
+            let stock = left.boxes.get(si).copied().flatten().filter(|_| si > 0)?;
+            let before = left.before.get(si).cloned().flatten();
+            let frame = volume::Frame::new(setup, mesh);
+            let part = simulation::part_box(setup, mesh);
+            let layout = holding::layout(setup).ok();
+            let bands = before
+                .as_deref()
+                .filter(|v| !v.cuts.is_empty())
+                .map(|v| holding::Bands::new(v, frame, part));
+            let held = holding::held_by(doc, setup, stock, bands.as_ref());
+            let problems = match (layout, doc.holder(get(&setup.p, "holder"))) {
+                (Some(layout), Some(holder))
+                    if doc.holding_issues_with(si, Some(held)).is_empty() =>
+                {
+                    let removed = before
+                        .as_deref()
+                        .map(|v| rest::Removed::new(v, frame).with_part(part));
+                    holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
+                }
+                _ => vec![],
+            };
+            Some(SetupHolding { held, problems })
+        })
+        .collect();
+    HoldingChecks { key, setups }
 }
 pub struct App {
     pub smoke_dir: Option<PathBuf>,
@@ -347,6 +436,8 @@ pub struct App {
     pub post_busy: bool,
     /// The stock the earlier setups left each later setup, once worked out.
     pub left_stock: LeftStock,
+    /// The holding checks of each later setup on that stock, once worked out.
+    pub holding_checks: HoldingChecks,
     /// The fingerprint of the job a background run is working out the stock
     /// for.
     left_job: Option<u64>,
@@ -616,6 +707,7 @@ impl App {
             post: None,
             post_busy: false,
             left_stock: LeftStock::default(),
+            holding_checks: HoldingChecks::default(),
             left_job: None,
             holding_note: std::cell::RefCell::new(None),
             post_epoch: 0,
@@ -879,6 +971,11 @@ impl App {
         }
         let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
         // Without toolpaths, the stock the earlier setups left when that is known.
+        let bands = if refs.is_empty() {
+            self.known_bands(si)
+        } else {
+            bands
+        };
         let Some((stock, layout)) =
             request.suggest_on(&refs, || self.known_stock(si).0, bands.as_ref())
         else {
@@ -1245,33 +1342,106 @@ impl App {
             si == 0 || self.is_sample(),
         )
     }
-    /// Works out the stock each later setup starts from, when the job has
-    /// changed since and no run is working on it: on the blocking pool (in
-    /// line in the smoke run), as `refresh_post` checks the program.
+    /// The fingerprint of the job as its holding checks are concerned
+    /// (`holding_fingerprint`): the stock's (`left_key`), how each setup is
+    /// held and the workholding library. None when `left_key` is.
+    pub(crate) fn holding_key(&self) -> Option<u64> {
+        holding_fingerprint(&self.doc, self.left_key()?)
+    }
+    /// The holding checks of each setup as worked out, when that was for the
+    /// job and its workholding as they are now.
+    pub(crate) fn current_checks(&self) -> Option<&[Option<SetupHolding>]> {
+        let key = self.holding_key()?;
+        (self.holding_checks.key == key).then_some(self.holding_checks.setups.as_slice())
+    }
+    /// What setup `si`'s workholding holds as far as the editor knows: the
+    /// box `known_stock_in` gives (`left`, from `left_boxes`) and the band
+    /// its vise closes on that the holding checks found for that box
+    /// (`checks`, from `current_checks`); the band is the box itself until
+    /// they are worked out, for setup 1 and without a vise. None without a
+    /// box.
+    pub(crate) fn known_held_in(
+        &self,
+        left: Option<&[Option<mesh::Bounds>]>,
+        checks: Option<&[Option<SetupHolding>]>,
+        si: usize,
+    ) -> Option<holding::Gripped> {
+        let stock = self.known_stock_in(left, si).0?;
+        let found = checks.and_then(|c| c.get(si)?.as_ref());
+        Some(
+            found
+                .map(|c| c.held)
+                .filter(|held| held.stock == stock)
+                .unwrap_or(holding::Gripped::whole(stock)),
+        )
+    }
+    /// `known_held_in` for the job as it is now.
+    pub(crate) fn known_held(&self, si: usize) -> Option<holding::Gripped> {
+        self.known_held_in(self.left_boxes(), self.current_checks(), si)
+    }
+    /// What tells the bands setup `si`'s vise closes on, from the stock the
+    /// earlier setups left it as worked out for the job as it is now. None
+    /// for setup 1, until it is worked out and where nothing was cut.
+    fn known_bands(&self, si: usize) -> Option<holding::Bands> {
+        let mesh = self.part_mesh()?;
+        let volume = self
+            .left_boxes()
+            .and(self.left_stock.before.get(si))?
+            .as_deref()
+            .filter(|v| si > 0 && !v.cuts.is_empty())?;
+        let setup = self.doc.setups.get(si)?;
+        Some(holding::Bands::new(
+            volume,
+            volume::Frame::new(setup, mesh),
+            simulation::part_box(setup, mesh),
+        ))
+    }
+    /// Works out the stock each later setup starts from and its holding
+    /// checks (`leftover_stock`, `holding_checks`), when the job or its
+    /// workholding has changed since and no run is working on it: on the
+    /// blocking pool (in line in the smoke run), as `refresh_post` checks the
+    /// program. A change of the workholding alone keeps the stock worked out
+    /// and checks it again.
     fn refresh_left_stock(&mut self) -> Task<Message> {
-        let Some(key) = self.left_key() else {
+        let (Some(key), Some(held)) = (self.left_key(), self.holding_key()) else {
             return Task::none();
         };
-        if self.left_job.is_some() || self.left_stock.key == key {
+        let known = self.left_stock.key == key;
+        if self.left_job.is_some() || (known && self.holding_checks.key == held) {
             return Task::none();
         }
         let Some(mesh) = self.part_mesh().cloned() else {
             return Task::none();
         };
         let doc = self.doc.clone();
-        let run = move || leftover_boxes(&doc, &mesh);
+        let left = known.then(|| self.left_stock.clone());
+        let run = move || {
+            let left = left.unwrap_or_else(|| leftover_stock(&doc, &mesh, key));
+            let checks = holding_checks(&doc, &mesh, &left, held);
+            (left, checks)
+        };
         if self.smoke_dir.is_some() {
-            self.left_stock = LeftStock { key, boxes: run() };
+            (self.left_stock, self.holding_checks) = run();
             return Task::none();
         }
         self.left_job = Some(key);
         Task::perform(
             async move {
-                // A run that failed leaves no boxes: the original stock is kept.
-                let boxes = tokio::task::spawn_blocking(run).await.unwrap_or_default();
-                (key, boxes)
+                // A run that failed leaves no boxes and no checks: the
+                // original stock is kept, and the job is not run again.
+                tokio::task::spawn_blocking(run).await.unwrap_or_else(|_| {
+                    let left = LeftStock {
+                        key,
+                        ..Default::default()
+                    };
+                    let checks = HoldingChecks {
+                        key: held,
+                        setups: vec![],
+                    };
+                    (left, checks)
+                })
             },
-            |(key, boxes)| Message::LeftStock(key, boxes),
+            |found| Message::LeftStock(Box::new(found)),
         )
     }
     fn write_settings(&self) -> Result<(), String> {
@@ -2895,11 +3065,15 @@ impl App {
             Message::Close(id) => return self.request_close(id),
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
-            Message::LeftStock(key, boxes) => {
+            Message::LeftStock(found) => {
                 self.left_job = None;
                 // A job edited while it ran gets a run of its own at the next pause.
-                if self.left_key() == Some(key) {
-                    self.left_stock = LeftStock { key, boxes };
+                let (left, checks) = *found;
+                if self.left_key() == Some(left.key) {
+                    self.left_stock = left;
+                }
+                if self.holding_key() == Some(checks.key) {
+                    self.holding_checks = checks;
                 }
             }
             Message::PostChecked(epoch, job) => {

@@ -852,10 +852,14 @@ impl App {
             // The same screen again, with its pictures uploaded.
             115 => vec![],
             116 => {
-                // Setup 1 only faces the 10 mm above the part; setup 2 turns
-                // the part over and is held in the starter vise. The setup
-                // editor shows the stock setup 2 starts from, in the panel
-                // and drawn, and the jaws start at its bottom.
+                // Setup 1, on stock 4 mm wider than the part all round, faces
+                // the 10 mm above the part and contours its walls down to its
+                // underside; setup 2 turns the part over and is held in the
+                // starter vise. The setup editor shows the stock setup 2
+                // starts from, in the panel and drawn: as wide as the block,
+                // for the 3 mm left under the part, now its top. The jaws
+                // start at its bottom and close on the walls the Contour
+                // finished, under that rim.
                 use crate::model::{Setup, Strategy};
                 // The run's last check of the earlier screens: the operation
                 // of the Workholding screens is still previewed.
@@ -867,9 +871,15 @@ impl App {
                 self.paths = false;
                 self.camera = crate::viewport::Camera::default();
                 self.doc.setups.truncate(1);
-                self.doc.setups[0]
-                    .operations
-                    .retain(|o| o.strategy == Strategy::Face);
+                let mut contour =
+                    crate::model::Operation::new(Strategy::Contour, self.doc.tools[0].id.clone());
+                contour.geometry.clear();
+                let first = &mut self.doc.setups[0];
+                first.operations.retain(|o| o.strategy == Strategy::Face);
+                first.operations.push(contour);
+                for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+                    first.p.insert(key.into(), "4".into());
+                }
                 let mut setup = Setup::new(self.doc.setups[0].machine.clone(), "G55");
                 setup.p.insert("name".into(), "Flipped underside".into());
                 setup.p.insert("rx".into(), "180".into());
@@ -968,10 +978,28 @@ impl App {
                     crate::stock::dimensions_text(original.dimensions())
                 );
                 assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Vise");
-                assert_eq!(crate::ui::holding_boxes(self).len(), 2, "{}", self.status);
                 assert!(crate::ui::stock_note(self).is_none());
                 // The 3D view draws that box as the stock.
                 assert_eq!(crate::ui::leftover_view(self), Some(stock));
+                // The jaws close on the walls: the band they grip is
+                // narrower across them than the box, and they hold it.
+                let held = self.known_held(1).expect("setup 2's holding");
+                let axis = usize::from(crate::model::get(&self.doc.setup().p, "vise_axis") == "Y");
+                let (band, whole) = (held.band.dimensions()[axis], stock.dimensions()[axis]);
+                assert!(band < whole - 7., "{band} across the jaws of {whole}");
+                let jaws = crate::ui::holding_boxes(self);
+                assert_eq!(jaws.len(), 2, "{}", self.status);
+                assert!(
+                    jaws.iter()
+                        .all(|j| (j.bounds.max[axis] - held.band.min[axis]).abs() < 1e-3
+                            || (j.bounds.min[axis] - held.band.max[axis]).abs() < 1e-3),
+                    "{jaws:?} {held:?}"
+                );
+                assert_eq!(crate::ui::holding_lines(self), Vec::<String>::new());
+                eprintln!(
+                    "Screen 92: the jaws close on {band:.3} mm of the box's {whole:.3} mm across them. {}",
+                    self.status
+                );
             }
             // The overview's picture at the top of the visible part, so the
             // lines of the open request fit under it.
@@ -3189,8 +3217,17 @@ mod tests {
     /// on the setup directly, nothing is suggested). Background jobs run in
     /// line, as in the smoke run. Setup 2 is the active one.
     fn leftover_app(dir: &tempfile::TempDir) -> App {
+        let (doc, mesh) = crate::post::fixture::flipped_after(1);
+        vise_app(dir, doc, mesh)
+    }
+    /// `doc`, on `mesh`, its second setup held in the starter vise on ±Y at
+    /// grip 8, in the setup editor of that setup.
+    fn vise_app(
+        dir: &tempfile::TempDir,
+        mut doc: crate::model::Document,
+        mesh: crate::mesh::Mesh,
+    ) -> App {
         let mut a = fresh_app(dir);
-        let (mut doc, mesh) = crate::post::fixture::flipped_after(1);
         doc.adopt_holders();
         a.replace_document(doc, None);
         a.imported_mesh = Some(mesh);
@@ -3219,6 +3256,91 @@ mod tests {
             .unwrap()
             .plan
             .stock
+    }
+    /// `flipped_after(3)` (setup 1 faces, pockets and contours the walls,
+    /// but only down to `bottom` mm above the part's underside) in
+    /// `vise_app`, setup 1 held in the starter vise too, on ±Y at grip 8.
+    fn contoured_app(dir: &tempfile::TempDir, bottom: &str) -> App {
+        let (mut doc, mesh) = crate::post::fixture::flipped_after(3);
+        doc.setups[0].operations[2]
+            .p
+            .insert("bottom".into(), bottom.into());
+        let mut a = vise_app(dir, doc, mesh);
+        let id = first_of(&a, "Vise");
+        let p = &mut a.doc.setups[0].p;
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", id.as_str()),
+            ("vise_axis", "Y"),
+            ("vise_offset", "0"),
+            ("vise_grip", "8"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        a
+    }
+    #[test]
+    fn the_setup_editor_shows_what_the_earlier_setups_left_the_vise_to_grip() {
+        use crate::holding::Held;
+        let dir = tempfile::tempdir().unwrap();
+        // Setup 1's Contour takes only the top 5 mm of the walls. Turned
+        // over, setup 2's vise grips 8 mm of what was that top, cut in part.
+        let mut a = contoured_app(&dir, "35");
+        let mesh = a.imported_mesh.clone().unwrap();
+        // Before the job has run, only what needs no simulation is said, and
+        // both setups count as checked.
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        assert_eq!(crate::ui::held(&a), Held::Every);
+        let _ = a.refresh_left_stock();
+        assert!(a.known_stock(1).1);
+        // Worked out: the editor says what the export says, in its words,
+        // and the NC program page no longer counts setup 2 as checked.
+        let lines = crate::ui::holding_lines(&a);
+        assert!(
+            lines[0].starts_with("Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm of those sides uncut in setup 1, "),
+            "{lines:?}"
+        );
+        let mut doc = a.doc.clone();
+        doc.setups[1]
+            .p
+            .insert("origin".into(), "Model origin".into());
+        let exported = crate::post::post_job(&doc, &mesh);
+        let refused = exported.setups[1].result.as_ref().unwrap_err();
+        let said: Vec<String> = lines.iter().map(|l| format!("Flipped: {l}")).collect();
+        assert_eq!(refused, &said);
+        assert_eq!(crate::ui::held(&a), Held::Mixed);
+        assert!(!crate::ui::modelled(&a));
+        let _ = a.view();
+        // Gripping 3 mm, all of it cut through: the jaws close on the walls.
+        // A change of the holding alone checks it again on the stock worked
+        // out, without simulating the earlier setups again.
+        let before = a.left_stock.before[1].clone().unwrap();
+        let _ = a.update(Message::Edit(Target::Setup, "vise_grip", "3".into()));
+        assert!(a.known_stock(1).1);
+        assert!(a.current_checks().is_none());
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        let _ = a.refresh_left_stock();
+        assert!(std::sync::Arc::ptr_eq(
+            &before,
+            a.left_stock.before[1].as_ref().unwrap()
+        ));
+        assert!(a.current_checks().is_some());
+        assert_eq!(crate::ui::holding_lines(&a), Vec::<String>::new());
+        assert_eq!(crate::ui::held(&a), Held::Every);
+        // The jaws are drawn on those walls, the band 80.7 mm across them
+        // (the Contour's 0.3 mm allowance), inside the 84 mm box.
+        let held = a.known_held(1).unwrap();
+        let across = held.band.dimensions()[1];
+        assert!(across > 80.6 && across < 80.8, "{held:?}");
+        assert!(held.stock.dimensions()[1] > 83.9);
+        let jaws = crate::ui::holding_boxes(&a);
+        assert_eq!(jaws.len(), 2);
+        assert!(
+            jaws.iter()
+                .any(|j| (j.bounds.max[1] - held.band.min[1]).abs() < 1e-4),
+            "{jaws:?}"
+        );
+        let _ = a.view();
     }
     #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
@@ -3419,13 +3541,28 @@ mod tests {
         let _ = a.update(Message::Edit(Target::Setup, "rz", "90".into()));
         assert_ne!(a.left_key(), key);
     }
+    /// What a job that worked out `boxes` for the job whose fingerprints are
+    /// `key` (the stock's) and `held` (its holding checks') answers, with no
+    /// checks to show.
+    fn worked_out(key: u64, held: u64, boxes: Vec<Option<crate::mesh::Bounds>>) -> Message {
+        let left = crate::LeftStock {
+            key,
+            boxes,
+            before: vec![],
+        };
+        let checks = crate::HoldingChecks {
+            key: held,
+            setups: vec![],
+        };
+        Message::LeftStock(Box::new((left, checks)))
+    }
     #[test]
     fn a_result_for_a_document_that_was_edited_while_it_ran_is_discarded() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = leftover_app(&dir);
         // Not in line: the job is on the blocking pool, its result a message.
         a.smoke_dir = None;
-        let started = a.left_key().unwrap();
+        let (started, held) = (a.left_key().unwrap(), a.holding_key().unwrap());
         let _ = a.refresh_left_stock();
         assert_eq!(a.left_job, Some(started));
         // One job at a time.
@@ -3438,20 +3575,43 @@ mod tests {
         let _ = a.update(Message::Edit(Target::Operation, "bottom", "1".into()));
         let _ = a.update(Message::SelectSetup(1));
         assert_ne!(a.left_key(), Some(started));
-        let _ = a.update(Message::LeftStock(started, boxes.clone()));
+        let _ = a.update(worked_out(started, held, boxes.clone()));
         assert_eq!(a.left_job, None);
-        assert_eq!(a.left_stock, crate::LeftStock::default());
+        assert_eq!((a.left_stock.key, a.left_stock.boxes.len()), (0, 0));
+        assert_eq!(a.holding_checks, crate::HoldingChecks::default());
         assert_eq!(a.known_stock(1), (nominal.0, false));
         // The next job is for the edited document, and its result is kept.
         let now = a.left_key().unwrap();
         assert_eq!(a.refresh_left_stock().units(), 1);
         assert_eq!(a.left_job, Some(now));
-        let _ = a.update(Message::LeftStock(now, boxes.clone()));
+        let _ = a.update(worked_out(now, a.holding_key().unwrap(), boxes.clone()));
         assert_eq!(a.left_job, None);
         assert_eq!(a.known_stock(1), (boxes[1], true));
         // Nothing more to do for the document as it is.
         assert_eq!(a.refresh_left_stock().units(), 0);
         assert_eq!(a.left_job, None);
+    }
+    #[test]
+    fn a_result_whose_holding_was_edited_while_it_ran_keeps_the_stock_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        a.smoke_dir = None;
+        let (key, held) = (a.left_key().unwrap(), a.holding_key().unwrap());
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.left_job, Some(key));
+        let boxes = vec![None, Some(simulated_stock(&a))];
+        // The grip changes while it runs: the stock is still the job's, its
+        // holding checks are not.
+        let _ = a.update(Message::Edit(Target::Setup, "vise_grip", "6".into()));
+        assert_eq!(a.left_key(), Some(key));
+        assert_ne!(a.holding_key(), Some(held));
+        let _ = a.update(worked_out(key, held, boxes.clone()));
+        assert_eq!(a.left_job, None);
+        assert_eq!(a.known_stock(1), (boxes[1], true));
+        assert!(a.current_checks().is_none());
+        // The next run is for the checks.
+        assert_eq!(a.refresh_left_stock().units(), 1);
+        assert_eq!(a.left_job, Some(key));
     }
     #[test]
     fn the_simulation_waits_for_the_edits_to_pause_and_runs_one_at_a_time() {
@@ -3473,7 +3633,8 @@ mod tests {
         let _ = a.update(Message::Tick);
         assert_eq!(a.left_job, running);
         assert!(a.blocking_work());
-        let _ = a.update(Message::LeftStock(running.unwrap(), vec![None, None]));
+        let held = a.holding_key().unwrap();
+        let _ = a.update(worked_out(running.unwrap(), held, vec![None, None]));
         assert!(!a.blocking_work());
         // Done for this document: the ticks start none.
         let _ = a.update(Message::Tick);
