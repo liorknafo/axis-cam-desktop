@@ -1710,6 +1710,22 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
         }
     } else {
         c=c.push(note("Remaining stock from every preceding setup is inherited automatically. Rotation and translation reposition the same 3D material, including cavities and holes. Define the initial stock in the first setup."));
+        if let (Some(stock), _) = app.known_stock(app.doc.index()) {
+            c = c.push(
+                container(
+                    column![
+                        bold("Stock before this setup · X × Y × Z", 12),
+                        text(crate::stock::dimensions_text(stock.dimensions()))
+                            .size(14)
+                            .color(BLUE)
+                    ]
+                    .spacing(6),
+                )
+                .padding(12)
+                .width(Fill)
+                .style(panel_style),
+            );
+        }
     }
     c = c.push(section("Part position")).push(
         row![
@@ -1962,6 +1978,9 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
             c.push(caution(heading, lines));
         }
     }
+    if let Some(note) = stock_note(app) {
+        c.push(muted(note).into());
+    }
     c.push(
         btn(
             "Open workholding library",
@@ -2007,10 +2026,10 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
     )
 }
 /// The jaws or clamps the 3D view draws with the stock: the active setup's,
-/// round the stock of the preview shown or else the setup's own, from the
-/// stock's bottom up (`holding::shown`). None when the stock is hidden, the
-/// setup has no workholding or it cannot be modelled (the setup editor says
-/// why).
+/// round the stock of the preview shown or else the box the setup starts from
+/// as far as it is known (`App::known_stock`), from the stock's bottom up
+/// (`holding::shown`). None when the stock is hidden, the setup has no
+/// workholding or it cannot be modelled (the setup editor says why).
 pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
     let boxes = || {
         let setup = app
@@ -2020,7 +2039,7 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
         let stock = app
             .active_simulation()
             .map(|sim| sim.plan.stock)
-            .or_else(|| app.doc.setup_stock(app.doc.index(), app.part_mesh()))?;
+            .or_else(|| app.known_stock(app.doc.index()).0)?;
         let boxes = app.doc.holding_boxes(setup, stock).ok()?;
         Some(crate::holding::shown(&boxes, stock))
     };
@@ -2094,9 +2113,23 @@ fn holding_note(
     })
 }
 /// What is wrong with the active setup's workholding, as the setup editor
-/// lists it under the controls.
+/// lists it under the controls, the stock being the box the setup starts from
+/// as far as it is known (`App::known_stock`).
 pub(crate) fn holding_lines(app: &App) -> Vec<String> {
-    app.doc.holding_issues(app.doc.index(), app.part_mesh())
+    let si = app.doc.index();
+    app.doc.holding_issues_with(si, app.known_stock(si).0)
+}
+/// What the setup editor says of a stock box it shows that is the original
+/// one.
+pub(crate) const ORIGINAL_STOCK: &str =
+    "Original stock size until the earlier setups are simulated.";
+/// The note under the active setup's workholding controls: the stock they
+/// are checked against is the original box, not yet the one the earlier
+/// setups left. None for the first setup, when the box is the one left and
+/// when there is no box.
+pub(crate) fn stock_note(app: &App) -> Option<&'static str> {
+    let (stock, current) = app.known_stock(app.doc.index());
+    (stock.is_some() && !current).then_some(ORIGINAL_STOCK)
 }
 fn page_header<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
     row![
@@ -3231,8 +3264,13 @@ pub(crate) fn fixture_note(app: &App, note: Note) -> String {
 /// How many of the job's setups have their vise or clamps checked: those that
 /// model them and have nothing wrong with how (`holding_issues`).
 pub(crate) fn held(app: &App) -> Held {
+    let left = app.left_boxes();
     crate::holding::held_of(app.doc.setups.iter().enumerate().map(|(i, setup)| {
-        crate::holding::modelled(setup) && app.doc.holding_issues(i, app.part_mesh()).is_empty()
+        crate::holding::modelled(setup)
+            && app
+                .doc
+                .holding_issues_with(i, app.known_stock_in(left, i).0)
+                .is_empty()
     }))
 }
 /// Whether the active setup's vise or clamps are checked: it models them and

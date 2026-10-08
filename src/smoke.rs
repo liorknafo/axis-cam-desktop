@@ -2983,6 +2983,274 @@ mod tests {
             crate::ui::holding_lines(&a)
         );
     }
+    /// The fixture block faced 4 mm off the top on setup 1 and flipped onto that
+    /// face on setup 2, which the starter vise holds on ±Y, 8 mm up (written
+    /// on the setup directly, nothing is suggested). Background jobs run in
+    /// line, as in the smoke run. Setup 2 is the active one.
+    fn leftover_app(dir: &tempfile::TempDir) -> App {
+        let mut a = fresh_app(dir);
+        let (mut doc, mesh) = crate::post::fixture::flipped_after(1);
+        doc.adopt_holders();
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let id = first_of(&a, "Vise");
+        let p = &mut a.doc.setups[1].p;
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", id.as_str()),
+            ("vise_axis", "Y"),
+            ("vise_offset", "0"),
+            ("vise_grip", "8"),
+            ("holding_gap", "2"),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupEditor);
+        a
+    }
+    /// The box setup 2 of `leftover_app` starts from, as simulating setup 1
+    /// makes it.
+    fn simulated_stock(a: &App) -> crate::mesh::Bounds {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        crate::simulation::prepare(&a.doc, mesh, 1, 0)
+            .unwrap()
+            .plan
+            .stock
+    }
+    #[test]
+    fn the_setup_editor_says_the_stock_is_the_original_until_the_earlier_setups_are_simulated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        const NOTE: &str = "Original stock size until the earlier setups are simulated.";
+        // Setup 1's stock is its own, whatever has been simulated.
+        assert_eq!(a.known_stock(0), (a.doc.setup_stock(0, Some(&mesh)), true));
+        assert_eq!(crate::ui::stock_note(&a), Some(NOTE));
+        assert_eq!(a.known_stock(1), (Some(nominal), false));
+        let _ = a.view();
+        // Simulated: the box setup 1 left, and no note.
+        let _ = a.refresh_left_stock();
+        let left = simulated_stock(&a);
+        assert!((left.dimensions()[2] - (nominal.dimensions()[2] - 4.)).abs() < 0.01);
+        assert_eq!(a.known_stock(1), (Some(left), true));
+        assert_eq!(crate::ui::stock_note(&a), None);
+        let _ = a.view();
+        // Setup 1 is not a later setup: no note for it.
+        let _ = a.update(Message::SelectSetup(0));
+        assert_eq!(crate::ui::stock_note(&a), None);
+        let _ = a.view();
+        // Nothing to simulate with one setup or without the part.
+        let mut single = leftover_app(&dir);
+        single.doc.setups.pop();
+        assert_eq!(single.left_key(), None);
+        let mut no_part = leftover_app(&dir);
+        no_part.imported_mesh = None;
+        assert_eq!(no_part.left_key(), None);
+        assert_eq!(no_part.known_stock(1), (None, false));
+        assert_eq!(crate::ui::stock_note(&no_part), None);
+    }
+    #[test]
+    fn the_workholding_checks_and_the_jaws_use_the_stock_the_earlier_setups_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        let top_of_jaws = |a: &App| -> Vec<f32> {
+            crate::ui::holding_boxes(a)
+                .iter()
+                .map(|b| b.bounds.max[2])
+                .collect()
+        };
+        // The jaws are drawn from the original box's bottom, then from the leftover's.
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        assert_eq!(top_of_jaws(&a).len(), 2);
+        assert!(
+            top_of_jaws(&a)
+                .iter()
+                .all(|z| (z - (nominal.min[2] + 8.)).abs() < 0.01)
+        );
+        let _ = a.refresh_left_stock();
+        let left = simulated_stock(&a);
+        assert!(left.min[2] > nominal.min[2] + 3.9);
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        assert_eq!(top_of_jaws(&a).len(), 2);
+        assert!(
+            top_of_jaws(&a)
+                .iter()
+                .all(|z| (z - (left.min[2] + 8.)).abs() < 0.01)
+        );
+        // A grip the original box is tall enough for and the leftover is not:
+        // the editor says so once the box is known.
+        let grip = (nominal.dimensions()[2] + left.dimensions()[2]) / 2.;
+        let _ = a.update(Message::Edit(Target::Setup, "vise_grip", grip.to_string()));
+        assert!(!crate::ui::holding_lines(&a).is_empty());
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            a.doc.holding_issues_with(1, Some(left))
+        );
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        let _ = a.view();
+        assert_eq!(
+            a.doc.holding_issues_with(1, Some(nominal)),
+            Vec::<String>::new()
+        );
+        // The same grip on the original box is fine.
+        assert_eq!(a.doc.holding_issues(1, Some(&mesh)), Vec::<String>::new());
+        // The export-side height rule agrees with the editor.
+        assert_eq!(
+            a.doc.holding_issues_with(1, Some(left)),
+            [crate::holding::height_issue(
+                &crate::holding::layout(&a.doc.setups[1]).unwrap(),
+                left
+            )
+            .unwrap()]
+        );
+    }
+    #[test]
+    fn an_edit_makes_the_known_stock_stale_until_the_simulation_is_done_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        let _ = a.refresh_left_stock();
+        let first = simulated_stock(&a);
+        assert_eq!(a.known_stock(1), (Some(first), true));
+        // Facing 1 mm less off setup 1's top leaves a taller block.
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "bottom", "1".into()));
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupEditor);
+        assert_eq!(a.known_stock(1), (Some(nominal), false));
+        assert!(crate::ui::stock_note(&a).is_some());
+        let _ = a.view();
+        let _ = a.refresh_left_stock();
+        let second = simulated_stock(&a);
+        assert!(second.dimensions()[2] > first.dimensions()[2] + 0.5);
+        assert_eq!(a.known_stock(1), (Some(second), true));
+        assert_eq!(crate::ui::stock_note(&a), None);
+        // A tool change, a placement change and another part do too.
+        let key = a.left_key();
+        a.doc.tools[0].p.insert("diameter".into(), "8".into());
+        assert_ne!(a.left_key(), key);
+        assert!(!a.known_stock(1).1);
+        a.doc.tools[0].p.insert("diameter".into(), "10".into());
+        assert_eq!(a.left_key(), key);
+        assert!(a.known_stock(1).1);
+        a.doc.setups[1].p.insert("tx".into(), "5".into());
+        assert_ne!(a.left_key(), key);
+        a.doc.setups[1].p.insert("tx".into(), "0".into());
+        a.imported_mesh.as_mut().unwrap().fingerprint = "another part".into();
+        assert_ne!(a.left_key(), key);
+        assert!(!a.known_stock(1).1);
+    }
+    #[test]
+    fn editing_the_workholding_keeps_the_known_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let _ = a.refresh_left_stock();
+        let (left, key) = (a.known_stock(1), a.left_key());
+        assert!(left.1);
+        for (k, v) in [
+            ("vise_grip", "6"),
+            ("vise_offset", "2"),
+            ("vise_axis", "X"),
+            ("holding_gap", "3"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Setup, k, v.into()));
+            assert_eq!(a.left_key(), key, "{k}");
+            assert_eq!(a.known_stock(1), left, "{k}");
+        }
+        let clamp = first_of(&a, "Clamp");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::Edit(Target::Setup, "holder", clamp));
+        let _ = a.update(Message::SetClamps("-X:0".into()));
+        assert_eq!(a.left_key(), key);
+        assert_eq!(a.known_stock(1), left);
+        // The name of the setup and its other settings are the document's, though.
+        let _ = a.update(Message::Edit(Target::Setup, "rz", "90".into()));
+        assert_ne!(a.left_key(), key);
+    }
+    #[test]
+    fn a_result_for_a_document_that_was_edited_while_it_ran_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        // Not in line: the job is on the blocking pool, its result a message.
+        a.smoke_dir = None;
+        let started = a.left_key().unwrap();
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.left_job, Some(started));
+        // One job at a time.
+        assert_eq!(a.refresh_left_stock().units(), 0);
+        let nominal = a.known_stock(1);
+        let boxes = vec![None, Some(simulated_stock(&a))];
+        // An edit while it runs.
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "bottom", "1".into()));
+        let _ = a.update(Message::SelectSetup(1));
+        assert_ne!(a.left_key(), Some(started));
+        let _ = a.update(Message::LeftStock(started, boxes.clone()));
+        assert_eq!(a.left_job, None);
+        assert_eq!(a.left_stock, crate::LeftStock::default());
+        assert_eq!(a.known_stock(1), (nominal.0, false));
+        // The next job is for the edited document, and its result is kept.
+        let now = a.left_key().unwrap();
+        assert_eq!(a.refresh_left_stock().units(), 1);
+        assert_eq!(a.left_job, Some(now));
+        let _ = a.update(Message::LeftStock(now, boxes.clone()));
+        assert_eq!(a.left_job, None);
+        assert_eq!(a.known_stock(1), (boxes[1], true));
+        // Nothing more to do for the document as it is.
+        assert_eq!(a.refresh_left_stock().units(), 0);
+        assert_eq!(a.left_job, None);
+    }
+    #[test]
+    fn the_simulation_waits_for_the_edits_to_pause_and_runs_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        a.smoke_dir = None;
+        let _ = a.update(Message::Tick);
+        // Just edited: not yet.
+        a.last_edit = std::time::Instant::now();
+        let _ = a.update(Message::Tick);
+        assert_eq!(a.left_job, None);
+        // The pause is as long as the project's save waits.
+        a.last_edit = std::time::Instant::now() - std::time::Duration::from_millis(800);
+        let _ = a.update(Message::Tick);
+        assert_eq!(a.left_job, a.left_key());
+        assert!(a.left_job.is_some());
+        // Running: the ticks start no other.
+        let running = a.left_job;
+        let _ = a.update(Message::Tick);
+        assert_eq!(a.left_job, running);
+        assert!(a.blocking_work());
+        let _ = a.update(Message::LeftStock(running.unwrap(), vec![None, None]));
+        assert!(!a.blocking_work());
+        // Done for this document: the ticks start none.
+        let _ = a.update(Message::Tick);
+        assert_eq!(a.left_job, None);
+    }
+    #[test]
+    fn a_setup_whose_earlier_setups_failed_keeps_the_original_stock_and_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        // Setup 1's facing has no tool to cut with.
+        a.doc.setups[0].operations[0].tool = "gone".into();
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.left_stock.key, a.left_key().unwrap());
+        assert_eq!(a.left_stock.boxes, [None, None]);
+        assert_eq!(a.known_stock(1), (Some(nominal), false));
+        assert!(crate::ui::stock_note(&a).is_some());
+        let _ = a.view();
+        // The job is not done again for the same document.
+        assert_eq!(a.refresh_left_stock().units(), 0);
+    }
     /// The fixture job with its first setup held by the starter clamp, on -X
     /// at `bite` mm onto the stock (12 reaches only the stock's edge, 40 the
     /// pocket), written on the setup directly so that nothing is suggested.

@@ -1117,6 +1117,19 @@ impl Document {
         };
         self.holding_problems(s, || self.setup_stock(setup, mesh))
     }
+    /// `holding_issues` with the starting stock box of `setup` told by the
+    /// caller (mm, in that setup's frame; None when it is not known) instead
+    /// of `setup_stock`: the editor passes the box the earlier setups left.
+    pub fn holding_issues_with(
+        &self,
+        setup: usize,
+        stock: Option<crate::mesh::Bounds>,
+    ) -> Vec<String> {
+        let Some(s) = self.setups.get(setup) else {
+            return vec![];
+        };
+        self.holding_problems(s, || stock)
+    }
     /// `holding_issues` of `s`, the stock being told by `stock` when needed.
     fn holding_problems(
         &self,
@@ -2056,6 +2069,56 @@ mod tests {
             doc.holding_issues(0, None),
             ["Choose a clamp from the library."]
         );
+    }
+    #[test]
+    fn holding_issues_with_checks_the_stock_it_is_told() {
+        let mut doc = doc_with_holding(&[
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "100"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+        ]);
+        let vise = starter(&doc, "Vise");
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", &vise),
+            ("vise_axis", "X"),
+            ("vise_grip", "8"),
+        ] {
+            doc.setup_mut().p.insert(k.into(), v.into());
+        }
+        let own = doc.setup_stock(0, None).unwrap();
+        // The setup's own box is what `holding_issues` takes.
+        assert!(doc.holding_issues(0, None).is_empty());
+        assert_eq!(
+            doc.holding_issues_with(0, Some(own)),
+            doc.holding_issues(0, None)
+        );
+        // A box wider across the jaws than the vise opens, or too low for the grip.
+        let wide = crate::mesh::Bounds {
+            max: [own.min[0] + 130., own.max[1], own.max[2]],
+            ..own
+        };
+        assert_eq!(
+            doc.holding_issues_with(0, Some(wide)),
+            ["The stock is 130 mm across the jaws; this vise opens to 120 mm."]
+        );
+        let low = crate::mesh::Bounds {
+            max: [own.max[0], own.max[1], own.min[2] + 8.5],
+            ..own
+        };
+        assert_eq!(
+            doc.holding_issues_with(0, Some(low)),
+            [
+                "The stock is 8.5 mm tall; the vise grips 8 mm of it, which leaves less than 1 mm above the jaws."
+            ]
+        );
+        // No box is told: only what does not need one is checked.
+        assert!(doc.holding_issues_with(0, None).is_empty());
+        doc.setup_mut().p.insert("holder".into(), "gone".into());
+        assert_eq!(doc.holding_issues_with(0, None), [crate::holding::DELETED]);
+        // An unknown setup has none.
+        assert!(doc.holding_issues_with(9, Some(wide)).is_empty());
     }
     #[test]
     fn holding_boxes_refuse_with_the_first_line_the_editor_shows() {

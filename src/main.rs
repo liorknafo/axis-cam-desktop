@@ -84,6 +84,9 @@ const PLAN_BUSY: &str = "The previous plan check is still finishing; try again i
 const DEFAULT_MODEL: &str = "gpt-6.1-sol";
 const NOT_GRANTED: &str =
     "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.";
+/// How long edits must pause before the project is saved and the stock the
+/// earlier setups left is worked out again.
+const EDIT_PAUSE: Duration = Duration::from_millis(700);
 /// A loaded project, its path, and the notes of the load (`load_reporting`).
 type Opened = Result<(Document, PathBuf, Vec<String>), String>;
 #[derive(Debug, Clone)]
@@ -177,6 +180,9 @@ pub enum Message {
     Exported(PathBuf),
     ExportError(String),
     PostChecked(u64, std::sync::Arc<post::JobPost>),
+    /// The stock each setup starts from, worked out for the job with this
+    /// fingerprint.
+    LeftStock(u64, Vec<Option<mesh::Bounds>>),
     ExportGcode,
     /// None when no folder was chosen.
     GcodeExported(Option<Result<(PathBuf, usize), String>>),
@@ -249,6 +255,86 @@ pub struct ClampsDraft {
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
+/// The stock each setup of a job starts from once the earlier setups have cut
+/// it, worked out in the background (`App::refresh_left_stock`) for the job
+/// whose fingerprint is `key` (`App::left_key`): one entry per setup, None for
+/// the first, which starts from its own stock, and for one that could not be
+/// simulated. Only good for the job it was worked out for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LeftStock {
+    pub key: u64,
+    pub boxes: Vec<Option<mesh::Bounds>>,
+}
+/// Setup settings that decide how the setup is held and nothing the earlier
+/// setups' cuts leave behind: an edit of one keeps the stock worked out.
+const HOLDING_KEYS: [&str; 7] = [
+    "holding",
+    "holder",
+    "vise_axis",
+    "vise_offset",
+    "vise_grip",
+    "clamps",
+    "holding_gap",
+];
+/// A writer that feeds what is written to a hasher.
+struct HashWriter<'a>(&'a mut std::hash::DefaultHasher);
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use std::hash::Hasher;
+        self.0.write(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+/// A fingerprint of what the stock each setup of `doc` starts from depends
+/// on: its setups with their operations (less how they are held), its tools
+/// and the part. None when it cannot be written.
+fn left_fingerprint(doc: &Document, mesh: &mesh::Mesh) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    let mut out = HashWriter(&mut hasher);
+    for setup in &doc.setups {
+        let p: Vec<_> = setup
+            .p
+            .iter()
+            .filter(|(k, _)| !HOLDING_KEYS.contains(&k.as_str()))
+            .collect();
+        serde_json::to_writer(&mut out, &(&setup.id, &setup.machine, p, &setup.operations)).ok()?;
+    }
+    serde_json::to_writer(&mut out, &doc.tools).ok()?;
+    mesh.fingerprint.hash(&mut hasher);
+    Some(hasher.finish())
+}
+/// The box each setup of `doc` starts from when the earlier ones are
+/// simulated on `mesh` (`simulation::sequence`): the first simulation's stock
+/// of each later setup, None for the first setup and for a setup that has no
+/// simulation, because it has no enabled operation or because it, or an
+/// earlier one, failed.
+fn leftover_boxes(doc: &Document, mesh: &mesh::Mesh) -> Vec<Option<mesh::Bounds>> {
+    let mut boxes = vec![None; doc.setups.len()];
+    // Nothing is simulated after the first operation of the last setup that has one.
+    let stop = doc
+        .setups
+        .iter()
+        .enumerate()
+        .skip(1)
+        .rev()
+        .find_map(|(si, setup)| {
+            let first = setup.operations.iter().position(|o| o.enabled)?;
+            Some((si, first))
+        });
+    simulation::sequence(doc, mesh, stop, |si, _, result| {
+        if si > 0
+            && boxes[si].is_none()
+            && let Ok(sim) = result
+        {
+            boxes[si] = Some(sim.plan.stock);
+        }
+    });
+    boxes
+}
 pub struct App {
     pub smoke_dir: Option<PathBuf>,
     pub smoke_step: usize,
@@ -262,6 +348,11 @@ pub struct App {
     pub audit_report: Vec<(String, bool, String)>,
     pub post: Option<std::sync::Arc<post::JobPost>>,
     pub post_busy: bool,
+    /// The stock the earlier setups left each later setup, once worked out.
+    pub left_stock: LeftStock,
+    /// The fingerprint of the job a background run is working out the stock
+    /// for.
+    left_job: Option<u64>,
     /// The workholding warning of the preview shown (`ui::holding_warning`)
     /// and what it was worked out from.
     holding_note: std::cell::RefCell<Option<(String, HoldingNote)>>,
@@ -527,6 +618,8 @@ impl App {
             audit_report: vec![],
             post: None,
             post_busy: false,
+            left_stock: LeftStock::default(),
+            left_job: None,
             holding_note: std::cell::RefCell::new(None),
             post_epoch: 0,
             settings: settings::load(&settings_path),
@@ -828,7 +921,10 @@ impl App {
     /// Blocking work that keeps the process alive after its window closes:
     /// iced's runtime waits for it on exit.
     fn blocking_work(&self) -> bool {
-        self.plan_busy.running() > 0 || self.post_busy || self.stock_mesh_job.is_some()
+        self.plan_busy.running() > 0
+            || self.post_busy
+            || self.left_job.is_some()
+            || self.stock_mesh_job.is_some()
     }
     /// Work that must not be cut short by ending the process: a G-code
     /// export. Its blocking part finishes on exit.
@@ -1092,6 +1188,79 @@ impl App {
                 })
             },
             move |job| Message::PostChecked(epoch, std::sync::Arc::new(job)),
+        )
+    }
+    /// The fingerprint of the job as the stock the earlier setups leave is
+    /// concerned (`left_fingerprint`). None when there is nothing to work out:
+    /// fewer than two setups, the example part (which is not simulated) or no
+    /// part loaded.
+    pub(crate) fn left_key(&self) -> Option<u64> {
+        if self.doc.setups.len() < 2 || self.is_sample() {
+            return None;
+        }
+        left_fingerprint(&self.doc, self.part_mesh()?)
+    }
+    /// The stock of each setup as worked out, when that was for the job as it
+    /// is now.
+    fn left_boxes(&self) -> Option<&[Option<mesh::Bounds>]> {
+        let key = self.left_key()?;
+        (self.left_stock.key == key).then_some(self.left_stock.boxes.as_slice())
+    }
+    /// The box setup `si` starts from, in its frame (mm), and whether it is the
+    /// real one. The first setup starts from its own stock. A later setup
+    /// starts from what the earlier ones left (`left_stock`) when that was
+    /// worked out for the job as it is now; until then, and when its
+    /// simulation failed, from the original stock carried into its frame
+    /// (`Document::setup_stock`), which is not current. The example part is not
+    /// simulated: its original stock is all there is.
+    pub fn known_stock(&self, si: usize) -> (Option<mesh::Bounds>, bool) {
+        self.known_stock_in(self.left_boxes(), si)
+    }
+    /// `known_stock` for the `left` boxes of `left_boxes`, worked out once for
+    /// several setups.
+    pub(crate) fn known_stock_in(
+        &self,
+        left: Option<&[Option<mesh::Bounds>]>,
+        si: usize,
+    ) -> (Option<mesh::Bounds>, bool) {
+        if si > 0
+            && !self.is_sample()
+            && let Some(stock) = left.and_then(|boxes| boxes.get(si).copied().flatten())
+        {
+            return (Some(stock), true);
+        }
+        (
+            self.doc.setup_stock(si, self.part_mesh()),
+            si == 0 || self.is_sample(),
+        )
+    }
+    /// Works out the stock each later setup starts from, when the job has
+    /// changed since and no run is working on it: on the blocking pool (in
+    /// line in the smoke run), as `refresh_post` checks the program.
+    fn refresh_left_stock(&mut self) -> Task<Message> {
+        let Some(key) = self.left_key() else {
+            return Task::none();
+        };
+        if self.left_job.is_some() || self.left_stock.key == key {
+            return Task::none();
+        }
+        let Some(mesh) = self.part_mesh().cloned() else {
+            return Task::none();
+        };
+        let doc = self.doc.clone();
+        let run = move || leftover_boxes(&doc, &mesh);
+        if self.smoke_dir.is_some() {
+            self.left_stock = LeftStock { key, boxes: run() };
+            return Task::none();
+        }
+        self.left_job = Some(key);
+        Task::perform(
+            async move {
+                // A run that failed leaves no boxes: the original stock is kept.
+                let boxes = tokio::task::spawn_blocking(run).await.unwrap_or_default();
+                (key, boxes)
+            },
+            |(key, boxes)| Message::LeftStock(key, boxes),
         )
     }
     fn write_settings(&self) -> Result<(), String> {
@@ -2481,13 +2650,24 @@ impl App {
                         self.playing = false;
                     }
                 }
-                if self.dirty && now.duration_since(self.last_edit) > Duration::from_millis(700) {
+                let paused = now.duration_since(self.last_edit) > EDIT_PAUSE;
+                if self.dirty && paused {
                     self.persist()
                 }
                 // A close waiting for the sign-in is checked again, so that
                 // it happens when the wait is over.
                 let close = self.close_if_waiting();
-                return Task::batch([close, self.refresh_stock_surface(), self.refresh_post()]);
+                let left = if paused {
+                    self.refresh_left_stock()
+                } else {
+                    Task::none()
+                };
+                return Task::batch([
+                    close,
+                    self.refresh_stock_surface(),
+                    self.refresh_post(),
+                    left,
+                ]);
             }
             Message::Plan => {
                 if matches!(self.planner, Planner::Running(_)) {
@@ -2704,6 +2884,13 @@ impl App {
             Message::Close(id) => return self.request_close(id),
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
+            Message::LeftStock(key, boxes) => {
+                self.left_job = None;
+                // A job edited while it ran gets a run of its own at the next pause.
+                if self.left_key() == Some(key) {
+                    self.left_stock = LeftStock { key, boxes };
+                }
+            }
             Message::PostChecked(epoch, job) => {
                 self.post_busy = false;
                 if epoch == self.post_epoch {
