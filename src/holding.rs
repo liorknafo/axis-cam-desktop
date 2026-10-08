@@ -649,7 +649,9 @@ const MIN_GRIP: f32 = 3.;
 const CLEAR_ENOUGH: f32 = 10.;
 /// The vise jaws' axis (true: jaws on the Y sides) and grip for the `plans`
 /// of a setup whose stock is `stock`, at offset 0. Each axis tries the
-/// holder's grip, then 1 mm less at a time down to 3 mm (all in hundredths of
+/// holder's grip (at most the stock's height less 1 mm, so that something
+/// stands above the jaws, but not cut below 3 mm for that), then 1 mm less at
+/// a time down to 3 mm (all in hundredths of
 /// a millimetre, as stored), for the first at which no move comes within
 /// `gap` of the jaws (`hits`); the axis clear at the larger grip wins. With
 /// neither clear the grip is 3 mm and the axis whose jaws keep the larger
@@ -660,8 +662,14 @@ pub fn suggest_vise(stock: Bounds, holder: &Holder, plans: &[&Plan], gap: f32) -
     // Grips in hundredths of a millimetre, as the setup stores them: the holder's, then 1 mm less at a
     // time while above 3 mm, then 3 mm itself. (The 0.05 forgives the f32 of a decimal such as 3.29.)
     let holder_grip = num(&holder.p, "grip").filter(|g| *g > 0.);
+    // Something stands above the jaws: at most the stock's height less 1 mm,
+    // but a holder's grip is not cut below the least grip for that.
+    let below_top = ((f64::from(stock.dimensions()[2]) - 1.) * 100. + 0.05)
+        .floor()
+        .max(f64::from(MIN_GRIP) * 100.);
     let hundredths = (f64::from(holder_grip.unwrap_or(MIN_GRIP)) * 100. + 0.05)
         .floor()
+        .min(below_top)
         .max(1.);
     let start = (hundredths / 100.) as f32;
     let steps = (((hundredths - 300.) / 100.).max(0.).ceil() as usize).saturating_add(1);
@@ -1028,20 +1036,16 @@ pub fn height_issue(layout: &Layout, stock: Bounds) -> Option<String> {
     })
 }
 /// How the holding checks name operation `operation` of setup `setup` of
-/// `doc` (both from 0, as `stock_surface::Cut::source` stores them):
-/// "setup 1, operation 3 (Contour \"Outside\")". Numbered alone when `doc`
-/// has no such operation.
+/// `doc` (both from 0, as `stock_surface::Cut::source` stores them): its
+/// strategy and its name, "Contour \"Outside\"". Empty when `doc` has no
+/// such operation.
 pub fn operation_name(doc: &Document, setup: u16, operation: u16) -> String {
     let (s, o) = (usize::from(setup), usize::from(operation));
-    let numbered = format!("setup {}, operation {}", s + 1, o + 1);
-    match doc.setups.get(s).and_then(|x| x.operations.get(o)) {
-        Some(op) => format!(
-            "{numbered} ({} \"{}\")",
-            op.strategy.name(),
-            op.name().trim()
-        ),
-        None => numbered,
-    }
+    doc.setups
+        .get(s)
+        .and_then(|x| x.operations.get(o))
+        .map(|op| format!("{} \"{}\"", op.strategy.name(), op.name().trim()))
+        .unwrap_or_default()
 }
 /// How far inside the stock box the holding checks look for material, mm:
 /// just inside the face a jaw, the table or a clamp touches.
@@ -1106,13 +1110,16 @@ fn missing(
     }
 }
 /// The earlier operations that removed the material at the `failed`
-/// samples, in words: those whose cuts removed at least a quarter of them,
-/// the most first (the most alone when none does).
+/// samples: those whose cuts removed at least a quarter of them, the most
+/// first (the most alone when none does). Said twice: by number, "setup 1,
+/// operation 3 and setup 1, operation 2", for the sentence; and by name
+/// (`names`), " Setup 1, operation 3 is Contour \"Outside\"; …", to end the
+/// message, where a long name clipped from it costs no advice.
 fn cause(
     failed: &[[f32; 3]],
     removed: &crate::rest::Removed,
     names: &dyn Fn(u16, u16) -> String,
-) -> String {
+) -> (String, String) {
     let mut counts: Vec<((u16, u16), usize)> = vec![];
     for source in failed.iter().filter_map(|p| removed.by(*p)) {
         match counts.iter_mut().find(|(s, _)| *s == source) {
@@ -1121,27 +1128,84 @@ fn cause(
         }
     }
     counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut named: Vec<String> = counts
+    let mut named: Vec<(u16, u16)> = counts
         .iter()
         .filter(|(_, n)| n * 4 >= failed.len())
-        .map(|((s, o), _)| names(*s, *o))
+        .map(|(source, _)| *source)
         .collect();
     if named.is_empty() {
-        named.extend(counts.first().map(|((s, o), _)| names(*s, *o)));
+        named.extend(counts.first().map(|(source, _)| *source));
     }
-    match named.split_last() {
+    let numbered = |(s, o): (u16, u16)| format!("setup {}, operation {}", s + 1, o + 1);
+    let who = match named.split_last() {
         None => "earlier setups".into(),
-        Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
-    }
+        Some((last, [])) => numbered(*last),
+        Some((last, rest)) => format!(
+            "{} and {}",
+            rest.iter()
+                .map(|s| numbered(*s))
+                .collect::<Vec<_>>()
+                .join(", "),
+            numbered(*last)
+        ),
+    };
+    let said: Vec<String> = named
+        .iter()
+        .filter_map(|&source| {
+            let name = names(source.0, source.1);
+            (!name.trim().is_empty()).then(|| format!("{} is {name}", numbered(source)))
+        })
+        .collect();
+    // A sentence of its own: its first "setup" capitalised.
+    let late = match said.join("; ") {
+        text if text.is_empty() => text,
+        text => format!(" S{}.", &text[1..]),
+    };
+    (who, late)
 }
+/// Whether the material at a jaw's or clamp's contact `points` was cut free
+/// from the part: none of them is joined to it (`Removed::joined`) and some
+/// hold material cut free. If so, the points between them and the part where
+/// earlier cuts removed the stock, found walking from each in 192 steps of
+/// `step` mm along `axis`, toward the part, across the stock: what cut it free.
+fn freed(
+    points: &[[f32; 3]],
+    removed: &crate::rest::Removed,
+    axis: usize,
+    step: f32,
+) -> Option<Vec<[f32; 3]>> {
+    let states: Vec<Option<bool>> = points.iter().map(|p| removed.joined(*p)).collect();
+    if states.contains(&Some(true)) || !states.contains(&Some(false)) {
+        return None;
+    }
+    let mut between = vec![];
+    for (p, state) in points.iter().zip(&states) {
+        if *state != Some(false) {
+            continue;
+        }
+        let mut q = *p;
+        for _ in 0..192 {
+            q[axis] += step;
+            match removed.joined(q) {
+                Some(true) => break,
+                Some(false) => {}
+                None => between.push(q),
+            }
+        }
+    }
+    Some(between)
+}
+/// The advice of a message that says the part was cut free.
+const JOIN: &str = "Leave material joining them (for example a `bottom_offset` above the stock's bottom, or a skin under the part) and cut it free in the last setup.";
 /// Why `layout` with `holder` cannot hold `stock` (the starting box of setup
 /// `setup`, from 0, in mm) given the material earlier setups removed
 /// (`removed`, None for setup 1): stock not taller than the grip by 1 mm,
-/// too little material at a jaw, under the stock, or under a clamp's bite.
-/// Each message names the operations (`names(setup, operation)` gives
-/// "setup 1, operation 3 (Contour \"Outside\")") whose cuts removed most of
-/// the failed samples.
+/// too little material at a jaw, under the stock, or under a clamp's bite,
+/// or (when `removed` knows the part: `Removed::with_part`) a jaw's or
+/// clamp's material cut free from the part. Each message names the
+/// operations whose cuts removed most of the failed samples, by number in
+/// its sentence and, after its advice, by name (`names(setup, operation)`
+/// gives "Contour \"Outside\"").
 ///
 /// Material is looked for 0.05 mm inside the stock's faces, at points
 /// spread evenly with the ends inset by 1 % of the span: on each jaw's
@@ -1149,7 +1213,9 @@ fn cause(
 /// bottom up to the grip, 12 × 4, at least 60 % of them; on the stock's
 /// bottom, 8 × 8, at least 50 %; under each clamp's bite on the stock's
 /// top, 6 along its width × 3 across the bite, at least 60 %. A point has
-/// material when it is inside `stock` and no earlier cut removed it.
+/// material when it is inside `stock` and no earlier cut removed it. A jaw
+/// or clamp with material enough is cut free when none of its points' voxels
+/// is joined to the part (`freed`).
 pub fn holdable(
     setup: usize,
     layout: &Layout,
@@ -1174,7 +1240,8 @@ pub fn holdable(
             let axis = if *axis_y { "Y" } else { "X" };
             // The jaws reach from far below the stock up to the grip.
             let height = (stock.min[2], (stock.min[2] + grip).min(stock.max[2]));
-            let (mut sides, mut failed) = (vec![], vec![]);
+            let (mut bare, mut failed) = (vec![], vec![]);
+            let (mut loose, mut between) = (vec![], vec![]);
             for jaw in &placed {
                 let b = jaw.bounds;
                 let plus = b.min[across] >= stock.max[across];
@@ -1191,18 +1258,38 @@ pub fn holdable(
                 let Some(points) = grid([along, 2, across], width, height, face, (12, 4)) else {
                     continue;
                 };
+                let sign = if plus { "+" } else { "-" };
                 let lost = missing(&points, stock, removed, 60);
                 if !lost.is_empty() {
-                    sides.push(if plus { "+" } else { "-" });
+                    bare.push(sign);
                     failed.extend(lost);
+                    continue;
+                }
+                // Toward the part: inward from the jaw.
+                let step = (stock.max[across] - stock.min[across]) / 192.;
+                let step = if plus { -step } else { step };
+                if let Some(cut) = freed(&points, removed, across, step) {
+                    loose.push(sign);
+                    between.extend(cut);
                 }
             }
-            if !sides.is_empty() {
+            let sides = |signs: &[&str]| {
+                let sign = if signs.len() == 2 { "±" } else { signs[0] };
+                format!("{sign}{axis}")
+            };
+            if !bare.is_empty() {
                 let band = mm(height.1 - height.0);
-                let sides = if sides.len() == 2 { "±" } else { sides[0] };
+                let (who, late) = cause(&failed, removed, names);
                 found.push(format!(
-                    "Setup {n} cannot be held in the vise: {} removed the material the jaws grip on {sides}{axis} from 0 to {band} mm above the stock's bottom. Leave at least {band} mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.",
-                    cause(&failed, removed, names),
+                    "Setup {n} cannot be held in the vise: {who} removed the material the jaws grip on {} from 0 to {band} mm above the stock's bottom. Leave at least {band} mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.{late}",
+                    sides(&bare),
+                ));
+            }
+            if !loose.is_empty() {
+                let (who, late) = cause(&between, removed, names);
+                found.push(format!(
+                    "Setup {n} cannot be held in the vise: {who} cut the part free from the material the jaws grip on {}. {JOIN}{late}",
+                    sides(&loose),
                 ));
             }
             let bottom = grid(
@@ -1214,18 +1301,20 @@ pub fn holdable(
             );
             let lost = missing(&bottom.unwrap_or_default(), stock, removed, 50);
             if !lost.is_empty() {
+                let (who, late) = cause(&lost, removed, names);
                 found.push(format!(
-                    "Setup {n} cannot be held in the vise: {} removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder.",
-                    cause(&lost, removed, names)
+                    "Setup {n} cannot be held in the vise: {who} removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder.{late}"
                 ));
             }
         }
         Layout::Clamps { clamps, .. } => {
             let bite = num(&holder.p, "bite").unwrap_or(0.);
             for (&(side, _), placed) in clamps.iter().zip(&placed) {
-                let (across, along) = match side {
-                    Side::MinusX | Side::PlusX => (0, 1),
-                    Side::MinusY | Side::PlusY => (1, 0),
+                let (across, along, plus) = match side {
+                    Side::MinusX => (0, 1, false),
+                    Side::PlusX => (0, 1, true),
+                    Side::MinusY => (1, 0, false),
+                    Side::PlusY => (1, 0, true),
                 };
                 let b = placed.bounds;
                 let width = clip(
@@ -1245,13 +1334,24 @@ pub fn holdable(
                     stock.max[2] - INSIDE,
                     (6, 3),
                 );
-                let lost = missing(&points.unwrap_or_default(), stock, removed, 60);
+                let points = points.unwrap_or_default();
+                let lost = missing(&points, stock, removed, 60);
+                let label = &placed.label;
                 if !lost.is_empty() {
+                    let (who, late) = cause(&lost, removed, names);
                     found.push(format!(
-                        "Setup {n} cannot be held by the {}: {} removed the stock under its bite. Leave the top there, {} mm in from the edge, and finish it in a later setup, move the clamp, or choose another holder.",
-                        placed.label,
-                        cause(&lost, removed, names),
+                        "Setup {n} cannot be held by the {label}: {who} removed the stock under its bite. Leave the top there, {} mm in from the edge, and finish it in a later setup, move the clamp, or choose another holder.{late}",
                         mm(bite)
+                    ));
+                    continue;
+                }
+                // Toward the part: inward from the clamp's side.
+                let step = (stock.max[across] - stock.min[across]) / 192.;
+                let step = if plus { -step } else { step };
+                if let Some(cut) = freed(&points, removed, across, step) {
+                    let (who, late) = cause(&cut, removed, names);
+                    found.push(format!(
+                        "Setup {n} cannot be held by the {label}: {who} cut the part free from the stock under its bite. {JOIN}{late}"
                     ));
                 }
             }
@@ -2572,14 +2672,14 @@ mod tests {
     /// The earlier operations the tests' cuts come from, named as the export
     /// names them.
     fn names(setup: u16, operation: u16) -> String {
-        let name = match (setup, operation) {
+        match (setup, operation) {
             (0, 0) => "Facing \"Rim\"",
             (0, 1) => "Pocket \"Underside\"",
             (0, 2) => "Contour \"Outside\"",
             (0, 3) => "Contour \"Low\"",
-            _ => "Other \"Other\"",
-        };
-        format!("setup {}, operation {} ({name})", setup + 1, operation + 1)
+            _ => "",
+        }
+        .into()
     }
     /// The part inside `stock()` (3 mm of stock under it): the leftover box
     /// never reaches into it.
@@ -2610,7 +2710,7 @@ mod tests {
         assert_eq!(
             holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names),
             [
-                "Setup 2 cannot be held in the vise: setup 1, operation 3 (Contour \"Outside\") removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder."
+                "Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder. Setup 1, operation 3 is Contour \"Outside\"."
             ]
         );
         // Gripping only the 3 mm it left, the vise holds.
@@ -2699,7 +2799,7 @@ mod tests {
         assert_eq!(
             holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names),
             [
-                "Setup 2 cannot be held in the vise: setup 1, operation 2 (Pocket \"Underside\") removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder."
+                "Setup 2 cannot be held in the vise: setup 1, operation 2 removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder. Setup 1, operation 2 is Pocket \"Underside\"."
             ]
         );
         // A pocket over the middle 18 mm leaves enough to rest on.
@@ -2732,7 +2832,7 @@ mod tests {
         let clamps = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.), (Side::MinusY, 0.)]);
         let said = |side: &str| {
             format!(
-                "Setup 2 cannot be held by the clamp on {side} (offset 0): setup 1, operation 1 (Facing \"Rim\") removed the stock under its bite. Leave the top there, 12 mm in from the edge, and finish it in a later setup, move the clamp, or choose another holder."
+                "Setup 2 cannot be held by the clamp on {side} (offset 0): setup 1, operation 1 removed the stock under its bite. Leave the top there, 12 mm in from the edge, and finish it in a later setup, move the clamp, or choose another holder. Setup 1, operation 1 is Facing \"Rim\"."
             )
         };
         assert_eq!(
@@ -2778,8 +2878,8 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found[0].starts_with(
-                "Setup 2 cannot be held in the vise: setup 1, operation 4 (Contour \"Low\") removed the material the jaws grip on -Y from 0 to 8 mm"
-            ),
+                "Setup 2 cannot be held in the vise: setup 1, operation 4 removed the material the jaws grip on -Y from 0 to 8 mm"
+            ) && found[0].ends_with(" holder. Setup 1, operation 4 is Contour \"Low\"."),
             "{found:?}"
         );
         // Along the whole width it is 12 of 36: named after the larger.
@@ -2795,7 +2895,9 @@ mod tests {
         );
         assert!(
             found[0].starts_with(
-                "Setup 2 cannot be held in the vise: setup 1, operation 4 (Contour \"Low\") and setup 1, operation 3 (Contour \"Outside\") removed the material the jaws grip on -Y from 0 to 8 mm"
+                "Setup 2 cannot be held in the vise: setup 1, operation 4 and setup 1, operation 3 removed the material the jaws grip on -Y from 0 to 8 mm"
+            ) && found[0].ends_with(
+                " holder. Setup 1, operation 4 is Contour \"Low\"; setup 1, operation 3 is Contour \"Outside\"."
             ),
             "{found:?}"
         );
@@ -2803,15 +2905,110 @@ mod tests {
     #[test]
     fn earlier_operations_are_named_by_their_setup_number_and_strategy() {
         let (doc, _) = crate::post::fixture::job();
-        assert_eq!(
-            operation_name(&doc, 0, 2),
-            "setup 1, operation 3 (Contour \"Contour\")"
+        assert_eq!(operation_name(&doc, 0, 2), "Contour \"Contour\"");
+        assert_eq!(operation_name(&doc, 0, 0), "Facing \"Facing\"");
+        // One the document does not have has no name.
+        assert_eq!(operation_name(&doc, 2, 0), "");
+    }
+    /// Flat Ø10 passes, 5 mm of flute each, along the rectangle of corners
+    /// (±`half[0]`, ±`half[1]`) at each tip height of `tips`: an outside
+    /// contour by setup 1's operation 3.
+    fn around(v: &mut Volume, f: Frame, half: [f32; 2], tips: &[f32]) {
+        let [x, y] = half;
+        let corners = [[-x, -y], [x, -y], [x, y], [-x, y]];
+        for &z in tips {
+            for k in 0..4 {
+                let (a, b) = (corners[k], corners[(k + 1) % 4]);
+                v.cut(
+                    [a[0], a[1], z],
+                    [b[0], b[1], z],
+                    5.,
+                    5.,
+                    CutterShape::Flat,
+                    f,
+                    (0, 2),
+                );
+            }
+        }
+    }
+    #[test]
+    fn a_part_cut_free_from_what_the_jaws_or_clamps_hold_cannot_be_held() {
+        // A part on the stock's bottom, 20 mm inside its ±X faces and 15
+        // inside its ±Y faces, and an outside contour 10 mm wide round it,
+        // down past the bottom: it leaves a frame cut free from the part.
+        let part = Bounds {
+            min: [-30., -15., 0.],
+            max: [30., 15., 37.],
+        };
+        let (mut v, f, _) = untouched();
+        around(
+            &mut v,
+            f,
+            [35., 20.],
+            &[-1., 4., 9., 14., 19., 24., 29., 34., 39.],
         );
+        let left = RestStock::new(&v, f).left(part);
+        assert_eq!(left, stock());
+        let removed = Removed::new(&v, f).with_part(part);
+        let advice = "Leave material joining them (for example a `bottom_offset` above the stock's bottom, or a skin under the part) and cut it free in the last setup. Setup 1, operation 3 is Contour \"Outside\".";
+        // The jaws grip the frame: material, but not the part's.
         assert_eq!(
-            operation_name(&doc, 0, 0),
-            "setup 1, operation 1 (Facing \"Facing\")"
+            holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names),
+            [format!(
+                "Setup 2 cannot be held in the vise: setup 1, operation 3 cut the part free from the material the jaws grip on ±Y. {advice}"
+            )]
         );
-        // One the document does not have is still numbered.
-        assert_eq!(operation_name(&doc, 2, 0), "setup 3, operation 1");
+        // So do the clamps on ±X: their bites are on the frame and the cut.
+        let clamps = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.)]);
+        let said = |side: &str| {
+            format!(
+                "Setup 2 cannot be held by the clamp on {side} (offset 0): setup 1, operation 3 cut the part free from the stock under its bite. {advice}"
+            )
+        };
+        assert_eq!(
+            holdable(1, &clamps, &clamp(), left, Some(&removed), &names),
+            [said("-X"), said("+X")]
+        );
+        // Not knowing the part, only the material is checked: it is there.
+        let unknown = Removed::new(&v, f);
+        assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&unknown), &names).is_empty());
+        // Stopped 3 mm above the bottom, the contour leaves a skin joining
+        // the frame to the part: both hold.
+        let (mut v, f, _) = untouched();
+        around(
+            &mut v,
+            f,
+            [35., 20.],
+            &[3., 8., 13., 18., 23., 28., 33., 38.],
+        );
+        let removed = Removed::new(&v, f).with_part(part);
+        assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names).is_empty());
+        assert!(holdable(1, &clamps, &clamp(), left, Some(&removed), &names).is_empty());
+    }
+    #[test]
+    fn the_suggested_grip_leaves_a_millimetre_of_a_thin_stock_above_the_jaws() {
+        let tall = |z: f32| Bounds {
+            min: [-50., -30., 0.],
+            max: [50., 30., z],
+        };
+        for (z, grip) in [(40., 8.), (9., 8.), (6., 5.), (6.25, 5.25), (4.5, 3.5)] {
+            let (axis_y, suggested) = suggest_vise(tall(z), &vise(), &[], 2.);
+            assert_eq!(suggested, grip, "{z} mm tall");
+            let layout = Layout::Vise {
+                holder: String::new(),
+                axis_y,
+                offset: 0.,
+                grip: suggested,
+                gap: 2.,
+            };
+            assert_eq!(height_issue(&layout, tall(z)), None, "{z} mm tall");
+        }
+        // Never below the least grip a suggestion makes, however thin.
+        assert_eq!(suggest_vise(tall(3.5), &vise(), &[], 2.).1, 3.);
+        assert_eq!(suggest_vise(tall(1.), &vise(), &[], 2.).1, 3.);
+        // A holder gripping less than that keeps its own grip.
+        let mut low = vise();
+        low.p.insert("grip".into(), "2".into());
+        assert_eq!(suggest_vise(tall(1.), &low, &[], 2.).1, 2.);
     }
 }

@@ -1709,20 +1709,19 @@ mod tests {
         proposal.setups[0].operations[2].bottom_offset = Some(8.);
         let (check, job) = check(&doc, &mesh, &report, &proposal);
         assert!(!check.passed && job.is_none());
-        // Setup 1 holds; setup 2 does not, whole sentences within the 300
-        // characters a message keeps. (Its bottom, also cut away by the
-        // Contour and the Pocket, is the other problem.)
+        // Setup 1 holds; setup 2 does not. (Its bottom, also cut away by the
+        // Contour and the Pocket, is the other problem.) Within the 300
+        // characters a message keeps, the advice comes before the names.
         let found = stages(&check);
         assert!(
-            found.contains(&"workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 (Contour \"Contour by planner\") removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder.".to_string()),
+            found[0].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm there (for example with `bottom_offset`) and finish it in a later setup, or choose another holder. Setup 1, operation 3 is "),
             "{found:?}"
         );
         assert!(
-            found.iter().all(|p| p.starts_with(
-                "workholding 2/None: Underside: Setup 2 cannot be held in the vise: "
-            ) && p.ends_with(", or choose another holder.")),
+            found[1].starts_with("workholding 2/None: Underside: Setup 2 cannot be held in the vise: setup 1, operation 3 and setup 1, operation 2 removed most of the stock's bottom it would rest on. Leave at least half of it and cut the rest in a later setup, or choose another holder. Setup 1, operation 3 is Contour \"Contour by planner\"; "),
             "{found:?}"
         );
+        assert_eq!(found.len(), 2, "{found:?}");
     }
     #[test]
     fn the_clearance_plane_refusal_is_reported_once_per_setup_as_workholding() {

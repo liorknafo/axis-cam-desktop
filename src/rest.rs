@@ -101,6 +101,11 @@ pub struct Removed<'a> {
     current: Frame,
     /// `removal_boxes`, one per cut: a quick test before the exact one.
     boxes: Vec<Bounds>,
+    /// The stock earlier setups left, whose voxels `joined` reads.
+    volume: &'a Volume,
+    /// Per voxel of `volume`: whether it holds material joined to the part
+    /// (`with_part`). None until the part is given, and without earlier cuts.
+    joined: Option<Vec<bool>>,
 }
 impl<'a> Removed<'a> {
     pub fn new(volume: &'a Volume, current: Frame) -> Self {
@@ -108,7 +113,78 @@ impl<'a> Removed<'a> {
             cuts: &volume.cuts[..],
             current,
             boxes: removal_boxes(volume, current),
+            volume,
+            joined: None,
         }
+    }
+    /// `self` knowing the part, whose bounds are `part` (current frame, mm):
+    /// which of the stock's voxels still hold material joined to it
+    /// (`joined`). A flood fill through the occupied voxels (6-connectivity)
+    /// from those whose centres lie within `part`, each voxel visited once
+    /// (at most 96³). Nothing is filled without earlier cuts, the stock then
+    /// being one piece, nor when no material is left within `part`.
+    pub fn with_part(mut self, part: Bounds) -> Self {
+        let v = self.volume;
+        if v.cuts.is_empty() {
+            return self;
+        }
+        let part = transformed(part, self.current, v.frame);
+        let mut joined = vec![false; v.occupied.len()];
+        let mut stack = vec![];
+        for z in 0..v.n[2] {
+            for y in 0..v.n[1] {
+                for x in 0..v.n[0] {
+                    let i = v.index([x, y, z]);
+                    let c = v.point([x, y, z], 0.5);
+                    if v.occupied[i] != 0
+                        && (0..3).all(|k| c[k] >= part.min[k] && c[k] <= part.max[k])
+                    {
+                        joined[i] = true;
+                        stack.push([x, y, z]);
+                    }
+                }
+            }
+        }
+        if stack.is_empty() {
+            return self;
+        }
+        while let Some(p) = stack.pop() {
+            for k in 0..3 {
+                for next in [p[k].checked_sub(1), Some(p[k] + 1)] {
+                    let Some(next) = next.filter(|c| *c < v.n[k]) else {
+                        continue;
+                    };
+                    let mut q = p;
+                    q[k] = next;
+                    let i = v.index(q);
+                    if v.occupied[i] != 0 && !joined[i] {
+                        joined[i] = true;
+                        stack.push(q);
+                    }
+                }
+            }
+        }
+        self.joined = Some(joined);
+        self
+    }
+    /// Whether the stock's voxel at `p` (current frame) holds material joined
+    /// to the part (`with_part`): Some(true) when it does, Some(false) for
+    /// material cut free from it, None for a voxel cut away, a point outside
+    /// the stock, or the part not given.
+    pub fn joined(&self, p: [f32; 3]) -> Option<bool> {
+        let joined = self.joined.as_ref()?;
+        let v = self.volume;
+        let q = transfer(p, self.current, v.frame);
+        let mut cell = [0; 3];
+        for k in 0..3 {
+            let t = ((q[k] - v.bounds.min[k]) / v.cell[k]).floor();
+            if !(t >= 0. && t < v.n[k] as f32) {
+                return None;
+            }
+            cell[k] = t as usize;
+        }
+        let i = v.index(cell);
+        (v.occupied[i] != 0).then(|| joined[i])
     }
     /// Whether an earlier cut can have removed material at `p`, in the
     /// current frame. A point within 0.001 mm of a cut counts as removed,
@@ -556,6 +632,76 @@ mod tests {
         let removed = Removed::new(&v, flipped);
         assert_eq!(removed.by(f.transfer([0., 6., 9.], flipped)), Some((1, 0)));
         assert_eq!(removed.by(f.transfer([8., 6., 9.], flipped)), None);
+    }
+    /// Flat Ø4 passes round the square of `half` mm about the middle of the
+    /// fixture's stock, tool centres on it, one at each tip height of `tips`
+    /// with 3 mm of flute, made by setup 1's operation 3.
+    fn ring(v: &mut Volume, f: Frame, half: f32, tips: &[f32]) {
+        let corners = [[-half, -half], [half, -half], [half, half], [-half, half]];
+        for &z in tips {
+            for k in 0..4 {
+                let (a, b) = (corners[k], corners[(k + 1) % 4]);
+                v.cut(
+                    [a[0], a[1], z],
+                    [b[0], b[1], z],
+                    2.,
+                    3.,
+                    CutterShape::Flat,
+                    f,
+                    (0, 2),
+                );
+            }
+        }
+    }
+    #[test]
+    fn the_material_joined_to_the_part_is_found_through_the_stock_left() {
+        // The part is the middle 8 mm square, its walls 2 mm inside a ring
+        // cut down past the stock's bottom: the stock outside is cut free.
+        let part = Bounds {
+            min: [-4., -4., 0.],
+            max: [4., 4., 12.],
+        };
+        let (mut v, f, _, mut s, mesh) = fixture();
+        // Without earlier cuts the stock is one piece: nothing is said.
+        assert_eq!(
+            Removed::new(&v, f).with_part(part).joined([9., 0., 6.]),
+            None
+        );
+        ring(&mut v, f, 6., &[-1., 2., 5., 8., 11.]);
+        let removed = Removed::new(&v, f);
+        // Not knowing the part, nothing is said either.
+        assert_eq!(removed.joined([0., 0., 6.]), None);
+        let removed = removed.with_part(part);
+        assert_eq!(removed.joined([0., 0., 6.]), Some(true));
+        assert_eq!(removed.joined([9.5, 0., 0.5]), Some(false));
+        assert_eq!(removed.joined([-9.5, 9.5, 11.5]), Some(false));
+        // In the ring, and outside the stock.
+        assert_eq!(removed.joined([6., 0., 6.]), None);
+        assert_eq!(removed.joined([0., 0., 13.]), None);
+        // The same from a flipped setup.
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let turned = Removed::new(&v, flipped).with_part(f.transfer_bounds(part, flipped));
+        assert_eq!(turned.joined(f.transfer([0., 0., 6.], flipped)), Some(true));
+        assert_eq!(
+            turned.joined(f.transfer([9.5, 0., 0.5], flipped)),
+            Some(false)
+        );
+        // Stopped 2 mm above the bottom, the ring leaves a skin joining them.
+        let (mut v, f, _, _, _) = fixture();
+        ring(&mut v, f, 6., &[2., 5., 8., 11.]);
+        let removed = Removed::new(&v, f).with_part(part);
+        assert_eq!(removed.joined([9.5, 0., 6.]), Some(true));
+        assert_eq!(removed.joined([6., 0., 6.]), None);
+        // A part where no stock is left cannot be told apart from the rest.
+        let gone = Bounds {
+            min: [5.8, -1., 6.],
+            max: [6.2, 1., 7.],
+        };
+        assert_eq!(
+            Removed::new(&v, f).with_part(gone).joined([9.5, 0., 6.]),
+            None
+        );
     }
     fn in_any(boxes: &[Bounds], p: [f32; 3]) -> bool {
         boxes
