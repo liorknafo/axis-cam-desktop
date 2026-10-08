@@ -258,8 +258,8 @@ pub type HoldingNote = Option<(String, Vec<String>)>;
 /// The stock each setup of a job starts from once the earlier setups have cut
 /// it, worked out in the background (`App::refresh_left_stock`) for the job
 /// whose fingerprint is `key` (`App::left_key`): one entry per setup, None for
-/// the first, which starts from its own stock, and for one that could not be
-/// simulated. Only good for the job it was worked out for.
+/// the first, which starts from its own stock, and for one after an operation
+/// or setup that failed. Only good for the job it was worked out for.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LeftStock {
     pub key: u64,
@@ -308,31 +308,27 @@ fn left_fingerprint(doc: &Document, mesh: &mesh::Mesh) -> Option<u64> {
     Some(hasher.finish())
 }
 /// The box each setup of `doc` starts from when the earlier ones are
-/// simulated on `mesh` (`simulation::sequence`): the first simulation's stock
-/// of each later setup, None for the first setup and for a setup that has no
-/// simulation, because it has no enabled operation or because it, or an
-/// earlier one, failed.
+/// simulated on `mesh` (`simulation::sequence_walk`, as the simulation itself
+/// gives it to the setup's operations): None for the first setup, and for a
+/// setup after an operation or setup that failed. A setup without an enabled
+/// operation has its box too.
 fn leftover_boxes(doc: &Document, mesh: &mesh::Mesh) -> Vec<Option<mesh::Bounds>> {
     let mut boxes = vec![None; doc.setups.len()];
-    // Nothing is simulated after the first operation of the last setup that has one.
-    let stop = doc
-        .setups
-        .iter()
-        .enumerate()
-        .skip(1)
-        .rev()
-        .find_map(|(si, setup)| {
-            let first = setup.operations.iter().position(|o| o.enabled)?;
-            Some((si, first))
-        });
-    simulation::sequence(doc, mesh, stop, |si, _, result| {
-        if si > 0
-            && boxes[si].is_none()
-            && let Ok(sim) = result
-        {
-            boxes[si] = Some(sim.plan.stock);
-        }
+    // The last setup's boxes are known before its first operation: when it has
+    // one, nothing needs simulating after that. When it has none, the setups
+    // before it are simulated whole, for its box.
+    let stop = doc.setups.last().and_then(|setup| {
+        let first = setup.operations.iter().position(|o| o.enabled)?;
+        Some((doc.setups.len() - 1, first))
     });
+    simulation::sequence_walk(
+        doc,
+        mesh,
+        stop,
+        |_, _, _| {},
+        |_, _, _| {},
+        |si, stock| boxes[si] = stock,
+    );
     boxes
 }
 pub struct App {

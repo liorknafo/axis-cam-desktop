@@ -3256,39 +3256,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = leftover_app(&dir);
         let mesh = a.imported_mesh.clone().unwrap();
-        // No toolpaths: the stock alone decides.
-        a.doc.setups[1].operations.clear();
+        // The box setup 1's facing leaves setup 2, worked out from its toolpaths.
+        let left = simulated_stock(&a);
         let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        assert!((left.dimensions()[2] - (nominal.dimensions()[2] - 4.)).abs() < 0.01);
+        // Setup 2 has no toolpaths: the stock alone decides. The vise is one
+        // that grips as much as the original box allows, and is not cut below.
+        a.doc.setups[1].operations.clear();
+        let id = first_of(&a, "Vise");
+        let vise = a.doc.workholding.iter_mut().find(|h| h.id == id).unwrap();
+        for (k, v) in [("grip", "45"), ("jaw_height", "50")] {
+            vise.p.insert(k.into(), v.into());
+        }
         // The original box is 124 mm across X, which the 120 mm vise does not
-        // open to: the jaws go on ±Y, 8 mm up.
-        assert!(nominal.dimensions()[0] > 120. && nominal.dimensions()[1] < 120.);
+        // open to: the jaws go on ±Y. Before the earlier setups are simulated
+        // the original box is all there is: it is 47 mm tall, 45 mm of grip.
+        assert!(nominal.dimensions()[0] > 120. && nominal.dimensions()[2] > 46.);
+        assert_eq!(a.known_stock(1), (Some(nominal), false));
         let _ = a.update(Message::SuggestLayout);
         assert_eq!(get(&a.doc.setup().p, "vise_axis"), "Y");
-        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
-        // A box the earlier setups left that is only 70 mm across X and 6 mm tall.
-        let left = crate::mesh::Bounds {
-            min: [nominal.min[0], nominal.min[1], nominal.min[2]],
-            max: [nominal.min[0] + 70., nominal.max[1], nominal.min[2] + 6.],
-        };
-        let key = a.left_key().unwrap();
-        a.left_stock = crate::LeftStock {
-            key,
-            boxes: vec![None, Some(left)],
-        };
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "45");
+        // The job's own run, as it is done after a pause: setup 2 has no
+        // operation to simulate and still gets its box.
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.left_stock.boxes, [None, Some(left)]);
         assert_eq!(a.known_stock(1), (Some(left), true));
-        // Not worked out for this job: the original box again.
-        a.left_stock.key = key.wrapping_add(1);
+        // The box is 43 mm tall: the grip leaves 1 mm above the jaws.
         let _ = a.update(Message::SuggestLayout);
         assert_eq!(get(&a.doc.setup().p, "vise_axis"), "Y");
-        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "8");
-        // Worked out: the narrower way across, and a grip that leaves 1 mm above the jaws.
-        a.left_stock.key = key;
-        let _ = a.update(Message::SuggestLayout);
-        assert_eq!(get(&a.doc.setup().p, "vise_axis"), "X");
-        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "5");
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "42");
         assert_eq!(
             a.status,
-            format!("Suggested: vise jaws on ±X, grip 5 mm. {STOCK_ONLY}")
+            format!("Suggested: vise jaws on ±Y, grip 42 mm. {STOCK_ONLY}")
         );
         // The editor agrees: nothing wrong with what was suggested, and the
         // jaws are drawn on the box that was left.
@@ -3297,12 +3296,66 @@ mod tests {
         assert_eq!(jaws.len(), 2);
         assert!(
             jaws.iter()
-                .all(|j| (j.bounds.max[2] - (left.min[2] + 5.)).abs() < 0.01)
+                .all(|j| (j.bounds.max[2] - (left.min[2] + 42.)).abs() < 0.01)
         );
-        // Clamps are placed on the same box: the sides the 70 mm leaves room for.
+        // Not worked out for this job (an edit since): the original box again.
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "bottom", "1".into()));
+        let _ = a.update(Message::SelectSetup(1));
+        assert_eq!(a.known_stock(1), (Some(nominal), false));
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(get(&a.doc.setup().p, "vise_grip"), "45");
+        // Clamps are placed on the same box.
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         assert!(a.status.starts_with("Suggested: "), "{}", a.status);
         assert!(crate::ui::holding_lines(&a).is_empty());
+    }
+    #[test]
+    fn a_later_setup_without_operations_gets_its_box_from_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let nominal = a.doc.setup_stock(1, Some(&mesh)).unwrap();
+        let left = simulated_stock(&a);
+        // A third setup, a copy of the second, and neither has an operation.
+        let mut third = a.doc.setups[1].clone();
+        third.id = crate::model::id();
+        a.doc.setups.push(third);
+        for setup in &mut a.doc.setups[1..] {
+            setup.operations.clear();
+        }
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.left_stock.boxes, [None, Some(left), Some(left)]);
+        for si in [1, 2] {
+            assert_eq!(a.known_stock(si), (Some(left), true));
+        }
+        assert_eq!(crate::ui::stock_note(&a), None);
+        let _ = a.update(Message::SelectSetup(2));
+        assert_eq!(crate::ui::stock_note(&a), None);
+        let _ = a.update(Message::SetupEditor);
+        let _ = a.view();
+        // Nothing cut by the setup before them: the original block in their frame.
+        let mut b = leftover_app(&dir);
+        b.doc.setups[0].operations.clear();
+        let _ = b.refresh_left_stock();
+        let (stock, current) = b.known_stock(1);
+        let stock = stock.unwrap();
+        assert!(current);
+        assert!(
+            (0..3).all(|k| (stock.min[k] - nominal.min[k]).abs() < 0.001
+                && (stock.max[k] - nominal.max[k]).abs() < 0.001),
+            "{stock:?} {nominal:?}"
+        );
+        assert_eq!(crate::ui::stock_note(&b), None);
+        // An earlier setup that fails leaves no box for any later one, those
+        // without operations included.
+        let mut c = leftover_app(&dir);
+        c.doc.setups[0].operations[0].tool = "gone".into();
+        c.doc.setups[1].operations.clear();
+        let _ = c.refresh_left_stock();
+        assert_eq!(c.left_stock.boxes, [None, None]);
+        assert!(crate::ui::stock_note(&c).is_some());
     }
     /// The fixture job with its first setup held by the starter clamp, on -X
     /// at `bite` mm onto the stock (12 reaches only the stock's edge, 40 the

@@ -639,8 +639,34 @@ pub fn sequence_with(
     doc: &crate::model::Document,
     mesh: &Mesh,
     stop: Option<(usize, usize)>,
+    visit: impl FnMut(usize, usize, Result<Simulation, String>),
+    after: impl FnMut(usize, usize, &crate::volume::Volume),
+) {
+    sequence_walk(doc, mesh, stop, visit, after, |_, _| {})
+}
+/// The box a later setup `setup` starts from, in its frame (mm), once the
+/// cuts in `volume` (the stock left by the setups before it) are made: the
+/// original block in that frame, less the layers those cuts provably removed
+/// whole, never into the part (`rest::RestStock::left`).
+pub fn leftover_box(volume: &crate::volume::Volume, setup: &Setup, mesh: &Mesh) -> Bounds {
+    let frame = crate::volume::Frame::new(setup, mesh);
+    let part = Placement::new(mesh, Some(setup))
+        .bounds
+        .scaled(1. / mesh.display_scale());
+    crate::rest::RestStock::new(volume, frame).left(part)
+}
+/// `sequence_with`, also telling `begin` as each setup begins, before its
+/// operations, the box it starts from (`leftover_box`): None for the first
+/// setup and when an earlier operation or setup failed, because the stock
+/// left is not known then. Every setup is told, those without an enabled
+/// operation too, up to the one `stop` is in; none after it.
+pub fn sequence_walk(
+    doc: &crate::model::Document,
+    mesh: &Mesh,
+    stop: Option<(usize, usize)>,
     mut visit: impl FnMut(usize, usize, Result<Simulation, String>),
     mut after: impl FnMut(usize, usize, &crate::volume::Volume),
+    mut begin: impl FnMut(usize, Option<Bounds>),
 ) {
     use crate::volume::{Frame, Volume};
     let mut volume: Option<Volume> = None;
@@ -653,19 +679,18 @@ pub fn sequence_with(
         // Stock is automatic in document order; inherited geometry supersedes
         // the later setup's nominal bounding-box settings for generation.
         setup.p.insert("stock_source".into(), "fresh".into());
+        let mut starts = None;
         if let Some(v) = &volume {
-            // The stock earlier setups left: the original block in this
-            // frame, less the layers their cuts provably removed whole.
-            let part = Placement::new(mesh, Some(&setup))
-                .bounds
-                .scaled(1. / mesh.display_scale());
-            setup.preview_stock = Some(crate::rest::RestStock::new(v, frame).left(part));
+            // The stock earlier setups left.
+            starts = Some(leftover_box(v, &setup, mesh));
+            setup.preview_stock = starts;
         } else if blocked.is_none() {
             match stock::resolve(&setup, Some(mesh)) {
                 Ok(s) => volume = Some(Volume::new(s.stock, frame)),
                 Err(error) => blocked = Some(format!("{}: {error}", setup.name())),
             }
         }
+        begin(si, starts.filter(|_| blocked.is_none()));
         for (oi, op) in setup.operations.iter().enumerate() {
             if !op.enabled {
                 if stop == Some((si, oi)) {
@@ -1287,6 +1312,72 @@ mod cumulative_tests {
             mesh_fingerprint: mesh.fingerprint.clone(),
             ids: vec![id],
         });
+    }
+    #[test]
+    fn each_setup_is_told_the_box_it_starts_from_with_or_without_operations() {
+        let (mut doc, mesh) = fixture();
+        let starts = |doc: &crate::model::Document| {
+            let (mut told, mut firsts) = (vec![], vec![]);
+            sequence_walk(
+                doc,
+                &mesh,
+                None,
+                |si, _, result| {
+                    if !firsts.iter().any(|(s, _)| *s == si) {
+                        firsts.push((si, result.map(|sim| sim.plan.stock)));
+                    }
+                },
+                |_, _, _| {},
+                |si, stock| told.push((si, stock)),
+            );
+            (told, firsts)
+        };
+        // The first setup starts from its own stock; a later one from what
+        // the earlier cut away, which its first operation's plan has too.
+        let (told, firsts) = starts(&doc);
+        assert_eq!(told.len(), 2);
+        assert_eq!(told[0], (0, None));
+        let left = told[1].1.unwrap();
+        assert_eq!(firsts[1], (1, Ok(left)));
+        let facing = doc.setups[0].operations[0].clone();
+        // The same without operations of its own.
+        doc.setups[1].operations.clear();
+        assert_eq!(starts(&doc).0[1], (1, Some(left)));
+        // A setup with nothing before it cut has the original block.
+        doc.setups[0].operations.clear();
+        let original = starts(&doc).0[1].1.unwrap();
+        let carried = crate::volume::Volume::new(
+            stock::resolve(&doc.setups[0], Some(&mesh)).unwrap().stock,
+            Frame::new(&doc.setups[0], &mesh),
+        )
+        .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
+        assert!(
+            (0..3).all(|k| (original.min[k] - carried.min[k]).abs() < 0.001
+                && (original.max[k] - carried.max[k]).abs() < 0.001),
+            "{original:?} {carried:?}"
+        );
+        // When an earlier operation fails the box is not known.
+        doc.setups[0].operations = vec![facing];
+        doc.setups[0].operations[0].tool = "gone".into();
+        assert_eq!(starts(&doc).0[1], (1, None));
+        // The shared computation gives what the plans start from.
+        let (doc, _) = fixture();
+        let mut volume = None;
+        sequence_with(
+            &doc,
+            &mesh,
+            Some((1, 0)),
+            |_, _, _| {},
+            |si, _, v| {
+                if si == 0 {
+                    volume = Some(v.clone());
+                }
+            },
+        );
+        assert_eq!(
+            leftover_box(&volume.unwrap(), &doc.setups[1], &mesh),
+            prepare(&doc, &mesh, 1, 0).unwrap().plan.stock
+        );
     }
     #[test]
     fn pocket_starts_from_facing_and_restart_restores_inherited_stock() {
