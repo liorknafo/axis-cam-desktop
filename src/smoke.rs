@@ -5424,6 +5424,42 @@ mod tests {
         assert_eq!(a.deleted_ops.len(), 1);
         let _ = a.update(Message::ConfirmDeleteSetup(true));
         assert!(a.deleted_ops.is_empty());
+        // The line naming the next Undo goes when that one is forgotten:
+        // one delete in setup 1, two in its copy, one of them undone, then
+        // the copy is deleted.
+        let mut a = app();
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::DeleteKey);
+        let _ = a.update(Message::DuplicateSetup);
+        for _ in 0..2 {
+            let _ = a.update(Message::SelectOp(0));
+            let _ = a.update(Message::DeleteKey);
+        }
+        assert_eq!(a.deleted_ops.len(), 3);
+        let _ = a.update(Message::UndoDelete);
+        assert!(a.status.contains("Undo delete again"), "{}", a.status);
+        let _ = a.update(Message::ConfirmDeleteSetup(true));
+        assert_eq!(a.doc.setups.len(), 1);
+        assert_eq!(a.deleted_ops.len(), 1, "setup 1's delete stays");
+        assert!(!a.status.contains("Undo delete again"), "{}", a.status);
+    }
+    #[test]
+    fn importing_a_part_forgets_deleted_operations() {
+        let mut a = imported_app();
+        let _ = a.update(Message::AddOp(Strategy::Face));
+        let _ = a.update(Message::DeleteKey);
+        assert_eq!(a.deleted_ops.len(), 1, "{}", a.status);
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/four-setup-block.3mf");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let file = ModelFile {
+            name: "other.3mf".into(),
+            path: path.to_string_lossy().into_owned(),
+            format: "3mf".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        assert!(a.deleted_ops.is_empty());
     }
     #[test]
     fn the_keys_are_left_to_a_text_field_and_a_held_key_does_not_repeat() {

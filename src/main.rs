@@ -1128,7 +1128,9 @@ impl App {
     fn forget_deleted(&mut self, keep: impl Fn(&DeletedOp) -> bool) {
         let before = self.deleted_ops.len();
         self.deleted_ops.retain(|d| keep(d));
-        if self.deleted_ops.len() < before && self.status.contains(UNDO_DELETE_HINT) {
+        if self.deleted_ops.len() < before
+            && (self.status.contains(UNDO_DELETE_HINT) || self.status.contains(UNDO_AGAIN_HINT))
+        {
             self.status.clear();
         }
     }
@@ -2194,7 +2196,7 @@ impl App {
                     let _ = self.handle(Message::SelectOp(i));
                     self.status = match self.deleted_ops.last() {
                         Some(next) => format!(
-                            "Put back \"{name}\". Undo delete again puts back \"{}\".",
+                            "Put back \"{name}\". {UNDO_AGAIN_HINT} \"{}\".",
                             next.op.name()
                         ),
                         None => format!("Put back \"{name}\"."),
@@ -2796,6 +2798,7 @@ impl App {
                 self.imported_mesh = m;
                 // Undo would put the previous part's job under this one.
                 self.undo = None;
+                self.deleted_ops.clear();
                 self.camera = viewport::Camera::default();
                 self.picking = false;
                 self.page = Page::Work;
@@ -3630,6 +3633,8 @@ impl App {
 }
 /// The status line's offer of Undo delete.
 const UNDO_DELETE_HINT: &str = "Undo delete or Command/Ctrl+Z puts it back.";
+/// The status line's offer of the next Undo delete.
+const UNDO_AGAIN_HINT: &str = "Undo delete again puts back";
 /// How many deleted operations Undo delete keeps.
 const UNDO_DELETES: usize = 50;
 /// Delete or Backspace deletes the selected operation and Command/Ctrl+Z
