@@ -831,6 +831,36 @@ impl App {
             }
             113 => vec![Message::Page(Page::Workholding)],
             114 => {
+                // The run's last check of the earlier screens: the operation
+                // of the Workholding screens is still previewed.
+                assert!(self.active_simulation().is_some(), "{}", self.status);
+                // Setup 1 held as the app holds it: 25 mm of stock beside the
+                // part on ±X, the facing kept to the part's outline, and the
+                // clamps Suggest layout places on that rim.
+                for message in [
+                    Message::Edit(Target::Setup, "stock_left", "25".into()),
+                    Message::Edit(Target::Setup, "stock_right", "25".into()),
+                    Message::SelectOp(0),
+                    Message::Edit(Target::Operation, "boundary", "Model silhouette".into()),
+                    Message::Edit(
+                        Target::Operation,
+                        "containment",
+                        "Tool outside boundary".into(),
+                    ),
+                    Message::SuggestLayout,
+                ] {
+                    let _ = self.update(message);
+                }
+                let clamps = crate::model::get(&self.doc.setup().p, "clamps").to_string();
+                assert!(
+                    self.status.starts_with("Suggested: ") && !clamps.is_empty(),
+                    "{}",
+                    self.status
+                );
+                eprintln!(
+                    "Screen 91: setup 1 holds clamps at {clamps}: {}",
+                    self.status
+                );
                 // The first request still going: the overview the run started
                 // from, the model's two looks (a picture and a view it could
                 // not get), then OpenAI refusing the tool, and the plan as far
@@ -868,9 +898,6 @@ impl App {
                 // start at its bottom and close on the walls the Contour
                 // finished, under that rim.
                 use crate::model::{Setup, Strategy};
-                // The run's last check of the earlier screens: the operation
-                // of the Workholding screens is still previewed.
-                assert!(self.active_simulation().is_some(), "{}", self.status);
                 self.planner = crate::Planner::Idle;
                 self.plan_timeline.clear();
                 self.plan_overview = None;
@@ -883,6 +910,14 @@ impl App {
                 contour.geometry.clear();
                 let first = &mut self.doc.setups[0];
                 first.operations.retain(|o| o.strategy == Strategy::Face);
+                // Facing the whole top again, as before screen 91 kept it to
+                // the part's outline.
+                for (k, v) in [
+                    ("boundary", "Stock silhouette"),
+                    ("containment", "Tool center on boundary"),
+                ] {
+                    first.operations[0].p.insert(k.into(), v.into());
+                }
                 first.operations.push(contour);
                 for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
                     first.p.insert(key.into(), "4".into());
