@@ -768,9 +768,11 @@ pub fn shown(boxes: &[HoldBox], stock: Bounds) -> Vec<HoldBox> {
 }
 /// The least grip a suggested vise is reduced to, in mm.
 const MIN_GRIP: f32 = 3.;
-/// The most margin that counts when ranking clamp spots, in mm: spots clear
-/// by this much are equally good.
-const CLEAR_ENOUGH: f32 = 10.;
+/// The most margin (beyond the clearance gap) that counts when ranking clamp
+/// spots, in mm: spots clear by this much are equally good, and of them the
+/// one that spreads the clamps best wins, the middle of its side when
+/// nothing else decides (`suggest_clamps`).
+const CLEAR_ENOUGH: f32 = 3.;
 /// The vise jaws' axis (true: jaws on the Y sides) and grip for the `plans`
 /// of a setup whose stock is `stock`, at offset 0, the jaws closing on the
 /// band at each grip that `bands` tells (`gripped`; the whole box when the
@@ -939,14 +941,14 @@ struct Spot {
 /// and no move comes within `gap` of it (`margin` above 0: the cutter and
 /// the holder both counted). Each side tries the offsets every `CLAMP_STEP`
 /// mm that keep the clamp's whole width on the side, the middle first, then
-/// out both ways (- before +), and takes the first of the highest score; the
-/// score is the margin, at most `CLEAR_ENOUGH`, so that spots clear by that
-/// much tie and the one nearest the middle wins, except that a side whose
-/// opposite side has its clamp away from the middle takes, of its spots of
-/// the highest score, the one nearest the opposite end, so the two hold the
-/// stock across its diagonal. The sides are taken in the order of
-/// `Side::ALL`, each skipping the spots whose clamp would overlap one taken
-/// already. A layout needs two clamps on opposite sides and has one on each
+/// out both ways (- before +), and takes, of its spots of the highest
+/// score (the margin, at most `CLEAR_ENOUGH`, so that spots clear by that
+/// much tie), the one crowding the fewest clamps taken already (within a
+/// clamp width of it), then, when the opposite side has its clamp away from
+/// the middle, the one nearest the opposite end, so the two hold the stock
+/// across its diagonal, then the one nearest the middle. The sides are
+/// taken in the order of `Side::ALL`, each skipping the spots whose clamp
+/// would overlap one taken already. A layout needs two clamps on opposite sides and has one on each
 /// side that has a spot, or, when the stock is shorter than 3 clamp widths
 /// along both axes, only the pair of opposite sides (-X and +X, then -Y and
 /// +Y) whose worse clamp scores better, the first on a tie. Without two
@@ -1055,9 +1057,15 @@ pub fn suggest_clamps(
     });
     let overlap =
         |a: &Bounds, b: &Bounds| (0..2).all(|k| a.min[k] < b.max[k] && b.min[k] < a.max[k]);
+    // Two clamps closer than a clamp width crowd one corner.
+    let crowded = |a: &Bounds, b: &Bounds| {
+        let apart = |k: usize| (a.min[k] - b.max[k]).max(b.min[k] - a.max[k]).max(0.);
+        apart(0).hypot(apart(1)) < width
+    };
     // The best spot of each of `sides` clear of the clamps taken before it:
-    // of those of the highest score, the first, or, when the opposite side's
-    // clamp is away from the middle, the one nearest the opposite end.
+    // of those of the highest score, the one crowding the fewest clamps
+    // taken, then, when the opposite side's clamp is away from the middle,
+    // the one nearest the opposite end, then the first (nearest the middle).
     let take = |sides: &[Side]| {
         let mut taken: Vec<Spot> = vec![];
         for side in sides {
@@ -1074,16 +1082,29 @@ pub fn suggest_clamps(
                 .iter()
                 .find(|t| t.side == side.opposite())
                 .map_or(0., |t| t.offset);
+            let crowding = |s: &Spot| {
+                taken
+                    .iter()
+                    .filter(|t| crowded(&s.bounds, &t.bounds))
+                    .count()
+            };
+            let across = |s: &Spot| {
+                if partner == 0. {
+                    0.
+                } else {
+                    (s.offset + partner).abs()
+                }
+            };
             let found = free
                 .iter()
                 .take_while(|s| s.score >= best)
                 .min_by(|a, b| {
-                    (a.offset + partner)
-                        .abs()
-                        .total_cmp(&(b.offset + partner).abs())
+                    crowding(a)
+                        .cmp(&crowding(b))
+                        .then(across(a).total_cmp(&across(b)))
                 })
                 .copied();
-            if let Some(found) = found.filter(|_| partner != 0.).or(free.first().copied()) {
+            if let Some(found) = found {
                 taken.push(found.clone());
             }
         }
@@ -2864,12 +2885,12 @@ mod tests {
         assert_eq!(chosen[0].1.abs(), 20.);
         let placed = boxes(&clamp_layout(&chosen), &clamp(), stock()).unwrap();
         assert!(hits(&lead, &placed, 2.).is_empty(), "{chosen:?}");
-        // On the Y sides (100 mm) the first spot 10 mm clear of a move along
-        // Y through the middle is at 25.
+        // On the Y sides (100 mm) the first spot 3 mm clear of a move along
+        // Y through the middle (beyond the gap) is at 20.
         let along_y = plan(2., &[([0., 20., 41.], [0., 70., 41.])]);
         let chosen = clamps_for(stock(), &[&along_y]);
         assert_eq!(sides_of(&chosen), Side::ALL);
-        assert_eq!(chosen[3].1.abs(), 25.);
+        assert_eq!(chosen[3].1.abs(), 20.);
         let placed = boxes(&clamp_layout(&chosen), &clamp(), stock()).unwrap();
         assert!(hits(&along_y, &placed, 2.).is_empty(), "{chosen:?}");
     }
@@ -2877,11 +2898,11 @@ mod tests {
     fn a_cut_low_in_the_stock_counts_for_the_clamps_above_it() {
         // The tip at Z 5 is below the clamps' top (65 + 2): the holder, from Z 35, reaches them, and the
         // cut along Y through the middle of the stock keeps the Y sides' clamps 18 mm (holder and gap) from
-        // X 0. The spot clear by 10 mm more is at the end of the 100 mm side, 40 mm out (X 30..50).
+        // X 0. The first spot clear by 3 mm more is 35 mm out along the 100 mm side (X 25..45).
         let cut = plan(2., &[([0., -20., 5.], [0., 20., 5.])]);
         let chosen = clamps_for(stock(), &[&cut]);
-        assert_eq!(chosen[2].1.abs(), 40., "{chosen:?}");
-        assert_eq!(chosen[3].1.abs(), 40., "{chosen:?}");
+        assert_eq!(chosen[2].1.abs(), 35., "{chosen:?}");
+        assert_eq!(chosen[3].1.abs(), 35., "{chosen:?}");
     }
     #[test]
     fn clamps_are_four_one_per_side_and_the_middles_with_no_moves_nearby() {
@@ -3033,10 +3054,10 @@ mod tests {
         assert_eq!(vise_for(stock(), &vise(), &[&short, &cutter]), (false, 3.));
     }
     #[test]
-    fn a_spot_clear_by_ten_millimetres_is_as_good_as_any_other() {
+    fn a_spot_clear_by_three_millimetres_is_as_good_as_any_other() {
         // A short move in the middle of the stock, 1 mm above its top, is 29 mm from the -X clamp's middle
-        // and more from the other spots along that side: all of them clear by more than 10, so the middles
-        // stay.
+        // and more from the other spots along that side: all of them clear by more than 3 beyond the gap,
+        // so the middles stay.
         let middle = plan(2., &[([-5., 0., 40.], [5., 0., 40.])]);
         assert_eq!(
             clamps_for(stock(), &[&middle]),
@@ -3441,12 +3462,38 @@ mod tests {
         assert!(after.remaining < after.occupied.len());
     }
     #[test]
+    fn clamps_off_the_middles_spread_to_the_four_corners() {
+        // Leads through the middles of all four sides keep every clamp off
+        // its middle. The X pair goes across the diagonal (-X at -20, +X at
+        // +20); the Y pair, as good at either end, takes the ends away from
+        // the X clamps (-Y at +20, +Y at -20) rather than crowding a corner
+        // one of them holds already.
+        let leads = plan(
+            2.,
+            &[
+                ([-80., 0., 41.], [-20., 0., 41.]),
+                ([20., 0., 41.], [80., 0., 41.]),
+                ([0., -70., 41.], [0., 70., 41.]),
+            ],
+        );
+        assert_eq!(
+            clamps_for(stock(), &[&leads]),
+            [
+                (Side::MinusX, -20.),
+                (Side::PlusX, 20.),
+                (Side::MinusY, 20.),
+                (Side::PlusY, -20.)
+            ]
+        );
+    }
+    #[test]
     fn opposite_clamps_away_from_the_middle_go_to_opposite_ends() {
         // A lead along Y through the middle of the stock, above its top,
-        // keeps both Y clamps off the middle: the first spot clear by 10 mm
-        // is 25 out either way. The -Y clamp takes -25 (- before +); the +Y
-        // clamp, as good at either end, takes the opposite one, +25, so the
-        // two hold the stock across its diagonal instead of both at one end.
+        // keeps both Y clamps off the middle: the first spot clear by 3 mm
+        // beyond the gap is 20 out either way. The -Y clamp takes -20 (-
+        // before +); the +Y clamp, as good at either end, takes the opposite
+        // one, +20, so the two hold the stock across its diagonal instead of
+        // both at one end.
         let lead = plan(2., &[([0., -70., 41.], [0., 70., 41.])]);
         let chosen = clamps_for(stock(), &[&lead]);
         assert_eq!(
@@ -3454,8 +3501,8 @@ mod tests {
             [
                 (Side::MinusX, 0.),
                 (Side::PlusX, 0.),
-                (Side::MinusY, -25.),
-                (Side::PlusY, 25.)
+                (Side::MinusY, -20.),
+                (Side::PlusY, 20.)
             ]
         );
     }
