@@ -105,11 +105,11 @@ pub enum Message {
     Title(String),
     AddOp(Strategy),
     DuplicateOp,
-    /// Ask to delete the selected operation; `ConfirmDeleteOp` answers.
     RemoveOp,
-    ConfirmDeleteOp(bool),
     /// The Delete or Backspace key, pressed outside a text field.
     DeleteKey,
+    /// Put back the operation deleted last (Command/Ctrl+Z).
+    UndoDelete,
     MoveOp(isize),
     ToggleOp,
     Feature(usize),
@@ -461,6 +461,13 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
         .collect();
     HoldingChecks { key, setups }
 }
+/// An operation deleted from a setup, kept so Undo delete can put it back
+/// in its place.
+pub struct DeletedOp {
+    pub setup: String,
+    pub index: usize,
+    pub op: Operation,
+}
 pub struct App {
     pub smoke_dir: Option<PathBuf>,
     pub smoke_step: usize,
@@ -566,7 +573,8 @@ pub struct App {
     pub plan_camera: viewport::Camera,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
-    pub confirm_delete_op: bool,
+    /// The operation deleted last, until the next change to the job.
+    pub deleted_op: Option<DeletedOp>,
     pub icons: Vec<iced::widget::svg::Handle>,
     /// A close request waiting for a sign-out, a sign-in save or a refresh
     /// of the sign-in, and when it first came.
@@ -808,7 +816,7 @@ impl App {
             plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
-            confirm_delete_op: false,
+            deleted_op: None,
             icons,
             closing: None,
             signing_out: None,
@@ -886,6 +894,7 @@ impl App {
         self.help_animating = false;
         self.drop_plan();
         self.undo = None;
+        self.deleted_op = None;
     }
     fn create_setup(&mut self, machine: Machine) {
         let mut setup = Setup::new(machine, &self.doc.next_offset());
@@ -1114,6 +1123,7 @@ impl App {
         changed
     }
     fn touch(&mut self) {
+        self.deleted_op = None;
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
@@ -1837,7 +1847,6 @@ impl App {
         self.progress = 0.;
         self.simulation = None;
         self.confirm_delete_setup = false;
-        self.confirm_delete_op = false;
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
@@ -1863,7 +1872,6 @@ impl App {
                     | Message::AddOp(_)
                     | Message::DuplicateOp
                     | Message::RemoveOp
-                    | Message::ConfirmDeleteOp(_)
                     | Message::MoveOp(_)
                     | Message::Generate
                     | Message::GenerateAll
@@ -1964,7 +1972,6 @@ impl App {
             }
             Message::SelectOp(i) => {
                 if i < self.doc.setup().operations.len() {
-                    self.confirm_delete_op = false;
                     if self.selected != Some(i) {
                         self.simulation = None;
                     }
@@ -2120,7 +2127,6 @@ impl App {
                 );
             }
             Message::DuplicateOp => {
-                self.confirm_delete_op = false;
                 if let Some(i) = self.selected {
                     let mut o = self.doc.setup().operations[i].clone();
                     o.id = id();
@@ -2131,30 +2137,54 @@ impl App {
                 }
             }
             Message::RemoveOp => {
-                self.confirm_delete_op = self.operation().is_some();
+                if let Some(i) = self.selected
+                    && self.operation().is_some()
+                {
+                    let op = self.doc.setup_mut().operations.remove(i);
+                    self.selected = if self.doc.setup().operations.is_empty() {
+                        None
+                    } else {
+                        Some(i.min(self.doc.setup().operations.len() - 1))
+                    };
+                    self.touch();
+                    self.status = format!(
+                        "Deleted \"{}\". Undo delete or Command/Ctrl+Z puts it back.",
+                        op.name()
+                    );
+                    self.deleted_op = Some(DeletedOp {
+                        setup: self.doc.active.clone(),
+                        index: i,
+                        op,
+                    });
+                }
             }
             Message::DeleteKey => {
+                // While surfaces are being picked the key could mean a surface.
                 if self.page == Page::Work
+                    && !self.picking
                     && self.doc.active_setup().is_some()
                     && self.operation().is_some()
                 {
                     return self.handle(Message::RemoveOp);
                 }
             }
-            Message::ConfirmDeleteOp(yes) => {
-                self.confirm_delete_op = false;
-                if yes && let Some(i) = self.selected {
-                    self.doc.setup_mut().operations.remove(i);
-                    self.selected = if self.doc.setup().operations.is_empty() {
-                        None
-                    } else {
-                        Some(i.min(self.doc.setup().operations.len() - 1))
-                    };
-                    self.touch()
+            Message::UndoDelete => {
+                if let Some(d) = self.deleted_op.take()
+                    && let Some(si) = self.doc.setups.iter().position(|s| s.id == d.setup)
+                {
+                    let ops = &mut self.doc.setups[si].operations;
+                    let i = d.index.min(ops.len());
+                    let name = d.op.name().to_string();
+                    ops.insert(i, d.op);
+                    self.doc.active = d.setup;
+                    self.stop_selection();
+                    self.selected = Some(i);
+                    self.page = Page::Work;
+                    self.touch();
+                    self.status = format!("Put back \"{name}\".");
                 }
             }
             Message::MoveOp(d) => {
-                self.confirm_delete_op = false;
                 if let Some(i) = self.selected {
                     let n = i as isize + d;
                     if n >= 0 && (n as usize) < self.doc.setup().operations.len() {
@@ -2165,7 +2195,6 @@ impl App {
                 }
             }
             Message::ToggleOp => {
-                self.confirm_delete_op = false;
                 if let Some(o) = self.operation_mut() {
                     o.enabled = !o.enabled;
                 }
@@ -3561,9 +3590,9 @@ impl App {
                     modifiers,
                     ..
                 }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
-                    delete_key(&key, status)
-                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => edit_key(&key, modifiers, status),
                 _ => None,
             }),
         ])
@@ -3572,13 +3601,26 @@ impl App {
         ui::view(self)
     }
 }
-/// Delete or Backspace asks to delete the selected operation, unless a
-/// text field took the key.
-fn delete_key(key: &iced::keyboard::Key, status: iced::event::Status) -> Option<Message> {
+/// Delete or Backspace deletes the selected operation and Command/Ctrl+Z
+/// puts it back, unless a text field took the key.
+fn edit_key(
+    key: &iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+    status: iced::event::Status,
+) -> Option<Message> {
     use iced::keyboard::{Key, key::Named};
-    (status == iced::event::Status::Ignored
-        && matches!(key, Key::Named(Named::Delete | Named::Backspace)))
-    .then_some(Message::DeleteKey)
+    if status != iced::event::Status::Ignored {
+        return None;
+    }
+    match key {
+        Key::Named(Named::Delete | Named::Backspace) => Some(Message::DeleteKey),
+        Key::Character(c)
+            if modifiers.command() && !modifiers.shift() && c.to_lowercase() == "z" =>
+        {
+            Some(Message::UndoDelete)
+        }
+        _ => None,
+    }
 }
 fn sanitize_name(s: &str) -> String {
     let n: String = s

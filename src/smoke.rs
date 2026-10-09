@@ -143,7 +143,7 @@ impl App {
                 114 | 115 => "91-planner-pictures".into(),
                 116 => "92-flipped-setup-leftover-stock".into(),
                 117 => "93-planner-tool-lines".into(),
-                118 => "94-operation-delete-confirm".into(),
+                118 => "94-operation-deleted-undo".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -992,11 +992,11 @@ impl App {
             }
             118 => {
                 // The selected operation's actions sit above its fields; the
-                // Delete key asks before anything is deleted.
+                // Delete key deletes it, and Undo delete is offered.
                 *self.plan_stream.lock().unwrap() = String::new();
                 self.planner = crate::Planner::Idle;
                 let count = self.doc.setup().operations.len();
-                assert!(count > 0);
+                assert!(count > 1);
                 for action in [
                     Message::Page(Page::Work),
                     Message::SelectOp(0),
@@ -1004,11 +1004,13 @@ impl App {
                 ] {
                     let _ = self.update(action);
                 }
-                assert!(self.confirm_delete_op);
-                assert_eq!(self.doc.setup().operations.len(), count);
+                assert_eq!(self.doc.setup().operations.len(), count - 1);
+                let deleted = self.deleted_op.as_ref().expect("the deleted operation");
                 eprintln!(
-                    "Screen 94: deleting \"{}\" waits for an answer",
-                    self.operation().unwrap().name()
+                    "Screen 94: deleted \"{}\", now on \"{}\"; status: {}",
+                    deleted.op.name(),
+                    self.operation().unwrap().name(),
+                    self.status
                 );
                 vec![]
             }
@@ -5289,7 +5291,7 @@ mod tests {
         a
     }
     #[test]
-    fn deleting_an_operation_asks_first_and_the_delete_key_asks_too() {
+    fn the_delete_key_deletes_the_operation_and_undo_puts_it_back() {
         let mut a = app();
         let names = |a: &App| -> Vec<String> {
             a.doc
@@ -5302,47 +5304,85 @@ mod tests {
         let before = names(&a);
         assert!(before.len() >= 3, "{before:?}");
         let _ = a.update(Message::SelectOp(1));
-        let _ = a.update(Message::RemoveOp);
-        assert!(a.confirm_delete_op);
-        assert_eq!(names(&a), before, "nothing is deleted before the answer");
-        let _ = a.update(Message::ConfirmDeleteOp(false));
-        assert!(!a.confirm_delete_op);
-        assert_eq!(names(&a), before);
-        // Choosing another operation drops a pending question.
-        let _ = a.update(Message::RemoveOp);
-        let _ = a.update(Message::SelectOp(0));
-        assert!(!a.confirm_delete_op);
-        let _ = a.update(Message::SelectOp(1));
         let _ = a.update(Message::DeleteKey);
-        assert!(a.confirm_delete_op);
-        let _ = a.update(Message::ConfirmDeleteOp(true));
-        let mut expected = before.clone();
-        expected.remove(1);
-        assert_eq!(names(&a), expected);
+        let mut without = before.clone();
+        without.remove(1);
+        assert_eq!(names(&a), without, "the key deletes at once");
         assert_eq!(a.selected, Some(1), "the next operation is selected");
-        // Off the machining page, or with no operation chosen, the key does nothing.
+        assert!(a.status.contains(&before[1]), "{}", a.status);
+        // Undo puts it back in its place, selected, even from another
+        // operation or page.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Page(Page::Tools));
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(names(&a), before);
+        assert_eq!(a.selected, Some(1));
+        assert_eq!(a.page, Page::Work);
+        assert!(a.deleted_op.is_none());
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(names(&a), before, "only one delete is undone");
+        // The Delete button does the same; another change ends the Undo.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::RemoveOp);
+        assert_eq!(names(&a).len(), before.len() - 1);
+        assert!(a.deleted_op.is_some());
+        let _ = a.update(Message::Edit(Target::Operation, "name", "Renamed".into()));
+        assert!(a.deleted_op.is_none());
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(names(&a).len(), before.len() - 1);
+        // Off the machining page, while picking surfaces, or with no
+        // operation chosen, the key does nothing.
+        let now = names(&a);
+        let _ = a.update(Message::SelectOp(0));
+        a.picking = true;
+        let _ = a.update(Message::DeleteKey);
+        a.picking = false;
         let _ = a.update(Message::Page(Page::Tools));
         let _ = a.update(Message::DeleteKey);
-        assert!(!a.confirm_delete_op);
         let _ = a.update(Message::Page(Page::Work));
         a.selected = None;
         let _ = a.update(Message::DeleteKey);
-        assert!(!a.confirm_delete_op);
-        assert_eq!(names(&a), expected);
+        assert_eq!(names(&a), now);
+        assert!(a.deleted_op.is_none());
     }
     #[test]
-    fn the_delete_key_is_left_to_a_text_field_that_takes_it() {
+    fn deleting_the_last_operation_can_be_undone_from_the_setup_editor() {
+        let mut a = app();
+        let ops = a.doc.setup().operations.len();
+        for _ in 0..ops {
+            let _ = a.update(Message::SelectOp(0));
+            let _ = a.update(Message::DeleteKey);
+        }
+        assert!(a.doc.setup().operations.is_empty());
+        assert!(a.operation().is_none());
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(a.doc.setup().operations.len(), 1);
+        assert_eq!(a.selected, Some(0));
+    }
+    #[test]
+    fn the_keys_are_left_to_a_text_field_that_takes_them() {
         use iced::event::Status;
-        use iced::keyboard::{Key, key::Named};
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        let none = Modifiers::empty();
         for named in [Named::Delete, Named::Backspace] {
             assert!(matches!(
-                crate::delete_key(&Key::Named(named), Status::Ignored),
+                crate::edit_key(&Key::Named(named), none, Status::Ignored),
                 Some(Message::DeleteKey)
             ));
-            assert!(crate::delete_key(&Key::Named(named), Status::Captured).is_none());
+            assert!(crate::edit_key(&Key::Named(named), none, Status::Captured).is_none());
         }
-        assert!(crate::delete_key(&Key::Named(Named::Enter), Status::Ignored).is_none());
-        assert!(crate::delete_key(&Key::Character("d".into()), Status::Ignored).is_none());
+        let z = Key::Character("z".into());
+        assert!(matches!(
+            crate::edit_key(&z, Modifiers::COMMAND, Status::Ignored),
+            Some(Message::UndoDelete)
+        ));
+        assert!(crate::edit_key(&z, Modifiers::COMMAND, Status::Captured).is_none());
+        assert!(crate::edit_key(&z, none, Status::Ignored).is_none());
+        assert!(
+            crate::edit_key(&z, Modifiers::COMMAND | Modifiers::SHIFT, Status::Ignored).is_none()
+        );
+        assert!(crate::edit_key(&Key::Named(Named::Enter), none, Status::Ignored).is_none());
+        assert!(crate::edit_key(&Key::Character("d".into()), none, Status::Ignored).is_none());
     }
     fn imported_app() -> App {
         let mut a = app();

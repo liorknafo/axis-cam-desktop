@@ -950,6 +950,24 @@ fn inspector(app: &App) -> Element<'_, Message> {
         setup_editor(app)
     };
     let mut c = Column::new().spacing(12);
+    if let Some(d) = &app.deleted_op
+        && app.doc.active_setup().is_some_and(|s| s.id == d.setup)
+    {
+        c = c.push(
+            container(
+                row![
+                    muted(format!("Deleted \"{}\"", d.op.name()))
+                        .size(12)
+                        .wrapping(text::Wrapping::WordOrGlyph)
+                        .width(Fill),
+                    outlined("Undo delete", Message::UndoDelete)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(304),
+        );
+    }
     if let Some(o) = selected {
         c = c
             .push(container(operation_actions(app, o)).width(304))
@@ -975,48 +993,32 @@ fn operation_actions<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message>
     let title = row![
         icon(app, o.strategy, 30.),
         column![
-            bold(o.name(), 16),
+            bold(o.name(), 16).wrapping(text::Wrapping::WordOrGlyph),
             muted(format!("{} · edit its settings below", o.strategy.name())).size(12)
         ]
         .spacing(2)
+        .width(Fill)
     ]
     .spacing(9)
     .align_y(Alignment::Center);
-    let actions: Element<'a, Message> = if app.confirm_delete_op {
-        column![
-            note(format!(
-                "Delete \"{}\"? Its settings and toolpath go with it.",
-                o.name()
-            )),
-            row![
-                outlined("Cancel", Message::ConfirmDeleteOp(false)).width(Fill),
-                primary("Delete operation", Message::ConfirmDeleteOp(true)).width(Fill)
-            ]
-            .spacing(5)
+    let actions = column![
+        row![
+            outlined("Duplicate", Message::DuplicateOp).width(Fill),
+            outlined(
+                if o.enabled { "Suppress" } else { "Enable" },
+                Message::ToggleOp
+            )
+            .width(Fill),
+            outlined("Delete", Message::RemoveOp).width(Fill)
         ]
-        .spacing(8)
-        .into()
-    } else {
-        column![
-            row![
-                outlined("Duplicate", Message::DuplicateOp).width(Fill),
-                outlined(
-                    if o.enabled { "Suppress" } else { "Enable" },
-                    Message::ToggleOp
-                )
-                .width(Fill),
-                outlined("Delete…", Message::RemoveOp).width(Fill)
-            ]
-            .spacing(5),
-            row![
-                outlined("Move up", Message::MoveOp(-1)).width(Fill),
-                outlined("Move down", Message::MoveOp(1)).width(Fill)
-            ]
-            .spacing(5)
+        .spacing(5),
+        row![
+            outlined("Move up", Message::MoveOp(-1)).width(Fill),
+            outlined("Move down", Message::MoveOp(1)).width(Fill)
         ]
         .spacing(5)
-        .into()
-    };
+    ]
+    .spacing(5);
     column![title, actions].spacing(10).into()
 }
 fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
