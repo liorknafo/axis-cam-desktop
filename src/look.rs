@@ -128,6 +128,10 @@ pub(crate) struct View {
     projector: Projector,
     sim: Option<crate::simulation::Simulation>,
     holding: Vec<crate::holding::HoldBox>,
+    /// The clamps of `holding` whose bite has lost its stock in the
+    /// operation's simulation (`Viewport::bare_clamps`), by their labels
+    /// without the offset: "clamp on -X".
+    bare: Vec<String>,
     angle_words: &'static str,
     focus: Vec<usize>,
     /// The operation looked at, counted from 1: setup and operation.
@@ -290,6 +294,13 @@ impl View {
         let boxes = focus_bounds(mesh, &setup, &args.focus_surfaces)
             .map(|b| vec![b])
             .unwrap_or_else(|| viewport.scene_boxes());
+        let mut bare: Vec<String> = vec![];
+        for (hold, lost) in holding.iter().zip(viewport.bare_clamps()) {
+            let label = hold.label.split(" (offset").next().unwrap_or_default();
+            if lost && !bare.iter().any(|b| b == label) {
+                bare.push(label.to_string());
+            }
+        }
         let frame = (SIZE as f32, (SIZE - CAPTION) as f32);
         let projector = Projector::filling(camera, frame, &boxes, FILL);
         Ok(Self {
@@ -298,6 +309,7 @@ impl View {
             projector,
             sim,
             holding,
+            bare,
             angle_words,
             focus: args.focus_surfaces.clone(),
             operation,
@@ -700,11 +712,14 @@ fn describe(view: &View, args: &Args, tags: &[String]) -> String {
     } else {
         "stock hidden"
     };
-    let holding = if view.holding.is_empty() {
-        ""
+    let mut holding = if view.holding.is_empty() {
+        String::new()
     } else {
-        "; vise or clamps shown"
+        "; vise or clamps shown".to_string()
     };
+    for clamp in &view.bare {
+        holding += &format!("; {clamp} has no stock under its bite");
+    }
     let tags = if tags.is_empty() {
         "none".to_string()
     } else {
@@ -1100,6 +1115,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(out.contains("Setup 1 has no operation 99"), "{out}");
+    }
+    /// The example block held by four clamps at the middles of its sides on
+    /// its 2 mm of stock beside the part, as setup 1's workholding, with
+    /// the job of the `good` proposal, whose first Face covers the stock.
+    fn clamped_on_the_part() -> Scene {
+        let (mut doc, mesh, report) = block();
+        crate::proposal::tests::hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0;-Y:0;+Y:0")]);
+        let (_, job) = crate::plan_check::evaluate(&doc, &mesh, &report, &good(&report));
+        Scene {
+            doc: Arc::new(doc),
+            mesh: Arc::new(mesh),
+            report: Arc::new(report),
+            job: job.map(Arc::new),
+        }
+    }
+    #[test]
+    fn an_operation_view_says_which_clamps_lost_the_stock_under_their_bites() {
+        let s = clamped_on_the_part();
+        // After the Face, which takes 4 mm off the whole top: every bite's
+        // stock is gone.
+        let after = draw(
+            &s,
+            &args(serde_json::json!({"operation": {"setup": 1, "operation": 1}, "angle": "front"})),
+        )
+        .unwrap();
+        for side in ["-X", "+X", "-Y", "+Y"] {
+            assert!(
+                after
+                    .description
+                    .contains(&format!("; clamp on {side} has no stock under its bite")),
+                "{}",
+                after.description
+            );
+        }
+        // The red of a bare clamp is in the picture.
+        let red = decode(&after.png)
+            .2
+            .chunks(3)
+            .filter(|p| p == &[205, 60, 60] || p == &[166, 46, 46] || p == &[186, 52, 52])
+            .count();
+        assert!(red > 500, "{red} red pixels");
+        // Before machining nothing is cut: no clamp is bare, none is red.
+        let before = draw(&s, &args(serde_json::json!({"angle": "front"}))).unwrap();
+        assert!(
+            !before.description.contains("no stock under"),
+            "{}",
+            before.description
+        );
+        assert!(
+            before.description.contains("vise or clamps shown"),
+            "{}",
+            before.description
+        );
     }
     #[test]
     fn the_purpose_is_cleaned_and_clipped() {

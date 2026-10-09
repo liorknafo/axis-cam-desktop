@@ -219,13 +219,13 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
         // Without its overview (it could not be drawn) the section does not
         // promise one.
         let first = if overview {
-            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks)."
+            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks), the stock under each clamp's bite solid amber."
         } else {
-            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks)."
+            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks), the stock under each clamp's bite solid amber."
         };
         let (look, limits) = if tool {
             (
-                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green).\n",
+                "- Call `view_model` to see more: another orientation or angle, zoomed on surfaces, surfaces highlighted in blue, layers on or off, and, once a proposal has been checked, one of its operations (`operation`, counted from 1 as in the check report): its toolpaths, and the stock left after it (cut stock green; a clamp whose bite has lost its stock red, which the description says).\n",
                 format!(
                     "You get at most {MAX_PICTURES_PER_REQUEST} pictures per request (the part report, or a check report the program sends back) and {MAX_PICTURES_PER_RUN} in the run. "
                 ),
