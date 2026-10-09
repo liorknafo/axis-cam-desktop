@@ -704,8 +704,23 @@ fn laid_out(
         let removed = first
             .and_then(|first| first.initial_volume.as_ref().zip(first.frame))
             .map(|(volume, frame)| crate::rest::Removed::new(volume, frame).with_part(part));
+        // Clamps hold the stock to the end of the setup: the stock its own
+        // operations leave, once for the suggestion.
+        let after = first
+            .filter(|_| !request.vise)
+            .and_then(|first| first.initial_volume.clone().zip(first.frame))
+            .map(|(before, frame)| {
+                let own = results[si]
+                    .iter()
+                    .filter_map(|(oi, r)| r.as_ref().ok().map(|sim| (*oi, &sim.plan)));
+                (crate::rest::after_setup(before, own, si, frame), frame)
+            });
+        let after = after
+            .as_ref()
+            .map(|(volume, frame)| crate::rest::Removed::new(volume, *frame).with_part(part));
         let known = holding::Known {
             earlier: removed.as_ref(),
+            after: after.as_ref(),
             part: Some(part),
         };
         let Some((_, suggested)) =
@@ -2011,8 +2026,19 @@ mod tests {
     /// The block with `margin` mm of stock round the part, held by the
     /// starter clamps at `clamps` (each 60 mm long, reaching 12 mm onto the
     /// stock and 25 mm above it), and `good` cut to the model's outline, which
-    /// keeps its tools clear of clamps that far out.
+    /// keeps its tools clear of clamps that far out. Setup 1's Contour stops
+    /// 5 mm above the part's underside: the part stays joined to the stock
+    /// round it by those 5 mm of its walls until setup 2, which faces the
+    /// stock left under the part away (`unjoined` does not).
     fn clamped(clamps: &str, margin: &str) -> (Document, Mesh, PartReport, Proposal) {
+        let (doc, mesh, report, mut proposal) = unjoined(clamps, margin);
+        proposal.setups[0].operations[2].bottom_offset = Some(5.);
+        (doc, mesh, report, proposal)
+    }
+    /// `clamped` with setup 1's Contour down to the part's underside: setup
+    /// 2's Face, taking the 3 mm left under the part, cuts the part free from
+    /// the stock round it.
+    fn unjoined(clamps: &str, margin: &str) -> (Document, Mesh, PartReport, Proposal) {
         use crate::proposal::tests::hold;
         let (mut doc, mesh, report) = block();
         for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
@@ -2098,7 +2124,11 @@ mod tests {
         let refs: Vec<&simulation::Plan> = sims.iter().map(|sim| &sim.plan).collect();
         let before = sims[0].initial_volume.as_ref().unwrap();
         let part = simulation::part_box(second, &mesh);
-        let removed = crate::rest::Removed::new(before, sims[0].frame.unwrap()).with_part(part);
+        let frame = sims[0].frame.unwrap();
+        let removed = crate::rest::Removed::new(before, frame).with_part(part);
+        let own = sims.iter().map(|sim| &sim.plan).enumerate();
+        let left = crate::rest::after_setup(before.clone(), own, 1, frame);
+        let after = crate::rest::Removed::new(&left, frame).with_part(part);
         let holder = job.holder(get(&second.p, "holder")).unwrap();
         let (_, again) = holding::request(second, Some(holder))
             .unwrap()
@@ -2110,6 +2140,7 @@ mod tests {
                 None,
                 holding::Known {
                     earlier: Some(&removed),
+                    after: Some(&after),
                     part: Some(part),
                 },
             )
@@ -2117,6 +2148,43 @@ mod tests {
         assert_eq!(
             holding::placement(&again.unwrap()),
             vec![("clamps", get(&second.p, "clamps").to_string())]
+        );
+    }
+    #[test]
+    fn clamps_on_stock_that_setup_2_cuts_free_from_the_part_do_not_pass() {
+        // Setup 1's Contour goes down to the part's underside; setup 2,
+        // turned over, faces away the 3 mm left under the part, which was
+        // all that joined the part to the 36 mm of stock round it. No clamp
+        // on that stock holds by the end of setup 2: the app lays none out,
+        // and the plan check says why, at the stage workholding.
+        let (doc, mesh, report, proposal) = unjoined("-X:0;+X:0", "36");
+        let (check, job) = check(&doc, &mesh, &report, &proposal);
+        assert!(!check.passed && job.is_none());
+        let found = stages(&check);
+        assert_eq!(
+            found,
+            [
+                "workholding 2/None: Underside: Toe clamps cannot hold this setup: on every side its operations cut the stock under the 12 mm bite free from the part. Leave a skin or tabs joining them until the last setup, or use the vise."
+            ],
+            "{found:?}"
+        );
+        // The four clamps the app laid out before, typed on setup 2, are
+        // refused by the export, every one, as cut free by its Face.
+        let mut built = proposal::build(&doc, &mesh, &report, &proposal).unwrap();
+        built.setups[1]
+            .p
+            .insert("clamps".into(), "-X:0;+X:0;-Y:0;+Y:0".into());
+        let found = stages(&check_built(&built, &mesh, &report));
+        let freed: Vec<&String> = found
+            .iter()
+            .filter(|l| l.contains("would cut the part free from the stock under its bite"))
+            .collect();
+        assert_eq!(freed.len(), 4, "{found:?}");
+        assert!(
+            freed.iter().all(|l| l.starts_with(
+                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on "
+            ) && l.contains(": setup 2, operation 1 would cut the part free")),
+            "{freed:?}"
         );
     }
     #[test]

@@ -2159,9 +2159,12 @@ fn bites_lost(app: &App, plan: &crate::simulation::Plan, setup: &Setup) -> Vec<S
     let oi = app.selected.unwrap_or_default();
     let frame = crate::volume::Frame::new(setup, mesh);
     let cuts = crate::rest::Cuts::of_plans([(oi, plan)], si, frame);
+    // One operation's own cuts; whether the setup's operations together cut
+    // the part free is the export's and the preview's red to tell.
     let own = crate::holding::Own {
         cuts: &cuts,
         part: crate::simulation::part_box(setup, mesh),
+        after: None,
     };
     let held = held_of(app, plan.stock);
     let height = crate::holding::height_issue(&layout, plan.stock);

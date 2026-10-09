@@ -881,12 +881,15 @@ pub fn suggest_vise(
 const CLAMP_STEP: f32 = 5.;
 /// What a clamp suggestion knows of a setup besides its toolpaths: what the
 /// earlier setups cut from its stock (None for setup 1 or when it is not
-/// known), knowing the part (`Removed::with_part`) to tell stock cut free
-/// from it as the export does, and the part's bounds in its frame (mm; None
-/// when not known), which the stock to leave beside the part is said from.
+/// known), and the stock the setup leaves once its own operations are done
+/// (`rest::after_setup`; None when not known), each knowing the part
+/// (`Removed::with_part`) to tell stock cut free from it as the export
+/// does; and the part's bounds in its frame (mm; None when not known),
+/// which the stock to leave beside the part is said from.
 #[derive(Clone, Copy, Default)]
 pub struct Known<'a> {
     pub earlier: Option<&'a crate::rest::Removed<'a>>,
+    pub after: Option<&'a crate::rest::Removed<'a>>,
     pub part: Option<Bounds>,
 }
 /// Why a spot along a side cannot hold a clamp.
@@ -896,6 +899,9 @@ enum Unheld {
     OverPart,
     /// The earlier setups cut the stock under its bite free from the part.
     CutFree,
+    /// By the end of the setup, its own operations (with the earlier ones)
+    /// cut the stock under its bite free from the part.
+    FreedHere,
     /// Off its side, its bite's stock lost, or a move within the gap.
     Other,
 }
@@ -927,11 +933,12 @@ struct Spot {
 /// at least 60 % of the points `holdable` samples under its bite have
 /// material for the whole setup (removed neither by the setup's own cuts,
 /// `rest::Cuts` of `plans`, nor by the earlier setups' when they are
-/// `known`); that material is not cut free from the part by the earlier
-/// setups (`freed`, when they know the part: the export's own test); and no
-/// move comes within `gap` of it (`margin` above 0: the cutter and the
-/// holder both counted). Each side tries the offsets every `CLAMP_STEP` mm
-/// that keep the clamp's whole width on the side, the middle first, then
+/// `known`); that material is not cut free from the part, neither by the
+/// earlier setups nor by the end of the setup, its own operations done
+/// (`freed` on the stocks `known` knowing the part: the export's own test);
+/// and no move comes within `gap` of it (`margin` above 0: the cutter and
+/// the holder both counted). Each side tries the offsets every `CLAMP_STEP`
+/// mm that keep the clamp's whole width on the side, the middle first, then
 /// out both ways (- before +), and takes the first of the highest score; the
 /// score is the margin, at most `CLEAR_ENOUGH`, so that spots clear by that
 /// much tie and the one nearest the middle wins, except that a side whose
@@ -995,6 +1002,13 @@ pub fn suggest_clamps(
                 return Err(Unheld::CutFree);
             }
         }
+        if let Some(after) = known.after {
+            let step = (stock.max[across] - stock.min[across]) / 192.;
+            let step = if plus { -step } else { step };
+            if freed(&points, after, across, step).is_some() {
+                return Err(Unheld::FreedHere);
+            }
+        }
         let clear = plans
             .iter()
             .map(|plan| margin(plan, &placed.bounds, gap))
@@ -1016,22 +1030,28 @@ pub fn suggest_clamps(
         let (_, along, _) = side.axes();
         let reach = ((stock.dimensions()[along] - width) / 2.).max(0.);
         let steps = (reach / CLAMP_STEP + 0.001).floor() as i32;
-        let (mut found, mut over, mut free) = (vec![], true, false);
+        let mut side_spots = SideSpots {
+            found: vec![],
+            over: true,
+            free: false,
+            here: false,
+        };
         for offset in std::iter::once(0.).chain((1..=steps).flat_map(|k| {
             let offset = k as f32 * CLAMP_STEP;
             [-offset, offset]
         })) {
             match spot(side, offset) {
-                Ok(spot) => found.push(spot),
+                Ok(spot) => side_spots.found.push(spot),
                 Err(why) => {
-                    over &= why == Unheld::OverPart;
-                    free |= why == Unheld::CutFree;
+                    side_spots.over &= why == Unheld::OverPart;
+                    side_spots.free |= why == Unheld::CutFree;
+                    side_spots.here |= why == Unheld::FreedHere;
                 }
             }
         }
         // Stable: equal scores keep the middle-first order.
-        found.sort_by(|a, b| b.score.total_cmp(&a.score));
-        (found, over, free)
+        side_spots.found.sort_by(|a, b| b.score.total_cmp(&a.score));
+        side_spots
     });
     let overlap =
         |a: &Bounds, b: &Bounds| (0..2).all(|k| a.min[k] < b.max[k] && b.min[k] < a.max[k]);
@@ -1043,7 +1063,7 @@ pub fn suggest_clamps(
         for side in sides {
             let index = Side::ALL.iter().position(|s| s == side).unwrap_or(0);
             let free: Vec<&Spot> = spots[index]
-                .0
+                .found
                 .iter()
                 .filter(|s| !taken.iter().any(|t| overlap(&s.bounds, &t.bounds)))
                 .collect();
@@ -1096,12 +1116,15 @@ pub fn suggest_clamps(
     match chosen {
         Some(taken) => Ok(taken.iter().map(|s| (s.side, s.offset)).collect()),
         None => {
-            let bare: Vec<Side> = Side::ALL
-                .into_iter()
-                .zip(&spots)
-                .filter(|(_, (found, ..))| found.is_empty())
-                .map(|(side, _)| side)
-                .collect();
+            let bare_where = |test: fn(&SideSpots) -> bool| -> Vec<Side> {
+                Side::ALL
+                    .into_iter()
+                    .zip(&spots)
+                    .filter(|(_, s)| s.found.is_empty() && test(s))
+                    .map(|(side, _)| side)
+                    .collect()
+            };
+            let bare = bare_where(|_| true);
             // Two opposite sides each have a spot, but their clamps meet.
             if Side::ALL
                 .iter()
@@ -1109,22 +1132,34 @@ pub fn suggest_clamps(
             {
                 return Err(OVERLAP.into());
             }
-            let why = if spots
-                .iter()
-                .all(|(found, over, _)| !found.is_empty() || *over)
-            {
-                Unheld::OverPart
-            } else if spots
-                .iter()
-                .all(|(found, _, free)| !found.is_empty() || *free)
-            {
-                Unheld::CutFree
+            // The reason that more stock beside the part cannot mend comes
+            // first: stock cut free from the part, by the earlier setups,
+            // then by this one; a bite over the part only when that is all.
+            let (free, here) = (bare_where(|s| s.free), bare_where(|s| s.here));
+            let (sides, why) = if bare_where(|s| s.over) == bare {
+                (bare, Unheld::OverPart)
+            } else if !free.is_empty() {
+                (free, Unheld::CutFree)
+            } else if !here.is_empty() {
+                (here, Unheld::FreedHere)
             } else {
-                Unheld::Other
+                (bare, Unheld::Other)
             };
-            Err(no_clamps(&bare, why, holder, plans, stock, gap, known.part))
+            Err(no_clamps(
+                &sides, why, holder, plans, stock, gap, known.part,
+            ))
         }
     }
+}
+/// The spots a side has for a clamp, best first, and why the others were
+/// refused: whether only for a bite over the part (`over`), and whether any
+/// for stock cut free from the part by the earlier setups (`free`) or by
+/// the end of this one (`here`).
+struct SideSpots {
+    found: Vec<Spot>,
+    over: bool,
+    free: bool,
+    here: bool,
 }
 /// Why no clamps can hold a stock so small that clamps on opposite sides,
 /// each with stock under its bite, would overlap.
@@ -1134,6 +1169,16 @@ const OVERLAP: &str = "Toe clamps cannot hold this setup: the stock is too small
 /// only where it is strictly clear), with a hair for rounding.
 fn advised(needed: f32) -> f32 {
     ((needed + 0.01) / 5.).floor() * 5. + 5.
+}
+/// Whether `b`, a clamp on `stock`'s top, bites over the outline of `part`
+/// (bounds in the same frame, mm). False for a jaw.
+pub fn over(b: &Bounds, stock: Bounds, part: Bounds) -> bool {
+    let Some(on) = bite(b, stock) else {
+        return false;
+    };
+    let out = |k: usize| (stock.min[k] - b.min[k]).max(0.) + (b.max[k] - stock.max[k]).max(0.);
+    let across = usize::from(out(1) > out(0));
+    over_part(on, part, across, b.max[across] > stock.max[across]) > 0.005
 }
 /// How far `bite` (`bite`, on the stock's top) reaches over the outline of
 /// `part` (its bounds, mm) along `across`, from a clamp on the stock's high
@@ -1151,12 +1196,12 @@ fn over_part(bite: Bounds, part: Bounds, across: usize, plus: bool) -> f32 {
     depth.clamp(0., bite.max[across] - bite.min[across])
 }
 /// Why no clamps can hold a setup whose stock is `stock`: on `bare` (the
-/// sides without a spot; all four are said as every side). When every spot
-/// was refused only for a bite over the part (`why`, without toolpaths),
-/// that, and the stock to leave beside the part for the bite and the gap.
-/// When every side without a spot had one refused for stock the earlier
-/// setups cut free from the part, that, and to leave material joining them.
-/// Otherwise the bite's stock is lost or a move comes within `gap`, and the
+/// sides it is about; all four are said as every side), as `why` says. For
+/// bites over the part (without toolpaths), that, and the stock to leave
+/// beside the part for the bite and the gap. For stock cut free from the
+/// part by the earlier setups, or by this one's operations by its end,
+/// that, and to leave material joining them (a skin or tabs, until the last
+/// setup). Otherwise the bite's stock is lost or a move comes within `gap`, and the
 /// stock to leave is for the bite, the gap and the farthest a tool of
 /// `plans` reaches past the part's outline (`reach`), always the next
 /// multiple of 5 mm above it (`advised`). Facing only the part's outline is
@@ -1187,6 +1232,12 @@ fn no_clamps(
             last.label()
         ),
     };
+    if why == Unheld::FreedHere {
+        return format!(
+            "Toe clamps cannot hold this setup: on {sides} its operations cut the stock under the {} mm bite free from the part. Leave a skin or tabs joining them until the last setup, or use the vise.",
+            mm(bite)
+        );
+    }
     if why == Unheld::CutFree {
         return format!(
             "Toe clamps cannot hold this setup: on {sides} the earlier setups cut the stock under the {} mm bite free from the part. Leave material joining them (for example a `bottom_offset` or a skin under the part), or use the vise.",
@@ -1718,14 +1769,65 @@ fn freed(
     }
     Some(between)
 }
+/// What joined the stock under a clamp's bite (`points`) to the part and the
+/// setup's own operations cut away: points between the bite and the middle
+/// of the part (`own.part`), at 6 heights through `stock`, 48 along each
+/// line, where the stock the setup leaves (`after`) has none, the earlier
+/// setups (`removed`, None for setup 1) had not cut and one of the setup's
+/// own cuts (`own.cuts`) did.
+fn joining(
+    points: &[[f32; 3]],
+    removed: Option<&crate::rest::Removed>,
+    after: &crate::rest::Removed,
+    own: &Own,
+    stock: Bounds,
+) -> Vec<[f32; 3]> {
+    use crate::rest::Removes;
+    let part = own.part;
+    let middle = [
+        (part.min[0] + part.max[0]) / 2.,
+        (part.min[1] + part.max[1]) / 2.,
+    ];
+    let mut found = vec![];
+    for p in points {
+        for z in spread(stock.min[2] + INSIDE, stock.max[2] - INSIDE, 6) {
+            for i in 1..48 {
+                let t = i as f32 / 48.;
+                let q = [
+                    p[0] + (middle[0] - p[0]) * t,
+                    p[1] + (middle[1] - p[1]) * t,
+                    z,
+                ];
+                if after.joined(q).is_none() && removed.is_none_or(|r| !r.at(q)) && own.cuts.at(q) {
+                    found.push(q);
+                }
+            }
+        }
+    }
+    found
+}
 /// The advice of a message that says the part was cut free.
 const JOIN: &str = "Leave material joining them (for example a `bottom_offset` above the stock's bottom, or a skin under the part) and cut it free in the last setup.";
-/// The cuts a setup's own operations make (`rest::Cuts::of_plans`) and the
-/// part's bounds in its frame (mm): a clamp must keep the stock under its
-/// bite for the whole setup, and a bite that reaches over the part cannot.
+/// The cuts a setup's own operations make (`rest::Cuts::of_plans`), the
+/// part's bounds in its frame (mm) and, when known, the stock the setup
+/// leaves once they are done, knowing the part (`rest::after_setup`,
+/// `Removed::with_part`): a clamp must keep the stock under its bite for the
+/// whole setup, joined to the part, and a bite that reaches over the part
+/// cannot.
 pub struct Own<'a> {
     pub cuts: &'a crate::rest::Cuts,
     pub part: Bounds,
+    pub after: Option<&'a crate::rest::Removed<'a>>,
+}
+/// How a clamp's bite fares in the stock as far as it is cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bite {
+    /// It has its stock, joined to the part.
+    Holds,
+    /// Fewer than 60 % of the points under it have material.
+    Gone,
+    /// Its stock is there but cut free from the part.
+    Free,
 }
 /// The footprint of `b` on `stock`'s top when `b` rests there as a clamp
 /// does (its bottom at the top, its footprint over the stock): the bite, a
@@ -1758,24 +1860,37 @@ fn bite_points(bite: Bounds, across: usize) -> Vec<[f32; 3]> {
     )
     .unwrap_or_default()
 }
-/// Which of `boxes` (a setup's jaws or clamps on `stock`, in its frame, mm)
-/// are clamps whose bite has lost its stock: fewer than 60 % of the points
-/// `holdable` samples under the bite have material that `removed` (the cuts
-/// so far) leaves. False for a jaw.
-pub fn bare(boxes: &[HoldBox], stock: Bounds, removed: &dyn crate::rest::Removes) -> Vec<bool> {
+/// How each of `boxes` (a setup's jaws or clamps on `stock`, in its frame,
+/// mm) fares in the stock `removed` tells (the cuts so far): a clamp whose
+/// bite has fewer than 60 % of the points `holdable` samples under it with
+/// material has lost it (`Bite::Gone`); one whose material is all cut free
+/// from the part (`freed`, when `removed` knows the part) holds nothing
+/// either (`Bite::Free`). A jaw `Bite::Holds`.
+pub fn bare(boxes: &[HoldBox], stock: Bounds, removed: &crate::rest::Removed) -> Vec<Bite> {
     boxes
         .iter()
         .map(|b| {
-            bite(&b.bounds, stock).is_some_and(|on| {
-                // The axis the clamp reaches across the stock's edge along:
-                // the one it sticks out of the stock further on.
-                let out = |k: usize| {
-                    (stock.min[k] - b.bounds.min[k]).max(0.)
-                        + (b.bounds.max[k] - stock.max[k]).max(0.)
-                };
-                let across = usize::from(out(1) > out(0));
-                !missing(&bite_points(on, across), stock, removed, 60).is_empty()
-            })
+            let Some(on) = bite(&b.bounds, stock) else {
+                return Bite::Holds;
+            };
+            // The axis the clamp reaches across the stock's edge along: the
+            // one it sticks out of the stock further on, and on which side.
+            let out = |k: usize| {
+                (stock.min[k] - b.bounds.min[k]).max(0.) + (b.bounds.max[k] - stock.max[k]).max(0.)
+            };
+            let across = usize::from(out(1) > out(0));
+            let plus = b.bounds.max[across] > stock.max[across];
+            let points = bite_points(on, across);
+            if !missing(&points, stock, removed, 60).is_empty() {
+                return Bite::Gone;
+            }
+            // Toward the part: inward from the clamp's side.
+            let step = (stock.max[across] - stock.min[across]) / 192.;
+            let step = if plus { -step } else { step };
+            match freed(&points, removed, across, step) {
+                Some(_) => Bite::Free,
+                None => Bite::Holds,
+            }
         })
         .collect()
 }
@@ -1970,6 +2085,26 @@ pub fn holdable(
                                 "Setup {n} cannot be held by the {label}: {who} would cut away the stock under its bite. Keep those cuts off it{example}, clamp on stock this setup does not cut, or use the vise.{late}"
                             )
                         });
+                        continue;
+                    }
+                    // Its material must stay joined to the part to the end
+                    // of the setup: the stock after its own operations.
+                    if let Some(after) = own.after {
+                        let step = (stock.max[across] - stock.min[across]) / 192.;
+                        let step = if plus { -step } else { step };
+                        if let Some(cut) = freed(&points, after, across, step) {
+                            // Named after this setup's operations that cut
+                            // away what joined the bite to the part.
+                            let joining = joining(&points, removed, after, own, stock);
+                            let (who, late) = if joining.is_empty() {
+                                cause(&cut, after, names)
+                            } else {
+                                cause(&joining, own.cuts, names)
+                            };
+                            found.push(format!(
+                                "Setup {n} cannot be held by the {label}: {who} would cut the part free from the stock under its bite. Leave a skin or tabs joining them until the last setup, or hold this setup in the vise.{late}"
+                            ));
+                        }
                     }
                 }
             }
@@ -2966,6 +3101,7 @@ mod tests {
                 2.,
                 Known {
                     earlier: Some(&removed),
+                    after: None,
                     part: None
                 }
             ),
@@ -2980,6 +3116,7 @@ mod tests {
         let own = Own {
             cuts: &cuts,
             part: PART,
+            after: None,
         };
         assert!(holdable(0, &layout, &clamp(), stock(), None, Some(&own), &names).is_empty());
     }
@@ -3032,6 +3169,7 @@ mod tests {
         };
         let with_part = Known {
             earlier: None,
+            after: None,
             part: Some(part),
         };
         assert_eq!(
@@ -3081,6 +3219,7 @@ mod tests {
         // 24, so 25; Ø11: 25, so 30; Ø16: 30, so 35.
         let part = Known {
             earlier: None,
+            after: None,
             part: Some(PART),
         };
         for (r, advised) in [(3., "25"), (5., "25"), (5.5, "30"), (8., "35")] {
@@ -3116,6 +3255,7 @@ mod tests {
         let removed = Removed::new(&v, f);
         let blind = Known {
             earlier: Some(&removed),
+            after: None,
             part: None,
         };
         let on_the_frame = vec![
@@ -3133,6 +3273,7 @@ mod tests {
         let joined = Removed::new(&v, f).with_part(part);
         let known = Known {
             earlier: Some(&joined),
+            after: None,
             part: Some(part),
         };
         assert_eq!(
@@ -3163,12 +3304,141 @@ mod tests {
         let joined = Removed::new(&v, f).with_part(part);
         let known = Known {
             earlier: Some(&joined),
+            after: None,
             part: Some(part),
         };
         assert_eq!(
             suggest_clamps(stock(), &clamp(), &[], 2., known),
             Ok(on_the_frame)
         );
+    }
+    /// A contour round a 40 × 20 mm part in the middle of `stock()`, its
+    /// Ø10 cutter's centre 5 mm outside it, one pass at each tip height of
+    /// `tips`, with a stickout long enough to keep the holder above the
+    /// clamps: setup 1's operation 3.
+    fn contour_round(tips: &[f32]) -> Plan {
+        let corners = [[-25., -15.], [25., -15.], [25., 15.], [-25., 15.]];
+        let moves: Vec<_> = tips
+            .iter()
+            .flat_map(|&z| {
+                (0..4).map(move |k| {
+                    let (a, b) = (corners[k], corners[(k + 1) % 4]);
+                    ([a[0], a[1], z], [b[0], b[1], z])
+                })
+            })
+            .collect();
+        let mut contour = plan(5., &moves);
+        contour.strategy = crate::model::Strategy::Contour;
+        contour.tool_length = 80.;
+        contour
+    }
+    /// The part `contour_round` goes round.
+    const SMALL_PART: Bounds = Bounds {
+        min: [-20., -10., 0.],
+        max: [20., 10., 37.],
+    };
+    #[test]
+    fn a_spot_whose_stock_the_setup_itself_cuts_free_holds_nothing() {
+        // Setup 1 contours the part down past the stock's bottom: by the end
+        // of the setup the stock round it, where the X clamps bite (and the
+        // Y clamps could, past the contour's corners), is cut free from it.
+        // Each bite keeps its material all along, so only the stock after
+        // the setup's own cuts, knowing the part, tells.
+        let (fresh, f, _) = untouched();
+        let through = contour_round(&[-1., 4., 9., 14., 19., 24., 29., 34., 39.]);
+        let after = crate::rest::after_setup(fresh.clone(), [(2, &through)], 0, f);
+        let freed = Removed::new(&after, f).with_part(SMALL_PART);
+        let known = Known {
+            earlier: None,
+            after: Some(&freed),
+            part: Some(SMALL_PART),
+        };
+        assert_eq!(
+            suggest_clamps(stock(), &clamp(), &[&through], 2., known),
+            Err("Toe clamps cannot hold this setup: on every side its operations cut the stock under the 12 mm bite free from the part. Leave a skin or tabs joining them until the last setup, or use the vise.".into())
+        );
+        // Not looking at the stock after the setup, the X clamps were placed.
+        let blind = Known {
+            after: None,
+            ..known
+        };
+        assert_eq!(
+            suggest_clamps(stock(), &clamp(), &[&through], 2., blind),
+            Ok(vec![(Side::MinusX, 0.), (Side::PlusX, 0.)])
+        );
+        // The export refuses those clamps, naming the contour.
+        let cuts = crate::rest::Cuts::of_plans([(2, &through)], 0, f);
+        let own = Own {
+            cuts: &cuts,
+            part: SMALL_PART,
+            after: Some(&freed),
+        };
+        let layout = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.)]);
+        let said = |side: &str| {
+            format!(
+                "Setup 1 cannot be held by the clamp on {side} (offset 0): setup 1, operation 3 would cut the part free from the stock under its bite. Leave a skin or tabs joining them until the last setup, or hold this setup in the vise. Setup 1, operation 3 is Contour \"Outside\"."
+            )
+        };
+        assert_eq!(
+            holdable(0, &layout, &clamp(), stock(), None, Some(&own), &names),
+            [said("-X"), said("+X")]
+        );
+        // And the preview draws them as having lost their hold once the
+        // contour is done.
+        let held = boxes(&layout, &clamp(), stock()).unwrap();
+        assert_eq!(bare(&held, stock(), &freed), [Bite::Free, Bite::Free]);
+        // Stopped 3 mm above the bottom, the contour leaves a skin joining
+        // the stock round the part to it: they hold, and nothing is refused.
+        let skin = contour_round(&[3., 8., 13., 18., 23., 28., 33., 38.]);
+        let after = crate::rest::after_setup(fresh, [(2, &skin)], 0, f);
+        let joined = Removed::new(&after, f).with_part(SMALL_PART);
+        let known = Known {
+            earlier: None,
+            after: Some(&joined),
+            part: Some(SMALL_PART),
+        };
+        assert_eq!(
+            suggest_clamps(stock(), &clamp(), &[&skin], 2., known),
+            Ok(vec![(Side::MinusX, 0.), (Side::PlusX, 0.)])
+        );
+        let cuts = crate::rest::Cuts::of_plans([(2, &skin)], 0, f);
+        let own = Own {
+            cuts: &cuts,
+            part: SMALL_PART,
+            after: Some(&joined),
+        };
+        assert!(holdable(0, &layout, &clamp(), stock(), None, Some(&own), &names).is_empty());
+        assert_eq!(bare(&held, stock(), &joined), [Bite::Holds, Bite::Holds]);
+    }
+    #[test]
+    fn the_stock_after_a_setup_is_what_its_simulation_leaves() {
+        // The example block's Face, Pocket and Contour: their own feed moves
+        // cut from the stock the setup starts from leave the same voxels and
+        // cuts as the simulation leaves after the Contour.
+        let (mut doc, mesh) = crate::post::fixture::job();
+        for (k, op) in doc.setups[0].operations.iter_mut().enumerate() {
+            op.enabled = k < 3;
+        }
+        let (mut sims, mut last) = (vec![], None);
+        crate::simulation::sequence_with(
+            &doc,
+            &mesh,
+            None,
+            |_, oi, r| sims.push((oi, r.unwrap())),
+            |_, _, v| last = Some(v.clone()),
+        );
+        let before = sims[0].1.initial_volume.clone().unwrap();
+        let frame = sims[0].1.frame.unwrap();
+        let after = crate::rest::after_setup(
+            before,
+            sims.iter().map(|(oi, sim)| (*oi, &sim.plan)),
+            0,
+            frame,
+        );
+        let played = last.unwrap();
+        assert_eq!(after.occupied, played.occupied);
+        assert_eq!(after.cuts.len(), played.cuts.len());
+        assert!(after.remaining < after.occupied.len());
     }
     #[test]
     fn opposite_clamps_away_from_the_middle_go_to_opposite_ends() {
@@ -3197,6 +3467,7 @@ mod tests {
         // on X and on Y: every bite reaches over it.
         let near = Known {
             earlier: None,
+            after: None,
             part: Some(Bounds {
                 min: [-40., -20., 3.],
                 max: [40., 20., 37.],
@@ -3209,6 +3480,7 @@ mod tests {
         // 20 mm on X and 15 on Y: every bite is beside the part.
         let beside = Known {
             earlier: None,
+            after: None,
             part: Some(Bounds {
                 min: [-30., -15., 3.],
                 max: [30., 15., 37.],
@@ -3223,6 +3495,7 @@ mod tests {
         // X ±30), across the diagonal.
         let x_middles = Known {
             earlier: None,
+            after: None,
             part: Some(Bounds {
                 min: [-30., -20., 3.],
                 max: [30., 20., 37.],
@@ -3287,7 +3560,11 @@ mod tests {
                 max: [20., 5., 37.],
             },
         ] {
-            let own = Own { cuts: &cuts, part };
+            let own = Own {
+                cuts: &cuts,
+                part,
+                after: None,
+            };
             let layout = clamp_layout(&[(Side::MinusX, -12.5)]);
             let lines = holdable(11, &layout, &clamp(), stock(), None, Some(&own), &|_, _| {
                 String::new()
@@ -3348,10 +3625,16 @@ mod tests {
         )
         .unwrap();
         held.extend(boxes(&vise_layout(true, 0., 2.), &vise(), stock()).unwrap());
-        assert_eq!(bare(&held, stock(), &removed), [true, false, false, false]);
+        assert_eq!(
+            bare(&held, stock(), &removed),
+            [Bite::Gone, Bite::Holds, Bite::Holds, Bite::Holds]
+        );
         // Nothing cut: nothing bare.
         let (uncut, f, _) = untouched();
-        assert_eq!(bare(&held, stock(), &Removed::new(&uncut, f)), [false; 4]);
+        assert_eq!(
+            bare(&held, stock(), &Removed::new(&uncut, f)),
+            [Bite::Holds; 4]
+        );
         // The bite of a clamp is its footprint on the stock's top; a jaw has
         // none.
         assert_eq!(
@@ -4186,6 +4469,7 @@ mod tests {
                 min: [-30., -15., 3.],
                 max: [30., 15., 37.],
             },
+            after: None,
         };
         let clamps = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusY, 0.)]);
         let said = |side: &str, example: &str| {
@@ -4215,6 +4499,7 @@ mod tests {
         let near = Own {
             cuts: &small,
             part: beside.part,
+            after: None,
         };
         assert_eq!(
             holdable(0, &clamps, &clamp(), stock(), None, Some(&near), &names),
@@ -4233,6 +4518,7 @@ mod tests {
                 min: [-40., -28., 3.],
                 max: [40., 28., 37.],
             },
+            after: None,
         };
         let reaches = |side: &str, by: &str| {
             format!(
@@ -4250,6 +4536,7 @@ mod tests {
         let inside = Own {
             cuts: &inside,
             part: beside.part,
+            after: None,
         };
         assert!(holdable(0, &clamps, &clamp(), stock(), None, Some(&inside), &names).is_empty());
         // The vise grips the sides below the cut: its own cuts do not matter.

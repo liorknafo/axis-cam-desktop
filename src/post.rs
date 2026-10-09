@@ -1175,7 +1175,30 @@ fn unholdable(
         let plans = walk.indexes.iter().zip(&walk.simulations);
         crate::rest::Cuts::of_plans(plans.map(|(oi, sim)| (*oi, &sim.plan)), si, frame)
     });
-    let own = cuts.as_ref().map(|cuts| crate::holding::Own { cuts, part });
+    // And the stock they leave, which must stay joined to the part under a
+    // clamp to the end of the setup.
+    let after = (matches!(layout, crate::holding::Layout::Clamps { .. }))
+        .then_some(first.frame)
+        .flatten()
+        .map(|frame| {
+            let plans = walk.indexes.iter().zip(&walk.simulations);
+            let volume = crate::rest::after_setup_from(
+                first.initial_volume.as_ref(),
+                walk.stock,
+                plans.map(|(oi, sim)| (*oi, &sim.plan)),
+                si,
+                frame,
+            );
+            (volume, frame)
+        });
+    let after = after
+        .as_ref()
+        .map(|(volume, frame)| crate::rest::Removed::new(volume, *frame).with_part(part));
+    let own = cuts.as_ref().map(|cuts| crate::holding::Own {
+        cuts,
+        part,
+        after: after.as_ref(),
+    });
     let names = |s, o| crate::holding::operation_name(doc, s, o);
     crate::holding::holdable(
         si,

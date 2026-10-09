@@ -437,10 +437,18 @@ fn workholding(
         .as_deref()
         .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
     let plans = start.operations.iter().copied().zip(&start.plans);
-    let cuts = crate::rest::Cuts::of_plans(plans, si, start.frame);
+    let cuts = crate::rest::Cuts::of_plans(plans.clone(), si, start.frame);
+    // Clamps hold the stock to the end of the setup.
+    let after = matches!(layout, holding::Layout::Clamps { .. }).then(|| {
+        crate::rest::after_setup_from(start.before.as_deref(), start.stock, plans, si, start.frame)
+    });
+    let after = after
+        .as_ref()
+        .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
     let own = holding::Own {
         cuts: &cuts,
         part: start.part,
+        after: after.as_ref(),
     };
     let names = |s, o| holding::operation_name(job, s, o);
     holding::holdable(
@@ -521,8 +529,16 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
             .before
             .as_deref()
             .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
+        let after = (!vise).then(|| {
+            let own = start.operations.iter().copied().zip(&start.plans);
+            crate::rest::after_setup_from(start.before.as_deref(), stock, own, si, start.frame)
+        });
+        let after = after
+            .as_ref()
+            .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
         let known = holding::Known {
             earlier: removed.as_ref(),
+            after: after.as_ref(),
             part: Some(start.part),
         };
         let suggested = holding::request(setup, Some(entry))

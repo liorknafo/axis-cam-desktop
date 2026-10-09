@@ -988,7 +988,9 @@ impl App {
                 return false;
             }
         };
-        let mut generated: Vec<Option<simulation::Plan>> = vec![];
+        // Each operation visited, by its index, with its plan when it
+        // generated.
+        let mut generated: Vec<(usize, Option<simulation::Plan>)> = vec![];
         // What tells the bands a vise closes on, and what a clamp bites on:
         // the setup's first simulation starts from the stock the earlier
         // setups left.
@@ -1003,7 +1005,7 @@ impl App {
             last,
         ) {
             let setup = &self.doc.setups[si];
-            simulation::sequence(&self.doc, mesh, Some((si, last)), |s, _, result| {
+            simulation::sequence(&self.doc, mesh, Some((si, last)), |s, oi, result| {
                 if s == si {
                     if generated.is_empty()
                         && let Ok(first) = &result
@@ -1011,11 +1013,11 @@ impl App {
                         bands = post::bands(setup, mesh, first);
                         before = first.initial_volume.clone().zip(first.frame);
                     }
-                    generated.push(result.ok().map(|sim| sim.plan));
+                    generated.push((oi, result.ok().map(|sim| sim.plan)));
                 }
             });
         }
-        let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
+        let (refs, failed) = holding::gathered(generated.iter().map(|(_, plan)| plan.as_ref()));
         // Without the setup's first simulation (no toolpaths, or its first
         // operation did not generate), the stock the earlier setups left when
         // that is known.
@@ -1036,8 +1038,27 @@ impl App {
                 }
                 None => self.known_removed(si),
             };
+            // Clamps hold the stock to the end of the setup: the stock its
+            // own operations leave, worked out once for the suggestion.
+            let after = before
+                .as_ref()
+                .filter(|_| !request.vise)
+                .map(|(volume, frame)| {
+                    let own = generated
+                        .iter()
+                        .filter_map(|(oi, plan)| plan.as_ref().map(|plan| (*oi, plan)));
+                    (rest::after_setup(volume.clone(), own, si, *frame), *frame)
+                });
+            let after = after.as_ref().map(|(volume, frame)| {
+                let removed = rest::Removed::new(volume, *frame);
+                match part {
+                    Some(part) => removed.with_part(part),
+                    None => removed,
+                }
+            });
             let known = holding::Known {
                 earlier: removed.as_ref(),
+                after: after.as_ref(),
                 part,
             };
             request.suggest_on(&refs, || self.known_stock(si).0, bands.as_ref(), known)

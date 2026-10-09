@@ -188,6 +188,51 @@ impl Cuts {
         }
     }
 }
+/// The stock a setup leaves once its operations are done: `before`, the
+/// stock it starts from (the earlier setups' leftover, or a fresh `Volume`
+/// of its stock box for setup 1), with the feed moves of `plans` (each with
+/// its operation's index, in order) of setup `setup`, whose frame is
+/// `frame`, cut from it as the simulation cuts them when each is played to
+/// its end.
+pub fn after_setup<'p>(
+    mut before: Volume,
+    plans: impl IntoIterator<Item = (usize, &'p crate::simulation::Plan)>,
+    setup: usize,
+    frame: Frame,
+) -> Volume {
+    let index = |i: usize| u16::try_from(i).unwrap_or(u16::MAX);
+    for (oi, plan) in plans {
+        for m in plan
+            .moves
+            .iter()
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+        {
+            before.cut(
+                m.from,
+                m.to,
+                plan.radius,
+                plan.flute_length,
+                plan.shape,
+                frame,
+                (index(setup), index(oi)),
+            );
+        }
+    }
+    before
+}
+/// `after_setup` from the stock the setup starts from as the caller has it:
+/// `before` (the earlier setups' leftover), else a fresh `Volume` of its
+/// stock box `stock` in its frame, as the simulation starts setup 1.
+pub fn after_setup_from<'p>(
+    before: Option<&Volume>,
+    stock: Bounds,
+    plans: impl IntoIterator<Item = (usize, &'p crate::simulation::Plan)>,
+    setup: usize,
+    frame: Frame,
+) -> Volume {
+    let before = before.cloned().unwrap_or_else(|| Volume::new(stock, frame));
+    after_setup(before, plans, setup, frame)
+}
 impl Cuts {
     /// The cutter radius of the cuts operation `source` makes (its first
     /// cut's), or None when it makes none.

@@ -298,22 +298,42 @@ impl Viewport<'_> {
             })
             .collect()
     }
-    /// For each of `holding`, whether it is a clamp whose bite has lost its
-    /// stock in the simulation shown, as far as it has run
-    /// (`holding::bare`, the simulated stock's cuts so far, on the stock the
-    /// operation starts from). All false without a simulated stock.
-    pub(crate) fn bare_clamps(&self) -> Vec<bool> {
-        match self
-            .simulation
-            .and_then(|sim| Some((sim.volume.as_ref()?, sim.frame?, sim.plan.stock)))
-        {
-            Some((volume, frame, stock)) => crate::holding::bare(
-                &self.holding,
-                stock,
-                &crate::rest::Removed::new(volume, frame),
-            ),
-            None => vec![false; self.holding.len()],
+    /// For each of `holding`, how its bite fares in the simulation shown, as
+    /// far as it has run (`holding::bare`: the simulated stock's cuts so
+    /// far, knowing the part, on the stock the operation starts from): a
+    /// clamp whose bite has lost its stock or whose stock is cut free from
+    /// the part. All `Bite::Holds` without a simulated stock. Worked out once
+    /// for a simulation's playback point and the boxes (`BARE`): orbiting
+    /// the view does not work it out again.
+    pub(crate) fn bare_clamps(&self) -> Vec<crate::holding::Bite> {
+        use crate::holding::Bite;
+        let (Some(sim), Some(setup)) = (self.simulation, self.setup) else {
+            return vec![Bite::Holds; self.holding.len()];
+        };
+        let (Some(volume), Some(frame)) = (sim.volume.as_ref(), sim.frame) else {
+            return vec![Bite::Holds; self.holding.len()];
+        };
+        if self.holding.is_empty() {
+            return vec![];
         }
+        let key = format!(
+            "{}|{}|{:?}|{:p}",
+            sim.id,
+            sim.revision,
+            self.holding,
+            self.mesh.faces.as_ptr()
+        );
+        let mut cached = BARE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((previous, found)) = cached.as_ref()
+            && *previous == key
+        {
+            return found.clone();
+        }
+        let part = crate::simulation::part_box(setup, self.mesh);
+        let removed = crate::rest::Removed::new(volume, frame).with_part(part);
+        let found = crate::holding::bare(&self.holding, sim.plan.stock, &removed);
+        *cached = Some((key, found.clone()));
+        found
     }
     /// `scene_bounds` box by box: the part's first, then the stock's, each
     /// jaw's or clamp's and, when simulating, the simulated stock's and the
@@ -566,7 +586,11 @@ impl Viewport<'_> {
                 (w, h),
                 project(hold.bounds),
                 (ratio, p.scale),
-                if *bare { &BARE } else { &HOLDING },
+                if *bare == crate::holding::Bite::Holds {
+                    &HOLDING
+                } else {
+                    &LOST
+                },
             );
         }
         if let Some(simulation) = self.simulation {
@@ -1265,8 +1289,9 @@ const HOLDING: Block = Block {
     faces: [[176, 176, 176], [138, 138, 138], [158, 158, 158]],
     edge: [84, 84, 84],
 };
-/// A clamp whose bite has lost its stock in the simulation shown: red.
-const BARE: Block = Block {
+/// A clamp whose bite has lost its stock in the simulation shown, or whose
+/// stock is cut free from the part: red.
+const LOST: Block = Block {
     faces: [[205, 60, 60], [166, 46, 46], [186, 52, 52]],
     edge: [112, 30, 30],
 };
@@ -1276,6 +1301,10 @@ const PAD: Block = Block {
     faces: STOCK.faces,
     edge: STOCK.edge,
 };
+/// The clamps' bites as last worked out (`Viewport::bare_clamps`), by what
+/// they were worked out from.
+static BARE: std::sync::Mutex<Option<(String, Vec<crate::holding::Bite>)>> =
+    std::sync::Mutex::new(None);
 /// How far down from the stock's top the stock under a clamp's bite is
 /// drawn solid, mm.
 const PAD_DEPTH: f32 = 3.;
@@ -2103,7 +2132,7 @@ mod tests {
         };
         assert!(simulating.pads().is_empty());
         // The Face took the top from under that clamp's bite: it is bare.
-        assert_eq!(simulating.bare_clamps(), [true]);
+        assert_eq!(simulating.bare_clamps(), [crate::holding::Bite::Gone]);
     }
     #[test]
     fn a_block_in_front_of_the_part_hides_it_and_one_behind_is_hidden() {
