@@ -1005,7 +1005,7 @@ impl App {
                     let _ = self.update(action);
                 }
                 assert_eq!(self.doc.setup().operations.len(), count - 1);
-                let deleted = self.deleted_op.as_ref().expect("the deleted operation");
+                let deleted = self.deleted_ops.last().expect("the deleted operation");
                 eprintln!(
                     "Screen 94: deleted \"{}\", now on \"{}\"; status: {}",
                     deleted.op.name(),
@@ -5290,99 +5290,175 @@ mod tests {
         a.page = Page::Work;
         a
     }
+    fn op_names(a: &App) -> Vec<String> {
+        a.doc
+            .setup()
+            .operations
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect()
+    }
     #[test]
     fn the_delete_key_deletes_the_operation_and_undo_puts_it_back() {
         let mut a = app();
-        let names = |a: &App| -> Vec<String> {
-            a.doc
-                .setup()
-                .operations
-                .iter()
-                .map(|o| o.name().to_string())
-                .collect()
-        };
-        let before = names(&a);
+        let before = op_names(&a);
         assert!(before.len() >= 3, "{before:?}");
         let _ = a.update(Message::SelectOp(1));
         let _ = a.update(Message::DeleteKey);
         let mut without = before.clone();
         without.remove(1);
-        assert_eq!(names(&a), without, "the key deletes at once");
+        assert_eq!(op_names(&a), without, "the key deletes at once");
         assert_eq!(a.selected, Some(1), "the next operation is selected");
         assert!(a.status.contains(&before[1]), "{}", a.status);
         // Undo puts it back in its place, selected, even from another
-        // operation or page.
+        // operation or page and after other edits.
         let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Edit(Target::Operation, "name", "Renamed".into()));
         let _ = a.update(Message::Page(Page::Tools));
         let _ = a.update(Message::UndoDelete);
-        assert_eq!(names(&a), before);
+        let mut expected = before.clone();
+        expected[0] = "Renamed".into();
+        assert_eq!(op_names(&a), expected);
         assert_eq!(a.selected, Some(1));
         assert_eq!(a.page, Page::Work);
-        assert!(a.deleted_op.is_none());
+        assert!(a.deleted_ops.is_empty());
         let _ = a.update(Message::UndoDelete);
-        assert_eq!(names(&a), before, "only one delete is undone");
-        // The Delete button does the same; another change ends the Undo.
-        let _ = a.update(Message::SelectOp(0));
-        let _ = a.update(Message::RemoveOp);
-        assert_eq!(names(&a).len(), before.len() - 1);
-        assert!(a.deleted_op.is_some());
-        let _ = a.update(Message::Edit(Target::Operation, "name", "Renamed".into()));
-        assert!(a.deleted_op.is_none());
-        let _ = a.update(Message::UndoDelete);
-        assert_eq!(names(&a).len(), before.len() - 1);
-        // Off the machining page, while picking surfaces, or with no
-        // operation chosen, the key does nothing.
-        let now = names(&a);
-        let _ = a.update(Message::SelectOp(0));
-        a.picking = true;
-        let _ = a.update(Message::DeleteKey);
-        a.picking = false;
+        assert_eq!(op_names(&a), expected, "nothing more to undo");
+        // Off the machining page, or with no operation chosen, the key does nothing.
         let _ = a.update(Message::Page(Page::Tools));
         let _ = a.update(Message::DeleteKey);
         let _ = a.update(Message::Page(Page::Work));
         a.selected = None;
         let _ = a.update(Message::DeleteKey);
-        assert_eq!(names(&a), now);
-        assert!(a.deleted_op.is_none());
+        assert_eq!(op_names(&a), expected);
+        assert!(a.deleted_ops.is_empty());
+    }
+    #[test]
+    fn several_deletes_come_back_one_undo_at_a_time_latest_first() {
+        let mut a = app();
+        let before = op_names(&a);
+        let _ = a.update(Message::SelectOp(0));
+        for _ in 0..3 {
+            let _ = a.update(Message::DeleteKey);
+        }
+        assert_eq!(op_names(&a), before[3..].to_vec());
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(op_names(&a)[0], before[2]);
+        assert!(
+            a.status.contains(&before[1]),
+            "the next undo is named: {}",
+            a.status
+        );
+        let _ = a.update(Message::UndoDelete);
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(op_names(&a), before);
+        assert_eq!(a.selected, Some(0));
     }
     #[test]
     fn deleting_the_last_operation_can_be_undone_from_the_setup_editor() {
         let mut a = app();
-        let ops = a.doc.setup().operations.len();
-        for _ in 0..ops {
+        let before = op_names(&a);
+        for _ in 0..before.len() {
             let _ = a.update(Message::SelectOp(0));
             let _ = a.update(Message::DeleteKey);
         }
         assert!(a.doc.setup().operations.is_empty());
-        assert!(a.operation().is_none());
+        assert!(a.operation().is_none() && !a.picking);
         let _ = a.update(Message::UndoDelete);
-        assert_eq!(a.doc.setup().operations.len(), 1);
+        assert_eq!(op_names(&a), vec![before.last().unwrap().clone()]);
         assert_eq!(a.selected, Some(0));
     }
     #[test]
-    fn the_keys_are_left_to_a_text_field_that_takes_them() {
+    fn the_key_deletes_while_picking_surfaces_and_the_next_operation_opens_cleanly() {
+        let mut a = app();
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        let _ = a.update(Message::SelectOp(0));
+        assert!(a.picking, "the example picks on the Geometry tab");
+        let count = op_names(&a).len();
+        let _ = a.update(Message::DeleteKey);
+        assert_eq!(op_names(&a).len(), count - 1);
+        let next = a.operation().unwrap();
+        assert!(next.strategy.tabs().contains(&a.tab.as_str()), "{}", a.tab);
+        assert_eq!(a.picking, a.tab == "Geometry" && a.can_pick());
+        // A tab the next operation does not have falls back to Tool.
+        a.tab = "No such tab".into();
+        let _ = a.update(Message::DeleteKey);
+        assert_eq!(a.tab, "Tool");
+        assert!(!a.picking);
+    }
+    #[test]
+    fn undo_forgets_what_cannot_go_back_and_stops_offering_it() {
+        let mut a = app();
+        // A tool used only by the deleted operation is deleted after it.
+        let tool = a.doc.tools[0].id.clone();
+        let users: Vec<usize> = a
+            .doc
+            .setup()
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.tool == tool)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!users.is_empty());
+        for s in a.doc.setups.iter_mut().skip(1) {
+            s.operations.retain(|o| o.tool != tool);
+        }
+        for &i in users.iter().rev() {
+            let _ = a.update(Message::SelectOp(i));
+            let _ = a.update(Message::DeleteKey);
+        }
+        assert!(a.status.contains("Undo delete"), "{}", a.status);
+        let _ = a.update(Message::DeleteTool(tool.clone()));
+        assert!(a.doc.tools.iter().all(|t| t.id != tool), "{}", a.status);
+        assert!(a.deleted_ops.is_empty());
+        assert!(!a.status.contains("Undo delete"), "{}", a.status);
+        let count = op_names(&a).len();
+        let _ = a.update(Message::UndoDelete);
+        assert_eq!(op_names(&a).len(), count);
+        // A deleted setup takes its deleted operations with it.
+        let _ = a.update(Message::DuplicateSetup);
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::DeleteKey);
+        assert_eq!(a.deleted_ops.len(), 1);
+        let _ = a.update(Message::ConfirmDeleteSetup(true));
+        assert!(a.deleted_ops.is_empty());
+    }
+    #[test]
+    fn the_keys_are_left_to_a_text_field_and_a_held_key_does_not_repeat() {
         use iced::event::Status;
         use iced::keyboard::{Key, Modifiers, key::Named};
         let none = Modifiers::empty();
         for named in [Named::Delete, Named::Backspace] {
             assert!(matches!(
-                crate::edit_key(&Key::Named(named), none, Status::Ignored),
+                crate::edit_key(&Key::Named(named), none, false, Status::Ignored),
                 Some(Message::DeleteKey)
             ));
-            assert!(crate::edit_key(&Key::Named(named), none, Status::Captured).is_none());
+            assert!(crate::edit_key(&Key::Named(named), none, false, Status::Captured).is_none());
+            assert!(
+                crate::edit_key(&Key::Named(named), none, true, Status::Ignored).is_none(),
+                "a held key deletes once"
+            );
         }
         let z = Key::Character("z".into());
         assert!(matches!(
-            crate::edit_key(&z, Modifiers::COMMAND, Status::Ignored),
+            crate::edit_key(&z, Modifiers::COMMAND, false, Status::Ignored),
             Some(Message::UndoDelete)
         ));
-        assert!(crate::edit_key(&z, Modifiers::COMMAND, Status::Captured).is_none());
-        assert!(crate::edit_key(&z, none, Status::Ignored).is_none());
+        assert!(crate::edit_key(&z, Modifiers::COMMAND, true, Status::Ignored).is_none());
+        assert!(crate::edit_key(&z, Modifiers::COMMAND, false, Status::Captured).is_none());
+        assert!(crate::edit_key(&z, none, false, Status::Ignored).is_none());
         assert!(
-            crate::edit_key(&z, Modifiers::COMMAND | Modifiers::SHIFT, Status::Ignored).is_none()
+            crate::edit_key(
+                &z,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+                false,
+                Status::Ignored
+            )
+            .is_none()
         );
-        assert!(crate::edit_key(&Key::Named(Named::Enter), none, Status::Ignored).is_none());
-        assert!(crate::edit_key(&Key::Character("d".into()), none, Status::Ignored).is_none());
+        assert!(crate::edit_key(&Key::Named(Named::Enter), none, false, Status::Ignored).is_none());
     }
     fn imported_app() -> App {
         let mut a = app();

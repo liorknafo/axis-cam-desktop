@@ -950,7 +950,7 @@ fn inspector(app: &App) -> Element<'_, Message> {
         setup_editor(app)
     };
     let mut c = Column::new().spacing(12);
-    if let Some(d) = &app.deleted_op
+    if let Some(d) = app.deleted_ops.last()
         && app.doc.active_setup().is_some_and(|s| s.id == d.setup)
     {
         c = c.push(

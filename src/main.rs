@@ -573,8 +573,9 @@ pub struct App {
     pub plan_camera: viewport::Camera,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
-    /// The operation deleted last, until the next change to the job.
-    pub deleted_op: Option<DeletedOp>,
+    /// Operations deleted, the latest last, for Undo delete. They stay until
+    /// the job is replaced or what they need to go back is gone.
+    pub deleted_ops: Vec<DeletedOp>,
     pub icons: Vec<iced::widget::svg::Handle>,
     /// A close request waiting for a sign-out, a sign-in save or a refresh
     /// of the sign-in, and when it first came.
@@ -816,7 +817,7 @@ impl App {
             plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
-            deleted_op: None,
+            deleted_ops: vec![],
             icons,
             closing: None,
             signing_out: None,
@@ -894,7 +895,7 @@ impl App {
         self.help_animating = false;
         self.drop_plan();
         self.undo = None;
-        self.deleted_op = None;
+        self.deleted_ops.clear();
     }
     fn create_setup(&mut self, machine: Machine) {
         let mut setup = Setup::new(machine, &self.doc.next_offset());
@@ -1122,8 +1123,16 @@ impl App {
         self.status = message;
         changed
     }
+    /// Drops the deleted operations Undo delete could no longer put back,
+    /// and a status line that still offers them.
+    fn forget_deleted(&mut self, keep: impl Fn(&DeletedOp) -> bool) {
+        let before = self.deleted_ops.len();
+        self.deleted_ops.retain(|d| keep(d));
+        if self.deleted_ops.len() < before && self.status.contains(UNDO_DELETE_HINT) {
+            self.status.clear();
+        }
+    }
     fn touch(&mut self) {
-        self.deleted_op = None;
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
@@ -2141,27 +2150,29 @@ impl App {
                     && self.operation().is_some()
                 {
                     let op = self.doc.setup_mut().operations.remove(i);
-                    self.selected = if self.doc.setup().operations.is_empty() {
-                        None
-                    } else {
-                        Some(i.min(self.doc.setup().operations.len() - 1))
-                    };
-                    self.touch();
-                    self.status = format!(
-                        "Deleted \"{}\". Undo delete or Command/Ctrl+Z puts it back.",
-                        op.name()
-                    );
-                    self.deleted_op = Some(DeletedOp {
+                    let name = op.name().to_string();
+                    self.deleted_ops.push(DeletedOp {
                         setup: self.doc.active.clone(),
                         index: i,
                         op,
                     });
+                    if self.deleted_ops.len() > UNDO_DELETES {
+                        self.deleted_ops.remove(0);
+                    }
+                    self.touch();
+                    // The next operation opens as if it were clicked: its own
+                    // tabs, and surface picking only where it applies.
+                    self.selected = None;
+                    self.picking = false;
+                    let left = self.doc.setup().operations.len();
+                    if left > 0 {
+                        let _ = self.handle(Message::SelectOp(i.min(left - 1)));
+                    }
+                    self.status = format!("Deleted \"{name}\". {UNDO_DELETE_HINT}");
                 }
             }
             Message::DeleteKey => {
-                // While surfaces are being picked the key could mean a surface.
                 if self.page == Page::Work
-                    && !self.picking
                     && self.doc.active_setup().is_some()
                     && self.operation().is_some()
                 {
@@ -2169,19 +2180,26 @@ impl App {
                 }
             }
             Message::UndoDelete => {
-                if let Some(d) = self.deleted_op.take()
-                    && let Some(si) = self.doc.setups.iter().position(|s| s.id == d.setup)
-                {
+                while let Some(d) = self.deleted_ops.pop() {
+                    let Some(si) = self.doc.setups.iter().position(|s| s.id == d.setup) else {
+                        continue;
+                    };
                     let ops = &mut self.doc.setups[si].operations;
                     let i = d.index.min(ops.len());
                     let name = d.op.name().to_string();
                     ops.insert(i, d.op);
                     self.doc.active = d.setup;
                     self.stop_selection();
-                    self.selected = Some(i);
-                    self.page = Page::Work;
                     self.touch();
-                    self.status = format!("Put back \"{name}\".");
+                    let _ = self.handle(Message::SelectOp(i));
+                    self.status = match self.deleted_ops.last() {
+                        Some(next) => format!(
+                            "Put back \"{name}\". Undo delete again puts back \"{}\".",
+                            next.op.name()
+                        ),
+                        None => format!("Put back \"{name}\"."),
+                    };
+                    break;
                 }
             }
             Message::MoveOp(d) => {
@@ -2389,6 +2407,9 @@ impl App {
                     let i = self.doc.index();
                     match self.doc.remove_setup(i) {
                         Ok(()) => {
+                            let ids: Vec<String> =
+                                self.doc.setups.iter().map(|s| s.id.clone()).collect();
+                            self.forget_deleted(|d| ids.contains(&d.setup));
                             self.stop_selection();
                             self.touch()
                         }
@@ -2509,6 +2530,7 @@ impl App {
                     self.status="This tool is assigned to an operation. Reassign those operations before deleting it.".into()
                 } else {
                     self.doc.tools.retain(|t| t.id != id);
+                    self.forget_deleted(|d| d.op.tool != id);
                     self.tool_draft = self
                         .doc
                         .tools
@@ -3169,6 +3191,7 @@ impl App {
                     return Task::none();
                 }
                 self.undo = Some(self.doc.clone());
+                self.deleted_ops.clear();
                 self.planner = Planner::Idle;
                 // A workholding entry the plan's setups use that was deleted
                 // since the preview comes back, as Undo does it.
@@ -3194,6 +3217,7 @@ impl App {
                 let Some(before) = self.undo.take() else {
                     return Task::none();
                 };
+                self.deleted_ops.clear();
                 let mut status = String::from(
                     "The setups from before the plan are restored. The applied job is in History.",
                 );
@@ -3591,8 +3615,11 @@ impl App {
                     ..
                 }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key, modifiers, ..
-                }) => edit_key(&key, modifiers, status),
+                    key,
+                    modifiers,
+                    repeat,
+                    ..
+                }) => edit_key(&key, modifiers, repeat, status),
                 _ => None,
             }),
         ])
@@ -3601,15 +3628,21 @@ impl App {
         ui::view(self)
     }
 }
+/// The status line's offer of Undo delete.
+const UNDO_DELETE_HINT: &str = "Undo delete or Command/Ctrl+Z puts it back.";
+/// How many deleted operations Undo delete keeps.
+const UNDO_DELETES: usize = 50;
 /// Delete or Backspace deletes the selected operation and Command/Ctrl+Z
-/// puts it back, unless a text field took the key.
+/// puts it back, unless a text field took the key. A held key repeats
+/// nothing: one press, one operation.
 fn edit_key(
     key: &iced::keyboard::Key,
     modifiers: iced::keyboard::Modifiers,
+    repeat: bool,
     status: iced::event::Status,
 ) -> Option<Message> {
     use iced::keyboard::{Key, key::Named};
-    if status != iced::event::Status::Ignored {
+    if repeat || status != iced::event::Status::Ignored {
         return None;
     }
     match key {

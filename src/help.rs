@@ -241,10 +241,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Copy this operation, including its tool, geometry and cutting settings, into the current setup. Adjust the copy for another pass."
         }
         RemoveOp | DeleteKey => {
-            "Delete this operation from the current setup (the Delete key does the same). Undo delete or Command/Ctrl+Z puts it back until the next change to the job."
+            "Delete this operation from the current setup (the Delete key does the same). Undo delete or Command/Ctrl+Z puts it back, the latest first."
         }
         UndoDelete => {
-            "Put back the operation deleted last, in its place in its setup. Any other change to the job ends this Undo."
+            "Put back the operation deleted last, in its place in its setup; press again for the one before. Deleted operations stay available until another project is opened, a plan is applied or undone, or their tool or setup is deleted."
         }
         MoveOp(n) if *n < 0 => {
             "Move the operation earlier in the setup. Review rest-machining dependencies after changing the cutting order."
