@@ -667,16 +667,19 @@ pub(crate) fn check_built(built: &Document, mesh: &Mesh, report: &PartReport) ->
 }
 /// A copy of `built` in which every later setup that holds its stock with a
 /// vise or clamps but says nowhere has the layout the app suggests for the
-/// toolpaths `results` holds (`Request::layout`, as Suggest layout does), or
-/// None when no setup needed one. A setup whose layout cannot be suggested
-/// (its library entry is gone, its stock unknown) is left as it is: the
+/// toolpaths `results` holds (`Request::suggest`, as Suggest layout does), or
+/// None when no setup needed one; and, by setup, why the clamps of a later
+/// setup could not be laid out (no two opposite sides where they keep their
+/// stock and stay clear). A setup whose layout cannot be suggested (its
+/// library entry is gone, its stock unknown) is left as it is: the
 /// workholding stage says why it cannot be modelled.
 fn laid_out(
     built: &Document,
     mesh: &Mesh,
     results: &[Vec<(usize, Result<Simulation, String>)>],
-) -> Option<Document> {
+) -> (Option<Document>, Vec<(usize, String)>) {
     let mut laid: Option<Document> = None;
+    let mut refused = vec![];
     for (si, setup) in built.setups.iter().enumerate().skip(1) {
         if holding::placed(setup) {
             continue;
@@ -690,21 +693,35 @@ fn laid_out(
                 .map(|(_, result)| result.as_ref().ok().map(|sim| &sim.plan)),
         );
         // A vise closes on the band the earlier setups left, which the
-        // setup's first simulation starts from.
-        let bands = results[si]
+        // setup's first simulation starts from; a clamp bites on what they
+        // left of the top.
+        let first = results[si]
             .first()
-            .and_then(|(_, result)| result.as_ref().ok())
-            .and_then(|first| crate::post::bands(setup, mesh, first));
-        let Some((_, layout)) = request.suggest(built, Some(mesh), si, &plans, bands.as_ref())
+            .and_then(|(_, result)| result.as_ref().ok());
+        let bands = first.and_then(|first| crate::post::bands(setup, mesh, first));
+        let removed = first
+            .and_then(|first| first.initial_volume.as_ref().zip(first.frame))
+            .map(|(volume, frame)| crate::rest::Removed::new(volume, frame));
+        let known = holding::Known {
+            earlier: removed.as_ref().map(|r| r as &dyn crate::rest::Removes),
+            part: Some(crate::simulation::part_box(setup, mesh)),
+        };
+        let Some((_, suggested)) =
+            request.suggest(built, Some(mesh), si, &plans, bands.as_ref(), known)
         else {
             continue;
         };
-        holding::place(
-            &mut laid.get_or_insert_with(|| built.clone()).setups[si],
-            &layout,
-        );
+        match suggested {
+            Ok(layout) => {
+                holding::place(
+                    &mut laid.get_or_insert_with(|| built.clone()).setups[si],
+                    &layout,
+                );
+            }
+            Err(why) => refused.push((si, why)),
+        }
     }
-    laid
+    (laid, refused)
 }
 /// The setups of `built` whose starting stock the sequence knew, in order,
 /// from their `results` and `starts` (the box each later setup began with and
@@ -874,16 +891,31 @@ fn run(
     if out.problems.is_empty() {
         // The workholding is checked as the plan will be applied: with the
         // layouts the app suggests for the later setups.
-        laid = laid_out(built, mesh, &results);
+        let refused;
+        (laid, refused) = laid_out(built, mesh, &results);
         let job_doc = laid.as_ref().unwrap_or(built);
         let job = crate::post::post_simulated(job_doc, mesh, &results);
         // Every workholding problem is reported once, as such: export finds
-        // the same messages, which are left out of its list.
-        let held: Vec<(usize, crate::post::Held)> = (0..job_doc.setups.len())
+        // the same messages, which are left out of its list. A later setup
+        // whose clamps could not be laid out says why instead of what its
+        // missing clamps make the export say.
+        let walked: Vec<(usize, crate::post::Held)> = (0..job_doc.setups.len())
             .flat_map(|si| {
                 crate::post::held(job_doc, mesh, si, &results[si])
                     .into_iter()
                     .map(move |h| (si, h))
+            })
+            .collect();
+        let held: Vec<(usize, crate::post::Held)> = (0..job_doc.setups.len())
+            .flat_map(|si| match refused.iter().find(|(s, _)| *s == si) {
+                Some((_, why)) => vec![(
+                    si,
+                    crate::post::Held {
+                        operation: None,
+                        message: format!("{}: {why}", job_doc.setups[si].name()),
+                    },
+                )],
+                None => walked.iter().filter(|(s, _)| *s == si).cloned().collect(),
             })
             .collect();
         let mut export: Vec<Problem> = job
@@ -899,8 +931,9 @@ fn run(
         for setup in &job.setups {
             let ops = &built.setups[setup.setup].operations;
             for message in setup.result.as_ref().err().into_iter().flatten() {
-                if held
+                if walked
                     .iter()
+                    .chain(&held)
                     .any(|(si, h)| *si == setup.setup && h.message == *message)
                 {
                     continue;
@@ -1997,33 +2030,30 @@ mod tests {
         hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
         let (check, built) = check(&doc, &mesh, &report, &good(&report));
         assert!(!check.passed && built.is_none());
-        // Each hit is reported once, under its own stage and operation. Setup
-        // 2 has the clamps the app suggested for its toolpaths: facing the
-        // whole stock runs through any place they can be.
+        // Each problem is reported once, under its own stage and operation.
         let all = stages(&check);
-        // Facing the whole stock also cuts away the stock under every clamp's
-        // bite: each clamp is said to lose it, once, before the hits.
+        // Setup 1's clamps, which the user placed on the 2 mm of stock beside
+        // the part, bite 10 mm over the part, whose top the Face cuts: each
+        // is said to lose its stock, once, before the hits.
         let lost: Vec<String> = all
             .iter()
             .filter(|l| l.contains("would cut away the stock under its bite"))
-            .map(|l| l.split(" (offset").next().unwrap().to_string())
+            .cloned()
             .collect();
-        assert_eq!(
-            lost,
-            [
-                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on -X",
-                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on +X",
-                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on -X",
-                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on +X",
-                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on -Y",
-                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on +Y",
-            ]
-        );
-        assert!(
-            all.iter()
-                .filter(|l| l.contains("would cut away"))
-                .all(|l| l.contains("operation 1 would cut away"))
-        );
+        // Within the 300 characters a message keeps, the advice is whole.
+        let said = |side: &str| {
+            format!(
+                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on {side} (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 10 mm over the part. Clamp on stock beside the part: leave more of it on two opposite sides and face only the model's outline, or use the vise."
+            )
+        };
+        assert_eq!(lost.len(), 2, "{lost:?}");
+        for (line, side) in lost.iter().zip(["-X", "+X"]) {
+            assert!(line.starts_with(&said(side)), "{line}");
+        }
+        // Setup 2 gets no clamps: facing the whole stock leaves no spot for
+        // them, which is said once, with the stock to leave (its Ø10 cutters,
+        // a 12 mm bite and the 2 mm gap: about 25 mm), and nothing else.
+        let unheld = "workholding 2/None: Underside: Toe clamps cannot hold this setup: on every side the stock under a 12 mm bite is cut away or a toolpath comes within the 2 mm gap of the clamp. Leave at least about 25 mm of stock beside the part on two opposite sides and face only the part's outline, or use the vise.";
         assert_eq!(
             all.iter()
                 .filter(|l| !l.contains("would cut away"))
@@ -2034,7 +2064,7 @@ mod tests {
                 "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-6.0 (within the 2 mm gap).",
                 "workholding 1/Some(3): Contour by planner: the holder hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-38.0 (within the 2 mm gap).",
                 "workholding 1/Some(4): Drill by planner: the tool hits the clamp on +X (offset 0) at X48.0 Y-10.0 Z15.0 (within the 2 mm gap).",
-                "workholding 2/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z1.0 (within the 2 mm gap).",
+                unheld,
             ]
         );
         assert!(check.operations.len() == 6 && check.coverage.is_some());
@@ -2055,21 +2085,34 @@ mod tests {
             panic!("setup 2 has no readable clamps: {:?}", second.p)
         };
         assert!(clamps.len() >= 2, "{clamps:?}");
-        // The layout is what the suggestion makes of setup 2's own toolpaths.
-        let mut plans = vec![];
+        // The layout is what the suggestion makes of setup 2's own toolpaths
+        // and of the stock setup 1 left it.
+        let mut sims = vec![];
         simulation::sequence(&job, &mesh, None, |si, _, r| {
             if si == 1 {
-                plans.push(r.unwrap().plan);
+                sims.push(r.unwrap());
             }
         });
-        let refs: Vec<&simulation::Plan> = plans.iter().collect();
+        let refs: Vec<&simulation::Plan> = sims.iter().map(|sim| &sim.plan).collect();
+        let before = sims[0].initial_volume.as_ref().unwrap();
+        let removed = crate::rest::Removed::new(before, sims[0].frame.unwrap());
         let holder = job.holder(get(&second.p, "holder")).unwrap();
         let (_, again) = holding::request(second, Some(holder))
             .unwrap()
-            .suggest(&job, Some(&mesh), 1, &refs, None)
+            .suggest(
+                &job,
+                Some(&mesh),
+                1,
+                &refs,
+                None,
+                holding::Known {
+                    earlier: Some(&removed),
+                    part: Some(simulation::part_box(second, &mesh)),
+                },
+            )
             .unwrap();
         assert_eq!(
-            holding::placement(&again),
+            holding::placement(&again.unwrap()),
             vec![("clamps", get(&second.p, "clamps").to_string())]
         );
     }

@@ -1171,10 +1171,11 @@ fn unholdable(
         .zip(first.frame)
         .map(|(volume, frame)| crate::rest::Removed::new(volume, frame).with_part(part));
     // What the setup's own operations cut, which its clamps must not lose.
-    let own = first.frame.map(|frame| {
+    let cuts = first.frame.map(|frame| {
         let plans = walk.indexes.iter().zip(&walk.simulations);
         crate::rest::Cuts::of_plans(plans.map(|(oi, sim)| (*oi, &sim.plan)), si, frame)
     });
+    let own = cuts.as_ref().map(|cuts| crate::holding::Own { cuts, part });
     let names = |s, o| crate::holding::operation_name(doc, s, o);
     crate::holding::holdable(
         si,
@@ -3229,11 +3230,12 @@ M2
         let datum = datum(&doc.setups[0], plans[0].stock, &mesh).unwrap();
         let expected = holding::message("Pocket", hit, 2., datum);
         // Why the setup cannot be held (the pocket cuts away the stock under
-        // the clamp's bite), then where the program comes too close.
+        // the clamp's bite, which reaches over the part), then where the
+        // program comes too close.
         let errors = errors(&posted);
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(
-            errors[0].starts_with("Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite."),
+            errors[0].starts_with("Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part. Clamp on stock beside the part:"),
             "{errors:?}"
         );
         assert_eq!(errors[1], expected.as_str());
@@ -3339,7 +3341,7 @@ M2
         .unwrap_err();
         // The first reason, naming its setup once.
         assert!(
-            error.starts_with("Nothing was written. Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite."),
+            error.starts_with("Nothing was written. Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part."),
             "{error}"
         );
         assert!(
@@ -3385,11 +3387,12 @@ M2
         entry.p.insert("bite".into(), "40".into());
         let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);
         assert_eq!(found.len(), 2, "{found:?}");
-        // The pocket (operation 2) cuts away the stock under the clamp's bite.
+        // The pocket (operation 2) cuts away the stock under the clamp's
+        // bite, which reaches over the part.
         assert_eq!(found[0].operation, None);
         assert!(found[0].message.starts_with(
-            "Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 2 would cut away the stock under its bite."
-        ));
+            "Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 2 would cut away the stock under its bite, which reaches 38 mm over the part."
+        ), "{found:?}");
         assert_eq!(found[1].operation, Some(1));
         assert!(
             found[1]

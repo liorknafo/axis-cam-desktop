@@ -21,6 +21,14 @@ impl Frame {
             ..Self::axes(setup)
         }
     }
+    /// A frame neither turned nor moved: for cuts made and looked at in one
+    /// and the same frame, which is all such cuts need of it.
+    pub fn identity() -> Self {
+        Self {
+            basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            shift: [0.; 3],
+        }
+    }
     /// The axes of `setup`'s frame, which its rotation alone gives, at no shift.
     fn axes(setup: &Setup) -> Self {
         let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
