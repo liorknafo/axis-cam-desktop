@@ -436,11 +436,21 @@ fn workholding(
         .before
         .as_deref()
         .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
+    let plans = start.operations.iter().copied().zip(&start.plans);
+    let own = crate::rest::Cuts::of_plans(plans, si, start.frame);
     let names = |s, o| holding::operation_name(job, s, o);
-    holding::holdable(si, &layout, entry, held, removed.as_ref(), &names)
-        .into_iter()
-        .map(named)
-        .collect()
+    holding::holdable(
+        si,
+        &layout,
+        entry,
+        held,
+        removed.as_ref(),
+        Some(&own),
+        &names,
+    )
+    .into_iter()
+    .map(named)
+    .collect()
 }
 
 /// What `check_holding` answers for setup 1 with an entry other than setup

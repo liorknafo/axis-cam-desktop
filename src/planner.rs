@@ -189,9 +189,9 @@ fn holding_rules(tools: bool) -> String {
 - `workholding_library` lists the vises and clamps you may choose from, by `number` from 1, with their sizes in mm and no names. A `Vise` has `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening` (the widest stock it opens to across its jaws) and `grip` (how far up from the stock's bottom the jaws hold it). A `Clamp` has `length`, `width`, `height` and `bite` (how far it reaches onto the stock top).
 - Each setup's `holder` is a `number` from `workholding_library`, or null. Setup 1 is held by the user's own entry, whose `number` is given in the report's `workholding` (which is absent when setup 1 models no vise or clamps): its `holder` is null or that `number` and cannot be changed. For a later setup null means the same holder as setup 1 when setup 1 has an entry, and no modelled holding when it has none; choose a `number` when the stock it starts from suits another holder better, for example clamps when the earlier setups took the material a vise would grip, or a vise that opens wider. The program lays the chosen holder out (a vise's axis and grip, the clamps' sides and positions) for the setup's toolpaths: you choose only the entry.
 - A vise closes on the material in its grip band, from the stock's bottom up to the grip: across the jaws, the stock is as wide as that band. Walls an earlier setup cut through the whole band, such as walls an outside Contour finished, can be gripped, even under stock left wider above them; sides cut through only part of the band cannot, as the jaws then close on the wider stock with part of their face on air.
-- A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material under the band to rest on (at least half of it), stock at least 1 mm above the grip, and a band no wider across the jaws than `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it). A part cut free of the material the holder grips cannot be held either.
+- A vise needs, in the stock the setup starts from: material at both jaws from the bottom up to the grip (at least 60 % of each jaw's contact face), material under the band to rest on (at least half of it), stock at least 1 mm above the grip, and a band no wider across the jaws than `max_opening`. Clamps need material under each clamp's bite (at least 60 % of it), and it must stay there for the whole setup: clamps press on the stock's top at its edges, so a setup held by clamps must not cut under its own clamps (face only the model's outline, or keep pockets and contours off the bites) and finishes those areas in another setup, or is held in the vise instead. A part cut free of the material the holder grips cannot be held either.
 - Plan the earlier setups for that. A later setup turned over grips what was their top: cut the sides there through the whole band (an outside Contour down past it) or leave them whole, never part of the way. A later setup facing the same way grips what was their bottom: stop an outside Contour above its grip with `bottom_offset` and finish the rest in a later setup. Order the setups so that each starts from stock its holder can hold.
-- A setup its holder cannot hold comes back as a problem with the stage `workholding` on that setup; it names the earlier operation that removed the material. Change that operation, the order of the setups or the `holder`.{tools}
+- A setup its holder cannot hold comes back as a problem with the stage `workholding` on that setup; it names the operation that removed the material, an earlier one or one of the setup's own under a clamp. Change that operation, the order of the setups or the `holder`.{tools}
 
 ")
 }
@@ -1554,7 +1554,12 @@ pub(crate) mod tests {
             "`bottom_offset`",
             "in a later setup",
             "stage `workholding`",
-            "names the earlier operation",
+            "names the operation that removed the material",
+            // Clamps press on the top at its edges for the whole setup: the
+            // setup must not cut under its own clamps.
+            "it must stay there for the whole setup",
+            "must not cut under its own clamps",
+            "or is held in the vise instead",
             // The vise closes on its grip band: walls finished through it
             // can be gripped, sides cut through part of it cannot.
             "A vise closes on the material in its grip band",

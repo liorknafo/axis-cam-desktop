@@ -4006,6 +4006,10 @@ mod tests {
             expected[0].starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0 Y"),
             "{expected:?}"
         );
+        // The pocket also cuts away the stock under that clamp's bite, so the
+        // clamp would hold nothing: said after the hits.
+        let lost = "Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 2 would cut away the stock under its bite. Keep those cuts off the clamp's bite (for example facing only the model's outline), clamp on stock this setup does not cut, or use the vise. Setup 1, operation 2 is Pocket \"Pocket\".";
+        let expected: Vec<String> = expected.into_iter().chain([lost.to_string()]).collect();
         assert_eq!(
             crate::ui::holding_warning(&a),
             Some((
@@ -4061,7 +4065,8 @@ mod tests {
             .iter()
             .map(|hit| crate::holding::message("Pocket", hit, 2., [0.; 3]))
             .collect();
-        assert_eq!(lines, in_frame);
+        assert_eq!(lines[..lines.len() - 1], in_frame[..]);
+        assert_eq!(lines.last(), expected.last());
         assert_ne!(lines, expected);
         let _ = a.view();
         a.doc.setups[0].p.insert("origin".into(), origin);
@@ -4192,10 +4197,25 @@ mod tests {
             named.contains(&"Pocket") && named.contains(&"Facing"),
             "{problems:?}"
         );
+        // Why the setup cannot be held first: the operations cut away the
+        // stock under the clamps' bites; then each hit.
+        let (lost, hits): (Vec<&String>, Vec<&String>) = problems
+            .iter()
+            .partition(|p| p.contains("would cut away the stock under its bite"));
         assert!(
-            problems
-                .iter()
-                .all(|p| p.ends_with("(within the 2 mm gap)."))
+            !lost.is_empty()
+                && lost
+                    .iter()
+                    .all(|p| p.starts_with("Top: Setup 1 cannot be held by the clamp")),
+            "{problems:?}"
+        );
+        assert!(
+            problems[..lost.len()].iter().all(|p| lost.contains(&p)),
+            "{problems:?}"
+        );
+        assert!(
+            !hits.is_empty() && hits.iter().all(|p| p.ends_with("(within the 2 mm gap).")),
+            "{problems:?}"
         );
         for name in &named {
             assert!(

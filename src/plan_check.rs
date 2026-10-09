@@ -2000,8 +2000,35 @@ mod tests {
         // Each hit is reported once, under its own stage and operation. Setup
         // 2 has the clamps the app suggested for its toolpaths: facing the
         // whole stock runs through any place they can be.
+        let all = stages(&check);
+        // Facing the whole stock also cuts away the stock under every clamp's
+        // bite: each clamp is said to lose it, once, before the hits.
+        let lost: Vec<String> = all
+            .iter()
+            .filter(|l| l.contains("would cut away the stock under its bite"))
+            .map(|l| l.split(" (offset").next().unwrap().to_string())
+            .collect();
         assert_eq!(
-            stages(&check),
+            lost,
+            [
+                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on -X",
+                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on +X",
+                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on -X",
+                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on +X",
+                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on -Y",
+                "workholding 2/None: Underside: Setup 2 cannot be held by the clamp on +Y",
+            ]
+        );
+        assert!(
+            all.iter()
+                .filter(|l| l.contains("would cut away"))
+                .all(|l| l.contains("operation 1 would cut away"))
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|l| !l.contains("would cut away"))
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![
                 "workholding 1/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z-2.0 (within the 2 mm gap).",
                 "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-6.0 (within the 2 mm gap).",

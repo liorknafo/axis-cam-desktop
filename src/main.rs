@@ -412,7 +412,9 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
                     let removed = before
                         .as_deref()
                         .map(|v| rest::Removed::new(v, frame).with_part(part));
-                    holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
+                    // The setup's own toolpaths are not generated here; the
+                    // operation inspector says when one cuts under a clamp.
+                    holding::holdable(si, &layout, holder, held, removed.as_ref(), None, &names)
                 }
                 _ => vec![],
             };

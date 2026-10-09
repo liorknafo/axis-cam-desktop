@@ -2121,21 +2121,51 @@ fn holding_note(
     let datum = app
         .part_mesh()
         .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok());
-    let lines: Vec<String> = crate::holding::hits(plan, &boxes, gap)
+    let mut lines: Vec<String> = crate::holding::hits(plan, &boxes, gap)
         .iter()
         .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
         .collect();
+    let hit = !lines.is_empty();
+    lines.extend(bites_lost(app, plan, setup));
     (!lines.is_empty()).then(|| {
         let frame = if datum.is_none() {
             "; coordinates in the setup frame"
         } else {
             ""
         };
-        (
-            format!("Too close to the workholding (export will refuse this{frame})"),
-            lines,
-        )
+        let what = if hit {
+            "Too close to the workholding"
+        } else {
+            "A clamp would lose the stock under it"
+        };
+        (format!("{what} (export will refuse this{frame})"), lines)
     })
+}
+/// Where the operation whose toolpath is `plan` cuts away the stock under a
+/// clamp of `setup`, as the export says it (`holding::holdable` with the
+/// setup's own cuts); the vise and a setup without clamps have none.
+fn bites_lost(app: &App, plan: &crate::simulation::Plan, setup: &Setup) -> Vec<String> {
+    let (Some(mesh), Ok(layout), Some(holder)) = (
+        app.part_mesh(),
+        crate::holding::layout(setup),
+        app.doc.holder(get(&setup.p, "holder")),
+    ) else {
+        return vec![];
+    };
+    if !matches!(layout, crate::holding::Layout::Clamps { .. }) {
+        return vec![];
+    }
+    let si = app.doc.index();
+    let oi = app.selected.unwrap_or_default();
+    let frame = crate::volume::Frame::new(setup, mesh);
+    let own = crate::rest::Cuts::of_plans([(oi, plan)], si, frame);
+    let held = held_of(app, plan.stock);
+    let height = crate::holding::height_issue(&layout, plan.stock);
+    let names = |s, o| crate::holding::operation_name(&app.doc, s, o);
+    crate::holding::holdable(si, &layout, holder, held, None, Some(&own), &names)
+        .into_iter()
+        .filter(|line| Some(line) != height.as_ref())
+        .collect()
 }
 /// What is wrong with the active setup's workholding, as the setup editor
 /// lists it under the controls (`holding_lines_in`).
