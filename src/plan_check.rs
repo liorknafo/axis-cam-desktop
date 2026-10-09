@@ -699,12 +699,14 @@ fn laid_out(
             .first()
             .and_then(|(_, result)| result.as_ref().ok());
         let bands = first.and_then(|first| crate::post::bands(setup, mesh, first));
+        // Knowing the part, as the export does, to tell stock cut free from it.
+        let part = crate::simulation::part_box(setup, mesh);
         let removed = first
             .and_then(|first| first.initial_volume.as_ref().zip(first.frame))
-            .map(|(volume, frame)| crate::rest::Removed::new(volume, frame));
+            .map(|(volume, frame)| crate::rest::Removed::new(volume, frame).with_part(part));
         let known = holding::Known {
-            earlier: removed.as_ref().map(|r| r as &dyn crate::rest::Removes),
-            part: Some(crate::simulation::part_box(setup, mesh)),
+            earlier: removed.as_ref(),
+            part: Some(part),
         };
         let Some((_, suggested)) =
             request.suggest(built, Some(mesh), si, &plans, bands.as_ref(), known)
@@ -2043,7 +2045,7 @@ mod tests {
         // Within the 300 characters a message keeps, the advice is whole.
         let said = |side: &str| {
             format!(
-                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on {side} (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 10 mm over the part. Clamp on stock beside the part: leave more of it on two opposite sides and face only the model's outline, or use the vise."
+                "workholding 1/None: Top: Setup 1 cannot be held by the clamp on {side} (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 10 mm over the part. Clamp on stock beside the part, on two opposite sides, or use the vise."
             )
         };
         assert_eq!(lost.len(), 2, "{lost:?}");
@@ -2053,7 +2055,7 @@ mod tests {
         // Setup 2 gets no clamps: facing the whole stock leaves no spot for
         // them, which is said once, with the stock to leave (its Ø10 cutters,
         // a 12 mm bite and the 2 mm gap: about 25 mm), and nothing else.
-        let unheld = "workholding 2/None: Underside: Toe clamps cannot hold this setup: on every side the stock under a 12 mm bite is cut away or a toolpath comes within the 2 mm gap of the clamp. Leave at least about 25 mm of stock beside the part on two opposite sides and face only the part's outline, or use the vise.";
+        let unheld = "workholding 2/None: Underside: Toe clamps cannot hold this setup: on every side the 12 mm bite loses its stock or comes within 2 mm of a toolpath. Leave about 25 mm of stock beside the part on two opposite sides and face only its outline, or use the vise.";
         assert_eq!(
             all.iter()
                 .filter(|l| !l.contains("would cut away"))
@@ -2095,7 +2097,8 @@ mod tests {
         });
         let refs: Vec<&simulation::Plan> = sims.iter().map(|sim| &sim.plan).collect();
         let before = sims[0].initial_volume.as_ref().unwrap();
-        let removed = crate::rest::Removed::new(before, sims[0].frame.unwrap());
+        let part = simulation::part_box(second, &mesh);
+        let removed = crate::rest::Removed::new(before, sims[0].frame.unwrap()).with_part(part);
         let holder = job.holder(get(&second.p, "holder")).unwrap();
         let (_, again) = holding::request(second, Some(holder))
             .unwrap()
@@ -2107,7 +2110,7 @@ mod tests {
                 None,
                 holding::Known {
                     earlier: Some(&removed),
-                    part: Some(simulation::part_box(second, &mesh)),
+                    part: Some(part),
                 },
             )
             .unwrap();

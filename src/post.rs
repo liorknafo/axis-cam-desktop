@@ -3235,7 +3235,7 @@ M2
         let errors = errors(&posted);
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(
-            errors[0].starts_with("Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part. Clamp on stock beside the part:"),
+            errors[0].starts_with("Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part. Clamp on stock beside the part, on two opposite sides, or use the vise."),
             "{errors:?}"
         );
         assert_eq!(errors[1], expected.as_str());

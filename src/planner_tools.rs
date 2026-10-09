@@ -520,9 +520,9 @@ fn check_holding(arguments: &str, state: &ToolState) -> Answer {
         let removed = start
             .before
             .as_deref()
-            .map(|v| crate::rest::Removed::new(v, start.frame));
+            .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
         let known = holding::Known {
-            earlier: removed.as_ref().map(|r| r as &dyn crate::rest::Removes),
+            earlier: removed.as_ref(),
             part: Some(start.part),
         };
         let suggested = holding::request(setup, Some(entry))
@@ -1123,7 +1123,7 @@ mod tests {
             out["problems"],
             json!([{
                 "operation": null,
-                "message": "Underside: Toe clamps cannot hold this setup: on every side the stock under a 12 mm bite is cut away or a toolpath comes within the 2 mm gap of the clamp. Leave at least about 25 mm of stock beside the part on two opposite sides and face only the part's outline, or use the vise."
+                "message": "Underside: Toe clamps cannot hold this setup: on every side the 12 mm bite loses its stock or comes within 2 mm of a toolpath. Leave about 25 mm of stock beside the part on two opposite sides and face only its outline, or use the vise."
             }])
         );
         assert_eq!(out["stock_size"], json!([124., 84., 45.]));

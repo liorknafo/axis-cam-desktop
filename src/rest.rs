@@ -188,6 +188,16 @@ impl Cuts {
         }
     }
 }
+impl Cuts {
+    /// The cutter radius of the cuts operation `source` makes (its first
+    /// cut's), or None when it makes none.
+    pub fn radius(&self, source: (u16, u16)) -> Option<f32> {
+        self.cuts
+            .iter()
+            .find(|c| c.source == source)
+            .map(|c| c.radius)
+    }
+}
 impl Removes for Cuts {
     fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
         first_removing(&self.cuts, &self.boxes, self.current, p)
