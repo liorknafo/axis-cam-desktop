@@ -145,6 +145,7 @@ Open **Start → Explore example project** first. This loads the housing, sample
 1. Open **Machine library → Set up a machine**, complete the wizard and save. Assign the profile to the current setup.
 2. Click **Edit setup** to configure stock, work offset, origin, fixture and material.
 3. Choose an operation from the ribbon. Set the cutter and feeds/speeds; a warning on the Tool tab shows when they are outside the project material's cutting data (see **Materials**).
+   Click an operation in the browser to edit it: its settings open in the right-hand panel. The panel's top row stays in view while its settings scroll: the operation's name and **Duplicate**, **Suppress**/**Enable**, **Delete…**, **Move up** and **Move down**. **Delete…** (or the Delete or Backspace key, when no text field has the cursor) asks before the operation is removed.
 4. Open **Geometry**. Select sample features from the list or click them in the viewport. Drag still orbits the model.
 5. Set Heights, Passes/Cycle, Orientation when applicable, and Linking.
 6. Click **Generate sample preview**, then **Play**. Previews are invalidated when job parameters change.

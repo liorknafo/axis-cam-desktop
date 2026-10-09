@@ -71,6 +71,32 @@ fn btn<'a>(label: impl Into<String>, msg: Message, active: bool) -> HelpButton<'
         });
     HelpButton::new(b, &action, label)
 }
+/// A secondary action drawn with an outline, so it reads as a button.
+fn outlined<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
+    let label = label.into();
+    let action = msg.clone();
+    let b = button(text(label.clone()).size(12).center())
+        .on_press(msg)
+        .padding([6, 8])
+        .style(|_, status| button::Style {
+            background: Some(
+                if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    Color::from_rgb8(235, 242, 250)
+                } else {
+                    Color::WHITE
+                }
+                .into(),
+            ),
+            text_color: INK,
+            border: Border {
+                color: LINE,
+                width: 1.,
+                radius: 4.into(),
+            },
+            ..Default::default()
+        });
+    HelpButton::new(b, &action, label)
+}
 fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
     let label = label.into();
     let action = msg.clone();
@@ -915,18 +941,27 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .into()
 }
 fn inspector(app: &App) -> Element<'_, Message> {
+    let selected = app.doc.active_setup().and(app.operation());
     let content = if app.doc.active_setup().is_none() {
         first_setup(app)
-    } else if let Some(o) = app.operation() {
+    } else if let Some(o) = selected {
         operation_editor(app, o)
     } else {
         setup_editor(app)
     };
+    let mut c = Column::new().spacing(12);
+    if let Some(o) = selected {
+        c = c
+            .push(container(operation_actions(app, o)).width(304))
+            .push(rule::horizontal(1));
+    }
     container(
-        scrollable(container(content).width(304))
-            .id("inspector")
-            .width(Fill)
-            .height(Fill),
+        c.push(
+            scrollable(container(content).width(304))
+                .id("inspector")
+                .width(Fill)
+                .height(Fill),
+        ),
     )
     .padding(15)
     .width(350)
@@ -934,14 +969,58 @@ fn inspector(app: &App) -> Element<'_, Message> {
     .style(panel_style)
     .into()
 }
+/// The selected operation's name and actions, kept above its parameters so
+/// they never scroll out of sight.
+fn operation_actions<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
+    let title = row![
+        icon(app, o.strategy, 30.),
+        column![
+            bold(o.name(), 16),
+            muted(format!("{} · edit its settings below", o.strategy.name())).size(12)
+        ]
+        .spacing(2)
+    ]
+    .spacing(9)
+    .align_y(Alignment::Center);
+    let actions: Element<'a, Message> = if app.confirm_delete_op {
+        column![
+            note(format!(
+                "Delete \"{}\"? Its settings and toolpath go with it.",
+                o.name()
+            )),
+            row![
+                outlined("Cancel", Message::ConfirmDeleteOp(false)).width(Fill),
+                primary("Delete operation", Message::ConfirmDeleteOp(true)).width(Fill)
+            ]
+            .spacing(5)
+        ]
+        .spacing(8)
+        .into()
+    } else {
+        column![
+            row![
+                outlined("Duplicate", Message::DuplicateOp).width(Fill),
+                outlined(
+                    if o.enabled { "Suppress" } else { "Enable" },
+                    Message::ToggleOp
+                )
+                .width(Fill),
+                outlined("Delete…", Message::RemoveOp).width(Fill)
+            ]
+            .spacing(5),
+            row![
+                outlined("Move up", Message::MoveOp(-1)).width(Fill),
+                outlined("Move down", Message::MoveOp(1)).width(Fill)
+            ]
+            .spacing(5)
+        ]
+        .spacing(5)
+        .into()
+    };
+    column![title, actions].spacing(10).into()
+}
 fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     let mut c = column![
-        row![
-            icon(app, o.strategy, 30.),
-            column![bold(o.strategy.name(), 17), muted("Operation parameters")].spacing(2)
-        ]
-        .spacing(9)
-        .align_y(Alignment::Center),
         field(&o.p, "name", "Operation name", Target::Operation),
         note(o.strategy.help())
     ]
@@ -1365,39 +1444,19 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
     if let Some((heading, lines)) = holding_warning(app) {
         c = c.push(caution(heading, lines));
     }
-    c = c
-        .push(
-            primary(
-                if app.is_sample() {
-                    "Generate sample preview"
-                } else if o.strategy.imported_preview() {
-                    "Generate operation preview"
-                } else {
-                    "Unavailable · see Operation support"
-                },
-                Message::Generate,
-            )
-            .width(Fill),
+    c = c.push(
+        primary(
+            if app.is_sample() {
+                "Generate sample preview"
+            } else if o.strategy.imported_preview() {
+                "Generate operation preview"
+            } else {
+                "Unavailable · see Operation support"
+            },
+            Message::Generate,
         )
-        .push(
-            row![
-                btn("Duplicate", Message::DuplicateOp, false),
-                btn(
-                    if o.enabled { "Suppress" } else { "Enable" },
-                    Message::ToggleOp,
-                    false
-                ),
-                btn("Delete", Message::RemoveOp, false)
-            ]
-            .spacing(1),
-        )
-        .push(
-            row![
-                btn("Move up", Message::MoveOp(-1), false),
-                btn("Move down", Message::MoveOp(1), false)
-            ]
-            .spacing(5),
-        );
+        .width(Fill),
+    );
     c.into()
 }
 fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {

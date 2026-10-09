@@ -143,6 +143,7 @@ impl App {
                 114 | 115 => "91-planner-pictures".into(),
                 116 => "92-flipped-setup-leftover-stock".into(),
                 117 => "93-planner-tool-lines".into(),
+                118 => "94-operation-delete-confirm".into(),
                 _ => format!("motion-{:02}", self.smoke_step - 26),
             });
         if (26..50).contains(&self.smoke_step) {
@@ -987,6 +988,28 @@ impl App {
                     .collect();
                 *self.plan_stream.lock().unwrap() = SMOKE_REPLY.into();
                 self.page = Page::Ai;
+                vec![]
+            }
+            118 => {
+                // The selected operation's actions sit above its fields; the
+                // Delete key asks before anything is deleted.
+                *self.plan_stream.lock().unwrap() = String::new();
+                self.planner = crate::Planner::Idle;
+                let count = self.doc.setup().operations.len();
+                assert!(count > 0);
+                for action in [
+                    Message::Page(Page::Work),
+                    Message::SelectOp(0),
+                    Message::DeleteKey,
+                ] {
+                    let _ = self.update(action);
+                }
+                assert!(self.confirm_delete_op);
+                assert_eq!(self.doc.setup().operations.len(), count);
+                eprintln!(
+                    "Screen 94: deleting \"{}\" waits for an answer",
+                    self.operation().unwrap().name()
+                );
                 vec![]
             }
             _ => {
@@ -5264,6 +5287,62 @@ mod tests {
         a.selected = Some(0);
         a.page = Page::Work;
         a
+    }
+    #[test]
+    fn deleting_an_operation_asks_first_and_the_delete_key_asks_too() {
+        let mut a = app();
+        let names = |a: &App| -> Vec<String> {
+            a.doc
+                .setup()
+                .operations
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect()
+        };
+        let before = names(&a);
+        assert!(before.len() >= 3, "{before:?}");
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::RemoveOp);
+        assert!(a.confirm_delete_op);
+        assert_eq!(names(&a), before, "nothing is deleted before the answer");
+        let _ = a.update(Message::ConfirmDeleteOp(false));
+        assert!(!a.confirm_delete_op);
+        assert_eq!(names(&a), before);
+        // Choosing another operation drops a pending question.
+        let _ = a.update(Message::RemoveOp);
+        let _ = a.update(Message::SelectOp(0));
+        assert!(!a.confirm_delete_op);
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::DeleteKey);
+        assert!(a.confirm_delete_op);
+        let _ = a.update(Message::ConfirmDeleteOp(true));
+        let mut expected = before.clone();
+        expected.remove(1);
+        assert_eq!(names(&a), expected);
+        assert_eq!(a.selected, Some(1), "the next operation is selected");
+        // Off the machining page, or with no operation chosen, the key does nothing.
+        let _ = a.update(Message::Page(Page::Tools));
+        let _ = a.update(Message::DeleteKey);
+        assert!(!a.confirm_delete_op);
+        let _ = a.update(Message::Page(Page::Work));
+        a.selected = None;
+        let _ = a.update(Message::DeleteKey);
+        assert!(!a.confirm_delete_op);
+        assert_eq!(names(&a), expected);
+    }
+    #[test]
+    fn the_delete_key_is_left_to_a_text_field_that_takes_it() {
+        use iced::event::Status;
+        use iced::keyboard::{Key, key::Named};
+        for named in [Named::Delete, Named::Backspace] {
+            assert!(matches!(
+                crate::delete_key(&Key::Named(named), Status::Ignored),
+                Some(Message::DeleteKey)
+            ));
+            assert!(crate::delete_key(&Key::Named(named), Status::Captured).is_none());
+        }
+        assert!(crate::delete_key(&Key::Named(Named::Enter), Status::Ignored).is_none());
+        assert!(crate::delete_key(&Key::Character("d".into()), Status::Ignored).is_none());
     }
     fn imported_app() -> App {
         let mut a = app();

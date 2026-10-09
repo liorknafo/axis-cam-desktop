@@ -240,9 +240,10 @@ pub fn command(m: &Message, label: String) -> Help {
         DuplicateOp => {
             "Copy this operation, including its tool, geometry and cutting settings, into the current setup. Adjust the copy for another pass."
         }
-        RemoveOp => {
+        RemoveOp | DeleteKey | ConfirmDeleteOp(true) => {
             "Delete this operation from the current setup. References from later rest-machining operations are cleared."
         }
+        ConfirmDeleteOp(false) => "Keep this operation and close the deletion confirmation.",
         MoveOp(n) if *n < 0 => {
             "Move the operation earlier in the setup. Review rest-machining dependencies after changing the cutting order."
         }

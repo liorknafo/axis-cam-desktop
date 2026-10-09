@@ -105,7 +105,11 @@ pub enum Message {
     Title(String),
     AddOp(Strategy),
     DuplicateOp,
+    /// Ask to delete the selected operation; `ConfirmDeleteOp` answers.
     RemoveOp,
+    ConfirmDeleteOp(bool),
+    /// The Delete or Backspace key, pressed outside a text field.
+    DeleteKey,
     MoveOp(isize),
     ToggleOp,
     Feature(usize),
@@ -562,6 +566,7 @@ pub struct App {
     pub plan_camera: viewport::Camera,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
+    pub confirm_delete_op: bool,
     pub icons: Vec<iced::widget::svg::Handle>,
     /// A close request waiting for a sign-out, a sign-in save or a refresh
     /// of the sign-in, and when it first came.
@@ -803,6 +808,7 @@ impl App {
             plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
+            confirm_delete_op: false,
             icons,
             closing: None,
             signing_out: None,
@@ -1831,6 +1837,7 @@ impl App {
         self.progress = 0.;
         self.simulation = None;
         self.confirm_delete_setup = false;
+        self.confirm_delete_op = false;
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
@@ -1856,6 +1863,7 @@ impl App {
                     | Message::AddOp(_)
                     | Message::DuplicateOp
                     | Message::RemoveOp
+                    | Message::ConfirmDeleteOp(_)
                     | Message::MoveOp(_)
                     | Message::Generate
                     | Message::GenerateAll
@@ -1956,6 +1964,7 @@ impl App {
             }
             Message::SelectOp(i) => {
                 if i < self.doc.setup().operations.len() {
+                    self.confirm_delete_op = false;
                     if self.selected != Some(i) {
                         self.simulation = None;
                     }
@@ -2111,6 +2120,7 @@ impl App {
                 );
             }
             Message::DuplicateOp => {
+                self.confirm_delete_op = false;
                 if let Some(i) = self.selected {
                     let mut o = self.doc.setup().operations[i].clone();
                     o.id = id();
@@ -2121,7 +2131,19 @@ impl App {
                 }
             }
             Message::RemoveOp => {
-                if let Some(i) = self.selected {
+                self.confirm_delete_op = self.operation().is_some();
+            }
+            Message::DeleteKey => {
+                if self.page == Page::Work
+                    && self.doc.active_setup().is_some()
+                    && self.operation().is_some()
+                {
+                    return self.handle(Message::RemoveOp);
+                }
+            }
+            Message::ConfirmDeleteOp(yes) => {
+                self.confirm_delete_op = false;
+                if yes && let Some(i) = self.selected {
                     self.doc.setup_mut().operations.remove(i);
                     self.selected = if self.doc.setup().operations.is_empty() {
                         None
@@ -2132,6 +2154,7 @@ impl App {
                 }
             }
             Message::MoveOp(d) => {
+                self.confirm_delete_op = false;
                 if let Some(i) = self.selected {
                     let n = i as isize + d;
                     if n >= 0 && (n as usize) < self.doc.setup().operations.len() {
@@ -2142,6 +2165,7 @@ impl App {
                 }
             }
             Message::ToggleOp => {
+                self.confirm_delete_op = false;
                 if let Some(o) = self.operation_mut() {
                     o.enabled = !o.enabled;
                 }
@@ -3518,7 +3542,7 @@ impl App {
                 Duration::from_millis(500)
             })
             .map(|_| Message::Tick),
-            iced::event::listen_with(|event, _, window| match event {
+            iced::event::listen_with(|event, status, window| match event {
                 iced::Event::Window(iced::window::Event::CloseRequested) => {
                     Some(Message::Close(window))
                 }
@@ -3537,6 +3561,9 @@ impl App {
                     modifiers,
                     ..
                 }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
+                    delete_key(&key, status)
+                }
                 _ => None,
             }),
         ])
@@ -3544,6 +3571,14 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         ui::view(self)
     }
+}
+/// Delete or Backspace asks to delete the selected operation, unless a
+/// text field took the key.
+fn delete_key(key: &iced::keyboard::Key, status: iced::event::Status) -> Option<Message> {
+    use iced::keyboard::{Key, key::Named};
+    (status == iced::event::Status::Ignored
+        && matches!(key, Key::Named(Named::Delete | Named::Backspace)))
+    .then_some(Message::DeleteKey)
 }
 fn sanitize_name(s: &str) -> String {
     let n: String = s
