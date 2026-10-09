@@ -488,6 +488,24 @@ impl Viewport<'_> {
                 }
             }
         }
+        // Jaws and clamps are solid: drawn before the stock, which is
+        // translucent (or simulated) and tints them only where it is nearer.
+        let scale = self.mesh.display_scale();
+        for hold in &self.holding {
+            let projected = box_vertices(hold.bounds.scaled(scale)).map(|v| {
+                let q = p.p(v);
+                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+            });
+            raster_block(
+                &mut rgba,
+                &mut depths,
+                &mut plain,
+                (w, h),
+                projected,
+                ratio,
+                p.scale,
+            );
+        }
         if let Some(simulation) = self.simulation {
             self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
         } else if self.show_stock
@@ -505,24 +523,6 @@ impl Viewport<'_> {
             // so the translucent box must not dim them.
             for (index, _) in plain.iter().enumerate().filter(|(_, kept)| **kept) {
                 rgba[index * 4..index * 4 + 4].copy_from_slice(&SELECTED);
-            }
-        }
-        if !self.holding.is_empty() {
-            let scale = self.mesh.display_scale();
-            for hold in &self.holding {
-                let projected = box_vertices(hold.bounds.scaled(scale)).map(|v| {
-                    let q = p.p(v);
-                    (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
-                });
-                raster_solid(
-                    &HOLDING,
-                    &mut rgba,
-                    &depths,
-                    (w, h),
-                    projected,
-                    ratio,
-                    p.scale,
-                );
             }
         }
         if self.sample && self.show_paths && self.setup.is_some_and(|s| !s.is_repositioned()) {
@@ -1175,14 +1175,34 @@ const STOCK: Look = Look {
     open: 0.30,
     behind: 0.12,
 };
-/// Jaws and clamps: a neutral grey, more opaque than the stock.
-const HOLDING: Look = Look {
-    faces: [[176, 176, 176], [138, 138, 138], [158, 158, 158]],
-    edge: [84, 84, 84],
-    hidden_edge: [118, 118, 118],
-    open: 0.5,
-    behind: 0.3,
-};
+/// Jaws and clamps: solid neutral grey blocks, the faces shaded by the axis
+/// they face (top and bottom, Y sides, X sides), with dark visible edges.
+const HOLDING_FACES: [[u8; 3]; 3] = [[176, 176, 176], [138, 138, 138], [158, 158, 158]];
+const HOLDING_EDGE: [u8; 3] = [84, 84, 84];
+/// A box's faces as `box_vertices` corners: bottom, top, -Y, +X, +Y, -X.
+const BOX_FACES: [[usize; 4]; 6] = [
+    [0, 1, 2, 3],
+    [4, 5, 6, 7],
+    [0, 1, 5, 4],
+    [1, 2, 6, 5],
+    [2, 3, 7, 6],
+    [3, 0, 4, 7],
+];
+/// A box's twelve edges as `box_vertices` corners.
+const BOX_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+];
 /// The stock's box: `raster_solid` in the stock's colors.
 fn raster_stock(
     pixels: &mut [u8],
@@ -1208,17 +1228,7 @@ fn raster_solid(
 ) {
     let mut near = vec![f32::NEG_INFINITY; (w * h) as usize];
     let mut tones = vec![0usize; (w * h) as usize];
-    for (tone, face) in [
-        [0, 1, 2, 3],
-        [4, 5, 6, 7],
-        [0, 1, 5, 4],
-        [1, 2, 6, 5],
-        [2, 3, 7, 6],
-        [3, 0, 4, 7],
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (tone, face) in BOX_FACES.iter().enumerate() {
         for tri in [[face[0], face[1], face[2]], [face[0], face[2], face[3]]] {
             let tri = tri.map(|i| vertices[i]);
             let minx = tri
@@ -1258,7 +1268,6 @@ fn raster_solid(
             }
         }
     }
-    let tolerance = 1.5 / (scale * ratio).max(0.01);
     for (index, z) in near.iter().enumerate() {
         if z.is_finite() && *z >= part_depth[index] - 0.001 {
             let tint = match tones[index] {
@@ -1274,20 +1283,33 @@ fn raster_solid(
             alpha_over(&mut pixels[index * 4..index * 4 + 4], tint, alpha);
         }
     }
-    for (a, b) in [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ] {
+    let tolerance = 1.5 / (scale * ratio).max(0.01);
+    box_edges(
+        pixels,
+        (w, h),
+        vertices,
+        ratio,
+        |index| near[index].max(part_depth[index]),
+        tolerance,
+        look.edge,
+        Some(look.hidden_edge),
+    );
+}
+/// The visible edges of a box drawn in `edge`; with `hidden`, the edges
+/// behind `cover` (the depth in front at a pixel) dashed in that colour,
+/// otherwise left out.
+#[allow(clippy::too_many_arguments)]
+fn box_edges(
+    pixels: &mut [u8],
+    (w, h): (u32, u32),
+    vertices: [(Point, f32); 8],
+    ratio: f32,
+    cover: impl Fn(usize) -> f32,
+    tolerance: f32,
+    edge: [u8; 3],
+    hidden_edge: Option<[u8; 3]>,
+) {
+    for (a, b) in BOX_EDGES {
         let (a, za) = vertices[a];
         let (b, zb) = vertices[b];
         let dx = b.x - a.x;
@@ -1309,22 +1331,88 @@ fn raster_solid(
                 let closest = Point::new(a.x + t * dx, a.y + t * dy);
                 let index = (y * w + x) as usize;
                 let z = za + t * (zb - za);
-                let hidden = z + tolerance < near[index].max(part_depth[index]);
-                if hidden && (t * length) % (10. * ratio) > 4. * ratio {
-                    continue;
-                }
+                let hidden = z + tolerance < cover(index);
+                // Hidden edges are dashed, or left out without a colour.
+                let color = match (hidden, hidden_edge) {
+                    (false, _) => edge,
+                    (true, Some(dashed)) if (t * length) % (10. * ratio) <= 4. * ratio => dashed,
+                    (true, _) => continue,
+                };
                 let thickness = if hidden { radius * 0.55 } else { radius };
                 let coverage = (thickness + 0.5 - q.distance(closest)).clamp(0., 1.);
                 if coverage > 0. {
                     alpha_over(
                         &mut pixels[index * 4..index * 4 + 4],
-                        if hidden { look.hidden_edge } else { look.edge },
+                        color,
                         coverage * if hidden { 0.34 } else { 0.95 },
                     );
                 }
             }
         }
     }
+}
+/// A jaw or clamp as a solid block: its faces shaded by the axis they face,
+/// hidden where something nearer is drawn and hiding what is behind them
+/// (`depths` takes the block), then its visible edges. `kept` (the planner's
+/// marked pixels to restore) loses the pixels the block covers.
+fn raster_block(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    kept: &mut [bool],
+    (w, h): (u32, u32),
+    vertices: [(Point, f32); 8],
+    ratio: f32,
+    scale: f32,
+) {
+    for (tone, face) in BOX_FACES.iter().enumerate() {
+        let shade = match tone {
+            0 | 1 => HOLDING_FACES[0],
+            2 | 4 => HOLDING_FACES[1],
+            _ => HOLDING_FACES[2],
+        };
+        let color = [shade[0], shade[1], shade[2], 255];
+        for tri in [[face[0], face[1], face[2]], [face[0], face[2], face[3]]] {
+            let tri = tri.map(|i| vertices[i]);
+            let span = |k: fn(&Point) -> f32, size: u32| {
+                let lo = tri.iter().map(|(p, _)| k(p)).fold(f32::INFINITY, f32::min);
+                let hi = tri
+                    .iter()
+                    .map(|(p, _)| k(p))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                (
+                    lo.floor().clamp(0., size as f32) as u32,
+                    hi.ceil().clamp(0., size as f32) as u32,
+                )
+            };
+            let ((minx, maxx), (miny, maxy)) = (span(|p| p.x, w), span(|p| p.y, h));
+            for y in miny..maxy {
+                for x in minx..maxx {
+                    let index = (y * w + x) as usize;
+                    if let Some(z) = triangle_depth(tri, Point::new(x as f32 + 0.5, y as f32 + 0.5))
+                        && z >= depths[index]
+                    {
+                        depths[index] = z;
+                        pixels[index * 4..index * 4 + 4].copy_from_slice(&color);
+                        if let Some(kept) = kept.get_mut(index) {
+                            *kept = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let tolerance = 1.5 / (scale * ratio).max(0.01);
+    let depths = &*depths;
+    box_edges(
+        pixels,
+        (w, h),
+        vertices,
+        ratio,
+        |index| depths[index],
+        tolerance,
+        HOLDING_EDGE,
+        None,
+    );
 }
 fn raster_triangle(
     pixels: &mut [u8],
@@ -1759,7 +1847,7 @@ mod tests {
         assert!(transparent[index + 3] > 0 && transparent[index + 3] < 128);
     }
     #[test]
-    fn workholding_is_drawn_as_grey_translucent_boxes() {
+    fn workholding_is_drawn_as_solid_grey_blocks() {
         use crate::holding::HoldBox;
         let d = crate::model::Document::sample();
         let mesh = crate::mesh::sample();
@@ -1799,10 +1887,10 @@ mod tests {
         let at = |x: f32, y: f32| ((y * 1.5) as u32 * w + (x * 1.5) as u32) as usize * 4;
         let top = p.p([0., 70. * scale, 30. * scale]);
         let i = at(top.x, top.y);
-        // Nothing was there; now there is neutral grey, not opaque.
+        // Nothing was there; now there is solid neutral grey.
         assert_eq!(plain[i + 3], 0);
         let [r, g, bl, a] = [drawn[i], drawn[i + 1], drawn[i + 2], drawn[i + 3]];
-        assert!(a > 0 && a < 255, "{a}");
+        assert_eq!(a, 255);
         assert!(r == g && g == bl, "{r} {g} {bl}");
         // Only the jaw's own pixels changed.
         let changed = (0..plain.len() / 4)
@@ -1815,6 +1903,75 @@ mod tests {
         let (_, _, listed) = v.pixels(&p, b, None);
         v.holding.clear();
         assert_ne!(v.pixels(&p, b, None).2, listed);
+    }
+    #[test]
+    fn a_block_in_front_of_the_part_hides_it_and_one_behind_is_hidden() {
+        use crate::holding::HoldBox;
+        let d = crate::model::Document::sample();
+        let mesh = crate::mesh::sample();
+        let scale = mesh.display_scale();
+        // Seen from above: a clamp-like block over the middle of the part,
+        // and one under it.
+        let over = HoldBox {
+            label: "clamp on top".into(),
+            bounds: crate::mesh::Bounds {
+                min: [-10., -10., 200.],
+                max: [10., 10., 220.],
+            },
+        };
+        let under = HoldBox {
+            label: "block below".into(),
+            bounds: crate::mesh::Bounds {
+                min: [-10., -10., -220.],
+                max: [10., 10., -200.],
+            },
+        };
+        let mut v = Viewport {
+            setup: Some(d.setup()),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: true,
+            camera: Camera {
+                yaw: 0.,
+                pitch: std::f32::consts::FRAC_PI_2,
+                ..Default::default()
+            },
+            picking: false,
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+        };
+        let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
+        let p = v.projector(b);
+        let ratio = 1.5;
+        let (w, h) = (600, 450);
+        let centre = p.p([0., 0., 0.]);
+        let i = ((centre.y * ratio) as u32 * w + (centre.x * ratio) as u32) as usize;
+        let (part, part_depths) = v.render(&p, (w, h), ratio, None, &[]);
+        assert_eq!(part[i * 4 + 3], 255, "the part is under the centre");
+        // Above: solid grey covers the part, and is the nearest depth.
+        v.holding = vec![over.clone()];
+        let (rgba, depths) = v.render(&p, (w, h), ratio, None, &[]);
+        let [r, g, bl, a] = [
+            rgba[i * 4],
+            rgba[i * 4 + 1],
+            rgba[i * 4 + 2],
+            rgba[i * 4 + 3],
+        ];
+        assert_eq!(a, 255);
+        assert!(r == g && g == bl, "{r} {g} {bl}");
+        assert_ne!(rgba[i * 4..i * 4 + 4], part[i * 4..i * 4 + 4]);
+        assert!(depths[i] > part_depths[i]);
+        let top = p.depth([0., 0., 220. * scale]);
+        assert!((depths[i] - top).abs() < 0.01, "{} {top}", depths[i]);
+        // Below: hidden by the part, which is drawn as before.
+        v.holding = vec![under];
+        let (rgba, depths) = v.render(&p, (w, h), ratio, None, &[]);
+        assert_eq!(rgba[i * 4..i * 4 + 4], part[i * 4..i * 4 + 4]);
+        assert_eq!(depths[i], part_depths[i]);
     }
     #[test]
     fn the_camera_fit_contains_the_drawn_workholding() {
