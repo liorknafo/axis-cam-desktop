@@ -219,9 +219,9 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
         // Without its overview (it could not be drawn) the section does not
         // promise one.
         let first = if overview {
-            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (grey)."
+            "After the part report you get an overview picture drawn by the program: setup 1's orientation from the front-left, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks)."
         } else {
-            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (grey)."
+            "The pictures are drawn by the program, with the stock (amber, see-through) and setup 1's vise or clamps (solid grey blocks)."
         };
         let (look, limits) = if tool {
             (
@@ -4027,7 +4027,7 @@ pub(crate) mod tests {
             // The overview is promised only when the conversation has it.
             assert_eq!(with.contains("overview"), overview, "{tool} {overview}");
             assert!(with.contains("stock (amber, see-through)"));
-            assert!(with.contains("vise or clamps (grey)"));
+            assert!(with.contains("vise or clamps (solid grey blocks)"));
             assert!(with.contains("the triad shows +X (red)"));
             assert!(with.contains("the report's numbers are right"));
             // Without the section the text is the same as a run without
