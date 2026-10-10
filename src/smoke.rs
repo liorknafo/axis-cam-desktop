@@ -1290,6 +1290,34 @@ mod tests {
     use super::*;
     use crate::model::*;
     #[test]
+    fn a_uc100_machine_needs_its_profile_file() {
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        assert!(m.issues().iter().any(|e| e.contains("UC100 profile")));
+        m.p.insert("uc100_profile".into(), "C:/machines/jy5800.toml".into());
+        assert!(m.issues().is_empty());
+        assert!(Machine::new(3).issues().is_empty());
+    }
+
+    #[test]
+    fn the_wizard_shows_the_uc100_fields_and_takes_a_picked_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::WizardStep(3));
+        let _ = a.update(Message::Edit(Target::Machine, "controller", "UC100".into()));
+        let _ = a.view();
+        let profile = dir.path().join("jy5800.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let _ = a.update(Message::Uc100ProfilePicked(Some(profile.clone())));
+        assert_eq!(get(&a.machine_draft.p, "uc100_profile"), profile.display().to_string());
+        let _ = a.view();
+        // Cancelling the file dialog keeps the chosen profile.
+        let _ = a.update(Message::Uc100ProfilePicked(None));
+        assert_eq!(get(&a.machine_draft.p, "uc100_profile"), profile.display().to_string());
+    }
+
+    #[test]
     fn first_launch_and_empty_project_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workspace.json");

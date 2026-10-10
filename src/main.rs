@@ -126,6 +126,10 @@ pub enum Message {
     WizardStep(usize),
     SaveMachine,
     DeleteMachine(String),
+    /// Opens a file dialog for the machine draft's UC100 profile.
+    BrowseUc100Profile,
+    /// The chosen UC100 profile; None when the dialog was cancelled.
+    Uc100ProfilePicked(Option<PathBuf>),
     EditTool(String),
     NewTool,
     SaveTool,
@@ -2257,6 +2261,28 @@ impl App {
                 }
             }
             Message::WizardStep(s) => self.wizard_step = s.min(4),
+            Message::BrowseUc100Profile => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose the UC100 profile")
+                            .add_filter("UC100 profile", &["toml"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::Uc100ProfilePicked,
+                );
+            }
+            Message::Uc100ProfilePicked(path) => {
+                if let Some(path) = path {
+                    return self.update(Message::Edit(
+                        Target::Machine,
+                        "uc100_profile",
+                        path.display().to_string(),
+                    ));
+                }
+            }
             Message::SaveMachine => {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {

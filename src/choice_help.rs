@@ -374,6 +374,9 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "offset" => format!(
                 "Use {value} as this setup's work offset. The LinuxCNC program selects it before any motion; touch it off at the setup's work zero."
             ),
+            "controller" if value == "UC100" => "AXIS CAM drives this machine itself through the UC100 driver: connect, reset and E-stop it on the Control page. G-code export is not offered for it.".to_string(),
+            "uc100_connection" if value == "Simulated" => "Connect to a simulated UC100 inside AXIS CAM: the driver's controller, planner and checks run, but no hardware is opened and nothing moves. Its saved offsets and position are kept apart from the real machine's.".to_string(),
+            "uc100_connection" => "Connect to the real UC100 over USB (macOS). The machine starts in E-stop; press Reset on the Control page to enable it.".to_string(),
             "controller" if value == "LinuxCNC" => "LinuxCNC has a 3-axis postprocessor. Export checks every setup and replays each program against the simulated moves before writing it.".to_string(),
             "controller" => format!(
                 "Save {value} as the intended controller family for planning. Only LinuxCNC output is implemented, so G-code export is refused for this machine."
@@ -710,6 +713,21 @@ mod tests {
             selected("controller", "Controller", "GRBL", Target::Machine, &p)
                 .body
                 .contains("refused")
+        );
+        assert!(
+            selected("controller", "Controller", "UC100", Target::Machine, &p)
+                .body
+                .contains("Control page")
+        );
+        assert!(
+            selected("uc100_connection", "Connection", "Simulated", Target::Machine, &p)
+                .body
+                .contains("no hardware")
+        );
+        assert!(
+            selected("uc100_connection", "Connection", "USB", Target::Machine, &p)
+                .body
+                .contains("E-stop")
         );
         for origin in ["Stock top center", "Stock top front-left", "Model origin"] {
             assert!(

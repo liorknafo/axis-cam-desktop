@@ -280,6 +280,9 @@ impl Machine {
                 finite(&self.p, k, &mut e)
             }
         }
+        if get(&self.p, "controller") == "UC100" && get(&self.p, "uc100_profile").trim().is_empty() {
+            e.push("Choose the machine's UC100 profile file.".into())
+        }
         e
     }
     pub fn fill_post_defaults(&mut self) {

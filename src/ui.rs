@@ -2385,7 +2385,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
             }
         }
         3 => {
-            form=form.push(choice(p,"controller","Controller / intended postprocessor",&["LinuxCNC","GRBL","Mach3 / Mach4","Fanuc","Haas","Siemens","Heidenhain","Custom"],t)).push(choice(p,"tool_change","Tool change",&["Manual","Automatic"],t)).push(choice(p,"tcp","Tool center point control",&["No","Yes"],t)).push(note("LinuxCNC has a 3-axis postprocessor. Other controllers are saved for planning; exporting G-code for them is refused."));
+            form=form.push(choice(p,"controller","Controller / intended postprocessor",&["LinuxCNC","UC100","GRBL","Mach3 / Mach4","Fanuc","Haas","Siemens","Heidenhain","Custom"],t)).push(choice(p,"tool_change","Tool change",&["Manual","Automatic"],t)).push(choice(p,"tcp","Tool center point control",&["No","Yes"],t)).push(note("LinuxCNC has a 3-axis postprocessor. AXIS CAM drives a UC100 machine itself. Other controllers are saved for planning; exporting G-code for them is refused."));
             if get(p, "controller") == "LinuxCNC" {
                 form = form
                     .push(bold("Postprocessor", 15))
@@ -2396,6 +2396,33 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(choice_value(p, post_setting(p, "post_air"), "post_air", "Air blast output", &POST_AIR, t))
                     .push(warnings(post_setting_issues(p)))
                     .push(note("Setups keep a snapshot of the machine. After saving, use Assign to setup so existing setups use these settings."));
+            }
+            if get(p, "controller") == "UC100" {
+                // ponytail: reads the profile on each redraw of this step; cache it if that ever shows.
+                let check: Element<_> = match crate::control::profile(m) {
+                    Ok(_) => muted("UC100 profile checked.").into(),
+                    Err(e) => warnings(vec![e]),
+                };
+                form = form
+                    .push(bold("UC100", 15))
+                    .push(
+                        row![
+                            field(p, "uc100_profile", "UC100 profile file", t),
+                            btn("Browse…", Message::BrowseUc100Profile, false)
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::End),
+                    )
+                    .push(choice_value(
+                        p,
+                        crate::control::connection_label(m),
+                        "uc100_connection",
+                        "Connection",
+                        &["USB", "Simulated"],
+                        t,
+                    ))
+                    .push(check)
+                    .push(note("AXIS CAM drives this machine itself from the Control page. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing."));
             }
         }
         _ => {
