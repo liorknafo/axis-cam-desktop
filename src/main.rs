@@ -2,6 +2,7 @@ mod analysis;
 mod cam;
 mod choice_diagram;
 mod choice_help;
+mod control;
 #[cfg(test)]
 mod fake_openai;
 mod help;

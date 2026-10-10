@@ -1,0 +1,4 @@
+# The UC100 driver is a private GitHub repository: fetch it with git, which
+# already has the login, rather than cargo's built-in client.
+[net]
+git-fetch-with-cli = true
