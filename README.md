@@ -283,6 +283,26 @@ A setup can model the vise or the toe clamps that hold its stock. The app then c
 - **What is not checked.** Parallels, bolts, the table and the machine body; a shank wider than the cutter or a reduced neck; the motion of a tool change; a vise or clamps in a setup turned from setup 1 by other than a multiple of 90 degrees (refused instead); clamping force and vibration; whether the material left at a jaw or clamp is strong enough to hold (the checks above ask only that it is there and joined to the part). In the texts that say what is not checked (the status and notes of the operation preview, the NC program page, the plan preview and the program header), a setup with None keeps the older wording, "fixtures, clamps and the machine body are not checked".
 - **The planner.** The part report sends setup 1's jaws or clamps as boxes (their sizes and positions, relative to the model's −X, −Y and bottom corner), their kind, the clearance gap and, when they reach above the stock top, how far: never the entry's name or its notes. The model is told to keep its plan clear of them and that a move within the gap is refused. Setups that a plan adds get the library entry the plan names for them, or setup 1's when it names none (see **Choosing the holders**), laid out by the app for their generated toolpaths before the check, and the plan card shows each layout. A proposal's optional `clearance` can only raise the 15 mm default, which already covers jaws and clamps (with their gap) that reach less than 15 mm above the stock top; the planner is told to raise it only when the reported height is 15 mm or more, because a clearance-plane machine refuses a plan whose plane is not above them.
 
+## Machine control (UC100)
+
+AXIS CAM can drive a CNCdrive UC100 itself, through the
+[UC100 driver](https://github.com/liorknafo/UC100-driver) (pinned in `Cargo.toml`).
+
+1. In the Machine library, set a machine's controller to **UC100**, choose its
+   **UC100 profile file** (the driver's machine TOML: pins, steps per mm,
+   speeds, limits, homing) and its **Connection**: **USB** for the real
+   controller (macOS) or **Simulated**.
+2. Open **Control**, pick the machine and press **Connect**. The machine
+   starts in E-stop; **Reset** enables it.
+3. While connected, a red **E-STOP** is in the top bar on every page, and
+   **Esc** sends E-stop from anywhere, even while typing. Leaving E-stop
+   always needs Reset.
+
+**Simulated** runs the driver's real controller, planner and checks against a
+simulated UC100: no hardware is opened and nothing moves. It keeps its own
+saved offsets and position, separate from the real machine's. Jogging,
+homing, work zero and running setups come in the next parts.
+
 ## LinuxCNC G-code export
 
 Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
@@ -429,6 +449,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-three 
 - `src/storage.rs`: project loading and atomic persistence.
 - `src/rest.rs`: conservative continuous-sweep coverage for automatic cutting start heights, also used by export to prove a rapid's descent clear and to find the stock faces earlier setups cut, and (`RestStock::left`) the box a later setup starts from, and (`Removed`) where earlier cuts removed material, which operation did and whether the part is still joined to the material a holder grips.
 - `src/post.rs`: LinuxCNC postprocessor: blocks from the simulated moves, the emitter and its header (work zero, part box for Model origin, fixture, workholding), file names, and `post_job`/`write_job` for the NC program page and `--export-gcode`.
+- `src/control.rs`: the UC100 connection: a machine's driver profile and Connection, the driver's controller for one machine, its saved state files and the snapshot the Control page draws.
 - `src/post_check.rs`: export checks: spindle and feed limits, travel, rapids into material, holder clearance, jaw and clamp clearance over every program move, and touch-off rules.
 - `src/holding.rs`: the workholding library (vises and clamps and their starters), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
 - `src/ngc.rs`: strict reader for the G-code subset the post writes, and the replay that compares each program move by move with the simulation.
