@@ -720,9 +720,15 @@ mod tests {
                 .contains("Control page")
         );
         assert!(
-            selected("uc100_connection", "Connection", "Simulated", Target::Machine, &p)
-                .body
-                .contains("no hardware")
+            selected(
+                "uc100_connection",
+                "Connection",
+                "Simulated",
+                Target::Machine,
+                &p
+            )
+            .body
+            .contains("no hardware")
         );
         assert!(
             selected("uc100_connection", "Connection", "USB", Target::Machine, &p)

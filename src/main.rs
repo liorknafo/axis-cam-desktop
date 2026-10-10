@@ -47,6 +47,7 @@ pub enum Page {
     Home,
     Work,
     Machines,
+    Control,
     Tools,
     Materials,
     Workholding,
@@ -3472,11 +3473,13 @@ impl App {
     }
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            iced::time::every(if self.playing || self.help_animating || self.control.is_some() {
-                Duration::from_millis(33)
-            } else {
-                Duration::from_millis(500)
-            })
+            iced::time::every(
+                if self.playing || self.help_animating || self.control.is_some() {
+                    Duration::from_millis(33)
+                } else {
+                    Duration::from_millis(500)
+                },
+            )
             .map(|_| Message::Tick),
             iced::event::listen_with(|event, _, window| match event {
                 iced::Event::Window(iced::window::Event::CloseRequested) => {

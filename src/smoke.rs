@@ -1310,11 +1310,17 @@ mod tests {
         let profile = dir.path().join("jy5800.toml");
         std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
         let _ = a.update(Message::Uc100ProfilePicked(Some(profile.clone())));
-        assert_eq!(get(&a.machine_draft.p, "uc100_profile"), profile.display().to_string());
+        assert_eq!(
+            get(&a.machine_draft.p, "uc100_profile"),
+            profile.display().to_string()
+        );
         let _ = a.view();
         // Cancelling the file dialog keeps the chosen profile.
         let _ = a.update(Message::Uc100ProfilePicked(None));
-        assert_eq!(get(&a.machine_draft.p, "uc100_profile"), profile.display().to_string());
+        assert_eq!(
+            get(&a.machine_draft.p, "uc100_profile"),
+            profile.display().to_string()
+        );
     }
 
     /// An app with one simulated UC100 machine whose profile is the driver's template.
@@ -1332,7 +1338,12 @@ mod tests {
     }
 
     /// Ticks until the machine snapshot satisfies `ok`; fails after `secs`.
-    fn tick_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&uc100::controller::Snapshot) -> bool) {
+    fn tick_until(
+        a: &mut App,
+        secs: f64,
+        what: &str,
+        ok: impl Fn(&uc100::controller::Snapshot) -> bool,
+    ) {
         let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
         loop {
             let _ = a.update(Message::Tick);
@@ -1340,7 +1351,12 @@ mod tests {
             if ok(s) {
                 return;
             }
-            assert!(std::time::Instant::now() < end, "timed out waiting for {what}: {:?} {:?}", s.state, s.log);
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for {what}: {:?} {:?}",
+                s.state,
+                s.log
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
@@ -1352,11 +1368,22 @@ mod tests {
         let mut a = uc100_app(dir.path());
         let _ = a.update(Message::Connect);
         assert!(a.control.as_ref().is_some_and(|c| c.simulated));
-        tick_until(&mut a, 3.0, "E-stop after connecting", |s| s.state == Some(State::EStop));
-        let identity = a.control.as_ref().unwrap().snapshot.identity.clone().unwrap();
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let identity = a
+            .control
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .identity
+            .clone()
+            .unwrap();
         assert_eq!(identity.hardware_id.as_deref(), Some("SIMULATED"));
         let _ = a.update(Message::MachineReset);
-        tick_until(&mut a, 3.0, "Idle after Reset", |s| s.state == Some(State::Idle));
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
         let _ = a.update(Message::MachineEStop);
         tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
         let _ = a.update(Message::Disconnect);
@@ -1390,9 +1417,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = uc100_app(dir.path());
         let _ = a.update(Message::Connect);
-        tick_until(&mut a, 3.0, "E-stop after connecting", |s| s.state == Some(State::EStop));
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
         let _ = a.request_close(iced::window::Id::unique());
         assert!(a.control.is_none());
+    }
+
+    #[test]
+    fn the_control_page_renders_in_every_state() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut empty = App::from_workspace(dir.path().join("empty.json"), None);
+        empty.page = Page::Control;
+        let _view = empty.view();
+        let mut a = uc100_app(dir.path());
+        a.page = Page::Control;
+        let _ = a.view();
+        let _ = a.update(Message::Connect);
+        let _ = a.view();
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.view();
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        for page in [Page::Home, Page::Machines, Page::Control] {
+            a.page = page;
+            let _ = a.view();
+        }
+        // The connected machine's UC100 fields are locked in the wizard.
+        let id = a.doc.machines[0].id.clone();
+        let _ = a.update(Message::EditMachine(id));
+        let _ = a.update(Message::WizardStep(3));
+        let _ = a.view();
+        let _ = a.update(Message::Disconnect);
     }
 
     #[test]
@@ -1413,6 +1474,7 @@ mod tests {
             Page::Home,
             Page::Work,
             Page::Machines,
+            Page::Control,
             Page::Tools,
             Page::Materials,
             Page::Workholding,

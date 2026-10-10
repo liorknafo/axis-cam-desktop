@@ -261,56 +261,63 @@ pub fn view(app: &App) -> Element<'_, Message> {
             background: Some(Color::from_rgb8(29, 46, 63).into()),
             ..Default::default()
         });
-    let docbar = container(
-        row![
-            btn("Start", Message::Page(Page::Home), app.page == Page::Home),
-            btn("New project", Message::NewProject, false),
-            help::wrap(
-                text_input("Project name", &app.doc.title)
-                    .on_input(Message::Title)
-                    .width(140)
-                    .size(14)
-                    .padding(7),
-                Help::text(
-                    "Project name",
-                    "The name shown in the browser and used as the suggested project filename."
-                ),
-                widget::tooltip::Position::Bottom
+    let mut top_row = row![
+        btn("Start", Message::Page(Page::Home), app.page == Page::Home),
+        btn("New project", Message::NewProject, false),
+        help::wrap(
+            text_input("Project name", &app.doc.title)
+                .on_input(Message::Title)
+                .width(140)
+                .size(14)
+                .padding(7),
+            Help::text(
+                "Project name",
+                "The name shown in the browser and used as the suggested project filename."
             ),
-            space().width(Fill),
-            btn("Import model", Message::Import, false),
-            btn("Open", Message::OpenProject, false),
-            btn("Save project", Message::SaveProject, false),
-            rule::vertical(1),
-            btn(
-                "Machine library",
-                Message::Page(Page::Machines),
-                app.page == Page::Machines
-            ),
-            btn("Tools", Message::Page(Page::Tools), app.page == Page::Tools),
-            btn(
-                "Materials",
-                Message::Page(Page::Materials),
-                app.page == Page::Materials
-            ),
-            btn(
-                "Workholding",
-                Message::Page(Page::Workholding),
-                app.page == Page::Workholding
-            ),
-            btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai),
-            btn(
-                "Operation support",
-                Message::Page(Page::Audit),
-                app.page == Page::Audit
-            )
-        ]
-        .spacing(5)
-        .align_y(Alignment::Center),
-    )
-    .height(48)
-    .padding([6, 12])
-    .style(panel_style);
+            widget::tooltip::Position::Bottom
+        ),
+        space().width(Fill),
+        btn("Import model", Message::Import, false),
+        btn("Open", Message::OpenProject, false),
+        btn("Save project", Message::SaveProject, false),
+        rule::vertical(1),
+        btn(
+            "Machine library",
+            Message::Page(Page::Machines),
+            app.page == Page::Machines
+        ),
+        btn(
+            "Control",
+            Message::Page(Page::Control),
+            app.page == Page::Control
+        ),
+        btn("Tools", Message::Page(Page::Tools), app.page == Page::Tools),
+        btn(
+            "Materials",
+            Message::Page(Page::Materials),
+            app.page == Page::Materials
+        ),
+        btn(
+            "Workholding",
+            Message::Page(Page::Workholding),
+            app.page == Page::Workholding
+        ),
+        btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai),
+        btn(
+            "Operation support",
+            Message::Page(Page::Audit),
+            app.page == Page::Audit
+        )
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center);
+    if app.control.is_some() {
+        top_row = top_row.push(estop());
+    }
+    let docbar = container(top_row)
+        .height(48)
+        .padding([6, 12])
+        .style(panel_style);
     let body: Element<_> = match app.page {
         Page::Home => start_screen(app),
         Page::Work if !app.doc.has_model() && app.doc.setups.is_empty() => blank_project(app),
@@ -319,6 +326,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .height(Fill)
             .into(),
         Page::Machines => machines(app),
+        Page::Control => control(app),
         Page::Wizard => wizard(app),
         Page::Tools => tools(app),
         Page::Materials => materials(app),
@@ -2398,31 +2406,38 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(note("Setups keep a snapshot of the machine. After saving, use Assign to setup so existing setups use these settings."));
             }
             if get(p, "controller") == "UC100" {
-                // ponytail: reads the profile on each redraw of this step; cache it if that ever shows.
-                let check: Element<_> = match crate::control::profile(m) {
-                    Ok(_) => muted("UC100 profile checked.").into(),
-                    Err(e) => warnings(vec![e]),
-                };
-                form = form
-                    .push(bold("UC100", 15))
-                    .push(
-                        row![
-                            field(p, "uc100_profile", "UC100 profile file", t),
-                            btn("Browse…", Message::BrowseUc100Profile, false)
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::End),
-                    )
-                    .push(choice_value(
-                        p,
-                        crate::control::connection_label(m),
-                        "uc100_connection",
-                        "Connection",
-                        &["USB", "Simulated"],
-                        t,
-                    ))
-                    .push(check)
-                    .push(note("AXIS CAM drives this machine itself from the Control page. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing."));
+                form = form.push(bold("UC100", 15));
+                if app.control.as_ref().is_some_and(|c| c.machine_id == m.id) {
+                    form = form
+                        .push(muted(format!("Profile: {}", get(p, "uc100_profile"))))
+                        .push(muted(format!("Connection: {}", crate::control::connection_label(m))))
+                        .push(note("Connected on the Control page. Disconnect there to change the profile or the connection."));
+                } else {
+                    // ponytail: reads the profile on each redraw of this step; cache it if that ever shows.
+                    let check: Element<_> = match crate::control::profile(m) {
+                        Ok(_) => muted("UC100 profile checked.").into(),
+                        Err(e) => warnings(vec![e]),
+                    };
+                    form = form
+                        .push(
+                            row![
+                                field(p, "uc100_profile", "UC100 profile file", t),
+                                btn("Browse…", Message::BrowseUc100Profile, false)
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::End),
+                        )
+                        .push(choice_value(
+                            p,
+                            crate::control::connection_label(m),
+                            "uc100_connection",
+                            "Connection",
+                            &["USB", "Simulated"],
+                            t,
+                        ))
+                        .push(check);
+                }
+                form = form.push(note("AXIS CAM drives this machine itself from the Control page. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing."));
             }
         }
         _ => {
@@ -2462,6 +2477,168 @@ fn wizard(app: &App) -> Element<'_, Message> {
         .center_x(Fill)
         .height(Fill)
         .into()
+}
+/// The red E-stop: in the top bar on every page while connected, and on the Control page.
+fn estop<'a>() -> Element<'a, Message> {
+    button(bold("E-STOP", 14).color(Color::WHITE))
+        .on_press(Message::MachineEStop)
+        .padding([8, 16])
+        .style(|_, status| button::Style {
+            background: Some(
+                if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    Color::from_rgb8(160, 20, 20)
+                } else {
+                    Color::from_rgb8(200, 30, 30)
+                }
+                .into(),
+            ),
+            text_color: Color::WHITE,
+            border: Border {
+                radius: 4.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The Control page: the UC100 machine, its connection and its live state.
+fn control(app: &App) -> Element<'_, Message> {
+    use uc100::{controller::State, gcode::Spindle};
+    let target = app.control_target();
+    let mut left = column![bold("Machine", 18)].spacing(10).width(300);
+    let machines: Vec<&Machine> = app
+        .doc
+        .machines
+        .iter()
+        .filter(|m| get(&m.p, "controller") == "UC100")
+        .collect();
+    if machines.is_empty() {
+        left = left
+            .push(note("No UC100 machine yet. In the Machine library, set a machine's controller to UC100 and choose its UC100 profile file."))
+            .push(btn("Machine library", Message::Page(Page::Machines), false));
+    }
+    for m in &machines {
+        left = left.push(btn(
+            m.name(),
+            Message::ControlMachine(m.id.clone()),
+            target.is_some_and(|t| t.id == m.id),
+        ));
+    }
+    if let Some(m) = target {
+        left = left.push(muted(format!(
+            "Connection: {}",
+            crate::control::connection_label(m)
+        )));
+        // The profile is read only while disconnected, not on every 33 ms tick.
+        left = match &app.control {
+            Some(_) => left.push(btn("Disconnect", Message::Disconnect, false)),
+            None => match crate::control::profile(m) {
+                Ok(_) => left.push(primary("Connect", Message::Connect)),
+                Err(e) => left.push(warnings(vec![e])),
+            },
+        };
+    }
+    let left = container(left).padding(16).style(panel_style);
+    let Some(c) = &app.control else {
+        return row![
+            left,
+            container(muted("Not connected.")).padding(16).width(Fill)
+        ]
+        .spacing(12)
+        .padding(12)
+        .height(Fill)
+        .into();
+    };
+    let s = &c.snapshot;
+    let mut head = row![bold(
+        s.state.as_ref().map_or("Connecting…", State::label),
+        28
+    )]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    if c.simulated {
+        head = head.push(
+            container(bold("SIMULATED", 12).color(Color::WHITE))
+                .padding([4, 8])
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgb8(196, 120, 20).into()),
+                    border: Border {
+                        radius: 4.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+    let mut main = column![head].spacing(12).width(Fill);
+    if s.state == Some(State::EStop) {
+        if let Some(reason) = &s.estop_reason {
+            main = main.push(text(reason.clone()).size(13));
+        }
+    }
+    let mut buttons = row![].spacing(8).align_y(Alignment::Center);
+    if s.state == Some(State::EStop) {
+        buttons = buttons.push(primary("Reset", Message::MachineReset));
+    }
+    main = main.push(buttons.push(estop()));
+    if let Some(id) = &s.identity {
+        let v = |o: &Option<String>| o.clone().unwrap_or_else(|| "?".into());
+        main = main.push(muted(format!(
+            "UC100 firmware {} · hardware {} · bootloader {}",
+            v(&id.firmware),
+            v(&id.hardware_id),
+            v(&id.bootloader)
+        )));
+    }
+    let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(120);
+    let mut table = column![row![
+        bold("Axis", 12).width(60),
+        bold("Machine", 12).width(120),
+        bold("Work", 12).width(120),
+        bold("Homed", 12)
+    ]]
+    .spacing(4);
+    for i in (0..6).filter(|&i| s.axes_enabled[i]) {
+        table = table.push(row![
+            text(["X", "Y", "Z", "A", "B", "C"][i]).size(14).width(60),
+            mono(format!("{:.3}", s.machine_pos[i])),
+            mono(format!("{:.3}", s.work_pos[i])),
+            text(if s.referenced[i] { "Yes" } else { "No" }).size(14),
+        ]);
+    }
+    main = main.push(table);
+    let spindle = match s.spindle {
+        Some(Spindle::Cw) => "CW",
+        Some(Spindle::Ccw) => "CCW",
+        _ => "off",
+    };
+    let on = |b: bool| if b { "on" } else { "off" };
+    main = main.push(muted(format!(
+        "Spindle {spindle} · {:.0} rpm · flood {} · mist {} · feed {:.0} mm/min · override {:.0}%",
+        s.rpm,
+        on(s.flood),
+        on(s.mist),
+        s.feed_rate,
+        s.feed_override * 100.0
+    )));
+    // ponytail: the last 30 log lines, newest last; a scrollable log when someone needs older lines.
+    let log = s
+        .log
+        .iter()
+        .skip(s.log.len().saturating_sub(30))
+        .fold(column![bold("Log", 14)].spacing(2), |col, line| {
+            col.push(text(line.clone()).size(11).font(Font::MONOSPACE))
+        });
+    row![
+        left,
+        container(main).padding(16).width(Fill).style(panel_style),
+        container(log).padding(16).width(420).style(panel_style)
+    ]
+    .spacing(12)
+    .padding(12)
+    .height(Fill)
+    .into()
 }
 fn tools(app: &App) -> Element<'_, Message> {
     if app.doc.tools.is_empty() && app.tool_draft.name().is_empty() {
