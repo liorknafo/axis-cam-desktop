@@ -130,6 +130,12 @@ pub enum Message {
     BrowseUc100Profile,
     /// The chosen UC100 profile; None when the dialog was cancelled.
     Uc100ProfilePicked(Option<PathBuf>),
+    /// Chooses the UC100 machine for the Control page (machine id).
+    ControlMachine(String),
+    Connect,
+    Disconnect,
+    MachineReset,
+    MachineEStop,
     EditTool(String),
     NewTool,
     SaveTool,
@@ -504,6 +510,10 @@ pub struct App {
     pub dirty: bool,
     pub last_edit: Instant,
     pub state_path: PathBuf,
+    /// The machine controller, while connected.
+    pub control: Option<control::Connection>,
+    /// The UC100 machine chosen on the Control page (machine id).
+    pub control_machine: Option<String>,
     pub project_path: Option<PathBuf>,
     pub project_dirty: bool,
     pub planner: Planner,
@@ -689,6 +699,8 @@ impl App {
             smoke_dir,
             smoke_step: 0,
             help_animating: false,
+            control: None,
+            control_machine: None,
             smoke_pending: false,
             machine_draft: doc
                 .machines
@@ -1079,9 +1091,27 @@ impl App {
         }
         action
     }
+    /// The machine the Control page connects to: the chosen UC100 machine, or the first one.
+    pub fn control_target(&self) -> Option<&Machine> {
+        let uc100 = |m: &&Machine| get(&m.p, "controller") == "UC100";
+        self.doc
+            .machines
+            .iter()
+            .filter(uc100)
+            .find(|m| self.control_machine.as_ref() == Some(&m.id))
+            .or_else(|| self.doc.machines.iter().find(uc100))
+    }
+    /// Disables the machine and stops its controller, if connected.
+    pub fn disconnect_machine(&mut self) {
+        if let Some(c) = self.control.take() {
+            c.close();
+            self.status = "Disconnected from the machine.".into();
+        }
+    }
     /// Saves the workspace, then carries out `close_decision`: closes the
     /// window, waits, or ends the process.
     fn request_close(&mut self, id: iced::window::Id) -> Task<Message> {
+        self.disconnect_machine();
         self.persist();
         match self.close_decision(id, Instant::now()) {
             CloseAction::Stay => {
@@ -2283,6 +2313,39 @@ impl App {
                     ));
                 }
             }
+            Message::ControlMachine(id) => {
+                if self.control.is_none() {
+                    self.control_machine = Some(id);
+                }
+            }
+            Message::Connect => {
+                if self.control.is_some() {
+                    return Task::none();
+                }
+                let Some(m) = self.control_target().cloned() else {
+                    self.status = "Add a UC100 machine in the Machine library first.".into();
+                    return Task::none();
+                };
+                let dir = self.state_path.parent().unwrap().join("uc100");
+                match control::Connection::open(&m, &dir) {
+                    Ok(c) => {
+                        self.status = format!("Connecting to {}…", m.name());
+                        self.control = Some(c);
+                    }
+                    Err(e) => self.status = format!("Cannot connect to {}: {e}", m.name()),
+                }
+            }
+            Message::Disconnect => self.disconnect_machine(),
+            Message::MachineReset => {
+                if let Some(c) = &self.control {
+                    c.send(uc100::controller::Command::Reset);
+                }
+            }
+            Message::MachineEStop => {
+                if let Some(c) = &self.control {
+                    c.send(uc100::controller::Command::EStop);
+                }
+            }
             Message::SaveMachine => {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
@@ -2829,6 +2892,9 @@ impl App {
             }
             Message::HelpHover(on) => self.help_animating = on,
             Message::Tick => {
+                if let Some(c) = &mut self.control {
+                    c.refresh();
+                }
                 if self.smoke_dir.is_some() && self.stock_mesh_key().is_some() {
                     assert!(
                         self.stock_mesh_failed.as_ref() != self.stock_mesh_key().as_ref(),
@@ -3406,7 +3472,7 @@ impl App {
     }
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            iced::time::every(if self.playing || self.help_animating {
+            iced::time::every(if self.playing || self.help_animating || self.control.is_some() {
                 Duration::from_millis(33)
             } else {
                 Duration::from_millis(500)
@@ -3431,6 +3497,11 @@ impl App {
                     modifiers,
                     ..
                 }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
+                // E-stop from any page, even while typing; ignored when not connected.
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::MachineEStop),
                 _ => None,
             }),
         ])

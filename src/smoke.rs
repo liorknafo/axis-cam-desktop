@@ -1317,6 +1317,84 @@ mod tests {
         assert_eq!(get(&a.machine_draft.p, "uc100_profile"), profile.display().to_string());
     }
 
+    /// An app with one simulated UC100 machine whose profile is the driver's template.
+    fn uc100_app(dir: &std::path::Path) -> App {
+        let mut a = App::from_workspace(dir.join("workspace.json"), None);
+        let profile = dir.join("uc100.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("name".into(), "JY5800".into());
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        a.doc.machines.push(m);
+        a
+    }
+
+    /// Ticks until the machine snapshot satisfies `ok`; fails after `secs`.
+    fn tick_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&uc100::controller::Snapshot) -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        loop {
+            let _ = a.update(Message::Tick);
+            let s = &a.control.as_ref().expect("connected").snapshot;
+            if ok(s) {
+                return;
+            }
+            assert!(std::time::Instant::now() < end, "timed out waiting for {what}: {:?} {:?}", s.state, s.log);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn connects_to_the_simulated_uc100_resets_and_e_stops() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        let _ = a.update(Message::Connect);
+        assert!(a.control.as_ref().is_some_and(|c| c.simulated));
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| s.state == Some(State::EStop));
+        let identity = a.control.as_ref().unwrap().snapshot.identity.clone().unwrap();
+        assert_eq!(identity.hardware_id.as_deref(), Some("SIMULATED"));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none());
+        // The simulator keeps its own saved state; the real machine's file is untouched.
+        let id = a.doc.machines[0].id.clone();
+        let state = dir.path().join("uc100");
+        assert!(state.join(format!("{id}-simulated.toml")).exists());
+        assert!(!state.join(format!("{id}.toml")).exists());
+    }
+
+    #[test]
+    fn connect_reports_a_missing_profile_and_needs_a_uc100_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut empty = App::from_workspace(dir.path().join("empty.json"), None);
+        let _ = empty.update(Message::Connect);
+        assert!(empty.control.is_none() && empty.status.contains("UC100 machine"));
+        // Esc without a connection does nothing.
+        let _ = empty.update(Message::MachineEStop);
+        assert!(empty.control.is_none());
+        let mut a = uc100_app(dir.path());
+        std::fs::remove_file(dir.path().join("uc100.toml")).unwrap();
+        let _ = a.update(Message::Connect);
+        assert!(a.control.is_none());
+        assert!(a.status.contains("cannot read"), "{}", a.status);
+    }
+
+    #[test]
+    fn closing_the_app_disconnects_the_machine() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| s.state == Some(State::EStop));
+        let _ = a.request_close(iced::window::Id::unique());
+        assert!(a.control.is_none());
+    }
+
     #[test]
     fn first_launch_and_empty_project_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

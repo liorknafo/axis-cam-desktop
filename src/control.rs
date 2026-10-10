@@ -3,6 +3,7 @@
 use crate::model::{Machine, get};
 use std::path::Path;
 use uc100::config::MachineConfig;
+use uc100::controller::{Command, Controller, Snapshot};
 
 /// Whether a UC100 machine connects to the simulator. Unset means the
 /// simulator, except on macOS, where the real machine is connected.
@@ -26,6 +27,54 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
         return Err("Choose the machine's UC100 profile file.".into());
     }
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
+}
+
+/// A running driver controller for one machine.
+pub struct Connection {
+    controller: Controller,
+    pub machine_id: String,
+    pub simulated: bool,
+    /// The driver's state at the last tick.
+    pub snapshot: Snapshot,
+    /// Keeps macOS from throttling AXIS CAM in the background, which would
+    /// starve the controller's motion buffer.
+    _nap: uc100::macos::ActivityToken,
+}
+
+impl Connection {
+    /// Starts the controller for `m`. The driver connects and leaves the
+    /// machine in E-stop. `state_dir` holds its saved offsets and last
+    /// position: one file per machine, and a separate one for the simulator
+    /// so a simulated session never overwrites the real machine's.
+    pub fn open(m: &Machine, state_dir: &Path) -> Result<Self, String> {
+        let mut cfg = profile(m)?;
+        let simulated = simulated(m);
+        cfg.controller.simulated = simulated;
+        let suffix = if simulated { "-simulated" } else { "" };
+        let file = state_dir.join(format!("{}{suffix}.toml", m.id));
+        Ok(Self {
+            _nap: uc100::macos::prevent_app_nap("AXIS CAM machine control"),
+            controller: Controller::start(cfg, Some(file)),
+            machine_id: m.id.clone(),
+            simulated,
+            snapshot: Snapshot::default(),
+        })
+    }
+
+    pub fn send(&self, command: Command) {
+        self.controller.send(command)
+    }
+
+    pub fn refresh(&mut self) {
+        self.snapshot = self.controller.snapshot();
+    }
+
+    /// Disables the machine and stops the controller thread.
+    pub fn close(self) {
+        let Connection { controller, .. } = self;
+        controller.send(Command::Disconnect);
+        controller.shutdown();
+    }
 }
 
 #[cfg(test)]
