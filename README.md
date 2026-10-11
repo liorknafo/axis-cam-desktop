@@ -302,8 +302,7 @@ AXIS CAM can drive a CNCdrive UC100 itself, through the
 simulated UC100: no hardware is opened and nothing moves. It keeps its own
 saved offsets and position, separate from the real machine's.
 
-Once the machine is Idle, the Control page has everything needed before a job
-(running setups comes in part 3):
+Once the machine is Idle, the Control page has everything needed before a job:
 
 - **Machine zero and soft limits.** A machine without home switches (the
   JY5800) does not know where its axes are. Jog X to its left end, Y to its
@@ -312,8 +311,9 @@ Once the machine is Idle, the Control page has everything needed before a job
   takes the position AXIS CAM saved at the last disconnect, for when nothing
   moved the machine since. Until every axis with a soft limit has a machine
   position, an amber box says the soft limits are **OFF**: nothing stops an
-  axis at the end of its travel. **Home** appears only when every axis has a
-  home switch.
+  axis at the end of its travel. Every E-stop clears the machine position, so
+  set it again after one. **Home** appears when every axis has a home switch;
+  an axis with a switch gets its position only by homing.
 - **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys (X, Y;
   up is +Y, away from you) and **Page Up/Down** (Z), and let go to stop. A
   release anywhere, leaving the button, or the window losing focus stops the
@@ -333,6 +333,45 @@ Once the machine is Idle, the Control page has everything needed before a job
   set. Its dimensions are **assumed** from a similar machine's spec sheet,
   as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
   the machine and correct both (`src/machine_view.rs`, the driver profile).
+
+### Running a setup
+
+The **Run** panel on the Control page runs a setup directly on the machine,
+with no G-code file in between.
+
+1. Pick one of the setups that use the connected machine. AXIS CAM simulates
+   the job up to it and checks it as export would (stock, work zero, rapids,
+   holder, jaws and clamps), then lists its **tool runs**: one per run of the
+   same tool, as with touch-off G-code programs.
+2. Set machine zero, then the work zero (the setup's work offset must be the
+   active one). **Cycle Start** stays grey, with the reasons listed, until the
+   tool run can start: the machine Idle, the AXIS CAM machine's X/Y/Z travel
+   equal to the profile's soft limits, X, Y and Z with a machine position,
+   the tool run inside the soft limits at this work zero, a spindle speed,
+   direction and coolant the profile can give, and the setup checked since
+   the last edit.
+3. **Cycle Start** turns the tool run into the driver's actions at the
+   current work zero (plan point − work zero + work offset, feeds in mm/s)
+   and sends them as one job; the driver checks the soft limits again before
+   anything moves. **Hold**, **Resume** and **Stop** (decelerate, then spindle
+   and coolant off). The panel shows the tool run, operation and block being
+   cut, and how the tool run ended.
+4. Between tool runs with different tools: the last one ended with the
+   spindle and coolant off at the setup's clearance plane. Touch the old tool
+   on a surface that stays put and press **Record reference** (this can be
+   done any time a tool is zeroed, also before the first tool run), change
+   the tool, touch the new one on the same surface and press **Set Z from
+   reference** (or **Zero Z** on an uncut stock top). Cycle Start then checks
+   the next tool run at the new Z; it waits for a new tool's touch-off and
+   refuses an X/Y work zero that moved since the first tool run. Each tool run
+   starts by rising (or dropping) to the clearance plane where the tool
+   stands, so leave it where a vertical move is safe.
+
+While a tool run of the setup shown on the Work page cuts, the 3D view draws
+the machine's tool in red at the live position; when that operation's
+simulation is shown, it follows the machine to the move being cut. The
+spindle start dwell and the Air output for UC100 runs are in the machine
+wizard.
 
 ## LinuxCNC G-code export
 
@@ -479,8 +518,9 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-three 
 - `src/choice_help.rs`, `src/choice_diagram.rs`: selected-value descriptions, related-setting context and matching native animations.
 - `src/storage.rs`: project loading and atomic persistence.
 - `src/rest.rs`: conservative continuous-sweep coverage for automatic cutting start heights, also used by export to prove a rapid's descent clear and to find the stock faces earlier setups cut, and (`RestStock::left`) the box a later setup starts from, and (`Removed`) where earlier cuts removed material, which operation did and whether the part is still joined to the material a holder grips.
-- `src/post.rs`: LinuxCNC postprocessor: blocks from the simulated moves, the emitter and its header (work zero, part box for Model origin, fixture, workholding), file names, and `post_job`/`write_job` for the NC program page and `--export-gcode`.
+- `src/post.rs`: LinuxCNC postprocessor: blocks from the simulated moves, the emitter and its header (work zero, part box for Model origin, fixture, workholding), file names, and `post_job`/`write_job` for the NC program page and `--export-gcode`; `checked`, the export checks shared with UC100 runs (`PostSettings::for_uc100`).
 - `src/control.rs`: the UC100 connection: a machine's driver profile and Connection, the driver's controller for one machine, its saved state files and the snapshot the Control page draws; the Control page's actions (`Action`, `Connection::act`) and their guards, machine positions declared one per tick, and the held jog's keepalive.
+- `src/run.rs`: running a setup on the UC100: its checked tool runs, the lowering of a tool run to the driver's actions at the live work offset, the checks before Cycle Start, progress, the tool change between tool runs, and the live tool for the 3D view.
 - `src/machine_view.rs`: the CNC4030 model on the Control page: assumed dimensions, flat-shaded faces drawn far to near, the travel box and the tool tip.
 - `src/post_check.rs`: export checks: spindle and feed limits, travel, rapids into material, holder clearance, jaw and clamp clearance over every program move, and touch-off rules.
 - `src/holding.rs`: the workholding library (vises and clamps and their starters), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
