@@ -528,6 +528,48 @@ impl Viewport<'_> {
                 );
             }
         }
+        if let Some((tip, radius, stickout)) = self.live {
+            // The machine's tool, in red, depth-tested like the simulated one.
+            // A little wider, so that it shows over the simulated tool when
+            // the simulation follows the machine.
+            let radius = radius + 0.5;
+            let scale = self.mesh.display_scale();
+            let project = |v: [f32; 3]| {
+                let v = v.map(|n| n * scale);
+                let q = p.p(v);
+                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+            };
+            let ring = |a: f32, up: f32| {
+                project([
+                    tip[0] + radius * a.cos(),
+                    tip[1] + radius * a.sin(),
+                    tip[2] + up,
+                ])
+            };
+            let step = std::f32::consts::TAU / 24.;
+            let top = ring(0., stickout);
+            for i in 0..24 {
+                let (a, b) = (i as f32 * step, (i + 1) as f32 * step);
+                let light = 0.75 + 0.25 * (a + 0.6).cos().abs();
+                let side = [
+                    (214. * light) as u8,
+                    (40. * light) as u8,
+                    (40. * light) as u8,
+                    255,
+                ];
+                let quad = [
+                    ring(a, 0.),
+                    ring(b, 0.),
+                    ring(b, stickout),
+                    ring(a, stickout),
+                ];
+                for t in [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]] {
+                    raster_triangle(&mut rgba, &mut depths, w, h, t, side);
+                }
+                let cap = [top, ring(a, stickout), ring(b, stickout)];
+                raster_triangle(&mut rgba, &mut depths, w, h, cap, [214, 40, 40, 255]);
+            }
+        }
         if self.sample && self.show_paths && self.setup.is_some_and(|s| !s.is_repositioned()) {
             let strategy = self
                 .operation
@@ -1011,7 +1053,10 @@ impl canvas::Program<Event> for Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
-        let key = format!("{key}|{:?}|{:?}", self.holding, self.leftover);
+        let key = format!(
+            "{key}|{:?}|{:?}|{:?}",
+            self.holding, self.leftover, self.live
+        );
         let mut cached = state.raster.borrow_mut();
         if cached.as_ref().is_none_or(|(previous, _)| *previous != key) {
             *cached = Some((key, self.raster(&p, bounds, hovered)));
@@ -1054,22 +1099,14 @@ impl canvas::Program<Event> for Viewport<'_> {
                 ..Text::default()
             });
         }
-        if let Some((tip, radius, stickout)) = self.live {
+        // The live tool is in the raster; text is drawn above it.
+        if let Some((tip, _, stickout)) = self.live {
             let scale = self.mesh.display_scale();
-            let at = |up: f32| p.p([tip[0] * scale, tip[1] * scale, (tip[2] + up) * scale]);
-            let red = Color::from_rgb8(214, 40, 40);
-            let width = (2. * radius * scale * p.scale).max(3.);
-            line(
-                &mut frame,
-                &[at(0.), at(stickout)],
-                Color { a: 0.45, ..red },
-                width,
-            );
-            frame.fill(&Path::circle(at(0.), 4.), red);
+            let top = p.p([tip[0] * scale, tip[1] * scale, (tip[2] + stickout) * scale]);
             frame.fill_text(Text {
                 content: "Machine".into(),
-                position: Point::new(at(0.).x + 8., at(0.).y - 6.),
-                color: red,
+                position: Point::new(top.x + 10., top.y - 14.),
+                color: Color::from_rgb8(214, 40, 40),
                 size: 12.into(),
                 ..Text::default()
             });
