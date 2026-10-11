@@ -300,8 +300,39 @@ AXIS CAM can drive a CNCdrive UC100 itself, through the
 
 **Simulated** runs the driver's real controller, planner and checks against a
 simulated UC100: no hardware is opened and nothing moves. It keeps its own
-saved offsets and position, separate from the real machine's. Jogging,
-homing, work zero and running setups come in the next parts.
+saved offsets and position, separate from the real machine's.
+
+Once the machine is Idle, the Control page has everything needed before a job
+(running setups comes in part 3):
+
+- **Machine zero and soft limits.** A machine without home switches (the
+  JY5800) does not know where its axes are. Jog X to its left end, Y to its
+  front end (gantry toward you) and Z to the top, then press **Set machine
+  zero here** (or **X**, **Y**, **Z** for one axis). **Keep the last position**
+  takes the position AXIS CAM saved at the last disconnect, for when nothing
+  moved the machine since. Until every axis with a soft limit has a machine
+  position, an amber box says the soft limits are **OFF**: nothing stops an
+  axis at the end of its travel. **Home** appears only when every axis has a
+  home switch.
+- **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys (X, Y;
+  up is +Y, away from you) and **Page Up/Down** (Z), and let go to stop. A
+  release anywhere, leaving the button, or the window losing focus stops the
+  jog too; a jog that a soft limit or E-stop ended needs a new press. Keys do
+  nothing while a text field is being edited. **0.01/0.1/1/10 mm** move one
+  step per press; the speed slider is a share of each axis's maximum speed.
+- **Work zero.** **Zero X/Y/Z/all** in the active coordinate system;
+  **G54–G59** pick it (while Idle).
+- **Spindle and coolant.** CW at an RPM, Stop; CCW only when the profile has a
+  direction output; Flood and Mist only for the outputs the profile has.
+- **Overrides.** Feed override 10–200 %; **Override limit switches** when the
+  profile has any.
+- **MDI.** One G-code line, sent with Enter or **Send**.
+- **The machine.** A model of the CNC4030 (gantry, carriage, spindle, T-slot
+  table) moves with the live position, with the tool-tip travel box from the
+  soft limits; drag to turn it. It is amber until the machine position is
+  set. Its dimensions are **assumed** from a similar machine's spec sheet,
+  as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
+  the machine and correct both (`src/machine_view.rs`, the driver profile).
 
 ## LinuxCNC G-code export
 
@@ -449,7 +480,8 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-three 
 - `src/storage.rs`: project loading and atomic persistence.
 - `src/rest.rs`: conservative continuous-sweep coverage for automatic cutting start heights, also used by export to prove a rapid's descent clear and to find the stock faces earlier setups cut, and (`RestStock::left`) the box a later setup starts from, and (`Removed`) where earlier cuts removed material, which operation did and whether the part is still joined to the material a holder grips.
 - `src/post.rs`: LinuxCNC postprocessor: blocks from the simulated moves, the emitter and its header (work zero, part box for Model origin, fixture, workholding), file names, and `post_job`/`write_job` for the NC program page and `--export-gcode`.
-- `src/control.rs`: the UC100 connection: a machine's driver profile and Connection, the driver's controller for one machine, its saved state files and the snapshot the Control page draws.
+- `src/control.rs`: the UC100 connection: a machine's driver profile and Connection, the driver's controller for one machine, its saved state files and the snapshot the Control page draws; the Control page's actions (`Action`, `Connection::act`) and their guards, machine positions declared one per tick, and the held jog's keepalive.
+- `src/machine_view.rs`: the CNC4030 model on the Control page: assumed dimensions, flat-shaded faces drawn far to near, the travel box and the tool tip.
 - `src/post_check.rs`: export checks: spindle and feed limits, travel, rapids into material, holder clearance, jaw and clamp clearance over every program move, and touch-off rules.
 - `src/holding.rs`: the workholding library (vises and clamps and their starters), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
 - `src/ngc.rs`: strict reader for the G-code subset the post writes, and the replay that compares each program move by move with the simulation.

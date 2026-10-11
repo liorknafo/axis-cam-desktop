@@ -106,7 +106,7 @@ Read-only helpers for the page: `held()`, `home_switches()` (every enabled axis 
 
 Left column (300 px): the machine picker, Connection, Connect/Disconnect (part 1), then the log (moved here from the right column so the main area has room at the minimum window width).
 
-Main area, scrollable:
+Main area, scrollable (as built after a look in the app: Position beside Jog, so jogging needs no scrolling at the default window size; the model beside Work zero, Spindle and Overrides; MDI last):
 
 1. **Head:** the state in large type, SIMULATED, Reset (in E-stop), E-STOP, the identity line (part 1).
 2. **Soft limits:** an amber box "Soft limits are OFF" naming the axes without a machine position, while any limited axis is unreferenced; "Soft limits on: X 0…390, Y 0…280, Z −55…0 mm" once all are; "This profile sets no soft limits" without any.
@@ -136,7 +136,7 @@ World coordinates are machine coordinates of the tool tip (mm): machine zero at 
 | Spindle body | Ø65 × 185 mm |
 | Nominal tool | Ø6, 30 mm below the collet nut |
 
-Parts: base frame and T-slot table (fixed); gantry (side plates and beam) at the tool's Y; X carriage on the front of the beam at the tool's X; Z plate, spindle, collet nut and tool at X, Y, Z. The tool-tip travel box is drawn from the profile's soft limits when X, Y and Z all have them, otherwise from the assumed travel; the tool tip is a red dot. While X, Y or Z has no machine position the moving parts are drawn translucent, the box amber, and a label says "Machine position not set: the model follows the step counters, not the machine".
+Parts: base frame and T-slot table (fixed); gantry (side plates and beam) at the tool's Y; X carriage on the front of the beam at the tool's X; Z plate, spindle, collet nut and tool at X, Y, Z. The tool-tip travel box is drawn from the profile's soft limits when X, Y and Z all have them, otherwise from the assumed travel; the tool tip is a red dot. While X, Y or Z has no machine position the moving parts are tinted amber (translucent parts showed their inner faces when tried), the box amber, and a label says "Machine position not set: the model follows the step counters, not the machine".
 
 ## 5. Status line (LIO-75)
 
