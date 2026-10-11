@@ -516,6 +516,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml_edit",
  "uc100",
  "uuid",
  "zip",
@@ -5592,6 +5593,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

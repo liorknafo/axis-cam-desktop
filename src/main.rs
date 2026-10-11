@@ -25,6 +25,7 @@ mod proposal;
 mod rest;
 mod session;
 mod settings;
+mod setup;
 mod simulation;
 mod smoke;
 mod step;
