@@ -34,6 +34,8 @@ pub struct Connection {
     controller: Controller,
     pub machine_id: String,
     pub simulated: bool,
+    /// The profile the controller was started with; the snapshot has no config.
+    pub config: MachineConfig,
     /// The driver's state at the last tick.
     pub snapshot: Snapshot,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
@@ -54,7 +56,8 @@ impl Connection {
         let file = state_dir.join(format!("{}{suffix}.toml", m.id));
         Ok(Self {
             _nap: uc100::macos::prevent_app_nap("AXIS CAM machine control"),
-            controller: Controller::start(cfg, Some(file)),
+            controller: Controller::start(cfg.clone(), Some(file)),
+            config: cfg,
             machine_id: m.id.clone(),
             simulated,
             snapshot: Snapshot::default(),

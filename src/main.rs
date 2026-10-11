@@ -2895,6 +2895,19 @@ impl App {
             Message::Tick => {
                 if let Some(c) = &mut self.control {
                     c.refresh();
+                    // "Connecting to <machine>…" until the driver reports a state.
+                    if let (Some(name), Some(state)) = (
+                        self.status.strip_prefix("Connecting to "),
+                        &c.snapshot.state,
+                    ) {
+                        let name = name.trim_end_matches('…');
+                        self.status = match state {
+                            uc100::controller::State::Disconnected => format!(
+                                "Could not connect to {name}; see the log on the Control page."
+                            ),
+                            s => format!("Connected to {name}: {}", s.label()),
+                        };
+                    }
                 }
                 if self.smoke_dir.is_some() && self.stock_mesh_key().is_some() {
                     assert!(

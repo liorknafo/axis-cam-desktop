@@ -1325,9 +1325,107 @@ mod tests {
 
     /// An app with one simulated UC100 machine whose profile is the driver's template.
     fn uc100_app(dir: &std::path::Path) -> App {
+        profile_app(dir, uc100::config::TEMPLATE)
+    }
+
+    /// Like the JY5800: X, Y, Z with soft limits, no switches, a PWM spindle
+    /// without a direction output, flood but no mist.
+    const LIMITED: &str = r#"
+[controller]
+step_rate = "100kHz"
+[axes.x]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 390.0
+[axes.y]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 280.0
+[axes.z]
+steps_per_unit = 400.0
+max_velocity = 1000.0
+acceleration = 200.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -55.0
+soft_max = 0.0
+[outputs]
+spindle_pwm = { pin = 16 }
+flood = { pin = 8 }
+"#;
+
+    /// Home switches on every axis, a limit switch on X, a reversible
+    /// spindle and mist.
+    const SWITCHED: &str = r#"
+[controller]
+step_rate = "100kHz"
+[axes.x]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 2 }
+dir = { pin = 3 }
+home = { pin = 11 }
+limit_neg = { pin = 15 }
+[axes.y]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 4 }
+dir = { pin = 5 }
+home = { pin = 12 }
+[axes.z]
+steps_per_unit = 400.0
+max_velocity = 1000.0
+acceleration = 200.0
+step = { pin = 6 }
+dir = { pin = 7 }
+home = { pin = 13 }
+home_negative = false
+[outputs]
+spindle_cw = { pin = 1 }
+spindle_ccw = { pin = 14 }
+mist = { pin = 9 }
+"#;
+
+    /// The connection of a connected test app.
+    fn conn(a: &App) -> &crate::control::Connection {
+        a.control.as_ref().expect("connected")
+    }
+
+    /// Connects, resets and waits for Idle.
+    fn idle(a: &mut App) {
+        use uc100::controller::State;
+        let _ = a.update(Message::Connect);
+        tick_until(a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::MachineReset);
+        tick_until(a, 3.0, "Idle after Reset", |s| s.state == Some(State::Idle));
+    }
+
+    /// Runs one MDI line and waits until the machine is Idle again.
+    fn mdi(a: &mut App, line: &str) {
+        use uc100::controller::{Command, State};
+        conn(a).send(Command::Mdi(line.into()));
+        // The line leaves Idle (Run) and comes back; the log shows a refusal.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        tick_until(a, 5.0, line, |s| s.state == Some(State::Idle));
+    }
+
+    /// An app with one simulated UC100 machine with the given profile.
+    fn profile_app(dir: &std::path::Path, profile_text: &str) -> App {
         let mut a = App::from_workspace(dir.join("workspace.json"), None);
         let profile = dir.join("uc100.toml");
-        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        std::fs::write(&profile, profile_text).unwrap();
         let mut m = Machine::new(3);
         m.p.insert("name".into(), "JY5800".into());
         m.p.insert("controller".into(), "UC100".into());
@@ -1393,6 +1491,33 @@ mod tests {
         let state = dir.path().join("uc100");
         assert!(state.join(format!("{id}-simulated.toml")).exists());
         assert!(!state.join(format!("{id}.toml")).exists());
+    }
+
+    #[test]
+    fn the_test_profiles_are_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [LIMITED, SWITCHED] {
+            let a = profile_app(dir.path(), text);
+            assert!(crate::control::profile(&a.doc.machines[0]).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_status_line_shows_the_machine_state_once_connected() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        let _ = a.update(Message::Connect);
+        assert!(a.status.starts_with("Connecting to JY5800"), "{}", a.status);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        assert_eq!(a.status, "Connected to JY5800: E-STOP");
+        // Later states do not overwrite other messages.
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        assert_eq!(a.status, "Connected to JY5800: E-STOP");
+        assert!(conn(&a).config.axis_enabled(2));
     }
 
     #[test]
