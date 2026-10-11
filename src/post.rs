@@ -42,8 +42,43 @@ impl PostSettings {
         if !e.is_empty() {
             return Err(e);
         }
-        let value = |k: &str| post_setting(&m.p, k).trim().parse::<f32>().unwrap_or(0.);
+        Ok(Self::read(m))
+    }
+    /// What running a setup on a UC100 machine uses: touch-off mode (one
+    /// program per tool run, the tool changed by hand in between), retracts
+    /// to the setup clearance plane, which the checks prove clear of the
+    /// stock and the jaws, and the machine's spindle start dwell and Air
+    /// output. The driver blends corners with the profile's own setting.
+    pub fn for_uc100(m: &Machine) -> Result<Self, Vec<String>> {
+        let mut e = vec![];
+        if get(&m.p, "controller") != "UC100" {
+            e.push(format!(
+                "{} uses the {} controller, not the UC100.",
+                m.name(),
+                get(&m.p, "controller")
+            ));
+        }
+        if m.axes() != 3 || get(&m.p, "mode") != "3-axis" {
+            e.push(format!(
+                "{} is not a 3-axis machine. Only 3-axis runs are implemented.",
+                m.name()
+            ));
+        }
+        e.extend(m.issues());
+        e.extend(post_setting_issues(&m.p));
+        if !e.is_empty() {
+            return Err(e);
+        }
         Ok(Self {
+            tool_table: false,
+            machine_home: false,
+            blend: 0.,
+            ..Self::read(m)
+        })
+    }
+    fn read(m: &Machine) -> Self {
+        let value = |k: &str| post_setting(&m.p, k).trim().parse::<f32>().unwrap_or(0.);
+        Self {
             tool_table: post_setting(&m.p, "post_tool_length") == POST_TOOL_LENGTH[0],
             machine_home: post_setting(&m.p, "post_retract") == POST_RETRACT[0],
             blend: value("post_blend"),
@@ -53,7 +88,7 @@ impl PostSettings {
                 "M8" => Some((false, true)),
                 _ => None,
             },
-        })
+        }
     }
 }
 /// Program zero in the setup's plan coordinates (mm).
@@ -1030,6 +1065,9 @@ struct Walk<'a> {
     /// the setup at every change of tool.
     groups: Vec<std::ops::Range<usize>>,
 }
+/// How a setup's machine turns into post settings: `PostSettings::from_machine`
+/// for G-code export, `PostSettings::for_uc100` for a UC100 run.
+pub(crate) type Settings = fn(&Machine) -> Result<PostSettings, Vec<String>>;
 /// A setup's `Walk`, or why export cannot walk it: a setting, an operation
 /// that did not generate or cannot be posted, no work zero, or stock boxes
 /// that differ between its operations.
@@ -1038,13 +1076,12 @@ fn walk<'a>(
     mesh: &Mesh,
     si: usize,
     sims: &'a [(usize, Result<Simulation, String>)],
+    settings: Settings,
 ) -> Result<Walk<'a>, Vec<String>> {
     let setup = &doc.setups[si];
     let offset = get(&setup.p, "offset").to_string();
     let mut errors = vec![];
-    let settings = PostSettings::from_machine(&setup.machine)
-        .map_err(|e| errors.extend(e))
-        .ok();
+    let settings = settings(&setup.machine).map_err(|e| errors.extend(e)).ok();
     if !OFFSETS.contains(&offset.as_str()) {
         errors.push(format!(
             "Work offset \"{offset}\" is not a LinuxCNC register (G54-G59.3)."
@@ -1232,7 +1269,7 @@ pub(crate) fn held_walked(
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Option<Vec<Held>> {
-    let walk = walk(doc, mesh, si, sims).ok()?;
+    let walk = walk(doc, mesh, si, sims, PostSettings::from_machine).ok()?;
     let held = gripped(doc, mesh, si, &walk);
     let boxes = match holding_boxes(doc, si, held) {
         Ok(boxes) => boxes,
@@ -1266,6 +1303,25 @@ pub(crate) fn held_walked(
     }
     Some(found)
 }
+/// One program of a setup that passed every check: its blocks and what they
+/// were made from.
+#[derive(Debug, Clone)]
+pub struct Checked {
+    pub blocks: Vec<Block>,
+    pub ops: Vec<OpState>,
+    /// The index in the setup of each of `ops`.
+    pub indexes: Vec<usize>,
+    /// How many plan moves each of `ops` has.
+    pub moves: Vec<usize>,
+    pub stock: Bounds,
+    pub datum: [f32; 3],
+    pub settings: PostSettings,
+    pub offset: String,
+    /// (program, count, tool) when touch-off mode splits the setup.
+    pub part: Option<(usize, usize, u32)>,
+    /// A Model-origin zero located for the operator (`model_zero`).
+    pub located: Option<(Bounds, Option<f32>)>,
+}
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
 pub(crate) fn prepare(
@@ -1275,8 +1331,51 @@ pub(crate) fn prepare(
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Result<Vec<Prepared>, Vec<String>> {
     let setup = &doc.setups[si];
+    let programs = checked(doc, mesh, si, sims, PostSettings::from_machine)?;
+    Ok(programs
+        .into_iter()
+        .map(|c| {
+            let header = Header {
+                job: &doc.title,
+                setup,
+                number: si + 1,
+                part: c.part.map(|(i, count, _)| (i, count)),
+                stock: c.stock,
+                located: c.located,
+                datum: c.datum,
+                holding: doc.holding_text(setup),
+                disabled: setup
+                    .operations
+                    .iter()
+                    .filter(|o| !o.enabled)
+                    .map(|o| o.name().to_string())
+                    .collect(),
+            };
+            Prepared {
+                file_name: file_name(doc, si, c.part),
+                text: emit(&header, &c.ops, &c.blocks, &c.settings),
+                blocks: c.blocks,
+                ops: c.ops,
+                datum: c.datum,
+                settings: c.settings,
+                offset: c.offset,
+            }
+        })
+        .collect())
+}
+/// Check one setup from its `sequence` results (enabled operations only), as
+/// export does, with the post settings `settings` makes of its machine: its
+/// programs, one, or one per run of the same tool in touch-off mode.
+pub(crate) fn checked(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+    settings: Settings,
+) -> Result<Vec<Checked>, Vec<String>> {
+    let setup = &doc.setups[si];
     let offset = get(&setup.p, "offset").to_string();
-    let walk = walk(doc, mesh, si, sims)?;
+    let walk = walk(doc, mesh, si, sims, settings)?;
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
     let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
     let held = gripped(doc, mesh, si, &walk);
@@ -1328,32 +1427,17 @@ pub(crate) fn prepare(
         if !problems.is_empty() {
             return Err(problems);
         }
-        let part = (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool));
-        let header = Header {
-            job: &doc.title,
-            setup,
-            number: si + 1,
-            part: part.map(|(i, count, _)| (i, count)),
-            stock: plans[0].stock,
-            located,
-            datum: zero,
-            holding: doc.holding_text(setup),
-            disabled: setup
-                .operations
-                .iter()
-                .filter(|o| !o.enabled)
-                .map(|o| o.name().to_string())
-                .collect(),
-        };
-        let text = emit(&header, group_ops, &blocks, &settings);
-        out.push(Prepared {
-            file_name: file_name(doc, si, part),
-            text,
+        out.push(Checked {
             blocks,
             ops: group_ops.to_vec(),
+            indexes: walk.indexes[g.clone()].to_vec(),
+            moves: plans.iter().map(|p| p.moves.len()).collect(),
+            stock: plans[0].stock,
             datum: zero,
             settings,
             offset: offset.clone(),
+            part: (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool)),
+            located,
         });
     }
     Ok(out)
@@ -3478,7 +3562,10 @@ M2
         machine.insert("post_retract".into(), POST_RETRACT[1].into());
         machine.insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
         let sims = results(&doc, &mesh);
-        let programs = walk(&doc, &mesh, 0, &sims[0]).unwrap().groups.len();
+        let programs = walk(&doc, &mesh, 0, &sims[0], PostSettings::from_machine)
+            .unwrap()
+            .groups
+            .len();
         assert_eq!(programs, 2);
         let found = held(&doc, &mesh, 0, &sims[0]);
         let plane: Vec<_> = found
