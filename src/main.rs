@@ -590,6 +590,7 @@ fn while_locked(m: &Message) -> bool {
         Page(_)
             | SelectSetup(_)
             | SelectOp(_)
+            | SetupEditor
             | Tab(_)
             | Connect
             | Disconnect
@@ -3230,6 +3231,9 @@ impl App {
                             s => format!("Connected to {name}: {}", s.label()),
                         };
                     }
+                }
+                if self.status == LOCKED && !self.locked() {
+                    self.status.clear();
                 }
                 if self.smoke_dir.is_some() && self.stock_mesh_key().is_some() {
                     assert!(

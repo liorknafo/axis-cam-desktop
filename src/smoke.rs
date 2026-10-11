@@ -1845,12 +1845,15 @@ flood = { pin = 8 }
             assert_eq!(a.status, crate::LOCKED);
         }
         assert!(!a.playing && a.progress == 0. && a.doc.title == title);
-        a.page = Page::Work;
+        // Looking at it on the Work page is not planning.
+        let _ = a.update(Message::SetupEditor);
+        let _ = a.update(Message::SelectOp(0));
+        assert_eq!((a.page, a.selected), (Page::Work, Some(0)));
         let _ = a.view();
         let _ = a.update(Message::Run(R::Stop));
         run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
         tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
-        assert!(a.live_tool().is_none() && !a.locked());
+        assert!(a.live_tool().is_none() && !a.locked() && a.status.is_empty());
         let _ = a.update(Message::Play);
         assert!(a.playing);
     }
