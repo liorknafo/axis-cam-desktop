@@ -21,6 +21,10 @@ pub struct Draft {
     pub path: PathBuf,
     /// The file as read, to refuse saving over a change made since.
     original: String,
+    /// The document as opened or last saved, to tell whether it changed.
+    shown: String,
+    /// The file has Windows line endings, which Save keeps.
+    crlf: bool,
     doc: DocumentMut,
     /// Number fields as typed, by path, so "0." stays on screen while the
     /// document already holds 0. Those that are not numbers block Save.
@@ -65,13 +69,17 @@ impl Draft {
         }
         let original =
             std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
-        let doc: DocumentMut = original.parse().map_err(|e| {
+        // toml_edit writes LF, so a CRLF file is read as LF and written back as CRLF.
+        let crlf = original.contains("\r\n");
+        let doc: DocumentMut = original.replace("\r\n", "\n").parse().map_err(|e| {
             format!("{path} is not valid TOML, so it cannot be edited here; fix it in a text editor: {e}")
         })?;
         let mut d = Draft {
             machine_id: m.id.clone(),
             path: path.into(),
             original,
+            shown: doc.to_string(),
+            crlf,
             doc,
             typed: BTreeMap::new(),
             checked: Err(String::new()),
@@ -220,7 +228,7 @@ impl Draft {
     }
 
     pub fn dirty(&self) -> bool {
-        self.doc.to_string() != self.original
+        self.doc.to_string() != self.shown
     }
 
     /// Why Save is not offered, if it is not.
@@ -247,9 +255,15 @@ impl Draft {
         if now != self.original {
             return Err("The profile file changed since it was opened. Revert to load it, then make the changes again.".into());
         }
-        let text = self.doc.to_string();
+        let shown = self.doc.to_string();
+        let text = if self.crlf {
+            shown.replace('\n', "\r\n")
+        } else {
+            shown.clone()
+        };
         crate::storage::write_atomic(&self.path, text.as_bytes())?;
         self.original = text;
+        self.shown = shown;
         self.typed.clear();
         self.checked.clone()
     }
@@ -943,6 +957,23 @@ order = \"X\"\n";
                 .contains("changed since it was opened")
         );
         assert_eq!(std::fs::read_to_string(&d.path).unwrap(), PROFILE);
+    }
+
+    #[test]
+    fn a_windows_file_opens_unchanged_and_keeps_its_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let crlf = PROFILE.replace('\n', "\r\n");
+        let mut d = draft(dir.path(), &crlf);
+        assert!(!d.dirty());
+        assert_eq!(d.blocker().unwrap(), "No changes.");
+        d.edit(Edit::Number("axes.x.soft_max".into(), "380".into()));
+        d.save().unwrap();
+        let text = std::fs::read_to_string(&d.path).unwrap();
+        assert_eq!(text, crlf.replace("soft_max = 390", "soft_max = 380"));
+        assert!(!d.dirty());
+        // Saving again checks the disk against what was written.
+        d.edit(Edit::Number("axes.x.soft_max".into(), "370".into()));
+        d.save().unwrap();
     }
 
     #[test]
