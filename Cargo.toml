@@ -25,7 +25,7 @@ futures-util = "0.3.34"
 sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
-uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "36885a1fd0ea124e494b9db7d464e0393401ce6d", default-features = false }
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "d48a4780ccd137c3d987ef58b9f3eb80c1b571b5", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
