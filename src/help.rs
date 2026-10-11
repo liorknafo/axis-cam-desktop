@@ -484,6 +484,10 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         JogStep(None) => "Jog for as long as the button or key is held.",
         JogStep(Some(_)) => "Move exactly this far for each press.",
         JogSpeed(_) => "Jog speed, as a share of each axis's maximum speed in the profile.",
+        TestOutput(_, Some(_)) => {
+            "Force this output pin for a wiring test, while Idle. E-stop releases every forced pin."
+        }
+        TestOutput(_, None) => "Release the pin: the machine drives it again.",
         WorkZero(None) => {
             "Make the current position work zero on every axis, in the active coordinate system (G54–G59)."
         }

@@ -1,10 +1,13 @@
 //! Machine setup on the Control page: the UC100 profile form, the inputs
 //! and the output test, the driver's audit, and steps-per-mm calibration.
+use crate::control::{Action, Connection};
 use crate::model::{Machine, get};
 use crate::ui::{act, bold, btn, caution, machine_panel, muted, note};
 use crate::{App, Message};
-use iced::widget::{checkbox, column, container, pick_list, row, scrollable, text, text_input};
-use iced::{Alignment, Color, Element, Fill};
+use iced::widget::{
+    Column, checkbox, column, container, pick_list, row, scrollable, text, text_input,
+};
+use iced::{Alignment, Color, Element, Fill, Font};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
@@ -409,6 +412,14 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
         }));
     }
     let mut main = column![head].spacing(12);
+    match here {
+        Some(c) => main = main.push(row![inputs(c), outputs(c)].spacing(12)),
+        None => {
+            main = main.push(muted(
+                "Connect to watch the inputs, test the outputs and calibrate.",
+            ))
+        }
+    }
     main = main.push(machine_panel(
         "Commissioning",
         column![
@@ -519,6 +530,166 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
         ],
     ));
     main.into()
+}
+
+/// What the running profile wires to a pin: "X step", "E-stop".
+fn roles(cfg: &MachineConfig, pin: u8) -> String {
+    let mut names = Vec::new();
+    for (i, axis) in AXES.iter().enumerate() {
+        let Some(a) = cfg.axes.get(i) else { continue };
+        for (p, what) in [
+            (Some(a.step), "step"),
+            (Some(a.dir), "direction"),
+            (a.limit_neg, "limit, low end"),
+            (a.limit_pos, "limit, high end"),
+            (a.home, "home"),
+        ] {
+            if p.is_some_and(|p| p.pin == pin) {
+                names.push(format!("{} {what}", axis.to_uppercase()));
+            }
+        }
+    }
+    let (i, o) = (&cfg.inputs, &cfg.outputs);
+    for (p, what) in [
+        (i.estop, "E-stop"),
+        (i.probe, "probe"),
+        (i.index, "spindle index"),
+        (o.spindle_pwm, "spindle PWM"),
+        (o.spindle_dir, "spindle direction"),
+        (o.spindle_cw, "spindle CW"),
+        (o.spindle_ccw, "spindle CCW"),
+        (o.flood, "flood"),
+        (o.mist, "mist"),
+        (o.enable, "drive enable"),
+        (o.charge_pump, "charge pump"),
+    ] {
+        if p.is_some_and(|p| p.pin == pin) {
+            names.push(what.into());
+        }
+    }
+    if names.is_empty() {
+        "unused".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn level<'a>(high: Option<bool>) -> iced::widget::Text<'a> {
+    let (s, c) = match high {
+        Some(true) => ("HIGH", Color::from_rgb8(39, 130, 93)),
+        Some(false) => ("LOW", Color::from_rgb8(110, 128, 145)),
+        None => ("?", Color::from_rgb8(110, 128, 145)),
+    };
+    text(s).size(12).font(Font::MONOSPACE).color(c).width(44)
+}
+
+/// The input pins: level, role, changes, the last edges and the E-stop input.
+fn inputs(c: &Connection) -> Element<'_, Message> {
+    let Some(st) = &c.snapshot.status else {
+        return machine_panel(
+            "Inputs",
+            column![muted("No status from the controller yet.")],
+        );
+    };
+    let mut rows = Column::new().spacing(4);
+    for &pin in &INPUT_PINS {
+        rows = rows.push(
+            row![
+                text(format!("Pin {pin}")).size(12).width(50),
+                level(st.input_level(pin)),
+                text(roles(&c.config, pin)).size(12).width(Fill),
+                muted(format!("{} changes", c.inputs.changes(pin))),
+            ]
+            .spacing(8),
+        );
+    }
+    let b = st.bits;
+    let yes = |on: bool| if on { "yes" } else { "no" };
+    let mut edges = Column::new().spacing(2);
+    for (t, pin, high) in c.inputs.edges.iter().rev().take(6) {
+        edges = edges.push(
+            text(format!(
+                "{t:8.2} s  pin {pin} → {}",
+                if *high { "HIGH" } else { "LOW" }
+            ))
+            .size(11)
+            .font(Font::MONOSPACE),
+        );
+    }
+    machine_panel(
+        "Inputs",
+        column![
+            rows,
+            text(uc100::diagnostics::estop_input_report(
+                c.config.inputs.estop,
+                st
+            ))
+            .size(12),
+            muted(format!(
+                "Controller stop latch: {} · hard limit: {} · soft limit: {}",
+                yes(b.stop_latched()),
+                yes(b.hard_limit()),
+                yes(b.soft_limit())
+            )),
+            edges,
+            muted(
+                "Press and release a switch to see its pin change. Every input HIGH can also mean nothing is connected. A change shorter than about 1/30 s can be missed."
+            ),
+        ],
+    )
+}
+
+/// The output pins: the level the controller applies, role, and the test.
+fn outputs(c: &Connection) -> Element<'_, Message> {
+    let Some(st) = &c.snapshot.status else {
+        return machine_panel(
+            "Outputs",
+            column![muted("No status from the controller yet.")],
+        );
+    };
+    let word = uc100::protocol::OutputWord(st.outputs);
+    let mut rows = Column::new().spacing(4);
+    for &pin in &OUTPUT_PINS {
+        let test: Element<_> = if c.config.firmware_output_pin(pin) {
+            muted("driven by the controller").into()
+        } else {
+            let forced = c.forced.get(&pin).copied();
+            let force = |high| {
+                c.can_force(pin)
+                    .then_some(Message::Machine(Action::TestOutput(pin, Some(high))))
+            };
+            row![
+                act("High", force(true), forced == Some(true)),
+                act("Low", force(false), forced == Some(false)),
+                act(
+                    "Release",
+                    forced.map(|_| Message::Machine(Action::TestOutput(pin, None))),
+                    false
+                ),
+            ]
+            .spacing(4)
+            .into()
+        };
+        rows = rows.push(
+            row![
+                text(format!("Pin {pin}")).size(12).width(50),
+                level(word.level(pin)),
+                text(roles(&c.config, pin)).size(12).width(Fill),
+                test,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    machine_panel(
+        "Outputs",
+        column![
+            rows,
+            muted(
+                "High and Low work while Idle; E-stop releases every forced pin. The level is what the controller reports applying, not a measured voltage."
+            ),
+        ],
+    )
 }
 
 /// `axes.x.step` → (`axes.x`, `step`).

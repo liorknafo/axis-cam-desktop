@@ -1953,6 +1953,54 @@ mist = { pin = 9 }
     }
 
     #[test]
+    fn outputs_are_forced_only_while_idle_and_on_free_pins() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlSetup(true));
+        idle(&mut a);
+        let level = |a: &App, pin: u8| {
+            let st = conn(a).snapshot.status.unwrap();
+            uc100::protocol::OutputWord(st.outputs).level(pin)
+        };
+        assert_eq!(level(&a, 14), Some(false));
+        let _ = a.update(Message::Machine(Action::TestOutput(14, Some(true))));
+        let _ = a.view();
+        tick_until(&mut a, 2.0, "pin 14 HIGH", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(14) == Some(true)
+        });
+        assert_eq!(conn(&a).forced.get(&14), Some(&true));
+        let _ = a.update(Message::Machine(Action::TestOutput(14, None)));
+        tick_until(&mut a, 2.0, "pin 14 released", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(14) == Some(false)
+        });
+        assert!(conn(&a).forced.is_empty());
+        // A step pin and the spindle PWM are the controller's.
+        for pin in [2, 16] {
+            let _ = a.update(Message::Machine(Action::TestOutput(pin, Some(true))));
+        }
+        assert!(conn(&a).forced.is_empty());
+        // E-stop releases a forced pin, and nothing is forced in E-stop.
+        let _ = a.update(Message::Machine(Action::TestOutput(17, Some(true))));
+        tick_until(&mut a, 2.0, "pin 17 HIGH", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(17) == Some(true)
+        });
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert!(conn(&a).forced.is_empty());
+        tick_until(&mut a, 2.0, "pin 17 released", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(17) == Some(false)
+        });
+        let _ = a.update(Message::Machine(Action::TestOutput(17, Some(true))));
+        assert!(conn(&a).forced.is_empty());
+        let _ = a.view();
+        // Input pins are not outputs.
+        assert!(level(&a, 10).is_none());
+    }
+
+    #[test]
     fn saving_while_connected_reconnects_with_the_new_profile() {
         use crate::control::Action;
         use crate::setup::{Edit, Msg};
