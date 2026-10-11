@@ -135,3 +135,10 @@ Between tool runs, when the next run has another tool, the Run panel shows:
 - `smoke.rs`, against the simulated UC100 with a fast profile: check a two-tool setup, Cycle Start runs tool run 1 to the end; Cycle Start for run 2 is refused until Z is touched off; Record reference and Set Z from reference; run 2 runs; Hold and Resume; Stop; the live position follows the machine; the Run panel renders.
 - In the real app against the simulator (Windows): a setup run end to end.
 - On the Mac (LIO-54): the attended checklist in `docs/VALIDATION.md`.
+
+## As built
+
+- The driver work merged the hardening branch (origin/axis-cam-foundation c047a20). Two things in it needed changes here: every E-stop now clears the machine position, so the soft-limits box and the Run panel say so and ask for machine zero again; and declaring a position references only an axis without a home switch, so the Control page offers machine zero for those axes and Home for switched ones.
+- Two driver fixes found while integrating: the simulator's home switch reads active while its axis is on it (homing from the switch failed in simulation); a profile without an `[outputs]` table gets the output defaults again (it got 0 Hz and 0 rpm, which the new checks refuse).
+- The live tool is rastered with the scene, slightly wider than the simulated tool: drawn as a stroke it was hidden behind the part, because the canvas draws the scene image above its strokes.
+- The test fixture needs more than the JY5800's 55 mm of Z (the fixture's drill and a 15 mm clearance span 59 mm), so the tests use a fast JY5800-like profile with Z −80…0.

@@ -334,6 +334,32 @@ Once the machine is Idle, the Control page has everything needed before a job:
   as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
   the machine and correct both (`src/machine_view.rs`, the driver profile).
 
+**Setup** (the switch at the top of the Control page) does the commissioning
+work that needed the driver's own app or a text editor:
+
+- **The UC100 profile as a form**: pins and polarity, steps per mm, speeds,
+  acceleration, switches, homing and soft limits per axis; the E-stop, probe
+  and index inputs; spindle, coolant, drive enable and charge pump outputs;
+  homing order, step rate and the commissioning checks. Every change is
+  checked by the driver as you make it, and **Save** is offered only for a
+  profile it accepts. Save rewrites only the values you changed: comments,
+  layout and Windows line endings stay. It refuses if the file was edited
+  elsewhere since it was opened (**Revert** reads it again). Editing works
+  without connecting. A connected machine is reconnected with the saved
+  profile, in E-stop, and its machine position must be set again.
+- **Inputs**: each input pin's level, what the profile wires to it, how often
+  it changed and the last changes, the E-stop input and the controller's
+  stop latch and limit flags.
+- **Outputs**: each output pin's level and role; **High**, **Low** and
+  **Release** for a wiring test while Idle, never on pins the controller
+  drives itself. E-stop releases every forced pin.
+- **Calibrate steps per mm**: pick an axis and a travel, **Move**, measure
+  how far the carriage really went, and **Use in profile**.
+- **Audit**: the driver's report on the profile as edited.
+
+Adding or removing an axis, motion tuning and the tool table are still edits
+of the file.
+
 ### Running a setup
 
 The **Run** panel on the Control page runs a setup directly on the machine,
@@ -372,31 +398,6 @@ the machine's tool in red at the live position; when that operation's
 simulation is shown, it follows the machine to the move being cut. The
 spindle start dwell and the Air output for UC100 runs are in the machine
 wizard.
-**Setup** (the switch at the top of the Control page) does the commissioning
-work that needed the driver's own app or a text editor:
-
-- **The UC100 profile as a form**: pins and polarity, steps per mm, speeds,
-  acceleration, switches, homing and soft limits per axis; the E-stop, probe
-  and index inputs; spindle, coolant, drive enable and charge pump outputs;
-  homing order, step rate and the commissioning checks. Every change is
-  checked by the driver as you make it, and **Save** is offered only for a
-  profile it accepts. Save rewrites only the values you changed: comments,
-  layout and Windows line endings stay. It refuses if the file was edited
-  elsewhere since it was opened (**Revert** reads it again). Editing works
-  without connecting. A connected machine is reconnected with the saved
-  profile, in E-stop, and its machine position must be set again.
-- **Inputs**: each input pin's level, what the profile wires to it, how often
-  it changed and the last changes, the E-stop input and the controller's
-  stop latch and limit flags.
-- **Outputs**: each output pin's level and role; **High**, **Low** and
-  **Release** for a wiring test while Idle, never on pins the controller
-  drives itself. E-stop releases every forced pin.
-- **Calibrate steps per mm**: pick an axis and a travel, **Move**, measure
-  how far the carriage really went, and **Use in profile**.
-- **Audit**: the driver's report on the profile as edited.
-
-Adding or removing an axis, motion tuning and the tool table are still edits
-of the file.
 
 ## LinuxCNC G-code export
 
