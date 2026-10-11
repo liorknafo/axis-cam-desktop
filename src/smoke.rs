@@ -1791,6 +1791,55 @@ flood = { pin = 8 }
     }
 
     #[test]
+    fn the_3d_view_shows_the_machine_over_the_simulation() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        // The Work page shows the facing operation's simulation.
+        a.selected = Some(0);
+        let sim = crate::simulation::prepare(&a.doc, a.part_mesh().unwrap(), 0, 0).unwrap();
+        a.simulation = Some(sim);
+        assert!(a.live_tool().is_none());
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 5.0, "a cutting move", |r| {
+            r.running.is_some() && r.done.iter().all(|d| !d)
+        });
+        let datum = run_of(&a).checked().unwrap()[0].datum;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let _ = a.update(Message::Tick);
+            let s = conn(&a).snapshot.clone();
+            let (tip, radius, stickout) = a.live_tool().expect("the live tool");
+            // The tip in plan coordinates: machine - work offset + datum.
+            for k in 0..3 {
+                let expected = s.machine_pos[k] - s.work_offset[k] + datum[k] as f64;
+                assert!((tip[k] as f64 - expected).abs() < 1e-3, "{k}: {tip:?}");
+            }
+            assert_eq!((radius, stickout), (5., 65.));
+            if a.progress > 0.2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "the simulation stays at {}",
+                a.progress
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // It follows the machine: the shown simulation is at the move being cut.
+        assert!(a.simulation.as_ref().unwrap().seconds > 0.);
+        a.page = Page::Work;
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        assert!(a.live_tool().is_none());
+    }
+
+    #[test]
     fn a_tool_run_holds_resumes_and_stops() {
         use crate::run::Action as R;
         use uc100::controller::State;

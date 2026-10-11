@@ -286,6 +286,7 @@ impl View {
             progress: None,
             holding: holding.clone(),
             leftover: None,
+            live: None,
         };
         let boxes = focus_bounds(mesh, &setup, &args.focus_surfaces)
             .map(|b| vec![b])
@@ -364,6 +365,7 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         progress: None,
         holding: view.holding.clone(),
         leftover: None,
+        live: None,
     };
     let (w, h) = (SIZE, SIZE - CAPTION);
     let (rgba, depths) =

@@ -726,6 +726,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             },
             holding: holding_boxes(app),
             leftover: leftover_view(app),
+            live: app.live_tool(),
         })
         .width(Fill)
         .height(Fill)
@@ -4281,6 +4282,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         })
         .width(Fill)
         .height(380)

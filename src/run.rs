@@ -303,6 +303,36 @@ impl Run {
     }
 }
 
+/// The machine's tool while a tool run cuts, for the 3D view.
+pub struct Live {
+    pub setup: usize,
+    /// The tool tip in the setup's plan coordinates (mm).
+    pub tip: [f32; 3],
+    pub radius: f32,
+    pub stickout: f32,
+    /// The plan move being cut: the operation's index in the setup, the
+    /// move's index in its plan.
+    pub cutting: Option<(usize, usize)>,
+}
+
+impl Run {
+    /// Where the machine's tool is in the running tool run's plan: machine
+    /// position − the work offset it was lowered with + datum.
+    pub fn live(&self, s: &uc100::controller::Snapshot) -> Option<Live> {
+        let r = self.running.as_ref()?;
+        let (p, op, block) = self.progress(s.current_line)?;
+        Some(Live {
+            setup: self.setup,
+            tip: std::array::from_fn(|k| {
+                (s.machine_pos[k] - r.offset[k] + p.datum[k] as f64) as f32
+            }),
+            radius: p.ops[op].diameter / 2.,
+            stickout: p.ops[op].stickout,
+            cutting: plan_move(p, block).map(|(o, m)| (p.indexes[o], m)),
+        })
+    }
+}
+
 /// The operation a block belongs to, if it names one.
 fn op_of(b: &Block) -> Option<usize> {
     match b {

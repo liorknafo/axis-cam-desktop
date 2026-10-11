@@ -1127,6 +1127,39 @@ impl App {
             .find(|m| self.control_machine.as_ref() == Some(&m.id))
             .or_else(|| self.doc.machines.iter().find(uc100))
     }
+    /// The machine's tool for the 3D view, while a tool run of the active
+    /// setup cuts: tip in plan coordinates, radius, stickout.
+    pub fn live_tool(&self) -> Option<([f32; 3], f32, f32)> {
+        let c = self.control.as_ref()?;
+        let live = c.run.as_ref()?.live(&c.snapshot)?;
+        let setup = self.doc.setups.get(live.setup)?;
+        (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
+    }
+    /// While a tool run cuts the operation whose simulation is shown, the
+    /// simulation follows the machine to the move being cut.
+    fn follow_machine(&mut self) {
+        let Some(c) = &self.control else { return };
+        let Some(live) = c.run.as_ref().and_then(|r| r.live(&c.snapshot)) else {
+            return;
+        };
+        let (Some((op, m)), Some(setup)) = (live.cutting, self.doc.setups.get(live.setup)) else {
+            return;
+        };
+        let id = setup.operations.get(op).map(|o| o.id.clone());
+        if self.playing || setup.id != self.doc.active || self.selected != Some(op) {
+            return;
+        }
+        if let Some(sim) = self
+            .simulation
+            .as_mut()
+            .filter(|s| Some(&s.plan.operation) == id.as_ref() && s.plan.duration > 0.)
+        {
+            if let Some(m) = sim.plan.moves.get(m) {
+                self.progress = (m.end / sim.plan.duration).clamp(0., 1.);
+                sim.seek(self.progress);
+            }
+        }
+    }
     /// Disables the machine and stops its controller, if connected.
     pub fn disconnect_machine(&mut self) {
         if let Some(c) = self.control.take() {
@@ -3007,6 +3040,7 @@ impl App {
             }
             Message::HelpHover(on) => self.help_animating = on,
             Message::Tick => {
+                self.follow_machine();
                 if let Some(c) = &mut self.control {
                     c.refresh();
                     // "Connecting to <machine>…" until the driver reports a state.

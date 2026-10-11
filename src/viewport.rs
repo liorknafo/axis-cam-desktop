@@ -136,6 +136,9 @@ pub struct Viewport<'a> {
     /// the label, where the setup's own box would be the original block's.
     /// None for the first setup and when it is not known.
     pub leftover: Option<crate::mesh::Bounds>,
+    /// The machine's tool while a tool run of this setup cuts: its tip in
+    /// plan coordinates (mm), radius and stickout. Drawn over the scene.
+    pub live: Option<([f32; 3], f32, f32)>,
 }
 pub(crate) struct Projector {
     camera: Camera,
@@ -1051,6 +1054,26 @@ impl canvas::Program<Event> for Viewport<'_> {
                 ..Text::default()
             });
         }
+        if let Some((tip, radius, stickout)) = self.live {
+            let scale = self.mesh.display_scale();
+            let at = |up: f32| p.p([tip[0] * scale, tip[1] * scale, (tip[2] + up) * scale]);
+            let red = Color::from_rgb8(214, 40, 40);
+            let width = (2. * radius * scale * p.scale).max(3.);
+            line(
+                &mut frame,
+                &[at(0.), at(stickout)],
+                Color { a: 0.45, ..red },
+                width,
+            );
+            frame.fill(&Path::circle(at(0.), 4.), red);
+            frame.fill_text(Text {
+                content: "Machine".into(),
+                position: Point::new(at(0.).x + 8., at(0.).y - 6.),
+                color: red,
+                size: 12.into(),
+                ..Text::default()
+            });
+        }
         let origin = Point::new(45., bounds.height - 45.);
         let o = p.p([0., 0., 0.]);
         for (v, c, label) in [
@@ -1482,6 +1505,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1516,6 +1540,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover,
+            live: None,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1581,6 +1606,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
         let tint = [92, 168, 223, 255];
@@ -1710,6 +1736,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
         let reference = v.projector(b);
@@ -1789,6 +1816,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let p = v.projector(b);
@@ -1843,6 +1871,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
         let bounds = clamp.bounds;
@@ -1884,6 +1913,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
         let p = v.projector(b);
@@ -1926,6 +1956,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let p = v.projector(b);
@@ -1959,6 +1990,7 @@ mod tests {
             progress: None,
             holding: vec![],
             leftover: None,
+            live: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);
