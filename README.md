@@ -334,6 +334,32 @@ Once the machine is Idle, the Control page has everything needed before a job
   as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
   the machine and correct both (`src/machine_view.rs`, the driver profile).
 
+**Setup** (the switch at the top of the Control page) does the commissioning
+work that needed the driver's own app or a text editor:
+
+- **The UC100 profile as a form**: pins and polarity, steps per mm, speeds,
+  acceleration, switches, homing and soft limits per axis; the E-stop, probe
+  and index inputs; spindle, coolant, drive enable and charge pump outputs;
+  homing order, step rate and the commissioning checks. Every change is
+  checked by the driver as you make it, and **Save** is offered only for a
+  profile it accepts. Save rewrites only the values you changed: comments,
+  layout and Windows line endings stay. It refuses if the file was edited
+  elsewhere since it was opened (**Revert** reads it again). Editing works
+  without connecting. A connected machine is reconnected with the saved
+  profile, in E-stop, and its machine position must be set again.
+- **Inputs**: each input pin's level, what the profile wires to it, how often
+  it changed and the last changes, the E-stop input and the controller's
+  stop latch and limit flags.
+- **Outputs**: each output pin's level and role; **High**, **Low** and
+  **Release** for a wiring test while Idle, never on pins the controller
+  drives itself. E-stop releases every forced pin.
+- **Calibrate steps per mm**: pick an axis and a travel, **Move**, measure
+  how far the carriage really went, and **Use in profile**.
+- **Audit**: the driver's report on the profile as edited.
+
+Adding or removing an axis, motion tuning and the tool table are still edits
+of the file.
+
 ## LinuxCNC G-code export
 
 Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
@@ -482,6 +508,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-three 
 - `src/post.rs`: LinuxCNC postprocessor: blocks from the simulated moves, the emitter and its header (work zero, part box for Model origin, fixture, workholding), file names, and `post_job`/`write_job` for the NC program page and `--export-gcode`.
 - `src/control.rs`: the UC100 connection: a machine's driver profile and Connection, the driver's controller for one machine, its saved state files and the snapshot the Control page draws; the Control page's actions (`Action`, `Connection::act`) and their guards, machine positions declared one per tick, and the held jog's keepalive.
 - `src/machine_view.rs`: the CNC4030 model on the Control page: assumed dimensions, flat-shaded faces drawn far to near, the travel box and the tool tip.
+- `src/setup.rs`: the Control page's Setup view: the UC100 profile edited in place with `toml_edit` (`Draft`: comments and line endings kept, checked by the driver, saved atomically, refused over a change on disk), the inputs and output test, calibration and the audit.
 - `src/post_check.rs`: export checks: spindle and feed limits, travel, rapids into material, holder clearance, jaw and clamp clearance over every program move, and touch-off rules.
 - `src/holding.rs`: the workholding library (vises and clamps and their starters), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
 - `src/ngc.rs`: strict reader for the G-code subset the post writes, and the replay that compares each program move by move with the simulation.
