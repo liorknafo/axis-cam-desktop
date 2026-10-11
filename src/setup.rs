@@ -1,6 +1,10 @@
 //! Machine setup on the Control page: the UC100 profile form, the inputs
 //! and the output test, the driver's audit, and steps-per-mm calibration.
 use crate::model::{Machine, get};
+use crate::ui::{act, bold, btn, caution, machine_panel, muted, note};
+use crate::{App, Message};
+use iced::widget::{checkbox, column, container, pick_list, row, scrollable, text, text_input};
+use iced::{Alignment, Color, Element, Fill};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
@@ -20,6 +24,17 @@ pub struct Draft {
     typed: BTreeMap<String, String>,
     /// The driver's check of the document.
     pub checked: Result<MachineConfig, String>,
+    /// What the last Save did.
+    pub note: Option<String>,
+}
+
+/// What the Setup view asks.
+#[derive(Debug, Clone)]
+pub enum Msg {
+    Edit(Edit),
+    Save,
+    /// Throw the changes away and read the file again.
+    Revert,
 }
 
 /// One change in the form. Paths are dotted keys: `axes.x.steps_per_unit`.
@@ -55,6 +70,7 @@ impl Draft {
             doc,
             typed: BTreeMap::new(),
             checked: Err(String::new()),
+            note: None,
         };
         d.check();
         Ok(d)
@@ -150,6 +166,10 @@ impl Draft {
         t.get(key)
     }
 
+    pub fn has(&self, path: &str) -> bool {
+        self.item(path).is_some()
+    }
+
     /// A number field's text: as typed, else the file's value, else empty.
     pub fn number(&self, path: &str) -> String {
         if let Some(t) = self.typed.get(path) {
@@ -228,6 +248,277 @@ impl Draft {
         self.typed.clear();
         self.checked.clone()
     }
+}
+
+const AXES: [&str; 6] = ["x", "y", "z", "a", "b", "c"];
+const OUTPUT_PINS: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 14, 16, 17];
+const INPUT_PINS: [u8; 5] = uc100::diagnostics::INPUT_PINS;
+
+/// A pin in a pick list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PinChoice(Option<u8>);
+
+impl std::fmt::Display for PinChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "Pin {n}"),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+fn edit(e: Edit) -> Message {
+    Message::Setup(Msg::Edit(e))
+}
+
+fn label<'a>(s: &str) -> iced::widget::Text<'a> {
+    text(s.to_string()).size(12).width(200)
+}
+
+/// A number field; the placeholder says what an empty field means.
+fn number<'a>(d: &Draft, path: String, name: &str, empty: &str) -> Element<'a, Message> {
+    let value = d.number(&path);
+    row![
+        label(name),
+        text_input(empty, &value)
+            .on_input(move |v| edit(Edit::Number(path.clone(), v)))
+            .width(110)
+            .padding([5, 8])
+            .size(12)
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn pin<'a>(d: &Draft, path: String, name: &str, pins: &[u8]) -> Element<'a, Message> {
+    let now = d.pin(&path);
+    let options: Vec<PinChoice> = std::iter::once(None)
+        .chain(pins.iter().copied().map(Some))
+        .map(PinChoice)
+        .collect();
+    let to = path.clone();
+    let mut r = row![
+        label(name),
+        pick_list(
+            options,
+            Some(PinChoice(now.map(|p| p.0))),
+            move |c: PinChoice| { edit(Edit::Pin(to.clone(), c.0)) }
+        )
+        .text_size(12)
+        .padding([5, 8])
+        .width(110)
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if let Some((_, low)) = now {
+        r = r.push(
+            checkbox(low)
+                .label("Active LOW")
+                .on_toggle(move |b| edit(Edit::ActiveLow(path.clone(), b)))
+                .text_size(12),
+        );
+    }
+    r.into()
+}
+
+/// A checkbox; `default` is the driver's value when the file leaves it out.
+fn flag<'a>(d: &Draft, path: String, name: &str, default: bool) -> Element<'a, Message> {
+    checkbox(d.flag(&path).unwrap_or(default))
+        .label(name.to_string())
+        .on_toggle(move |b| edit(Edit::Flag(path.clone(), b)))
+        .text_size(12)
+        .into()
+}
+
+/// The Setup view of the Control page, right of the machine panel.
+pub fn view(app: &App) -> Element<'_, Message> {
+    let body: Element<_> = match &app.profile_draft {
+        None => muted("Add a UC100 machine in the Machine library.").into(),
+        Some((_, Err(e))) => column![
+            caution("The profile cannot be edited", vec![e.clone()]),
+            btn("Read it again", Message::Setup(Msg::Revert), false)
+        ]
+        .spacing(10)
+        .into(),
+        Some((_, Ok(d))) => form(app, d),
+    };
+    scrollable(container(body).padding(4))
+        .height(Fill)
+        .width(Fill)
+        .into()
+}
+
+fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
+    let here = app
+        .control
+        .as_ref()
+        .filter(|c| c.machine_id == d.machine_id);
+    let stopped = here.is_none_or(|c| c.stopped());
+    let save = (d.blocker().is_none() && stopped).then_some(Message::Setup(Msg::Save));
+    let mut head = column![
+        row![
+            bold("UC100 profile", 18),
+            act(
+                if here.is_some() {
+                    "Save and reconnect"
+                } else {
+                    "Save"
+                },
+                save,
+                false
+            ),
+            act(
+                "Revert",
+                d.dirty().then_some(Message::Setup(Msg::Revert)),
+                false
+            )
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        muted(d.path.display().to_string()),
+    ]
+    .spacing(8);
+    if let Some(path) = d.bad_numbers().first() {
+        head = head.push(caution(
+            "Not a number",
+            vec![format!("{path} needs a number.")],
+        ));
+    }
+    let verdict: Element<_> = match &d.checked {
+        Ok(cfg) => match cfg.commissioning_blocker() {
+            Some(why) => caution(
+                "Reset is refused until the machine setup is verified",
+                vec![why],
+            ),
+            None => muted("The driver accepts this profile.")
+                .color(Color::from_rgb8(39, 130, 93))
+                .into(),
+        },
+        Err(e) => caution("The driver refuses this profile", vec![e.clone()]),
+    };
+    head = head.push(verdict);
+    if let Some(n) = &d.note {
+        head = head.push(note(n.clone()));
+    }
+    if here.is_some() {
+        head = head.push(muted(if stopped {
+            "Saving reconnects the machine: it starts in E-stop, and its machine position must be set again, since a new steps per mm moves it."
+        } else {
+            "Stop the machine to save the profile."
+        }));
+    }
+    let mut main = column![head].spacing(12);
+    main = main.push(machine_panel(
+        "Commissioning",
+        column![
+            flag(d, "commissioning.required".into(), "Require the checks below before Reset", false),
+            flag(d, "commissioning.pinout_verified".into(), "Step and direction pins and polarity checked", false),
+            flag(d, "commissioning.estop_verified".into(), "E-stop input and polarity checked", false),
+            flag(d, "commissioning.drive_enable_verified".into(), "Drive enable and charge pump need checked", false),
+            flag(d, "commissioning.steps_per_unit_verified".into(), "Steps per mm checked", false),
+            muted("These record what was checked at the machine. AXIS CAM does not check the wiring itself."),
+        ],
+    ));
+    for l in AXES.iter().filter(|l| d.has(&format!("axes.{l}"))) {
+        let p = |k: &str| format!("axes.{l}.{k}");
+        let numbers = column![
+            number(d, p("steps_per_unit"), "Steps per mm", ""),
+            number(d, p("max_velocity"), "Maximum speed · mm/min", ""),
+            number(d, p("acceleration"), "Acceleration · mm/s²", ""),
+            number(d, p("soft_min"), "Soft limit, low end · mm", "none"),
+            number(d, p("soft_max"), "Soft limit, high end · mm", "none"),
+            number(
+                d,
+                p("home_speed_percent"),
+                "Homing speed · % of maximum",
+                "20"
+            ),
+            number(d, p("home_position"), "Machine position at home · mm", "0"),
+        ]
+        .spacing(6);
+        let pins = column![
+            pin(d, p("step"), "Step", &OUTPUT_PINS),
+            pin(d, p("dir"), "Direction", &OUTPUT_PINS),
+            pin(d, p("limit_neg"), "Limit switch, low end", &INPUT_PINS),
+            pin(d, p("limit_pos"), "Limit switch, high end", &INPUT_PINS),
+            pin(d, p("home"), "Home switch", &INPUT_PINS),
+            flag(d, p("reversed"), "Reverse the direction", false),
+            flag(d, p("home_negative"), "Home toward the low end", true),
+        ]
+        .spacing(6);
+        main = main.push(machine_panel(
+            &format!("{} axis", l.to_uppercase()),
+            column![row![numbers, pins].spacing(24)],
+        ));
+    }
+    main = main.push(machine_panel(
+        "Inputs",
+        column![
+            pin(d, "inputs.estop".into(), "E-stop", &INPUT_PINS),
+            pin(d, "inputs.probe".into(), "Probe", &INPUT_PINS),
+            pin(d, "inputs.index".into(), "Spindle index pulse", &INPUT_PINS),
+        ],
+    ));
+    main = main.push(machine_panel(
+        "Spindle, coolant and drives",
+        column![
+            row![
+                column![
+                    pin(d, "outputs.spindle_pwm".into(), "Spindle speed (PWM)", &OUTPUT_PINS),
+                    pin(d, "outputs.spindle_dir".into(), "Spindle direction (PWM)", &OUTPUT_PINS),
+                    pin(d, "outputs.spindle_cw".into(), "Spindle CW relay (M3)", &OUTPUT_PINS),
+                    pin(d, "outputs.spindle_ccw".into(), "Spindle CCW relay (M4)", &OUTPUT_PINS),
+                    pin(d, "outputs.flood".into(), "Flood (M8)", &OUTPUT_PINS),
+                    pin(d, "outputs.mist".into(), "Mist (M7)", &OUTPUT_PINS),
+                    pin(d, "outputs.enable".into(), "Drive enable", &OUTPUT_PINS),
+                    pin(d, "outputs.charge_pump".into(), "Charge pump", &OUTPUT_PINS),
+                ]
+                .spacing(6),
+                column![
+                    number(d, "outputs.spindle_max_rpm".into(), "Speed at 100 % PWM · rpm", "24000"),
+                    number(d, "outputs.spindle_pwm_hz".into(), "PWM frequency · Hz", "5000"),
+                    number(d, "outputs.spindle_spinup_s".into(), "Wait after starting · s", "0"),
+                ]
+                .spacing(6),
+            ]
+            .spacing(24),
+            muted("No pin means the machine has no such output: the Control page then does not offer it."),
+        ],
+    ));
+    let rates = vec!["25kHz".to_string(), "50kHz".into(), "100kHz".into()];
+    let rate = Some(d.text("controller.step_rate")).filter(|r| !r.is_empty());
+    let order = d.text("homing.order");
+    main = main.push(machine_panel(
+        "Homing and controller",
+        column![
+            row![
+                label("Homing order (axis letters)"),
+                text_input("ZXY", &order)
+                    .on_input(|v| edit(Edit::Text("homing.order".into(), v)))
+                    .width(110)
+                    .padding([5, 8])
+                    .size(12)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            flag(d, "homing.override_limits".into(), "Ignore the limit switches while homing", true),
+            row![
+                label("Step rate"),
+                pick_list(rates, rate.or(Some("100kHz".into())), |r| edit(Edit::Text(
+                    "controller.step_rate".into(),
+                    r
+                )))
+                .text_size(12)
+                .padding([5, 8])
+                .width(110)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            muted("Adding or removing an axis, motion tuning and the tool table stay edits of the file."),
+        ],
+    ));
+    main.into()
 }
 
 /// `axes.x.step` → (`axes.x`, `step`).

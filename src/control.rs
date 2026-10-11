@@ -321,6 +321,14 @@ impl Connection {
             .any(|a| a.limit_pos.is_some() || a.limit_neg.is_some())
     }
 
+    /// Nothing moves: the profile may be saved and the machine reconnected.
+    pub fn stopped(&self) -> bool {
+        matches!(
+            self.snapshot.state,
+            None | Some(State::EStop | State::Idle | State::Disconnected)
+        )
+    }
+
     pub fn idle(&self) -> bool {
         self.snapshot.state == Some(State::Idle)
     }
