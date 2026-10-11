@@ -8,6 +8,7 @@ mod fake_openai;
 mod help;
 mod holding;
 mod look;
+mod machine_view;
 mod material;
 mod mesh;
 mod model;

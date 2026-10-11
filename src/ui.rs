@@ -2732,16 +2732,34 @@ fn control(app: &App) -> Element<'_, Message> {
     if c.home_switches() {
         zero_actions = zero_actions.push(act("Home", idle(Action::Home), false));
     }
-    main = main.push(machine_panel(
-        "Position",
-        column![
-            table,
-            bold("Machine zero", 13),
-            zero,
-            zero_actions,
-            note(MACHINE_ZERO_NOTE)
+    let model = crate::machine_view::MachineView {
+        pos: [
+            s.machine_pos[0] as f32,
+            s.machine_pos[1] as f32,
+            s.machine_pos[2] as f32,
         ],
-    ));
+        known: (0..3).all(|a| !c.axis(a) || s.referenced[a]),
+        envelope: crate::machine_view::MachineView::envelope(&c.config),
+    };
+    main = main.push(
+        row![
+            machine_panel(
+                "Position",
+                column![
+                    table,
+                    bold("Machine zero", 13),
+                    zero,
+                    zero_actions,
+                    note(MACHINE_ZERO_NOTE)
+                ],
+            ),
+            container(canvas(model).width(Fill).height(380))
+                .padding(1)
+                .width(Fill)
+                .style(panel_style)
+        ]
+        .spacing(12),
+    );
     let can_jog = c.manual() || s.state == Some(State::Jog);
     let mut modes = row![act(
         "Continuous",
