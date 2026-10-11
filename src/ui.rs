@@ -2502,11 +2502,65 @@ fn estop<'a>() -> Element<'a, Message> {
         .into()
 }
 
+/// A Control page button: greyed out without a message, when the machine
+/// cannot do it now; `on` marks the selected one of a group.
+fn act<'a>(label: impl Into<String>, msg: Option<Message>, on: bool) -> Element<'a, Message> {
+    let label = label.into();
+    let b = button(text(label.clone()).size(12))
+        .padding([7, 12])
+        .on_press_maybe(msg.clone())
+        .style(move |_, status| {
+            let (background, text_color) = match status {
+                button::Status::Disabled => (BG, MUTED),
+                _ if on => (Color::from_rgb8(223, 237, 249), BLUE),
+                button::Status::Hovered | button::Status::Pressed => {
+                    (Color::from_rgb8(235, 240, 246), INK)
+                }
+                _ => (Color::WHITE, INK),
+            };
+            button::Style {
+                background: Some(background.into()),
+                text_color,
+                border: Border {
+                    color: if on { BLUE } else { LINE },
+                    width: 1.,
+                    radius: 4.into(),
+                },
+                ..Default::default()
+            }
+        });
+    match msg {
+        Some(m) => HelpButton::new(b, &m, label).into(),
+        None => b.into(),
+    }
+}
+
+/// A titled box on the Control page.
+fn machine_panel<'a>(title: &str, body: Column<'a, Message>) -> Element<'a, Message> {
+    container(column![bold(title, 14), body.spacing(10)].spacing(10))
+        .padding(14)
+        .width(Fill)
+        .style(panel_style)
+        .into()
+}
+
+const AXES: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
+
+/// "X", "X and Y", "X, Y and Z".
+fn axis_names(axes: &[usize]) -> String {
+    let names: Vec<&str> = axes.iter().map(|&a| AXES[a]).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.concat(),
+    }
+}
+
 /// The Control page: the UC100 machine, its connection and its live state.
 fn control(app: &App) -> Element<'_, Message> {
+    use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
     let target = app.control_target();
-    let mut left = column![bold("Machine", 18)].spacing(10).width(300);
+    let mut left = column![bold("Machine", 18)].spacing(10);
     let machines: Vec<&Machine> = app
         .doc
         .machines
@@ -2539,10 +2593,9 @@ fn control(app: &App) -> Element<'_, Message> {
             },
         };
     }
-    let left = container(left).padding(16).style(panel_style);
     let Some(c) = &app.control else {
         return row![
-            left,
+            container(left).padding(16).width(300).style(panel_style),
             container(muted("Not connected.")).padding(16).width(Fill)
         ]
         .spacing(12)
@@ -2551,6 +2604,27 @@ fn control(app: &App) -> Element<'_, Message> {
         .into();
     };
     let s = &c.snapshot;
+    // ponytail: the last 40 log lines, newest last; a scrollable log when someone needs older lines.
+    let log = s
+        .log
+        .iter()
+        .skip(s.log.len().saturating_sub(40))
+        .fold(column![].spacing(2), |col, line| {
+            col.push(text(line.clone()).size(11).font(Font::MONOSPACE))
+        });
+    let left = container(
+        column![
+            left,
+            rule::horizontal(1),
+            bold("Log", 14),
+            scrollable(log).anchor_bottom().height(Fill)
+        ]
+        .spacing(10),
+    )
+    .padding(16)
+    .width(300)
+    .height(Fill)
+    .style(panel_style);
     let mut head = row![bold(
         s.state.as_ref().map_or("Connecting…", State::label),
         28
@@ -2571,17 +2645,15 @@ fn control(app: &App) -> Element<'_, Message> {
                 }),
         );
     }
-    let mut main = column![head].spacing(12).width(Fill);
+    if s.state == Some(State::EStop) {
+        head = head.push(primary("Reset", Message::MachineReset));
+    }
+    let mut main = column![head.push(estop())].spacing(12).width(Fill);
     if s.state == Some(State::EStop) {
         if let Some(reason) = &s.estop_reason {
             main = main.push(text(reason.clone()).size(13));
         }
     }
-    let mut buttons = row![].spacing(8).align_y(Alignment::Center);
-    if s.state == Some(State::EStop) {
-        buttons = buttons.push(primary("Reset", Message::MachineReset));
-    }
-    main = main.push(buttons.push(estop()));
     if let Some(id) = &s.identity {
         let v = |o: &Option<String>| o.clone().unwrap_or_else(|| "?".into());
         main = main.push(muted(format!(
@@ -2591,23 +2663,85 @@ fn control(app: &App) -> Element<'_, Message> {
             v(&id.bootloader)
         )));
     }
-    let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(120);
+    let unset = c.unset_limited_axes();
+    let limits: Element<_> = if !c.soft_limits_configured() {
+        muted("This profile sets no soft limits: nothing stops an axis at the end of its travel.")
+            .into()
+    } else if !unset.is_empty() {
+        let one = unset.len() == 1;
+        caution(
+            "Soft limits are OFF",
+            vec![
+                format!(
+                    "{} {} no machine position yet, so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
+                    axis_names(&unset),
+                    if one { "has" } else { "have" },
+                    if one { "it" } else { "them" },
+                    if one { "its" } else { "their" },
+                ),
+                "Set machine zero below to turn them on.".into(),
+            ],
+        )
+    } else {
+        let ranges: Vec<String> = (0..6)
+            .filter_map(|a| {
+                let x = c.config.axes.get(a)?;
+                Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
+            })
+            .collect();
+        muted(format!("Soft limits on: {} mm.", ranges.join(", ")))
+            .color(Color::from_rgb8(39, 130, 93))
+            .into()
+    };
+    main = main.push(limits);
+    let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
+    let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(110);
     let mut table = column![row![
-        bold("Axis", 12).width(60),
-        bold("Machine", 12).width(120),
-        bold("Work", 12).width(120),
-        bold("Homed", 12)
+        bold("Axis", 12).width(50),
+        bold("Machine", 12).width(110),
+        bold(format!("Work (G{})", 54 + s.active_wcs), 12).width(110),
+        bold("Position set", 12)
     ]]
     .spacing(4);
-    for i in (0..6).filter(|&i| s.axes_enabled[i]) {
+    for &i in &enabled {
         table = table.push(row![
-            text(["X", "Y", "Z", "A", "B", "C"][i]).size(14).width(60),
+            text(AXES[i]).size(14).width(50),
             mono(format!("{:.3}", s.machine_pos[i])),
             mono(format!("{:.3}", s.work_pos[i])),
             text(if s.referenced[i] { "Yes" } else { "No" }).size(14),
         ]);
     }
-    main = main.push(table);
+    let idle = |a: Action| c.idle().then_some(Message::Machine(a));
+    let mut zero = row![act(
+        "Set machine zero here",
+        idle(Action::MachineZero(None)),
+        false
+    )]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .push(muted("or one axis"));
+    for &a in enabled.iter().filter(|&&a| a < 3) {
+        zero = zero.push(act(AXES[a], idle(Action::MachineZero(Some(a))), false));
+    }
+    let mut zero_actions = row![act(
+        "Keep the last position",
+        idle(Action::KeepPosition),
+        false
+    )]
+    .spacing(6);
+    if c.home_switches() {
+        zero_actions = zero_actions.push(act("Home", idle(Action::Home), false));
+    }
+    main = main.push(machine_panel(
+        "Position",
+        column![
+            table,
+            bold("Machine zero", 13),
+            zero,
+            zero_actions,
+            note(MACHINE_ZERO_NOTE)
+        ],
+    ));
     let spindle = match s.spindle {
         Some(Spindle::Cw) => "CW",
         Some(Spindle::Ccw) => "CCW",
@@ -2622,24 +2756,13 @@ fn control(app: &App) -> Element<'_, Message> {
         s.feed_rate,
         s.feed_override * 100.0
     )));
-    // ponytail: the last 30 log lines, newest last; a scrollable log when someone needs older lines.
-    let log = s
-        .log
-        .iter()
-        .skip(s.log.len().saturating_sub(30))
-        .fold(column![bold("Log", 14)].spacing(2), |col, line| {
-            col.push(text(line.clone()).size(11).font(Font::MONOSPACE))
-        });
-    row![
-        left,
-        container(main).padding(16).width(Fill).style(panel_style),
-        container(log).padding(16).width(420).style(panel_style)
-    ]
-    .spacing(12)
-    .padding(12)
-    .height(Fill)
-    .into()
+    row![left, scrollable(main.padding(4)).height(Fill).width(Fill)]
+        .spacing(12)
+        .padding(12)
+        .height(Fill)
+        .into()
 }
+const MACHINE_ZERO_NOTE: &str = "AXIS CAM knows where the axes are only once each has a machine position. Without home switches: jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then press Set machine zero here (or one axis at a time). Keep the last position takes the position shown, which after connecting is where AXIS CAM last left the machine: use it only if nothing moved the machine since (no hand-turned screws, no stalled motors, no power cut during a move).";
 fn tools(app: &App) -> Element<'_, Message> {
     if app.doc.tools.is_empty() && app.tool_draft.name().is_empty() {
         return container(

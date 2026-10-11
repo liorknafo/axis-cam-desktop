@@ -440,6 +440,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Send one tiny request to the selected model to confirm that your ChatGPT plan works with this app. It uses a very small amount of your plan's usage."
         }
         LoadModels => "Ask OpenAI again which models your ChatGPT plan can use in this app.",
+        Machine(a) => machine_help(a),
         PlanNoticeDismissed => "Close this notice. It is shown once.",
         OpenUrl(_) => {
             "Open your ChatGPT usage settings in the browser, where you can see and manage how much of your plan this app uses."
@@ -450,6 +451,23 @@ pub fn command(m: &Message, label: String) -> Help {
     match m {
         Flip(_) | AddSetup | DuplicateSetup => h.animated(Diagram::Orientation),
         _ => h,
+    }
+}
+
+/// What a Control page button does to the machine.
+fn machine_help(a: &crate::control::Action) -> &'static str {
+    use crate::control::Action::*;
+    match a {
+        Home => {
+            "Home every axis on its switch, in the profile's order. This sets machine zero, and the soft limits apply from then on."
+        }
+        MachineZero(None) => {
+            "Declare the current position machine zero for X, Y and Z. First jog X to its left end, Y to its front end and Z to the top. The soft limits apply once every limited axis has a machine position."
+        }
+        MachineZero(Some(_)) => "Declare the current position machine zero for this axis only.",
+        KeepPosition => {
+            "Take the position shown as the machine position. After connecting it is where AXIS CAM last left the machine: use it only if nothing moved the machine since."
+        }
     }
 }
 

@@ -137,6 +137,8 @@ pub enum Message {
     Disconnect,
     MachineReset,
     MachineEStop,
+    /// An action on the connected machine, from the Control page.
+    Machine(control::Action),
     EditTool(String),
     NewTool,
     SaveTool,
@@ -2345,6 +2347,11 @@ impl App {
             Message::MachineEStop => {
                 if let Some(c) = &self.control {
                     c.send(uc100::controller::Command::EStop);
+                }
+            }
+            Message::Machine(action) => {
+                if let Some(c) = &mut self.control {
+                    c.act(action);
                 }
             }
             Message::SaveMachine => {

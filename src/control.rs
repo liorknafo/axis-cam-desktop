@@ -1,9 +1,10 @@
 //! The connection to a UC100 machine controller: the driver's `Controller`
 //! for one machine of the project, real (USB) or simulated.
 use crate::model::{Machine, get};
+use std::collections::VecDeque;
 use std::path::Path;
 use uc100::config::MachineConfig;
-use uc100::controller::{Command, Controller, Snapshot};
+use uc100::controller::{Command, Controller, Snapshot, State};
 
 /// Whether a UC100 machine connects to the simulator. Unset means the
 /// simulator, except on macOS, where the real machine is connected.
@@ -29,6 +30,18 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
+/// What the Control page asks of the connected machine.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Home every axis in the profile's order.
+    Home,
+    /// Declare the current position machine zero: X, Y and Z, or one axis.
+    MachineZero(Option<usize>),
+    /// Declare every axis at the machine position it shows, which after
+    /// connecting is where the machine was left.
+    KeepPosition,
+}
+
 /// A running driver controller for one machine.
 pub struct Connection {
     controller: Controller,
@@ -38,6 +51,9 @@ pub struct Connection {
     pub config: MachineConfig,
     /// The driver's state at the last tick.
     pub snapshot: Snapshot,
+    /// Machine positions still to declare (axis, value), sent one per tick:
+    /// the driver drops a second `SetMachine` until it has re-read the position.
+    declare: VecDeque<(usize, f64)>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -61,6 +77,7 @@ impl Connection {
             machine_id: m.id.clone(),
             simulated,
             snapshot: Snapshot::default(),
+            declare: VecDeque::new(),
         })
     }
 
@@ -70,6 +87,68 @@ impl Connection {
 
     pub fn refresh(&mut self) {
         self.snapshot = self.controller.snapshot();
+        // Any state but Idle (E-stop, a move) drops what is left, so nothing
+        // is declared later by surprise.
+        if self.idle() {
+            if let Some((axis, value)) = self.declare.pop_front() {
+                self.send(Command::SetMachine { axis, value });
+            }
+        } else {
+            self.declare.clear();
+        }
+    }
+
+    /// Does what the page asks, if the machine can; otherwise nothing.
+    pub fn act(&mut self, action: Action) {
+        match action {
+            Action::Home if self.idle() && self.home_switches() => self.send(Command::Home(vec![])),
+            Action::MachineZero(axis) if self.idle() => {
+                let axes = axis.map_or(0..3, |a| a..a + 1);
+                for a in axes.filter(|&a| self.config.axis_enabled(a)) {
+                    self.declare.push_back((a, 0.0));
+                }
+            }
+            Action::KeepPosition if self.idle() => {
+                for a in (0..6).filter(|&a| self.config.axis_enabled(a)) {
+                    self.declare.push_back((a, self.snapshot.machine_pos[a]));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn idle(&self) -> bool {
+        self.snapshot.state == Some(State::Idle)
+    }
+
+    /// Jog, work zero, MDI and the spindle are allowed: Idle, or paused in a program.
+    pub fn manual(&self) -> bool {
+        matches!(self.snapshot.state, Some(State::Idle | State::Paused(_)))
+    }
+
+    /// Every enabled axis has a home switch, so Home can run.
+    pub fn home_switches(&self) -> bool {
+        (0..6)
+            .filter_map(|a| self.config.axes.get(a))
+            .all(|a| a.home.is_some())
+    }
+
+    pub fn soft_limits_configured(&self) -> bool {
+        self.config.soft_limits_configured()
+    }
+
+    /// Axes with a soft limit and no machine position yet. The driver applies
+    /// the soft limits only once this is empty.
+    pub fn unset_limited_axes(&self) -> Vec<usize> {
+        (0..6)
+            .filter(|&a| {
+                self.config
+                    .axes
+                    .get(a)
+                    .is_some_and(|x| x.soft_min.is_some())
+                    && !self.snapshot.referenced[a]
+            })
+            .collect()
     }
 
     /// Disables the machine and stops the controller thread.

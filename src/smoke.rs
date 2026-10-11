@@ -1520,6 +1520,98 @@ mist = { pin = 9 }
         assert!(conn(&a).config.axis_enabled(2));
     }
 
+    /// The machine position of a connected test app.
+    fn at(a: &App) -> [f64; 6] {
+        conn(a).snapshot.machine_pos
+    }
+
+    #[test]
+    fn machine_zero_turns_the_soft_limits_on() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        assert!(conn(&a).soft_limits_configured());
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2]);
+        // Until then nothing stops a move past the travel.
+        mdi(&mut a, "G0 X20 Y10 Z-5");
+        assert!((at(&a)[0] - 20.).abs() < 1e-3 && (at(&a)[2] + 5.).abs() < 1e-3);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "X, Y and Z set to 0", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+                && s.machine_pos[..3].iter().all(|v| v.abs() < 1e-3)
+        });
+        assert!(conn(&a).unset_limited_axes().is_empty());
+        // The soft limits now refuse a move below X 0.
+        mdi(&mut a, "G0 X-5");
+        assert!(at(&a)[0].abs() < 1e-3);
+        assert!(conn(&a).snapshot.log.iter().any(|l| l.starts_with("MDI:")));
+        // One axis at a time.
+        mdi(&mut a, "G0 X7 Y3");
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(0))));
+        tick_until(&mut a, 3.0, "X set to 0", |s| s.machine_pos[0].abs() < 1e-3);
+        assert!((at(&a)[1] - 3.).abs() < 1e-3);
+        // Nothing is declared outside Idle.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| {
+            s.state == Some(uc100::controller::State::EStop)
+        });
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(1))));
+        let _ = a.update(Message::Tick);
+        assert!((at(&a)[1] - 3.).abs() < 1e-3);
+    }
+
+    #[test]
+    fn keep_the_last_position_declares_where_the_machine_was_left() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        mdi(&mut a, "G0 X12 Y7");
+        let _ = a.update(Message::Disconnect);
+        idle(&mut a);
+        assert!((at(&a)[0] - 12.).abs() < 1e-3 && (at(&a)[1] - 7.).abs() < 1e-3);
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2]);
+        let _ = a.update(Message::Machine(Action::KeepPosition));
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        assert!((at(&a)[0] - 12.).abs() < 1e-3 && (at(&a)[1] - 7.).abs() < 1e-3);
+        assert!(conn(&a).unset_limited_axes().is_empty());
+    }
+
+    #[test]
+    fn home_needs_home_switches_on_every_axis() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        assert!(!conn(&a).home_switches());
+        let _ = a.update(Message::Machine(Action::Home));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = a.update(Message::Tick);
+        let s = &conn(&a).snapshot;
+        assert_eq!(s.state, Some(State::Idle));
+        assert!(
+            !s.log.iter().any(|l| l.contains("no home switch")),
+            "{:?}",
+            s.log
+        );
+        let _ = a.update(Message::Disconnect);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), SWITCHED);
+        idle(&mut a);
+        assert!(conn(&a).home_switches());
+        mdi(&mut a, "G0 X4 Y3 Z-2");
+        let _ = a.update(Message::Machine(Action::Home));
+        tick_until(&mut a, 3.0, "homing", |s| s.state == Some(State::Homing));
+        tick_until(&mut a, 10.0, "homed", |s| {
+            s.state == Some(State::Idle) && s.referenced[..3].iter().all(|r| *r)
+        });
+        assert!(at(&a)[..3].iter().all(|v| v.abs() < 1e-2), "{:?}", at(&a));
+    }
+
     #[test]
     fn connect_reports_a_missing_profile_and_needs_a_uc100_machine() {
         let dir = tempfile::tempdir().unwrap();
@@ -1579,6 +1671,19 @@ mist = { pin = 9 }
         let _ = a.update(Message::WizardStep(3));
         let _ = a.view();
         let _ = a.update(Message::Disconnect);
+        // A JY5800-like machine before and after machine zero, and one with switches.
+        for profile in [LIMITED, SWITCHED] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = profile_app(dir.path(), profile);
+            a.page = Page::Control;
+            idle(&mut a);
+            let _ = a.view();
+            let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+            tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+                s.referenced[..3].iter().all(|r| *r)
+            });
+            let _ = a.view();
+        }
     }
 
     #[test]
