@@ -372,6 +372,31 @@ the machine's tool in red at the live position; when that operation's
 simulation is shown, it follows the machine to the move being cut. The
 spindle start dwell and the Air output for UC100 runs are in the machine
 wizard.
+**Setup** (the switch at the top of the Control page) does the commissioning
+work that needed the driver's own app or a text editor:
+
+- **The UC100 profile as a form**: pins and polarity, steps per mm, speeds,
+  acceleration, switches, homing and soft limits per axis; the E-stop, probe
+  and index inputs; spindle, coolant, drive enable and charge pump outputs;
+  homing order, step rate and the commissioning checks. Every change is
+  checked by the driver as you make it, and **Save** is offered only for a
+  profile it accepts. Save rewrites only the values you changed: comments,
+  layout and Windows line endings stay. It refuses if the file was edited
+  elsewhere since it was opened (**Revert** reads it again). Editing works
+  without connecting. A connected machine is reconnected with the saved
+  profile, in E-stop, and its machine position must be set again.
+- **Inputs**: each input pin's level, what the profile wires to it, how often
+  it changed and the last changes, the E-stop input and the controller's
+  stop latch and limit flags.
+- **Outputs**: each output pin's level and role; **High**, **Low** and
+  **Release** for a wiring test while Idle, never on pins the controller
+  drives itself. E-stop releases every forced pin.
+- **Calibrate steps per mm**: pick an axis and a travel, **Move**, measure
+  how far the carriage really went, and **Use in profile**.
+- **Audit**: the driver's report on the profile as edited.
+
+Adding or removing an axis, motion tuning and the tool table are still edits
+of the file.
 
 ## LinuxCNC G-code export
 
@@ -522,6 +547,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-three 
 - `src/control.rs`: the UC100 connection: a machine's driver profile and Connection, the driver's controller for one machine, its saved state files and the snapshot the Control page draws; the Control page's actions (`Action`, `Connection::act`) and their guards, machine positions declared one per tick, and the held jog's keepalive.
 - `src/run.rs`: running a setup on the UC100: its checked tool runs, the lowering of a tool run to the driver's actions at the live work offset, the checks before Cycle Start, progress, the tool change between tool runs, and the live tool for the 3D view.
 - `src/machine_view.rs`: the CNC4030 model on the Control page: assumed dimensions, flat-shaded faces drawn far to near, the travel box and the tool tip.
+- `src/setup.rs`: the Control page's Setup view: the UC100 profile edited in place with `toml_edit` (`Draft`: comments and line endings kept, checked by the driver, saved atomically, refused over a change on disk), the inputs and output test, calibration and the audit.
 - `src/post_check.rs`: export checks: spindle and feed limits, travel, rapids into material, holder clearance, jaw and clamp clearance over every program move, and touch-off rules.
 - `src/holding.rs`: the workholding library (vises and clamps and their starters), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
 - `src/ngc.rs`: strict reader for the G-code subset the post writes, and the replay that compares each program move by move with the simulation.

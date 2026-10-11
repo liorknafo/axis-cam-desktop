@@ -516,6 +516,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml_edit",
  "uc100",
  "uuid",
  "zip",
@@ -5592,6 +5593,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -5711,7 +5713,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "uc100"
 version = "0.1.0"
-source = "git+https://github.com/liorknafo/UC100-driver.git?rev=fac396e1f82eb23126e76fc4d5dce2f0efac0dcf#fac396e1f82eb23126e76fc4d5dce2f0efac0dcf"
+source = "git+https://github.com/liorknafo/UC100-driver.git?rev=b386794de3c5185b1c9b7684baf383fb2d83e743#b386794de3c5185b1c9b7684baf383fb2d83e743"
 dependencies = [
  "anyhow",
  "clap",

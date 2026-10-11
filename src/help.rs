@@ -442,6 +442,19 @@ pub fn command(m: &Message, label: String) -> Help {
         LoadModels => "Ask OpenAI again which models your ChatGPT plan can use in this app.",
         Machine(a) => machine_help(a),
         Run(a) => run_help(a),
+        ControlSetup(false) => "Jog, zero and run the machine.",
+        ControlSetup(true) => {
+            "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm."
+        }
+        Setup(crate::setup::Msg::Save) => {
+            "Write the profile file. Only the values changed are rewritten; its comments stay. A connected machine is reconnected with it: it starts in E-stop, and its machine position must be set again."
+        }
+        Setup(crate::setup::Msg::UseCalibration) => {
+            "Put this steps per mm in the profile below. Save to use it."
+        }
+        Setup(crate::setup::Msg::Revert) => {
+            "Throw the changes away and read the profile file again."
+        }
         PlanNoticeDismissed => "Close this notice. It is shown once.",
         OpenUrl(_) => {
             "Open your ChatGPT usage settings in the browser, where you can see and manage how much of your plan this app uses."
@@ -475,6 +488,15 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         JogStep(None) => "Jog for as long as the button or key is held.",
         JogStep(Some(_)) => "Move exactly this far for each press.",
         JogSpeed(_) => "Jog speed, as a share of each axis's maximum speed in the profile.",
+        TestOutput(_, Some(_)) => {
+            "Force this output pin for a wiring test, while Idle. E-stop releases every forced pin."
+        }
+        TestOutput(_, None) => "Release the pin: the machine drives it again.",
+        CalAxis(_) => "Calibrate this axis.",
+        CalDistance(_) | CalMeasured(_) => "Travel in mm.",
+        CalMove => {
+            "Move the axis by the commanded travel at the jog speed, counting its step pulses. Soft limits apply."
+        }
         WorkZero(None) => {
             "Make the current position work zero on every axis, in the active coordinate system (G54–G59)."
         }

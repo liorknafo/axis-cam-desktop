@@ -21,13 +21,13 @@ const MUTED: Color = Color::from_rgb(0.43, 0.50, 0.57);
 const BLUE: Color = Color::from_rgb(0.13, 0.42, 0.71);
 const LINE: Color = Color::from_rgb(0.85, 0.88, 0.91);
 const BG: Color = Color::from_rgb(0.95, 0.96, 0.975);
-fn bold<'a>(s: impl Into<String>, size: u32) -> widget::Text<'a> {
+pub(crate) fn bold<'a>(s: impl Into<String>, size: u32) -> widget::Text<'a> {
     text(s.into()).size(size).font(Font {
         weight: iced::font::Weight::Semibold,
         ..Font::DEFAULT
     })
 }
-fn muted<'a>(s: impl Into<String>) -> widget::Text<'a> {
+pub(crate) fn muted<'a>(s: impl Into<String>) -> widget::Text<'a> {
     text(s.into()).size(12).color(MUTED)
 }
 fn panel_style(_: &Theme) -> container::Style {
@@ -42,7 +42,7 @@ fn panel_style(_: &Theme) -> container::Style {
         ..Default::default()
     }
 }
-fn btn<'a>(label: impl Into<String>, msg: Message, active: bool) -> HelpButton<'a> {
+pub(crate) fn btn<'a>(label: impl Into<String>, msg: Message, active: bool) -> HelpButton<'a> {
     let label = label.into();
     let action = msg.clone();
     let b = button(text(label.clone()).size(12))
@@ -148,7 +148,7 @@ fn choice_value<'a>(
         widget::tooltip::Position::Left,
     )
 }
-fn note<'a>(s: impl Into<String>) -> Element<'a, Message> {
+pub(crate) fn note<'a>(s: impl Into<String>) -> Element<'a, Message> {
     container(
         text(s.into())
             .size(12)
@@ -184,7 +184,7 @@ fn warnings<'a>(issues: Vec<String>) -> Element<'a, Message> {
     )
 }
 /// An amber box: a heading and one bullet per line.
-fn caution<'a>(heading: impl Into<String>, lines: Vec<String>) -> Element<'a, Message> {
+pub(crate) fn caution<'a>(heading: impl Into<String>, lines: Vec<String>) -> Element<'a, Message> {
     let mut c = column![bold(heading, 12).color(Color::from_rgb8(166, 101, 32))].spacing(5);
     for line in lines {
         c = c.push(
@@ -2509,7 +2509,11 @@ fn estop<'a>() -> Element<'a, Message> {
 
 /// A Control page button: greyed out without a message, when the machine
 /// cannot do it now; `on` marks the selected one of a group.
-fn act<'a>(label: impl Into<String>, msg: Option<Message>, on: bool) -> Element<'a, Message> {
+pub(crate) fn act<'a>(
+    label: impl Into<String>,
+    msg: Option<Message>,
+    on: bool,
+) -> Element<'a, Message> {
     let label = label.into();
     let b = button(text(label.clone()).size(12))
         .padding([7, 12])
@@ -2541,7 +2545,7 @@ fn act<'a>(label: impl Into<String>, msg: Option<Message>, on: bool) -> Element<
 }
 
 /// A titled box on the Control page.
-fn machine_panel<'a>(title: &str, body: Column<'a, Message>) -> Element<'a, Message> {
+pub(crate) fn machine_panel<'a>(title: &str, body: Column<'a, Message>) -> Element<'a, Message> {
     container(column![bold(title, 14), body.spacing(10)].spacing(10))
         .padding(14)
         .width(Fill)
@@ -2565,7 +2569,23 @@ fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
     let target = app.control_target();
-    let mut left = column![bold("Machine", 18)].spacing(10);
+    let mut left = column![
+        bold("Machine", 18),
+        row![
+            act(
+                "Control",
+                Some(Message::ControlSetup(false)),
+                !app.machine_setup
+            ),
+            act(
+                "Setup",
+                Some(Message::ControlSetup(true)),
+                app.machine_setup
+            )
+        ]
+        .spacing(6)
+    ]
+    .spacing(10);
     let machines: Vec<&Machine> = app
         .doc
         .machines
@@ -2599,9 +2619,17 @@ fn control(app: &App) -> Element<'_, Message> {
         };
     }
     let Some(c) = &app.control else {
+        let main: Element<_> = if app.machine_setup {
+            crate::setup::view(app)
+        } else {
+            container(muted("Not connected."))
+                .padding(16)
+                .width(Fill)
+                .into()
+        };
         return row![
             container(left).padding(16).width(300).style(panel_style),
-            container(muted("Not connected.")).padding(16).width(Fill)
+            main
         ]
         .spacing(12)
         .padding(12)
@@ -2630,6 +2658,13 @@ fn control(app: &App) -> Element<'_, Message> {
     .width(300)
     .height(Fill)
     .style(panel_style);
+    if app.machine_setup {
+        return row![left, crate::setup::view(app)]
+            .spacing(12)
+            .padding(12)
+            .height(Fill)
+            .into();
+    }
     let mut head = row![bold(
         s.state.as_ref().map_or("Connecting…", State::label),
         28

@@ -2282,6 +2282,205 @@ flood = { pin = 8 }
         );
     }
 
+    /// The profile open on Setup.
+    fn draft(a: &App) -> &crate::setup::Draft {
+        a.profile_draft
+            .as_ref()
+            .and_then(|(_, d)| d.as_ref().ok())
+            .expect("profile open")
+    }
+
+    fn setup_edit(a: &mut App, e: crate::setup::Edit) {
+        let _ = a.update(Message::Setup(crate::setup::Msg::Edit(e)));
+    }
+
+    #[test]
+    fn setup_edits_and_saves_the_profile() {
+        use crate::setup::{Edit, Msg};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlSetup(true));
+        assert!(draft(&a).checked.is_ok());
+        let _ = a.view();
+        setup_edit(&mut a, Edit::Number("axes.x.soft_max".into(), "380".into()));
+        setup_edit(&mut a, Edit::Pin("inputs.estop".into(), Some(10)));
+        // Back to Control and to Setup again: the changes stay.
+        let _ = a.update(Message::ControlSetup(false));
+        let _ = a.update(Message::ControlSetup(true));
+        assert_eq!(draft(&a).number("axes.x.soft_max"), "380");
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::Save));
+        assert_eq!(draft(&a).note.as_deref(), Some("Saved."));
+        let cfg = crate::control::profile(&a.doc.machines[0]).unwrap();
+        assert_eq!(cfg.axes.x.unwrap().soft_max, Some(380.));
+        assert_eq!(cfg.inputs.estop.unwrap().pin, 10);
+        // Revert throws changes away.
+        setup_edit(&mut a, Edit::Number("axes.x.soft_max".into(), "1".into()));
+        let _ = a.update(Message::Setup(Msg::Revert));
+        assert_eq!(draft(&a).number("axes.x.soft_max"), "380");
+        // A profile the driver refuses is shown and not saved.
+        setup_edit(&mut a, Edit::Pin("axes.y.step".into(), Some(2)));
+        assert!(draft(&a).blocker().unwrap().contains("already used"));
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::Save));
+        let cfg = crate::control::profile(&a.doc.machines[0]).unwrap();
+        assert_eq!(cfg.axes.y.unwrap().step.pin, 4);
+        // A file that is not TOML is shown as such.
+        std::fs::write(dir.path().join("uc100.toml"), "[axes.x\n").unwrap();
+        let _ = a.update(Message::Setup(Msg::Revert));
+        assert!(matches!(&a.profile_draft, Some((_, Err(e))) if e.contains("not valid TOML")));
+        let _ = a.view();
+    }
+
+    #[test]
+    fn outputs_are_forced_only_while_idle_and_on_free_pins() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlSetup(true));
+        idle(&mut a);
+        let level = |a: &App, pin: u8| {
+            let st = conn(a).snapshot.status.unwrap();
+            uc100::protocol::OutputWord(st.outputs).level(pin)
+        };
+        assert_eq!(level(&a, 14), Some(false));
+        let _ = a.update(Message::Machine(Action::TestOutput(14, Some(true))));
+        let _ = a.view();
+        tick_until(&mut a, 2.0, "pin 14 HIGH", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(14) == Some(true)
+        });
+        assert_eq!(conn(&a).forced.get(&14), Some(&true));
+        let _ = a.update(Message::Machine(Action::TestOutput(14, None)));
+        tick_until(&mut a, 2.0, "pin 14 released", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(14) == Some(false)
+        });
+        assert!(conn(&a).forced.is_empty());
+        // A step pin and the spindle PWM are the controller's.
+        for pin in [2, 16] {
+            let _ = a.update(Message::Machine(Action::TestOutput(pin, Some(true))));
+        }
+        assert!(conn(&a).forced.is_empty());
+        // E-stop releases a forced pin, and nothing is forced in E-stop.
+        let _ = a.update(Message::Machine(Action::TestOutput(17, Some(true))));
+        tick_until(&mut a, 2.0, "pin 17 HIGH", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(17) == Some(true)
+        });
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert!(conn(&a).forced.is_empty());
+        tick_until(&mut a, 2.0, "pin 17 released", |s| {
+            uc100::protocol::OutputWord(s.status.unwrap().outputs).level(17) == Some(false)
+        });
+        let _ = a.update(Message::Machine(Action::TestOutput(17, Some(true))));
+        assert!(conn(&a).forced.is_empty());
+        let _ = a.view();
+        // Input pins are not outputs.
+        assert!(level(&a, 10).is_none());
+    }
+
+    #[test]
+    fn calibration_measures_steps_per_mm_and_fills_the_profile() {
+        use crate::control::Action;
+        use crate::setup::Msg;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlSetup(true));
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        for action in [
+            Action::CalAxis(0),
+            Action::CalDistance("10".into()),
+            Action::CalMove,
+        ] {
+            let _ = a.update(Message::Machine(action));
+        }
+        let _ = a.view();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        tick_until(&mut a, 5.0, "X at 10", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[0] - 10.).abs() < 1e-3
+        });
+        // 10 mm at the profile's 200 steps per mm.
+        assert_eq!(conn(&a).cal_pulses(), Some(2000));
+        let _ = a.update(Message::Machine(Action::CalMeasured("9.95".into())));
+        let v = conn(&a).calibrated().unwrap().unwrap();
+        assert!((v - 201.005_025).abs() < 1e-5, "{v}");
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::UseCalibration));
+        assert_eq!(draft(&a).number("axes.x.steps_per_unit"), "201.005");
+        let _ = a.update(Message::Setup(Msg::Save));
+        assert_eq!(
+            conn(&a).config.axes.x.as_ref().unwrap().steps_per_unit,
+            201.005
+        );
+        // A move that is not a number, or one in E-stop, is not made.
+        tick_until(&mut a, 3.0, "E-stop after reconnecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::Machine(Action::CalMove));
+        assert_eq!(conn(&a).cal_pulses(), None);
+        let _ = a.update(Message::Machine(Action::CalDistance("far".into())));
+        assert_eq!(conn(&a).cal_distance(), None);
+        let _ = a.view();
+    }
+
+    #[test]
+    fn saving_while_connected_reconnects_with_the_new_profile() {
+        use crate::control::Action;
+        use crate::setup::{Edit, Msg};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        a.page = Page::Control;
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        let _ = a.update(Message::ControlSetup(true));
+        setup_edit(
+            &mut a,
+            Edit::Number("axes.x.steps_per_unit".into(), "250".into()),
+        );
+        // Not while the machine moves.
+        let _ = a.update(Message::Machine(Action::JogPress(1, false)));
+        tick_until(&mut a, 3.0, "jogging", |s| s.state == Some(State::Jog));
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::Save));
+        assert_eq!(
+            draft(&a).note.as_deref(),
+            Some("Stop the machine before saving the profile.")
+        );
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Setup(Msg::Save));
+        assert!(
+            draft(&a)
+                .note
+                .as_deref()
+                .unwrap()
+                .starts_with("Saved, and the machine was reconnected")
+        );
+        assert_eq!(
+            conn(&a).config.axes.x.as_ref().unwrap().steps_per_unit,
+            250.
+        );
+        assert!(conn(&a).simulated);
+        tick_until(&mut a, 3.0, "E-stop after reconnecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        // The machine position counted with 200 steps per mm is gone.
+        assert!(conn(&a).snapshot.referenced.iter().all(|r| !r));
+        let _ = a.view();
+    }
+
     #[test]
     fn connect_reports_a_missing_profile_and_needs_a_uc100_machine() {
         let dir = tempfile::tempdir().unwrap();

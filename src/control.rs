@@ -1,12 +1,14 @@
 //! The connection to a UC100 machine controller: the driver's `Controller`
 //! for one machine of the project, real (USB) or simulated.
 use crate::model::{Machine, get};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use uc100::config::MachineConfig;
 use uc100::controller::{Command, Controller, Snapshot, State};
+use uc100::diagnostics::{INPUT_PINS, InputTracker};
 use uc100::gcode::Spindle;
+use uc100::protocol::Status;
 
 /// Whether a UC100 machine connects to the simulator. Unset means the
 /// simulator, except on macOS, where the real machine is connected.
@@ -76,6 +78,53 @@ pub enum Action {
     MdiText(String),
     /// Run the MDI field's line.
     MdiSend,
+    /// Force an output pin high or low for a wiring test, or release it.
+    TestOutput(u8, Option<bool>),
+    /// Calibration: the axis, the commanded travel field, the measured
+    /// travel field, and the move.
+    CalAxis(usize),
+    CalDistance(String),
+    CalMeasured(String),
+    CalMove,
+}
+
+/// Steps-per-mm calibration: one commanded move, then the travel measured
+/// at the machine.
+pub struct Calibration {
+    pub axis: usize,
+    /// Commanded travel, mm.
+    pub distance: String,
+    /// Measured travel, mm.
+    pub measured: String,
+    /// The axis's step counter before the move.
+    start: Option<i32>,
+}
+
+/// The input pins' changes since connecting, as seen at each tick.
+#[derive(Default)]
+pub struct InputLog {
+    tracker: InputTracker,
+    /// The last edges, newest last: seconds since connecting, pin, HIGH now.
+    pub edges: VecDeque<(f64, u8, bool)>,
+}
+
+impl InputLog {
+    fn observe(&mut self, since: Duration, st: &Status) {
+        for (pin, high) in self.tracker.observe(st) {
+            self.edges.push_back((since.as_secs_f64(), pin, high));
+            if self.edges.len() > 20 {
+                self.edges.pop_front();
+            }
+        }
+    }
+
+    /// How often a pin changed since connecting.
+    pub fn changes(&self, pin: u8) -> u32 {
+        INPUT_PINS
+            .iter()
+            .position(|&p| p == pin)
+            .map_or(0, |i| self.tracker.transitions[i])
+    }
 }
 
 /// The continuous jog held down.
@@ -109,6 +158,12 @@ pub struct Connection {
     pub mdi: String,
     /// The setup being run, tool run by tool run.
     pub run: Option<crate::run::Run>,
+    opened: Instant,
+    pub inputs: InputLog,
+    /// Output pins forced for a wiring test (pin, high). The driver releases
+    /// them all on E-stop.
+    pub forced: BTreeMap<u8, bool>,
+    pub calibration: Calibration,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -140,6 +195,15 @@ impl Connection {
             rpm: String::new(),
             mdi: String::new(),
             run: None,
+            opened: Instant::now(),
+            inputs: InputLog::default(),
+            forced: BTreeMap::new(),
+            calibration: Calibration {
+                axis: 0,
+                distance: "100".into(),
+                measured: String::new(),
+                start: None,
+            },
         })
     }
 
@@ -151,6 +215,12 @@ impl Connection {
         self.snapshot = self.controller.snapshot();
         if let Some(run) = &mut self.run {
             run.refresh(self.snapshot.program_outcome.as_ref());
+        }
+        if let Some(st) = &self.snapshot.status {
+            self.inputs.observe(self.opened.elapsed(), st);
+        }
+        if self.snapshot.state == Some(State::EStop) {
+            self.forced.clear();
         }
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
@@ -277,6 +347,36 @@ impl Connection {
                 let line = std::mem::take(&mut self.mdi);
                 self.send(Command::Mdi(line.trim().into()));
             }
+            Action::TestOutput(pin, None) => {
+                self.forced.remove(&pin);
+                self.send(Command::TestOutput { pin, high: None });
+            }
+            Action::CalAxis(axis) if self.axis(axis) => {
+                self.calibration.axis = axis;
+                self.calibration.start = None;
+            }
+            Action::CalDistance(text) => self.calibration.distance = text,
+            Action::CalMeasured(text) => self.calibration.measured = text,
+            Action::CalMove => {
+                let axis = self.calibration.axis;
+                if let (true, Some(distance), Some(st)) =
+                    (self.idle(), self.cal_distance(), &self.snapshot.status)
+                {
+                    self.calibration.start = Some(st.position[axis]);
+                    self.send(Command::JogStep {
+                        axis,
+                        distance,
+                        feed: self.jog_feed(axis),
+                    });
+                }
+            }
+            Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
+                self.forced.insert(pin, high);
+                self.send(Command::TestOutput {
+                    pin,
+                    high: Some(high),
+                });
+            }
             _ => {}
         }
     }
@@ -372,6 +472,42 @@ impl Connection {
             .any(|a| a.limit_pos.is_some() || a.limit_neg.is_some())
     }
 
+    /// The commanded calibration travel, when it is a move to make.
+    pub fn cal_distance(&self) -> Option<f64> {
+        let d: f64 = self.calibration.distance.trim().parse().ok()?;
+        (d.is_finite() && d != 0. && self.axis(self.calibration.axis)).then_some(d)
+    }
+
+    /// Step pulses commanded on the calibration axis since its move began.
+    pub fn cal_pulses(&self) -> Option<i32> {
+        let st = self.snapshot.status.as_ref()?;
+        Some(st.position[self.calibration.axis] - self.calibration.start?)
+    }
+
+    /// Steps per mm from the pulses and the measured travel, once both exist.
+    pub fn calibrated(&self) -> Option<Result<f64, String>> {
+        let measured: f64 = self.calibration.measured.trim().parse().ok()?;
+        let pulses = self.cal_pulses()?;
+        Some(
+            uc100::diagnostics::measured_steps_per_unit(pulses, measured)
+                .map_err(|e| e.to_string()),
+        )
+    }
+
+    /// An output pin may be forced: while Idle, and never one the firmware
+    /// drives (step, direction, charge pump, PWM, spindle direction).
+    pub fn can_force(&self, pin: u8) -> bool {
+        self.idle() && uc100::protocol::is_output_pin(pin) && !self.config.firmware_output_pin(pin)
+    }
+
+    /// Nothing moves: the profile may be saved and the machine reconnected.
+    pub fn stopped(&self) -> bool {
+        matches!(
+            self.snapshot.state,
+            None | Some(State::EStop | State::Idle | State::Disconnected)
+        )
+    }
+
     pub fn idle(&self) -> bool {
         self.snapshot.state == Some(State::Idle)
     }
@@ -446,6 +582,27 @@ mod tests {
         m.p.insert("uc100_profile".into(), profile.into());
         m.p.insert("uc100_connection".into(), connection.into());
         m
+    }
+
+    #[test]
+    fn the_input_log_keeps_the_last_edges() {
+        let mut log = InputLog::default();
+        let mut st = Status {
+            inputs: 0x1f,
+            ..Default::default()
+        };
+        log.observe(Duration::ZERO, &st);
+        assert!(log.edges.is_empty());
+        st.inputs = 0x1e;
+        log.observe(Duration::from_millis(1500), &st);
+        assert_eq!(log.edges.back(), Some(&(1.5, 10, false)));
+        assert_eq!((log.changes(10), log.changes(15)), (1, 0));
+        for _ in 0..30 {
+            st.inputs ^= 1;
+            log.observe(Duration::from_secs(2), &st);
+        }
+        assert_eq!(log.edges.len(), 20);
+        assert_eq!(log.changes(10), 31);
     }
 
     #[test]
