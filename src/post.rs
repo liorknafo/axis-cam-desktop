@@ -1170,11 +1170,48 @@ fn unholdable(
         .as_ref()
         .zip(first.frame)
         .map(|(volume, frame)| crate::rest::Removed::new(volume, frame).with_part(part));
+    // What the setup's own operations cut, which its clamps must not lose.
+    let cuts = first.frame.map(|frame| {
+        let plans = walk.indexes.iter().zip(&walk.simulations);
+        crate::rest::Cuts::of_plans(plans.map(|(oi, sim)| (*oi, &sim.plan)), si, frame)
+    });
+    // And the stock they leave, which must stay joined to the part under a
+    // clamp to the end of the setup.
+    let after = (matches!(layout, crate::holding::Layout::Clamps { .. }))
+        .then_some(first.frame)
+        .flatten()
+        .map(|frame| {
+            let plans = walk.indexes.iter().zip(&walk.simulations);
+            let volume = crate::rest::after_setup_from(
+                first.initial_volume.as_ref(),
+                walk.stock,
+                plans.map(|(oi, sim)| (*oi, &sim.plan)),
+                si,
+                frame,
+            );
+            (volume, frame)
+        });
+    let after = after
+        .as_ref()
+        .map(|(volume, frame)| crate::rest::Removed::new(volume, *frame).with_part(part));
+    let own = cuts.as_ref().map(|cuts| crate::holding::Own {
+        cuts,
+        part,
+        after: after.as_ref(),
+    });
     let names = |s, o| crate::holding::operation_name(doc, s, o);
-    crate::holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
-        .into_iter()
-        .map(|message| format!("{}: {message}", setup.name()))
-        .collect()
+    crate::holding::holdable(
+        si,
+        &layout,
+        holder,
+        held,
+        removed.as_ref(),
+        own.as_ref(),
+        &names,
+    )
+    .into_iter()
+    .map(|message| format!("{}: {message}", setup.name()))
+    .collect()
 }
 impl Walk<'_> {
     /// The plans of the operations of `group`, one of `groups`.
@@ -1283,7 +1320,18 @@ pub(crate) fn prepare(
     let boxes = holding_boxes(doc, si, held).map_err(|e| vec![e])?;
     let unholdable = unholdable(doc, mesh, si, &walk, held);
     if !unholdable.is_empty() {
-        return Err(unholdable);
+        // Why the setup cannot be held first, then where its programs come
+        // too close to the jaws or clamps, which says where to look.
+        let mut problems = unholdable;
+        for group in groups {
+            let blocks = blocks(&ops[group.clone()], &walk.plans(group), &settings);
+            for h in walk.held(setup, group, &blocks, &boxes) {
+                if !problems.contains(&h.message) {
+                    problems.push(h.message);
+                }
+            }
+        }
+        return Err(problems);
     }
     let origin = get(&setup.p, "origin");
     if let (true, Some(volume), Some(frame)) = (
@@ -1450,10 +1498,14 @@ pub fn write_job(
             .cloned()
             .or_else(|| {
                 job.setups.iter().find_map(|s| {
-                    s.result
-                        .as_ref()
-                        .err()
-                        .and_then(|e| e.first().map(|x| format!("{}: {x}", s.name)))
+                    s.result.as_ref().err().and_then(|e| e.first()).map(|x| {
+                        // Some messages name their setup already.
+                        if x.starts_with(&format!("{}: ", s.name)) {
+                            x.clone()
+                        } else {
+                            format!("{}: {x}", s.name)
+                        }
+                    })
                 })
             })
             .unwrap_or_else(|| "No programs were produced.".into());
@@ -3200,7 +3252,16 @@ M2
         let hit = &holding::hits(&plans[0], &boxes, 2.)[0];
         let datum = datum(&doc.setups[0], plans[0].stock, &mesh).unwrap();
         let expected = holding::message("Pocket", hit, 2., datum);
-        assert_eq!(errors(&posted), [expected.as_str()]);
+        // Why the setup cannot be held (the pocket cuts away the stock under
+        // the clamp's bite, which reaches over the part), then where the
+        // program comes too close.
+        let errors = errors(&posted);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part. Clamp on stock beside the part, on two opposite sides, or use the vise."),
+            "{errors:?}"
+        );
+        assert_eq!(errors[1], expected.as_str());
         // The clamp's inner face is X-22 in work coordinates; the rapids pass
         // it 15 mm above the stock top.
         assert!(
@@ -3301,7 +3362,15 @@ M2
             Some(&out.to_string_lossy().into_owned()),
         )
         .unwrap_err();
-        assert_eq!(error, format!("Nothing was written. Top: {expected}"));
+        // The first reason, naming its setup once.
+        assert!(
+            error.starts_with("Nothing was written. Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part."),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Top: Top:") && !expected.is_empty(),
+            "{error}"
+        );
         assert!(!out.exists(), "nothing was written");
         // With the toe clamp's own bite it is clear of the pocket: it exports.
         doc.workholding
@@ -3340,15 +3409,24 @@ M2
         let entry = doc.workholding.iter_mut().find(|h| h.id == id).unwrap();
         entry.p.insert("bite".into(), "40".into());
         let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].operation, Some(1));
+        assert_eq!(found.len(), 2, "{found:?}");
+        // The pocket (operation 2) cuts away the stock under the clamp's
+        // bite, which reaches over the part.
+        assert_eq!(found[0].operation, None);
+        assert!(found[0].message.starts_with(
+            "Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 2 would cut away the stock under its bite, which reaches 38 mm over the part."
+        ), "{found:?}");
+        assert_eq!(found[1].operation, Some(1));
         assert!(
-            found[0]
+            found[1]
                 .message
                 .starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0")
         );
         // These are the messages export refuses the setup with.
-        assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
+        assert_eq!(
+            errors(&post_job(&doc, &mesh)),
+            [found[0].message.as_str(), found[1].message.as_str()]
+        );
         // A setup that cannot be modelled: the one line, for no operation.
         doc.setups[0].p.insert("holder".into(), "gone".into());
         let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);

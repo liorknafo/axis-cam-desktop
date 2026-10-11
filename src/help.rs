@@ -351,7 +351,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this entry from the library. It cannot be deleted while a setup uses it: choose other workholding in that setup first."
         }
         SuggestLayout => {
-            "Place this setup's vise jaws or clamps. A vise goes on the X or the Y sides, whichever its generated toolpaths leave clearer, at its grip or less. Clamps are chosen among the middle and quarter points of each side: four, or two on a small stock. The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again."
+            "Place this setup's vise jaws or clamps. A vise goes on the X or the Y sides, whichever its generated toolpaths leave clearer, at its grip or less. Clamps go only where they hold: along each side, every 5 mm, the spot clearest of the toolpaths whose bite keeps its stock for the whole setup, one per side on at least two opposite sides, or two on a small stock. Where no two opposite sides can be clamped, none are placed and the status says why and how much stock to leave beside the part. The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again."
         }
         SetOpTool(_) => {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview."
@@ -1770,7 +1770,7 @@ mod tests {
         }
         let suggest = command(&Message::SuggestLayout, "x".into()).body;
         assert!(suggest.contains("never changed"), "{suggest}");
-        assert!(suggest.contains("middle and quarter points"), "{suggest}");
+        assert!(suggest.contains("only where they hold"), "{suggest}");
         assert!(suggest.contains("parallels, bolts, the table"), "{suggest}");
         let delete = command(&Message::DeleteHolder("h".into()), "x".into()).body;
         assert!(delete.contains("setup uses"), "{delete}");

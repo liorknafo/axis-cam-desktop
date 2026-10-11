@@ -810,20 +810,57 @@ impl App {
                 ]
             }
             112 => {
-                // Clamps, drawn the same way; the facing preview's toolpath
-                // comes within the gap of them, which its warning says in the
-                // inspector.
+                // Clamps. The facing covers the whole stock top, so choosing
+                // Clamps places none and says why. The four middles typed
+                // anyway are drawn round the stock; the facing preview, at
+                // the first of a few points of its playback where it has cut
+                // the stock from under some of their bites and not yet the
+                // others (below), draws those clamps red and the others grey,
+                // and its warning in the inspector says the toolpath comes
+                // within the gap and the bites are lost. Suggest layout,
+                // pressed again, says why none can be placed, in the status
+                // line.
                 self.camera = crate::viewport::Camera::default();
                 vec![
                     Message::Edit(Target::Setup, "holding", "Clamps".into()),
+                    Message::SetClamps("-X:0;+X:0;-Y:0;+Y:0".into()),
                     Message::SelectOp(0),
                     Message::Tab("Passes".into()),
                     Message::Generate,
-                    Message::Scrub(0.5),
                 ]
             }
             113 => vec![Message::Page(Page::Workholding)],
             114 => {
+                // The run's last check of the earlier screens: the operation
+                // of the Workholding screens is still previewed.
+                assert!(self.active_simulation().is_some(), "{}", self.status);
+                // Setup 1 held as the app holds it: 25 mm of stock beside the
+                // part on ±X, the facing kept to the part's outline, and the
+                // clamps Suggest layout places on that rim.
+                for message in [
+                    Message::Edit(Target::Setup, "stock_left", "25".into()),
+                    Message::Edit(Target::Setup, "stock_right", "25".into()),
+                    Message::SelectOp(0),
+                    Message::Edit(Target::Operation, "boundary", "Model silhouette".into()),
+                    Message::Edit(
+                        Target::Operation,
+                        "containment",
+                        "Tool outside boundary".into(),
+                    ),
+                    Message::SuggestLayout,
+                ] {
+                    let _ = self.update(message);
+                }
+                let clamps = crate::model::get(&self.doc.setup().p, "clamps").to_string();
+                assert!(
+                    self.status.starts_with("Suggested: ") && !clamps.is_empty(),
+                    "{}",
+                    self.status
+                );
+                eprintln!(
+                    "Screen 91: setup 1 holds clamps at {clamps}: {}",
+                    self.status
+                );
                 // The first request still going: the overview the run started
                 // from, the model's two looks (a picture and a view it could
                 // not get), then OpenAI refusing the tool, and the plan as far
@@ -861,9 +898,6 @@ impl App {
                 // start at its bottom and close on the walls the Contour
                 // finished, under that rim.
                 use crate::model::{Setup, Strategy};
-                // The run's last check of the earlier screens: the operation
-                // of the Workholding screens is still previewed.
-                assert!(self.active_simulation().is_some(), "{}", self.status);
                 self.planner = crate::Planner::Idle;
                 self.plan_timeline.clear();
                 self.plan_overview = None;
@@ -876,6 +910,14 @@ impl App {
                 contour.geometry.clear();
                 let first = &mut self.doc.setups[0];
                 first.operations.retain(|o| o.strategy == Strategy::Face);
+                // Facing the whole top again, as before screen 91 kept it to
+                // the part's outline.
+                for (k, v) in [
+                    ("boundary", "Stock silhouette"),
+                    ("containment", "Tool center on boundary"),
+                ] {
+                    first.operations[0].p.insert(k.into(), v.into());
+                }
                 first.operations.push(contour);
                 for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
                     first.p.insert(key.into(), "4".into());
@@ -1021,8 +1063,31 @@ impl App {
             }
             112 => {
                 assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Clamps");
+                let clamps = crate::ui::holding_boxes(self);
+                assert_eq!(clamps.len(), 4, "{}", self.status);
+                // Where in the playback the facing has taken the stock from
+                // under some bites and not the others: 30 % when it never is.
+                use crate::holding::Bite;
+                let bare_at = |a: &mut Self, fraction: f32| {
+                    let _ = a.update(Message::Scrub(fraction));
+                    let sim = a.active_simulation().expect("the facing preview");
+                    let part = crate::simulation::part_box(a.doc.setup(), a.part_mesh().unwrap());
+                    let removed = crate::rest::Removed::new(
+                        sim.volume.as_ref().expect("simulated stock"),
+                        sim.frame.expect("its frame"),
+                    )
+                    .with_part(part);
+                    crate::holding::bare(&clamps, sim.plan.stock, &removed)
+                };
+                let (fraction, bare) = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
+                    .into_iter()
+                    .map(|f| (f, bare_at(self, f)))
+                    .find(|(_, bare)| bare.contains(&Bite::Gone) && bare.contains(&Bite::Holds))
+                    .unwrap_or_else(|| (0.3, bare_at(self, 0.3)));
+                let _ = self.update(Message::SuggestLayout);
                 assert!(
-                    !crate::ui::holding_boxes(self).is_empty(),
+                    self.status
+                        .starts_with("Toe clamps cannot hold this setup: "),
                     "{}",
                     self.status
                 );
@@ -1030,6 +1095,16 @@ impl App {
                     crate::ui::holding_warning(self).is_some(),
                     "no warning on screen 89: {}",
                     self.status
+                );
+                assert!(
+                    bare.contains(&Bite::Gone),
+                    "no clamp lost its stock: {bare:?}"
+                );
+                eprintln!(
+                    "Screen 89: {} The preview at {} % has taken the stock from under {} of the 4 clamps typed: {bare:?}.",
+                    self.status,
+                    (fraction * 100.).round(),
+                    bare.iter().filter(|b| **b != Bite::Holds).count()
                 );
                 // The warning is under the operation's fields: scroll to it.
                 return iced::widget::operation::scroll_to(
@@ -2333,6 +2408,14 @@ mod tests {
         a.doc.adopt_holders();
         a
     }
+    /// The active setup's stock 20 mm beside the part on every side: room
+    /// for the starter clamp's 12 mm bite and its gap beside the part, which
+    /// the example's 5 mm is not.
+    fn room_for_clamps(a: &mut App) {
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            a.doc.setup_mut().p.insert(key.into(), "20".into());
+        }
+    }
     fn first_of(a: &App, kind: &str) -> String {
         a.doc
             .workholding
@@ -2651,6 +2734,7 @@ mod tests {
         let _ = a.update(Message::Edit(Target::Setup, "holding", "None".into()));
         assert_eq!(layout(a.doc.setup()), Ok(Layout::None));
         assert!(a.doc.holding_issues(0, None).is_empty());
+        room_for_clamps(&mut a);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         assert_eq!(get(&a.doc.setup().p, "holder"), first_of(&a, "Clamp"));
         // The first Clamps places them; without positions the setup says so.
@@ -2699,6 +2783,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
         let clamp = first_of(&a, "Clamp");
+        room_for_clamps(&mut a);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         // The first Clamps also places them: all four, at the middles.
         assert_eq!(a.clamps_field(), ("-X:0;+X:0;-Y:0;+Y:0".into(), None));
@@ -2917,11 +3002,25 @@ mod tests {
     fn choosing_clamps_the_first_time_suggests_them_and_the_typed_text_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
+        // The example's stock is 5 mm beside the part: with no toolpaths yet
+        // a 12 mm bite there reaches over the part, so none is placed.
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "");
+        assert_eq!(
+            a.status,
+            "Toe clamps cannot hold this setup: on every side the 12 mm bite reaches over the part. Leave about 15 mm of stock beside it on two opposite sides, and more for the cutters' reach, or use the vise."
+        );
+        // With 20 mm beside it, the middles, beside the part, and the status
+        // says to suggest again once there are toolpaths.
+        room_for_clamps(&mut a);
+        let _ = a.update(Message::SuggestLayout);
         assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0;-Y:0;+Y:0");
         assert_eq!(
             a.status,
-            format!("Suggested: 4 clamps on -X at 0, +X at 0, -Y at 0, +Y at 0. {STOCK_ONLY}")
+            format!(
+                "Suggested: 4 clamps on -X at 0, +X at 0, -Y at 0, +Y at 0. {STOCK_ONLY} {}",
+                crate::holding::BESIDE
+            )
         );
         assert!(a.doc.holding_issues(0, None).is_empty());
         // A text that does not read is dropped when the suggestion writes the positions.
@@ -3106,6 +3205,373 @@ mod tests {
             );
         }
     }
+    /// The example block with only its Face and Pocket, the Face over
+    /// `boundary`, and `margin` mm of stock beside the part on ±X.
+    fn faced_block(dir: &tempfile::TempDir, margin: &str, boundary: &str) -> App {
+        let mut a = planning_app(dir);
+        let setup = &mut a.doc.setups[0];
+        for (k, op) in setup.operations.iter_mut().enumerate() {
+            op.enabled = k < 2;
+        }
+        setup.operations[0]
+            .p
+            .insert("boundary".into(), boundary.into());
+        for key in ["stock_left", "stock_right"] {
+            setup.p.insert(key.into(), margin.into());
+        }
+        a
+    }
+    /// What the export finds wrong with setup 1's workholding.
+    fn held_problems(a: &App) -> Vec<String> {
+        held_problems_of(a, 0)
+    }
+    /// What the export finds wrong with setup `si`'s workholding.
+    fn held_problems_of(a: &App, si: usize) -> Vec<String> {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let mut sims = vec![];
+        crate::simulation::sequence(&a.doc, mesh, None, |s, oi, r| {
+            if s == si {
+                sims.push((oi, r));
+            }
+        });
+        crate::post::held(&a.doc, mesh, si, &sims)
+            .into_iter()
+            .map(|h| h.message)
+            .collect()
+    }
+    /// What Suggest layout says when the Face takes the stock from under every
+    /// bite: a 12 mm bite, the 2 mm gap and the Ø10 cutter of a Face kept to
+    /// the part's outline.
+    const NO_CLAMPS: &str = "Toe clamps cannot hold this setup: on every side the 12 mm bite loses its stock or comes within 2 mm of a toolpath. Leave about 25 mm of stock beside the part on two opposite sides and face only its outline, or use the vise.";
+    #[test]
+    fn clamps_are_not_placed_where_the_facing_takes_every_bite_and_the_editor_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        // The example block on 2 mm of stock beside the part: the Face over
+        // the stock takes its top from under any bite.
+        let mut a = faced_block(&dir, "2", "Stock silhouette");
+        a.project_dirty = false;
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(a.status, NO_CLAMPS);
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "");
+        assert!(a.project_dirty, "the edit itself still counts");
+        // The setup editor says it first, then that nothing is placed.
+        assert_eq!(
+            crate::ui::editor_holding_lines(&a),
+            [NO_CLAMPS, "Place 1 to 8 clamps."]
+        );
+        assert_eq!(crate::ui::holding_lines(&a), ["Place 1 to 8 clamps."]);
+        // Suggest layout says it again and leaves typed positions alone.
+        let _ = a.update(Message::SetClamps("-X:0;+X:0".into()));
+        a.status.clear();
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(a.status, NO_CLAMPS);
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0");
+        assert_eq!(crate::ui::editor_holding_lines(&a), [NO_CLAMPS]);
+        // The reason is advice: the typed clamps are still checked, and the
+        // texts say so.
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        assert!(crate::ui::modelled(&a));
+        // Those positions are the old middles: the export refuses them.
+        assert!(
+            held_problems(&a)
+                .iter()
+                .any(|p| p.contains("which reaches 10 mm over the part")),
+            "{:?}",
+            held_problems(&a)
+        );
+        // Once the setup changes the line goes: it was about the setup as it
+        // was.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("boundary".into(), "Model silhouette".into());
+        assert!(
+            crate::ui::editor_holding_lines(&a).is_empty(),
+            "{:?}",
+            crate::ui::editor_holding_lines(&a)
+        );
+    }
+    #[test]
+    fn the_advised_stock_beside_the_part_holds_the_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        // A 12 mm bite, the 2 mm gap and the facing cutter's diameter: with
+        // Ø6, Ø11 and Ø16 that is exactly 20, 25 and 30 mm, which a clamp
+        // must exceed. The reason advises the next 5 mm above it, and with
+        // that much stock beside the part the clamps go on it and export.
+        for (diameter, needed, advised) in
+            [("6", "20", "25"), ("11", "25", "30"), ("16", "30", "35")]
+        {
+            let block = |margin: &str| {
+                let mut a = faced_block(&dir, margin, "Model silhouette");
+                a.doc.tools[0].p.insert("diameter".into(), diameter.into());
+                let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+                a
+            };
+            let a = block("2");
+            assert!(
+                a.status
+                    .contains(&format!("Leave about {advised} mm of stock")),
+                "Ø{diameter}: {}",
+                a.status
+            );
+            let exact = block(needed);
+            assert_eq!(
+                get(&exact.doc.setup().p, "clamps"),
+                "",
+                "Ø{diameter} at {needed}"
+            );
+            let enough = block(advised);
+            assert_eq!(
+                get(&enough.doc.setup().p, "clamps"),
+                "-X:0;+X:0",
+                "Ø{diameter} at {advised}: {}",
+                enough.status
+            );
+            assert_eq!(held_problems(&enough), Vec::<String>::new(), "Ø{diameter}");
+        }
+    }
+    #[test]
+    fn a_later_setup_gets_no_clamps_on_stock_the_earlier_setups_cut_free() {
+        let dir = tempfile::tempdir().unwrap();
+        // The example block on 40 mm of stock on ±X; setup 1 faces, pockets
+        // and contours down to the stock's bottom, cutting the part free from
+        // the stock round it; setup 2, turned over, faces the part's outline.
+        let (mut doc, mesh) = crate::post::fixture::flipped_after(3);
+        for key in ["stock_left", "stock_right"] {
+            doc.setups[0].p.insert(key.into(), "40".into());
+        }
+        doc.setups[0].operations[2]
+            .p
+            .insert("bottom".into(), "-3".into());
+        doc.setups[1].operations[0]
+            .p
+            .insert("boundary".into(), "Model silhouette".into());
+        doc.adopt_holders();
+        let mut a = planning_app(&dir);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        // The stock round the part is cut free: no clamp on it holds, so none
+        // is placed, and the export has nothing of the kind to refuse.
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "", "{}", a.status);
+        assert_eq!(
+            a.status,
+            "Toe clamps cannot hold this setup: on every side the earlier setups cut the stock under the 12 mm bite free from the part. Leave material joining them (for example a `bottom_offset` or a skin under the part), or use the vise."
+        );
+        // Typed there anyway, the export refuses them as cut free.
+        let _ = a.update(Message::SetClamps("-X:0;+X:0".into()));
+        let refused = held_problems_of(&a, 1);
+        assert!(
+            refused.iter().any(|p| p.contains("cut the part free")),
+            "{refused:?}"
+        );
+    }
+    /// How the 3D view finds each clamp of the active setup's bite in the
+    /// preview shown (`Viewport::bare_clamps`).
+    fn bites(a: &App) -> Vec<crate::holding::Bite> {
+        crate::viewport::Viewport {
+            setup: a.doc.active_setup(),
+            operation: a.operation(),
+            mesh: a.part_mesh().unwrap(),
+            simulation: a.active_simulation(),
+            sample: false,
+            camera: a.camera,
+            picking: false,
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: crate::ui::holding_boxes(a),
+            leftover: None,
+        }
+        .bare_clamps()
+    }
+    /// What Suggest layout says when the setup's own operations leave the
+    /// stock under every bite cut free from the part.
+    const FREED_HERE: &str = "Toe clamps cannot hold this setup: on every side its operations cut the stock under the 12 mm bite free from the part. Leave a skin or tabs joining them until the last setup, or use the vise.";
+    #[test]
+    fn clamps_are_not_placed_on_stock_the_setup_cuts_free_and_the_preview_turns_them_red() {
+        use crate::holding::Bite;
+        let dir = tempfile::tempdir().unwrap();
+        // The example block on 40 mm of stock on ±X, both setups facing the
+        // part's outline. Setup 1's Contour goes down to the part's
+        // underside, leaving the 3 mm under it; setup 2, turned over, faces
+        // those 3 mm away, which joined the part to the stock round it.
+        let (mut doc, mesh) = crate::post::fixture::flipped_after(3);
+        for key in ["stock_left", "stock_right"] {
+            doc.setups[0].p.insert(key.into(), "40".into());
+        }
+        for si in [0, 1] {
+            doc.setups[si].operations[0]
+                .p
+                .insert("boundary".into(), "Model silhouette".into());
+        }
+        doc.adopt_holders();
+        let mut a = planning_app(&dir);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        // Setup 1 keeps those 3 mm: its clamps hold, and export.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert!(a.status.starts_with("Suggested: "), "{}", a.status);
+        assert_eq!(held_problems_of(&a, 0), Vec::<String>::new());
+        // Setup 2: by the end of its Face every bite's stock is cut free.
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "", "{}", a.status);
+        assert_eq!(a.status, FREED_HERE);
+        // The layout placed before, typed by hand: the export refuses each
+        // clamp, naming setup 2's Face.
+        let _ = a.update(Message::SetClamps("-X:0;+X:0;-Y:-90;+Y:90".into()));
+        let refused = held_problems_of(&a, 1);
+        let freed: Vec<&String> = refused
+            .iter()
+            .filter(|p| {
+                p.contains(
+                    "setup 2, operation 1 would cut the part free from the stock under its bite",
+                )
+            })
+            .collect();
+        assert_eq!(freed.len(), 4, "{refused:?}");
+        // The preview of that Face: the clamps hold at its start and are red
+        // at its end.
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        assert!(a.playback_ready(), "{}", a.status);
+        let _ = a.update(Message::Scrub(0.));
+        assert_eq!(bites(&a), [Bite::Holds; 4]);
+        let _ = a.update(Message::Scrub(1.));
+        assert_eq!(bites(&a), [Bite::Free; 4]);
+    }
+    #[test]
+    fn clamps_are_not_placed_on_stock_setup_1_cuts_free_and_a_skin_holds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        // The example block on 40 mm of stock on ±X, faced over its outline,
+        // pocketed and contoured: down to the stock's bottom the Contour
+        // cuts the part free from the stock round it; down to the part's
+        // underside it leaves the 3 mm under the part joining them.
+        let block = |bottom: &str| {
+            let mut a = faced_block(&dir, "40", "Model silhouette");
+            let ops = &mut a.doc.setups[0].operations;
+            ops[2].enabled = true;
+            ops[2].p.insert("bottom".into(), bottom.into());
+            let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+            a
+        };
+        let mut through = block("-3");
+        assert_eq!(
+            get(&through.doc.setup().p, "clamps"),
+            "",
+            "{}",
+            through.status
+        );
+        assert_eq!(through.status, FREED_HERE);
+        let _ = through.update(Message::SetClamps("-X:0;+X:0".into()));
+        let refused = held_problems_of(&through, 0);
+        assert_eq!(
+            refused
+                .iter()
+                .filter(|p| p.contains("setup 1, operation 3 would cut the part free from the stock under its bite. Leave a skin or tabs joining them until the last setup, or hold this setup in the vise."))
+                .count(),
+            2,
+            "{refused:?}"
+        );
+        let skin = block("0");
+        assert_eq!(
+            get(&skin.doc.setup().p, "clamps"),
+            "-X:0;+X:0",
+            "{}",
+            skin.status
+        );
+        assert_eq!(held_problems(&skin), Vec::<String>::new());
+    }
+    #[test]
+    fn a_refusal_goes_once_clamps_are_placed_or_an_earlier_setup_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        // 30 mm beside the part and the Face on its outline: clamps.
+        let mut a = faced_block(&dir, "30", "Model silhouette");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert!(a.status.starts_with("Suggested: "), "{}", a.status);
+        // A reason left for the setup as it is now, as when the stock it
+        // starts from has been worked out since: a suggestion that places
+        // clamps ends it.
+        a.clamp_refusal = Some(crate::ClampRefusal {
+            setup: a.doc.setups[0].id.clone(),
+            key: crate::suggestion_key(&a.doc, 0),
+            reason: NO_CLAMPS.into(),
+        });
+        assert_eq!(crate::ui::editor_holding_lines(&a), [NO_CLAMPS]);
+        let _ = a.update(Message::SuggestLayout);
+        assert!(a.status.starts_with("Suggested: "), "{}", a.status);
+        assert_eq!(a.clamp_refusal, None);
+        assert!(crate::ui::editor_holding_lines(&a).is_empty());
+        // On a later setup, it goes when an earlier setup changes, which
+        // changes the stock it starts from.
+        let (doc, mesh) = crate::post::fixture::flipped_after(3);
+        let mut b = planning_app(&dir);
+        b.replace_document(doc, None);
+        b.imported_mesh = Some(mesh);
+        b.doc.adopt_holders();
+        let _ = b.update(Message::SelectSetup(1));
+        let _ = b.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let reason = b.status.clone();
+        assert!(
+            reason.starts_with("Toe clamps cannot hold this setup: "),
+            "{reason}"
+        );
+        assert_eq!(crate::ui::editor_holding_lines(&b)[0], reason);
+        b.doc.setups[0].operations[0]
+            .p
+            .insert("bottom".into(), "1".into());
+        assert!(
+            !crate::ui::editor_holding_lines(&b).contains(&reason),
+            "{:?}",
+            crate::ui::editor_holding_lines(&b)
+        );
+    }
+    #[test]
+    fn with_25_mm_of_stock_beside_the_part_the_clamps_go_on_it_and_export() {
+        let dir = tempfile::tempdir().unwrap();
+        // 25 mm of stock on ±X and the Face over the part's outline only: the
+        // clamps rest on that rim, clear of every move.
+        let mut a = faced_block(&dir, "25", "Model silhouette");
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;+X:0", "{}", a.status);
+        assert_eq!(
+            a.status,
+            "Suggested: 2 clamps on -X at 0, +X at 0. Every operation is clear of them."
+        );
+        assert!(crate::ui::editor_holding_lines(&a).is_empty());
+        assert_eq!(held_problems(&a), Vec::<String>::new());
+        // 20 mm is not enough: no clamps, and the same reason.
+        // The Face is on the outline already: facing only the outline is not
+        // advised.
+        let on_outline = NO_CLAMPS.replace(" and face only its outline", "");
+        let mut b = faced_block(&dir, "20", "Model silhouette");
+        let _ = b.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        assert_eq!(b.status, on_outline);
+        // With every operation of the block, the Contour's and Waterline's
+        // holders, above their 65 mm stickout, come down beside the part to
+        // the clamps' height, 21 mm past its outline: about 40 mm, which is
+        // enough, where 35 is not.
+        let all = |margin: &str| {
+            let mut a = faced_block(&dir, margin, "Model silhouette");
+            for op in &mut a.doc.setups[0].operations {
+                op.enabled = true;
+            }
+            let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+            a
+        };
+        let short = all("35");
+        assert_eq!(get(&short.doc.setup().p, "clamps"), "");
+        assert_eq!(short.status, on_outline.replace("about 25", "about 40"));
+        let wide = all("40");
+        assert_eq!(
+            get(&wide.doc.setup().p, "clamps"),
+            "-X:0;+X:0",
+            "{}",
+            wide.status
+        );
+        assert_eq!(held_problems(&wide), Vec::<String>::new());
+    }
     #[test]
     fn without_a_stock_nothing_is_suggested_or_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -3193,6 +3659,7 @@ mod tests {
     fn suggesting_clamps_leaves_another_setups_typed_text_alone() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
+        room_for_clamps(&mut a);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         let _ = a.update(Message::SetClamps("-X".into()));
         assert!(a.clamps_draft.is_some());
@@ -3275,6 +3742,7 @@ mod tests {
     fn the_setup_editor_says_a_later_setup_not_square_to_setup_1_cannot_model_its_workholding() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = holding_app(&dir);
+        room_for_clamps(&mut a);
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         let _ = a.update(Message::DuplicateSetup);
         assert_eq!(a.doc.index(), 1);
@@ -3880,10 +4348,17 @@ mod tests {
         assert_eq!(a.known_stock(1), (Some(nominal), false));
         let _ = a.update(Message::SuggestLayout);
         assert_eq!(get(&a.doc.setup().p, "vise_grip"), "45");
-        // Clamps are placed on the same box.
+        // Clamps are suggested on the same box: with no toolpaths, a bite on
+        // its 2 mm beside the part reaches over the part, so none is placed,
+        // and the editor says why.
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
-        assert!(a.status.starts_with("Suggested: "), "{}", a.status);
-        assert!(crate::ui::holding_lines(&a).is_empty());
+        assert!(
+            a.status
+                .starts_with("Toe clamps cannot hold this setup: on every side the 12 mm bite reaches over the part."),
+            "{}",
+            a.status
+        );
+        assert_eq!(crate::ui::editor_holding_lines(&a)[0], a.status);
     }
     #[test]
     fn a_later_setup_without_operations_gets_its_box_from_the_job() {
@@ -4174,6 +4649,11 @@ mod tests {
             expected[0].starts_with("Pocket: the tool hits the clamp on -X (offset 0) at X-22.0 Y"),
             "{expected:?}"
         );
+        // The pocket also cuts away the stock under that clamp's bite, which
+        // reaches 38 mm over the part, so the clamp would hold nothing: said
+        // after the hits.
+        let lost = "Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 2 would cut away the stock under its bite, which reaches 38 mm over the part. Clamp on stock beside the part, on two opposite sides, or use the vise. Setup 1, operation 2 is Pocket \"Pocket\".";
+        let expected: Vec<String> = expected.into_iter().chain([lost.to_string()]).collect();
         assert_eq!(
             crate::ui::holding_warning(&a),
             Some((
@@ -4229,7 +4709,8 @@ mod tests {
             .iter()
             .map(|hit| crate::holding::message("Pocket", hit, 2., [0.; 3]))
             .collect();
-        assert_eq!(lines, in_frame);
+        assert_eq!(lines[..lines.len() - 1], in_frame[..]);
+        assert_eq!(lines.last(), expected.last());
         assert_ne!(lines, expected);
         let _ = a.view();
         a.doc.setups[0].p.insert("origin".into(), origin);
@@ -4360,10 +4841,25 @@ mod tests {
             named.contains(&"Pocket") && named.contains(&"Facing"),
             "{problems:?}"
         );
+        // Why the setup cannot be held first: the operations cut away the
+        // stock under the clamps' bites; then each hit.
+        let (lost, hits): (Vec<&String>, Vec<&String>) = problems
+            .iter()
+            .partition(|p| p.contains("would cut away the stock under its bite"));
         assert!(
-            problems
-                .iter()
-                .all(|p| p.ends_with("(within the 2 mm gap)."))
+            !lost.is_empty()
+                && lost
+                    .iter()
+                    .all(|p| p.starts_with("Top: Setup 1 cannot be held by the clamp")),
+            "{problems:?}"
+        );
+        assert!(
+            problems[..lost.len()].iter().all(|p| lost.contains(&p)),
+            "{problems:?}"
+        );
+        assert!(
+            !hits.is_empty() && hits.iter().all(|p| p.ends_with("(within the 2 mm gap).")),
+            "{problems:?}"
         );
         for name in &named {
             assert!(
@@ -7606,10 +8102,13 @@ mod tests {
             a.doc.setups[0].p.insert(key.into(), "36".into());
         }
         crate::proposal::tests::hold(&mut a.doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        // The Contour stops 5 mm above the part's underside, so the part
+        // stays joined to the stock round it for setup 2's clamps.
         let preview = checked_preview_of(&a, false, |proposal| {
             for setup in &mut proposal.setups {
                 setup.operations[0].facing_area = Some("model".into());
             }
+            proposal.setups[0].operations[2].bottom_offset = Some(5.);
         });
         let job = &preview.outcome.job;
         // Every setup of the plan models its clamps, so the note says so.

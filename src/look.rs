@@ -128,6 +128,12 @@ pub(crate) struct View {
     projector: Projector,
     sim: Option<crate::simulation::Simulation>,
     holding: Vec<crate::holding::HoldBox>,
+    /// What the description says of the clamps of `holding`: those whose
+    /// bite has lost its stock, or whose stock is cut free from the part, in
+    /// the operation's simulation (`Viewport::bare_clamps`), and before
+    /// machining those whose bite reaches over the part's outline, each
+    /// once, by its label without the offset ("clamp on -X").
+    bare: Vec<String>,
     angle_words: &'static str,
     focus: Vec<usize>,
     /// The operation looked at, counted from 1: setup and operation.
@@ -290,6 +296,36 @@ impl View {
         let boxes = focus_bounds(mesh, &setup, &args.focus_surfaces)
             .map(|b| vec![b])
             .unwrap_or_else(|| viewport.scene_boxes());
+        let mut bare: Vec<String> = vec![];
+        let part = crate::simulation::part_box(&setup, mesh);
+        let stock = sim.as_ref().map(|s| s.plan.stock).or_else(|| {
+            crate::stock::resolve(&setup, Some(mesh))
+                .ok()
+                .map(|r| r.stock)
+        });
+        for (hold, bite) in holding.iter().zip(viewport.bare_clamps()) {
+            let label = hold.label.split(" (offset").next().unwrap_or_default();
+            let said = match bite {
+                crate::holding::Bite::Gone => format!("{label} has no stock under its bite"),
+                crate::holding::Bite::Free => {
+                    format!("{label} holds stock cut free from the part")
+                }
+                // Before machining: a bite over the part's outline, whose
+                // top the operations cut.
+                crate::holding::Bite::Holds
+                    if sim.is_none()
+                        && stock.is_some_and(|stock| {
+                            crate::holding::over(&hold.bounds, stock, part)
+                        }) =>
+                {
+                    format!("{label} bites over the part")
+                }
+                crate::holding::Bite::Holds => continue,
+            };
+            if !bare.contains(&said) {
+                bare.push(said);
+            }
+        }
         let frame = (SIZE as f32, (SIZE - CAPTION) as f32);
         let projector = Projector::filling(camera, frame, &boxes, FILL);
         Ok(Self {
@@ -298,6 +334,7 @@ impl View {
             projector,
             sim,
             holding,
+            bare,
             angle_words,
             focus: args.focus_surfaces.clone(),
             operation,
@@ -700,11 +737,14 @@ fn describe(view: &View, args: &Args, tags: &[String]) -> String {
     } else {
         "stock hidden"
     };
-    let holding = if view.holding.is_empty() {
-        ""
+    let mut holding = if view.holding.is_empty() {
+        String::new()
     } else {
-        "; vise or clamps shown"
+        "; vise or clamps shown".to_string()
     };
+    for said in &view.bare {
+        holding += &format!("; {said}");
+    }
     let tags = if tags.is_empty() {
         "none".to_string()
     } else {
@@ -1100,6 +1140,133 @@ mod tests {
         )
         .unwrap_err();
         assert!(out.contains("Setup 1 has no operation 99"), "{out}");
+    }
+    /// The example block held by four clamps at the middles of its sides on
+    /// its 2 mm of stock beside the part, as setup 1's workholding, with
+    /// the job of the `good` proposal, whose first Face covers the stock.
+    fn clamped_on_the_part() -> Scene {
+        let (mut doc, mesh, report) = block();
+        crate::proposal::tests::hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0;-Y:0;+Y:0")]);
+        let (_, job) = crate::plan_check::evaluate(&doc, &mesh, &report, &good(&report));
+        Scene {
+            doc: Arc::new(doc),
+            mesh: Arc::new(mesh),
+            report: Arc::new(report),
+            job: job.map(Arc::new),
+        }
+    }
+    #[test]
+    fn an_operation_view_says_which_clamps_lost_the_stock_under_their_bites() {
+        let s = clamped_on_the_part();
+        // After the Face, which takes 4 mm off the whole top: every bite's
+        // stock is gone.
+        let after = draw(
+            &s,
+            &args(serde_json::json!({"operation": {"setup": 1, "operation": 1}, "angle": "front"})),
+        )
+        .unwrap();
+        for side in ["-X", "+X", "-Y", "+Y"] {
+            assert!(
+                after
+                    .description
+                    .contains(&format!("; clamp on {side} has no stock under its bite")),
+                "{}",
+                after.description
+            );
+        }
+        // The red of a bare clamp is in the picture.
+        let red = decode(&after.png)
+            .2
+            .chunks(3)
+            .filter(|p| p == &[205, 60, 60] || p == &[166, 46, 46] || p == &[186, 52, 52])
+            .count();
+        assert!(red > 500, "{red} red pixels");
+        // Before machining nothing is cut: no clamp is bare, none is red.
+        let before = draw(&s, &args(serde_json::json!({"angle": "front"}))).unwrap();
+        assert!(
+            !before.description.contains("no stock under"),
+            "{}",
+            before.description
+        );
+        assert!(
+            before.description.contains("vise or clamps shown"),
+            "{}",
+            before.description
+        );
+    }
+    #[test]
+    fn the_pictures_say_which_clamps_bite_over_the_part_or_hold_stock_cut_free() {
+        // Before machining, the old middles on 2 mm of stock bite over the
+        // part's outline, whose top the operations will cut: said of each.
+        let s = clamped_on_the_part();
+        let before = draw(&s, &args(serde_json::json!({"labels": false}))).unwrap();
+        for side in ["-X", "+X", "-Y", "+Y"] {
+            assert!(
+                before
+                    .description
+                    .contains(&format!("; clamp on {side} bites over the part")),
+                "{}",
+                before.description
+            );
+        }
+        // Clamps on 40 mm of stock beside the part do not.
+        let (mut doc, mesh, _) = block();
+        for key in ["stock_left", "stock_right"] {
+            doc.setups[0].p.insert(key.into(), "40".into());
+        }
+        doc.setups[0].operations[0]
+            .p
+            .insert("boundary".into(), "Model silhouette".into());
+        // The Contour down to the stock's bottom cuts the part free from it.
+        doc.setups[0].operations[2]
+            .p
+            .insert("bottom".into(), "-3".into());
+        crate::proposal::tests::hold(&mut doc, "Clamp", &[("clamps", "-X:0;+X:0")]);
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        let scene = Scene {
+            job: Some(Arc::new(doc.clone())),
+            doc: Arc::new(doc),
+            mesh: Arc::new(mesh),
+            report: Arc::new(report),
+        };
+        let overview = draw(&scene, &args(serde_json::json!({"labels": false}))).unwrap();
+        assert!(
+            !overview.description.contains("bites over"),
+            "{}",
+            overview.description
+        );
+        // After the Pocket the clamps hold; after the Contour their stock is
+        // still under them but cut free from the part: red, and said.
+        let pocket = draw(
+            &scene,
+            &args(serde_json::json!({"operation": {"setup": 1, "operation": 2}, "labels": false})),
+        )
+        .unwrap();
+        assert!(
+            !pocket.description.contains("clamp on -X"),
+            "{}",
+            pocket.description
+        );
+        let contour = draw(
+            &scene,
+            &args(serde_json::json!({"operation": {"setup": 1, "operation": 3}, "angle": "front", "labels": false})),
+        )
+        .unwrap();
+        for side in ["-X", "+X"] {
+            assert!(
+                contour.description.contains(&format!(
+                    "; clamp on {side} holds stock cut free from the part"
+                )),
+                "{}",
+                contour.description
+            );
+        }
+        let red = decode(&contour.png)
+            .2
+            .chunks(3)
+            .filter(|p| p == &[205, 60, 60] || p == &[166, 46, 46] || p == &[186, 52, 52])
+            .count();
+        assert!(red > 500, "{red} red pixels");
     }
     #[test]
     fn the_purpose_is_cleaned_and_clipped() {

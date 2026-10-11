@@ -265,6 +265,40 @@ pub struct ClampsDraft {
     pub text: String,
     pub over: String,
 }
+/// Why Suggest layout placed no clamps on a setup (`holding::suggest_clamps`),
+/// for the setup as it was then: its id and `suggestion_key`. The setup
+/// editor lists it while the setup is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClampRefusal {
+    pub setup: String,
+    pub key: String,
+    pub reason: String,
+}
+/// What setup `si`'s suggested layout follows from in the document: the
+/// parameters and operations (what they are, their tools and settings,
+/// surfaces and whether they are enabled) of that setup and the setups
+/// before it, which leave it its stock, and its library entry.
+pub(crate) fn suggestion_key(doc: &Document, si: usize) -> String {
+    let setups: Vec<_> = doc
+        .setups
+        .iter()
+        .take(si + 1)
+        .map(|setup| {
+            let operations: Vec<_> = setup
+                .operations
+                .iter()
+                .map(|o| (o.strategy, &o.tool, &o.p, &o.surfaces, o.enabled))
+                .collect();
+            format!("{:?}|{operations:?}", setup.p)
+        })
+        .collect();
+    let entry = doc
+        .setups
+        .get(si)
+        .and_then(|setup| doc.holder(get(&setup.p, "holder")))
+        .map(|holder| &holder.p);
+    format!("{setups:?}|{entry:?}")
+}
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
@@ -424,7 +458,9 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
                     let removed = before
                         .as_deref()
                         .map(|v| rest::Removed::new(v, frame).with_part(part));
-                    holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
+                    // The setup's own toolpaths are not generated here; the
+                    // operation inspector says when one cuts under a clamp.
+                    holding::holdable(si, &layout, holder, held, removed.as_ref(), None, &names)
                 }
                 _ => vec![],
             };
@@ -490,6 +526,8 @@ pub struct App {
     /// What was typed in the active setup's clamp positions field while it
     /// does not read correctly; the setup keeps its last good text.
     pub clamps_draft: Option<ClampsDraft>,
+    /// Why the last Suggest layout placed no clamps, while it holds.
+    pub clamp_refusal: Option<ClampRefusal>,
     pub camera: viewport::Camera,
     pub sample_mesh: mesh::Mesh,
     pub imported_mesh: Option<mesh::Mesh>,
@@ -716,6 +754,7 @@ impl App {
             material_draft: material_draft(&doc),
             holder_draft: holder_draft(&doc),
             clamps_draft: None,
+            clamp_refusal: None,
             doc,
             page: Page::Home,
             selected: None,
@@ -951,8 +990,12 @@ impl App {
     /// Generate all does; those that cannot be are left out. Toolpaths are
     /// never changed. Without toolpaths the stock alone decides (that of a
     /// later setup is the box the earlier setups left when that is known,
-    /// `known_stock`); without a stock nothing is written. Whether the setup changed (and was marked
-    /// so): nothing is written or marked when the suggestion is what it has.
+    /// `known_stock`); without a stock nothing is written. Clamps go only
+    /// where their bites keep the stock (`holding::suggest_clamps`); where no
+    /// two opposite sides can, nothing is written and the reason is the
+    /// status and, while the setup is unchanged, a line of the setup editor
+    /// (`clamp_refusal`). Whether the setup changed (and was marked so):
+    /// nothing is written or marked when the suggestion is what it has.
     fn suggest_layout(&mut self) -> bool {
         let si = self.doc.index();
         let setup = self.doc.setup();
@@ -963,10 +1006,14 @@ impl App {
                 return false;
             }
         };
-        let mut generated: Vec<Option<simulation::Plan>> = vec![];
-        // What tells the bands a vise closes on: the setup's first simulation
-        // starts from the stock the earlier setups left.
+        // Each operation visited, by its index, with its plan when it
+        // generated.
+        let mut generated: Vec<(usize, Option<simulation::Plan>)> = vec![];
+        // What tells the bands a vise closes on, and what a clamp bites on:
+        // the setup's first simulation starts from the stock the earlier
+        // setups left.
         let mut bands = None;
+        let mut before: Option<(volume::Volume, volume::Frame)> = None;
         let last = self.doc.setups[si]
             .operations
             .iter()
@@ -976,30 +1023,82 @@ impl App {
             last,
         ) {
             let setup = &self.doc.setups[si];
-            simulation::sequence(&self.doc, mesh, Some((si, last)), |s, _, result| {
+            simulation::sequence(&self.doc, mesh, Some((si, last)), |s, oi, result| {
                 if s == si {
                     if generated.is_empty()
                         && let Ok(first) = &result
                     {
                         bands = post::bands(setup, mesh, first);
+                        before = first.initial_volume.clone().zip(first.frame);
                     }
-                    generated.push(result.ok().map(|sim| sim.plan));
+                    generated.push((oi, result.ok().map(|sim| sim.plan)));
                 }
             });
         }
-        let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
-        // Without toolpaths, the stock the earlier setups left when that is known.
-        let bands = if refs.is_empty() {
-            self.known_bands(si)
-        } else {
-            bands
+        let (refs, failed) = holding::gathered(generated.iter().map(|(_, plan)| plan.as_ref()));
+        // Without the setup's first simulation (no toolpaths, or its first
+        // operation did not generate), the stock the earlier setups left when
+        // that is known.
+        let bands = bands.or_else(|| self.known_bands(si));
+        let part = self
+            .part_mesh()
+            .map(|mesh| simulation::part_box(&self.doc.setups[si], mesh));
+        let suggested = {
+            // Knowing the part, as the export does, to tell stock cut free
+            // from it.
+            let removed = match &before {
+                Some((volume, frame)) => {
+                    let removed = rest::Removed::new(volume, *frame);
+                    Some(match part {
+                        Some(part) => removed.with_part(part),
+                        None => removed,
+                    })
+                }
+                None => self.known_removed(si),
+            };
+            // Clamps hold the stock to the end of the setup: the stock its
+            // own operations leave, worked out once for the suggestion.
+            let after = before
+                .as_ref()
+                .filter(|_| !request.vise)
+                .map(|(volume, frame)| {
+                    let own = generated
+                        .iter()
+                        .filter_map(|(oi, plan)| plan.as_ref().map(|plan| (*oi, plan)));
+                    (rest::after_setup(volume.clone(), own, si, *frame), *frame)
+                });
+            let after = after.as_ref().map(|(volume, frame)| {
+                let removed = rest::Removed::new(volume, *frame);
+                match part {
+                    Some(part) => removed.with_part(part),
+                    None => removed,
+                }
+            });
+            let known = holding::Known {
+                earlier: removed.as_ref(),
+                after: after.as_ref(),
+                part,
+            };
+            request.suggest_on(&refs, || self.known_stock(si).0, bands.as_ref(), known)
         };
-        let Some((stock, layout)) =
-            request.suggest_on(&refs, || self.known_stock(si).0, bands.as_ref())
-        else {
+        let Some((stock, suggested)) = suggested else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
             return false;
         };
+        let layout = match suggested {
+            Ok(layout) => layout,
+            Err(reason) => {
+                self.clamp_refusal = Some(ClampRefusal {
+                    setup: self.doc.setups[si].id.clone(),
+                    key: suggestion_key(&self.doc, si),
+                    reason: reason.clone(),
+                });
+                self.status = reason;
+                return false;
+            }
+        };
+        // A suggestion that places clamps ends what a refused one said.
+        self.clamp_refusal = None;
         let changed = holding::place(&mut self.doc.setups[si], &layout);
         let id = &self.doc.setups[si].id;
         if !request.vise && self.clamps_draft.as_ref().is_some_and(|d| d.setup == *id) {
@@ -1012,7 +1111,14 @@ impl App {
         let boxes = holding::boxes(&layout, holder, held).unwrap_or_default();
         let clashing = holding::clashes(&refs, &boxes, gap);
         let opening = holding::opening_issue(&layout, holder, held);
-        let message = holding::summary(&layout, refs.len(), clashing, failed, opening.as_deref());
+        // Without toolpaths, clamps are kept to the stock beside the part.
+        let note = match &layout {
+            holding::Layout::Clamps { .. } if refs.is_empty() && part.is_some() => {
+                Some(holding::BESIDE)
+            }
+            _ => opening.as_deref(),
+        };
+        let message = holding::summary(&layout, refs.len(), clashing, failed, note);
         if changed {
             self.touch();
         }
@@ -1414,6 +1520,33 @@ impl App {
     /// `known_held_in` for the job as it is now.
     pub(crate) fn known_held(&self, si: usize) -> Option<holding::Gripped> {
         self.known_held_in(self.left_boxes(), self.current_checks(), si)
+    }
+    /// What the earlier setups cut from the stock setup `si` starts from, as
+    /// worked out for the job as it is now (`rest::Removed`, in its frame,
+    /// knowing the part). None for setup 1, until it is worked out and where
+    /// nothing was cut.
+    fn known_removed(&self, si: usize) -> Option<rest::Removed<'_>> {
+        let mesh = self.part_mesh()?;
+        let volume = self
+            .left_boxes()
+            .and(self.left_stock.before.get(si))?
+            .as_deref()
+            .filter(|v| si > 0 && !v.cuts.is_empty())?;
+        let setup = self.doc.setups.get(si)?;
+        Some(
+            rest::Removed::new(volume, volume::Frame::new(setup, mesh))
+                .with_part(simulation::part_box(setup, mesh)),
+        )
+    }
+    /// The reason the last Suggest layout placed no clamps on setup `si`
+    /// (`clamp_refusal`), while that setup is as it was then.
+    pub(crate) fn clamp_refusal_of(&self, si: usize) -> Option<&str> {
+        let refusal = self.clamp_refusal.as_ref()?;
+        let setup = self.doc.setups.get(si)?;
+        (refusal.setup == setup.id
+            && get(&setup.p, "holding") == "Clamps"
+            && refusal.key == suggestion_key(&self.doc, si))
+        .then_some(refusal.reason.as_str())
     }
     /// What tells the bands setup `si`'s vise closes on, from the stock the
     /// earlier setups left it as worked out for the job as it is now. None
