@@ -1791,7 +1791,7 @@ flood = { pin = 8 }
     }
 
     #[test]
-    fn the_3d_view_shows_the_machine_over_the_simulation() {
+    fn the_3d_view_shows_the_machine_and_planning_waits_for_it() {
         use crate::run::Action as R;
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
@@ -1803,12 +1803,18 @@ flood = { pin = 8 }
         let sim = crate::simulation::prepare(&a.doc, a.part_mesh().unwrap(), 0, 0).unwrap();
         a.simulation = Some(sim);
         assert!(a.live_tool().is_none());
+        // Cycle Start waits for planning work under way in the background.
+        a.post_busy = true;
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        a.post_busy = false;
         let _ = a.update(Message::Run(R::CycleStart));
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         run_until(&mut a, 5.0, "a cutting move", |r| {
             r.running.is_some() && r.done.iter().all(|d| !d)
         });
         let datum = run_of(&a).checked().unwrap()[0].datum;
+        let first = a.live_tool().expect("the live tool").0;
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let _ = a.update(Message::Tick);
@@ -1820,23 +1826,33 @@ flood = { pin = 8 }
                 assert!((tip[k] as f64 - expected).abs() < 1e-3, "{k}: {tip:?}");
             }
             assert_eq!((radius, stickout), (5., 65.));
-            if a.progress > 0.2 {
+            if tip != first {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < end,
-                "the simulation stays at {}",
-                a.progress
-            );
+            assert!(std::time::Instant::now() < end, "the tool stays at {tip:?}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // It follows the machine: the shown simulation is at the move being cut.
-        assert!(a.simulation.as_ref().unwrap().seconds > 0.);
+        // Planning is locked while it runs: no edit, preview or playback.
+        assert!(a.locked());
+        let title = a.doc.title.clone();
+        for m in [
+            Message::Play,
+            Message::Generate,
+            Message::Title("Changed".into()),
+            Message::Plan,
+        ] {
+            let _ = a.update(m);
+            assert_eq!(a.status, crate::LOCKED);
+        }
+        assert!(!a.playing && a.progress == 0. && a.doc.title == title);
         a.page = Page::Work;
         let _ = a.view();
         let _ = a.update(Message::Run(R::Stop));
         run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
-        assert!(a.live_tool().is_none());
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(a.live_tool().is_none() && !a.locked());
+        let _ = a.update(Message::Play);
+        assert!(a.playing);
     }
 
     #[test]

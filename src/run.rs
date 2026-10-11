@@ -310,9 +310,6 @@ pub struct Live {
     pub tip: [f32; 3],
     pub radius: f32,
     pub stickout: f32,
-    /// The plan move being cut: the operation's index in the setup, the
-    /// move's index in its plan.
-    pub cutting: Option<(usize, usize)>,
 }
 
 impl Run {
@@ -320,7 +317,7 @@ impl Run {
     /// position − the work offset it was lowered with + datum.
     pub fn live(&self, s: &uc100::controller::Snapshot) -> Option<Live> {
         let r = self.running.as_ref()?;
-        let (p, op, block) = self.progress(s.current_line)?;
+        let (p, op, _) = self.progress(s.current_line)?;
         Some(Live {
             setup: self.setup,
             tip: std::array::from_fn(|k| {
@@ -328,7 +325,6 @@ impl Run {
             }),
             radius: p.ops[op].diameter / 2.,
             stickout: p.ops[op].stickout,
-            cutting: plan_move(p, block).map(|(o, m)| (p.indexes[o], m)),
         })
     }
 }
@@ -343,25 +339,6 @@ fn op_of(b: &Block) -> Option<usize> {
         | Block::Move { op, .. } => Some(*op),
         _ => None,
     }
-}
-
-/// The plan move (operation index in the program, move index in its plan)
-/// that block `b` cuts; None for links, retracts and the like.
-pub fn plan_move(p: &Checked, b: usize) -> Option<(usize, usize)> {
-    let Block::Move { op, .. } = p.blocks[b] else {
-        return None;
-    };
-    let moves = |blocks: &[Block]| {
-        blocks
-            .iter()
-            .filter(|x| matches!(x, Block::Move { op: k, .. } if *k == op))
-            .count()
-    };
-    // The operation's links to the one before it come first, then its plan.
-    let links = moves(&p.blocks) - p.moves[op];
-    (moves(&p.blocks[..=b]) - 1)
-        .checked_sub(links)
-        .map(|m| (op, m))
 }
 
 /// The checked programs of setup `si` for a UC100 run, one per tool run,
@@ -529,7 +506,6 @@ mod tests {
             blocks,
             ops,
             indexes: vec![0],
-            moves: vec![plan.moves.len()],
             stock: plan.stock,
             datum: [0., 0., 10.],
             settings: settings(),
@@ -601,7 +577,6 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(plan_move(&p, feed.line as usize - 1), Some((0, 1)));
     }
 
     #[test]

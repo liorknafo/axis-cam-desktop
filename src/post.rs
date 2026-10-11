@@ -1311,8 +1311,6 @@ pub struct Checked {
     pub ops: Vec<OpState>,
     /// The index in the setup of each of `ops`.
     pub indexes: Vec<usize>,
-    /// How many plan moves each of `ops` has.
-    pub moves: Vec<usize>,
     pub stock: Bounds,
     pub datum: [f32; 3],
     pub settings: PostSettings,
@@ -1431,7 +1429,6 @@ pub(crate) fn checked(
             blocks,
             ops: group_ops.to_vec(),
             indexes: walk.indexes[g.clone()].to_vec(),
-            moves: plans.iter().map(|p| p.moves.len()).collect(),
             stock: plans[0].stock,
             datum: zero,
             settings,

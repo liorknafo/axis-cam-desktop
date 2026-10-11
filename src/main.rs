@@ -579,6 +579,73 @@ pub struct App {
     /// G-code exports started and not yet reported (folder choice and write).
     gcode_exports: usize,
 }
+pub const LOCKED: &str = "The machine is running: planning is locked until it stops.";
+/// What still works while planning is locked (`App::locked`): the Control
+/// page, looking around, saving, the account, and the answers of work started
+/// before. Everything else waits.
+fn while_locked(m: &Message) -> bool {
+    use Message::*;
+    matches!(
+        m,
+        Page(_)
+            | SelectSetup(_)
+            | SelectOp(_)
+            | Tab(_)
+            | Connect
+            | Disconnect
+            | MachineReset
+            | MachineEStop
+            | Machine(_)
+            | ControlSetup(_)
+            | Setup(_)
+            | JogKey(..)
+            | JogKeyChecked(..)
+            | JogKeyUp
+            | HoldKey
+            | Run(_)
+            | RunChecked(..)
+            | ToggleStock
+            | TogglePaths
+            | Camera(_)
+            | Viewport(_)
+            | PlanViewport(_)
+            | Speed(_)
+            | StockMeshed { .. }
+            | Tick
+            | PlanProgress(..)
+            | PlanFinished(..)
+            | PlanCancel
+            | PostChecked(..)
+            | LeftStock(_)
+            | SaveProject
+            | Saved(_)
+            | FileImported(_)
+            | ProjectOpened(_)
+            | ModelRestored(_)
+            | Exported(_)
+            | ExportError(_)
+            | GcodeExported(_)
+            | AccountRestored(_)
+            | SignIn
+            | SignInCancel
+            | SignedIn(_)
+            | SessionSaved(_)
+            | SignOut
+            | SignedOut(_)
+            | ModelsLoaded(..)
+            | LoadModels
+            | PickModel(_)
+            | CheckConnection
+            | ConnectionChecked(..)
+            | PlanNoticeDismissed
+            | PlanPictures(_)
+            | OpenUrl(_)
+            | Close(_)
+            | Captured(_)
+            | HelpHover(_)
+            | Noop
+    )
+}
 type PlanSender = iced::futures::channel::mpsc::Sender<Message>;
 /// The Plan task: runs the planner, sends each stage as it starts, builds the
 /// 3D view of a plan that passed and sends the result. Every message carries
@@ -1147,29 +1214,36 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
-    /// While a tool run cuts the operation whose simulation is shown, the
-    /// simulation follows the machine to the move being cut.
-    fn follow_machine(&mut self) {
-        let Some(c) = &self.control else { return };
-        let Some(live) = c.run.as_ref().and_then(|r| r.live(&c.snapshot)) else {
-            return;
-        };
-        let (Some((op, m)), Some(setup)) = (live.cutting, self.doc.setups.get(live.setup)) else {
-            return;
-        };
-        let id = setup.operations.get(op).map(|o| o.id.clone());
-        if self.playing || setup.id != self.doc.active || self.selected != Some(op) {
-            return;
-        }
-        if let Some(sim) = self
-            .simulation
-            .as_mut()
-            .filter(|s| Some(&s.plan.operation) == id.as_ref() && s.plan.duration > 0.)
-        {
-            if let Some(m) = sim.plan.moves.get(m) {
-                self.progress = (m.end / sim.plan.duration).clamp(0., 1.);
-                sim.seek(self.progress);
-            }
+    /// The machine moves, or a tool run of the Run panel is under way:
+    /// planning is locked (`while_locked`) and no preview or check is worked
+    /// out in the background, so that none competes with the driver for the
+    /// processor while it feeds the machine its motion.
+    pub fn locked(&self) -> bool {
+        use uc100::controller::State;
+        self.control.as_ref().is_some_and(|c| {
+            c.run.as_ref().is_some_and(|r| r.running.is_some())
+                || matches!(
+                    c.snapshot.state,
+                    Some(
+                        State::Jog
+                            | State::Homing
+                            | State::Run
+                            | State::Hold
+                            | State::Stopping
+                            | State::Paused(_)
+                    )
+                )
+        })
+    }
+    /// Planning work still under way in the background, which Cycle Start
+    /// waits for (see `locked`).
+    pub fn planning_busy(&self) -> Option<&'static str> {
+        if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
+            Some("The AI planner is working: wait for it, or cancel it.")
+        } else if self.stock_mesh_job.is_some() || self.post_busy || self.left_job.is_some() {
+            Some("A preview or check is still being worked out: wait a moment.")
+        } else {
+            None
         }
     }
     /// Opens the Control page machine's profile for Setup: again when asked,
@@ -1381,7 +1455,7 @@ impl App {
         ))
     }
     fn refresh_stock_surface(&mut self) -> Task<Message> {
-        if self.stock_mesh_job.is_some() {
+        if self.stock_mesh_job.is_some() || self.locked() {
             return Task::none();
         }
         let Some(key) = self.stock_mesh_key() else {
@@ -1445,7 +1519,7 @@ impl App {
     }
     /// Check and emit the whole job while the NC program page is open.
     fn refresh_post(&mut self) -> Task<Message> {
-        if self.page != Page::Post || self.post.is_some() || self.post_busy {
+        if self.page != Page::Post || self.post.is_some() || self.post_busy || self.locked() {
             return Task::none();
         }
         let doc = self.doc.clone();
@@ -1578,7 +1652,7 @@ impl App {
             return Task::none();
         };
         let known = self.left_stock.key == key;
-        if self.left_job.is_some() || (known && self.holding_checks.key == held) {
+        if self.left_job.is_some() || self.locked() || (known && self.holding_checks.key == held) {
             return Task::none();
         }
         let Some(mesh) = self.part_mesh().cloned() else {
@@ -1885,6 +1959,10 @@ impl App {
         task
     }
     fn handle(&mut self, message: Message) -> Task<Message> {
+        if self.locked() && !while_locked(&message) {
+            self.status = LOCKED.into();
+            return Task::none();
+        }
         // These actions require an explicitly created setup; no hidden defaults.
         if self.doc.active_setup().is_none()
             && matches!(
@@ -2577,6 +2655,9 @@ impl App {
                 return self.check_run();
             }
             Message::Run(action) => {
+                if matches!(action, run::Action::CycleStart) && self.planning_busy().is_some() {
+                    return Task::none();
+                }
                 if let Some(c) = &mut self.control {
                     c.run_act(action, &self.doc);
                 }
@@ -3134,7 +3215,6 @@ impl App {
             }
             Message::HelpHover(on) => self.help_animating = on,
             Message::Tick => {
-                self.follow_machine();
                 if let Some(c) = &mut self.control {
                     c.refresh();
                     // "Connecting to <machine>…" until the driver reports a state.
@@ -3168,6 +3248,7 @@ impl App {
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.2);
                 self.last_tick = now;
+                self.playing &= !self.locked();
                 if self.playing {
                     let duration = self
                         .active_simulation()

@@ -348,6 +348,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .padding([8, 14])
     .style(panel_style);
     let mut layout = column![brand, docbar].spacing(0);
+    if app.locked() && app.page != Page::Control {
+        let why = "Editing, previews and the AI planner wait until the machine stops, so that nothing competes with the driver feeding it. The Control page runs it; the Work page's 3D view shows its tool.";
+        layout = layout.push(container(caution(crate::LOCKED, vec![why.into()])).padding([6, 12]));
+    }
     if app.page != Page::Home && !app.doc.setups.is_empty() {
         layout = layout.push(ribbon(app));
     }
@@ -3200,7 +3204,8 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             .align_y(Alignment::Center),
         );
     }
-    let problems = run.problems(c, &app.doc);
+    let mut problems = run.problems(c, &app.doc);
+    problems.extend(app.planning_busy().map(String::from));
     let state = s.state.as_ref();
     body = body.push(
         row![

@@ -400,8 +400,11 @@ with no G-code file in between.
    stands, so leave it where a vertical move is safe.
 
 While a tool run of the setup shown on the Work page cuts, the 3D view draws
-the machine's tool in red at the live position; when that operation's
-simulation is shown, it follows the machine to the move being cut. The
+the machine's tool in red at the live position. While the machine moves (a
+tool run, held or paused, a jog or homing), planning is locked: editing,
+previews, playback and the AI planner wait until it stops, and Cycle Start
+waits for a preview, check or AI planner run still under way, so that nothing
+competes with the driver feeding the machine its motion. The
 spindle start dwell and the Air output for UC100 runs are in the machine
 wizard.
 
