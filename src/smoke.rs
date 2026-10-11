@@ -2001,6 +2001,56 @@ mist = { pin = 9 }
     }
 
     #[test]
+    fn calibration_measures_steps_per_mm_and_fills_the_profile() {
+        use crate::control::Action;
+        use crate::setup::Msg;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlSetup(true));
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        for action in [
+            Action::CalAxis(0),
+            Action::CalDistance("10".into()),
+            Action::CalMove,
+        ] {
+            let _ = a.update(Message::Machine(action));
+        }
+        let _ = a.view();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        tick_until(&mut a, 5.0, "X at 10", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[0] - 10.).abs() < 1e-3
+        });
+        // 10 mm at the profile's 200 steps per mm.
+        assert_eq!(conn(&a).cal_pulses(), Some(2000));
+        let _ = a.update(Message::Machine(Action::CalMeasured("9.95".into())));
+        let v = conn(&a).calibrated().unwrap().unwrap();
+        assert!((v - 201.005_025).abs() < 1e-5, "{v}");
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::UseCalibration));
+        assert_eq!(draft(&a).number("axes.x.steps_per_unit"), "201.005");
+        let _ = a.update(Message::Setup(Msg::Save));
+        assert_eq!(
+            conn(&a).config.axes.x.as_ref().unwrap().steps_per_unit,
+            201.005
+        );
+        // A move that is not a number, or one in E-stop, is not made.
+        tick_until(&mut a, 3.0, "E-stop after reconnecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::Machine(Action::CalMove));
+        assert_eq!(conn(&a).cal_pulses(), None);
+        let _ = a.update(Message::Machine(Action::CalDistance("far".into())));
+        assert_eq!(conn(&a).cal_distance(), None);
+        let _ = a.view();
+    }
+
+    #[test]
     fn saving_while_connected_reconnects_with_the_new_profile() {
         use crate::control::Action;
         use crate::setup::{Edit, Msg};

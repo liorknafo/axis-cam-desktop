@@ -2398,6 +2398,18 @@ impl App {
                 }
             }
             Message::Setup(setup::Msg::Revert) => self.open_profile(true),
+            Message::Setup(setup::Msg::UseCalibration) => {
+                if let (Some(c), Some((id, Ok(d)))) = (&self.control, &mut self.profile_draft)
+                    && c.machine_id == *id
+                    && let Some(Ok(v)) = c.calibrated()
+                {
+                    let axis = ["x", "y", "z", "a", "b", "c"][c.calibration.axis];
+                    d.edit(setup::Edit::Number(
+                        format!("axes.{axis}.steps_per_unit"),
+                        setup::steps_text(v),
+                    ));
+                }
+            }
             Message::Setup(setup::Msg::Save) => return self.save_profile(),
             Message::Connect => {
                 if self.control.is_some() {

@@ -80,6 +80,24 @@ pub enum Action {
     MdiSend,
     /// Force an output pin high or low for a wiring test, or release it.
     TestOutput(u8, Option<bool>),
+    /// Calibration: the axis, the commanded travel field, the measured
+    /// travel field, and the move.
+    CalAxis(usize),
+    CalDistance(String),
+    CalMeasured(String),
+    CalMove,
+}
+
+/// Steps-per-mm calibration: one commanded move, then the travel measured
+/// at the machine.
+pub struct Calibration {
+    pub axis: usize,
+    /// Commanded travel, mm.
+    pub distance: String,
+    /// Measured travel, mm.
+    pub measured: String,
+    /// The axis's step counter before the move.
+    start: Option<i32>,
 }
 
 /// The input pins' changes since connecting, as seen at each tick.
@@ -143,6 +161,7 @@ pub struct Connection {
     /// Output pins forced for a wiring test (pin, high). The driver releases
     /// them all on E-stop.
     pub forced: BTreeMap<u8, bool>,
+    pub calibration: Calibration,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -176,6 +195,12 @@ impl Connection {
             opened: Instant::now(),
             inputs: InputLog::default(),
             forced: BTreeMap::new(),
+            calibration: Calibration {
+                axis: 0,
+                distance: "100".into(),
+                measured: String::new(),
+                start: None,
+            },
         })
     }
 
@@ -314,6 +339,25 @@ impl Connection {
                 self.forced.remove(&pin);
                 self.send(Command::TestOutput { pin, high: None });
             }
+            Action::CalAxis(axis) if self.axis(axis) => {
+                self.calibration.axis = axis;
+                self.calibration.start = None;
+            }
+            Action::CalDistance(text) => self.calibration.distance = text,
+            Action::CalMeasured(text) => self.calibration.measured = text,
+            Action::CalMove => {
+                let axis = self.calibration.axis;
+                if let (true, Some(distance), Some(st)) =
+                    (self.idle(), self.cal_distance(), &self.snapshot.status)
+                {
+                    self.calibration.start = Some(st.position[axis]);
+                    self.send(Command::JogStep {
+                        axis,
+                        distance,
+                        feed: self.jog_feed(axis),
+                    });
+                }
+            }
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
                 self.forced.insert(pin, high);
                 self.send(Command::TestOutput {
@@ -375,6 +419,28 @@ impl Connection {
         (0..6)
             .filter_map(|a| self.config.axes.get(a))
             .any(|a| a.limit_pos.is_some() || a.limit_neg.is_some())
+    }
+
+    /// The commanded calibration travel, when it is a move to make.
+    pub fn cal_distance(&self) -> Option<f64> {
+        let d: f64 = self.calibration.distance.trim().parse().ok()?;
+        (d.is_finite() && d != 0. && self.axis(self.calibration.axis)).then_some(d)
+    }
+
+    /// Step pulses commanded on the calibration axis since its move began.
+    pub fn cal_pulses(&self) -> Option<i32> {
+        let st = self.snapshot.status.as_ref()?;
+        Some(st.position[self.calibration.axis] - self.calibration.start?)
+    }
+
+    /// Steps per mm from the pulses and the measured travel, once both exist.
+    pub fn calibrated(&self) -> Option<Result<f64, String>> {
+        let measured: f64 = self.calibration.measured.trim().parse().ok()?;
+        let pulses = self.cal_pulses()?;
+        Some(
+            uc100::diagnostics::measured_steps_per_unit(pulses, measured)
+                .map_err(|e| e.to_string()),
+        )
     }
 
     /// An output pin may be forced: while Idle, and never one the firmware

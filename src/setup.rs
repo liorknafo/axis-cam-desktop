@@ -38,6 +38,8 @@ pub enum Msg {
     Save,
     /// Throw the changes away and read the file again.
     Revert,
+    /// Put the calibrated steps per mm in the form.
+    UseCalibration,
 }
 
 /// One change in the form. Paths are dotted keys: `axes.x.steps_per_unit`.
@@ -413,7 +415,11 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
     }
     let mut main = column![head].spacing(12);
     match here {
-        Some(c) => main = main.push(row![inputs(c), outputs(c)].spacing(12)),
+        Some(c) => {
+            main = main
+                .push(row![inputs(c), outputs(c)].spacing(12))
+                .push(calibration(c))
+        }
         None => {
             main = main.push(muted(
                 "Connect to watch the inputs, test the outputs and calibrate.",
@@ -529,7 +535,92 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
             muted("Adding or removing an axis, motion tuning and the tool table stay edits of the file."),
         ],
     ));
+    if let Ok(cfg) = &d.checked {
+        main = main.push(machine_panel(
+            "Audit",
+            column![
+                text(uc100::diagnostics::setup_report(cfg))
+                    .size(11)
+                    .font(Font::MONOSPACE),
+                muted("The driver's report on the profile as edited above."),
+            ],
+        ));
+    }
     main.into()
+}
+
+/// A calibrated steps per mm as written in the profile.
+pub fn steps_text(v: f64) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').into()
+}
+
+/// Steps per mm from a commanded move and the travel measured at the machine.
+fn calibration(c: &Connection) -> Element<'_, Message> {
+    let cal = &c.calibration;
+    let axis = cal.axis;
+    let mut axes = row![label("Axis")].spacing(6).align_y(Alignment::Center);
+    for (i, l) in AXES.iter().enumerate().filter(|(i, _)| c.axis(*i)) {
+        axes = axes.push(act(
+            l.to_uppercase(),
+            Some(Message::Machine(Action::CalAxis(i))),
+            i == axis,
+        ));
+    }
+    let field = |name: &str, value: &str, f: fn(String) -> Action| {
+        row![
+            label(name),
+            text_input("mm", value)
+                .on_input(move |v| Message::Machine(f(v)))
+                .width(110)
+                .padding([5, 8])
+                .size(12)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    };
+    let go = (c.idle() && c.cal_distance().is_some()).then_some(Message::Machine(Action::CalMove));
+    let spu = c.config.axes.get(axis).map_or(1., |a| a.steps_per_unit);
+    let mut body = column![
+        axes,
+        field("Commanded travel · mm", &cal.distance, Action::CalDistance)
+            .push(act("Move", go, false)),
+    ];
+    if let Some(pulses) = c.cal_pulses() {
+        body = body.push(muted(format!(
+            "{pulses} step pulses since the move began: {:.3} mm at the profile's {} steps per mm.",
+            pulses as f64 / spu,
+            steps_text(spu)
+        )));
+    }
+    body = body.push(field(
+        "Measured travel · mm",
+        &cal.measured,
+        Action::CalMeasured,
+    ));
+    match c.calibrated() {
+        Some(Ok(v)) if c.idle() => {
+            body = body.push(
+                row![
+                    bold(format!("{} steps per mm", steps_text(v)), 13),
+                    act(
+                        "Use in profile",
+                        Some(Message::Setup(Msg::UseCalibration)),
+                        false
+                    )
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+        }
+        Some(Ok(_)) => body = body.push(muted("Wait for the move to end.")),
+        Some(Err(e)) => body = body.push(muted(e)),
+        None => {}
+    }
+    machine_panel(
+        "Calibrate steps per mm",
+        body.push(muted("Measure how far the carriage really moved, with a ruler or a dial indicator, not the position on screen: that is counted from the pulses. A longer move gives a better figure. The move runs at the jog speed, and the soft limits apply.")),
+    )
 }
 
 /// What the running profile wires to a pin: "X step", "E-stop".

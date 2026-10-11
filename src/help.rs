@@ -448,6 +448,9 @@ pub fn command(m: &Message, label: String) -> Help {
         Setup(crate::setup::Msg::Save) => {
             "Write the profile file. Only the values changed are rewritten; its comments stay. A connected machine is reconnected with it: it starts in E-stop, and its machine position must be set again."
         }
+        Setup(crate::setup::Msg::UseCalibration) => {
+            "Put this steps per mm in the profile below. Save to use it."
+        }
         Setup(crate::setup::Msg::Revert) => {
             "Throw the changes away and read the profile file again."
         }
@@ -488,6 +491,11 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
             "Force this output pin for a wiring test, while Idle. E-stop releases every forced pin."
         }
         TestOutput(_, None) => "Release the pin: the machine drives it again.",
+        CalAxis(_) => "Calibrate this axis.",
+        CalDistance(_) | CalMeasured(_) => "Travel in mm.",
+        CalMove => {
+            "Move the axis by the commanded travel at the jog speed, counting its step pulses. Soft limits apply."
+        }
         WorkZero(None) => {
             "Make the current position work zero on every axis, in the active coordinate system (G54–G59)."
         }
