@@ -1749,6 +1749,159 @@ mist = { pin = 9 }
     }
 
     #[test]
+    fn work_zero_and_the_coordinate_systems() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        mdi(&mut a, "G0 X5 Y6");
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(0))));
+        tick_until(&mut a, 2.0, "work X 0", |s| s.work_pos[0].abs() < 1e-3);
+        assert!((conn(&a).snapshot.work_pos[1] - 6.).abs() < 1e-3);
+        let _ = a.update(Message::Machine(Action::WorkZero(None)));
+        tick_until(&mut a, 2.0, "work X, Y, Z 0", |s| {
+            s.work_pos[..3].iter().all(|v| v.abs() < 1e-3)
+        });
+        // G55 has its own offsets, still unset.
+        let _ = a.update(Message::Machine(Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| {
+            s.active_wcs == 1 && s.state == Some(State::Idle)
+        });
+        assert!((conn(&a).snapshot.work_pos[0] - 5.).abs() < 1e-3);
+        let _ = a.update(Message::Machine(Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| {
+            s.active_wcs == 0 && s.state == Some(State::Idle)
+        });
+        assert!(conn(&a).snapshot.work_pos[0].abs() < 1e-3);
+        // Nothing changes in E-stop, and G60 does not exist.
+        let _ = a.update(Message::Machine(Action::Wcs(6)));
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(1))));
+        tick_for(&mut a, 100);
+        assert!((conn(&a).snapshot.work_pos[1]).abs() < 1e-3);
+        assert_eq!(conn(&a).snapshot.active_wcs, 0);
+    }
+
+    #[test]
+    fn spindle_and_coolant_follow_the_profile() {
+        use crate::control::Action;
+        use uc100::{controller::State, gcode::Spindle};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        assert!(!conn(&a).reversible());
+        let _ = a.update(Message::Machine(Action::Rpm("12000".into())));
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Cw)));
+        tick_until(&mut a, 2.0, "CW", |s| {
+            s.spindle == Some(Spindle::Cw) && s.rpm == 12000.
+        });
+        // Reversing, or CCW without a direction output, would be an E-stop:
+        // neither is sent.
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Ccw)));
+        tick_for(&mut a, 100);
+        let s = &conn(&a).snapshot;
+        assert_eq!(
+            (s.state.clone(), s.spindle),
+            (Some(State::Idle), Some(Spindle::Cw))
+        );
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Off)));
+        tick_until(&mut a, 2.0, "off", |s| s.spindle == Some(Spindle::Off));
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Ccw)));
+        tick_for(&mut a, 100);
+        let s = &conn(&a).snapshot;
+        assert_eq!(
+            (s.state.clone(), s.spindle),
+            (Some(State::Idle), Some(Spindle::Off))
+        );
+        // Flood is wired, mist is not.
+        let _ = a.update(Message::Machine(Action::Flood(true)));
+        tick_until(&mut a, 2.0, "flood", |s| s.flood);
+        let _ = a.update(Message::Machine(Action::Mist(true)));
+        tick_for(&mut a, 100);
+        assert!(!conn(&a).snapshot.mist);
+        // An RPM that is not a number, or above the profile's maximum, starts nothing.
+        for rpm in ["abc", "30000", "0"] {
+            let _ = a.update(Message::Machine(Action::Rpm(rpm.into())));
+            assert_eq!(conn(&a).rpm_value(), None, "{rpm}");
+            let _ = a.update(Message::Machine(Action::Spindle(Spindle::Cw)));
+        }
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.spindle, Some(Spindle::Off));
+        let _ = a.update(Message::Disconnect);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), SWITCHED);
+        idle(&mut a);
+        assert!(conn(&a).reversible());
+        let _ = a.update(Message::Machine(Action::Rpm("8000".into())));
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Ccw)));
+        tick_until(&mut a, 2.0, "CCW", |s| {
+            s.spindle == Some(Spindle::Ccw) && s.rpm == 8000.
+        });
+    }
+
+    #[test]
+    fn feed_and_limit_override() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::FeedOverride(150.)));
+        tick_until(&mut a, 2.0, "150 %", |s| {
+            (s.feed_override - 1.5).abs() < 1e-9
+        });
+        let _ = a.update(Message::Machine(Action::FeedOverride(500.)));
+        tick_until(&mut a, 2.0, "200 %", |s| {
+            (s.feed_override - 2.).abs() < 1e-9
+        });
+        assert_eq!(conn(&a).feed_override, 200.);
+        // Without limit switches there is nothing to override.
+        assert!(!conn(&a).limit_inputs());
+        let _ = a.update(Message::Machine(Action::OverrideLimits(true)));
+        tick_for(&mut a, 100);
+        assert!(!conn(&a).snapshot.limits_override);
+        let _ = a.update(Message::Disconnect);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), SWITCHED);
+        idle(&mut a);
+        assert!(conn(&a).limit_inputs());
+        let _ = a.update(Message::Machine(Action::OverrideLimits(true)));
+        // It turns itself off a second after no switch is active.
+        tick_until(&mut a, 0.8, "limit override", |s| s.limits_override);
+    }
+
+    #[test]
+    fn an_mdi_line_runs_and_the_field_clears() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MdiText("G0 X5".into())));
+        assert_eq!(conn(&a).mdi, "G0 X5");
+        let _ = a.update(Message::Machine(Action::MdiSend));
+        assert_eq!(conn(&a).mdi, "");
+        tick_until(&mut a, 3.0, "X at 5", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[0] - 5.).abs() < 1e-3
+        });
+        // An empty line sends nothing; a line in E-stop stays in the field.
+        let lines = conn(&a).snapshot.log.len();
+        let _ = a.update(Message::Machine(Action::MdiSend));
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::Machine(Action::MdiText("G0 X0".into())));
+        let _ = a.update(Message::Machine(Action::MdiSend));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).mdi, "G0 X0");
+        assert!(
+            !conn(&a).snapshot.log[lines..]
+                .iter()
+                .any(|l| l.starts_with("MDI"))
+        );
+    }
+
+    #[test]
     fn connect_reports_a_missing_profile_and_needs_a_uc100_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut empty = App::from_workspace(dir.path().join("empty.json"), None);
@@ -1818,6 +1971,10 @@ mist = { pin = 9 }
             tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
                 s.referenced[..3].iter().all(|r| *r)
             });
+            let _ = a.update(Message::Machine(crate::control::Action::Rpm("abc".into())));
+            let _ = a.update(Message::Machine(crate::control::Action::MdiText(
+                "G0 X1".into(),
+            )));
             let _ = a.view();
             let _ = a.update(Message::Machine(crate::control::Action::JogPress(1, false)));
             tick_until(&mut a, 3.0, "jogging", |s| {

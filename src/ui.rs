@@ -2511,8 +2511,8 @@ fn act<'a>(label: impl Into<String>, msg: Option<Message>, on: bool) -> Element<
         .on_press_maybe(msg.clone())
         .style(move |_, status| {
             let (background, text_color) = match status {
-                button::Status::Disabled => (BG, MUTED),
                 _ if on => (Color::from_rgb8(223, 237, 249), BLUE),
+                button::Status::Disabled => (BG, MUTED),
                 button::Status::Hovered | button::Status::Pressed => {
                     (Color::from_rgb8(235, 240, 246), INK)
                 }
@@ -2833,21 +2833,141 @@ fn control(app: &App) -> Element<'_, Message> {
             )
         ],
     );
-    main = main.push(jog_panel);
-    let spindle = match s.spindle {
-        Some(Spindle::Cw) => "CW",
-        Some(Spindle::Ccw) => "CCW",
-        _ => "off",
+    let manual = |a: Action| c.manual().then_some(Message::Machine(a));
+    let mut zeros = row![].spacing(6);
+    for &a in &enabled {
+        zeros = zeros.push(act(
+            format!("Zero {}", AXES[a]),
+            manual(Action::WorkZero(Some(a))),
+            false,
+        ));
+    }
+    zeros = zeros.push(act("Zero all", manual(Action::WorkZero(None)), false));
+    let mut systems = row![].spacing(4);
+    for i in 0..6 {
+        systems = systems.push(act(
+            format!("G{}", 54 + i),
+            idle(Action::Wcs(i)),
+            s.active_wcs == i,
+        ));
+    }
+    let work_panel = machine_panel(
+        &format!("Work zero (G{})", 54 + s.active_wcs),
+        column![
+            zeros,
+            systems,
+            muted(
+                "Zero makes the current position work zero in the active coordinate system. G54 to G59 each keep their own; they change only while Idle."
+            )
+        ],
+    );
+    main = main.push(row![jog_panel, work_panel].spacing(12));
+    let start = |state| {
+        (c.spindle_ok(state) && c.rpm_value().is_some())
+            .then_some(Message::Machine(Action::Spindle(state)))
     };
-    let on = |b: bool| if b { "on" } else { "off" };
-    main = main.push(muted(format!(
-        "Spindle {spindle} · {:.0} rpm · flood {} · mist {} · feed {:.0} mm/min · override {:.0}%",
-        s.rpm,
-        on(s.flood),
-        on(s.mist),
-        s.feed_rate,
-        s.feed_override * 100.0
-    )));
+    let mut spindle_row = row![
+        text_input("RPM", &c.rpm)
+            .on_input(|v| Message::Machine(Action::Rpm(v)))
+            .width(90)
+            .padding([7, 9])
+            .size(13),
+        act("CW", start(Spindle::Cw), s.spindle == Some(Spindle::Cw))
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if c.reversible() {
+        spindle_row = spindle_row.push(act(
+            "CCW",
+            start(Spindle::Ccw),
+            s.spindle == Some(Spindle::Ccw),
+        ));
+    }
+    spindle_row = spindle_row.push(act(
+        "Stop",
+        Some(Message::Machine(Action::Spindle(Spindle::Off))),
+        false,
+    ));
+    let turning = match s.spindle {
+        Some(Spindle::Cw) => format!("CW at {:.0} rpm", s.rpm),
+        Some(Spindle::Ccw) => format!("CCW at {:.0} rpm", s.rpm),
+        _ => "off".into(),
+    };
+    let mut spindle = column![spindle_row, muted(format!("Spindle {turning}."))];
+    if !c.rpm.trim().is_empty() && c.rpm_value().is_none() {
+        spindle = spindle.push(muted(format!(
+            "Enter an RPM from 1 to {:.0}.",
+            c.config.outputs.spindle_max_rpm
+        )));
+    }
+    if !c.reversible() {
+        spindle = spindle.push(muted(
+            "No CCW: the profile has no spindle direction output.",
+        ));
+    }
+    let coolant = |on: bool, label: &'static str, f: fn(bool) -> Action| {
+        checkbox(on)
+            .label(label)
+            .on_toggle(move |b| Message::Machine(f(b)))
+            .text_size(12)
+    };
+    if c.config.outputs.flood.is_some() {
+        spindle = spindle.push(coolant(s.flood, "Flood (M8)", Action::Flood));
+    }
+    if c.config.outputs.mist.is_some() {
+        spindle = spindle.push(coolant(s.mist, "Mist (M7)", Action::Mist));
+    }
+    if c.config.outputs.flood.is_none() && c.config.outputs.mist.is_none() {
+        spindle = spindle.push(muted("The profile has no coolant outputs."));
+    }
+    let mut overrides = column![
+        row![
+            text(format!("Feed override {:.0} %", c.feed_override))
+                .size(12)
+                .width(140),
+            slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
+                Action::FeedOverride(v)
+            ))
+            .step(5.0_f32)
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        muted(format!("Feed now {:.0} mm/min.", s.feed_rate))
+    ];
+    if c.limit_inputs() {
+        overrides = overrides.push(
+            checkbox(s.limits_override)
+                .label("Override limit switches")
+                .on_toggle(|b| Message::Machine(Action::OverrideLimits(b)))
+                .text_size(12),
+        );
+        overrides = overrides.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
+    }
+    main = main.push(
+        row![
+            machine_panel("Spindle and coolant", spindle),
+            machine_panel("Overrides", overrides)
+        ]
+        .spacing(12),
+    );
+    let send =
+        (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
+    main = main.push(machine_panel(
+        "MDI",
+        column![
+            row![
+                text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
+                    .on_input(|v| Message::Machine(Action::MdiText(v)))
+                    .on_submit_maybe(send.clone())
+                    .padding([7, 9])
+                    .size(13),
+                act("Send", send, false)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            muted("Runs the line when Idle, or while a program is paused. Enter sends it too.")
+        ],
+    ));
     row![left, scrollable(main.padding(4)).height(Fill).width(Fill)]
         .spacing(12)
         .padding(12)

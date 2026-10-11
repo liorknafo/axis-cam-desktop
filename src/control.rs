@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use uc100::config::MachineConfig;
 use uc100::controller::{Command, Controller, Snapshot, State};
+use uc100::gcode::Spindle;
 
 /// Whether a UC100 machine connects to the simulator. Unset means the
 /// simulator, except on macOS, where the real machine is connected.
@@ -57,6 +58,24 @@ pub enum Action {
     JogStep(Option<f64>),
     /// Jog speed, % of each axis's maximum velocity.
     JogSpeed(f32),
+    /// Make the current position work zero of the active coordinate
+    /// system: one axis, or every axis.
+    WorkZero(Option<usize>),
+    /// Select G54 (0) … G59 (5).
+    Wcs(usize),
+    /// The RPM field.
+    Rpm(String),
+    Spindle(Spindle),
+    Flood(bool),
+    Mist(bool),
+    /// Feed override, %.
+    FeedOverride(f32),
+    /// Ignore the limit switches, to drive off one that tripped.
+    OverrideLimits(bool),
+    /// The MDI field.
+    MdiText(String),
+    /// Run the MDI field's line.
+    MdiSend,
 }
 
 /// The continuous jog held down.
@@ -84,6 +103,10 @@ pub struct Connection {
     pub jog_step: Option<f64>,
     /// Jog speed, % of each axis's maximum velocity.
     pub jog_speed: f32,
+    /// Feed override, %.
+    pub feed_override: f32,
+    pub rpm: String,
+    pub mdi: String,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -111,6 +134,9 @@ impl Connection {
             held: None,
             jog_step: None,
             jog_speed: 50.,
+            feed_override: 100.,
+            rpm: String::new(),
+            mdi: String::new(),
         })
     }
 
@@ -195,6 +221,50 @@ impl Connection {
             }
             Action::JogStep(step) => self.jog_step = step,
             Action::JogSpeed(percent) => self.jog_speed = percent.clamp(1., 100.),
+            Action::WorkZero(axis) if self.manual() => {
+                let axes = axis.map_or(0..6, |a| a..a + 1);
+                for a in axes.filter(|&a| self.axis(a)) {
+                    self.send(Command::SetWork { axis: a, value: 0. });
+                }
+            }
+            Action::Wcs(i) if self.idle() && i < 6 => {
+                self.send(Command::Mdi(format!("G{}", 54 + i)))
+            }
+            Action::Rpm(text) => self.rpm = text,
+            Action::Spindle(Spindle::Off) => self.send(Command::Spindle {
+                state: Spindle::Off,
+                rpm: 0.,
+            }),
+            Action::Spindle(state) if self.spindle_ok(state) => {
+                if let Some(rpm) = self.rpm_value() {
+                    self.send(Command::Spindle { state, rpm });
+                }
+            }
+            Action::Flood(flood) if self.config.outputs.flood.is_some() => {
+                self.send(Command::Coolant {
+                    flood,
+                    mist: self.snapshot.mist,
+                })
+            }
+            Action::Mist(mist) if self.config.outputs.mist.is_some() => {
+                self.send(Command::Coolant {
+                    flood: self.snapshot.flood,
+                    mist,
+                })
+            }
+            Action::FeedOverride(percent) => {
+                self.feed_override = percent.clamp(10., 200.);
+                self.send(Command::FeedOverride(self.feed_override as f64 / 100.));
+            }
+            Action::OverrideLimits(on) if self.limit_inputs() => {
+                self.send(Command::OverrideLimits(on))
+            }
+            Action::MdiText(text) => self.mdi = text,
+            // A line the machine cannot take now stays in the field.
+            Action::MdiSend if self.manual() && !self.mdi.trim().is_empty() => {
+                let line = std::mem::take(&mut self.mdi);
+                self.send(Command::Mdi(line.trim().into()));
+            }
             _ => {}
         }
     }
@@ -216,6 +286,39 @@ impl Connection {
             .axes
             .get(axis)
             .map_or(0., |a| a.max_velocity * self.jog_speed as f64 / 100.)
+    }
+
+    /// The RPM field, when it is a speed the profile's spindle can run.
+    pub fn rpm_value(&self) -> Option<f64> {
+        let max = self.config.outputs.spindle_max_rpm;
+        self.rpm
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&rpm: &f64| rpm >= 1. && rpm <= max)
+    }
+
+    /// The profile has a way to run the spindle CCW. Without one the driver
+    /// E-stops on CCW, so it is never offered.
+    pub fn reversible(&self) -> bool {
+        let o = &self.config.outputs;
+        o.spindle_dir.is_some() || o.spindle_ccw.is_some()
+    }
+
+    /// The spindle may start this way now: never CCW without a direction
+    /// output, and never the other way while it turns (both E-stop).
+    pub fn spindle_ok(&self, state: Spindle) -> bool {
+        let turning = self.snapshot.spindle.unwrap_or(Spindle::Off);
+        self.manual()
+            && (state != Spindle::Ccw || self.reversible())
+            && (turning == Spindle::Off || turning == state)
+    }
+
+    /// Some axis has a limit switch, so there is something to override.
+    pub fn limit_inputs(&self) -> bool {
+        (0..6)
+            .filter_map(|a| self.config.axes.get(a))
+            .any(|a| a.limit_pos.is_some() || a.limit_neg.is_some())
     }
 
     pub fn idle(&self) -> bool {

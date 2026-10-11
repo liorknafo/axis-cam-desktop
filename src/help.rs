@@ -474,6 +474,25 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         JogStep(None) => "Jog for as long as the button or key is held.",
         JogStep(Some(_)) => "Move exactly this far for each press.",
         JogSpeed(_) => "Jog speed, as a share of each axis's maximum speed in the profile.",
+        WorkZero(None) => {
+            "Make the current position work zero on every axis, in the active coordinate system (G54–G59)."
+        }
+        WorkZero(Some(_)) => {
+            "Make the current position work zero on this axis, in the active coordinate system."
+        }
+        Wcs(_) => {
+            "Use this work coordinate system. Each of G54–G59 keeps its own work zero; they change only while Idle."
+        }
+        Rpm(_) => "Spindle speed for CW and CCW, in revolutions per minute.",
+        Spindle(uc100::gcode::Spindle::Off) => "Stop the spindle.",
+        Spindle(_) => "Start the spindle at the RPM above. Stop it before changing direction.",
+        Flood(_) | Mist(_) => "Switch the coolant output on or off.",
+        FeedOverride(_) => "Scale every programmed feed, from 10 % to 200 %.",
+        OverrideLimits(_) => {
+            "Ignore the limit switches, to drive off one that tripped. It turns itself off a second after no switch is active."
+        }
+        MdiText(_) => "One line of G-code, for example G0 X10 Y10.",
+        MdiSend => "Run the line now. Works when Idle, or while a program is paused.",
     }
 }
 
