@@ -135,9 +135,17 @@ fn cylinder(
 /// The machine with its tool tip at `pos` (machine X, Y, Z).
 fn faces(pos: [f32; 3], known: bool) -> Vec<Face> {
     let rgb = |r, g, b| Color::from_rgb8(r, g, b);
-    // The moving parts are see-through until the machine position is set.
+    // The moving parts turn amber until the machine position is set.
     let moving = |c: Color| {
-        if known { c } else { Color { a: 0.45, ..c } }
+        let amber = rgb(214, 150, 60);
+        match known {
+            true => c,
+            false => Color::from_rgb(
+                (c.r + amber.r) / 2.,
+                (c.g + amber.g) / 2.,
+                (c.b + amber.b) / 2.,
+            ),
+        }
     };
     let [x, y, z] = pos;
     let table_top = -TIP_HEIGHT;
@@ -334,8 +342,8 @@ pub struct Orbit {
 impl Default for Orbit {
     fn default() -> Self {
         Orbit {
-            yaw: 0.55,
-            pitch: 0.6,
+            yaw: 0.35,
+            pitch: 0.5,
             drag: None,
         }
     }
@@ -405,7 +413,7 @@ impl canvas::Program<Message> for MachineView {
         let min = |k: usize| corners.iter().map(|c| c[k]).fold(f32::MAX, f32::min);
         let max = |k: usize| corners.iter().map(|c| c[k]).fold(f32::MIN, f32::max);
         let size = Size::new(max(0) - min(0), max(1) - min(1));
-        let scale = (bounds.width / size.width).min(bounds.height / size.height) * 0.92;
+        let scale = (bounds.width / size.width).min(bounds.height / size.height) * 0.97;
         let origin = Point::new(
             (bounds.width - size.width * scale) / 2. - min(0) * scale,
             (bounds.height - size.height * scale) / 2. - min(1) * scale,
@@ -528,20 +536,11 @@ mod tests {
         assert_eq!(table(&home), table(&moved));
         // At the bottom of Z the tool stays above the table.
         assert!(lowest(&faces([0., 0., -TRAVEL[2]], true), "tool", 2) > -TIP_HEIGHT);
-        // Until the position is set, the moving parts are see-through.
-        let ghost = faces([0., 0., 0.], false);
-        assert!(
-            ghost
-                .iter()
-                .filter(|f| f.part == "spindle")
-                .all(|f| f.color.a < 1.)
-        );
-        assert!(
-            ghost
-                .iter()
-                .filter(|f| f.part == "table")
-                .all(|f| f.color.a == 1.)
-        );
+        // Until the position is set, the moving parts change colour.
+        let unset = faces([0., 0., 0.], false);
+        let colour = |f: &[Face], name: &str| f.iter().find(|f| f.part == name).unwrap().color;
+        assert_ne!(colour(&unset, "spindle"), colour(&home, "spindle"));
+        assert_eq!(colour(&unset, "table"), colour(&home, "table"));
     }
 
     #[test]

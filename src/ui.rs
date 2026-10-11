@@ -2741,25 +2741,20 @@ fn control(app: &App) -> Element<'_, Message> {
         known: (0..3).all(|a| !c.axis(a) || s.referenced[a]),
         envelope: crate::machine_view::MachineView::envelope(&c.config),
     };
-    main = main.push(
-        row![
-            machine_panel(
-                "Position",
-                column![
-                    table,
-                    bold("Machine zero", 13),
-                    zero,
-                    zero_actions,
-                    note(MACHINE_ZERO_NOTE)
-                ],
-            ),
-            container(canvas(model).width(Fill).height(380))
-                .padding(1)
-                .width(Fill)
-                .style(panel_style)
-        ]
-        .spacing(12),
+    let position = machine_panel(
+        "Position",
+        column![
+            table,
+            bold("Machine zero", 13),
+            zero,
+            zero_actions,
+            note(MACHINE_ZERO_NOTE)
+        ],
     );
+    let model = container(canvas(model).width(Fill).height(400))
+        .padding(1)
+        .width(Fill)
+        .style(panel_style);
     let can_jog = c.manual() || s.state == Some(State::Jog);
     let mut modes = row![act(
         "Continuous",
@@ -2879,7 +2874,6 @@ fn control(app: &App) -> Element<'_, Message> {
             )
         ],
     );
-    main = main.push(row![jog_panel, work_panel].spacing(12));
     let start = |state| {
         (c.spindle_ok(state) && c.rpm_value().is_some())
             .then_some(Message::Machine(Action::Spindle(state)))
@@ -2961,10 +2955,17 @@ fn control(app: &App) -> Element<'_, Message> {
         );
         overrides = overrides.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
-    main = main.push(
+    // Jog beside the position, so both fit without scrolling; the model
+    // beside the work zero and the spindle.
+    main = main.push(row![position, jog_panel].spacing(12)).push(
         row![
-            machine_panel("Spindle and coolant", spindle),
-            machine_panel("Overrides", overrides)
+            model,
+            column![
+                work_panel,
+                machine_panel("Spindle and coolant", spindle),
+                machine_panel("Overrides", overrides)
+            ]
+            .spacing(12)
         ]
         .spacing(12),
     );
@@ -2992,7 +2993,7 @@ fn control(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .into()
 }
-const MACHINE_ZERO_NOTE: &str = "AXIS CAM knows where the axes are only once each has a machine position. Without home switches: jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then press Set machine zero here (or one axis at a time). Keep the last position takes the position shown, which after connecting is where AXIS CAM last left the machine: use it only if nothing moved the machine since (no hand-turned screws, no stalled motors, no power cut during a move).";
+const MACHINE_ZERO_NOTE: &str = "Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
 fn tools(app: &App) -> Element<'_, Message> {
     if app.doc.tools.is_empty() && app.tool_draft.name().is_empty() {
         return container(
