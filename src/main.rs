@@ -139,6 +139,13 @@ pub enum Message {
     MachineEStop,
     /// An action on the connected machine, from the Control page.
     Machine(control::Action),
+    /// A jog key went down and no widget took it (axis, negative, repeat).
+    JogKey(usize, bool, bool),
+    /// Whether a text field had the focus when a jog key went down (axis,
+    /// negative, typing).
+    JogKeyChecked(usize, bool, bool),
+    /// A jog key went up.
+    JogKeyUp,
     EditTool(String),
     NewTool,
     SaveTool,
@@ -517,6 +524,8 @@ pub struct App {
     pub control: Option<control::Connection>,
     /// The UC100 machine chosen on the Control page (machine id).
     pub control_machine: Option<String>,
+    /// The jog key down on the Control page (axis, negative).
+    pub jog_key: Option<(usize, bool)>,
     pub project_path: Option<PathBuf>,
     pub project_dirty: bool,
     pub planner: Planner,
@@ -704,6 +713,7 @@ impl App {
             help_animating: false,
             control: None,
             control_machine: None,
+            jog_key: None,
             smoke_pending: false,
             machine_draft: doc
                 .machines
@@ -2354,6 +2364,34 @@ impl App {
                     c.act(action);
                 }
             }
+            // Keys jog on the Control page only, and not while a text field
+            // has the focus: iced's text field keeps the left and right
+            // arrows but lets up, down and Page Up/Down through.
+            Message::JogKey(axis, negative, repeat) => {
+                // A held key is kept going by the tick; a step is one per press.
+                if repeat || self.page != Page::Control || self.control.is_none() {
+                    return Task::none();
+                }
+                self.jog_key = Some((axis, negative));
+                return iced::advanced::widget::operate(control::typing())
+                    .map(move |typing| Message::JogKeyChecked(axis, negative, typing));
+            }
+            Message::JogKeyChecked(axis, negative, typing) => {
+                // The key must still be down: a release before the answer
+                // must not start a jog that nothing would stop.
+                if !typing && self.jog_key == Some((axis, negative)) && self.page == Page::Control {
+                    if let Some(c) = &mut self.control {
+                        c.act(control::Action::JogPress(axis, negative));
+                    }
+                }
+            }
+            Message::JogKeyUp => {
+                if self.jog_key.take().is_some() {
+                    if let Some(c) = &mut self.control {
+                        c.act(control::Action::JogRelease);
+                    }
+                }
+            }
             Message::SaveMachine => {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
@@ -3501,7 +3539,7 @@ impl App {
                 },
             )
             .map(|_| Message::Tick),
-            iced::event::listen_with(|event, _, window| match event {
+            iced::event::listen_with(|event, status, window| match event {
                 iced::Event::Window(iced::window::Event::CloseRequested) => {
                     Some(Message::Close(window))
                 }
@@ -3525,12 +3563,45 @@ impl App {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
                 }) => Some(Message::MachineEStop),
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(key),
+                    repeat,
+                    ..
+                }) if status == iced::event::Status::Ignored => {
+                    jog_key(key).map(|(axis, negative)| Message::JogKey(axis, negative, repeat))
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                    key: iced::keyboard::Key::Named(key),
+                    ..
+                }) => jog_key(key).map(|_| Message::JogKeyUp),
+                // A held jog stops on any left-button release, wherever it
+                // happens, and when the window loses the focus.
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))
+                | iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::Machine(control::Action::JogRelease))
+                }
                 _ => None,
             }),
         ])
     }
     fn view(&self) -> Element<'_, Message> {
         ui::view(self)
+    }
+}
+/// The axis and direction a jog key moves: the arrows jog X and Y (up is
+/// +Y, away from the operator), Page Up and Page Down jog Z.
+fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
+    use iced::keyboard::key::Named;
+    match key {
+        Named::ArrowLeft => Some((0, true)),
+        Named::ArrowRight => Some((0, false)),
+        Named::ArrowUp => Some((1, false)),
+        Named::ArrowDown => Some((1, true)),
+        Named::PageUp => Some((2, false)),
+        Named::PageDown => Some((2, true)),
+        _ => None,
     }
 }
 fn sanitize_name(s: &str) -> String {

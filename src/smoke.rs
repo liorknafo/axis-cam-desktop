@@ -1612,6 +1612,142 @@ mist = { pin = 9 }
         assert!(at(&a)[..3].iter().all(|v| v.abs() < 1e-2), "{:?}", at(&a));
     }
 
+    /// Ticks for `ms` milliseconds.
+    fn tick_for(a: &mut App, ms: u64) {
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_held_jog_keeps_moving_and_stops_on_release() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        assert_eq!(conn(&a).held(), Some((0, false)));
+        // Past the driver's 400 ms timeout: the tick keeps the jog going.
+        tick_for(&mut a, 700);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Jog));
+        assert!(at(&a)[0] > 5., "{:?}", at(&a));
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        assert_eq!(conn(&a).held(), None);
+        tick_until(&mut a, 3.0, "Idle after the release", |s| {
+            s.state == Some(State::Idle)
+        });
+        let x = at(&a)[0];
+        tick_for(&mut a, 100);
+        assert_eq!(at(&a)[0], x);
+        // Nothing jogs in E-stop, and an axis the profile lacks is never sent.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        let _ = a.update(Message::Machine(Action::JogPress(9, false)));
+        assert_eq!(conn(&a).held(), None);
+    }
+
+    #[test]
+    fn a_jog_step_moves_one_step() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::JogStep(Some(1.))));
+        let _ = a.update(Message::Machine(Action::JogPress(1, true)));
+        assert_eq!(conn(&a).held(), None);
+        tick_until(&mut a, 3.0, "Y at -1", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[1] + 1.).abs() < 1e-3
+        });
+        // A press for an axis the profile lacks sends nothing.
+        let _ = a.update(Message::Machine(Action::JogPress(9, true)));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+    }
+
+    #[test]
+    fn a_jog_into_a_soft_limit_ends_at_the_limit() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        mdi(&mut a, "G0 X3");
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        mdi(&mut a, "G0 X3");
+        let _ = a.update(Message::Machine(Action::JogPress(0, true)));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while conn(&a).held().is_some() {
+            assert!(std::time::Instant::now() < end, "the jog did not end");
+            tick_for(&mut a, 20);
+        }
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(at(&a)[0].abs() < 0.05, "{:?}", at(&a));
+        // A step past the limit is refused before it moves.
+        let x = at(&a)[0];
+        let _ = a.update(Message::Machine(Action::JogStep(Some(10.))));
+        let _ = a.update(Message::Machine(Action::JogPress(0, true)));
+        tick_for(&mut a, 100);
+        assert_eq!(at(&a)[0], x);
+        assert!(
+            conn(&a)
+                .snapshot
+                .log
+                .iter()
+                .any(|l| l.starts_with("Jog refused"))
+        );
+    }
+
+    #[test]
+    fn jog_keys_only_on_the_control_page_and_not_while_typing() {
+        use iced::keyboard::key::Named;
+        use uc100::controller::State;
+        let keys = [
+            (Named::ArrowLeft, (0, true)),
+            (Named::ArrowRight, (0, false)),
+            (Named::ArrowUp, (1, false)),
+            (Named::ArrowDown, (1, true)),
+            (Named::PageUp, (2, false)),
+            (Named::PageDown, (2, true)),
+        ];
+        for (key, jog) in keys {
+            assert_eq!(crate::jog_key(key), Some(jog));
+        }
+        assert_eq!(crate::jog_key(Named::Enter), None);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let held = |a: &App| conn(a).held();
+        let _ = a.update(Message::JogKey(0, false, false));
+        assert_eq!(a.jog_key, None, "not on the Control page");
+        a.page = Page::Control;
+        let _ = a.update(Message::JogKeyChecked(0, false, false));
+        assert_eq!(held(&a), None, "no key is down");
+        let _ = a.update(Message::JogKey(0, false, false));
+        let _ = a.update(Message::JogKeyChecked(0, false, true));
+        assert_eq!(held(&a), None, "a text field has the focus");
+        let _ = a.update(Message::JogKeyUp);
+        let _ = a.update(Message::JogKey(0, false, false));
+        let _ = a.update(Message::JogKeyUp);
+        let _ = a.update(Message::JogKeyChecked(0, false, false));
+        assert_eq!(held(&a), None, "released before the answer");
+        let _ = a.update(Message::JogKey(0, false, false));
+        let _ = a.update(Message::JogKeyChecked(0, false, false));
+        assert_eq!(held(&a), Some((0, false)));
+        let _ = a.update(Message::JogKey(0, false, true));
+        assert_eq!(held(&a), Some((0, false)));
+        let _ = a.update(Message::JogKeyUp);
+        assert_eq!((held(&a), a.jog_key), (None, None));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
     #[test]
     fn connect_reports_a_missing_profile_and_needs_a_uc100_machine() {
         let dir = tempfile::tempdir().unwrap();
@@ -1683,6 +1819,12 @@ mist = { pin = 9 }
                 s.referenced[..3].iter().all(|r| *r)
             });
             let _ = a.view();
+            let _ = a.update(Message::Machine(crate::control::Action::JogPress(1, false)));
+            tick_until(&mut a, 3.0, "jogging", |s| {
+                s.state == Some(uc100::controller::State::Jog)
+            });
+            let _ = a.view();
+            let _ = a.update(Message::Machine(crate::control::Action::JogRelease));
         }
     }
 

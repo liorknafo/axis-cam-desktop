@@ -12,8 +12,8 @@ use iced::{
     Length::{self, Fill},
     Theme,
     widget::{
-        self, Column, Row, button, canvas, checkbox, column, container, pick_list, row, rule,
-        scrollable, slider, space, svg, text, text_input,
+        self, Column, Row, button, canvas, checkbox, column, container, mouse_area, pick_list, row,
+        rule, scrollable, slider, space, svg, text, text_input,
     },
 };
 const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
@@ -2742,6 +2742,98 @@ fn control(app: &App) -> Element<'_, Message> {
             note(MACHINE_ZERO_NOTE)
         ],
     ));
+    let can_jog = c.manual() || s.state == Some(State::Jog);
+    let mut modes = row![act(
+        "Continuous",
+        Some(Message::Machine(Action::JogStep(None))),
+        c.jog_step.is_none()
+    )]
+    .spacing(6);
+    for step in [0.01, 0.1, 1., 10.] {
+        modes = modes.push(act(
+            format!("{step} mm"),
+            Some(Message::Machine(Action::JogStep(Some(step)))),
+            c.jog_step == Some(step),
+        ));
+    }
+    // Hold to jog: a press starts it; a release, anywhere, or leaving the
+    // button stops it.
+    let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
+        if !c.axis(axis) {
+            return space().width(64).height(44).into();
+        }
+        let held = c.held() == Some((axis, negative));
+        let label = format!("{}{}", AXES[axis], if negative { "−" } else { "+" });
+        let face = container(bold(label, 15).color(if held {
+            Color::WHITE
+        } else if can_jog {
+            INK
+        } else {
+            MUTED
+        }))
+        .center_x(64)
+        .center_y(44)
+        .style(move |_| container::Style {
+            background: Some(
+                if held {
+                    BLUE
+                } else if can_jog {
+                    Color::WHITE
+                } else {
+                    BG
+                }
+                .into(),
+            ),
+            border: Border {
+                color: if held { BLUE } else { LINE },
+                width: 1.,
+                radius: 6.into(),
+            },
+            ..Default::default()
+        });
+        let release = Message::Machine(Action::JogRelease);
+        mouse_area(face)
+            .on_press(Message::Machine(Action::JogPress(axis, negative)))
+            .on_release(release.clone())
+            .on_exit(release)
+            .into()
+    };
+    let gap = || space().width(64).height(44);
+    let pad = row![
+        column![gap(), jog(0, true), gap()].spacing(6),
+        column![jog(1, false), gap(), jog(1, true)].spacing(6),
+        column![gap(), jog(0, false), gap()].spacing(6),
+        space().width(18),
+        column![jog(2, false), gap(), jog(2, true)].spacing(6),
+    ]
+    .spacing(6);
+    let speed = row![
+        text(format!(
+            "Speed {:.0} % · X {:.0} mm/min",
+            c.jog_speed,
+            c.jog_feed(0)
+        ))
+        .size(12)
+        .width(190),
+        slider(1.0..=100.0, c.jog_speed, |v| Message::Machine(
+            Action::JogSpeed(v)
+        ))
+        .step(1.0_f32)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let jog_panel = machine_panel(
+        "Jog",
+        column![
+            modes,
+            pad,
+            speed,
+            muted(
+                "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. Keys work on this page while no text field is being edited."
+            )
+        ],
+    );
+    main = main.push(jog_panel);
     let spindle = match s.spindle {
         Some(Spindle::Cw) => "CW",
         Some(Spindle::Ccw) => "CCW",

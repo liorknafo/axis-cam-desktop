@@ -468,6 +468,12 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         KeepPosition => {
             "Take the position shown as the machine position. After connecting it is where AXIS CAM last left the machine: use it only if nothing moved the machine since."
         }
+        JogPress(..) | JogRelease => {
+            "Hold to jog this axis; release to stop. In step mode each press moves one step. The arrow keys and Page Up/Down do the same on this page."
+        }
+        JogStep(None) => "Jog for as long as the button or key is held.",
+        JogStep(Some(_)) => "Move exactly this far for each press.",
+        JogSpeed(_) => "Jog speed, as a share of each axis's maximum speed in the profile.",
     }
 }
 
