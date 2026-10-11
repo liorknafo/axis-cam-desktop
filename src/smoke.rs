@@ -1854,6 +1854,18 @@ flood = { pin = 8 }
         let _ = a.view();
         let _ = a.update(Message::Run(R::Resume));
         tick_until(&mut a, 2.0, "Run", |s| s.state == Some(State::Run));
+        // Space holds from any page and resumes only on the Control page.
+        a.page = Page::Work;
+        let _ = a.update(Message::HoldKey);
+        tick_until(&mut a, 2.0, "Hold by Space", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::HoldKey);
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Hold));
+        a.page = Page::Control;
+        let _ = a.update(Message::HoldKey);
+        tick_until(&mut a, 2.0, "Run by Space", |s| s.state == Some(State::Run));
         let _ = a.update(Message::Run(R::Stop));
         run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
         let (ok, message) = run_of(&a).outcome.clone().unwrap();

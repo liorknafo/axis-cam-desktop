@@ -152,6 +152,8 @@ pub enum Message {
     JogKeyChecked(usize, bool, bool),
     /// A jog key went up.
     JogKeyUp,
+    /// Space went down and no widget took it: Hold, or Resume.
+    HoldKey,
     /// An action of the Run panel on the Control page.
     Run(run::Action),
     /// A setup's tool runs, checked for a UC100 run (the check's epoch).
@@ -2541,6 +2543,19 @@ impl App {
                     }
                 }
             }
+            // Space holds a job or move from any page, and resumes from that
+            // hold only on the Control page, so a Space meant for something
+            // else cannot start the machine.
+            Message::HoldKey => {
+                use uc100::controller::{Command, State};
+                if let Some(c) = &self.control {
+                    match c.snapshot.state {
+                        Some(State::Run) => c.send(Command::FeedHold),
+                        Some(State::Hold) if self.page == Page::Control => c.send(Command::Resume),
+                        _ => {}
+                    }
+                }
+            }
             Message::Run(run::Action::Setup(si)) => {
                 let Some(c) = &mut self.control else {
                     return Task::none();
@@ -3745,6 +3760,12 @@ impl App {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
                 }) => Some(Message::MachineEStop),
+                // A focused text field takes Space as a character.
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+                    repeat: false,
+                    ..
+                }) if status == iced::event::Status::Ignored => Some(Message::HoldKey),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(key),
                     repeat,

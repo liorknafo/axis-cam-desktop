@@ -287,6 +287,10 @@ A setup can model the vise or the toe clamps that hold its stock. The app then c
 
 AXIS CAM can drive a CNCdrive UC100 itself, through the
 [UC100 driver](https://github.com/liorknafo/UC100-driver) (pinned in `Cargo.toml`).
+It is the one program for daily use: the driver's own egui app
+(`uc100-gui`, built only with the driver's `gui` feature) is a developer and
+bench tool. What only that app does: open and run a G-code file made
+elsewhere (LIO-111) and edit the profile as raw TOML.
 
 1. In the Machine library, set a machine's controller to **UC100**, choose its
    **UC100 profile file** (the driver's machine TOML: pins, steps per mm,
@@ -335,7 +339,7 @@ Once the machine is Idle, the Control page has everything needed before a job:
   the machine and correct both (`src/machine_view.rs`, the driver profile).
 
 **Setup** (the switch at the top of the Control page) does the commissioning
-work that needed the driver's own app or a text editor:
+work that needed the driver's egui app or a text editor:
 
 - **The UC100 profile as a form**: pins and polarity, steps per mm, speeds,
   acceleration, switches, homing and soft limits per axis; the E-stop, probe
@@ -380,8 +384,10 @@ with no G-code file in between.
    current work zero (plan point − work zero + work offset, feeds in mm/s)
    and sends them as one job; the driver checks the soft limits again before
    anything moves. **Hold**, **Resume** and **Stop** (decelerate, then spindle
-   and coolant off). The panel shows the tool run, operation and block being
-   cut, and how the tool run ended.
+   and coolant off). **Space** holds from any page while no text field is
+   being edited, and resumes from that hold on the Control page only. The
+   panel shows the tool run, operation and block being cut, and how the tool
+   run ended.
 4. Between tool runs with different tools: the last one ended with the
    spindle and coolant off at the setup's clearance plane. Touch the old tool
    on a surface that stays put and press **Record reference** (this can be

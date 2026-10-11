@@ -3219,6 +3219,9 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         .spacing(8)
         .align_y(Alignment::Center),
     );
+    body = body.push(muted(
+        "Space holds from any page while no text field is being edited, and resumes on this page.",
+    ));
     if let Some((p, op, block)) = run.progress(s.current_line) {
         let i = run.running.as_ref().map_or(0, |r| r.index);
         body = body
