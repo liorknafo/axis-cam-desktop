@@ -2437,7 +2437,11 @@ fn wizard(app: &App) -> Element<'_, Message> {
                         ))
                         .push(check);
                 }
-                form = form.push(note("AXIS CAM drives this machine itself from the Control page. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing."));
+                form = form
+                    .push(field(p, "post_dwell", "Spindle start dwell · s", t))
+                    .push(choice_value(p, post_setting(p, "post_air"), "post_air", "Air blast output", &POST_AIR, t))
+                    .push(warnings(post_setting_issues(p)))
+                    .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
         _ => {
@@ -2673,13 +2677,18 @@ fn control(app: &App) -> Element<'_, Message> {
             "Soft limits are OFF",
             vec![
                 format!(
-                    "{} {} no machine position yet, so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
+                    "{} {} no machine position (every E-stop clears it), so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
                     axis_names(&unset),
                     if one { "has" } else { "have" },
                     if one { "it" } else { "them" },
                     if one { "its" } else { "their" },
                 ),
-                "Set machine zero below to turn them on.".into(),
+                if c.home_switches() {
+                    "Home below to turn them on."
+                } else {
+                    "Set machine zero below to turn them on."
+                }
+                .into(),
             ],
         )
     } else {
@@ -2693,7 +2702,7 @@ fn control(app: &App) -> Element<'_, Message> {
             .color(Color::from_rgb8(39, 130, 93))
             .into()
     };
-    main = main.push(limits);
+    main = main.push(limits).push(run_panel(app, c));
     let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
     let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(110);
     let mut table = column![row![
@@ -2712,25 +2721,33 @@ fn control(app: &App) -> Element<'_, Message> {
         ]);
     }
     let idle = |a: Action| c.idle().then_some(Message::Machine(a));
-    let mut zero = row![act(
-        "Set machine zero here",
-        idle(Action::MachineZero(None)),
-        false
-    )]
-    .spacing(6)
-    .align_y(Alignment::Center)
-    .push(muted("or one axis"));
-    for &a in enabled.iter().filter(|&&a| a < 3) {
-        zero = zero.push(act(AXES[a], idle(Action::MachineZero(Some(a))), false));
+    // A declared position references only an axis without a home switch.
+    let declared: Vec<usize> = enabled
+        .iter()
+        .copied()
+        .filter(|&a| a < 3 && c.switchless(a))
+        .collect();
+    let mut zero = column![bold("Machine zero", 13)].spacing(10);
+    if !declared.is_empty() {
+        let mut here = row![act(
+            "Set machine zero here",
+            idle(Action::MachineZero(None)),
+            false
+        )]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .push(muted("or one axis"));
+        for &a in &declared {
+            here = here.push(act(AXES[a], idle(Action::MachineZero(Some(a))), false));
+        }
+        zero = zero.push(here).push(act(
+            "Keep the last position",
+            idle(Action::KeepPosition),
+            false,
+        ));
     }
-    let mut zero_actions = row![act(
-        "Keep the last position",
-        idle(Action::KeepPosition),
-        false
-    )]
-    .spacing(6);
     if c.home_switches() {
-        zero_actions = zero_actions.push(act("Home", idle(Action::Home), false));
+        zero = zero.push(act("Home", idle(Action::Home), false));
     }
     let model = crate::machine_view::MachineView {
         pos: [
@@ -2745,10 +2762,12 @@ fn control(app: &App) -> Element<'_, Message> {
         "Position",
         column![
             table,
-            bold("Machine zero", 13),
             zero,
-            zero_actions,
-            note(MACHINE_ZERO_NOTE)
+            note(if declared.is_empty() {
+                HOME_NOTE
+            } else {
+                MACHINE_ZERO_NOTE
+            })
         ],
     );
     let model = container(canvas(model).width(Fill).height(400))
@@ -2993,7 +3012,210 @@ fn control(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .into()
 }
-const MACHINE_ZERO_NOTE: &str = "Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
+/// The green Cycle Start button, greyed out without a message.
+fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
+    let on = msg.is_some();
+    let b = button(bold("Cycle Start", 14).color(Color::WHITE))
+        .on_press_maybe(msg.clone())
+        .padding([8, 18])
+        .style(move |_, status| button::Style {
+            background: Some(
+                if !on {
+                    Color::from_rgb8(166, 186, 176)
+                } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    Color::from_rgb8(28, 108, 74)
+                } else {
+                    Color::from_rgb8(39, 130, 93)
+                }
+                .into(),
+            ),
+            text_color: Color::WHITE,
+            border: Border {
+                radius: 4.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    match msg {
+        Some(m) => HelpButton::new(b, &m, "Cycle Start").into(),
+        None => b.into(),
+    }
+}
+
+/// The Run panel: a setup of this machine run tool run by tool run, with
+/// Cycle Start, Hold, Resume and Stop, its progress, and the manual tool
+/// change between tool runs.
+fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+    use crate::run::Action as R;
+    use uc100::controller::State;
+    let s = &c.snapshot;
+    let running = c.run.as_ref().is_some_and(|r| r.running.is_some());
+    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
+    let mut body = column![].spacing(10);
+    let setups: Vec<(usize, &Setup)> = app
+        .doc
+        .setups
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.machine.id == c.machine_id)
+        .collect();
+    if setups.is_empty() {
+        body = body.push(muted("No setup uses this machine. On the Work page, choose it as a setup's machine (Assign to setup) to run that setup here."));
+    } else {
+        let mut pick = row![muted("Setup")].spacing(6).align_y(Alignment::Center);
+        for (si, x) in setups {
+            let picked = c.run.as_ref().is_some_and(|r| r.setup == si);
+            pick = pick.push(act(
+                format!("{}. {}", si + 1, x.name()),
+                msg(!running, R::Setup(si)),
+                picked,
+            ));
+        }
+        body = body.push(pick);
+    }
+    let Some(run) = &c.run else {
+        return machine_panel(
+            "Run",
+            body.push(muted("Pick a setup: AXIS CAM checks it as export would and runs it here, one tool run at a time.")),
+        );
+    };
+    let programs = match run.programs.as_deref() {
+        None => {
+            return machine_panel(
+                "Run",
+                body.push(muted("Checking the setup: simulating the job up to it…")),
+            );
+        }
+        Some(Err(problems)) => {
+            return machine_panel(
+                "Run",
+                body.push(caution("This setup cannot run", problems.clone()))
+                    .push(act("Check again", msg(true, R::Check), false)),
+            );
+        }
+        Some(Ok(programs)) => programs,
+    };
+    let count = programs.len();
+    for (i, p) in programs.iter().enumerate() {
+        let mark = if run.running.as_ref().is_some_and(|r| r.index == i) {
+            "running"
+        } else if run.done[i] {
+            "done"
+        } else if i == run.next {
+            "next"
+        } else {
+            ""
+        };
+        let ops: Vec<&str> = p.ops.iter().map(|o| o.name.as_str()).collect();
+        body = body.push(
+            row![
+                text(mark).size(12).width(52),
+                act(
+                    format!(
+                        "Tool run {} of {count}: T{} {}",
+                        i + 1,
+                        p.ops[0].tool,
+                        p.ops[0].tool_name
+                    ),
+                    msg(!running, R::Next(i)),
+                    i == run.next,
+                ),
+                muted(ops.join(" → ")),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    if run.stale {
+        body = body
+            .push(caution(
+                "The project changed since this setup was checked",
+                vec!["Check it again before the next tool run.".into()],
+            ))
+            .push(act("Check again", msg(!running, R::Check), false));
+    }
+    if let Some(p) = run.tool_change() {
+        let o = &p.ops[0];
+        body = body.push(note(format!(
+            "Tool change for tool run {}: T{} {} (stickout {:.1} mm). The last tool run ended with the spindle and coolant off at the clearance plane. 1. If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and press Record reference. 2. Jog up and change to T{}. 3. Touch the new tool on the same surface and press Set Z from reference, or Zero Z on the stock top if no tool run has cut it. 4. Jog clear and press Cycle Start. X/Y zero stays as it is.",
+            run.next + 1,
+            o.tool,
+            o.tool_name,
+            o.stickout,
+            o.tool
+        )));
+    }
+    if count > 1 {
+        let manual = c.manual() && !running;
+        body = body.push(
+            row![
+                muted(match run.reference {
+                    Some(z) => format!("Reference surface: Z {z:.3} (G{})", 54 + s.active_wcs),
+                    None => "Reference surface: not recorded".into(),
+                }),
+                act("Record reference", msg(manual, R::RecordReference), false),
+                act(
+                    "Set Z from reference",
+                    msg(manual && run.reference.is_some(), R::ZFromReference),
+                    false
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    let problems = run.problems(c, &app.doc);
+    let state = s.state.as_ref();
+    body = body.push(
+        row![
+            cycle_start(problems.is_empty().then_some(Message::Run(R::CycleStart))),
+            act("Hold", msg(state == Some(&State::Run), R::Hold), false),
+            act(
+                "Resume",
+                msg(
+                    matches!(state, Some(State::Hold | State::Paused(_))),
+                    R::Resume
+                ),
+                false
+            ),
+            act("Stop", msg(crate::run::busy(state), R::Stop), false),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    );
+    if let Some((p, op, block)) = run.progress(s.current_line) {
+        let i = run.running.as_ref().map_or(0, |r| r.index);
+        body = body
+            .push(
+                text(format!(
+                    "Tool run {} of {count} · operation {} of {}: {} · block {} of {}",
+                    i + 1,
+                    op + 1,
+                    p.ops.len(),
+                    p.ops[op].name,
+                    block + 1,
+                    p.blocks.len()
+                ))
+                .size(13),
+            )
+            .push(widget::progress_bar(
+                0.0..=p.blocks.len() as f32,
+                block as f32 + 1.,
+            ));
+    } else if !problems.is_empty() && !crate::run::busy(state) {
+        body = body.push(caution("Before Cycle Start", problems));
+    }
+    if let Some((ok, message)) = &run.outcome {
+        body = body.push(text(message.clone()).size(12).color(if *ok {
+            Color::from_rgb8(39, 130, 93)
+        } else {
+            Color::from_rgb8(166, 101, 32)
+        }));
+    }
+    machine_panel(&format!("Run · {}", run.name), body)
+}
+const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
+const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
 fn tools(app: &App) -> Element<'_, Message> {
     if app.doc.tools.is_empty() && app.tool_draft.name().is_empty() {
         return container(

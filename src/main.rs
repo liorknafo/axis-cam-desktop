@@ -23,6 +23,7 @@ mod post;
 mod post_check;
 mod proposal;
 mod rest;
+mod run;
 mod session;
 mod settings;
 mod simulation;
@@ -147,6 +148,10 @@ pub enum Message {
     JogKeyChecked(usize, bool, bool),
     /// A jog key went up.
     JogKeyUp,
+    /// An action of the Run panel on the Control page.
+    Run(run::Action),
+    /// A setup's tool runs, checked for a UC100 run (the check's epoch).
+    RunChecked(u64, std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>),
     EditTool(String),
     NewTool,
     SaveTool,
@@ -527,6 +532,8 @@ pub struct App {
     pub control_machine: Option<String>,
     /// The jog key down on the Control page (axis, negative).
     pub jog_key: Option<(usize, bool)>,
+    /// Counts the checks of setups to run, so a late answer is ignored.
+    run_epoch: u64,
     pub project_path: Option<PathBuf>,
     pub project_dirty: bool,
     pub planner: Planner,
@@ -715,6 +722,7 @@ impl App {
             control: None,
             control_machine: None,
             jog_key: None,
+            run_epoch: 0,
             smoke_pending: false,
             machine_draft: doc
                 .machines
@@ -1045,6 +1053,10 @@ impl App {
             _ => {}
         }
         self.drop_plan();
+        // A setup being run was checked as it was.
+        if let Some(run) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            run.stale = true;
+        }
         self.dirty = true;
         self.project_dirty = true;
         self.last_edit = Instant::now();
@@ -1315,6 +1327,30 @@ impl App {
                 seconds,
                 result,
             },
+        )
+    }
+    /// Checks the setup being run, in the background: simulates the job up to
+    /// it and checks its tool runs as export would.
+    fn check_run(&mut self) -> Task<Message> {
+        let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) else {
+            return Task::none();
+        };
+        let (si, epoch) = (r.setup, r.epoch);
+        let doc = self.doc.clone();
+        let mesh = self.part_mesh().cloned();
+        let check = move || match mesh {
+            Some(mesh) => run::programs(&doc, &mesh, si),
+            None => Err(vec![
+                "Load the imported part before running a setup.".into(),
+            ]),
+        };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(check)
+                    .await
+                    .unwrap_or_else(|e| Err(vec![format!("The check failed: {e}")]))
+            },
+            move |programs| Message::RunChecked(epoch, std::sync::Arc::new(programs)),
         )
     }
     fn invalidate_post(&mut self) {
@@ -2390,6 +2426,38 @@ impl App {
                 if self.jog_key.take().is_some() {
                     if let Some(c) = &mut self.control {
                         c.act(control::Action::JogRelease);
+                    }
+                }
+            }
+            Message::Run(run::Action::Setup(si)) => {
+                let Some(c) = &mut self.control else {
+                    return Task::none();
+                };
+                if si >= self.doc.setups.len()
+                    || c.run.as_ref().is_some_and(|r| r.running.is_some())
+                {
+                    return Task::none();
+                }
+                self.run_epoch += 1;
+                c.run = Some(run::Run::new(&self.doc, si, self.run_epoch));
+                return self.check_run();
+            }
+            Message::Run(run::Action::Check) => {
+                self.run_epoch += 1;
+                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+                    (r.epoch, r.programs, r.stale) = (self.run_epoch, None, false);
+                }
+                return self.check_run();
+            }
+            Message::Run(action) => {
+                if let Some(c) = &mut self.control {
+                    c.run_act(action, &self.doc);
+                }
+            }
+            Message::RunChecked(epoch, programs) => {
+                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+                    if r.epoch == epoch {
+                        r.checked_as(programs);
                     }
                 }
             }

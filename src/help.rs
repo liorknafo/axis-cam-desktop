@@ -441,6 +441,7 @@ pub fn command(m: &Message, label: String) -> Help {
         }
         LoadModels => "Ask OpenAI again which models your ChatGPT plan can use in this app.",
         Machine(a) => machine_help(a),
+        Run(a) => run_help(a),
         PlanNoticeDismissed => "Close this notice. It is shown once.",
         OpenUrl(_) => {
             "Open your ChatGPT usage settings in the browser, where you can see and manage how much of your plan this app uses."
@@ -493,6 +494,32 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         }
         MdiText(_) => "One line of G-code, for example G0 X10 Y10.",
         MdiSend => "Run the line now. Works when Idle, or while a program is paused.",
+    }
+}
+
+/// What a Run panel button does.
+fn run_help(a: &crate::run::Action) -> &'static str {
+    use crate::run::Action::*;
+    match a {
+        Setup(_) => {
+            "Run this setup on the machine: AXIS CAM simulates the job up to it and checks its tool runs as export would, then starts from its first tool run."
+        }
+        Check => {
+            "Check the setup again after a change to the project, keeping which tool runs are done."
+        }
+        Next(_) => "Make this tool run the next one Cycle Start runs.",
+        CycleStart => {
+            "Run the next tool run: its moves at the current work zero, checked against the soft limits first. The tool first rises or drops to the clearance plane where it stands, so leave it where a straight vertical move is safe."
+        }
+        Hold => "Feed hold: slow to a stop and wait. Resume continues.",
+        Resume => "Continue after a feed hold or a pause.",
+        Stop => "Slow to a stop, then end the tool run with the spindle and coolant off.",
+        RecordReference => {
+            "With the tool that is zeroed touching a surface that stays put (a vise jaw, the table, a block), keep that surface's work Z for the next tool's touch-off."
+        }
+        ZFromReference => {
+            "With the new tool touching the recorded reference surface, set work Z here to the reference's Z. X and Y zero stay as they are."
+        }
     }
 }
 

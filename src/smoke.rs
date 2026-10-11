@@ -1493,12 +1493,344 @@ mist = { pin = 9 }
         assert!(!state.join(format!("{id}.toml")).exists());
     }
 
+    /// Like the JY5800 (X 0…390, Y 0…280, no switches, a PWM spindle without
+    /// direction) but fast, with Z −80…0 for the fixture's drill, flood and
+    /// no mist.
+    const FAST: &str = r#"
+[controller]
+step_rate = "100kHz"
+[motion]
+junction_deviation = 0.02
+arc_tolerance = 0.002
+buffer_ms = 400
+default_feed = 500
+[axes.x]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 390.0
+[axes.y]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 280.0
+[axes.z]
+steps_per_unit = 20.0
+max_velocity = 30000.0
+acceleration = 20000.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -80.0
+soft_max = 0.0
+[outputs]
+spindle_pwm = { pin = 16 }
+flood = { pin = 8 }
+"#;
+
+    /// The fixture block's top setup on a simulated FAST machine whose AXIS
+    /// CAM travel matches the profile: Facing (T1) then Drilling (T3), two
+    /// tool runs.
+    fn run_app(dir: &std::path::Path) -> App {
+        let mut a = profile_app(dir, FAST);
+        let mut m = a.doc.machines.pop().unwrap();
+        for (k, v) in [
+            ("x", "390"),
+            ("y", "280"),
+            ("z", "80"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let setup = &mut doc.setups[0];
+        setup.operations = vec![setup.operations[0].clone(), setup.operations[3].clone()];
+        for op in &mut setup.operations {
+            op.p.insert("feed".into(), "30000".into());
+        }
+        // A few seconds each: wide facing passes, holes without pecks.
+        setup.operations[0].p.insert("stepover".into(), "90".into());
+        setup.operations[0].p.insert("stepdown".into(), "5".into());
+        setup.operations[1]
+            .p
+            .insert("cycle".into(), "Drilling".into());
+        setup.operations[1].p.insert("coolant".into(), "Off".into());
+        setup.machine = m.clone();
+        doc.machines = vec![m];
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Control;
+        a
+    }
+
+    /// Idle with machine zero set where the machine starts and the work
+    /// zero (the stock top centre) at machine X195 Y140 Z-20.
+    fn zeroed(a: &mut App) {
+        idle(a);
+        zero(a);
+    }
+
+    /// Machine zero where the machine is, work zero at machine X195 Y140 Z-20.
+    fn zero(a: &mut App) {
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        tick_until(a, 3.0, "machine zero", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        mdi(a, "G0 X195 Y140 Z-20");
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(None)));
+        tick_until(a, 2.0, "work zero", |s| {
+            s.work_pos[..3].iter().all(|v| v.abs() < 1e-6)
+        });
+    }
+
+    /// Picks setup `si` to run and checks it here: tests do not run tasks.
+    fn check_run(a: &mut App, si: usize) {
+        let _ = a.update(Message::Run(crate::run::Action::Setup(si)));
+        let epoch = run_of(a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), si);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+    }
+
+    fn run_of(a: &App) -> &crate::run::Run {
+        conn(a).run.as_ref().expect("a setup to run")
+    }
+
+    fn problems(a: &App) -> Vec<String> {
+        run_of(a).problems(conn(a), &a.doc)
+    }
+
+    /// Ticks until the run satisfies `ok`; fails after `secs`.
+    fn run_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&crate::run::Run) -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        loop {
+            let _ = a.update(Message::Tick);
+            let _ = a.view();
+            if ok(run_of(a)) {
+                return;
+            }
+            let s = &conn(a).snapshot;
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for {what}: {:?} line {:?} at {:?} feed {} {:?} {:?}",
+                s.state,
+                s.current_line,
+                s.machine_pos,
+                s.feed_rate,
+                run_of(a).outcome,
+                s.log.iter().rev().take(5).collect::<Vec<_>>()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_setup_runs_tool_run_by_tool_run_with_a_manual_tool_change() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.view();
+        check_run(&mut a, 0);
+        let _ = a.view();
+        let programs = run_of(&a).checked().unwrap_or_else(|| {
+            panic!(
+                "{:?}",
+                run_of(&a).programs.as_deref().map(|p| p.as_ref().err())
+            )
+        });
+        assert_eq!(programs.len(), 2);
+        assert_eq!((programs[0].ops[0].tool, programs[1].ops[0].tool), (1, 3));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Tool run 1: progress names the operation and block being cut.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.view();
+        let (p, op, block) = run_of(&a).progress(conn(&a).snapshot.current_line).unwrap();
+        assert!(op == 0 && block < p.blocks.len());
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
+        assert_eq!(run_of(&a).next, 1);
+        // It ended at the clearance plane with the spindle and coolant off.
+        let s = conn(&a).snapshot.clone();
+        assert_eq!(
+            (s.spindle, s.flood),
+            (Some(uc100::gcode::Spindle::Off), false)
+        );
+        let p = &run_of(&a).checked().unwrap()[0];
+        let plane = crate::post::clearance_plane(&p.blocks) - p.datum[2];
+        assert!(
+            (s.work_pos[2] - plane as f64).abs() < 1e-3,
+            "{}",
+            s.work_pos[2]
+        );
+        // The drill is another tool: Cycle Start waits for its Z touch-off.
+        assert!(run_of(&a).tool_change().is_some());
+        let _ = a.view();
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("touch off its Z first")),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // The old tool on the reference surface (here, where it stands), then
+        // the new one 2 mm lower on the same surface: it is 2 mm longer.
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        assert!((reference - s.work_pos[2]).abs() < 1e-9);
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        tick_until(&mut a, 2.0, "the touch-off", |s| {
+            (s.work_offset[2] - (-22.)).abs() < 1e-6
+        });
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // X/Y zero must stay: moving it holds Cycle Start back.
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(0))));
+        tick_until(&mut a, 2.0, "X zero moved", |s| s.work_pos[0].abs() < 1e-6);
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("X/Y work zero changed"))
+        );
+        mdi(&mut a, "G10 L2 P1 X195");
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 2", |r| r.done[1]);
+        let s = &conn(&a).snapshot;
+        assert!(run_of(&a).outcome.as_ref().unwrap().0, "{:?}", s.log);
+        // Lowered with the new Z offset: it ends at the plane in work Z.
+        let p = &run_of(&a).checked().unwrap()[1];
+        let plane = crate::post::clearance_plane(&p.blocks) - p.datum[2];
+        assert!(
+            (s.work_pos[2] - plane as f64).abs() < 1e-3,
+            "{}",
+            s.work_pos[2]
+        );
+        assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
+    }
+
+    #[test]
+    fn cycle_start_waits_for_what_the_run_panel_lists() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        check_run(&mut a, 0);
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        // Machine zero is not set yet.
+        assert!(
+            has(&a, "no machine position (every E-stop clears it)"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::Next(9)));
+        assert_eq!(run_of(&a).next, 0);
+        zero(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // The work zero puts the clearance plane above the top of Z.
+        mdi(&mut a, "G53 G0 Z-5");
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
+        tick_until(&mut a, 2.0, "work Z", |s| s.work_pos[2].abs() < 1e-6);
+        assert!(has(&a, "outside the soft limits"), "{:?}", problems(&a));
+        mdi(&mut a, "G53 G0 Z-20");
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
+        tick_until(&mut a, 2.0, "work Z", |s| s.work_pos[2].abs() < 1e-6);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Another work system is active.
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        assert!(has(&a, "active work system is G55"), "{:?}", problems(&a));
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        // The AXIS CAM machine's travel disagrees with the profile, the
+        // spindle runs CCW without a direction output, and mist is missing:
+        // edits, so the setup is checked again.
+        let setup = &mut a.doc.setups[0];
+        setup.machine.p.insert("y".into(), "300".into());
+        setup.operations[0]
+            .p
+            .insert("spindle_rotation".into(), "Counterclockwise (CCW)".into());
+        setup.operations[1]
+            .p
+            .insert("coolant".into(), "Mist".into());
+        let _ = a.update(Message::Title("Edited".into()));
+        assert!(has(&a, "project changed"), "{:?}", problems(&a));
+        let _ = a.view();
+        let epoch = run_of(&a).epoch;
+        let _ = a.update(Message::Run(R::Check));
+        assert_ne!(run_of(&a).epoch, epoch);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        for text in [
+            "Y travel in AXIS CAM is 300.000 mm",
+            "no spindle direction output",
+        ] {
+            assert!(has(&a, text), "{text}: {:?}", problems(&a));
+        }
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(has(&a, "no mist output"), "{:?}", problems(&a));
+        // An E-stop clears the machine position: Cycle Start waits for it.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);
+        let _ = a.view();
+        assert!(has(&a, "Set machine zero again"), "{:?}", problems(&a));
+    }
+
+    #[test]
+    fn a_tool_run_holds_resumes_and_stops() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 2.0, "Hold", |s| s.state == Some(State::Hold));
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::Resume));
+        tick_until(&mut a, 2.0, "Run", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("stopped by the operator"),
+            "{message}"
+        );
+        assert_eq!((run_of(&a).next, run_of(&a).done[0]), (0, false));
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        // An E-stop ends the tool run and says why.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 2.0, "the E-stop", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok && message.contains("E-stop pressed"), "{message}");
+        let _ = a.view();
+    }
+
     #[test]
     fn the_test_profiles_are_valid() {
         let dir = tempfile::tempdir().unwrap();
-        for text in [LIMITED, SWITCHED] {
+        for text in [LIMITED, SWITCHED, FAST] {
             let a = profile_app(dir.path(), text);
-            assert!(crate::control::profile(&a.doc.machines[0]).is_ok());
+            let checked = crate::control::profile(&a.doc.machines[0]);
+            assert!(checked.is_ok(), "{checked:?}");
         }
     }
 
@@ -1967,8 +2299,14 @@ mist = { pin = 9 }
             a.page = Page::Control;
             idle(&mut a);
             let _ = a.view();
-            let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
-            tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            // An axis with a home switch is referenced by homing only.
+            let zero = if profile == SWITCHED {
+                crate::control::Action::Home
+            } else {
+                crate::control::Action::MachineZero(None)
+            };
+            let _ = a.update(Message::Machine(zero));
+            tick_until(&mut a, 10.0, "X, Y and Z set", |s| {
                 s.referenced[..3].iter().all(|r| *r)
             });
             let _ = a.update(Message::Machine(crate::control::Action::Rpm("abc".into())));

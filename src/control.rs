@@ -107,6 +107,8 @@ pub struct Connection {
     pub feed_override: f32,
     pub rpm: String,
     pub mdi: String,
+    /// The setup being run, tool run by tool run.
+    pub run: Option<crate::run::Run>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -137,6 +139,7 @@ impl Connection {
             feed_override: 100.,
             rpm: String::new(),
             mdi: String::new(),
+            run: None,
         })
     }
 
@@ -146,6 +149,9 @@ impl Connection {
 
     pub fn refresh(&mut self) {
         self.snapshot = self.controller.snapshot();
+        if let Some(run) = &mut self.run {
+            run.refresh(self.snapshot.program_outcome.as_ref());
+        }
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
@@ -181,12 +187,15 @@ impl Connection {
             Action::Home if self.idle() && self.home_switches() => self.send(Command::Home(vec![])),
             Action::MachineZero(axis) if self.idle() => {
                 let axes = axis.map_or(0..3, |a| a..a + 1);
-                let zero: Vec<_> = axes.filter(|&a| self.axis(a)).map(|a| (a, 0.)).collect();
+                let zero: Vec<_> = axes
+                    .filter(|&a| self.axis(a) && self.switchless(a))
+                    .map(|a| (a, 0.))
+                    .collect();
                 self.declare.extend(zero);
             }
             Action::KeepPosition if self.idle() => {
                 let here: Vec<_> = (0..6)
-                    .filter(|&a| self.axis(a))
+                    .filter(|&a| self.axis(a) && self.switchless(a))
                     .map(|a| (a, self.snapshot.machine_pos[a]))
                     .collect();
                 self.declare.extend(here);
@@ -222,6 +231,9 @@ impl Connection {
             Action::JogStep(step) => self.jog_step = step,
             Action::JogSpeed(percent) => self.jog_speed = percent.clamp(1., 100.),
             Action::WorkZero(axis) if self.manual() => {
+                if let (Some(run), None | Some(2)) = (&mut self.run, axis) {
+                    run.touched = true;
+                }
                 let axes = axis.map_or(0..6, |a| a..a + 1);
                 for a in axes.filter(|&a| self.axis(a)) {
                     self.send(Command::SetWork { axis: a, value: 0. });
@@ -269,10 +281,49 @@ impl Connection {
         }
     }
 
+    /// Does what the Run panel asks, if the machine can; otherwise nothing.
+    /// Picking and checking a setup is the app's: it needs the part.
+    pub fn run_act(&mut self, action: crate::run::Action, doc: &crate::model::Document) {
+        use crate::run::Action as R;
+        let Some(mut run) = self.run.take() else {
+            return;
+        };
+        let state = self.snapshot.state.clone();
+        match action {
+            R::Next(i) if run.running.is_none() && i < run.done.len() => run.next = i,
+            R::CycleStart => {
+                if let Some(job) = run.cycle_start(self, doc) {
+                    self.send(job);
+                }
+            }
+            R::Hold if state == Some(State::Run) => self.send(Command::FeedHold),
+            R::Resume if matches!(state, Some(State::Hold | State::Paused(_))) => {
+                self.send(Command::Resume)
+            }
+            R::Stop if crate::run::busy(state.as_ref()) => self.send(Command::Stop),
+            R::RecordReference if self.manual() => run.reference = Some(self.snapshot.work_pos[2]),
+            R::ZFromReference if self.manual() => {
+                if let Some(z) = run.reference {
+                    self.send(Command::SetWork { axis: 2, value: z });
+                    run.touched = true;
+                }
+            }
+            _ => {}
+        }
+        self.run = Some(run);
+    }
+
     /// An axis of the profile. The driver panics on an index of 6 or more,
     /// so nothing else is ever sent.
     pub fn axis(&self, a: usize) -> bool {
         a < 6 && self.config.axis_enabled(a)
+    }
+
+    /// An axis without a home switch: declaring its machine position
+    /// references it. The driver references an axis with a switch only by
+    /// homing, and a declaration takes that away.
+    pub fn switchless(&self, a: usize) -> bool {
+        self.config.axes.get(a).is_some_and(|x| x.home.is_none())
     }
 
     /// The continuous jog held down (axis, negative).
