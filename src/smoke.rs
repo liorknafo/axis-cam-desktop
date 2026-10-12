@@ -1810,9 +1810,9 @@ flood = { pin = 8 }
         }
     }
 
-    /// Ticks until the probe has ended; how it ended.
+    /// Ticks until the probe or probing routine has ended; how it ended.
     fn probed(a: &mut App) -> (bool, String) {
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let _ = a.update(Message::Tick);
             let _ = a.view();
@@ -1991,6 +1991,185 @@ flood = { pin = 8 }
         });
         assert!(run_of(&a).touched);
         let _ = a.view();
+    }
+
+    /// The fixture's top setup (Stock top center, or `origin`) checked on a
+    /// zeroed FAST machine with a probe input and a 4 mm probe tip probed at
+    /// 1000 mm/min. The simulator's block takes the stock's X/Y size round
+    /// X195 Y140, its top at machine Z -40.
+    fn edges_app(dir: &std::path::Path, origin: Option<&str>) -> App {
+        let mut a = run_app_on(dir, &probe_profile());
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert("probe_tip".into(), "4".into());
+        m.p.insert("probe_feed".into(), "1000".into());
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+        if let Some(o) = origin {
+            a.doc.setups[0].p.insert("origin".into(), o.into());
+        }
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        a
+    }
+
+    fn edges_blocked(a: &App) -> String {
+        conn(a).edges_blocked().unwrap_or_default()
+    }
+
+    /// Asserts the work offset X, Y and Z within 0.15 mm: the simulator's
+    /// probe trips at the first status inside the block, up to 4 ms late.
+    fn work_offset(a: &App, expected: [f64; 3]) {
+        let s = &conn(a).snapshot;
+        assert!(
+            (0..3).all(|k| (s.work_offset[k] - expected[k]).abs() < 0.15),
+            "{:?}, expected {expected:?}",
+            s.work_offset
+        );
+    }
+
+    #[test]
+    fn probe_centre_sets_the_work_zero_on_the_middle_of_the_block() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), None);
+        let (lo, hi) = conn(&a).block.unwrap();
+        let stock = run_of(&a).checked().unwrap()[0].stock.dimensions();
+        assert!(
+            (hi[0] - lo[0] - stock[0] as f64).abs() < 1e-3,
+            "{lo:?} {hi:?}"
+        );
+        assert!(
+            (hi[1] - lo[1] - stock[1] as f64).abs() < 1e-3,
+            "{lo:?} {hi:?}"
+        );
+        assert_eq!(
+            ((lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2., hi[2]),
+            (195., 140., -40.)
+        );
+        // 3 mm right of the middle and 2 mm in front of it, 10 mm above the
+        // top: inside the top's spot.
+        mdi(&mut a, "G53 G0 X198 Y138 Z-30");
+        assert_eq!(edges_blocked(&a), "");
+        let _ = a.view();
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        assert!(a.locked() && conn(&a).edging());
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        assert!(
+            message.contains("on the centre of the stock top")
+                && message.contains("from 5 touches"),
+            "{message}"
+        );
+        // Backed off the +Y side and up 10 mm above the top.
+        tick_until(&mut a, 5.0, "backing off", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[2] - -30.).abs() < 0.2
+        });
+        work_offset(&a, [195., 140., -40.]);
+        assert!(conn(&a).snapshot.machine_pos[1] > hi[1]);
+        assert!(!a.locked() && run_of(&a).touched);
+        let _ = a.view();
+    }
+
+    #[test]
+    fn probe_corner_sets_the_work_zero_on_the_front_left_corner() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        // The simulator's probe is a point: allowing for a 4 mm tip puts the
+        // sides it finds, and so the corner, 2 mm inside the block's.
+        let (lo, _) = conn(&a).block.unwrap();
+        let corner = [lo[0] + 2., lo[1] + 2., -40.];
+        // 2 mm in from both edges: on the top's spot (1 to 11 mm), short of
+        // the -X side's (5% to 15% of the stock's depth): -X is touched
+        // there again once -Y has fixed Y.
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-30", corner[0] + 2., corner[1] + 2.),
+        );
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        assert!(
+            message.contains("on the front-left corner") && message.contains("from 4 touches"),
+            "{message}"
+        );
+        tick_until(&mut a, 5.0, "work zero", |s| s.work_offset[2] < -39.);
+        work_offset(&a, corner);
+    }
+
+    #[test]
+    fn probing_the_edges_needs_a_stock_zero_a_tip_and_its_work_system() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &probe_profile());
+        zeroed(&mut a);
+        let why = edges_blocked(&a);
+        assert!(why.contains("picked in the Run panel"), "{why}");
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Model origin".into());
+        check_run(&mut a, 0);
+        let why = edges_blocked(&a);
+        assert!(
+            why.contains("Model origin") && why.contains("touch it off by hand"),
+            "{why}"
+        );
+        let _ = a.view();
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top center".into());
+        check_run(&mut a, 0);
+        let why = edges_blocked(&a);
+        assert!(why.contains("Probe tip diameter is not set"), "{why}");
+        // A tip saved while connected; saving changes the project.
+        a.machine_draft = a.doc.machines[0].clone();
+        a.machine_draft.p.insert("probe_tip".into(), "4".into());
+        a.machine_draft.p.insert("probe_feed".into(), "1000".into());
+        let _ = a.update(Message::SaveMachine);
+        let why = edges_blocked(&a);
+        assert!(why.contains("check it again"), "{why}");
+        check_run(&mut a, 0);
+        assert_eq!(edges_blocked(&a), "");
+        mdi(&mut a, "G55");
+        let why = edges_blocked(&a);
+        assert!(
+            why.contains("This setup uses G54, but the active work system is G55"),
+            "{why}"
+        );
+        mdi(&mut a, "G54");
+        // Started beside the block: the top is missed.
+        mdi(&mut a, "G53 G0 X20 Y20 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.contains("No contact down to machine Z -50.000"),
+            "{message}"
+        );
+        // 20 mm right of the middle: going down beside the -X side lands on
+        // the block.
+        mdi(&mut a, "G53 G0 X215 Y140 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.contains("touched something going down beside the -X side"),
+            "{message}"
+        );
+        // E-stop stops it.
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        mdi(&mut a, "G53 G0 X195 Y140 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        tick_until(&mut a, 5.0, "a side", |s| {
+            s.machine_pos[0] < 150. && s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::MachineEStop);
+        let (ok, message) = probed(&mut a);
+        assert!(!ok && message.contains("E-stop"), "{message}");
+        assert!(!a.locked());
+        // Nothing was set.
+        work_offset(&a, [195., 140., -20.]);
     }
 
     #[test]

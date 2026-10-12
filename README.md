@@ -306,9 +306,12 @@ elsewhere (LIO-111) and edit the profile as raw TOML.
 simulated UC100: no hardware is opened and nothing moves. It keeps its own
 saved offsets and position, separate from the real machine's. When the
 profile has soft limits on X, Y and Z, the simulator puts a block in the
-middle of the table for trying the probe: up to 100 × 100 mm, its top halfway
-down Z (the Work zero panel gives its place). The probe input reads active
-while the tool tip is inside it; it needs a probe input in the profile.
+middle of the table for trying the probe, its top halfway down Z: up to
+100 × 100 mm, then the X/Y size of the stock of the setup picked in the Run
+panel once it is checked (the Work zero panel gives its place). The probe
+input reads active while the tool tip is inside it; it needs a probe input in
+the profile. The simulated probe is a point, so with a tip diameter set, Probe
+corner finds the corner a tip radius inside the block's.
 
 Once the machine is Idle, the Control page has everything needed before a job:
 
@@ -342,6 +345,29 @@ Once the machine is Idle, the Control page has everything needed before a job:
   why. Probe Z is offered while Idle with Z referenced, a probe input in the
   profile and that input not already active; otherwise the panel says what
   is missing. E-stop stops a probe.
+- **Probe corner and Probe centre.** The X, Y and Z work zero of the setup
+  picked in the Run panel, from its stock: **Probe corner** for **Stock top
+  front-left**, **Probe centre** for **Stock top center**. **Model origin**
+  cannot be found on the stock: touch it off by hand. With a touch probe in
+  the spindle (or a tool, with the probe clipped onto conductive stock), set
+  the **probe tip diameter** in the Machine library, select the setup's work
+  system, jog the probe above the stock top over where Z0 is touched off and
+  press the button. It touches the top, then the −X and −Y sides (corner) or
+  all four (centre), at the spots the program header names: 1 mm to 10 mm
+  below the top (a quarter of the stock's height when that is less), 5–15 %
+  of each side's length from the corner or near each side's middle. Each
+  side's touch is corrected by the tip's radius. A face first touched off its
+  spot, because only the other touches tell where that is (the −X side when
+  the probe starts close to the corner, or the top when it starts off the
+  top's spot), is touched once more on it. The probe travels 10 mm above the
+  top (a quarter of the stock's shorter top side when that is less), goes
+  down that far outside where it expects each side, from the stock's size,
+  and probes up to that far past it: start within that distance of the spot.
+  Then it sets the work zero and backs off; Probe centre also gives the
+  stock's measured size. Anything touched on the way down, a miss, Stop or
+  E-stop ends it with nothing set. Every move in toward the stock is a probe
+  move at the probe feed. It needs X, Y and Z referenced, and the setup
+  checked since the last edit.
 - **Spindle and coolant.** CW at an RPM, Stop; CCW only when the profile has a
   direction output; Flood and Mist only for the outputs the profile has.
 - **Overrides.** Feed override 10–200 %; **Override limit switches** when the
@@ -390,7 +416,8 @@ with no G-code file in between.
    holder, jaws and clamps), then lists its **tool runs**: one per run of the
    same tool, as with touch-off G-code programs.
 2. Set machine zero, then the work zero (the setup's work offset must be the
-   active one). **Cycle Start** stays grey, with the reasons listed, until the
+   active one): by hand, with **Probe Z** on a plate, or with **Probe corner**
+   or **Probe centre** for a stock-based work zero. **Cycle Start** stays grey, with the reasons listed, until the
    tool run can start: the machine Idle, the AXIS CAM machine's X/Y/Z travel
    equal to the profile's soft limits, X, Y and Z with a machine position,
    the tool run inside the soft limits at this work zero, a spindle speed,

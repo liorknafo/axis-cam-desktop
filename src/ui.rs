@@ -2446,9 +2446,10 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(field(p, "post_dwell", "Spindle start dwell · s", t))
                     .push(choice_value(p, post_setting(p, "post_air"), "post_air", "Air blast output", &POST_AIR, t))
                     .push(warnings(post_setting_issues(p)))
-                    .push(bold("Touch plate", 15))
+                    .push(bold("Probing", 15))
                     .push(row![
-                        field(p, "probe_plate", "Plate thickness · mm", t),
+                        field(p, "probe_plate", "Touch plate thickness · mm", t),
+                        field(p, "probe_tip", "Probe tip diameter · mm", t),
                         field(p, "probe_feed", "Probe feed · mm/min", t),
                     ].spacing(8))
                     .push(row![
@@ -2939,13 +2940,13 @@ fn control(app: &App) -> Element<'_, Message> {
             act(
                 "Probe Z",
                 blocked.is_none().then_some(Message::Machine(Action::ProbeZ)),
-                c.probing()
+                c.probing() && !c.edging()
             ),
             muted(match (&blocked, &c.probe) {
                 (Some(why), _) if !c.probing() => why.clone(),
                 (_, Ok(p)) => format!(
                     "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, then the tool lifts {} mm.",
-                    p.feed, p.distance, p.plate, p.retract
+                    p.feed, p.distance, p.plate.unwrap_or_default(), p.retract
                 ),
                 _ => String::new(),
             })
@@ -2953,12 +2954,38 @@ fn control(app: &App) -> Element<'_, Message> {
         .spacing(8)
         .align_y(Alignment::Center)
     ];
+    probe = probe.push(match c.edges_setup() {
+        Err(why) => Element::from(muted(why)),
+        Ok((center, p)) => {
+            let blocked = c.edges_blocked();
+            let name = if center { "Probe centre" } else { "Probe corner" };
+            row![
+                act(
+                    name,
+                    blocked.is_none().then_some(Message::Machine(Action::ProbeEdges)),
+                    c.edging()
+                ),
+                muted(match (&blocked, &c.probe) {
+                    (Some(why), _) if !c.edging() => why.clone(),
+                    (_, Ok(pr)) => format!(
+                        "Jog the probe above the stock top, over where Z0 is touched off, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero.",
+                        crate::post::touch_off_spots(&p.origin, p.stock).unwrap_or_default(),
+                        pr.tip.unwrap_or_default(),
+                        pr.feed
+                    ),
+                    _ => String::new(),
+                })
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        }
+    });
     if let Some(note) = probe_note(c) {
         probe = probe.push(note);
     }
-    if c.simulated
-        && c.config.inputs.probe.is_some()
-        && let Some((lo, hi)) = crate::control::sim_block(&c.config)
+    if c.config.inputs.probe.is_some()
+        && let Some((lo, hi)) = c.block
     {
         probe = probe.push(muted(format!(
             "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, trips the probe.",

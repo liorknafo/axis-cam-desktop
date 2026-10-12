@@ -2665,10 +2665,12 @@ impl App {
                 }
             }
             Message::RunChecked(epoch, programs) => {
-                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
-                    if r.epoch == epoch {
-                        r.checked_as(programs);
-                    }
+                if let Some(c) = self.control.as_mut()
+                    && let Some(r) = c.run.as_mut()
+                    && r.epoch == epoch
+                {
+                    r.checked_as(programs);
+                    c.fit_sim_block();
                 }
             }
             Message::SaveMachine => {

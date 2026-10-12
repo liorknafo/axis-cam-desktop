@@ -519,6 +519,9 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         ProbeZ => {
             "With the touch plate on the stock top under the tool and the probe clipped on, feed Z down until the tool touches the plate, up to the maximum probe distance. Work Z at the contact becomes the plate's thickness, so the stock top is Z 0; then the tool lifts. Without contact nothing is set."
         }
+        ProbeEdges => {
+            "Probe corner (Stock top front-left) or Probe centre (Stock top center) for the setup picked in the Run panel. With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero. A side whose first touch was off its spot is touched again on it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set."
+        }
     }
 }
 
@@ -911,7 +914,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "probe_plate") => (
-            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0.",
+            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Leave it empty without a plate.",
+            None,
+        ),
+        (_, "probe_tip") => (
+            "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the probe clipped onto conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
             None,
         ),
         (_, "probe_feed") => (

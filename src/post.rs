@@ -134,7 +134,7 @@ fn short_mm(v: f32) -> String {
 /// Front-left's stretch of each side, 5% to 15% of its length from the
 /// corner, is rounded inwards to 0.1 mm, so that it lies in the checked
 /// stretch; the -X and -Y sides are named apart when their stretches differ.
-fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
+pub(crate) fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
     let band = short_mm(side_band(stock));
     match origin {
         "Stock top center" => Some(format!(
@@ -924,7 +924,7 @@ fn side_band(s: Bounds) -> f32 {
 /// The side of the stock-top area at the front-left corner where Stock top
 /// front-left's Z0 is touched off (mm): 10 mm, or a quarter of the stock's
 /// shorter top side when that is less.
-fn corner_area(s: Bounds) -> f32 {
+pub(crate) fn corner_area(s: Bounds) -> f32 {
     let size = s.dimensions();
     up_to_10_mm(size[0].min(size[1]), 0.25)
 }
@@ -995,6 +995,28 @@ fn touch_spots(s: Bounds, center: bool) -> Vec<(&'static str, Vec<[f32; 3]>)> {
                 _ => "near the front-left corner",
             };
             (words, area_points(k, lo, hi).collect())
+        })
+        .collect()
+}
+/// The faces a probe touches for a stock-based work zero, in `zero_faces`'s
+/// order (the top first): its name, its axis, whether it is the stock's far
+/// side on that axis (+X, +Y, the top), and the box its `touch_spots` span.
+pub(crate) fn probe_faces(s: Bounds, center: bool) -> Vec<(&'static str, usize, bool, Bounds)> {
+    zero_faces(s, center)
+        .into_iter()
+        .zip(touch_spots(s, center))
+        .map(|((name, k, plane), (_, points))| {
+            let mut spot = Bounds {
+                min: [f32::INFINITY; 3],
+                max: [f32::NEG_INFINITY; 3],
+            };
+            for p in points {
+                for a in 0..3 {
+                    spot.min[a] = spot.min[a].min(p[a]);
+                    spot.max[a] = spot.max[a].max(p[a]);
+                }
+            }
+            (name, k, plane > (s.min[k] + s.max[k]) / 2., spot)
         })
         .collect()
 }
@@ -1315,6 +1337,8 @@ pub struct Checked {
     pub datum: [f32; 3],
     pub settings: PostSettings,
     pub offset: String,
+    /// The setup's work zero: Stock top center, Stock top front-left or Model origin.
+    pub origin: String,
     /// (program, count, tool) when touch-off mode splits the setup.
     pub part: Option<(usize, usize, u32)>,
     /// A Model-origin zero located for the operator (`model_zero`).
@@ -1433,6 +1457,7 @@ pub(crate) fn checked(
             datum: zero,
             settings,
             offset: offset.clone(),
+            origin: origin.to_string(),
             part: (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool)),
             located,
         });

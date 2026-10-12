@@ -3,11 +3,12 @@
 use crate::model::{Fields, Machine, get, post_setting};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uc100::config::MachineConfig;
-use uc100::controller::{Block, Command, Controller, Snapshot, State};
+use uc100::controller::{Block, Command, Controller, ProbeResult, Snapshot, State};
 use uc100::diagnostics::{INPUT_PINS, InputTracker};
-use uc100::gcode::Spindle;
+use uc100::gcode::{Action as Do, Located, Spindle};
 use uc100::protocol::Status;
 
 /// Whether a UC100 machine connects to the simulator. Unset means the
@@ -34,11 +35,14 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
-/// A UC100 machine's touch plate (Machine library): mm and mm/min.
+/// A UC100 machine's probe settings (Machine library): mm and mm/min.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Probe {
-    /// The plate's thickness.
-    pub plate: f64,
+    /// The touch plate's thickness, for Probe Z; None until it is set.
+    pub plate: Option<f64>,
+    /// The probe tip's diameter, for Probe corner and Probe centre; None
+    /// until it is set.
+    pub tip: Option<f64>,
     pub feed: f64,
     /// How far down a probe goes at most.
     pub distance: f64,
@@ -46,24 +50,27 @@ pub struct Probe {
     pub retract: f64,
 }
 
-/// The machine's touch-plate settings, or what is wrong with them.
+/// The machine's probe settings, or what is wrong with them. The plate and
+/// the tip are measured: left empty, they are not set.
 pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
     let mut e = vec![];
-    let mut value = |key, what: &str, lo: f64, hi: f64, unit: &str| match post_setting(p, key)
-        .trim()
-        .parse::<f64>()
-    {
-        Ok(v) if (lo..=hi).contains(&v) => v,
-        _ => {
-            e.push(format!("{what} must be from {lo} to {hi} {unit}."));
-            0.
+    let mut value = |key, what: &str, lo: f64, hi: f64, unit: &str| {
+        let text = post_setting(p, key).trim();
+        match text.parse::<f64>() {
+            Ok(v) if (lo..=hi).contains(&v) => Some(v),
+            _ if text.is_empty() && matches!(key, "probe_plate" | "probe_tip") => None,
+            _ => {
+                e.push(format!("{what} must be from {lo} to {hi} {unit}."));
+                None
+            }
         }
     };
     let probe = Probe {
         plate: value("probe_plate", "Touch plate thickness", 0., 100., "mm"),
-        feed: value("probe_feed", "Probe feed", 1., 1000., "mm/min"),
-        distance: value("probe_distance", "Maximum probe distance", 0.1, 200., "mm"),
-        retract: value("probe_retract", "Retract after the probe", 0., 100., "mm"),
+        tip: value("probe_tip", "Probe tip diameter", 0., 50., "mm"),
+        feed: value("probe_feed", "Probe feed", 1., 1000., "mm/min").unwrap_or(0.),
+        distance: value("probe_distance", "Maximum probe distance", 0.1, 200., "mm").unwrap_or(0.),
+        retract: value("probe_retract", "Retract after the probe", 0., 100., "mm").unwrap_or(0.),
     };
     if e.is_empty() { Ok(probe) } else { Err(e) }
 }
@@ -99,22 +106,305 @@ pub fn work_z(at: f64, trip: f64, now: f64) -> f64 {
 }
 
 /// The simulator's block: a box on the middle of the table, its top halfway
-/// down Z, for trying the probe (min and max corners, machine mm). None
-/// without soft limits on X, Y and Z to place it by.
-pub fn sim_block(cfg: &MachineConfig) -> Option<([f64; 3], [f64; 3])> {
+/// down Z, for trying the probe (min and max corners, machine mm): `size` X
+/// and Y (a setup's stock), or up to 100 × 100 mm. None without soft limits
+/// on X, Y and Z to place it by.
+pub fn sim_block(cfg: &MachineConfig, size: Option<[f32; 3]>) -> Option<([f64; 3], [f64; 3])> {
     let mut lo = [0.; 3];
     let mut hi = [0.; 3];
     for a in 0..3 {
         let x = cfg.axes.get(a)?;
         let (min, max) = (x.soft_min?, x.soft_max?);
         if a < 2 {
-            let (mid, half) = ((min + max) / 2., ((max - min) / 4.).min(50.));
+            let half = size.map_or(((max - min) / 4.).min(50.), |s| s[a] as f64 / 2.);
+            let mid = (min + max) / 2.;
             (lo[a], hi[a]) = (mid - half, mid + half);
         } else {
             (lo[a], hi[a]) = (min, (min + max) / 2.);
         }
     }
     Some((lo, hi))
+}
+
+type Vec6 = [f64; 6];
+
+/// A face a probe touches for a stock-based work zero, in work coordinates
+/// (mm from the work zero).
+#[derive(Debug, Clone)]
+struct Face {
+    name: &'static str,
+    axis: usize,
+    /// 1 when the probe moves toward + to touch it (the -X and -Y sides),
+    /// -1 toward − (the +X and +Y sides, the top).
+    dir: f64,
+    /// Where the face is on its axis.
+    at: f64,
+    /// The spot it is touched in (`post::touch_spots`).
+    lo: [f64; 3],
+    hi: [f64; 3],
+}
+
+/// One command of a probing routine.
+#[derive(Debug, Clone)]
+enum Step {
+    /// Rapid moves, then a probe move that must touch nothing.
+    Go(Vec<Vec6>, Option<Vec6>),
+    /// A probe move that must touch face `.0`.
+    Touch(usize, Vec6),
+}
+
+/// Probe corner (Stock top front-left) or Probe centre (Stock top center):
+/// the top, then the sides, each touched at its spot (`post::touch_spots`),
+/// one driver command at a time.
+struct Edges {
+    center: bool,
+    faces: Vec<Face>,
+    /// The setup's stock (mm).
+    size: [f64; 3],
+    /// How far a face may be from where it is expected (mm): how high above
+    /// the top the probe travels, how far outside a side it goes down, and
+    /// how far past where the side should be it probes.
+    clear: f64,
+    radius: f64,
+    feed: f64,
+    /// How far the first touch of the top goes down at most.
+    distance: f64,
+    /// The bottom and the top of Z (machine).
+    z: (f64, f64),
+    /// Where the probe was when it started (machine).
+    start: Vec6,
+    /// Each face's touches: where the probe touched it (machine), as the
+    /// driver reports it.
+    touches: Vec<Vec<Vec6>>,
+    /// Where the last touch began: backing off returns there.
+    from: Vec6,
+    steps: VecDeque<Step>,
+    /// The command under way and the counts before it (`Connection::seq`).
+    sent: Option<(Step, (u64, u64))>,
+}
+
+impl Edges {
+    /// For a setup's `stock` and work zero `datum` (plan mm), the probe
+    /// with a tip of `tip` mm starting at `start`.
+    fn new(
+        center: bool,
+        stock: crate::mesh::Bounds,
+        datum: [f32; 3],
+        probe: &Probe,
+        tip: f64,
+        start: Vec6,
+        z: (f64, f64),
+    ) -> Self {
+        let rel = |v: f32, a: usize| (v - datum[a]) as f64;
+        let faces: Vec<Face> = crate::post::probe_faces(stock, center)
+            .into_iter()
+            .map(|(name, axis, far, spot)| Face {
+                name,
+                axis,
+                dir: if far { -1. } else { 1. },
+                at: rel(
+                    if far {
+                        stock.max[axis]
+                    } else {
+                        stock.min[axis]
+                    },
+                    axis,
+                ),
+                lo: std::array::from_fn(|a| rel(spot.min[a], a)),
+                hi: std::array::from_fn(|a| rel(spot.max[a], a)),
+            })
+            .collect();
+        Self {
+            center,
+            touches: vec![vec![]; faces.len()],
+            faces,
+            size: stock.dimensions().map(f64::from),
+            // 10 mm, a quarter of the shorter top side when less.
+            clear: crate::post::corner_area(stock) as f64,
+            radius: tip / 2.,
+            feed: probe.feed,
+            distance: probe.distance,
+            z,
+            start,
+            from: start,
+            steps: VecDeque::new(),
+            sent: None,
+        }
+    }
+
+    /// Where face `f` is on its axis from a touch at `p`: a side is a tip
+    /// radius ahead of the tip's centre; the top is where the tip's bottom is.
+    fn contact(&self, f: &Face, p: &Vec6) -> f64 {
+        p[f.axis] + if f.axis < 2 { f.dir * self.radius } else { 0. }
+    }
+
+    /// The work zero (machine) as far as the touches tell, and the axes they
+    /// fix: one whose faces are all touched. Until then X and Y come from
+    /// where the probe started, as if over the middle of the top's spot.
+    fn zero(&self) -> ([f64; 3], [bool; 3]) {
+        let (mut w, mut fixed) = ([0.; 3], [false; 3]);
+        for k in 0..3 {
+            let on: Vec<Option<f64>> = (self.faces.iter().zip(&self.touches))
+                .filter(|(f, _)| f.axis == k)
+                .map(|(f, t)| Some(self.contact(f, t.last()?) - f.at))
+                .collect();
+            let found: Vec<f64> = on.iter().flatten().copied().collect();
+            fixed[k] = found.len() == on.len();
+            let top = &self.faces[0];
+            w[k] = if found.is_empty() {
+                self.start[k] - (top.lo[k] + top.hi[k]) / 2.
+            } else {
+                found.iter().sum::<f64>() / found.len() as f64
+            };
+        }
+        (w, fixed)
+    }
+
+    /// The face to touch next: the first not touched yet, then, once, one
+    /// touched outside its spot now that the touches fix where that is.
+    fn next(&self) -> Option<usize> {
+        let (w, fixed) = self.zero();
+        let off = |i: usize| {
+            let (f, p) = (&self.faces[i], &self.touches[i][0]);
+            (0..2).any(|a| {
+                a != f.axis
+                    && fixed[a]
+                    && !(f.lo[a] - 1e-3..=f.hi[a] + 1e-3).contains(&(p[a] - w[a]))
+            })
+        };
+        let n = self.faces.len();
+        (0..n)
+            .find(|&i| self.touches[i].is_empty())
+            .or_else(|| (0..n).find(|&i| self.touches[i].len() == 1 && off(i)))
+    }
+
+    /// The commands that touch face `i`: back to where the last touch began,
+    /// up to the clearance above the top, over, down outside a side (a probe
+    /// move that must touch nothing) and in toward it; or down onto the top.
+    fn plan(&self, i: usize) -> VecDeque<Step> {
+        if self.touches[0].is_empty() {
+            // The first touch: straight down from where the probe is.
+            let mut to = self.start;
+            to[2] = (to[2] - self.distance).max(self.z.0);
+            return [Step::Touch(0, to)].into();
+        }
+        let (w, fixed) = self.zero();
+        let f = &self.faces[i];
+        let mid = |a: usize| (f.lo[a] + f.hi[a]) / 2.;
+        let high = (w[2] + self.clear).min(self.z.1);
+        let mut up = self.from;
+        up[2] = high;
+        let mut over = up;
+        for a in 0..2 {
+            over[a] = if fixed[a] {
+                w[a] + mid(a)
+            } else {
+                self.start[a]
+            };
+        }
+        let k = f.axis;
+        if k == 2 {
+            let mut to = over;
+            to[2] = (w[2] - self.clear).max(self.z.0);
+            return [
+                Step::Go(vec![self.from, up, over], None),
+                Step::Touch(i, to),
+            ]
+            .into();
+        }
+        let side = w[k] + f.at;
+        over[k] = side - f.dir * (self.clear + self.radius);
+        // A ball tip touches at its equator, a radius above its bottom.
+        let mut down = over;
+        down[2] = w[2] + (mid(2) - self.radius).max(f.lo[2]);
+        let mut to = down;
+        to[k] = side + f.dir * self.clear;
+        [
+            Step::Go(vec![self.from, up, over], Some(down)),
+            Step::Touch(i, to),
+        ]
+        .into()
+    }
+
+    /// Where the tip should be found, for a message.
+    fn spot(&self) -> &'static str {
+        if self.center {
+            "its centre"
+        } else {
+            "the front-left corner"
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        if self.center {
+            "Probe centre"
+        } else {
+            "Probe corner"
+        }
+    }
+
+    /// What was found, once every face is touched at its spot.
+    fn found(&self) -> String {
+        let (w, _) = self.zero();
+        let count: usize = self.touches.iter().map(Vec::len).sum();
+        let mut s = format!(
+            "Work zero set on {} of the stock top at machine X {:.3} Y {:.3} Z {:.3}, from {count} touches.",
+            if self.center {
+                "the centre"
+            } else {
+                "the front-left corner"
+            },
+            w[0],
+            w[1],
+            w[2]
+        );
+        if self.center {
+            let across = |k: usize| {
+                let mut c = (self.faces.iter().zip(&self.touches))
+                    .filter(|(f, _)| f.axis == k)
+                    .map(|(f, t)| self.contact(f, t.last().unwrap()));
+                let (a, b) = (c.next().unwrap(), c.next().unwrap());
+                (a - b).abs()
+            };
+            s += &format!(
+                " Measured {:.3} × {:.3} mm across; the setup's stock is {:.3} × {:.3} mm.",
+                across(0),
+                across(1),
+                self.size[0],
+                self.size[1]
+            );
+        }
+        s
+    }
+}
+
+/// Rapid moves through `points` from `at`, leaving out any that go nowhere.
+fn moves_from(mut at: Vec6, points: &[Vec6]) -> Vec<Do> {
+    let mut out = vec![];
+    for &p in points {
+        if p != at {
+            out.push(Do::Move {
+                target: p,
+                feed: None,
+            });
+            at = p;
+        }
+    }
+    out
+}
+
+/// A job of `actions` in machine coordinates, numbered from line 1.
+fn job(name: &str, actions: Vec<Do>) -> Command {
+    let actions = (actions.into_iter().enumerate())
+        .map(|(i, action)| Located {
+            line: i as u32 + 1,
+            action,
+        })
+        .collect();
+    Command::Job {
+        name: name.into(),
+        actions: Arc::new(actions),
+    }
 }
 
 /// How often a held jog is sent again: the driver ends a jog that is not
@@ -172,6 +462,9 @@ pub enum Action {
     /// Probe Z down onto the touch plate on the stock top: work Z there is
     /// the plate's thickness.
     ProbeZ,
+    /// Probe corner or Probe centre: the X, Y and Z work zero of the setup
+    /// picked in the Run panel, from its stock.
+    ProbeEdges,
 }
 
 /// Steps-per-mm calibration: one commanded move, then the travel measured
@@ -250,11 +543,14 @@ pub struct Connection {
     /// them all on E-stop.
     pub forced: BTreeMap<u8, bool>,
     pub calibration: Calibration,
-    /// The machine's touch-plate settings, or what is wrong with them.
+    /// The machine's probe settings, or what is wrong with them.
     pub probe: Result<Probe, Vec<String>>,
     probing: Option<Probing>,
+    edges: Option<Edges>,
     /// How the last probe ended (ok, what it did).
     pub probed: Option<(bool, String)>,
+    /// The simulator's block (min and max corners, machine mm).
+    pub block: Option<([f64; 3], [f64; 3])>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -272,7 +568,8 @@ impl Connection {
         let suffix = if simulated { "-simulated" } else { "" };
         let file = state_dir.join(format!("{}{suffix}.toml", m.id));
         let controller = Controller::start(cfg.clone(), Some(file));
-        if simulated && let Some((min, max)) = sim_block(&cfg) {
+        let block = sim_block(&cfg, None).filter(|_| simulated);
+        if let Some((min, max)) = block {
             controller.send(Command::SimBlock(Some(Block { min, max })));
         }
         Ok(Self {
@@ -301,8 +598,46 @@ impl Connection {
             },
             probe: probe_settings(&m.p),
             probing: None,
+            edges: None,
             probed: None,
+            block,
         })
+    }
+
+    /// The simulator's block takes the X/Y size of the stock of the setup
+    /// to run, once it is checked, so that Probe centre finds its sides.
+    pub fn fit_sim_block(&mut self) {
+        let size = (self.run.as_ref())
+            .and_then(|r| r.checked()?.first())
+            .map(|p| p.stock.dimensions());
+        if let (true, Some(size)) = (self.simulated, size)
+            && let Some((min, max)) = sim_block(&self.config, Some(size))
+        {
+            self.block = Some((min, max));
+            self.send(Command::SimBlock(Some(Block { min, max })));
+        }
+    }
+
+    /// The driver's program outcome and probe result counts now: the next
+    /// of each belong to the command sent next.
+    fn seq(&self) -> (u64, u64) {
+        let s = &self.snapshot;
+        (
+            s.program_outcome.as_ref().map_or(0, |o| o.seq),
+            s.probe_result.as_ref().map_or(0, |r| r.seq),
+        )
+    }
+
+    /// How the command sent after counts `seq` ended, once the machine has
+    /// stopped: ok, the driver's message, and its probe result if it made one.
+    fn ended(&self, seq: (u64, u64)) -> Option<(bool, String, Option<ProbeResult>)> {
+        let s = &self.snapshot;
+        let o = s.program_outcome.as_ref().filter(|o| o.seq > seq.0)?;
+        if matches!(s.state, Some(State::Run | State::Hold | State::Stopping)) {
+            return None;
+        }
+        let r = s.probe_result.as_ref().filter(|r| o.ok && r.seq > seq.1);
+        Some((o.ok, o.message.clone(), r.cloned()))
     }
 
     pub fn send(&self, command: Command) {
@@ -321,22 +656,14 @@ impl Connection {
             self.forced.clear();
         }
         // A probe ends with its outcome, once the machine has stopped.
-        let s = &self.snapshot;
-        if let Some(p) = &self.probing
-            && let Some(o) = s.program_outcome.as_ref().filter(|o| o.seq > p.seq.0)
-            && !matches!(s.state, Some(State::Run | State::Hold | State::Stopping))
-        {
-            let result = s.probe_result.as_ref().filter(|r| o.ok && r.seq > p.seq.1);
-            let ended = match result {
-                Some(r) => Ok(r.tripped.then_some(r.position[2])),
-                None => Err(o.message.clone()),
-            };
+        if let Some((_, message, result)) = self.probing.as_ref().and_then(|p| self.ended(p.seq)) {
             let p = self.probing.take().unwrap();
-            match ended {
-                Ok(trip) => self.probe_done(p, trip),
-                Err(why) => self.probed = Some((false, why)),
+            match result {
+                Some(r) => self.probe_done(p, r.tripped.then_some(r.position[2])),
+                None => self.probed = Some((false, message)),
             }
         }
+        self.edges_step();
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
@@ -486,6 +813,7 @@ impl Connection {
                 }
             }
             Action::ProbeZ => self.start_probe(Touch::WorkZ),
+            Action::ProbeEdges => self.start_edges(),
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
                 self.forced.insert(pin, high);
                 self.send(Command::TestOutput {
@@ -535,8 +863,8 @@ impl Connection {
         self.run = Some(run);
     }
 
-    /// Why a touch-plate probe cannot start now; None when it can.
-    pub fn probe_blocked(&self) -> Option<String> {
+    /// Why a probe moving `axes` cannot start now; None when it can.
+    fn probe_ready(&self, axes: &[usize]) -> Option<String> {
         let s = &self.snapshot;
         let Some(pin) = self.config.inputs.probe else {
             return Some(
@@ -549,9 +877,15 @@ impl Connection {
         if !self.idle() {
             return Some("The machine is not Idle.".into());
         }
-        if !s.referenced[2] {
+        let unset: Vec<&str> = (axes.iter())
+            .filter(|&&a| !s.referenced[a])
+            .map(|&a| ["X", "Y", "Z"][a])
+            .collect();
+        if !unset.is_empty() {
             return Some(format!(
-                "Z has no machine position (every E-stop clears it): {} first.",
+                "{} {} no machine position (every E-stop clears it): {} first.",
+                unset.join(", "),
+                if unset.len() == 1 { "has" } else { "have" },
                 if self.home_switches() {
                     "home"
                 } else {
@@ -560,14 +894,31 @@ impl Connection {
             ));
         }
         if s.status.as_ref().and_then(|st| st.input_active(pin)) == Some(true) {
-            return Some("The probe input is active: lift the tool off the plate, or check the probe's clip and wiring.".into());
+            return Some("The probe input is active: lift the tool or probe off what it touches, or check the probe's clip and wiring.".into());
         }
         None
     }
 
-    /// A probe move is under way: planning is locked (`App::locked`).
+    /// Why a touch-plate probe cannot start now; None when it can.
+    pub fn probe_blocked(&self) -> Option<String> {
+        self.probe_ready(&[2]).or_else(|| match &self.probe {
+            Ok(Probe { plate: None, .. }) => Some(
+                "Touch plate thickness is not set: measure the plate and set it in the Machine library."
+                    .into(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// A probe move or probing routine is under way: planning is locked
+    /// (`App::locked`).
     pub fn probing(&self) -> bool {
-        self.probing.is_some()
+        self.probing.is_some() || self.edges.is_some()
+    }
+
+    /// Probe corner or Probe centre is under way.
+    pub fn edging(&self) -> bool {
+        self.edges.is_some()
     }
 
     /// Probes straight down, up to the maximum distance or the bottom of Z.
@@ -580,15 +931,11 @@ impl Connection {
         if let Some(lo) = self.config.axes.get(2).and_then(|z| z.soft_min) {
             target[2] = target[2].max(lo);
         }
-        let s = &self.snapshot;
         self.probing = Some(Probing {
             touch,
             probe,
             target: target[2],
-            seq: (
-                s.program_outcome.as_ref().map_or(0, |o| o.seq),
-                s.probe_result.as_ref().map_or(0, |r| r.seq),
-            ),
+            seq: self.seq(),
         });
         self.probed = None;
         // G38.3: a miss is not an error; it is reported as one here.
@@ -613,7 +960,7 @@ impl Connection {
             return;
         };
         let s = &self.snapshot;
-        let (now, plate) = (s.machine_pos[2], p.probe.plate);
+        let (now, plate) = (s.machine_pos[2], p.probe.plate.unwrap_or_default());
         let message = match p.touch {
             Touch::Reference => {
                 // The surface under the plate, at today's work offset.
@@ -652,6 +999,184 @@ impl Connection {
             });
         }
         self.probed = Some((true, format!("Contact at machine Z {trip:.3}. {message}")));
+    }
+
+    /// The setup to run's stock-based work zero (true for Stock top center)
+    /// and its first program, or why it has none to probe.
+    pub fn edges_setup(&self) -> Result<(bool, &crate::post::Checked), String> {
+        let Some(run) = &self.run else {
+            return Err("Probe corner and Probe centre set the work zero of the setup picked in the Run panel, from its stock.".into());
+        };
+        let p = match run.programs.as_deref() {
+            None => return Err("Checking the setup…".into()),
+            Some(Ok(p)) if !p.is_empty() => &p[0],
+            Some(_) => return Err("The setup cannot run: see the Run panel.".into()),
+        };
+        if run.stale {
+            return Err(
+                "The project changed since the setup was checked: check it again in the Run panel."
+                    .into(),
+            );
+        }
+        match p.origin.as_str() {
+            "Stock top front-left" => Ok((false, p)),
+            "Stock top center" => Ok((true, p)),
+            o => Err(format!(
+                "This setup's work zero is {o}, which no probe finds on the stock: touch it off by hand."
+            )),
+        }
+    }
+
+    /// Why Probe corner or Probe centre cannot start now; None when it can.
+    pub fn edges_blocked(&self) -> Option<String> {
+        let (_, p) = match self.edges_setup() {
+            Ok(x) => x,
+            Err(why) => return Some(why),
+        };
+        if let Some(why) = self.probe_ready(&[0, 1, 2]) {
+            return Some(why);
+        }
+        if let Ok(Probe { tip: None, .. }) = self.probe {
+            return Some("Probe tip diameter is not set: set it in the Machine library.".into());
+        }
+        let active = 54 + self.snapshot.active_wcs;
+        if p.offset != format!("G{active}") {
+            return Some(format!(
+                "This setup uses {}, but the active work system is G{active}: select {} first.",
+                p.offset, p.offset
+            ));
+        }
+        None
+    }
+
+    /// Starts Probe corner or Probe centre from where the probe is.
+    fn start_edges(&mut self) {
+        let (None, Ok(probe), Ok((center, p))) =
+            (self.edges_blocked(), self.probe.clone(), self.edges_setup())
+        else {
+            return;
+        };
+        let z = self.config.axes.get(2);
+        let z = (
+            z.and_then(|z| z.soft_min).unwrap_or(f64::NEG_INFINITY),
+            z.and_then(|z| z.soft_max).unwrap_or(f64::INFINITY),
+        );
+        let start = self.snapshot.machine_pos;
+        let tip = probe.tip.unwrap_or_default();
+        self.edges = Some(Edges::new(center, p.stock, p.datum, &probe, tip, start, z));
+        self.probed = None;
+        self.edges_step();
+    }
+
+    /// Follows the probing routine: once a command has ended, checks how and
+    /// sends the next, until every face is touched at its spot.
+    fn edges_step(&mut self) {
+        let Some(mut e) = self.edges.take() else {
+            return;
+        };
+        if let Some((step, seq)) = e.sent.clone() {
+            let Some((ok, message, result)) = self.ended(seq) else {
+                self.edges = Some(e);
+                return;
+            };
+            let tripped = result.as_ref().filter(|r| r.tripped);
+            let failed = match &step {
+                _ if !ok => Some(message),
+                Step::Go(_, Some(_)) if tripped.is_some() => {
+                    let f = e.steps.front().map_or(0, |s| match s {
+                        Step::Touch(i, _) => *i,
+                        _ => 0,
+                    });
+                    let p = tripped.unwrap().position;
+                    Some(format!(
+                        "The probe touched something going down beside the {} at machine X {:.3} Y {:.3} Z {:.3}, where the stock should not be: start over the stock top nearer {}.",
+                        e.faces[f].name,
+                        p[0],
+                        p[1],
+                        p[2],
+                        e.spot()
+                    ))
+                }
+                Step::Touch(i, to) => match tripped {
+                    Some(r) => {
+                        e.touches[*i].push(r.position);
+                        None
+                    }
+                    None if e.touches[0].is_empty() => Some(format!(
+                        "No contact down to machine Z {:.3}: jog the probe over the stock top, closer, and probe again.",
+                        to[2]
+                    )),
+                    None => {
+                        let k = e.faces[*i].axis;
+                        Some(format!(
+                            "No contact with the {} up to machine {} {:.3}: check the probe and the setup's stock, and start over the stock top nearer {}.",
+                            e.faces[*i].name,
+                            ["X", "Y", "Z"][k],
+                            to[k],
+                            e.spot()
+                        ))
+                    }
+                },
+                _ => None,
+            };
+            if let Some(why) = failed {
+                self.probed = Some((false, why));
+                return;
+            }
+            e.sent = None;
+        }
+        if e.steps.is_empty() {
+            match e.next() {
+                Some(i) => e.steps = e.plan(i),
+                None => return self.edges_done(e),
+            }
+        }
+        let step = e.steps.pop_front().unwrap();
+        let seq = self.seq();
+        match &step {
+            Step::Go(moves, guard) => {
+                let mut actions = moves_from(self.snapshot.machine_pos, moves);
+                if let Some(target) = guard {
+                    actions.push(Do::Probe {
+                        target: *target,
+                        feed: e.feed / 60.,
+                        must_trip: false,
+                    });
+                }
+                self.send(job(e.name(), actions));
+            }
+            Step::Touch(_, target) => {
+                e.from = self.snapshot.machine_pos;
+                // G38.3: a miss is not an error; it is reported as one here.
+                self.send(Command::Probe {
+                    target: *target,
+                    feed: e.feed,
+                    must_trip: false,
+                });
+            }
+        }
+        e.sent = Some((step, seq));
+        self.edges = Some(e);
+    }
+
+    /// Every face is touched at its spot, Idle: sets the X, Y and Z work zero
+    /// and backs the probe off and up.
+    fn edges_done(&mut self, e: Edges) {
+        let (w, _) = e.zero();
+        let now = self.snapshot.machine_pos;
+        for a in 0..3 {
+            self.send(Command::SetWork {
+                axis: a,
+                value: now[a] - w[a],
+            });
+        }
+        if let Some(run) = &mut self.run {
+            run.touched = true;
+        }
+        let mut up = e.from;
+        up[2] = (w[2] + e.clear).min(e.z.1);
+        self.send(job(e.name(), moves_from(now, &[e.from, up])));
+        self.probed = Some((true, e.found()));
     }
 
     /// An axis of the profile. The driver panics on an index of 6 or more,
@@ -749,13 +1274,14 @@ impl Connection {
         )
     }
 
+    /// Idle, and no probing routine is between two of its moves.
     pub fn idle(&self) -> bool {
-        self.snapshot.state == Some(State::Idle)
+        self.snapshot.state == Some(State::Idle) && self.edges.is_none()
     }
 
     /// Jog, work zero, MDI and the spindle are allowed: Idle, or paused in a program.
     pub fn manual(&self) -> bool {
-        matches!(self.snapshot.state, Some(State::Idle | State::Paused(_)))
+        matches!(self.snapshot.state, Some(State::Idle | State::Paused(_))) && self.edges.is_none()
     }
 
     /// Every enabled axis has a home switch, so Home can run.
@@ -872,18 +1398,25 @@ mod tests {
     }
 
     #[test]
-    fn probe_settings_need_a_measured_plate_and_sane_values() {
+    fn probe_settings_leave_the_plate_and_tip_to_measure_and_need_sane_values() {
         let mut m = Machine::new(3);
-        let e = probe_settings(&m.p).unwrap_err();
+        let p = probe_settings(&m.p).unwrap();
+        assert_eq!((p.plate, p.tip), (None, None));
+        m.p.insert("probe_plate".into(), "-1".into());
+        m.p.insert("probe_tip".into(), "x".into());
         assert_eq!(
-            e,
-            vec!["Touch plate thickness must be from 0 to 100 mm.".to_string()]
+            probe_settings(&m.p).unwrap_err(),
+            vec![
+                "Touch plate thickness must be from 0 to 100 mm.".to_string(),
+                "Probe tip diameter must be from 0 to 50 mm.".to_string()
+            ]
         );
         m.p.insert("probe_plate".into(), "15.2".into());
+        m.p.insert("probe_tip".into(), "2".into());
         let p = probe_settings(&m.p).unwrap();
         assert_eq!(
-            (p.plate, p.feed, p.distance, p.retract),
-            (15.2, 100., 20., 5.)
+            (p.plate, p.tip, p.feed, p.distance, p.retract),
+            (Some(15.2), Some(2.), 100., 20., 5.)
         );
         // Machines saved before the probe settings get the same defaults.
         for k in ["probe_feed", "probe_distance", "probe_retract"] {
@@ -919,10 +1452,115 @@ mod tests {
             let x = cfg.axes.get_mut(a).unwrap();
             (x.soft_min, x.soft_max) = (Some(lo), Some(hi));
         }
-        let (lo, hi) = sim_block(&cfg).unwrap();
+        let (lo, hi) = sim_block(&cfg, None).unwrap();
         assert_eq!((lo, hi), ([145., 20., -55.], [245., 60., -27.5]));
+        // A setup's stock gives it its X/Y size.
+        let (lo, hi) = sim_block(&cfg, Some([124., 30., 47.])).unwrap();
+        assert_eq!((lo, hi), ([133., 25., -55.], [257., 55., -27.5]));
         cfg.axes.get_mut(1).unwrap().soft_min = None;
-        assert_eq!(sim_block(&cfg), None);
+        assert_eq!(sim_block(&cfg, None), None);
+    }
+
+    /// Runs a probing routine against a box at machine `lo`…`hi`: each touch
+    /// stops where the tip, `e.radius` round, meets a face.
+    fn touch_box(mut e: Edges, lo: [f64; 3], hi: [f64; 3]) -> Edges {
+        let mut at = e.start;
+        while let Some(i) = e.next() {
+            for step in e.plan(i) {
+                match step {
+                    Step::Go(moves, guard) => {
+                        if let Some(down) = guard {
+                            let clear = (0..2).any(|a| down[a] < lo[a] || down[a] > hi[a]);
+                            assert!(clear, "going down onto the box at {down:?}");
+                        }
+                        at = guard.or(moves.last().copied()).unwrap();
+                    }
+                    Step::Touch(i, to) => {
+                        let f = &e.faces[i];
+                        let k = f.axis;
+                        let mut p = to;
+                        p[k] = match (k, f.dir > 0.) {
+                            (2, _) => hi[2],
+                            (_, true) => lo[k] - e.radius,
+                            (_, false) => hi[k] + e.radius,
+                        };
+                        // It moves toward the face and reaches it before its target.
+                        assert!((p[k] - at[k]) * f.dir > 0. && (to[k] - p[k]) * f.dir > 0.);
+                        e.from = at;
+                        e.touches[i].push(p);
+                        at = p;
+                    }
+                }
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn probing_touches_each_face_at_its_spot_and_finds_the_zero() {
+        use crate::mesh::Bounds;
+        let stock = Bounds {
+            min: [0.; 3],
+            max: [124., 84., 40.],
+        };
+        let probe = Probe {
+            plate: None,
+            tip: Some(4.),
+            feed: 100.,
+            distance: 20.,
+            retract: 5.,
+        };
+        let z = (-80., 0.);
+        // The stock at machine X 100…224, Y 50…134, Z -70…-30.
+        let (lo, hi) = ([100., 50., -70.], [224., 134., -30.]);
+        let check = |e: &Edges, zero: [f64; 3]| {
+            let (w, fixed) = e.zero();
+            assert_eq!(fixed, [true; 3]);
+            assert!((0..3).all(|a| (w[a] - zero[a]).abs() < 1e-9), "{w:?}");
+            for (f, t) in e.faces.iter().zip(&e.touches) {
+                let p = t.last().unwrap();
+                for a in (0..3).filter(|&a| a != f.axis) {
+                    let v = p[a] - w[a] + if a == 2 { e.radius } else { 0. };
+                    assert!(
+                        (f.lo[a] - 1e-6..=f.hi[a] + 1e-6).contains(&v),
+                        "{} touched at {a} {v}, outside {}…{}",
+                        f.name,
+                        f.lo[a],
+                        f.hi[a]
+                    );
+                }
+            }
+        };
+        // Corner: started 2 mm in from both edges, inside the top's spot (1
+        // to 11 mm), but the -X side's spot is 4.2 to 12.6 mm from the
+        // corner: it is touched again there once -Y has fixed Y.
+        let start = [102., 52., -25., 0., 0., 0.];
+        let e = Edges::new(false, stock, [0., 0., 40.], &probe, 4., start, z);
+        let e = touch_box(e, lo, hi);
+        assert_eq!(
+            e.touches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 2, 1]
+        );
+        check(&e, [100., 50., -30.]);
+        assert!(e.found().contains("front-left corner of the stock top at machine X 100.000 Y 50.000 Z -30.000, from 4 touches"), "{}", e.found());
+        // Centre: started 3 mm off it, inside the top's spot: once each.
+        let start = [165., 90., -15., 0., 0., 0.];
+        let e = Edges::new(true, stock, [62., 42., 40.], &probe, 4., start, z);
+        let e = touch_box(e, lo, hi);
+        assert_eq!(e.touches.iter().map(Vec::len).collect::<Vec<_>>(), [1; 5]);
+        check(&e, [162., 92., -30.]);
+        assert!(
+            e.found().contains("Measured 124.000 × 84.000 mm across"),
+            "{}",
+            e.found()
+        );
+        // Off the top's spot (15 mm from the corner): the top is touched
+        // again on it.
+        let start = [115., 65., -25., 0., 0., 0.];
+        let e = Edges::new(false, stock, [0., 0., 40.], &probe, 4., start, z);
+        let e = touch_box(e, lo, hi);
+        assert_eq!(e.touches[0].len(), 2);
+        check(&e, [100., 50., -30.]);
     }
 
     #[test]

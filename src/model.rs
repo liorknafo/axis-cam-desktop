@@ -290,7 +290,7 @@ impl Machine {
         e
     }
     pub fn fill_post_defaults(&mut self) {
-        // The plate's thickness has no default to fill in.
+        // The plate's thickness and the tip's diameter have no default to fill in.
         for key in POST_KEYS.into_iter().chain(PROBE_KEYS) {
             let value = post_setting(&self.p, key).to_string();
             if !value.is_empty() {
@@ -439,10 +439,12 @@ pub const POST_KEYS: [&str; 5] = [
     "post_dwell",
     "post_air",
 ];
-/// A UC100 machine's touch-plate settings (`control::probe_settings`). The
-/// plate's thickness has no default: it must be measured.
-pub const PROBE_KEYS: [&str; 4] = [
+/// A UC100 machine's probe settings (`control::probe_settings`). The plate's
+/// thickness and the probe tip's diameter have no default: they must be
+/// measured.
+pub const PROBE_KEYS: [&str; 5] = [
     "probe_plate",
+    "probe_tip",
     "probe_feed",
     "probe_distance",
     "probe_retract",

@@ -514,6 +514,7 @@ mod tests {
             datum: [0., 0., 10.],
             settings: settings(),
             offset: "G54".into(),
+            origin: "Stock top center".into(),
             part: Some((1, 1, 1)),
             located: None,
         }
