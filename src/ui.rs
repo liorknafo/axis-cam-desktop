@@ -698,7 +698,7 @@ fn browser(app: &App) -> Element<'_, Message> {
             ]
             .spacing(2)
             .width(Fill),
-            stock_picture(app, si).map(|p| widget::image(p).width(64).height(48))
+            stock_picture(app, si, false).map(|p| widget::image(p).width(64).height(48))
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -774,6 +774,22 @@ fn browser(app: &App) -> Element<'_, Message> {
                     o.name(),
                 ));
             }
+            if let Some(picture) = stock_picture(app, si, true) {
+                tree = tree.push(help::wrap(
+                    row![
+                        muted("Stock after this setup").size(11).width(Fill),
+                        widget::image(picture).width(64).height(48)
+                    ]
+                    .spacing(6)
+                    .padding([0, 10])
+                    .align_y(Alignment::Center),
+                    Help::text(
+                        "Stock after this setup",
+                        "The stock as this setup's operations leave it, in its jaws or clamps, seen as its 3D view first shows it. Cut faces are green.",
+                    ),
+                    widget::tooltip::Position::Right,
+                ));
+            }
         }
     }
     tree = tree
@@ -793,26 +809,75 @@ fn browser(app: &App) -> Element<'_, Message> {
         .style(panel_style)
         .into()
 }
-/// The picture of the stock setup `si` leaves, for the browser
-/// (`LeftStock::pictures`; the last one worked out while the job is worked
-/// out again), else of the box it starts from (`App::known_stock`).
-pub(crate) fn stock_picture(app: &App, si: usize) -> Option<widget::image::Handle> {
-    if app.left_key().is_some()
-        && let Some(Some(cut)) = app.left_stock.pictures.get(si)
-    {
-        return Some(cut.clone());
+/// The picture of setup `si`'s stock in its jaws or clamps, for the browser.
+/// As it starts (`end` false): what the earlier setups left it
+/// (`LeftStock::before`), else its box (`App::known_stock`). As its
+/// operations leave it (`end`): `LeftStock::after`; None until that is worked
+/// out and when nothing was cut by then. While the job is worked out again,
+/// from the stock last worked out.
+pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::image::Handle> {
+    use std::hash::{Hash, Hasher};
+    let setup = app.doc.setups.get(si)?;
+    let left = &app.left_stock;
+    let cut = app
+        .left_key()
+        .and(if end { left.after.get(si) } else { left.before.get(si) })
+        .cloned()
+        .flatten()
+        .and_then(|v| {
+            let (_, surface) = left
+                .surfaces
+                .iter()
+                .find(|(s, _)| std::sync::Arc::ptr_eq(s, &v))?;
+            Some((v, surface.clone()))
+        });
+    if end && cut.is_none() {
+        return None;
     }
     let stock = app.known_stock(si).0?;
-    let mut drawn = app.box_pictures.borrow_mut();
-    if let Some((_, picture)) = drawn.iter().find(|(b, _)| *b == stock) {
+    let jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+        let held = app
+            .known_held(si)
+            .filter(|held| held.stock == stock)
+            .unwrap_or(crate::holding::Gripped::whole(stock));
+        app.doc
+            .holding_boxes(setup, held)
+            .map(|b| crate::holding::shown(&b, stock))
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    // What the picture shows: the stock meshed, else its box, and the jaws.
+    let mut hasher = std::hash::DefaultHasher::new();
+    match &cut {
+        Some((v, _)) => std::sync::Arc::as_ptr(v).hash(&mut hasher),
+        None => stock.min.iter().chain(&stock.max).for_each(|v| v.to_bits().hash(&mut hasher)),
+    }
+    (si, end).hash(&mut hasher);
+    for b in &jaws {
+        b.bounds.min.iter().chain(&b.bounds.max).for_each(|v| v.to_bits().hash(&mut hasher));
+    }
+    let key = hasher.finish();
+    let mut drawn = app.stock_pictures.borrow_mut();
+    if let Some((_, picture)) = drawn.iter().find(|(k, _)| *k == key) {
         return Some(picture.clone());
     }
-    let picture = crate::viewport::stock_picture(&crate::viewport::box_triangles(stock))?;
-    // ponytail: a few boxes per job, so all are kept until there are many.
-    if drawn.len() > 32 {
+    let mut triangles = match cut {
+        Some((v, surface)) => {
+            let frame = crate::volume::Frame::new(setup, app.part_mesh()?);
+            crate::viewport::stock_triangles(&v, &surface, frame).collect()
+        }
+        None => crate::viewport::box_triangles(stock, crate::viewport::BLOCK),
+    };
+    for b in &jaws {
+        triangles.extend(crate::viewport::box_triangles(b.bounds, crate::viewport::JAWS));
+    }
+    let picture = crate::viewport::stock_picture(&triangles)?;
+    // ponytail: two per setup, so all are kept until there are many.
+    if drawn.len() > 64 {
         drawn.clear();
     }
-    drawn.push((stock, picture.clone()));
+    drawn.push((key, picture.clone()));
     Some(picture)
 }
 /// The 3D view of the active setup, as the Work page shows it: the part,

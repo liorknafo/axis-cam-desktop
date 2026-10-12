@@ -1164,16 +1164,16 @@ fn line(frame: &mut Frame, points: &[Point], c: Color, w: f32) {
     });
     frame.stroke(&path, Stroke::default().with_color(c).with_width(w))
 }
-/// The colour the view gives a face of stock: tan for a face of the original
-/// block (`outer`), green where it was cut, shaded by its normal.
-fn stock_shade(points: &[[f32; 3]], outer: bool) -> [u8; 4] {
+/// The colour of the original block's faces of simulated stock.
+pub(crate) const BLOCK: [f32; 3] = [219., 183., 113.];
+/// The colour of the faces of simulated stock that were cut.
+const CUT: [f32; 3] = [103., 181., 151.];
+/// The colour of jaws and clamps in still pictures.
+pub(crate) const JAWS: [f32; 3] = [176., 176., 176.];
+/// `base` shaded as the view shades a face of simulated stock: by its normal.
+fn shade(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
     let n = normal(points);
     let light = 0.58 + 0.29 * n[2].abs() + 0.13 * n[0].abs();
-    let base = if outer {
-        [219., 183., 113.]
-    } else {
-        [103., 181., 151.]
-    };
     [
         (base[0] * light) as u8,
         (base[1] * light) as u8,
@@ -1199,12 +1199,15 @@ pub(crate) fn stock_triangles<'a>(
                     .iter()
                     .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
         });
-        (points, stock_shade(&points, outer))
+        (points, shade(&points, if outer { BLOCK } else { CUT }))
     })
 }
-/// The faces of a block of stock `b` (mm), two triangles each, coloured as
-/// the view colours the original block's.
-pub(crate) fn box_triangles(b: crate::mesh::Bounds) -> Vec<([[f32; 3]; 3], [u8; 4])> {
+/// The faces of a box `b` (mm), two triangles each, in `base` shaded as the
+/// view shades stock.
+pub(crate) fn box_triangles(
+    b: crate::mesh::Bounds,
+    base: [f32; 3],
+) -> Vec<([[f32; 3]; 3], [u8; 4])> {
     let v = box_vertices(b);
     [
         [0, 1, 2, 3],
@@ -1216,7 +1219,7 @@ pub(crate) fn box_triangles(b: crate::mesh::Bounds) -> Vec<([[f32; 3]; 3], [u8; 
     ]
     .into_iter()
     .flat_map(|[a, b, c, d]| [[v[a], v[b], v[c]], [v[a], v[c], v[d]]])
-    .map(|t| (t, stock_shade(&t, true)))
+    .map(|t| (t, shade(&t, base)))
     .collect()
 }
 /// The pixel size of the setup browser's stock pictures: twice the size they

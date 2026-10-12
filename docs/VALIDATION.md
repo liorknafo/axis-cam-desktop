@@ -145,14 +145,31 @@ A hand on the hardware E-stop for every step; the mushroom's power cutoff is not
 
 ## Stock pictures in the setup browser (LIO-132)
 
-- `the_browser_draws_the_stock_each_setup_leaves` uses the flipped fixture: setup 1 faces the top; setup 2, turned over, faces the other side.
-  - Before the job is simulated, both setups are drawn as plain blocks with no green (cut) pixels, and each box is drawn once.
-  - After the job is simulated, each setup's picture has over 1,000 green pixels. Setup 1's block is drawn lower than its original block: the drawn height over width falls by more than 0.01.
-  - A one-setup job gets its picture too. The example, which is not simulated, keeps its plain block.
-- `the_setup_editor_says_the_stock_is_the_original_until_the_earlier_setups_are_simulated` now expects a one-setup job to be simulated, for its picture.
-- The stock run no longer starts on the Control page. It first failed `a_setup_runs_tool_run_by_tool_run_with_a_manual_tool_change`: between tool runs, a run working out a one-setup job held Cycle Start back. With the run kept to the MANUFACTURE workspace, all 207 smoke tests pass. The smoke suite takes about 65 s instead of 42 s, because more test apps now simulate and mesh their stock.
-- Not a test: inspected on Windows (12 October 2026, debug build). The fixture block has Facing and Drilling in setup 1 and a flipped setup that faces the other side. The browser showed setup 1's faced top in green with its five drilled holes as dots, and the flipped setup's faced side with the through-holes. The pictures were ready within about 3 s of opening the Work page.
-- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 815 passed, 2 failed (the two STEP tests, as before).
+`the_browser_draws_the_stock_each_setup_starts_from_and_leaves_in_its_jaws` covers the contoured fixture. Both setups are in a vise. Setup 1 faces, pockets and contours the top 5 mm of the walls. Setup 2 has the part turned over and faces it.
+
+- **Before the job is simulated**
+  - Each setup starts from its block: no green (cut) pixels, and over 100 grey jaw pixels.
+  - Neither setup has an after picture.
+  - Each start picture is drawn once.
+- **After the job is simulated**
+  - Setup 1 still starts from its block.
+  - Setup 2 starts from what setup 1 left it. The cut band is green where the jaws, which grip it, leave it in sight (over 20 pixels).
+  - Each setup's after picture has over 1,000 green pixels and over 100 grey ones.
+  - Setup 2 starts from the very stock setup 1 leaves (the same `Arc`), so the job's stock is meshed twice, not three times.
+- **Other jobs**
+  - A one-setup job gets its after picture.
+  - The example, which is not simulated, keeps its block and has no after picture.
+
+Other checks:
+
+- `the_setup_editor_says_the_stock_is_the_original_until_the_earlier_setups_are_simulated` now expects a one-setup job to be simulated, for its after picture.
+- The stock run no longer starts on the Control page. While it ran it held Cycle Start back between tool runs, which `a_setup_runs_tool_run_by_tool_run_with_a_manual_tool_change` caught once one-setup jobs were simulated. With the run kept to the MANUFACTURE workspace, all smoke tests pass, apart from `the_control_page_renders_in_every_state` timing out under the full suite's load (LIO-131); it passes alone. The smoke suite takes about 65 s instead of 42 s, because more test apps simulate and mesh their stock.
+- Not a test: inspected on Windows (12 October 2026, debug build). Setup 1 had Facing, Contour (bottom 35) and Drilling, a flipped setup faced the other side, and both were in the starter vise. Each picture showed the stock in the vise:
+  - Top started as its block and ended faced and contoured, with its five holes as dots.
+  - Flipped started from what Top left it, turned over; the contoured band at the bottom was behind the jaws.
+  - Flipped ended with that side faced.
+  - The pictures were ready within about 20 s of opening the Work page.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 814 passed, 3 failed: the two STEP tests, as before, and `the_control_page_renders_in_every_state`, which timed out under load and passes alone (LIO-131).
 
 ## Planner analysis and checks (no AI)
 

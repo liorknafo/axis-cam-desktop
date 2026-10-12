@@ -302,10 +302,15 @@ pub struct LeftStock {
     /// which its holding checks are made: None where `boxes` is, and where
     /// nothing was cut before it.
     pub before: Vec<Option<std::sync::Arc<volume::Volume>>>,
-    /// A picture of the stock each setup leaves, in its frame, for the
-    /// browser (`viewport::stock_picture`): None where nothing was cut by its
-    /// end and after an operation that failed.
-    pub pictures: Vec<Option<iced::widget::image::Handle>>,
+    /// The stock each setup leaves, cells and cuts: None where nothing was
+    /// cut by its end, and from an operation that failed on.
+    pub after: Vec<Option<std::sync::Arc<volume::Volume>>>,
+    /// The surface of each stock in `before` and `after`, meshed at Draft
+    /// detail for the browser's pictures (`ui::stock_picture`).
+    pub surfaces: Vec<(
+        std::sync::Arc<volume::Volume>,
+        std::sync::Arc<stock_surface::SurfaceMesh>,
+    )>,
 }
 /// What the holding checks found for each setup of a job, worked out with
 /// `LeftStock` (`holding_checks`) for the job and its workholding whose
@@ -391,14 +396,17 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
 /// gives it to the setup's operations), and the stock they left it: None for
 /// the first setup, and for a setup after an operation or setup that failed.
 /// A setup without an enabled operation has its box too. The whole job is
-/// simulated, for the stock each setup leaves, which the browser draws. For
-/// the job whose fingerprint is `key`.
+/// simulated, for the stock each setup leaves too, and each stock is meshed
+/// for the browser's pictures. For the job whose fingerprint is `key`.
 fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
-    use std::cell::{Cell, RefCell};
+    use std::{
+        cell::{Cell, RefCell},
+        sync::Arc,
+    };
     let mut boxes = vec![None; doc.setups.len()];
     let mut before = vec![None; doc.setups.len()];
     // The stock after the last operation so far.
-    let last: RefCell<Option<std::sync::Arc<volume::Volume>>> = Default::default();
+    let last: RefCell<Option<Arc<volume::Volume>>> = Default::default();
     // The stock each setup leaves while every operation so far has worked:
     // what it starts from, then what each of its operations leaves.
     let after = RefCell::new(vec![None; doc.setups.len()]);
@@ -414,7 +422,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
             }
         },
         |si, _, stock| {
-            let stock = std::sync::Arc::new(stock.clone());
+            let stock = Arc::new(stock.clone());
             after.borrow_mut()[si] = Some(stock.clone());
             *last.borrow_mut() = Some(stock);
         },
@@ -428,32 +436,32 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
             }
         },
     );
-    // ponytail: meshed in the run the holding checks wait for; a run of its
-    // own if that delay ever shows.
-    let pictures = after
-        .into_inner()
-        .iter()
-        .zip(&doc.setups)
-        .map(|(volume, setup)| {
-            let volume = volume.as_deref()?;
-            let surface = stock_surface::Snapshot {
-                bounds: volume.bounds,
-                frame: volume.frame,
-                cuts: volume.cuts.clone(),
-                detail: stock_surface::Detail::Draft,
-            }
-            .build()
-            .ok()?;
-            let current = volume::Frame::new(setup, mesh);
-            let triangles: Vec<_> = viewport::stock_triangles(volume, &surface, current).collect();
-            viewport::stock_picture(&triangles)
-        })
-        .collect();
+    let after = after.into_inner();
+    // A setup starts from the very stock the one before it leaves: each is
+    // meshed once. ponytail: in the run the holding checks wait for; a run
+    // of its own if that delay ever shows.
+    let mut surfaces: Vec<(Arc<volume::Volume>, Arc<stock_surface::SurfaceMesh>)> = vec![];
+    for volume in before.iter().chain(&after).flatten() {
+        if surfaces.iter().any(|(v, _)| Arc::ptr_eq(v, volume)) {
+            continue;
+        }
+        let surface = stock_surface::Snapshot {
+            bounds: volume.bounds,
+            frame: volume.frame,
+            cuts: volume.cuts.clone(),
+            detail: stock_surface::Detail::Draft,
+        }
+        .build();
+        if let Ok(surface) = surface {
+            surfaces.push((volume.clone(), Arc::new(surface)));
+        }
+    }
     LeftStock {
         key,
         boxes,
         before,
-        pictures,
+        after,
+        surfaces,
     }
 }
 /// The holding checks of each later setup of `doc` whose box `left` knows,
@@ -521,9 +529,9 @@ pub struct App {
     /// The workholding warning of the preview shown (`ui::holding_warning`)
     /// and what it was worked out from.
     holding_note: std::cell::RefCell<Option<(String, HoldingNote)>>,
-    /// The browser's pictures of stock boxes, drawn once per box
+    /// The browser's pictures of stock, each drawn once for what it shows
     /// (`ui::stock_picture`).
-    pub(crate) box_pictures: std::cell::RefCell<Vec<(mesh::Bounds, iced::widget::image::Handle)>>,
+    pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
     post_epoch: u64,
     pub settings: settings::Settings,
     settings_path: PathBuf,
@@ -874,7 +882,7 @@ impl App {
             holding_checks: HoldingChecks::default(),
             left_job: None,
             holding_note: std::cell::RefCell::new(None),
-            box_pictures: Default::default(),
+            stock_pictures: Default::default(),
             post_epoch: 0,
             settings: settings::load(&settings_path),
             settings_path,

@@ -5059,57 +5059,66 @@ flood = { pin = 8 }
         let _ = a.view();
     }
     #[test]
-    fn the_browser_draws_the_stock_each_setup_leaves() {
+    fn the_browser_draws_the_stock_each_setup_starts_from_and_leaves_in_its_jaws() {
         let dir = tempfile::tempdir().unwrap();
-        // Setup 1 faces the top; setup 2, turned over, faces the other side.
-        let mut a = leftover_app(&dir);
-        // How many drawn pixels are green, a cut face's colour, and the drawn
-        // pixels' height over their width.
-        let look = |si: usize, a: &App| {
-            let iced::widget::image::Handle::Rgba { width, pixels, .. } =
-                crate::ui::stock_picture(a, si).unwrap()
-            else {
+        // Both setups are held in a vise. Setup 1 faces, pockets and
+        // contours the top 5 mm of the walls; setup 2 has the part turned
+        // over, so that cut band is at the bottom of its walls.
+        let mut a = contoured_app(&dir, "35");
+        // The drawn pixels that are green, a cut face's colour, and grey,
+        // the jaws'.
+        let count = |picture: iced::widget::image::Handle| {
+            let iced::widget::image::Handle::Rgba { pixels, .. } = picture else {
                 unreachable!()
             };
-            let green = pixels
-                .chunks(4)
-                .filter(|px| px[3] > 0 && px[1] > px[0].saturating_add(30))
+            let drawn = || pixels.chunks(4).filter(|px| px[3] > 0);
+            let green = drawn().filter(|px| px[1] > px[0].saturating_add(30)).count();
+            let grey = drawn()
+                .filter(|px| px[0].abs_diff(px[1]) < 4 && px[1].abs_diff(px[2]) < 4)
                 .count();
-            let rows: Vec<_> = pixels.chunks(width as usize * 4).collect();
-            let drawn = |row: &[u8]| row.chunks(4).any(|px| px[3] > 0);
-            let top = rows.iter().position(|r| drawn(r)).unwrap();
-            let bottom = rows.iter().rposition(|r| drawn(r)).unwrap();
-            let (left, right) = (0..width as usize)
-                .filter(|x| rows.iter().any(|r| r[x * 4 + 3] > 0))
-                .fold((usize::MAX, 0), |(l, r), x| (l.min(x), r.max(x)));
-            (green, (bottom - top) as f32 / (right - left) as f32)
+            (green, grey)
         };
-        // Not simulated yet: each setup is drawn as the block it starts
-        // from, nothing cut, and each box is drawn once.
-        let (green, block) = look(0, &a);
-        assert_eq!(green, 0);
-        assert_eq!(look(1, &a).0, 0);
-        let _ = look(1, &a);
-        assert_eq!(a.box_pictures.borrow().len(), 2);
+        let start = |si, a: &App| count(crate::ui::stock_picture(a, si, false).unwrap());
+        let end = |si, a: &App| crate::ui::stock_picture(a, si, true).map(count);
+        // Not simulated yet: each setup starts from its block in its jaws,
+        // and nothing is drawn as what it leaves. Each is drawn once.
+        for si in 0..2 {
+            let (green, grey) = start(si, &a);
+            assert!(green == 0 && grey > 100, "{green} {grey}");
+            assert_eq!(end(si, &a), None);
+        }
+        let _ = start(1, &a);
+        assert_eq!(a.stock_pictures.borrow().len(), 2);
         let _ = a.view();
-        // Simulated: each setup is drawn as the stock it leaves, its faced
-        // top green, setup 1's 4 mm lower than its block.
+        // Simulated: setup 1 still starts from its block; setup 2 starts
+        // from what setup 1 left it, the walls' cut band green where its
+        // jaws, which grip that band, leave it in sight.
         let _ = a.refresh_left_stock();
-        assert!(a.left_stock.pictures.iter().all(Option::is_some));
-        let (green, faced) = look(0, &a);
-        assert!(green > 1000, "{green}");
-        assert!(faced < block - 0.01, "{faced} {block}");
-        assert!(look(1, &a).0 > 1000);
+        assert_eq!(start(0, &a).0, 0);
+        let (green, grey) = start(1, &a);
+        assert!(green > 20 && grey > 100, "{green} {grey}");
+        // What each leaves, in its jaws: setup 1's cut top, and setup 2's
+        // faced side, from the very stock setup 2's start is drawn from.
+        for si in 0..2 {
+            let (green, grey) = end(si, &a).unwrap();
+            assert!(green > 1000 && grey > 100, "{si}: {green} {grey}");
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            a.left_stock.after[0].as_ref().unwrap(),
+            a.left_stock.before[1].as_ref().unwrap()
+        ));
+        assert_eq!(a.left_stock.surfaces.len(), 2);
         let _ = a.view();
-        // With one setup it is drawn as the stock it leaves too.
+        // A job of one setup: what it leaves is drawn too.
         let mut single = leftover_app(&dir);
         single.doc.setups.pop();
         let _ = single.refresh_left_stock();
-        assert!(look(0, &single).0 > 1000);
+        assert!(end(0, &single).unwrap().0 > 1000);
         // The example is not simulated: its setup is drawn as its block.
         let mut sample = app();
         sample.doc = Document::sample();
-        assert_eq!(look(0, &sample).0, 0);
+        assert_eq!(start(0, &sample).0, 0);
+        assert_eq!(end(0, &sample), None);
     }
     #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
@@ -5179,7 +5188,7 @@ flood = { pin = 8 }
         assert_eq!(crate::ui::stock_note(&a), None);
         let _ = a.view();
         // Nothing to simulate without the part; one setup is simulated for
-        // its picture in the browser.
+        // the browser's picture of what it leaves.
         let mut single = leftover_app(&dir);
         single.doc.setups.pop();
         assert!(single.left_key().is_some());
@@ -5319,7 +5328,8 @@ flood = { pin = 8 }
             key,
             boxes,
             before: vec![],
-            pictures: vec![],
+            after: vec![],
+            surfaces: vec![],
         };
         let checks = crate::HoldingChecks {
             key: held,

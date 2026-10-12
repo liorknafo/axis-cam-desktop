@@ -232,7 +232,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Set the machine, work coordinate system, stock, part orientation and workholding for the current setup."
         }
         SelectSetup(_) => {
-            "Make this setup active and show its part orientation and operations. Each setup represents a machining position or reclamping stage. The picture shows the stock as this setup leaves it, seen as its 3D view first shows it, the cut faces in green. Until the job has been simulated it shows the block the setup starts from."
+            "Make this setup active and show its part orientation and operations. Each setup represents a machining position or reclamping stage. The picture shows the stock as this setup starts, in its jaws or clamps, seen as its 3D view first shows it: its block, or what the earlier setups left it, the cut faces in green."
         }
         SelectOp(_) => {
             "Open this operation's parameters. The tabs guide you through the same tool, geometry, heights, passes and linking workflow used by CAM systems."
