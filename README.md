@@ -299,6 +299,9 @@ left of the toolbar:
   toolbar has **Control** and **Setup**, and the red **E-STOP** while
   connected.
 
+As in Fusion 360, each toolbar button has an icon above its label, and the
+switcher shows the open workspace's icon.
+
 Picking MANUFACTURE goes back to the page left for MACHINE. While the
 machine moves (a tool run, held or paused, a probe, a jog or homing) the
 switcher stays on MACHINE and says "Manufacture opens when the machine

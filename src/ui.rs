@@ -48,28 +48,47 @@ pub(crate) fn btn<'a>(label: impl Into<String>, msg: Message, active: bool) -> H
     let b = button(text(label.clone()).size(12))
         .on_press(msg)
         .padding([7, 10])
-        .style(move |_, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            button::Style {
-                background: Some(
-                    if active {
-                        Color::from_rgb8(223, 237, 249)
-                    } else if hovered {
-                        Color::from_rgb8(235, 240, 246)
-                    } else {
-                        Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                text_color: if active { BLUE } else { INK },
-                border: Border {
-                    radius: 4.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        });
+        .style(move |_, status| flat(active, status));
     HelpButton::new(b, &action, label)
+}
+/// A flat button's look: blue while `active`, shaded under the pointer.
+fn flat(active: bool, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(
+            if active {
+                Color::from_rgb8(223, 237, 249)
+            } else if hovered {
+                Color::from_rgb8(235, 240, 246)
+            } else {
+                Color::TRANSPARENT
+            }
+            .into(),
+        ),
+        text_color: if active { BLUE } else { INK },
+        border: Border {
+            radius: 4.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+/// A toolbar button with its icon over the label, like Fusion 360's.
+fn tool_btn<'a>(icon: &'static [u8], label: &str, msg: Message, active: bool) -> HelpButton<'a> {
+    let action = msg.clone();
+    let b = button(
+        column![tool_icon(icon), text(label.to_string()).size(11)]
+            .spacing(2)
+            .align_x(Alignment::Center),
+    )
+    .on_press(msg)
+    .padding([4, 8])
+    .style(move |_, status| flat(active, status));
+    HelpButton::new(b, &action, label)
+}
+fn tool_icon<'a>(icon: &'static [u8]) -> widget::Svg<'a> {
+    // ponytail: hashes the few hundred bytes every frame; keep handles on App if that ever shows.
+    svg(svg::Handle::from_memory(icon)).width(24).height(24)
 }
 /// A button on the dark application bar.
 fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
@@ -127,8 +146,15 @@ fn switcher(app: &App) -> Element<'_, Message> {
         .padding([7, 12])
         .into()
     };
+    let icon = if app.page == Page::Control || app.locked() {
+        include_bytes!("../assets/tb-machine.svg").as_slice()
+    } else {
+        include_bytes!("../assets/tb-manufacture.svg")
+    };
     help::wrap(
-        picker,
+        row![tool_icon(icon), picker]
+            .spacing(6)
+            .align_y(Alignment::Center),
         Help::text(
             "Workspace",
             "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC program. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
@@ -368,50 +394,39 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let mut top_row = row![switcher(app), rule::vertical(1)]
         .spacing(5)
         .align_y(Alignment::Center);
+    let pages = [
+        (Page::Machines, "Machine library", include_bytes!("../assets/tb-machine.svg").as_slice()),
+        (Page::Tools, "Tools", include_bytes!("../assets/tb-tools.svg")),
+        (Page::Materials, "Materials", include_bytes!("../assets/tb-materials.svg")),
+        (Page::Workholding, "Workholding", include_bytes!("../assets/tb-workholding.svg")),
+        (Page::Ai, "AI planner", include_bytes!("../assets/tb-ai.svg")),
+        (Page::Audit, "Operation support", include_bytes!("../assets/tb-support.svg")),
+    ];
     top_row = if manufacture {
-        top_row.extend([
-            btn(
-                "Machine library",
-                Message::Page(Page::Machines),
-                app.page == Page::Machines,
-            )
-            .into(),
-            btn("Tools", Message::Page(Page::Tools), app.page == Page::Tools).into(),
-            btn(
-                "Materials",
-                Message::Page(Page::Materials),
-                app.page == Page::Materials,
-            )
-            .into(),
-            btn(
-                "Workholding",
-                Message::Page(Page::Workholding),
-                app.page == Page::Workholding,
-            )
-            .into(),
-            btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai).into(),
-            btn(
-                "Operation support",
-                Message::Page(Page::Audit),
-                app.page == Page::Audit,
-            )
-            .into(),
-        ])
+        top_row.extend(pages.map(|(page, label, icon)| {
+            tool_btn(icon, label, Message::Page(page), app.page == page).into()
+        }))
     } else {
         top_row
-            .push(btn(
+            .push(tool_btn(
+                include_bytes!("../assets/tb-control.svg"),
                 "Control",
                 Message::ControlSetup(false),
                 !app.machine_setup,
             ))
-            .push(btn("Setup", Message::ControlSetup(true), app.machine_setup))
+            .push(tool_btn(
+                include_bytes!("../assets/tb-setup.svg"),
+                "Setup",
+                Message::ControlSetup(true),
+                app.machine_setup,
+            ))
     };
     top_row = top_row.push(space().width(Fill));
     if app.control.is_some() {
         top_row = top_row.push(estop());
     }
     let docbar = container(top_row)
-        .height(48)
+        .height(62)
         .padding([6, 12])
         .style(panel_style);
     let body: Element<_> = match app.page {
