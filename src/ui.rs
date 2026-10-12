@@ -88,7 +88,7 @@ fn tool_btn<'a>(icon: &'static [u8], label: &str, msg: Message, active: bool) ->
 }
 fn tool_icon<'a>(icon: &'static [u8]) -> widget::Svg<'a> {
     // ponytail: hashes the few hundred bytes every frame; keep handles on App if that ever shows.
-    svg(svg::Handle::from_memory(icon)).width(24).height(24)
+    svg(svg::Handle::from_memory(icon)).width(28).height(28)
 }
 /// A button on the dark application bar.
 fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
@@ -426,7 +426,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         top_row = top_row.push(estop());
     }
     let docbar = container(top_row)
-        .height(62)
+        .height(66)
         .padding([6, 12])
         .style(panel_style);
     let body: Element<_> = match app.page {

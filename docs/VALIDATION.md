@@ -129,6 +129,18 @@ A hand on the hardware E-stop for every step; the mushroom's power cutoff is not
 ## Toolbar icons (LIO-130)
 
 - Not a test: inspected on Windows (12 October 2026, debug build, same simulated setup as LIO-127). Each toolbar button shows its icon above the label. MANUFACTURE: Machine library, Tools, Materials, Workholding, AI planner and Operation support. MACHINE: Control and Setup. The switcher shows the open workspace's icon. The open page's button is blue, as before. While tool run 1 cut, the locked switcher kept the MACHINE icon.
+- Redrawn after review, because the first icons were grey outlines that looked almost the same at toolbar size. Each icon is now a filled silhouette in its own colour, shown at 28 px:
+  - Machine library: a blue gantry with a gold spindle.
+  - Tools: a gold end mill.
+  - Materials: brass, aluminium and wood slabs.
+  - Workholding: a red vise.
+  - AI planner: purple sparkles.
+  - Operation support: a teal clipboard.
+  - Control: a green start button inside jog arrows.
+  - Setup: a slate gear.
+  - Manufacture: a steel part with an orange toolpath.
+
+  Re-inspected on Windows in MACHINE, on Start and on the Work page with the ribbon. Not a test.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 3 failed. Two are the STEP tests, as before. The third, `the_control_page_renders_in_every_state`, timed out under the full suite's load and passed alone.
 
 ## Planner analysis and checks (no AI)
