@@ -659,33 +659,8 @@ impl Viewport<'_> {
         if self.show_stock {
             if let (Some(volume), Some(current)) = (&sim.volume, sim.frame) {
                 if let Some(surface) = &sim.stock_surface {
-                    for triangle in &surface.triangles {
-                        let source = triangle.map(|i| surface.vertices[i]);
-                        let points = source.map(|p| volume.frame.transfer(p, current));
-                        let n = normal(&points);
-                        let outer = (0..3).any(|k| {
-                            source
-                                .iter()
-                                .all(|p| (p[k] - volume.bounds.min[k]).abs() < 0.01)
-                                || source
-                                    .iter()
-                                    .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
-                        });
-                        let light = 0.58 + 0.29 * n[2].abs() + 0.13 * n[0].abs();
-                        let base = if outer {
-                            [219., 183., 113.]
-                        } else {
-                            [103., 181., 151.]
-                        };
-                        face(
-                            &points,
-                            [
-                                (base[0] * light) as u8,
-                                (base[1] * light) as u8,
-                                (base[2] * light) as u8,
-                                255,
-                            ],
-                        );
+                    for (points, color) in stock_triangles(volume, surface, current) {
+                        face(&points, color);
                     }
                 }
             }
@@ -1188,6 +1163,91 @@ fn line(frame: &mut Frame, points: &[Point], c: Color, w: f32) {
         }
     });
     frame.stroke(&path, Stroke::default().with_color(c).with_width(w))
+}
+/// The colour the view gives a face of stock: tan for a face of the original
+/// block (`outer`), green where it was cut, shaded by its normal.
+fn stock_shade(points: &[[f32; 3]], outer: bool) -> [u8; 4] {
+    let n = normal(points);
+    let light = 0.58 + 0.29 * n[2].abs() + 0.13 * n[0].abs();
+    let base = if outer {
+        [219., 183., 113.]
+    } else {
+        [103., 181., 151.]
+    };
+    [
+        (base[0] * light) as u8,
+        (base[1] * light) as u8,
+        (base[2] * light) as u8,
+        255,
+    ]
+}
+/// The triangles of `surface`, the simulated stock of `volume`, in the frame
+/// `current` (mm), each with the colour the view gives it.
+pub(crate) fn stock_triangles<'a>(
+    volume: &'a crate::volume::Volume,
+    surface: &'a crate::stock_surface::SurfaceMesh,
+    current: crate::volume::Frame,
+) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
+    surface.triangles.iter().map(move |triangle| {
+        let source = triangle.map(|i| surface.vertices[i]);
+        let points = source.map(|p| volume.frame.transfer(p, current));
+        let outer = (0..3).any(|k| {
+            source
+                .iter()
+                .all(|p| (p[k] - volume.bounds.min[k]).abs() < 0.01)
+                || source
+                    .iter()
+                    .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
+        });
+        (points, stock_shade(&points, outer))
+    })
+}
+/// The faces of a block of stock `b` (mm), two triangles each, coloured as
+/// the view colours the original block's.
+pub(crate) fn box_triangles(b: crate::mesh::Bounds) -> Vec<([[f32; 3]; 3], [u8; 4])> {
+    let v = box_vertices(b);
+    [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7],
+        [0, 1, 5, 4],
+        [1, 2, 6, 5],
+        [2, 3, 7, 6],
+        [3, 0, 4, 7],
+    ]
+    .into_iter()
+    .flat_map(|[a, b, c, d]| [[v[a], v[b], v[c]], [v[a], v[c], v[d]]])
+    .map(|t| (t, stock_shade(&t, true)))
+    .collect()
+}
+/// The pixel size of the setup browser's stock pictures: twice the size they
+/// are shown at, for smooth edges.
+pub(crate) const PICTURE: (u32, u32) = (128, 96);
+/// A still picture of stock, `triangles` in a setup's frame, seen as the 3D
+/// view first shows a setup and filling the frame; clear around it. None
+/// without a triangle.
+pub(crate) fn stock_picture(
+    triangles: &[([[f32; 3]; 3], [u8; 4])],
+) -> Option<iced::widget::image::Handle> {
+    let (w, h) = PICTURE;
+    let mut all = crate::mesh::Bounds {
+        min: [f32::INFINITY; 3],
+        max: [f32::NEG_INFINITY; 3],
+    };
+    for p in triangles.iter().flat_map(|(t, _)| t) {
+        all.min = std::array::from_fn(|k| all.min[k].min(p[k]));
+        all.max = std::array::from_fn(|k| all.max[k].max(p[k]));
+    }
+    if !all.min.iter().chain(&all.max).all(|v| v.is_finite()) {
+        return None;
+    }
+    let p = Projector::filling(Camera::default(), (w as f32, h as f32), &[all], 0.9);
+    let mut rgba = vec![0; (w * h * 4) as usize];
+    let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+    for (t, color) in triangles {
+        let vertices = t.map(|v| (p.p(v), p.depth(v)));
+        raster_triangle(&mut rgba, &mut depths, w, h, vertices, *color);
+    }
+    Some(iced::widget::image::Handle::from_rgba(w, h, rgba))
 }
 fn box_vertices(bounds: crate::mesh::Bounds) -> [[f32; 3]; 8] {
     let [x, y, z] = bounds.min;

@@ -5059,6 +5059,59 @@ flood = { pin = 8 }
         let _ = a.view();
     }
     #[test]
+    fn the_browser_draws_the_stock_each_setup_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        // Setup 1 faces the top; setup 2, turned over, faces the other side.
+        let mut a = leftover_app(&dir);
+        // How many drawn pixels are green, a cut face's colour, and the drawn
+        // pixels' height over their width.
+        let look = |si: usize, a: &App| {
+            let iced::widget::image::Handle::Rgba { width, pixels, .. } =
+                crate::ui::stock_picture(a, si).unwrap()
+            else {
+                unreachable!()
+            };
+            let green = pixels
+                .chunks(4)
+                .filter(|px| px[3] > 0 && px[1] > px[0].saturating_add(30))
+                .count();
+            let rows: Vec<_> = pixels.chunks(width as usize * 4).collect();
+            let drawn = |row: &[u8]| row.chunks(4).any(|px| px[3] > 0);
+            let top = rows.iter().position(|r| drawn(r)).unwrap();
+            let bottom = rows.iter().rposition(|r| drawn(r)).unwrap();
+            let (left, right) = (0..width as usize)
+                .filter(|x| rows.iter().any(|r| r[x * 4 + 3] > 0))
+                .fold((usize::MAX, 0), |(l, r), x| (l.min(x), r.max(x)));
+            (green, (bottom - top) as f32 / (right - left) as f32)
+        };
+        // Not simulated yet: each setup is drawn as the block it starts
+        // from, nothing cut, and each box is drawn once.
+        let (green, block) = look(0, &a);
+        assert_eq!(green, 0);
+        assert_eq!(look(1, &a).0, 0);
+        let _ = look(1, &a);
+        assert_eq!(a.box_pictures.borrow().len(), 2);
+        let _ = a.view();
+        // Simulated: each setup is drawn as the stock it leaves, its faced
+        // top green, setup 1's 4 mm lower than its block.
+        let _ = a.refresh_left_stock();
+        assert!(a.left_stock.pictures.iter().all(Option::is_some));
+        let (green, faced) = look(0, &a);
+        assert!(green > 1000, "{green}");
+        assert!(faced < block - 0.01, "{faced} {block}");
+        assert!(look(1, &a).0 > 1000);
+        let _ = a.view();
+        // With one setup it is drawn as the stock it leaves too.
+        let mut single = leftover_app(&dir);
+        single.doc.setups.pop();
+        let _ = single.refresh_left_stock();
+        assert!(look(0, &single).0 > 1000);
+        // The example is not simulated: its setup is drawn as its block.
+        let mut sample = app();
+        sample.doc = Document::sample();
+        assert_eq!(look(0, &sample).0, 0);
+    }
+    #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = leftover_app(&dir);
@@ -5125,10 +5178,11 @@ flood = { pin = 8 }
         let _ = a.update(Message::SelectSetup(0));
         assert_eq!(crate::ui::stock_note(&a), None);
         let _ = a.view();
-        // Nothing to simulate with one setup or without the part.
+        // Nothing to simulate without the part; one setup is simulated for
+        // its picture in the browser.
         let mut single = leftover_app(&dir);
         single.doc.setups.pop();
-        assert_eq!(single.left_key(), None);
+        assert!(single.left_key().is_some());
         let mut no_part = leftover_app(&dir);
         no_part.imported_mesh = None;
         assert_eq!(no_part.left_key(), None);
@@ -5265,6 +5319,7 @@ flood = { pin = 8 }
             key,
             boxes,
             before: vec![],
+            pictures: vec![],
         };
         let checks = crate::HoldingChecks {
             key: held,

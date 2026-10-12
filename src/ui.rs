@@ -697,8 +697,11 @@ fn browser(app: &App) -> Element<'_, Message> {
                 .size(10)
             ]
             .spacing(2)
+            .width(Fill),
+            stock_picture(app, si).map(|p| widget::image(p).width(64).height(48))
         ]
-        .spacing(6);
+        .spacing(6)
+        .align_y(Alignment::Center);
         tree = tree.push(HelpButton::new(
             button(label)
                 .on_press(Message::SelectSetup(si))
@@ -789,6 +792,28 @@ fn browser(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .style(panel_style)
         .into()
+}
+/// The picture of the stock setup `si` leaves, for the browser
+/// (`LeftStock::pictures`; the last one worked out while the job is worked
+/// out again), else of the box it starts from (`App::known_stock`).
+pub(crate) fn stock_picture(app: &App, si: usize) -> Option<widget::image::Handle> {
+    if app.left_key().is_some()
+        && let Some(Some(cut)) = app.left_stock.pictures.get(si)
+    {
+        return Some(cut.clone());
+    }
+    let stock = app.known_stock(si).0?;
+    let mut drawn = app.box_pictures.borrow_mut();
+    if let Some((_, picture)) = drawn.iter().find(|(b, _)| *b == stock) {
+        return Some(picture.clone());
+    }
+    let picture = crate::viewport::stock_picture(&crate::viewport::box_triangles(stock))?;
+    // ponytail: a few boxes per job, so all are kept until there are many.
+    if drawn.len() > 32 {
+        drawn.clear();
+    }
+    drawn.push((stock, picture.clone()));
+    Some(picture)
 }
 /// The 3D view of the active setup, as the Work page shows it: the part,
 /// stock, workholding, the preview and the machine's tool while a tool run of

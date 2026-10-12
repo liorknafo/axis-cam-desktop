@@ -302,6 +302,10 @@ pub struct LeftStock {
     /// which its holding checks are made: None where `boxes` is, and where
     /// nothing was cut before it.
     pub before: Vec<Option<std::sync::Arc<volume::Volume>>>,
+    /// A picture of the stock each setup leaves, in its frame, for the
+    /// browser (`viewport::stock_picture`): None where nothing was cut by its
+    /// end and after an operation that failed.
+    pub pictures: Vec<Option<iced::widget::image::Handle>>,
 }
 /// What the holding checks found for each setup of a job, worked out with
 /// `LeftStock` (`holding_checks`) for the job and its workholding whose
@@ -386,34 +390,71 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
 /// simulated on `mesh` (`simulation::sequence_walk`, as the simulation itself
 /// gives it to the setup's operations), and the stock they left it: None for
 /// the first setup, and for a setup after an operation or setup that failed.
-/// A setup without an enabled operation has its box too. For the job whose
-/// fingerprint is `key`.
+/// A setup without an enabled operation has its box too. The whole job is
+/// simulated, for the stock each setup leaves, which the browser draws. For
+/// the job whose fingerprint is `key`.
 fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
+    use std::cell::{Cell, RefCell};
     let mut boxes = vec![None; doc.setups.len()];
     let mut before = vec![None; doc.setups.len()];
     // The stock after the last operation so far.
-    let last: std::cell::RefCell<Option<std::sync::Arc<volume::Volume>>> = Default::default();
-    // The last setup's boxes are known before its first operation: when it has
-    // one, nothing needs simulating after that. When it has none, the setups
-    // before it are simulated whole, for its box.
-    let stop = doc.setups.last().and_then(|setup| {
-        let first = setup.operations.iter().position(|o| o.enabled)?;
-        Some((doc.setups.len() - 1, first))
-    });
+    let last: RefCell<Option<std::sync::Arc<volume::Volume>>> = Default::default();
+    // The stock each setup leaves while every operation so far has worked:
+    // what it starts from, then what each of its operations leaves.
+    let after = RefCell::new(vec![None; doc.setups.len()]);
+    let failed = Cell::new(false);
     simulation::sequence_walk(
         doc,
         mesh,
-        stop,
-        |_, _, _| {},
-        |_, _, stock| *last.borrow_mut() = Some(std::sync::Arc::new(stock.clone())),
+        None,
+        |si, _, result| {
+            if result.is_err() {
+                failed.set(true);
+                after.borrow_mut()[si] = None;
+            }
+        },
+        |si, _, stock| {
+            let stock = std::sync::Arc::new(stock.clone());
+            after.borrow_mut()[si] = Some(stock.clone());
+            *last.borrow_mut() = Some(stock);
+        },
         |si, stock| {
             boxes[si] = stock;
             if stock.is_some() {
                 before[si] = last.borrow().clone();
             }
+            if !failed.get() {
+                after.borrow_mut()[si] = last.borrow().clone();
+            }
         },
     );
-    LeftStock { key, boxes, before }
+    // ponytail: meshed in the run the holding checks wait for; a run of its
+    // own if that delay ever shows.
+    let pictures = after
+        .into_inner()
+        .iter()
+        .zip(&doc.setups)
+        .map(|(volume, setup)| {
+            let volume = volume.as_deref()?;
+            let surface = stock_surface::Snapshot {
+                bounds: volume.bounds,
+                frame: volume.frame,
+                cuts: volume.cuts.clone(),
+                detail: stock_surface::Detail::Draft,
+            }
+            .build()
+            .ok()?;
+            let current = volume::Frame::new(setup, mesh);
+            let triangles: Vec<_> = viewport::stock_triangles(volume, &surface, current).collect();
+            viewport::stock_picture(&triangles)
+        })
+        .collect();
+    LeftStock {
+        key,
+        boxes,
+        before,
+        pictures,
+    }
 }
 /// The holding checks of each later setup of `doc` whose box `left` knows,
 /// as the export makes them (`post::held_walked`): the band its vise closes
@@ -480,6 +521,9 @@ pub struct App {
     /// The workholding warning of the preview shown (`ui::holding_warning`)
     /// and what it was worked out from.
     holding_note: std::cell::RefCell<Option<(String, HoldingNote)>>,
+    /// The browser's pictures of stock boxes, drawn once per box
+    /// (`ui::stock_picture`).
+    pub(crate) box_pictures: std::cell::RefCell<Vec<(mesh::Bounds, iced::widget::image::Handle)>>,
     post_epoch: u64,
     pub settings: settings::Settings,
     settings_path: PathBuf,
@@ -830,6 +874,7 @@ impl App {
             holding_checks: HoldingChecks::default(),
             left_job: None,
             holding_note: std::cell::RefCell::new(None),
+            box_pictures: Default::default(),
             post_epoch: 0,
             settings: settings::load(&settings_path),
             settings_path,
@@ -1548,10 +1593,9 @@ impl App {
     }
     /// The fingerprint of the job as the stock the earlier setups leave is
     /// concerned (`left_fingerprint`). None when there is nothing to work out:
-    /// fewer than two setups, the example part (which is not simulated) or no
-    /// part loaded.
+    /// no setup, the example part (which is not simulated) or no part loaded.
     pub(crate) fn left_key(&self) -> Option<u64> {
-        if self.doc.setups.len() < 2 || self.is_sample() {
+        if self.doc.setups.is_empty() || self.is_sample() {
             return None;
         }
         left_fingerprint(&self.doc, self.part_mesh()?)
@@ -1649,13 +1693,18 @@ impl App {
     /// workholding has changed since and no run is working on it: on the
     /// blocking pool (in line in the smoke run), as `refresh_post` checks the
     /// program. A change of the workholding alone keeps the stock worked out
-    /// and checks it again.
+    /// and checks it again. Only in the Manufacture workspace: on the Control
+    /// page a run of it would hold Cycle Start back between tool runs.
     fn refresh_left_stock(&mut self) -> Task<Message> {
         let (Some(key), Some(held)) = (self.left_key(), self.holding_key()) else {
             return Task::none();
         };
         let known = self.left_stock.key == key;
-        if self.left_job.is_some() || self.locked() || (known && self.holding_checks.key == held) {
+        if self.left_job.is_some()
+            || self.locked()
+            || self.page == Page::Control
+            || (known && self.holding_checks.key == held)
+        {
             return Task::none();
         }
         let Some(mesh) = self.part_mesh().cloned() else {

@@ -143,6 +143,17 @@ A hand on the hardware E-stop for every step; the mushroom's power cutoff is not
   Re-inspected on Windows in MACHINE and on the Work page with the ribbon. Not a test.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 3 failed. Two are the STEP tests, as before. The third, `the_control_page_renders_in_every_state`, timed out under the full suite's load and passed alone.
 
+## Stock pictures in the setup browser (LIO-132)
+
+- `the_browser_draws_the_stock_each_setup_leaves` uses the flipped fixture: setup 1 faces the top; setup 2, turned over, faces the other side.
+  - Before the job is simulated, both setups are drawn as plain blocks with no green (cut) pixels, and each box is drawn once.
+  - After the job is simulated, each setup's picture has over 1,000 green pixels. Setup 1's block is drawn lower than its original block: the drawn height over width falls by more than 0.01.
+  - A one-setup job gets its picture too. The example, which is not simulated, keeps its plain block.
+- `the_setup_editor_says_the_stock_is_the_original_until_the_earlier_setups_are_simulated` now expects a one-setup job to be simulated, for its picture.
+- The stock run no longer starts on the Control page. It first failed `a_setup_runs_tool_run_by_tool_run_with_a_manual_tool_change`: between tool runs, a run working out a one-setup job held Cycle Start back. With the run kept to the MANUFACTURE workspace, all 207 smoke tests pass. The smoke suite takes about 65 s instead of 42 s, because more test apps now simulate and mesh their stock.
+- Not a test: inspected on Windows (12 October 2026, debug build). The fixture block has Facing and Drilling in setup 1 and a flipped setup that faces the other side. The browser showed setup 1's faced top in green with its five drilled holes as dots, and the flipped setup's faced side with the through-holes. The pictures were ready within about 3 s of opening the Work page.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 815 passed, 2 failed (the two STEP tests, as before).
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.
