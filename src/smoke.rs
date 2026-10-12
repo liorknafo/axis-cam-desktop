@@ -1537,7 +1537,11 @@ flood = { pin = 8 }
     /// CAM travel matches the profile: Facing (T1) then Drilling (T3), two
     /// tool runs.
     fn run_app(dir: &std::path::Path) -> App {
-        let mut a = profile_app(dir, FAST);
+        run_app_on(dir, FAST)
+    }
+
+    fn run_app_on(dir: &std::path::Path, profile: &str) -> App {
+        let mut a = profile_app(dir, profile);
         let mut m = a.doc.machines.pop().unwrap();
         for (k, v) in [
             ("x", "390"),
@@ -1788,6 +1792,205 @@ flood = { pin = 8 }
         tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);
         let _ = a.view();
         assert!(has(&a, "Set machine zero again"), "{:?}", problems(&a));
+    }
+
+    /// FAST with a probe input. Its simulated block (`control::sim_block`)
+    /// is X 145…245, Y 90…190, its top at machine Z -40.
+    fn probe_profile() -> String {
+        format!("{FAST}[inputs]\nprobe = {{ pin = 13, active_low = true }}\n")
+    }
+
+    /// A 10 mm touch plate probed at `feed` mm/min, set before connecting.
+    fn plate(a: &mut App, feed: &str) {
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert("probe_plate".into(), "10".into());
+        m.p.insert("probe_feed".into(), feed.into());
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+    }
+
+    /// Ticks until the probe has ended; how it ended.
+    fn probed(a: &mut App) -> (bool, String) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let _ = a.update(Message::Tick);
+            let _ = a.view();
+            let c = conn(a);
+            if let (false, Some(p)) = (c.probing(), &c.probed) {
+                return p.clone();
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for the probe: {:?} at {:?} {:?}",
+                c.snapshot.state,
+                c.snapshot.machine_pos,
+                c.snapshot.log.iter().rev().take(5).collect::<Vec<_>>()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn blocked(a: &App) -> String {
+        conn(a).probe_blocked().unwrap_or_default()
+    }
+
+    #[test]
+    fn probe_z_sets_work_z_at_the_plate_and_lifts() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        a.page = Page::Control;
+        idle(&mut a);
+        assert!(
+            blocked(&a).contains("Z has no machine position"),
+            "{}",
+            blocked(&a)
+        );
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        assert!(!conn(&a).probing());
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "machine zero", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        // From Z -10 the 20 mm probe ends at Z -30, above the block: a miss
+        // sets nothing.
+        mdi(&mut a, "G0 X195 Y140 Z-10");
+        assert_eq!(blocked(&a), "");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        assert!(a.locked());
+        let _ = a.view();
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.contains("No contact down to machine Z -30.000"),
+            "{message}"
+        );
+        assert!(conn(&a).snapshot.work_offset[2].abs() < 1e-9);
+        assert!(!a.locked());
+        // From Z -30: contact at the block's top, Z -40, which becomes the
+        // plate's 10 mm; then the tool lifts 5 mm.
+        mdi(&mut a, "G0 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        tick_until(&mut a, 3.0, "the retract", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[2] - -35.).abs() < 0.06
+        });
+        let s = &conn(&a).snapshot;
+        assert!(
+            (s.work_offset[2] - -50.).abs() < 0.06,
+            "{:?}",
+            s.work_offset
+        );
+        assert!((s.work_pos[2] - 15.).abs() < 0.06, "{:?}", s.work_pos);
+        assert!(!a.locked());
+    }
+
+    #[test]
+    fn probe_z_waits_for_a_probe_input_a_plate_and_a_free_input() {
+        use crate::control::Action;
+        // No probe input in the profile.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        assert!(blocked(&a).contains("no probe input"), "{}", blocked(&a));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        zeroed(&mut a);
+        assert_eq!(blocked(&a), "");
+        // The tool inside the block: the probe input is active.
+        mdi(&mut a, "G53 G0 Z-45");
+        tick_until(&mut a, 2.0, "the probe input", |_| true);
+        assert!(
+            blocked(&a).contains("probe input is active"),
+            "{}",
+            blocked(&a)
+        );
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        assert!(!conn(&a).probing());
+        mdi(&mut a, "G53 G0 Z-30");
+        assert_eq!(blocked(&a), "");
+        // Beside the block at the bottom of Z nothing is left to probe: the
+        // driver refuses and says why.
+        mdi(&mut a, "G53 G0 X10 Z-80");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.contains("not started, the target is where the machine already is"),
+            "{message}"
+        );
+        assert!(!a.locked());
+        // A plate without a thickness, saved while connected.
+        a.machine_draft = a.doc.machines[0].clone();
+        a.machine_draft.p.remove("probe_plate");
+        let _ = a.update(Message::SaveMachine);
+        assert!(
+            blocked(&a).contains("Touch plate thickness"),
+            "{}",
+            blocked(&a)
+        );
+        // E-stop.
+        a.machine_draft.p.insert("probe_plate".into(), "10".into());
+        let _ = a.update(Message::SaveMachine);
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| {
+            s.state == Some(uc100::controller::State::EStop)
+        });
+        assert!(blocked(&a).contains("not Idle"), "{}", blocked(&a));
+        let _ = a.view();
+    }
+
+    #[test]
+    fn e_stop_stops_a_probe() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        plate(&mut a, "60");
+        zeroed(&mut a);
+        mdi(&mut a, "G53 G0 Z-25");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        tick_until(&mut a, 2.0, "the probe", |s| s.state != Some(State::Idle));
+        let _ = a.update(Message::MachineEStop);
+        let (ok, message) = probed(&mut a);
+        assert!(!ok && message.contains("E-stop"), "{message}");
+        assert!(!a.locked());
+        assert!((conn(&a).snapshot.work_offset[2] - -20.).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_tool_change_probes_the_reference_surface() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.view();
+        // The plate on the block (top at machine Z -40, work Z -20): the
+        // surface under it is work Z -30.
+        mdi(&mut a, "G53 G0 Z-30");
+        let _ = a.update(Message::Run(R::ProbeReference));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        let reference = run_of(&a).reference.unwrap();
+        assert!((reference - -30.).abs() < 0.06, "{reference}");
+        // Z zeroed wrong, as a new tool would be: probing the reference
+        // puts it back and counts as the touch-off.
+        mdi(&mut a, "G53 G0 Z-30");
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
+        tick_until(&mut a, 2.0, "work Z", |s| s.work_pos[2].abs() < 1e-6);
+        let _ = a.update(Message::Run(R::ProbeFromReference));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        tick_until(&mut a, 2.0, "work Z set", |s| {
+            (s.work_offset[2] - -20.).abs() < 0.06
+        });
+        assert!(run_of(&a).touched);
+        let _ = a.view();
     }
 
     #[test]

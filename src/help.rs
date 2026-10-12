@@ -516,6 +516,9 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         }
         MdiText(_) => "One line of G-code, for example G0 X10 Y10.",
         MdiSend => "Run the line now. Works when Idle, or while a program is paused.",
+        ProbeZ => {
+            "With the touch plate on the stock top under the tool and the probe clipped on, feed Z down until the tool touches the plate, up to the maximum probe distance. Work Z at the contact becomes the plate's thickness, so the stock top is Z 0; then the tool lifts. Without contact nothing is set."
+        }
     }
 }
 
@@ -541,6 +544,12 @@ fn run_help(a: &crate::run::Action) -> &'static str {
         }
         ZFromReference => {
             "With the new tool touching the recorded reference surface, set work Z here to the reference's Z. X and Y zero stay as they are."
+        }
+        ProbeReference => {
+            "With the touch plate on a surface that stays put and the tool that is zeroed above it, probe down onto the plate and keep the surface's work Z (the contact less the plate's thickness) for the next tool's touch-off."
+        }
+        ProbeFromReference => {
+            "With the touch plate on the recorded reference surface and the new tool above it, probe down onto the plate and set work Z so that the surface is at the reference's Z. X and Y zero stay as they are."
         }
     }
 }
@@ -899,6 +908,22 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "post_air") => (
             "LinuxCNC output used for operations set to Air: M7 (mist) or M8 (flood), whichever is wired to the air blast.",
+            None,
+        ),
+        (_, "probe_plate") => (
+            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0.",
+            None,
+        ),
+        (_, "probe_feed") => (
+            "How fast Z feeds down to the plate, in mm/min. Slow is accurate: the machine stops a little past the contact, and AXIS CAM uses where the contact was.",
+            None,
+        ),
+        (_, "probe_distance") => (
+            "How far down a probe goes at most, in mm, and never below the bottom of Z. Without contact by then it stops and nothing is set.",
+            None,
+        ),
+        (_, "probe_retract") => (
+            "How far the tool lifts after the contact, in mm, so the plate can come away. 0 leaves it on the plate.",
             None,
         ),
         (_, "origin") => (

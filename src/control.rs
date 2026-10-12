@@ -1,11 +1,11 @@
 //! The connection to a UC100 machine controller: the driver's `Controller`
 //! for one machine of the project, real (USB) or simulated.
-use crate::model::{Machine, get};
+use crate::model::{Fields, Machine, get, post_setting};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use uc100::config::MachineConfig;
-use uc100::controller::{Command, Controller, Snapshot, State};
+use uc100::controller::{Block, Command, Controller, Snapshot, State};
 use uc100::diagnostics::{INPUT_PINS, InputTracker};
 use uc100::gcode::Spindle;
 use uc100::protocol::Status;
@@ -32,6 +32,89 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
         return Err("Choose the machine's UC100 profile file.".into());
     }
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
+}
+
+/// A UC100 machine's touch plate (Machine library): mm and mm/min.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probe {
+    /// The plate's thickness.
+    pub plate: f64,
+    pub feed: f64,
+    /// How far down a probe goes at most.
+    pub distance: f64,
+    /// How far the tool lifts after contact.
+    pub retract: f64,
+}
+
+/// The machine's touch-plate settings, or what is wrong with them.
+pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
+    let mut e = vec![];
+    let mut value = |key, what: &str, lo: f64, hi: f64, unit: &str| match post_setting(p, key)
+        .trim()
+        .parse::<f64>()
+    {
+        Ok(v) if (lo..=hi).contains(&v) => v,
+        _ => {
+            e.push(format!("{what} must be from {lo} to {hi} {unit}."));
+            0.
+        }
+    };
+    let probe = Probe {
+        plate: value("probe_plate", "Touch plate thickness", 0., 100., "mm"),
+        feed: value("probe_feed", "Probe feed", 1., 1000., "mm/min"),
+        distance: value("probe_distance", "Maximum probe distance", 0.1, 200., "mm"),
+        retract: value("probe_retract", "Retract after the probe", 0., 100., "mm"),
+    };
+    if e.is_empty() { Ok(probe) } else { Err(e) }
+}
+
+/// What a touch-plate probe straight down sets once the plate is touched.
+/// The plate lies on a surface; its top is the surface + its thickness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Touch {
+    /// The surface is the stock top, work Z 0.
+    WorkZ,
+    /// Record the surface's work Z as the tool-change reference.
+    Reference,
+    /// The surface is the reference, at this work Z.
+    FromReference(f64),
+}
+
+/// A probe move sent and not reported yet.
+struct Probing {
+    touch: Touch,
+    probe: Probe,
+    /// Machine Z it probes down to.
+    target: f64,
+    /// The driver's program outcome and probe result counts before it
+    /// started: the next of each are its. Every probe ends with an outcome,
+    /// also a refused or stopped one.
+    seq: (u64, u64),
+}
+
+/// The work Z to give machine Z `now` so that machine Z `trip` is at work Z
+/// `at`: the machine stops a little past the contact.
+pub fn work_z(at: f64, trip: f64, now: f64) -> f64 {
+    at + now - trip
+}
+
+/// The simulator's block: a box on the middle of the table, its top halfway
+/// down Z, for trying the probe (min and max corners, machine mm). None
+/// without soft limits on X, Y and Z to place it by.
+pub fn sim_block(cfg: &MachineConfig) -> Option<([f64; 3], [f64; 3])> {
+    let mut lo = [0.; 3];
+    let mut hi = [0.; 3];
+    for a in 0..3 {
+        let x = cfg.axes.get(a)?;
+        let (min, max) = (x.soft_min?, x.soft_max?);
+        if a < 2 {
+            let (mid, half) = ((min + max) / 2., ((max - min) / 4.).min(50.));
+            (lo[a], hi[a]) = (mid - half, mid + half);
+        } else {
+            (lo[a], hi[a]) = (min, (min + max) / 2.);
+        }
+    }
+    Some((lo, hi))
 }
 
 /// How often a held jog is sent again: the driver ends a jog that is not
@@ -86,6 +169,9 @@ pub enum Action {
     CalDistance(String),
     CalMeasured(String),
     CalMove,
+    /// Probe Z down onto the touch plate on the stock top: work Z there is
+    /// the plate's thickness.
+    ProbeZ,
 }
 
 /// Steps-per-mm calibration: one commanded move, then the travel measured
@@ -164,6 +250,11 @@ pub struct Connection {
     /// them all on E-stop.
     pub forced: BTreeMap<u8, bool>,
     pub calibration: Calibration,
+    /// The machine's touch-plate settings, or what is wrong with them.
+    pub probe: Result<Probe, Vec<String>>,
+    probing: Option<Probing>,
+    /// How the last probe ended (ok, what it did).
+    pub probed: Option<(bool, String)>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
     /// starve the controller's motion buffer.
     _nap: uc100::macos::ActivityToken,
@@ -180,9 +271,13 @@ impl Connection {
         cfg.controller.simulated = simulated;
         let suffix = if simulated { "-simulated" } else { "" };
         let file = state_dir.join(format!("{}{suffix}.toml", m.id));
+        let controller = Controller::start(cfg.clone(), Some(file));
+        if simulated && let Some((min, max)) = sim_block(&cfg) {
+            controller.send(Command::SimBlock(Some(Block { min, max })));
+        }
         Ok(Self {
             _nap: uc100::macos::prevent_app_nap("AXIS CAM machine control"),
-            controller: Controller::start(cfg.clone(), Some(file)),
+            controller,
             config: cfg,
             machine_id: m.id.clone(),
             simulated,
@@ -204,6 +299,9 @@ impl Connection {
                 measured: String::new(),
                 start: None,
             },
+            probe: probe_settings(&m.p),
+            probing: None,
+            probed: None,
         })
     }
 
@@ -221,6 +319,23 @@ impl Connection {
         }
         if self.snapshot.state == Some(State::EStop) {
             self.forced.clear();
+        }
+        // A probe ends with its outcome, once the machine has stopped.
+        let s = &self.snapshot;
+        if let Some(p) = &self.probing
+            && let Some(o) = s.program_outcome.as_ref().filter(|o| o.seq > p.seq.0)
+            && !matches!(s.state, Some(State::Run | State::Hold | State::Stopping))
+        {
+            let result = s.probe_result.as_ref().filter(|r| o.ok && r.seq > p.seq.1);
+            let ended = match result {
+                Some(r) => Ok(r.tripped.then_some(r.position[2])),
+                None => Err(o.message.clone()),
+            };
+            let p = self.probing.take().unwrap();
+            match ended {
+                Ok(trip) => self.probe_done(p, trip),
+                Err(why) => self.probed = Some((false, why)),
+            }
         }
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
@@ -370,6 +485,7 @@ impl Connection {
                     });
                 }
             }
+            Action::ProbeZ => self.start_probe(Touch::WorkZ),
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
                 self.forced.insert(pin, high);
                 self.send(Command::TestOutput {
@@ -408,9 +524,134 @@ impl Connection {
                     run.touched = true;
                 }
             }
+            R::ProbeReference => self.start_probe(Touch::Reference),
+            R::ProbeFromReference => {
+                if let Some(z) = run.reference {
+                    self.start_probe(Touch::FromReference(z));
+                }
+            }
             _ => {}
         }
         self.run = Some(run);
+    }
+
+    /// Why a touch-plate probe cannot start now; None when it can.
+    pub fn probe_blocked(&self) -> Option<String> {
+        let s = &self.snapshot;
+        let Some(pin) = self.config.inputs.probe else {
+            return Some(
+                "The UC100 profile has no probe input: add it under Inputs in Setup.".into(),
+            );
+        };
+        if let Err(e) = &self.probe {
+            return Some(format!("{} Set it in the Machine library.", e.join(" ")));
+        }
+        if !self.idle() {
+            return Some("The machine is not Idle.".into());
+        }
+        if !s.referenced[2] {
+            return Some(format!(
+                "Z has no machine position (every E-stop clears it): {} first.",
+                if self.home_switches() {
+                    "home"
+                } else {
+                    "set machine zero"
+                }
+            ));
+        }
+        if s.status.as_ref().and_then(|st| st.input_active(pin)) == Some(true) {
+            return Some("The probe input is active: lift the tool off the plate, or check the probe's clip and wiring.".into());
+        }
+        None
+    }
+
+    /// A probe move is under way: planning is locked (`App::locked`).
+    pub fn probing(&self) -> bool {
+        self.probing.is_some()
+    }
+
+    /// Probes straight down, up to the maximum distance or the bottom of Z.
+    fn start_probe(&mut self, touch: Touch) {
+        let (None, Ok(probe)) = (self.probe_blocked(), self.probe.clone()) else {
+            return;
+        };
+        let mut target = self.snapshot.machine_pos;
+        target[2] -= probe.distance;
+        if let Some(lo) = self.config.axes.get(2).and_then(|z| z.soft_min) {
+            target[2] = target[2].max(lo);
+        }
+        let s = &self.snapshot;
+        self.probing = Some(Probing {
+            touch,
+            probe,
+            target: target[2],
+            seq: (
+                s.program_outcome.as_ref().map_or(0, |o| o.seq),
+                s.probe_result.as_ref().map_or(0, |r| r.seq),
+            ),
+        });
+        self.probed = None;
+        // G38.3: a miss is not an error; it is reported as one here.
+        self.send(Command::Probe {
+            target,
+            feed: probe.feed,
+            must_trip: false,
+        });
+    }
+
+    /// A probe ended, Idle: on contact at machine Z `trip`, sets what it is
+    /// for and lifts the tool.
+    fn probe_done(&mut self, p: Probing, trip: Option<f64>) {
+        let Some(trip) = trip else {
+            self.probed = Some((
+                false,
+                format!(
+                    "No contact down to machine Z {:.3}. Check the plate and the probe's clip, jog closer and probe again.",
+                    p.target
+                ),
+            ));
+            return;
+        };
+        let s = &self.snapshot;
+        let (now, plate) = (s.machine_pos[2], p.probe.plate);
+        let message = match p.touch {
+            Touch::Reference => {
+                // The surface under the plate, at today's work offset.
+                let surface = trip - now + s.work_pos[2] - plate;
+                if let Some(run) = &mut self.run {
+                    run.reference = Some(surface);
+                }
+                format!("Reference surface recorded: Z {surface:.3} under the {plate} mm plate.")
+            }
+            Touch::WorkZ | Touch::FromReference(_) => {
+                let at = match p.touch {
+                    Touch::FromReference(z) => z,
+                    _ => 0.,
+                };
+                self.send(Command::SetWork {
+                    axis: 2,
+                    value: work_z(at + plate, trip, now),
+                });
+                if let Some(run) = &mut self.run {
+                    run.touched = true;
+                }
+                format!(
+                    "Work Z set: the plate's top is Z {:.3}, the surface under it Z {at:.3}.",
+                    at + plate
+                )
+            }
+        };
+        let top = self.config.axes.get(2).and_then(|z| z.soft_max);
+        let up = top.map_or(p.probe.retract, |top| p.probe.retract.min(top - now));
+        if up > 0. {
+            let feed = self.config.axes.get(2).map_or(0., |z| z.max_velocity);
+            self.send(Command::JogStep {
+                axis: 2,
+                distance: up,
+                feed,
+            });
+        }
+        self.probed = Some((true, format!("Contact at machine Z {trip:.3}. {message}")));
     }
 
     /// An axis of the profile. The driver panics on an index of 6 or more,
@@ -628,6 +869,60 @@ mod tests {
         };
         assert!(!answer(&mut [Field(false), Field(false)]));
         assert!(answer(&mut [Field(false), Field(true)]));
+    }
+
+    #[test]
+    fn probe_settings_need_a_measured_plate_and_sane_values() {
+        let mut m = Machine::new(3);
+        let e = probe_settings(&m.p).unwrap_err();
+        assert_eq!(
+            e,
+            vec!["Touch plate thickness must be from 0 to 100 mm.".to_string()]
+        );
+        m.p.insert("probe_plate".into(), "15.2".into());
+        let p = probe_settings(&m.p).unwrap();
+        assert_eq!(
+            (p.plate, p.feed, p.distance, p.retract),
+            (15.2, 100., 20., 5.)
+        );
+        // Machines saved before the probe settings get the same defaults.
+        for k in ["probe_feed", "probe_distance", "probe_retract"] {
+            m.p.remove(k);
+        }
+        assert_eq!(probe_settings(&m.p), Ok(p));
+        for (k, v) in [
+            ("probe_feed", "0"),
+            ("probe_distance", "NaN"),
+            ("probe_retract", "-1"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        assert_eq!(probe_settings(&m.p).unwrap_err().len(), 3);
+    }
+
+    #[test]
+    fn work_z_puts_the_contact_where_it_belongs() {
+        // Contact at machine Z -40, stopped 0.05 mm past it: the plate's top
+        // (15 mm) at the contact makes the stop work Z 14.95.
+        let z = work_z(15., -40., -40.05);
+        assert!((z - 14.95).abs() < 1e-9);
+        // The work offset that follows puts the contact at work Z 15.
+        let offset = -40.05 - z;
+        assert!((-40. - offset - 15.).abs() < 1e-9);
+        assert_eq!(work_z(-3.5, 10., 10.), -3.5);
+    }
+
+    #[test]
+    fn the_simulated_block_sits_on_the_middle_of_the_table() {
+        let mut cfg = MachineConfig::from_toml(uc100::config::TEMPLATE).unwrap();
+        for (a, (lo, hi)) in [(0., 390.), (0., 80.), (-55., 0.)].into_iter().enumerate() {
+            let x = cfg.axes.get_mut(a).unwrap();
+            (x.soft_min, x.soft_max) = (Some(lo), Some(hi));
+        }
+        let (lo, hi) = sim_block(&cfg).unwrap();
+        assert_eq!((lo, hi), ([145., 20., -55.], [245., 60., -27.5]));
+        cfg.axes.get_mut(1).unwrap().soft_min = None;
+        assert_eq!(sim_block(&cfg), None);
     }
 
     #[test]

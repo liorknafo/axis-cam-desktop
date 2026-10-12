@@ -213,6 +213,9 @@ impl Machine {
             ("post_blend", "0.01"),
             ("post_dwell", "2"),
             ("post_air", "M7"),
+            ("probe_feed", "100"),
+            ("probe_distance", "20"),
+            ("probe_retract", "5"),
         ]);
         p.insert("axes".into(), axes.to_string());
         if axes > 3 {
@@ -287,9 +290,10 @@ impl Machine {
         e
     }
     pub fn fill_post_defaults(&mut self) {
-        for key in POST_KEYS {
-            if !self.p.contains_key(key) {
-                let value = post_setting(&self.p, key).to_string();
+        // The plate's thickness has no default to fill in.
+        for key in POST_KEYS.into_iter().chain(PROBE_KEYS) {
+            let value = post_setting(&self.p, key).to_string();
+            if !value.is_empty() {
                 self.p.insert(key.into(), value);
             }
         }
@@ -435,7 +439,15 @@ pub const POST_KEYS: [&str; 5] = [
     "post_dwell",
     "post_air",
 ];
-/// Machines saved before the postprocessor settings use these defaults.
+/// A UC100 machine's touch-plate settings (`control::probe_settings`). The
+/// plate's thickness has no default: it must be measured.
+pub const PROBE_KEYS: [&str; 4] = [
+    "probe_plate",
+    "probe_feed",
+    "probe_distance",
+    "probe_retract",
+];
+/// Machines saved before the postprocessor or probe settings use these defaults.
 pub fn post_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
     p.get(key).map(String::as_str).unwrap_or(match key {
         "post_tool_length" => POST_TOOL_LENGTH[0],
@@ -443,6 +455,9 @@ pub fn post_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
         "post_blend" => "0.01",
         "post_dwell" => "2",
         "post_air" => POST_AIR[0],
+        "probe_feed" => "100",
+        "probe_distance" => "20",
+        "probe_retract" => "5",
         _ => "",
     })
 }

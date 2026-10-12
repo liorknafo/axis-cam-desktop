@@ -26,7 +26,7 @@ sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
-uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "7a834e1fbc322ccf5cf5fdc2ba5342ba4ae3674c", default-features = false }
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bec0ff1d235212c454b823b30f4f3bce254df9f9", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"

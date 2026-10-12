@@ -1215,7 +1215,7 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
-    /// The machine moves, or a tool run of the Run panel is under way:
+    /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
     /// out in the background, so that none competes with the driver for the
     /// processor while it feeds the machine its motion.
@@ -1223,6 +1223,7 @@ impl App {
         use uc100::controller::State;
         self.control.as_ref().is_some_and(|c| {
             c.run.as_ref().is_some_and(|r| r.running.is_some())
+                || c.probing()
                 || matches!(
                     c.snapshot.state,
                     Some(
@@ -2674,6 +2675,9 @@ impl App {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
                     let mut m = self.machine_draft.clone();
+                    if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
+                        c.probe = control::probe_settings(&m.p);
+                    }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
                         self.doc.machines[i] = m;

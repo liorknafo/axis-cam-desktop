@@ -2446,6 +2446,16 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(field(p, "post_dwell", "Spindle start dwell · s", t))
                     .push(choice_value(p, post_setting(p, "post_air"), "post_air", "Air blast output", &POST_AIR, t))
                     .push(warnings(post_setting_issues(p)))
+                    .push(bold("Touch plate", 15))
+                    .push(row![
+                        field(p, "probe_plate", "Plate thickness · mm", t),
+                        field(p, "probe_feed", "Probe feed · mm/min", t),
+                    ].spacing(8))
+                    .push(row![
+                        field(p, "probe_distance", "Maximum probe distance · mm", t),
+                        field(p, "probe_retract", "Retract after the probe · mm", t),
+                    ].spacing(8))
+                    .push(warnings(crate::control::probe_settings(p).err().unwrap_or_default()))
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
@@ -2923,6 +2933,38 @@ fn control(app: &App) -> Element<'_, Message> {
             s.active_wcs == i,
         ));
     }
+    let blocked = c.probe_blocked();
+    let mut probe = column![
+        row![
+            act(
+                "Probe Z",
+                blocked.is_none().then_some(Message::Machine(Action::ProbeZ)),
+                c.probing()
+            ),
+            muted(match (&blocked, &c.probe) {
+                (Some(why), _) if !c.probing() => why.clone(),
+                (_, Ok(p)) => format!(
+                    "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, then the tool lifts {} mm.",
+                    p.feed, p.distance, p.plate, p.retract
+                ),
+                _ => String::new(),
+            })
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    ];
+    if let Some(note) = probe_note(c) {
+        probe = probe.push(note);
+    }
+    if c.simulated
+        && c.config.inputs.probe.is_some()
+        && let Some((lo, hi)) = crate::control::sim_block(&c.config)
+    {
+        probe = probe.push(muted(format!(
+            "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, trips the probe.",
+            lo[0], hi[0], lo[1], hi[1], hi[2]
+        )));
+    }
     let work_panel = machine_panel(
         &format!("Work zero (G{})", 54 + s.active_wcs),
         column![
@@ -2930,7 +2972,8 @@ fn control(app: &App) -> Element<'_, Message> {
             systems,
             muted(
                 "Zero makes the current position work zero in the active coordinate system. G54 to G59 each keep their own; they change only while Idle."
-            )
+            ),
+            probe
         ],
     );
     let start = |state| {
@@ -3177,7 +3220,7 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     if let Some(p) = run.tool_change() {
         let o = &p.ops[0];
         body = body.push(note(format!(
-            "Tool change for tool run {}: T{} {} (stickout {:.1} mm). The last tool run ended with the spindle and coolant off at the clearance plane. 1. If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and press Record reference. 2. Jog up and change to T{}. 3. Touch the new tool on the same surface and press Set Z from reference, or Zero Z on the stock top if no tool run has cut it. 4. Jog clear and press Cycle Start. X/Y zero stays as it is.",
+            "Tool change for tool run {}: T{} {} (stickout {:.1} mm). The last tool run ended with the spindle and coolant off at the clearance plane. 1. If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and press Record reference. 2. Jog up and change to T{}. 3. Touch the new tool on the same surface and press Set Z from reference, or Zero Z on the stock top if no tool run has cut it. With a touch plate on that surface, Probe reference and Probe Z from reference do steps 1 and 3. 4. Jog clear and press Cycle Start. X/Y zero stays as it is.",
             run.next + 1,
             o.tool,
             o.tool_name,
@@ -3203,6 +3246,25 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             .spacing(8)
             .align_y(Alignment::Center),
         );
+        if c.config.inputs.probe.is_some() {
+            let probe = c.probe_blocked().is_none() && !running;
+            body = body.push(
+                row![
+                    act("Probe reference", msg(probe, R::ProbeReference), false),
+                    act(
+                        "Probe Z from reference",
+                        msg(probe && run.reference.is_some(), R::ProbeFromReference),
+                        false
+                    ),
+                    muted("The same with the touch plate on the reference surface."),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+            if let Some(note) = probe_note(c) {
+                body = body.push(note);
+            }
+        }
     }
     let mut problems = run.problems(c, &app.doc);
     problems.extend(app.planning_busy().map(String::from));
@@ -3257,6 +3319,23 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         }));
     }
     machine_panel(&format!("Run · {}", run.name), body)
+}
+/// How the last probe ended, or that one is under way.
+fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
+    if c.probing() {
+        return Some(text("Probing: E-stop stops it.").size(12).into());
+    }
+    let (ok, message) = c.probed.as_ref()?;
+    Some(
+        text(message.clone())
+            .size(12)
+            .color(if *ok {
+                Color::from_rgb8(39, 130, 93)
+            } else {
+                Color::from_rgb8(166, 101, 32)
+            })
+            .into(),
+    )
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";

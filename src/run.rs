@@ -30,6 +30,10 @@ pub enum Action {
     RecordReference,
     /// Make the tool tip's height now the reference's work Z.
     ZFromReference,
+    /// Record reference and Set Z from reference with the touch plate on
+    /// the reference surface: probes down onto it.
+    ProbeReference,
+    ProbeFromReference,
 }
 
 /// The tool run the machine is cutting.

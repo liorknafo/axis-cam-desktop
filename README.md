@@ -304,7 +304,11 @@ elsewhere (LIO-111) and edit the profile as raw TOML.
 
 **Simulated** runs the driver's real controller, planner and checks against a
 simulated UC100: no hardware is opened and nothing moves. It keeps its own
-saved offsets and position, separate from the real machine's.
+saved offsets and position, separate from the real machine's. When the
+profile has soft limits on X, Y and Z, the simulator puts a block in the
+middle of the table for trying the probe: up to 100 × 100 mm, its top halfway
+down Z (the Work zero panel gives its place). The probe input reads active
+while the tool tip is inside it; it needs a probe input in the profile.
 
 Once the machine is Idle, the Control page has everything needed before a job:
 
@@ -326,6 +330,18 @@ Once the machine is Idle, the Control page has everything needed before a job:
   step per press; the speed slider is a share of each axis's maximum speed.
 - **Work zero.** **Zero X/Y/Z/all** in the active coordinate system;
   **G54–G59** pick it (while Idle).
+- **Probe Z.** With a touch plate: set its **thickness** (measure it), the
+  **probe feed**, the **maximum probe distance** and the **retract** in the
+  Machine library, on the machine's UC100 step. Put the plate on the stock top
+  under the tool, clip the probe on and press **Probe Z**: Z feeds down until
+  the tool touches the plate, at most the maximum distance and never below
+  the bottom of Z. Work Z at the contact becomes the plate's thickness, so
+  the stock top is Z 0, and the tool lifts by the retract. The machine stops
+  a little past the contact; the driver reports where the contact was, and
+  that is what counts. Without contact nothing is set, and a refusal says
+  why. Probe Z is offered while Idle with Z referenced, a probe input in the
+  profile and that input not already active; otherwise the panel says what
+  is missing. E-stop stops a probe.
 - **Spindle and coolant.** CW at an RPM, Stop; CCW only when the profile has a
   direction output; Flood and Mist only for the outputs the profile has.
 - **Overrides.** Feed override 10–200 %; **Override limit switches** when the
@@ -393,7 +409,12 @@ with no G-code file in between.
    on a surface that stays put and press **Record reference** (this can be
    done any time a tool is zeroed, also before the first tool run), change
    the tool, touch the new one on the same surface and press **Set Z from
-   reference** (or **Zero Z** on an uncut stock top). Cycle Start then checks
+   reference** (or **Zero Z** on an uncut stock top). With a touch plate on
+   that surface, **Probe reference** and **Probe Z from reference** do the
+   same by probing. The reference is always the surface itself (under a
+   plate, the contact less the plate's thickness), so the by-hand and the
+   probed buttons can be mixed; **Probe Z** on the plate on an uncut stock
+   top also counts as the touch-off. Cycle Start then checks
    the next tool run at the new Z; it waits for a new tool's touch-off and
    refuses an X/Y work zero that moved since the first tool run. Each tool run
    starts by rising (or dropping) to the clearance plane where the tool
@@ -401,7 +422,7 @@ with no G-code file in between.
 
 While a tool run of the setup shown on the Work page cuts, the 3D view draws
 the machine's tool in red at the live position. While the machine moves (a
-tool run, held or paused, a jog or homing), planning is locked: editing,
+tool run, held or paused, a probe, a jog or homing), planning is locked: editing,
 previews, playback and the AI planner wait until it stops, and Cycle Start
 waits for a preview, check or AI planner run still under way, so that nothing
 competes with the driver feeding the machine its motion. The
