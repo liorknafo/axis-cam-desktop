@@ -461,6 +461,9 @@ pub struct App {
     pub smoke_pending: bool,
     pub doc: Document,
     pub page: Page,
+    /// The Manufacture page the workspace switcher goes back to from the
+    /// Machine workspace (the Control page).
+    pub cam_page: Page,
     pub selected: Option<usize>,
     pub tab: String,
     pub status: String,
@@ -580,18 +583,15 @@ pub struct App {
     gcode_exports: usize,
 }
 pub const LOCKED: &str = "The machine is running: planning is locked until it stops.";
-/// What still works while planning is locked (`App::locked`): the Control
-/// page, looking around, saving, the account, and the answers of work started
-/// before. Everything else waits.
+/// What still works while planning is locked (`App::locked`): the Machine
+/// workspace (the Control page), looking around, saving, the account, and the
+/// answers of work started before. Everything else waits, and the Manufacture
+/// workspace does not open.
 fn while_locked(m: &Message) -> bool {
     use Message::*;
     matches!(
         m,
-        Page(_)
-            | SelectSetup(_)
-            | SelectOp(_)
-            | SetupEditor
-            | Tab(_)
+        Page(crate::Page::Control)
             | Connect
             | Disconnect
             | MachineReset
@@ -819,6 +819,7 @@ impl App {
             clamps_draft: None,
             doc,
             page: Page::Home,
+            cam_page: Page::Home,
             selected: None,
             tab: "Tool".into(),
             status,
@@ -2053,6 +2054,9 @@ impl App {
             Message::Noop => {}
             Message::Page(p) => {
                 self.help_animating = false;
+                if p == Page::Control && self.page != Page::Control {
+                    self.cam_page = self.page;
+                }
                 self.page = p;
                 self.picking = false;
                 self.playing = false;
@@ -2647,6 +2651,13 @@ impl App {
                 }
                 self.run_epoch += 1;
                 c.run = Some(run::Run::new(&self.doc, si, self.run_epoch));
+                // The setup picked to run is the one the 3D views show.
+                if self.doc.setups[si].id != self.doc.active {
+                    self.doc.active = self.doc.setups[si].id.clone();
+                    self.stop_selection();
+                    self.dirty = true;
+                    self.last_edit = Instant::now();
+                }
                 return self.check_run();
             }
             Message::Run(run::Action::Check) => {

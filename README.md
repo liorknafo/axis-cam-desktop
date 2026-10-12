@@ -32,6 +32,7 @@ The script builds the release binary, bundles the STEP helper with its libraries
 | Area | Native implementation |
 | --- | --- |
 | Start / New project | Blank first launch, explicit example project, resume/open actions, New project shortcut and recoverable project history |
+| Workspaces | **MANUFACTURE** (planning) and **MACHINE** (running the CNC), picked like Fusion 360's workspace switcher; only MACHINE while the machine moves (see **Two workspaces**) |
 | Workspace | Grouped operation ribbon, custom SVG operation icons, setup/operation browser, parameter inspector, camera views, simulation strip |
 | Machine library | Saved profiles; five-step wizard; 3-, 4-, 5-axis configurations; indexed/continuous modes; travel, spindle, feed, rotary limits, pivots, directions, controller, tool change, TCP preference |
 | Multiple setups | Add, duplicate, reorder, delete; independent machine snapshots; G54–G59; automatic remaining stock from earlier setups; origin, fixture, rotation, translation and reclamping instructions |
@@ -62,7 +63,7 @@ Fields are specific to each strategy: optimal load/rest machining for adaptive c
 
 ## Operation coverage and checking a whole job
 
-Open **Operation support** in the header for the complete support list. **Generate all / Check all enabled operations** runs validation and actual path generation for each enabled operation in every setup. Failures are collected individually, so one failure does not hide later operations. Reports clear when the document changes. Stock advances in document order across operations and setups. An upstream failure blocks dependent stock previews with an explanation; it never silently substitutes a new blank. Suppressed operations are skipped. The playback timeline remains per operation.
+Open **Operation support** in the toolbar for the complete support list. **Generate all / Check all enabled operations** runs validation and actual path generation for each enabled operation in every setup. Failures are collected individually, so one failure does not hide later operations. Reports clear when the document changes. Stock advances in document order across operations and setups. An upstream failure blocks dependent stock previews with an explanation; it never silently substitutes a new blank. Suppressed operations are skipped. The playback timeline remains per operation.
 
 | Strategy | Imported-part status / scope |
 | --- | --- |
@@ -127,7 +128,7 @@ Meshing runs in a background worker. **Updating…** means the last completed st
 
 ## Start a project from nothing
 
-The app opens on a start screen. Choose **New blank project** to begin with no model, setups or operations and no project material chosen. On a fresh installation the machine and tool libraries are empty, and the material library holds the starter materials (see **Materials**). **New project** in the header or **Command/Ctrl+N** starts fresh at any time while retaining saved machine and tool profiles and the material library. The previous job is archived before switching; use **Start → Browse project history** to reopen it, or **Recover previous project** to undo the latest switch during the session.
+The app opens on a start screen. Choose **New blank project** to begin with no model, setups or operations and no project material chosen. On a fresh installation the machine and tool libraries are empty, and the material library holds the starter materials (see **Materials**). **New project** in the application bar or **Command/Ctrl+N** starts fresh at any time while retaining saved machine and tool profiles and the material library. The previous job is archived before switching; use **Start → Browse project history** to reopen it, or **Recover previous project** to undo the latest switch during the session.
 
 1. Click **Import your first model** and choose STEP/STP, 3MF, STL or OBJ. The part can be viewed before a setup exists.
 2. Choose **Create first setup**. Select a saved machine, or complete **Set up a machine**, save the profile and choose **Create first setup** from the library.
@@ -247,7 +248,7 @@ Hold the pointer over a button, field label/input, dropdown or toggle for about 
 
 ## Materials
 
-The **Materials** page (in the header, beside Tools) is the material library, built like the tool library: a list (name, group, surface speed range), an editor, **+ New material**, **Save material** and **Delete material**. Every field has hover help that explains surface speed (Vc) and chip load per tooth (fz).
+The **Materials** page (in the toolbar, beside Tools) is the material library, built like the tool library: a list (name, group, surface speed range), an editor, **+ New material**, **Save material** and **Delete material**. Every field has hover help that explains surface speed (Vc) and chip load per tooth (fz).
 
 - **A material** has a name (at most 60 characters; unique in the library, capitals and spaces at the ends ignored), a group (Aluminium, Steel, Stainless steel, Brass and copper, Plastic, Wood and composite, Other), hardness and notes (free text; notes up to 500 characters) and **cutting data for carbide tools**: a surface speed range in m/min and a chip load range per tooth in mm for each of five tool diameters (up to 3 mm, over 3 up to 6, over 6 up to 10, over 10 up to 16, over 16). Cutting data is all twelve numbers or none: each positive and each minimum not above its maximum. A material without cutting data can be chosen, but nothing is checked against it and the AI planner will not plan with it. Delete is refused while the project uses the material.
 - **Starter materials**, each marked in its notes "Starting point for carbide tools: adjust to your machine and your tool maker's data.": Aluminium 6061-T6, Aluminium 7075-T6, Mild steel 1018, Stainless steel 304, Brass C360, POM (Delrin), Acrylic (PMMA), HDPE, MDF, Aluminium 6082-T6, Aluminium 6063-T6, Aluminium 5083-H111, Aluminium 5052-H32, Aluminium 1050A-H14 and Cast aluminium plate (MIC-6). They are conservative starting points, not your tool maker's data: edit them to suit your machine and tools. They are added only to an empty library (a new workspace, a project or workspace saved before the library existed, a new project, Explore example), so a material you deleted does not come back while the library has any entry; a library you emptied gets the starters again the next time a project is opened or started. A library saved before these six were added gets them once, unless it already has a material of that name (capitals ignored); deleting one afterwards is final.
@@ -270,7 +271,7 @@ The cutting data are starting points for carbide tools, with no distinction betw
 
 A setup can model the vise or the toe clamps that hold its stock. The app then checks every move against them, as boxes, and refuses a program that would hit one. Toolpaths are never changed to avoid them: a move that comes too close is reported, not rerouted.
 
-- **The library.** The **Workholding** page (in the header, beside Materials) lists vises and toe clamps, built like the tool library: **+ New vise**, **+ New clamp**, **Save** and **Delete**. A vise has a jaw width (along the jaws), a jaw height (for reference: the modelled jaws reach from far below the stock up to the setup's grip), a jaw thickness, a maximum opening and a grip (the default height of stock held between the jaws, from the stock's bottom). A clamp has a length (along the clamp, from its tip outward), a width, a height above the stock's top and a bite (how far it reaches onto the stock from its edge; it must be shorter than the length). Every size is a positive number, a name is unique in the library (capitals and spaces at the ends are ignored) and at most 60 characters, and notes are up to 500. A library that has none gets two starters, marked "Measure yours: these are typical sizes.": "100 mm machine vise" (jaws 100 mm wide, 30 mm high and 20 mm thick, opening 120 mm, grip 8 mm) and "Toe clamp 60 mm" (60 mm long, 20 mm wide, 25 mm high, bite 12 mm). An entry that a setup uses cannot be deleted. The library is carried to a new project, and Explore example adds yours to the example by name, as it does for tools.
+- **The library.** The **Workholding** page (in the toolbar, beside Materials) lists vises and toe clamps, built like the tool library: **+ New vise**, **+ New clamp**, **Save** and **Delete**. A vise has a jaw width (along the jaws), a jaw height (for reference: the modelled jaws reach from far below the stock up to the setup's grip), a jaw thickness, a maximum opening and a grip (the default height of stock held between the jaws, from the stock's bottom). A clamp has a length (along the clamp, from its tip outward), a width, a height above the stock's top and a bite (how far it reaches onto the stock from its edge; it must be shorter than the length). Every size is a positive number, a name is unique in the library (capitals and spaces at the ends are ignored) and at most 60 characters, and notes are up to 500. A library that has none gets two starters, marked "Measure yours: these are typical sizes.": "100 mm machine vise" (jaws 100 mm wide, 30 mm high and 20 mm thick, opening 120 mm, grip 8 mm) and "Toe clamp 60 mm" (60 mm long, 20 mm wide, 25 mm high, bite 12 mm). An entry that a setup uses cannot be deleted. The library is carried to a new project, and Explore example adds yours to the example by name, as it does for tools.
 - **The setup controls.** The setup editor has **Modelled workholding**: None, Vise or Clamps. With a vise you pick the library entry, **Jaws face** the X sides or the Y sides of the stock, a **Jaw offset** along the jaws from the middle of the stock and the **Grip**. With clamps you pick the entry and type **Clamp positions** as `side:offset` separated by semicolons (`-X:0; +X:20`: the sides are -X, +X, -Y and +Y, the offset moves the clamp along that side from its middle), one to eight of them; the text is saved only when every clamp reads correctly, and what is wrong is shown under the field. **Clearance gap** is the margin kept round every jaw and clamp (0 or more; 2 mm when empty). What is wrong is listed under the controls: no entry chosen or the entry deleted, a layout that does not read, an entry of the other kind or with sizes that cannot be used, a stock wider across the jaws than the vise opens, jaws that do not overlap the stock along their length (an offset of half the stock's length plus half the jaw width or more), a clamp whose offset is beyond half the length of its side, and a later setup that is not square to setup 1 (turned from it by other than a multiple of 90 degrees), whose vise or clamps cannot be modelled: choose None there, or square the setup. The older **Fixture** choice, which is printed on the setup sheet and in the program header, and **Fixture clearance** remain as records and are not checked.
 - **Where the boxes are.** All in the setup's own frame, from the setup's starting stock box. A vise has two jaws against the two chosen sides of what it closes on (the stock, or in a later setup the band within its grip: see **What the vise closes on**), each a jaw thickness deep outward and a jaw width long, centred on that plus the offset, from 100 mm below the stock's bottom up to the grip above it. A clamp is a box a clamp width wide, centred at its offset along its side, reaching the bite inward from the stock's edge and the rest of its length outward, from the stock's top up by the clamp's height. In a later setup they sit at the box that setup starts from: the stock the earlier setups left (see **The stock earlier setups leave**), or setup 1's box carried over into that setup's frame while that has not been worked out (see **The setup editor**); a vise turns with the stock and a box does not, so a later setup that is not square to setup 1 has no modelled workholding and is refused. The 3D view draws them as grey boxes with the stock (the jaws from the stock's bottom up; the check keeps them whole), and the setup sheet describes them ("Workholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm."; "Workholding: 4 × Toe clamp 60 mm at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm."), as the program header does in plain ASCII ("on +-Y", "4 x").
 - **Suggest layout.** Choosing Vise or Clamps for a setup that has no placement of that kind yet, choosing another library entry, and **Suggest layout** generate the setup's operations (up to its last enabled one, as Generate all does; those that cannot be generated are left out) and place the workholding where their toolpaths stay clear of it, without changing them. A vise goes at offset 0 on the X or the Y sides, whichever are clear of every move at the largest grip: each axis is tried at the library's grip and then 1 mm lower at a time down to 3 mm, and the axis that is clear at the larger grip wins; when both are clear at the same grip, the sides with the narrower width across the jaws; when neither is clear even at 3 mm, the sides whose jaws stay farther from the moves, at 3 mm. When only one axis fits the vise's opening (across the band the jaws would close on, in a later setup), only that one is tried. Clamps are four, one on each side, or two on opposite sides when the stock is shorter than three clamp widths along both axes; each is placed at the middle or the quarter point of its side that keeps its distance largest, a spot that is clear by 10 mm or more counting as good as any, so the middle wins then. The status line says what was chosen and how many operations still come within the gap ("see the warnings"); with no toolpaths to look at, it says only the stock decided. Anything you set by hand is kept by other edits until you press **Suggest layout** again. The suggestion looks at each operation's own toolpath: the links between operations, the approaches and the retracts that export adds are not part of it, so export can still refuse one.
@@ -282,6 +283,26 @@ A setup can model the vise or the toe clamps that hold its stock. The app then c
 - **The setup editor.** The editor cannot simulate while you edit, so a later setup shows setup 1's box carried into its frame and says so under the workholding controls: "Original stock size until the earlier setups are simulated." After an edit, a pause of 0.7 seconds starts a background job that runs the earlier setups and keeps the box each later setup starts from, for the job as it is then. An edit of a setup, an operation, a tool or the part makes it out of date; the vise and clamp fields do not (choosing jaws keeps the box). While it is current, the Stock section of a later setup shows "Stock before this setup · X × Y × Z", the note goes, the 3D view draws that box as the stock (translucent, as setup 1's is, with its size in the label "Stock X × Y × Z"; until then a later setup's view says "Remaining stock · generate preview" and draws no stock), and the opening and layout checks listed under the controls, the jaws drawn and **Suggest layout** use that box. The same job then makes each later setup's holding checks on the stock it left, as export makes them: the band its vise closes on (see **What the vise closes on**), and, when nothing else is wrong with how it is held, what **Can it be held?** finds, in the export's words, listed with the other workholding issues under the controls while they are current. An edit of how a setup is held, or of the library, keeps the stock worked out and makes only these checks again, in the background after the same pause; until they are back the band is the box and their lines are not shown. The NC program page counts a setup's vise or clamps as checked only when the editor lists nothing for it. The example part is not simulated and keeps its original box, as does a setup after an operation or setup that failed to generate.
 - **What is not checked.** Parallels, bolts, the table and the machine body; a shank wider than the cutter or a reduced neck; the motion of a tool change; a vise or clamps in a setup turned from setup 1 by other than a multiple of 90 degrees (refused instead); clamping force and vibration; whether the material left at a jaw or clamp is strong enough to hold (the checks above ask only that it is there and joined to the part). In the texts that say what is not checked (the status and notes of the operation preview, the NC program page, the plan preview and the program header), a setup with None keeps the older wording, "fixtures, clamps and the machine body are not checked".
 - **The planner.** The part report sends setup 1's jaws or clamps as boxes (their sizes and positions, relative to the model's −X, −Y and bottom corner), their kind, the clearance gap and, when they reach above the stock top, how far: never the entry's name or its notes. The model is told to keep its plan clear of them and that a move within the gap is refused. Setups that a plan adds get the library entry the plan names for them, or setup 1's when it names none (see **Choosing the holders**), laid out by the app for their generated toolpaths before the check, and the plan card shows each layout. A proposal's optional `clearance` can only raise the 15 mm default, which already covers jaws and clamps (with their gap) that reach less than 15 mm above the stock top; the planner is told to raise it only when the reported height is 15 mm or more, because a clearance-plane machine refuses a plan whose plane is not above them.
+
+## Two workspaces
+
+Like Fusion 360, the window has workspaces, picked with the switcher at the
+left of the toolbar:
+
+- **MANUFACTURE** plans the job: Start, the part with its setups and
+  operations and the ribbon, the libraries (Machine library, Tools,
+  Materials, Workholding), the AI planner, Operation support and the NC
+  program. The dark application bar above holds the project's actions:
+  **Start**, **New project**, the project name, **Import model**, **Open**
+  and **Save project**.
+- **MACHINE** runs the CNC through the UC100 (the Control page below): its
+  toolbar has **Control** and **Setup**, and the red **E-STOP** while
+  connected.
+
+Picking MANUFACTURE goes back to the page left for MACHINE. While the
+machine moves (a tool run, held or paused, a probe, a jog or homing) the
+switcher stays on MACHINE and says "Manufacture opens when the machine
+stops": nothing of the job can be opened, edited or previewed until then.
 
 ## Machine control (UC100)
 
@@ -296,9 +317,9 @@ elsewhere (LIO-111) and edit the profile as raw TOML.
    **UC100 profile file** (the driver's machine TOML: pins, steps per mm,
    speeds, limits, homing) and its **Connection**: **USB** for the real
    controller (macOS) or **Simulated**.
-2. Open **Control**, pick the machine and press **Connect**. The machine
+2. Switch to the **MACHINE** workspace, pick the machine and press **Connect**. The machine
    starts in E-stop; **Reset** enables it.
-3. While connected, a red **E-STOP** is in the top bar on every page, and
+3. While connected, a red **E-STOP** is in the toolbar on every page, and
    **Esc** sends E-stop from anywhere, even while typing. Leaving E-stop
    always needs Reset.
 
@@ -380,7 +401,7 @@ Once the machine is Idle, the Control page has everything needed before a job:
   as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
   the machine and correct both (`src/machine_view.rs`, the driver profile).
 
-**Setup** (the switch at the top of the Control page) does the commissioning
+**Setup** (beside **Control** in the MACHINE toolbar) does the commissioning
 work that needed the driver's egui app or a text editor:
 
 - **The UC100 profile as a form**: pins and polarity, steps per mm, speeds,
@@ -413,7 +434,8 @@ with no G-code file in between.
 
 1. Pick one of the setups that use the connected machine. AXIS CAM simulates
    the job up to it and checks it as export would (stock, work zero, rapids,
-   holder, jaws and clamps), then lists its **tool runs**: one per run of the
+   holder, jaws and clamps), makes it the active setup and shows it in the
+   **Job** view beside the Run panel, then lists its **tool runs**: one per run of the
    same tool, as with touch-off G-code programs.
 2. Set machine zero, then the work zero (the setup's work offset must be the
    active one): by hand, with **Probe Z** on a plate, or with **Probe corner**
@@ -447,9 +469,9 @@ with no G-code file in between.
    starts by rising (or dropping) to the clearance plane where the tool
    stands, so leave it where a vertical move is safe.
 
-While a tool run of the setup shown on the Work page cuts, the 3D view draws
-the machine's tool in red at the live position. While the machine moves (a
-tool run, held or paused, a probe, a jog or homing), planning is locked: editing,
+While a tool run cuts, the Job view draws the machine's tool in red at the
+live position. While the machine moves (a tool run, held or paused, a probe, a jog or homing),
+planning is locked: the MANUFACTURE workspace does not open, editing,
 previews, playback and the AI planner wait until it stops, and Cycle Start
 waits for a preview, check or AI planner run still under way, so that nothing
 competes with the driver feeding the machine its motion. The

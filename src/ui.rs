@@ -71,6 +71,72 @@ pub(crate) fn btn<'a>(label: impl Into<String>, msg: Message, active: bool) -> H
         });
     HelpButton::new(b, &action, label)
 }
+/// A button on the dark application bar.
+fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
+    let action = msg.clone();
+    let b = button(text(label.to_string()).size(12))
+        .on_press(msg)
+        .padding([6, 10])
+        .style(move |_, status| button::Style {
+            background: (active
+                || matches!(status, button::Status::Hovered | button::Status::Pressed))
+            .then(|| Color::from_rgba8(255, 255, 255, 0.14).into()),
+            text_color: Color::from_rgb8(226, 236, 245),
+            border: Border {
+                radius: 4.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    HelpButton::new(b, &action, label)
+}
+/// The workspace switcher at the start of the toolbar, like Fusion 360's:
+/// MANUFACTURE plans the job, MACHINE (the Control page) runs it. While the
+/// machine moves it stays on MACHINE.
+fn switcher(app: &App) -> Element<'_, Message> {
+    const WORKSPACES: [&str; 2] = ["MANUFACTURE", "MACHINE"];
+    let font = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::DEFAULT
+    };
+    let picker: Element<_> = if app.locked() {
+        row![
+            container(text(WORKSPACES[1]).size(14).font(font).color(MUTED)).padding([7, 12]),
+            muted("Manufacture opens when the machine stops.")
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        let (page, back) = (app.page, app.cam_page);
+        let machine = page == Page::Control;
+        // Picking the open workspace again keeps its page.
+        pick_list(
+            WORKSPACES,
+            Some(WORKSPACES[usize::from(machine)]),
+            move |w| {
+                Message::Page(match w {
+                    "MACHINE" => Page::Control,
+                    _ if machine => back,
+                    _ => page,
+                })
+            },
+        )
+        .font(font)
+        .text_size(14)
+        .padding([7, 12])
+        .into()
+    };
+    help::wrap(
+        picker,
+        Help::text(
+            "Workspace",
+            "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC program. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
+        ),
+        // Beside it, not over the list it opens.
+        widget::tooltip::Position::Right,
+    )
+}
 fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
     let label = label.into();
     let action = msg.clone();
@@ -231,86 +297,116 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if app.smoke_dir.is_some() && (91..=97).contains(&app.smoke_step) {
         return help::gallery((app.smoke_step - 86) as u8);
     }
-    let brand = row![
+    // Two workspaces, like Fusion 360's: Manufacture plans the job, Machine
+    // (the Control page) runs it. The application bar on top has the
+    // project's file actions in Manufacture; the toolbar below starts with
+    // the workspace switcher and holds the workspace's own pages.
+    let manufacture = app.page != Page::Control;
+    let mut brand = row![
         bold("AXIS", 23).color(Color::WHITE),
         text("CAM STUDIO")
             .size(11)
             .color(Color::from_rgb8(164, 190, 213)),
         space().width(18),
-        text("MANUFACTURE")
-            .size(11)
-            .color(Color::from_rgb8(184, 215, 241)),
-        space().width(Fill),
-        text(if app.dirty {
-            "Saving workspace…"
-        } else {
-            "Workspace saved locally"
-        })
-        .size(11)
-        .color(Color::from_rgb8(183, 204, 222)),
-        space().width(10),
-        text("NATIVE PROTOTYPE")
-            .size(10)
-            .color(Color::from_rgb8(228, 193, 122))
     ]
     .spacing(7)
     .align_y(Alignment::Center);
+    brand = if manufacture {
+        brand.push(
+            row![
+                bar_btn("Start", Message::Page(Page::Home), app.page == Page::Home),
+                bar_btn("New project", Message::NewProject, false),
+                help::wrap(
+                    text_input("Project name", &app.doc.title)
+                        .on_input(Message::Title)
+                        .width(180)
+                        .size(13)
+                        .padding([5, 8]),
+                    Help::text(
+                        "Project name",
+                        "The name shown in the browser and used as the suggested project filename."
+                    ),
+                    widget::tooltip::Position::Bottom
+                ),
+                bar_btn("Import model", Message::Import, false),
+                bar_btn("Open", Message::OpenProject, false),
+                bar_btn("Save project", Message::SaveProject, false),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+    } else {
+        brand.push(
+            text(&app.doc.title)
+                .size(13)
+                .color(Color::from_rgb8(214, 228, 240)),
+        )
+    };
+    let brand = brand
+        .push(space().width(Fill))
+        .push(
+            text(if app.dirty {
+                "Saving workspaceâ€¦"
+            } else {
+                "Workspace saved locally"
+            })
+            .size(11)
+            .color(Color::from_rgb8(183, 204, 222)),
+        )
+        .push(space().width(10))
+        .push(
+            text("NATIVE PROTOTYPE")
+                .size(10)
+                .color(Color::from_rgb8(228, 193, 122)),
+        );
     let brand = container(brand)
-        .padding([12, 18])
+        .padding([8, 18])
         .style(|_| container::Style {
             background: Some(Color::from_rgb8(29, 46, 63).into()),
             ..Default::default()
         });
-    let mut top_row = row![
-        btn("Start", Message::Page(Page::Home), app.page == Page::Home),
-        btn("New project", Message::NewProject, false),
-        help::wrap(
-            text_input("Project name", &app.doc.title)
-                .on_input(Message::Title)
-                .width(140)
-                .size(14)
-                .padding(7),
-            Help::text(
-                "Project name",
-                "The name shown in the browser and used as the suggested project filename."
-            ),
-            widget::tooltip::Position::Bottom
-        ),
-        space().width(Fill),
-        btn("Import model", Message::Import, false),
-        btn("Open", Message::OpenProject, false),
-        btn("Save project", Message::SaveProject, false),
-        rule::vertical(1),
-        btn(
-            "Machine library",
-            Message::Page(Page::Machines),
-            app.page == Page::Machines
-        ),
-        btn(
-            "Control",
-            Message::Page(Page::Control),
-            app.page == Page::Control
-        ),
-        btn("Tools", Message::Page(Page::Tools), app.page == Page::Tools),
-        btn(
-            "Materials",
-            Message::Page(Page::Materials),
-            app.page == Page::Materials
-        ),
-        btn(
-            "Workholding",
-            Message::Page(Page::Workholding),
-            app.page == Page::Workholding
-        ),
-        btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai),
-        btn(
-            "Operation support",
-            Message::Page(Page::Audit),
-            app.page == Page::Audit
-        )
-    ]
-    .spacing(5)
-    .align_y(Alignment::Center);
+    let mut top_row = row![switcher(app), rule::vertical(1)]
+        .spacing(5)
+        .align_y(Alignment::Center);
+    top_row = if manufacture {
+        top_row.extend([
+            btn(
+                "Machine library",
+                Message::Page(Page::Machines),
+                app.page == Page::Machines,
+            )
+            .into(),
+            btn("Tools", Message::Page(Page::Tools), app.page == Page::Tools).into(),
+            btn(
+                "Materials",
+                Message::Page(Page::Materials),
+                app.page == Page::Materials,
+            )
+            .into(),
+            btn(
+                "Workholding",
+                Message::Page(Page::Workholding),
+                app.page == Page::Workholding,
+            )
+            .into(),
+            btn("AI planner", Message::Page(Page::Ai), app.page == Page::Ai).into(),
+            btn(
+                "Operation support",
+                Message::Page(Page::Audit),
+                app.page == Page::Audit,
+            )
+            .into(),
+        ])
+    } else {
+        top_row
+            .push(btn(
+                "Control",
+                Message::ControlSetup(false),
+                !app.machine_setup,
+            ))
+            .push(btn("Setup", Message::ControlSetup(true), app.machine_setup))
+    };
+    top_row = top_row.push(space().width(Fill));
     if app.control.is_some() {
         top_row = top_row.push(estop());
     }
@@ -348,11 +444,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .padding([8, 14])
     .style(panel_style);
     let mut layout = column![brand, docbar].spacing(0);
-    if app.locked() && app.page != Page::Control {
-        let why = "Editing, previews and the AI planner wait until the machine stops, so that nothing competes with the driver feeding it. The Control page runs it; the Work page's 3D view shows its tool.";
-        layout = layout.push(container(caution(crate::LOCKED, vec![why.into()])).padding([6, 12]));
-    }
-    if app.page != Page::Home && !app.doc.setups.is_empty() {
+    if manufacture && app.page != Page::Home && !app.doc.setups.is_empty() {
         layout = layout.push(ribbon(app));
     }
     container(layout.push(body).push(foot))
@@ -683,6 +775,35 @@ fn browser(app: &App) -> Element<'_, Message> {
         .style(panel_style)
         .into()
 }
+/// The 3D view of the active setup, as the Work page shows it: the part,
+/// stock, workholding, the preview and the machine's tool while a tool run of
+/// the setup cuts. None without a part to show.
+fn scene(app: &App) -> Option<Element<'_, Message>> {
+    let s = app.doc.active_setup();
+    let canvas: Element<viewport::Event> = canvas(Viewport {
+        setup: s,
+        mesh: app.part_mesh()?,
+        operation: app.operation(),
+        simulation: app.active_simulation(),
+        sample: app.is_sample(),
+        camera: app.camera,
+        picking: app.picking,
+        show_stock: app.stock && s.is_some(),
+        show_paths: app.paths && app.playback_ready(),
+        progress: if app.operation().is_some_and(|o| o.preview) {
+            Some(app.progress)
+        } else {
+            None
+        },
+        holding: holding_boxes(app),
+        leftover: leftover_view(app),
+        live: app.live_tool(),
+    })
+    .width(Fill)
+    .height(Fill)
+    .into();
+    Some(canvas.map(Message::Viewport))
+}
 fn workspace(app: &App) -> Element<'_, Message> {
     let s = app.doc.active_setup();
     let heading = container(
@@ -712,33 +833,9 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     )
     .padding([12, 14]);
-    let scene: Element<_> = if let Some(mesh) = app.part_mesh() {
-        let canvas: Element<viewport::Event> = canvas(Viewport {
-            setup: s,
-            operation: app.operation(),
-            mesh,
-            simulation: app.active_simulation(),
-            sample: app.is_sample(),
-            camera: app.camera,
-            picking: app.picking,
-            show_stock: app.stock && s.is_some(),
-            show_paths: app.paths && app.playback_ready(),
-            progress: if app.operation().is_some_and(|o| o.preview) {
-                Some(app.progress)
-            } else {
-                None
-            },
-            holding: holding_boxes(app),
-            leftover: leftover_view(app),
-            live: app.live_tool(),
-        })
-        .width(Fill)
-        .height(Fill)
-        .into();
-        canvas.map(Message::Viewport)
-    } else {
+    let scene = scene(app).unwrap_or_else(|| {
         container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),btn("Start screen",Message::Page(Page::Home),false)].spacing(20).max_width(380)).center(Fill).into()
-    };
+    });
     let detail = if app.is_sample() {
         "Sample housing · selectable demo geometry".to_string()
     } else if let Some(m) = &app.imported_mesh {
@@ -2584,23 +2681,7 @@ fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
     let target = app.control_target();
-    let mut left = column![
-        bold("Machine", 18),
-        row![
-            act(
-                "Control",
-                Some(Message::ControlSetup(false)),
-                !app.machine_setup
-            ),
-            act(
-                "Setup",
-                Some(Message::ControlSetup(true)),
-                app.machine_setup
-            )
-        ]
-        .spacing(6)
-    ]
-    .spacing(10);
+    let mut left = column![bold("Machine", 18)].spacing(10);
     let machines: Vec<&Machine> = app
         .doc
         .machines
@@ -2753,7 +2834,35 @@ fn control(app: &App) -> Element<'_, Message> {
             .color(Color::from_rgb8(39, 130, 93))
             .into()
     };
-    main = main.push(limits).push(run_panel(app, c));
+    main = main.push(limits);
+    // The setup picked to run, beside the Run panel, with the machine's tool
+    // while a tool run cuts: the Work page is out of reach while it moves.
+    let job = c
+        .run
+        .as_ref()
+        .filter(|r| {
+            app.doc
+                .setups
+                .get(r.setup)
+                .is_some_and(|x| x.id == app.doc.active)
+        })
+        .and_then(|_| scene(app));
+    main = main.push(match job {
+        Some(view) => Element::from(
+            row![
+                run_panel(app, c),
+                machine_panel(
+                    "Job",
+                    column![
+                        container(view).height(360),
+                        muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts.")
+                    ]
+                )
+            ]
+            .spacing(12),
+        ),
+        None => run_panel(app, c),
+    });
     let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
     let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(110);
     let mut table = column![row![

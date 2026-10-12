@@ -2227,10 +2227,19 @@ flood = { pin = 8 }
             assert_eq!(a.status, crate::LOCKED);
         }
         assert!(!a.playing && a.progress == 0. && a.doc.title == title);
-        // Looking at it on the Work page is not planning.
-        let _ = a.update(Message::SetupEditor);
-        let _ = a.update(Message::SelectOp(0));
-        assert_eq!((a.page, a.selected), (Page::Work, Some(0)));
+        // The Manufacture workspace does not open while it runs; the Machine
+        // workspace shows the job with the machine's tool.
+        for m in [
+            Message::Page(Page::Work),
+            Message::Page(Page::Tools),
+            Message::SetupEditor,
+            Message::SelectSetup(0),
+            Message::SelectOp(1),
+        ] {
+            let _ = a.update(m);
+            assert_eq!((a.page, a.status.as_str()), (Page::Control, crate::LOCKED));
+        }
+        assert_eq!(a.selected, Some(0));
         let _ = a.view();
         let _ = a.update(Message::Run(R::Stop));
         run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
@@ -2982,6 +2991,17 @@ flood = { pin = 8 }
             let _ = a.view();
             let _ = a.update(Message::Machine(crate::control::Action::JogRelease));
         }
+    }
+
+    #[test]
+    fn the_machine_workspace_goes_back_to_the_manufacture_page_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("w.json"), None);
+        let _ = a.update(Message::Page(Page::Tools));
+        let _ = a.update(Message::Page(Page::Control));
+        let _ = a.update(Message::Page(Page::Control));
+        assert_eq!((a.page, a.cam_page), (Page::Control, Page::Tools));
+        let _ = a.view();
     }
 
     #[test]
