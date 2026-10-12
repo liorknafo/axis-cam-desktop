@@ -395,12 +395,36 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .spacing(5)
         .align_y(Alignment::Center);
     let pages = [
-        (Page::Machines, "Machine library", include_bytes!("../assets/tb-machine.svg").as_slice()),
-        (Page::Tools, "Tools", include_bytes!("../assets/tb-tools.svg")),
-        (Page::Materials, "Materials", include_bytes!("../assets/tb-materials.svg")),
-        (Page::Workholding, "Workholding", include_bytes!("../assets/tb-workholding.svg")),
-        (Page::Ai, "AI planner", include_bytes!("../assets/tb-ai.svg")),
-        (Page::Audit, "Operation support", include_bytes!("../assets/tb-support.svg")),
+        (
+            Page::Machines,
+            "Machine library",
+            include_bytes!("../assets/tb-machine.svg").as_slice(),
+        ),
+        (
+            Page::Tools,
+            "Tools",
+            include_bytes!("../assets/tb-tools.svg"),
+        ),
+        (
+            Page::Materials,
+            "Materials",
+            include_bytes!("../assets/tb-materials.svg"),
+        ),
+        (
+            Page::Workholding,
+            "Workholding",
+            include_bytes!("../assets/tb-workholding.svg"),
+        ),
+        (
+            Page::Ai,
+            "AI planner",
+            include_bytes!("../assets/tb-ai.svg"),
+        ),
+        (
+            Page::Audit,
+            "Operation support",
+            include_bytes!("../assets/tb-support.svg"),
+        ),
     ];
     top_row = if manufacture {
         top_row.extend(pages.map(|(page, label, icon)| {
@@ -821,7 +845,11 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     let left = &app.left_stock;
     let cut = app
         .left_key()
-        .and(if end { left.after.get(si) } else { left.before.get(si) })
+        .and(if end {
+            left.after.get(si)
+        } else {
+            left.before.get(si)
+        })
         .cloned()
         .flatten()
         .and_then(|v| {
@@ -851,11 +879,19 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     let mut hasher = std::hash::DefaultHasher::new();
     match &cut {
         Some((v, _)) => std::sync::Arc::as_ptr(v).hash(&mut hasher),
-        None => stock.min.iter().chain(&stock.max).for_each(|v| v.to_bits().hash(&mut hasher)),
+        None => stock
+            .min
+            .iter()
+            .chain(&stock.max)
+            .for_each(|v| v.to_bits().hash(&mut hasher)),
     }
     (si, end).hash(&mut hasher);
     for b in &jaws {
-        b.bounds.min.iter().chain(&b.bounds.max).for_each(|v| v.to_bits().hash(&mut hasher));
+        b.bounds
+            .min
+            .iter()
+            .chain(&b.bounds.max)
+            .for_each(|v| v.to_bits().hash(&mut hasher));
     }
     let key = hasher.finish();
     let mut drawn = app.stock_pictures.borrow_mut();
@@ -870,7 +906,10 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
         None => crate::viewport::box_triangles(stock, crate::viewport::BLOCK),
     };
     for b in &jaws {
-        triangles.extend(crate::viewport::box_triangles(b.bounds, crate::viewport::JAWS));
+        triangles.extend(crate::viewport::box_triangles(
+            b.bounds,
+            crate::viewport::JAWS,
+        ));
     }
     let picture = crate::viewport::stock_picture(&triangles)?;
     // ponytail: two per setup, so all are kept until there are many.

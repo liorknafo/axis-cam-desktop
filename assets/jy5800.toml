@@ -1,0 +1,99 @@
+# This machine: Jingyan CNC4030-800W, JY5800, UC100 serial CD9090D3.
+# This is an INVESTIGATION profile, not a verified factory pinout.
+# Spindle pin 16 HIGH was operator-confirmed to stop unexpected rotation.
+# A 3-second 10% PWM start/stop worked; actual RPM remains uncalibrated.
+# No coolant, enable, or charge-pump output is guessed here.
+# Measured axis checks below permit Reset/motion; spindle direction, RPM,
+# hardware E-stop power cutoff and power/USB-loss behavior remain unverified.
+
+[controller]
+serial = "CD9090D3"
+running_firmware = "1041" # identified on this exact UC100 earlier in this session
+step_rate = "25kHz"
+
+[commissioning]
+required = true
+# 2026-10-10: X/Y/Z step/dir pins and polarity, and 320 steps/mm, were
+# confirmed by ruler-measured moves in both directions (operator). Every
+# move ran with no enable or charge-pump output configured, which is the
+# positive confirmation that this machine's drives need neither.
+pinout_verified = true
+estop_verified = true
+drive_enable_verified = true
+steps_per_unit_verified = true
+
+[motion]
+junction_deviation = 0.02
+arc_tolerance = 0.002
+buffer_ms = 40
+default_feed = 30
+
+[axes.x]
+# MEASURED 2026-10-10: 32000 pulses moved the carriage about 100 mm on a
+# ruler (operator), supporting 320 steps/mm; microstep/screw pitch not inferred.
+steps_per_unit = 320
+# Moderate limits; tests peaked near 900 mm/min. The seller's Mach3 profile
+# for this class of machine uses 2500 mm/min and 200 mm/s^2.
+max_velocity = 1000
+acceleration = 50
+# Active-LOW X pins 2/3, camera-confirmed and ruler-measured.
+step = { pin = 2, active_low = true }
+dir = { pin = 3, active_low = false }
+# Unreversed, a + command moved X to the LEFT (operator, facing the front).
+# Reversed so +X moves right, the usual convention.
+reversed = true
+# ASSUMED 2026-10-11, NOT MEASURED: travel 390 x 280 x 55 mm from a similar
+# 800 W 4030's spec sheet. Machine zero is X left end, Y front end, Z top,
+# declared with Set machine (no home switches). The soft limits apply once
+# X, Y and Z have all been declared. Measure the real travel and correct them.
+soft_min = 0.0
+soft_max = 390.0
+
+[axes.y]
+# MEASURED 2026-10-10: 16000 pulses moved the gantry about 50 mm by ruler,
+# so 320 steps/mm. Unreversed + moves the gantry toward the back (+Y).
+steps_per_unit = 320
+max_velocity = 1000
+acceleration = 50
+step = { pin = 4, active_low = true }
+dir = { pin = 5, active_low = false }
+reversed = false
+soft_min = 0.0
+soft_max = 280.0
+
+[axes.z]
+# MEASURED 2026-10-10: 6400 pulses moved the spindle about 20 mm by ruler,
+# so 320 steps/mm. Unreversed + moves the spindle UP (+Z).
+steps_per_unit = 320
+max_velocity = 500
+acceleration = 50
+step = { pin = 6, active_low = true }
+dir = { pin = 7, active_low = false }
+reversed = false
+soft_min = -55.0
+soft_max = 0.0
+
+[inputs]
+# MHC2 short ESTOP press: pin 10 LOW; cleared ESTOP: pin 10 HIGH.
+# Confirmed by raw input transitions and operator screen observation.
+# This verifies the handheld signal, not the separate mushroom's power cutoff.
+estop = { pin = 10, active_low = true }
+
+[outputs]
+# LOW caused rotation in PC PWM; setting pin 16 HIGH stopped it, confirmed
+# by the operator. This also sets the inactive static fallback before PWM
+# is configured. At 1 kHz / 10% for 3 seconds the operator observed rotation
+# followed by a complete stop at zero PWM. Actual RPM was not measured.
+spindle_pwm = { pin = 16, active_low = true }
+spindle_pwm_hz = 1000
+# Pin 17 changed during a standalone direction probe, but physical direction
+# is unverified. Leave spindle_dir unset until the attended follow-up.
+# The rebuilt app refuses CCW/M4 while direction/reverse output is unassigned.
+# UNCALIBRATED placeholder. Do not infer actual RPM from a commanded value.
+spindle_max_rpm = 24000
+# Related manuals disagree about whether pin 14 enable is implemented.
+# Confirm requirement AND polarity; do not scan/toggle unknown pins.
+
+[homing]
+order = "X"
+override_limits = false

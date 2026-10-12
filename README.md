@@ -320,6 +320,14 @@ It is the one program for daily use: the driver's own egui app
 bench tool. What only that app does: open and run a G-code file made
 elsewhere (LIO-111) and edit the profile as raw TOML.
 
+A workspace whose Machine library is empty starts with the owner's machine,
+the **Jingyan CNC4030** (CNC4030-800W, JY5800) on the UC100, ready to
+connect: travel 390 × 280 × 55 mm, 24000 RPM, 1000 mm/min. Its profile, the
+driver's JY5800 profile (`assets/jy5800.toml`), is written as `jy5800.toml`
+beside the workspace (on Windows `%LOCALAPPDATA%\AXIS CAM Studio`) only
+when that file is missing, so Setup's edits are kept. Tests and smoke runs
+never get it. Step 1 is for any other machine.
+
 1. In the Machine library, set a machine's controller to **UC100**, choose its
    **UC100 profile file** (the driver's machine TOML: pins, steps per mm,
    speeds, limits, homing) and its **Connection**: **USB** for the real

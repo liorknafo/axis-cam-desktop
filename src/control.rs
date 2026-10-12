@@ -35,6 +35,34 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
+/// The owner's machine, the Jingyan CNC4030-800W on its UC100, for a
+/// workspace whose library has no machine. Its profile, the driver's JY5800
+/// profile, is written to `dir` unless a file is there already: Setup may
+/// have edited it.
+pub fn owners_machine(dir: &Path) -> std::io::Result<Machine> {
+    let path = dir.join("jy5800.toml");
+    if !path.exists() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, include_str!("../assets/jy5800.toml"))?;
+    }
+    let mut m = Machine::new(3);
+    // Travel from the profile's soft limits, the feed from its X/Y speed and
+    // the RPM from its (uncalibrated) spindle maximum.
+    for (key, value) in [
+        ("name", "Jingyan CNC4030"),
+        ("controller", "UC100"),
+        ("x", "390"),
+        ("y", "280"),
+        ("z", "55"),
+        ("rpm", "24000"),
+        ("feed", "1000"),
+    ] {
+        m.p.insert(key.into(), value.into());
+    }
+    m.p.insert("uc100_profile".into(), path.display().to_string());
+    Ok(m)
+}
+
 /// A UC100 machine's probe settings (Machine library): mm and mm/min.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Probe {
@@ -1349,6 +1377,26 @@ mod tests {
         m.p.insert("uc100_profile".into(), profile.into());
         m.p.insert("uc100_connection".into(), connection.into());
         m
+    }
+
+    #[test]
+    fn the_owners_machine_runs_on_the_profile_it_writes_and_keeps_an_edited_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owners_machine(&dir.path().join("AXIS CAM Studio")).unwrap();
+        assert!(m.issues().is_empty(), "{:?}", m.issues());
+        assert!(crate::post::PostSettings::for_uc100(&m).is_ok());
+        // The library's travel is the span of the profile's soft limits.
+        let config = profile(&m).unwrap();
+        for (a, key) in ["x", "y", "z"].into_iter().enumerate() {
+            let axis = config.axes.get(a).unwrap();
+            let span = axis.soft_max.unwrap() - axis.soft_min.unwrap();
+            assert_eq!(span.to_string(), get(&m.p, key));
+        }
+        assert!(simulated(&m) != cfg!(target_os = "macos"));
+        let path = dir.path().join("AXIS CAM Studio").join("jy5800.toml");
+        std::fs::write(&path, "edited in Setup").unwrap();
+        owners_machine(&dir.path().join("AXIS CAM Studio")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited in Setup");
     }
 
     #[test]

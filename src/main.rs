@@ -793,7 +793,7 @@ impl App {
         // A load that changed something has notes; the workspace is then
         // saved once, so they are not repeated and what the load added, a
         // material for a legacy name, keeps its identifier.
-        let (mut doc, status, migrated) = if state_path.exists() && smoke_dir.is_none() {
+        let (mut doc, mut status, mut migrated) = if state_path.exists() && smoke_dir.is_none() {
             match storage::load_reporting(&state_path) {
                 Ok((d, notes)) => (
                     d,
@@ -825,6 +825,18 @@ impl App {
         // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
         doc.adopt_holders();
+        // The owner's CNC for a library with no machine; never in tests.
+        if !isolated && doc.machines.is_empty() {
+            match control::owners_machine(state_path.parent().unwrap_or(std::path::Path::new(".")))
+            {
+                Ok(m) => {
+                    status += " The Jingyan CNC4030 is in the Machine library.";
+                    doc.machines.push(m);
+                    migrated = true;
+                }
+                Err(e) => status += &format!(" Could not write the CNC4030's UC100 profile: {e}."),
+            }
+        }
         if !doc.sample_model {
             doc.sync_stock_sources();
         }

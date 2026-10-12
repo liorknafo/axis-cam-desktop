@@ -171,6 +171,15 @@ Other checks:
   - The pictures were ready within about 20 s of opening the Work page.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 814 passed, 3 failed: the two STEP tests, as before, and `the_control_page_renders_in_every_state`, which timed out under load and passes alone (LIO-131).
 
+## The owner's machine by default (LIO-138)
+
+- `the_owners_machine_runs_on_the_profile_it_writes_and_keeps_an_edited_one`:
+  - The Jingyan CNC4030 has no Machine library issues and passes the UC100 run checks (`PostSettings::for_uc100`).
+  - The profile it writes loads and passes the driver's checks. Its X, Y and Z soft-limit spans match the library's travel.
+  - Its connection is USB on macOS and Simulated elsewhere.
+  - A profile already beside the workspace is not overwritten.
+- Adding the machine to a workspace with no machine happens only outside tests and smoke runs, so no test covers that step. Seen on Windows: the release build started on the real workspace, which had no machine, and added the Jingyan CNC4030 and `jy5800.toml`.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

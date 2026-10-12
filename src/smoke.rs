@@ -5072,7 +5072,9 @@ flood = { pin = 8 }
                 unreachable!()
             };
             let drawn = || pixels.chunks(4).filter(|px| px[3] > 0);
-            let green = drawn().filter(|px| px[1] > px[0].saturating_add(30)).count();
+            let green = drawn()
+                .filter(|px| px[1] > px[0].saturating_add(30))
+                .count();
             let grey = drawn()
                 .filter(|px| px[0].abs_diff(px[1]) < 4 && px[1].abs_diff(px[2]) < 4)
                 .count();
