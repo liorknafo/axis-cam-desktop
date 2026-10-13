@@ -1,4 +1,4 @@
-//! Machine setup on the Control page: the UC100 profile form, the inputs
+//! Controller configuration on the Control page: the UC100 profile form, the inputs
 //! and the output test, the driver's audit, and steps-per-mm calibration.
 use crate::control::{Action, Connection};
 use crate::model::{Machine, get};
@@ -407,7 +407,7 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
     let verdict: Element<_> = match &d.checked {
         Ok(cfg) => match cfg.commissioning_blocker() {
             Some(why) => caution(
-                "Reset is refused until the machine setup is verified",
+                "Reset is refused until commissioning is verified",
                 vec![why],
             ),
             None => muted("The driver accepts this profile.")

@@ -440,7 +440,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             ))
             .push(tool_btn(
                 include_bytes!("../assets/tb-setup.svg"),
-                "Setup",
+                "Controller configuration",
                 Message::ControlSetup(true),
                 app.machine_setup,
             ))
@@ -581,7 +581,7 @@ fn blank_project(app: &App) -> Element<'_, Message> {
         text("2   Configure a machine and create the first setup.").size(14),
         text("3   Set stock and workholding, then add tools and operations.").size(14),
         space().height(12),
-        row![btn("Set up a machine",Message::NewMachine,false),btn("Saved machines",Message::Page(Page::Machines),false),btn("Tool library",Message::Page(Page::Tools),false)].spacing(8),
+        row![btn("New machine profile",Message::NewMachine,false),btn("Saved machines",Message::Page(Page::Machines),false),btn("Tool library",Message::Page(Page::Tools),false)].spacing(8),
         note("No sample geometry, setups or operations have been added. Saved machines, tools, materials and workholding are available when you need them.")
     ].spacing(13).max_width(730);
     if app.last_archived.is_some() {
@@ -603,7 +603,7 @@ fn first_setup(app: &App) -> Element<'_, Message> {
         bold("No setups yet", 22),
         text("Your model is ready to view. Choose the machine and workholding for its first machining position.").size(14),
         primary("Create first setup",Message::AddSetup).width(Fill),
-        btn(if app.doc.machines.is_empty() {"Set up a machine"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)},false).width(Fill),
+        btn(if app.doc.machines.is_empty() {"New machine profile"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)},false).width(Fill),
         note("Each setup starts with zero operations. Add another setup when the part needs to be flipped, indexed or reclamped.")
     ].spacing(18).into()
 }
@@ -1850,34 +1850,108 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     }
     c.into()
 }
+/// The setup editor's steps, one tab each, in order.
+pub(crate) const SETUP_STEPS: [&str; 4] = ["Machine", "Stock", "Position", "Holding"];
+/// Whether the active setup's `step` needs nothing more: its tab's ✓, else ○.
+pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
+    let s = app.doc.setup();
+    match step {
+        "Machine" => s.machine.issues().is_empty() && !get(&s.p, "offset").is_empty(),
+        "Stock" => {
+            app.doc.selected_material().is_some()
+                && crate::stock::resolve(s, app.part_mesh())
+                    .is_ok_and(|resolved| !outside_fixed_stock(s, &resolved))
+        }
+        "Position" => ["rx", "ry", "rz", "tx", "ty", "tz"]
+            .iter()
+            .all(|k| num(&s.p, k).is_some()),
+        _ => matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty(),
+    }
+}
+/// Whether the part reaches outside the setup's fixed stock box.
+fn outside_fixed_stock(s: &Setup, resolved: &crate::stock::ResolvedStock) -> bool {
+    !crate::stock::relative(s)
+        && resolved.part.is_some_and(|part| {
+            (0..3).any(|i| {
+                part.min[i] < resolved.stock.min[i] - 0.001
+                    || part.max[i] > resolved.stock.max[i] + 0.001
+            })
+        })
+}
 fn setup_editor(app: &App) -> Element<'_, Message> {
     let s = app.doc.setup();
     let p = &s.p;
     let t = Target::Setup;
-    let mut c = column![
+    let mut steps = Column::new().spacing(2);
+    for pair in SETUP_STEPS.chunks(2) {
+        let mut r = Row::new().spacing(1);
+        for &step in pair {
+            let on = app.setup_step == step;
+            let mark = if setup_step_done(app, step) { "✓" } else { "○" };
+            let b = button(text(format!("{mark}  {step}")).size(12))
+                .on_press(Message::SetupStep(step))
+                .padding([7, 10])
+                .style(move |_, status| flat(on, status));
+            r = r.push(HelpButton::new(b, &Message::SetupStep(step), step).width(Length::FillPortion(1)));
+        }
+        steps = steps.push(r);
+    }
+    let c = column![
         bold("Setup", 20),
-        muted("Define placement, stock and workholding."),
+        muted("One position of the part on the machine: its machine, stock, placement and holding."),
         field(p, "name", "Setup name", t),
-        section("Machine & coordinate system"),
-        btn(
-            format!(
-                "{} · {}-axis · v{}",
-                s.machine.name(),
-                s.machine.axes(),
-                s.machine.version
-            ),
-            Message::Page(Page::Machines),
-            true
+        steps,
+    ]
+    .spacing(12);
+    let mut c = match app.setup_step {
+        "Stock" => setup_stock(app, c),
+        "Position" => setup_position(app, c),
+        "Holding" => setup_holding(app, c),
+        _ => setup_machine(app, c),
+    };
+    c = c
+        .push(warnings(s.issues()))
+        .push(btn("Duplicate setup", Message::DuplicateSetup, false).width(Fill))
+        .push(
+            row![
+                btn("Move up", Message::MoveSetup(-1), false),
+                btn("Move down", Message::MoveSetup(1), false)
+            ]
+            .spacing(5),
+        );
+    if app.confirm_delete_setup {
+        c=c.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![btn("Cancel",Message::ConfirmDeleteSetup(false),false),primary("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
+    } else {
+        c = c.push(btn("Delete setup…", Message::RemoveSetup, false).width(Fill));
+    }
+    c.into()
+}
+fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    let s = app.doc.setup();
+    let p = &s.p;
+    let t = Target::Setup;
+    c.push(section("Machine & coordinate system"))
+        .push(
+            btn(
+                format!(
+                    "{} · {}-axis · v{}",
+                    s.machine.name(),
+                    s.machine.axes(),
+                    s.machine.version
+                ),
+                Message::Page(Page::Machines),
+                true,
+            )
+            .width(Fill),
         )
-        .width(Fill),
-        choice(
+        .push(choice(
             p,
             "offset",
             "Work offset",
             &["G54", "G55", "G56", "G57", "G58", "G59"],
-            t
-        ),
-        choice(
+            t,
+        ))
+        .push(choice(
             p,
             "origin",
             "Work coordinate origin",
@@ -1885,14 +1959,16 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
                 "Stock top center",
                 "Stock top front-left",
                 "Model origin",
-                "Selected point (planned)"
+                "Selected point (planned)",
             ],
-            t
-        ),
-        material_picker(app),
-        section("Stock")
-    ]
-    .spacing(12);
+            t,
+        ))
+}
+fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    let s = app.doc.setup();
+    let p = &s.p;
+    let t = Target::Setup;
+    let mut c = c.push(material_picker(app)).push(section("Stock"));
     if app.doc.index() == 0 || app.is_sample() {
         c = c.push(choice(
             p,
@@ -1958,14 +2034,7 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
                         .width(Fill)
                         .style(panel_style),
                 );
-                if !crate::stock::relative(s)
-                    && resolved.part.is_some_and(|part| {
-                        (0..3).any(|i| {
-                            part.min[i] < resolved.stock.min[i] - 0.001
-                                || part.max[i] > resolved.stock.max[i] + 0.001
-                        })
-                    })
-                {
+                if outside_fixed_stock(s, &resolved) {
                     c = c.push(note("The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."));
                 }
             }
@@ -1993,7 +2062,12 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
             );
         }
     }
-    c = c.push(section("Part position")).push(
+    c
+}
+fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    let p = &app.doc.setup().p;
+    let t = Target::Setup;
+    let mut c = c.push(section("Part position")).push(
         row![
             btn("Flip X 180°", Message::Flip("rx"), false),
             btn("Side Y 90°", Message::Flip("ry"), false)
@@ -2010,7 +2084,12 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
     ] {
         c = c.push(field(p, k, l, t));
     }
-    c = c.push(section("Workholding"));
+    c
+}
+fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    let p = &app.doc.setup().p;
+    let t = Target::Setup;
+    let mut c = c.push(section("Workholding"));
     for control in holding_controls(app) {
         c = c.push(control);
     }
@@ -2041,22 +2120,8 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
             ],
             t,
         ))
-        .push(field(p, "notes", "Setup instructions", t))
-        .push(warnings(s.issues()))
-        .push(btn("Duplicate setup", Message::DuplicateSetup, false).width(Fill))
-        .push(
-            row![
-                btn("Move up", Message::MoveSetup(-1), false),
-                btn("Move down", Message::MoveSetup(1), false)
-            ]
-            .spacing(5),
-        );
-    if app.confirm_delete_setup {
-        c=c.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![btn("Cancel",Message::ConfirmDeleteSetup(false),false),primary("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
-    } else {
-        c = c.push(btn("Delete setup…", Message::RemoveSetup, false).width(Fill));
-    }
-    c.into()
+        .push(field(p, "notes", "Setup instructions", t));
+    c
 }
 /// An item of a pick list: what is sent when it is chosen, and what it says.
 #[derive(Clone, PartialEq)]
@@ -2457,7 +2522,7 @@ fn machines(app: &App) -> Element<'_, Message> {
             "Machine library",
             "Saved locally. Each setup keeps a snapshot of its assigned profile."
         ),
-        primary("+ Set up a machine", Message::NewMachine),
+        primary("+ New machine profile", Message::NewMachine),
         space().height(5)
     ]
     .spacing(18);
@@ -2523,7 +2588,7 @@ fn machines(app: &App) -> Element<'_, Message> {
     }));
     if app.doc.machines.is_empty() {
         c = c.push(note(
-            "Your machine library is empty. Use Set up a machine to add your own specification.",
+            "Your machine library is empty. Use New machine profile to add your own specification.",
         ));
     }
     container(scrollable(c))
@@ -2738,7 +2803,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
     });
     let body = column![
         page_header(
-            "Machine setup wizard",
+            "Machine profile wizard",
             "Configure once. Reuse across future jobs."
         ),
         nav,
@@ -3712,21 +3777,21 @@ fn tools(app: &App) -> Element<'_, Message> {
     }
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
-    form = form.push(warnings(tool_issues)).push(
-        row![
-            primary(
-                app.resume_label().unwrap_or("Save tool".into()),
-                Message::SaveTool
-            ),
-            btn(
-                "Delete tool",
-                Message::DeleteTool(app.tool_draft.id.clone()),
-                false
-            )
-        ]
-        .spacing(10),
-    );
-    container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),container(scrollable(form)).padding(24).width(Fill).height(Fill).style(panel_style)].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
+    form = form.push(warnings(tool_issues));
+    // Below the scrolling fields, so Save stays in sight.
+    let actions = row![
+        primary(
+            app.resume_label().unwrap_or("Save tool".into()),
+            Message::SaveTool
+        ),
+        btn(
+            "Delete tool",
+            Message::DeleteTool(app.tool_draft.id.clone()),
+            false
+        )
+    ]
+    .spacing(10);
+    container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),container(column![scrollable(form).height(Fill),actions].spacing(14)).padding(24).width(Fill).height(Fill).style(panel_style)].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
 }
 fn materials(app: &App) -> Element<'_, Message> {
     let mut list = column![

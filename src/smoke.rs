@@ -265,6 +265,7 @@ impl App {
                 self.stock = true;
                 vec![
                     Message::AssignMachine(self.doc.machines[0].id.clone()),
+                    Message::SetupStep("Stock"),
                     Message::Edit(Target::Setup, "stock_top", "10".into()),
                     Message::Edit(Target::Setup, "stock_right", "2".into()),
                 ]
@@ -807,6 +808,7 @@ impl App {
                     Message::SelectOp(0),
                     Message::Edit(Target::Setup, "holding", "Vise".into()),
                     Message::SetupEditor,
+                    Message::SetupStep("Holding"),
                 ]
             }
             112 => {
@@ -915,6 +917,7 @@ impl App {
                     Message::SelectSetup(1),
                     Message::Edit(Target::Setup, "holding", "Vise".into()),
                     Message::SetupEditor,
+                    Message::SetupStep("Stock"),
                 ]
             }
             117 => {
@@ -1013,11 +1016,6 @@ impl App {
                 assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Vise");
                 assert_eq!(crate::ui::holding_boxes(self).len(), 2, "{}", self.status);
                 self.paths = false;
-                // The Workholding controls are far down the setup editor.
-                return iced::widget::operation::scroll_to(
-                    "inspector",
-                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 1380. },
-                );
             }
             112 => {
                 assert_eq!(crate::model::get(&self.doc.setup().p, "holding"), "Clamps");
@@ -1050,12 +1048,6 @@ impl App {
                 )
             };
             return Task::batch([top("inspector"), top("planner-result")]);
-        }
-        if (21..=24).contains(&self.smoke_step) {
-            return iced::widget::operation::scroll_to(
-                "inspector",
-                iced::widget::scrollable::AbsoluteOffset { x: 0., y: 390. },
-            );
         }
         Task::none()
     }
@@ -4876,6 +4868,45 @@ flood = { pin = 8 }
         assert!(crate::ui::holding_boxes(&a).is_empty());
         let _ = a.update(Message::SelectSetup(0));
         assert!(crate::ui::holding_lines(&a).is_empty());
+        let _ = a.view();
+    }
+    #[test]
+    fn the_setup_editor_opens_each_step_and_marks_what_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.doc.adopt_materials();
+        a.doc.material_id.clear();
+        let _ = a.update(Message::SetupEditor);
+        // Holding is one click from the top, like every step, and each builds.
+        assert_eq!(a.setup_step, "Machine");
+        for step in crate::ui::SETUP_STEPS {
+            let _ = a.update(Message::SetupStep(step));
+            assert_eq!(a.setup_step, step);
+            let _ = a.view();
+        }
+        let done = |a: &App, step| crate::ui::setup_step_done(a, step);
+        assert!(done(&a, "Machine") && done(&a, "Position"));
+        // Holding: a modelled vise with nothing wrong, not None or a vise too narrow.
+        assert!(!done(&a, "Holding"));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert!(done(&a, "Holding"));
+        let _ = a.update(Message::Edit(Target::Setup, "vise_axis", "X".into()));
+        assert!(!done(&a, "Holding"));
+        // Stock: a material, and a box that holds the part.
+        assert!(!done(&a, "Stock"));
+        let id = a.doc.materials[0].id.clone();
+        let _ = a.update(Message::PickMaterial(id));
+        assert!(done(&a, "Stock"));
+        edit_setup(&mut a, &[("stock_type", "Fixed size box"), ("stock_x", "10")]);
+        assert!(!done(&a, "Stock"));
+        // An operation opened in between keeps the step for the way back.
+        let _ = a.update(Message::SetupStep("Holding"));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::SetupEditor);
+        assert_eq!(a.setup_step, "Holding");
+        let _ = a.view();
+        // The tool editor, its Save under the scrolling fields, builds too.
+        let _ = a.update(Message::NewTool);
         let _ = a.view();
     }
     #[test]

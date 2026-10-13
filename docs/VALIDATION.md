@@ -89,7 +89,7 @@ A hand on the hardware E-stop for every step; the mushroom's power cutoff is not
 ## UC100 machine setup (part 4)
 
 - Profile form: an edit changes only its own line and keeps trailing and preceding comments; an integer stays an integer; a decimal point being typed stays on screen (`setup::tests::an_edit_changes_its_line_only_and_keeps_the_comments`). Pins change, appear in a table the file did not have, and go; a pin with two roles is the driver's error and blocks Save (`pins_change_appear_and_go`). An emptied optional field removes its key; a field that is not a number, or a missing required one, blocks Save (`an_empty_optional_field_removes_its_key_and_bad_numbers_block_save`). Save writes the file and refuses one changed on disk since it was opened (`save_writes_the_file_and_refuses_one_changed_on_disk`); a CRLF file opens unchanged and keeps CRLF (`a_windows_file_opens_unchanged_and_keeps_its_line_endings`); a file that is not TOML is not opened (`a_file_that_is_not_toml_is_not_opened`).
-- From the page: edits survive switching between Control and Setup, Save, Revert, a refused profile, a broken file (`setup_edits_and_saves_the_profile`). Saving while connected is refused while jogging; once Idle it reconnects with the new steps per mm, in E-stop, with no axis position set (`saving_while_connected_reconnects_with_the_new_profile`).
+- From the page: edits survive switching between Control and Controller configuration, Save, Revert, a refused profile, a broken file (`setup_edits_and_saves_the_profile`). Saving while connected is refused while jogging; once Idle it reconnects with the new steps per mm, in E-stop, with no axis position set (`saving_while_connected_reconnects_with_the_new_profile`).
 - Inputs: the log keeps the last 20 edges with their time and counts changes per pin (`control::tests::the_input_log_keeps_the_last_edges`).
 - Outputs: a free pin forced High shows in the controller's readback and Release brings it back; step and PWM pins are not forced; E-stop releases a forced pin and nothing is forced in E-stop (`outputs_are_forced_only_while_idle_and_on_free_pins`).
 - Calibration: 10 mm commanded at 200 steps per mm gives 2000 pulses; 9.95 mm measured gives 201.005 steps per mm, which Use in profile puts in the form and Save applies; no move in E-stop or with a travel that is not a number (`calibration_measures_steps_per_mm_and_fills_the_profile`).
@@ -211,6 +211,23 @@ Other checks:
 - The run's checks before Cycle Start keep their messages (`output_problems` is shared), as the run tests in `src/smoke.rs` and `src/run.rs` show.
 - Not covered: what needs the connected machine (the work offset, machine positions, the soft limits at the work zero, the profile's soft limits against the machine's travel) is checked when the setup is run, not when it is planned. A live planning run needs the owner's ChatGPT sign-in and was not made; the test checks the plan directly, with no model and no request to OpenAI.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 7 failed: the two STEP tests, as before, and five simulated-UC100 smoke tests that timed out under the load of parallel builds (`a_jog_into_a_soft_limit_ends_at_the_limit`, `cycle_start_waits_for_what_the_run_panel_lists`, `keep_the_last_position_declares_where_the_machine_was_left`, `probe_centre_sets_the_work_zero_on_the_middle_of_the_block`, `saving_while_connected_reconnects_with_the_new_profile`); the five pass alone.
+
+## One meaning of "Setup", and the setup editor in steps (LIO-149)
+
+- Names. "Setup" now means only a position of the part on the machine: Setup 1, **+ Setup**, **Edit setup** and the step 01 Setup.
+  - The MACHINE toolbar's **Setup** is now **Controller configuration**. Its verdict reads "Reset is refused until commissioning is verified", and the probe warning on the Control page says "add it under Inputs in Controller configuration."
+  - The machine wizard is the **Machine profile wizard**. **Set up a machine** is now **New machine profile**, on the start of a blank project, on a part with no setup and in the Machine library.
+  - Earlier sections keep the names of their day: their Setup on the MACHINE toolbar is Controller configuration.
+- The setup editor has four steps, as tabs under the setup name: **Machine** (machine, work offset, origin), **Stock** (project material, stock), **Position** (flips, rotation, translation) and **Holding** (modelled workholding, Fixture, Fixture clearance, Reposition action, Setup instructions). The setup's issues and Duplicate, Move up, Move down and Delete follow every step, so they stay in sight.
+- `smoke::tests::the_setup_editor_opens_each_step_and_marks_what_is_done` (the example job and starter library):
+  - The editor opens on Machine; each step opens in one click and builds.
+  - Machine and Position are ✓.
+  - Holding is ○ with no modelled workholding, ✓ with the suggested vise, and ○ again with the jaws on the X sides, where the stock is wider than the vise opens.
+  - Stock is ○ with no material, ✓ once one is chosen, and ○ again for a 10 mm fixed box the part does not fit in.
+  - Holding is still the step shown after opening an operation and going back with Edit setup.
+  - The tool editor builds with **Save tool** and **Delete tool** under its scrolling fields, outside the scroll, so they stay in sight at any window height.
+- The renderer's smoke run opens the Stock step for screens 22–25 and 92 and the Holding step for screen 88, where it scrolled the inspector before. It drives a real window, so it was not run here.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 818 passed, 3 failed: the two STEP tests, as before, and `the_control_page_renders_in_every_state`, which timed out waiting for jogging under the full suite's load and passes alone.
 
 ## Planner analysis and checks (no AI)
 

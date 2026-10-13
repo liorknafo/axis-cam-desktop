@@ -234,6 +234,18 @@ pub fn command(m: &Message, label: String) -> Help {
         SetupEditor => {
             "Set the machine, work coordinate system, stock, part orientation and workholding for the current setup."
         }
+        SetupStep("Machine") => {
+            "The machine this setup runs on, its work offset and where the work zero sits on the stock. ✓ once the machine profile has no issues and a work offset is chosen."
+        }
+        SetupStep("Stock") => {
+            "The project material and the block the part is cut from. ✓ once a material is chosen and the stock box holds the part."
+        }
+        SetupStep("Position") => {
+            "Turn or move the part for this setup: flip it over, stand it on a side or shift it. ✓ while every rotation and translation is a number."
+        }
+        SetupStep(_) => {
+            "The vise or clamps that hold the stock, checked against every toolpath, and the setup sheet's fixture notes. ✓ once a vise or clamps are modelled with nothing wrong."
+        }
         SelectSetup(_) => {
             "Make this setup active and show its part orientation and operations. Each setup represents a machining position or reclamping stage. The picture shows the stock as this setup starts, in its jaws or clamps, seen as its 3D view first shows it: its block, or what the earlier setups left it, the cut faces in green."
         }

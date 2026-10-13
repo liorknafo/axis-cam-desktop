@@ -896,7 +896,7 @@ impl Connection {
         let s = &self.snapshot;
         let Some(pin) = self.config.inputs.probe else {
             return Some(
-                "The UC100 profile has no probe input: add it under Inputs in Setup.".into(),
+                "The UC100 profile has no probe input: add it under Inputs in Controller configuration.".into(),
             );
         };
         if let Err(e) = &self.probe {

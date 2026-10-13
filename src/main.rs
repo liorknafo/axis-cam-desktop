@@ -105,6 +105,7 @@ pub enum Message {
     SelectSetup(usize),
     SelectOp(usize),
     SetupEditor,
+    SetupStep(&'static str),
     Tab(String),
     Edit(Target, &'static str, String),
     Title(String),
@@ -519,6 +520,8 @@ pub struct App {
     pub cam_page: Page,
     pub selected: Option<usize>,
     pub tab: String,
+    /// The setup editor's step shown (`ui::SETUP_STEPS`).
+    pub setup_step: &'static str,
     pub status: String,
     pub audit_report: Vec<(String, bool, String)>,
     pub post: Option<std::sync::Arc<post::JobPost>>,
@@ -593,9 +596,9 @@ pub struct App {
     pub state_path: PathBuf,
     /// The machine controller, while connected.
     pub control: Option<control::Connection>,
-    /// The Control page shows Setup.
+    /// The Control page shows the controller configuration.
     pub machine_setup: bool,
-    /// The profile being edited on Setup, for the machine with this id.
+    /// The profile being edited in the controller configuration, for the machine with this id.
     pub profile_draft: Option<(String, Result<setup::Draft, String>)>,
     /// The UC100 machine chosen on the Control page (machine id).
     pub control_machine: Option<String>,
@@ -898,6 +901,7 @@ impl App {
             cam_page: Page::Home,
             selected: None,
             tab: "Tool".into(),
+            setup_step: "Machine",
             status,
             audit_report: vec![],
             post: None,
@@ -2213,6 +2217,7 @@ impl App {
                 self.simulation = None;
                 self.progress = 0.;
             }
+            Message::SetupStep(step) => self.setup_step = step,
             Message::Tab(t) => {
                 self.picking = t == "Geometry" && self.can_pick();
                 if self.picking {
