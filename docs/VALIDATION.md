@@ -191,6 +191,16 @@ Other checks:
 - Not inspected in the real window: the window is shared with other work on this PC.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 6 failed: the two STEP tests, as before, and four simulated-UC100 smoke tests that timed out under the load of parallel builds (`the_control_page_renders_in_every_state`, `a_jog_into_a_soft_limit_ends_at_the_limit`, `e_stop_stops_a_probe`, `keep_the_last_position_declares_where_the_machine_was_left`); each passes alone.
 
+## Detours that come back (LIO-147)
+
+- `smoke::tests::part_then_machine_then_setup_without_hidden_operations`, on an imported part in an isolated workspace with no machine and no tool:
+  - Create first setup opens the machine wizard, whose Save reads "Save and create first setup". Saving creates Setup 1 on the Work page, with no operation.
+  - Face opens the Tool library and adds nothing. After New tool, Save reads "Save and continue to Facing", and the page builds. Saving adds the Facing operation and returns to the Work page, with no action left pending.
+  - Face again with no tool, then the Work page and back to Tools: saving a tool adds nothing and stays on Tools.
+  - With one machine in the library, Create first setup creates the setup with it, without the Machine library.
+- Not a test: the window was not driven or looked at; the labels and the empty Tool library's text ("Facing needs a cutter. Create one: saving it adds Facing.") come from the same code.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 815 passed, 4 failed: the two STEP tests, as before, and two simulated-UC100 smoke tests that timed out under the load of parallel builds (`machine_zero_turns_the_soft_limits_on`, `the_control_page_renders_in_every_state`); each passes alone.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

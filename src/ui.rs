@@ -2731,7 +2731,10 @@ fn wizard(app: &App) -> Element<'_, Message> {
     actions = actions.push(if app.wizard_step < 4 {
         primary("Continue", Message::WizardStep(app.wizard_step + 1))
     } else {
-        primary("Save machine profile", Message::SaveMachine)
+        primary(
+            app.resume_label().unwrap_or("Save machine profile".into()),
+            Message::SaveMachine,
+        )
     });
     let body = column![
         page_header(
@@ -3637,7 +3640,15 @@ fn tools(app: &App) -> Element<'_, Message> {
                 page_header("Tool library", "Save cutters you actually use."),
                 space().height(40),
                 bold("No tools yet", 28),
-                muted("Create your first cutter, then select it when adding an operation."),
+                muted(match &app.pending {
+                    Some((_, Message::AddOp(s))) => format!(
+                        "{} needs a cutter. Create one: saving it adds {}.",
+                        s.name(),
+                        s.name()
+                    ),
+                    _ =>
+                        "Create your first cutter, then select it when adding an operation.".into(),
+                }),
                 primary("+ Create first tool", Message::NewTool)
             ]
             .spacing(18),
@@ -3703,7 +3714,10 @@ fn tools(app: &App) -> Element<'_, Message> {
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues)).push(
         row![
-            primary("Save tool", Message::SaveTool),
+            primary(
+                app.resume_label().unwrap_or("Save tool".into()),
+                Message::SaveTool
+            ),
             btn(
                 "Delete tool",
                 Message::DeleteTool(app.tool_draft.id.clone()),

@@ -631,6 +631,10 @@ pub struct App {
     pub plan_camera: viewport::Camera,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
+    /// An action that sent the user to a page to make what it needs first
+    /// (Face to the Tool library), and that page: saving there carries the
+    /// action out; leaving the page drops it.
+    pub pending: Option<(Page, Message)>,
     pub icons: Vec<iced::widget::svg::Handle>,
     /// A close request waiting for a sign-out, a sign-in save or a refresh
     /// of the sign-in, and when it first came.
@@ -957,6 +961,7 @@ impl App {
             plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
+            pending: None,
             icons,
             closing: None,
             signing_out: None,
@@ -2024,9 +2029,32 @@ impl App {
         self.simulation = None;
         self.confirm_delete_setup = false;
     }
+    /// Carries out the pending action, once its page has saved what the
+    /// action needed.
+    fn resume(&mut self) -> Task<Message> {
+        match self.pending.take() {
+            Some((_, action)) => self.update(action),
+            None => Task::none(),
+        }
+    }
+    /// The Save button on the pending action's page: it says what follows.
+    pub fn resume_label(&self) -> Option<String> {
+        Some(match &self.pending.as_ref()?.1 {
+            Message::AddOp(s) => format!("Save and continue to {}", s.name()),
+            Message::AddSetup => "Save and create first setup".into(),
+            _ => return None,
+        })
+    }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
         let task = self.handle(message);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(page, _)| *page != self.page)
+        {
+            self.pending = None;
+        }
         // A message that dropped a running plan or a preview says why. When
         // its handler set a status of its own, both are shown, its own first.
         if let Some(dropped) = self.plan_dropped.take() {
@@ -2291,7 +2319,12 @@ impl App {
                     .or(self.doc.tools.first())
                 else {
                     self.page = Page::Tools;
-                    self.status = "Create and save a cutter first, then add your operation.".into();
+                    self.pending = Some((Page::Tools, Message::AddOp(strategy)));
+                    self.status = format!(
+                        "{} needs a cutter. Create one: saving it adds {}.",
+                        strategy.name(),
+                        strategy.name()
+                    );
                     return Task::none();
                 };
                 let mut operation = Operation::new(strategy, tool.id.clone());
@@ -2509,13 +2542,16 @@ impl App {
             Message::AddSetup => {
                 if let Some(setup) = self.doc.active_setup() {
                     self.create_setup(setup.machine.clone());
+                } else if let [machine] = &self.doc.machines[..] {
+                    self.create_setup(machine.clone());
                 } else if self.doc.machines.is_empty() {
-                    self.status =
-                        "Set up and save your machine, then choose Create first setup.".into();
-                    return self.update(Message::NewMachine);
+                    let task = self.update(Message::NewMachine);
+                    self.pending = Some((Page::Wizard, Message::AddSetup));
+                    self.status = "Set up your machine: saving it creates the first setup.".into();
+                    return task;
                 } else {
                     self.page = Page::Machines;
-                    self.status = "Choose a saved machine and click Create first setup.".into();
+                    self.status = "Choose the machine for the first setup.".into();
                 }
             }
             Message::DuplicateSetup => {
@@ -2802,6 +2838,7 @@ impl App {
                     self.page = Page::Machines;
                     self.touch();
                     self.status="Machine profile saved. Use Assign to setup to update an existing setup snapshot.".into();
+                    return self.resume();
                 } else {
                     self.status = errors.join(" ");
                 }
@@ -2840,7 +2877,8 @@ impl App {
                         self.doc.tools.push(self.tool_draft.clone())
                     }
                     self.touch();
-                    self.status = "Tool saved to the local library.".into()
+                    self.status = "Tool saved to the local library.".into();
+                    return self.resume();
                 } else {
                     self.status = issues.join(" ")
                 }

@@ -132,12 +132,14 @@ Meshing runs in a background worker. **Updating…** means the last completed st
 
 ## Start a project from nothing
 
-The app opens on a start screen. Choose **New blank project** to begin with no model, setups or operations and no project material chosen. On a fresh installation the machine and tool libraries are empty, and the material library holds the starter materials (see **Materials**). **New project** in the application bar or **Command/Ctrl+N** starts fresh at any time while retaining saved machine and tool profiles and the material library. The previous job is archived before switching; use **Start → Browse project history** to reopen it, or **Recover previous project** to undo the latest switch during the session.
+The app opens on a start screen. Choose **New blank project** to begin with no model, setups or operations and no project material chosen. On a fresh installation the machine library holds the owner's Jingyan CNC4030 (see **Machine control (UC100)**), the tool library is empty, and the material library holds the starter materials (see **Materials**). **New project** in the application bar or **Command/Ctrl+N** starts fresh at any time while retaining saved machine and tool profiles and the material library. The previous job is archived before switching; use **Start → Browse project history** to reopen it, or **Recover previous project** to undo the latest switch during the session.
 
 1. Click **Import your first model** and choose STEP/STP, 3MF, STL or OBJ. The part can be viewed before a setup exists.
-2. Choose **Create first setup**. Select a saved machine, or complete **Set up a machine**, save the profile and choose **Create first setup** from the library.
+2. Choose **Create first setup**. With one saved machine the setup is created with it; with several, choose one in the Machine library; with none, the machine wizard opens and its **Save and create first setup** creates the setup.
 3. Set the stock offsets (or fixed dimensions), the project material (chosen from the material library), work offset, origin and workholding in the setup editor. New setups contain no operations.
-4. Save a cutter in **Tool library**, then choose an operation and configure its parameters.
+4. Choose an operation and configure its parameters. With no cutter yet, the operation opens the Tool library; its **Save and continue to** button (for example **Save and continue to Facing**) saves the cutter and adds the operation (LIO-147).
+
+An action that needs something you have not made yet sends you to make it and then finishes once it is saved. Leaving that page instead drops the action.
 5. Add further setups for each repositioning of the part. The last setup can be deleted, returning the project to a part with no setups.
 6. Use **Save project** to create a portable `.axis.json` file, and **Open** to restore it later.
 

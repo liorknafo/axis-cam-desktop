@@ -6537,23 +6537,51 @@ flood = { pin = 8 }
         assert!(a.doc.setups.is_empty() && !a.is_sample());
         let _view = a.view();
         drop(_view);
+        // Each detour to make what an action needs comes back and finishes
+        // it (LIO-147): saving the machine creates the setup, saving the
+        // cutter adds Facing.
         let _ = a.update(Message::AddSetup);
         assert_eq!(a.page, Page::Wizard);
-        let machine = a.machine_draft.id.clone();
+        assert_eq!(
+            a.resume_label().as_deref(),
+            Some("Save and create first setup")
+        );
         let _ = a.update(Message::SaveMachine);
-        assert!(a.doc.setups.is_empty());
-        let _ = a.update(Message::AssignMachine(machine));
         assert_eq!(a.doc.setups.len(), 1);
+        assert_eq!(a.page, Page::Work);
         assert!(a.doc.setup().operations.is_empty());
         assert_eq!(get(&a.doc.setup().p, "stock_x"), "");
         let _ = a.update(Message::AddOp(Strategy::Face));
         assert!(a.doc.setup().operations.is_empty());
         assert_eq!(a.page, Page::Tools);
         let _ = a.update(Message::NewTool);
+        assert_eq!(
+            a.resume_label().as_deref(),
+            Some("Save and continue to Facing")
+        );
+        let _view = a.view();
+        drop(_view);
         let _ = a.update(Message::SaveTool);
-        let _ = a.update(Message::AddOp(Strategy::Face));
         assert_eq!(a.doc.setup().operations.len(), 1);
+        assert_eq!(a.doc.setup().operations[0].strategy, Strategy::Face);
+        assert_eq!(a.page, Page::Work);
+        assert!(a.pending.is_none());
         assert!(a.operation().unwrap().geometry.is_empty());
+        // Leaving the page drops the action: a later save does not add it.
+        let _ = a.update(Message::RemoveOp);
+        a.doc.tools.clear();
+        let _ = a.update(Message::AddOp(Strategy::Face));
+        let _ = a.update(Message::Page(Page::Work));
+        let _ = a.update(Message::Page(Page::Tools));
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::SaveTool);
+        assert!(a.doc.setup().operations.is_empty());
+        assert_eq!(a.page, Page::Tools);
+        // A library with one machine creates a further first setup with it.
+        let _ = a.update(Message::ConfirmDeleteSetup(true));
+        let _ = a.update(Message::AddSetup);
+        assert_eq!(a.doc.setups.len(), 1);
+        assert_eq!(a.page, Page::Work);
         let _ = a.update(Message::ConfirmDeleteSetup(true));
         assert!(a.doc.setups.is_empty() && a.doc.active.is_empty());
         assert!(a.doc.validate_structure().is_ok());
