@@ -166,7 +166,7 @@ Open **Start → Explore example project** first. This loads the housing, sample
 9. Open **NC program** to review configuration issues and export the setup sheet. G-code export is refused for the example project; it is for imported parts (see **LinuxCNC G-code export**).
 10. **Save project** writes a portable `.axis.json` file. **Open** restores it.
 
-Viewport: left-drag orbits, right/middle-drag pans, scroll zooms; ISO/TOP/FRONT/RIGHT reset the camera. Command/Ctrl+N starts a blank project, Command/Ctrl+S saves a project and Command/Ctrl+O opens one. In a form, Tab moves to the next field and Shift+Tab to the previous one, for example through the stock offsets.
+Viewport: left-drag orbits, right/middle-drag pans, scroll zooms; ISO/TOP/FRONT/RIGHT reset the camera. Command/Ctrl+N starts a blank project, Command/Ctrl+S saves a project and Command/Ctrl+O opens one. In a form, Tab moves to the next field and Shift+Tab to the previous one, for example through the stock offsets; the field's value arrives selected, so typing replaces it.
 
 The fit scale stays constant while orbiting and panning. Full-resolution viewport frames are uploaded as small tiles with filtering gutters, keeping them below Iced 0.14's asynchronous image-upload threshold and preventing missing model frames during camera movement.
 

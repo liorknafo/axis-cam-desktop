@@ -2836,15 +2836,20 @@ impl App {
                     }
                 }
             }
-            // Fields in layout order, such as the stock offsets. Only from a
-            // field: a Tab elsewhere must not give one the jog keys.
+            // Fields in layout order, such as the stock offsets, arriving with
+            // the value selected so typing replaces it. Only from a field: a
+            // Tab elsewhere must not give one the jog keys.
             Message::TabKey(back) => {
                 return iced::advanced::widget::operate(control::typing()).then(move |typing| {
-                    match (typing, back) {
-                        (false, _) => Task::none(),
-                        (true, false) => iced::widget::operation::focus_next(),
-                        (true, true) => iced::widget::operation::focus_previous(),
+                    if !typing {
+                        return Task::none();
                     }
+                    let step = if back {
+                        iced::widget::operation::focus_previous()
+                    } else {
+                        iced::widget::operation::focus_next()
+                    };
+                    step.chain(iced::advanced::widget::operate(control::select_focused()).discard())
                 });
             }
             Message::JogKeyUp => {

@@ -1438,9 +1438,94 @@ pub fn typing() -> impl iced::advanced::widget::Operation<bool> {
     Typing(false)
 }
 
+/// A widget operation that selects all of the focused text field, so typing
+/// replaces its value: a Tab into a field ends with it.
+pub fn select_focused() -> impl iced::advanced::widget::Operation {
+    use iced::advanced::widget::{
+        Id, Operation,
+        operation::{self, Focusable, TextInput, focusable::count},
+    };
+    // The focused field's index, and the fields passed. A text field is
+    // offered as a text input first, then as focusable.
+    struct SelectAt(Option<usize>, usize);
+    impl Operation for SelectAt {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self)
+        }
+        fn text_input(&mut self, _: Option<&Id>, _: iced::Rectangle, state: &mut dyn TextInput) {
+            if self.0 == Some(self.1) {
+                state.select_all()
+            }
+        }
+        fn focusable(&mut self, _: Option<&Id>, _: iced::Rectangle, _: &mut dyn Focusable) {
+            self.1 += 1
+        }
+    }
+    operation::then(count(), |count| SelectAt(count.focused, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tab_into_a_field_selects_its_value() {
+        use iced::advanced::widget::operation::{Focusable, Operation, Outcome, TextInput, focusable};
+        #[derive(Default)]
+        struct Field {
+            focused: bool,
+            selected: bool,
+        }
+        impl Focusable for Field {
+            fn is_focused(&self) -> bool {
+                self.focused
+            }
+            // Like iced's text field, which puts the cursor at the end.
+            fn focus(&mut self) {
+                (self.focused, self.selected) = (true, false)
+            }
+            fn unfocus(&mut self) {
+                (self.focused, self.selected) = (false, false)
+            }
+        }
+        impl TextInput for Field {
+            fn text(&self) -> &str {
+                "5"
+            }
+            fn move_cursor_to_front(&mut self) {}
+            fn move_cursor_to_end(&mut self) {}
+            fn move_cursor_to(&mut self, _: usize) {}
+            fn select_all(&mut self) {
+                self.selected = true
+            }
+            fn select_range(&mut self, _: usize, _: usize) {}
+        }
+        // An operation and those it chains to, over the fields offered in
+        // order the way a text field offers itself.
+        fn run(mut op: Box<dyn Operation>, fields: &mut [Field]) {
+            loop {
+                op.traverse(&mut |op| {
+                    for f in fields.iter_mut() {
+                        op.text_input(None, iced::Rectangle::default(), f);
+                        op.focusable(None, iced::Rectangle::default(), f);
+                    }
+                });
+                match op.finish() {
+                    Outcome::Chain(next) => op = next,
+                    _ => return,
+                }
+            }
+        }
+        let state = |f: &[Field]| f.iter().map(|f| (f.focused, f.selected)).collect::<Vec<_>>();
+        let mut fields: Vec<Field> = (0..3).map(|_| Field::default()).collect();
+        fields[0].focused = true;
+        run(Box::new(focusable::focus_next()), &mut fields);
+        run(Box::new(select_focused()), &mut fields);
+        assert_eq!(state(&fields), [(false, false), (true, true), (false, false)]);
+        run(Box::new(focusable::focus_previous()), &mut fields);
+        run(Box::new(select_focused()), &mut fields);
+        assert_eq!(state(&fields), [(true, true), (false, false), (false, false)]);
+    }
 
     fn uc100(profile: &str, connection: &str) -> Machine {
         let mut m = Machine::new(3);
