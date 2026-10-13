@@ -148,17 +148,8 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("stock_type", "Fixed size box") => {
             "Use the entered overall X, Y and Z stock dimensions. The preview centers it in X/Y with its bottom at Z=0. The box can be smaller than the part, which is reported. Relative offsets are retained for switching back."
         }
-        ("origin", "Stock top center") => {
-            "Program zero is the center of the stock's top face: the LinuxCNC program puts X0 Y0 at the stock center and Z0 on its top. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 10 mm below the top (a quarter of the stock's height when that is less), above the workholding; the program's header gives the figure. G-code export is refused when an earlier setup has cut the stock at one of those spots."
-        }
-        ("origin", "Stock top front-left") => {
-            "Program zero is the stock's top corner on −X and −Y in setup coordinates, independent of camera orientation. Touch off Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the −X and −Y sides between 5% and 15% of each side's length from the front-left corner, between 1 mm and 10 mm below the top (a quarter of the stock's shorter top side or of its height when that is less), above the workholding; the program's header gives the figures. G-code export is refused when an earlier setup has cut the stock at one of those spots."
-        }
         ("origin", "Model origin") => {
-            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top. Check that the point can be located on the machine before choosing it."
-        }
-        ("origin", "Selected point (planned)") => {
-            "Picking an arbitrary work zero is planned. G-code export is refused while this is selected."
+            "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top. With the probe, Probe corner on the Control page finds it from the front-left corner of the stock top, set off from it as the program has it. Check that the point can be located on the machine before choosing it."
         }
         ("post_tool_length", "Tool table (G43 H#)") => {
             "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first."
@@ -394,6 +385,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                     "Rotary axes are on the table and move the workpiece."
                 }
             ),
+            "origin" => origin_help(value).unwrap_or_default(),
             "speed" => format!(
                 "Play the preview at {value}× the estimated machining rate. This changes playback speed only, not the programmed feed or stock result. Estimates omit acceleration and tool changes."
             ),
@@ -410,6 +402,49 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         body,
         diagram,
     }
+}
+
+/// What a stock-based work zero (`post::stock_zero`) is and how it is
+/// found. None for any other value.
+fn origin_help(value: &str) -> Option<String> {
+    use crate::post::At;
+    let (xy, top) = crate::post::stock_zero(value)?;
+    let face = if top { "top" } else { "bottom" };
+    let at = match crate::control::probe_spot(xy).as_str() {
+        "its centre" => format!("the centre of the stock's {face}"),
+        spot => format!("{spot} of the stock's {face}"),
+    };
+    let sides = if xy == [At::Mid, At::Mid] {
+        "X0 Y0 from the four sides near their middles".to_string()
+    } else {
+        let side = |k: usize| {
+            let axis = ["X", "Y"][k];
+            let which = match xy[k] {
+                At::Min => format!("the -{axis} side"),
+                At::Max => format!("the +{axis} side"),
+                At::Mid => format!("the -{axis} and +{axis} sides"),
+            };
+            let a = 1 - k;
+            let near = match xy[a] {
+                At::Mid => "near the middle".to_string(),
+                end => format!(
+                    "near the {}",
+                    crate::post::ENDS[a][usize::from(end == At::Max)]
+                ),
+            };
+            format!("{axis}0 from {which} {near}")
+        };
+        format!("{} and {}", side(0), side(1))
+    };
+    let z = if top {
+        "Touch off Z0 on the stock top there".to_string()
+    } else {
+        "The bottom sits on the workholding: touch off the stock top over it and enter the stock's height as its Z, which the program's header gives,".to_string()
+    };
+    Some(format!(
+        "Program zero is {at}, in setup coordinates, on the stock box this setup starts from: for a later setup the stock the earlier setups leave, turned as this setup turns it. {z} and {sides}, between 1 mm and 10 mm below the top (a quarter of the stock's height when that is less), above the workholding; the program's header gives the figures. {} on the Control page finds exactly this point with the probe. G-code export and a run are refused when an earlier setup has cut the stock where it is touched off, and say which work zeros are still on the stock.",
+        crate::control::probe_name(xy)
+    ))
 }
 
 pub fn gallery(kind: u8) -> Vec<Help> {

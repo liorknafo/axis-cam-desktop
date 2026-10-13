@@ -2209,6 +2209,58 @@ flood = { pin = 8 }
         work_offset(&a, corner);
     }
 
+    /// Stock bottom back on the simulated UC100: the Control page offers
+    /// Probe edge, which sets the work zero the program has, the stock's
+    /// height below the block's top under the middle of its back edge (Y a
+    /// tip radius inside the block's, the simulator's probe being a point);
+    /// by hand, Move there and Set X0 Y0 Z… give it too.
+    #[test]
+    fn probe_edge_and_the_touch_off_set_a_zero_on_the_stock_bottom() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock bottom back"));
+        let (lo, hi) = conn(&a).block.unwrap();
+        let height = run_of(&a).checked().unwrap()[0].stock.dimensions()[2] as f64;
+        let zero = [(lo[0] + hi[0]) / 2., hi[1], hi[2] - height];
+        let sim = conn(&a).sim_zero().unwrap();
+        assert!(
+            (0..3).all(|k| (sim[k] - zero[k]).abs() < 1e-3),
+            "{sim:?} {zero:?}"
+        );
+        let (refs, _) = conn(&a).edges_setup().unwrap();
+        assert_eq!(crate::control::probe_name(refs), "Probe edge");
+        // Over the top's spot, 6 mm in from the middle of the back edge.
+        mdi(&mut a, &format!("G53 G0 X{} Y{} Z-30", zero[0], hi[1] - 6.));
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        assert!(
+            message.contains("on the stock bottom under the middle of the back edge"),
+            "{message}"
+        );
+        tick_until(&mut a, 5.0, "backing off", |s| {
+            s.state == Some(uc100::controller::State::Idle) && s.work_offset[2] < -40.
+        });
+        work_offset(&a, [zero[0], zero[1] - 2., zero[2]]);
+        // By hand: onto the top over the zero, then the program's position there.
+        let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        let set = format!("4. Set X0 Y0 Z{}", crate::post::exact_mm(height as f32));
+        assert!(steps.contains(&set), "{steps}");
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        tick_until(&mut a, 10.0, "the move onto the block", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+                && (s.machine_pos[2] - hi[2]).abs() < 0.06
+                && (s.machine_pos[1] - hi[1]).abs() < 0.06
+        });
+        // The probe set Y a tip radius inside; the touch-off puts it on the block's side.
+        let _ = a.update(Message::Machine(Action::TouchOff));
+        tick_until(&mut a, 2.0, "the touch-off", |s| {
+            s.work_pos[1].abs() < 1e-3 && (s.work_pos[2] - height).abs() < 1e-3
+        });
+        work_offset(&a, zero);
+        let _ = a.view();
+    }
+
     #[test]
     fn probing_the_edges_needs_a_stock_zero_a_tip_and_its_work_system() {
         use crate::control::Action;
@@ -2218,15 +2270,15 @@ flood = { pin = 8 }
         zeroed(&mut a);
         let why = edges_blocked(&a);
         assert!(why.contains("picked in the Run panel"), "{why}");
+        // Model origin is found from the front-left corner of the stock top.
         a.doc.setups[0]
             .p
             .insert("origin".into(), "Model origin".into());
         check_run(&mut a, 0);
+        let refs = conn(&a).edges_setup().map(|(refs, _)| refs);
+        assert_eq!(refs, Ok([crate::post::At::Min; 2]));
         let why = edges_blocked(&a);
-        assert!(
-            why.contains("Model origin") && why.contains("touch it off by hand"),
-            "{why}"
-        );
+        assert!(why.contains("Probe tip diameter is not set"), "{why}");
         let _ = a.view();
         a.doc.setups[0]
             .p

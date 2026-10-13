@@ -142,8 +142,8 @@ pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
 /// The plate lies on a surface; its top is the surface + its thickness.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Touch {
-    /// The surface is the stock top, work Z 0.
-    WorkZ,
+    /// The surface is the stock top, at this work Z (`Connection::stock_top`).
+    WorkZ(f64),
     /// Record the surface's work Z as the tool-change reference.
     Reference,
     /// The surface is the reference, at this work Z.
@@ -216,11 +216,16 @@ enum Step {
     Touch(usize, Vec6),
 }
 
-/// Probe corner (Stock top front-left) or Probe centre (Stock top center):
-/// the top, then the sides, each touched at its spot (`post::touch_spots`),
-/// one driver command at a time.
+/// Probe corner, Probe edge or Probe centre, by the work zero's
+/// references (`post::references`): the top, then the sides, each touched
+/// at its spot (`post::touch_spots`), one driver command at a time. The
+/// work zero is set where the setup's datum is from the faces touched.
 struct Edges {
-    center: bool,
+    refs: [crate::post::At; 2],
+    /// The work zero is on the stock's bottom, `size[2]` below the top.
+    bottom: bool,
+    /// The work zero is Model origin, found from the front-left corner.
+    model: bool,
     faces: Vec<Face>,
     /// The setup's stock (mm).
     size: [f64; 3],
@@ -247,10 +252,13 @@ struct Edges {
 }
 
 impl Edges {
-    /// For a setup's `stock` and work zero `datum` (plan mm), the probe
-    /// with a tip of `tip` mm starting at `start`.
+    /// For a setup's work zero `origin` found from the faces of `refs`
+    /// on its `stock` at `datum` (plan mm), the probe with a tip of `tip`
+    /// mm starting at `start`.
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        center: bool,
+        origin: &str,
+        refs: [crate::post::At; 2],
         stock: crate::mesh::Bounds,
         datum: [f32; 3],
         probe: &Probe,
@@ -259,7 +267,7 @@ impl Edges {
         z: (f64, f64),
     ) -> Self {
         let rel = |v: f32, a: usize| (v - datum[a]) as f64;
-        let faces: Vec<Face> = crate::post::probe_faces(stock, center)
+        let faces: Vec<Face> = crate::post::probe_faces(stock, refs)
             .into_iter()
             .map(|(name, axis, far, spot)| Face {
                 name,
@@ -278,7 +286,9 @@ impl Edges {
             })
             .collect();
         Self {
-            center,
+            refs,
+            bottom: crate::post::stock_zero(origin).is_some_and(|(_, top)| !top),
+            model: crate::post::stock_zero(origin).is_none(),
             touches: vec![vec![]; faces.len()],
             faces,
             size: stock.dimensions().map(f64::from),
@@ -354,7 +364,8 @@ impl Edges {
         let (w, fixed) = self.zero();
         let f = &self.faces[i];
         let mid = |a: usize| (f.lo[a] + f.hi[a]) / 2.;
-        let high = (w[2] + self.clear).min(self.z.1);
+        let top = self.top(w);
+        let high = (top + self.clear).min(self.z.1);
         let mut up = self.from;
         up[2] = high;
         let mut over = up;
@@ -368,7 +379,7 @@ impl Edges {
         let k = f.axis;
         if k == 2 {
             let mut to = over;
-            to[2] = (w[2] - self.clear).max(self.z.0);
+            to[2] = (top - self.clear).max(self.z.0);
             return [
                 Step::Go(vec![self.from, up, over], None),
                 Step::Touch(i, to),
@@ -389,55 +400,101 @@ impl Edges {
         .into()
     }
 
-    /// Where the tip should be found, for a message.
-    fn spot(&self) -> &'static str {
-        if self.center {
-            "its centre"
-        } else {
-            "the front-left corner"
-        }
+    /// The machine Z of the stock top, given the work zero `w` (machine).
+    fn top(&self, w: [f64; 3]) -> f64 {
+        w[2] + self.faces[0].at
+    }
+
+    /// Where the tip should be found, for a message: "its centre", "the
+    /// front-left corner", "the middle of the front edge".
+    fn spot(&self) -> String {
+        probe_spot(self.refs)
     }
 
     fn name(&self) -> &'static str {
-        if self.center {
-            "Probe centre"
-        } else {
-            "Probe corner"
-        }
+        probe_name(self.refs)
     }
 
     /// What was found, once every face is touched at its spot.
     fn found(&self) -> String {
+        use crate::post::At;
         let (w, _) = self.zero();
         let count: usize = self.touches.iter().map(Vec::len).sum();
-        let mut s = format!(
-            "Work zero set on {} of the stock top at machine X {:.3} Y {:.3} Z {:.3}, from {count} touches.",
-            if self.center {
-                "the centre"
-            } else {
-                "the front-left corner"
-            },
-            w[0],
-            w[1],
-            w[2]
-        );
-        if self.center {
-            let across = |k: usize| {
-                let mut c = (self.faces.iter().zip(&self.touches))
-                    .filter(|(f, _)| f.axis == k)
-                    .map(|(f, t)| self.contact(f, t.last().unwrap()));
-                let (a, b) = (c.next().unwrap(), c.next().unwrap());
-                (a - b).abs()
-            };
-            s += &format!(
-                " Measured {:.3} × {:.3} mm across; the setup's stock is {:.3} × {:.3} mm.",
-                across(0),
-                across(1),
-                self.size[0],
-                self.size[1]
-            );
+        let spot = match self.spot().as_str() {
+            "its centre" => "the centre".to_string(),
+            s => s.to_string(),
+        };
+        let at = format!("at machine X {:.3} Y {:.3} Z {:.3}", w[0], w[1], w[2]);
+        let mut s = if self.model {
+            format!(
+                "Work zero set on Model origin {at}, set off from {spot} of the stock top, from {count} touches."
+            )
+        } else if self.bottom {
+            format!(
+                "Work zero set on the stock bottom under {spot} of the stock top, {:.3} mm below it, {at}, from {count} touches.",
+                self.faces[0].at
+            )
+        } else {
+            format!("Work zero set on {spot} of the stock top {at}, from {count} touches.")
+        };
+        // Both sides of an axis touched: the stock measured across it.
+        let across = |k: usize| {
+            let mut c = (self.faces.iter().zip(&self.touches))
+                .filter(|(f, _)| f.axis == k)
+                .map(|(f, t)| self.contact(f, t.last().unwrap()));
+            let (a, b) = (c.next().unwrap(), c.next().unwrap());
+            (a - b).abs()
+        };
+        match self.refs {
+            [At::Mid, At::Mid] => {
+                s += &format!(
+                    " Measured {:.3} × {:.3} mm across; the setup's stock is {:.3} × {:.3} mm.",
+                    across(0),
+                    across(1),
+                    self.size[0],
+                    self.size[1]
+                )
+            }
+            [At::Mid, _] | [_, At::Mid] => {
+                let k = usize::from(self.refs[1] == At::Mid);
+                s += &format!(
+                    " Measured {:.3} mm across {}; the setup's stock is {:.3} mm.",
+                    across(k),
+                    ["X", "Y"][k],
+                    self.size[k]
+                );
+            }
+            _ => {}
         }
         s
+    }
+}
+
+/// The probing routine that finds a work zero from the faces of `refs`
+/// (`post::references`): Probe centre, Probe edge or Probe corner.
+pub fn probe_name(refs: [crate::post::At; 2]) -> &'static str {
+    use crate::post::At::Mid;
+    match refs {
+        [Mid, Mid] => "Probe centre",
+        [Mid, _] | [_, Mid] => "Probe edge",
+        _ => "Probe corner",
+    }
+}
+
+/// Where on the stock top the probing routine for `refs` starts:
+/// "its centre", "the middle of the front edge", "the front-left corner".
+pub fn probe_spot(refs: [crate::post::At; 2]) -> String {
+    use crate::post::At::{Max, Mid};
+    match refs {
+        [Mid, Mid] => "its centre".into(),
+        [Mid, _] | [_, Mid] => {
+            let k = usize::from(refs[0] == Mid);
+            format!(
+                "the middle of the {} edge",
+                crate::post::ENDS[k][usize::from(refs[k] == Max)]
+            )
+        }
+        _ => format!("the {} corner", crate::post::corner_name(refs)),
     }
 }
 
@@ -525,9 +582,13 @@ pub enum Action {
     /// Probe Z down onto the touch plate on the stock top: work Z there is
     /// the plate's thickness.
     ProbeZ,
-    /// Probe corner or Probe centre: the X, Y and Z work zero of the setup
-    /// picked in the Run panel, from its stock.
+    /// Probe corner, Probe edge or Probe centre: the X, Y and Z work zero
+    /// of the setup picked in the Run panel, from its stock.
     ProbeEdges,
+    /// Sets the work position where the tool tip is to that of the setup
+    /// picked in the Run panel's touch-off point (`Connection::touch_off`):
+    /// the tip is on the stock top there.
+    TouchOff,
     /// Simulated: rapid the tool tip onto the work zero of the setup picked
     /// in the Run panel on the simulator's block (`Connection::sim_zero`).
     ToSimZero,
@@ -684,13 +745,13 @@ impl Connection {
         }
     }
 
-    /// Simulated: where the work zero of the setup to run is on the
+    /// Simulated: where point `at` of the setup to run (plan mm) is on the
     /// simulator's block, which stands for its stock (machine mm). None until
     /// the setup is checked.
-    pub fn sim_zero(&self) -> Option<[f64; 3]> {
+    fn on_block(&self, at: impl FnOnce(&crate::post::Checked) -> [f32; 3]) -> Option<[f64; 3]> {
         let (lo, hi) = self.block.filter(|_| self.simulated)?;
         let p = self.run.as_ref()?.checked()?.first()?;
-        let (s, d) = (p.stock, p.datum);
+        let (s, d) = (p.stock, at(p));
         Some([
             lo[0] + (d[0] - s.min[0]) as f64,
             lo[1] + (d[1] - s.min[1]) as f64,
@@ -698,11 +759,27 @@ impl Connection {
         ])
     }
 
-    /// Rapids the tool tip up to the top of Z, over the setup's work zero on
-    /// the simulator's block and down onto it, once X, Y and Z have a machine
-    /// position.
+    /// Simulated: where the work zero of the setup to run is on the
+    /// simulator's block (`on_block`).
+    pub fn sim_zero(&self) -> Option<[f64; 3]> {
+        self.on_block(|p| p.datum)
+    }
+
+    /// Simulated: where the setup to run is touched off on the simulator's
+    /// block (`touch_off`), or its work zero when that is not on the stock
+    /// top (`on_block`).
+    pub fn sim_touch(&self) -> Option<[f64; 3]> {
+        let at = self.touch_off().map(|(at, _)| at);
+        self.on_block(|p| at.unwrap_or(p.datum))
+    }
+
+    /// Rapids the tool tip up to the top of Z, over where the setup is
+    /// touched off on the simulator's block and down onto it (`sim_touch`),
+    /// once X, Y and Z have a machine position.
     fn to_sim_zero(&mut self) -> Option<()> {
-        let to = self.sim_zero().filter(|_| self.idle() && self.unset_limited_axes().is_empty())?;
+        let to = self
+            .sim_touch()
+            .filter(|_| self.idle() && self.unset_limited_axes().is_empty())?;
         let now = self.snapshot.machine_pos;
         let mut up = now;
         up[2] = self.config.axes.get(2)?.soft_max?;
@@ -908,8 +985,22 @@ impl Connection {
                     });
                 }
             }
-            Action::ProbeZ => self.start_probe(Touch::WorkZ),
+            Action::ProbeZ => {
+                if let Ok(top) = self.stock_top() {
+                    self.start_probe(Touch::WorkZ(top));
+                }
+            }
             Action::ProbeEdges => self.start_edges(),
+            Action::TouchOff if self.manual() => {
+                if let Some((_, work)) = self.touch_off() {
+                    for (a, value) in work.into_iter().enumerate() {
+                        self.send(Command::SetWork { axis: a, value });
+                    }
+                    if let Some(run) = &mut self.run {
+                        run.touched = true;
+                    }
+                }
+            }
             Action::ToSimZero => {
                 self.to_sim_zero();
             }
@@ -998,6 +1089,23 @@ impl Connection {
         None
     }
 
+    /// The work Z of the stock top a touch plate lies on for Probe Z: that
+    /// of the setup picked in the Run panel (`touch_off`), 0 without one.
+    pub fn stock_top(&self) -> Result<f64, String> {
+        if self.run.is_none() {
+            return Ok(0.);
+        }
+        self.run_program()?;
+        self.touch_off()
+            .map(|(_, work)| work[2])
+            .ok_or_else(|| format!("{} Probe Z cannot set it.", crate::post::STOCK_TOP_CUT))
+    }
+
+    /// Why Probe Z cannot start now; None when it can.
+    pub fn probe_z_blocked(&self) -> Option<String> {
+        self.probe_blocked().or_else(|| self.stock_top().err())
+    }
+
     /// Why a touch-plate probe cannot start now; None when it can.
     pub fn probe_blocked(&self) -> Option<String> {
         self.probe_ready(&[2]).or_else(|| match &self.probe {
@@ -1069,11 +1177,7 @@ impl Connection {
                 }
                 format!("Reference surface recorded: Z {surface:.3} under the {plate} mm plate.")
             }
-            Touch::WorkZ | Touch::FromReference(_) => {
-                let at = match p.touch {
-                    Touch::FromReference(z) => z,
-                    _ => 0.,
-                };
+            Touch::WorkZ(at) | Touch::FromReference(at) => {
                 self.send(Command::SetWork {
                     axis: 2,
                     value: work_z(at + plate, trip, now),
@@ -1100,11 +1204,11 @@ impl Connection {
         self.probed = Some((true, format!("Contact at machine Z {trip:.3}. {message}")));
     }
 
-    /// The setup to run's stock-based work zero (true for Stock top center)
-    /// and its first program, or why it has none to probe.
-    pub fn edges_setup(&self) -> Result<(bool, &crate::post::Checked), String> {
+    /// The first program of the setup picked in the Run panel, once it is
+    /// checked for the project as it is, or why there is none.
+    pub fn run_program(&self) -> Result<&crate::post::Checked, String> {
         let Some(run) = &self.run else {
-            return Err("Probe corner and Probe centre set the work zero of the setup picked in the Run panel, from its stock.".into());
+            return Err("Pick a setup in the Run panel.".into());
         };
         let p = match run.programs.as_deref() {
             None => return Err("Checking the setup…".into()),
@@ -1117,13 +1221,34 @@ impl Connection {
                     .into(),
             );
         }
-        match p.origin.as_str() {
-            "Stock top front-left" => Ok((false, p)),
-            "Stock top center" => Ok((true, p)),
-            o => Err(format!(
-                "This setup's work zero is {o}, which no probe finds on the stock: touch it off by hand."
-            )),
+        Ok(p)
+    }
+
+    /// The faces a probe touches to find the work zero of the setup to run
+    /// (`post::Checked::probe`) and its first program, or why no probe
+    /// finds it.
+    pub fn edges_setup(&self) -> Result<([crate::post::At; 2], &crate::post::Checked), String> {
+        if self.run.is_none() {
+            return Err("Probe corner, Probe edge and Probe centre set the work zero of the setup picked in the Run panel, from its stock.".into());
         }
+        let p = self.run_program()?;
+        match &p.probe {
+            Ok(refs) => Ok((*refs, p)),
+            Err(why) => Err(why.clone()),
+        }
+    }
+
+    /// Where the operator touches off the setup to run, in plan mm, and the
+    /// work position that is there (`post::touch_point` less the datum).
+    /// None when it is not on the stock top: a Model origin whose stock top
+    /// an earlier setup cut.
+    pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
+        let p = self.run.as_ref()?.checked()?.first()?;
+        if p.located.is_some_and(|(_, top)| top.is_none()) {
+            return None;
+        }
+        let at = crate::post::touch_point(&p.origin, p.stock)?;
+        Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
     }
 
     /// Why Probe corner or Probe centre cannot start now; None when it can.
@@ -1150,7 +1275,7 @@ impl Connection {
 
     /// Starts Probe corner or Probe centre from where the probe is.
     fn start_edges(&mut self) {
-        let (None, Ok(probe), Ok((center, p))) =
+        let (None, Ok(probe), Ok((refs, p))) =
             (self.edges_blocked(), self.probe.clone(), self.edges_setup())
         else {
             return;
@@ -1162,7 +1287,9 @@ impl Connection {
         );
         let start = self.snapshot.machine_pos;
         let tip = probe.tip.unwrap_or_default();
-        self.edges = Some(Edges::new(center, p.stock, p.datum, &probe, tip, start, z));
+        self.edges = Some(Edges::new(
+            &p.origin, refs, p.stock, p.datum, &probe, tip, start, z,
+        ));
         self.probed = None;
         self.edges_step();
     }
@@ -1273,7 +1400,7 @@ impl Connection {
             run.touched = true;
         }
         let mut up = e.from;
-        up[2] = (w[2] + e.clear).min(e.z.1);
+        up[2] = (e.top(w) + e.clear).min(e.z.1);
         self.send(job(e.name(), moves_from(now, &[e.from, up])));
         self.probed = Some((true, e.found()));
     }
@@ -1702,7 +1829,7 @@ mod tests {
 
     #[test]
     fn probing_touches_each_face_at_its_spot_and_finds_the_zero() {
-        use crate::mesh::Bounds;
+        use crate::{mesh::Bounds, post::At};
         let stock = Bounds {
             min: [0.; 3],
             max: [124., 84., 40.],
@@ -1739,7 +1866,16 @@ mod tests {
         // to 11 mm), but the -X side's spot is 4.2 to 12.6 mm from the
         // corner: it is touched again there once -Y has fixed Y.
         let start = [102., 52., -25., 0., 0., 0.];
-        let e = Edges::new(false, stock, [0., 0., 40.], &probe, 4., start, z);
+        let e = Edges::new(
+            "Stock top front-left",
+            [At::Min; 2],
+            stock,
+            [0., 0., 40.],
+            &probe,
+            4.,
+            start,
+            z,
+        );
         let e = touch_box(e, lo, hi);
         assert_eq!(
             e.touches.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -1749,7 +1885,16 @@ mod tests {
         assert!(e.found().contains("front-left corner of the stock top at machine X 100.000 Y 50.000 Z -30.000, from 4 touches"), "{}", e.found());
         // Centre: started 3 mm off it, inside the top's spot: once each.
         let start = [165., 90., -15., 0., 0., 0.];
-        let e = Edges::new(true, stock, [62., 42., 40.], &probe, 4., start, z);
+        let e = Edges::new(
+            "Stock top center",
+            [At::Mid; 2],
+            stock,
+            [62., 42., 40.],
+            &probe,
+            4.,
+            start,
+            z,
+        );
         let e = touch_box(e, lo, hi);
         assert_eq!(e.touches.iter().map(Vec::len).collect::<Vec<_>>(), [1; 5]);
         check(&e, [162., 92., -30.]);
@@ -1761,10 +1906,161 @@ mod tests {
         // Off the top's spot (15 mm from the corner): the top is touched
         // again on it.
         let start = [115., 65., -25., 0., 0., 0.];
-        let e = Edges::new(false, stock, [0., 0., 40.], &probe, 4., start, z);
+        let e = Edges::new(
+            "Stock top front-left",
+            [At::Min; 2],
+            stock,
+            [0., 0., 40.],
+            &probe,
+            4.,
+            start,
+            z,
+        );
         let e = touch_box(e, lo, hi);
         assert_eq!(e.touches[0].len(), 2);
         check(&e, [100., 50., -30.]);
+    }
+
+    /// Runs a probing routine against the material `solid` says is there
+    /// (machine coordinates being the setup's, mm): a guarded descent must
+    /// meet nothing, and each touch stops where the tip, `e.radius` round,
+    /// first meets material on its way (its bottom going down, its equator
+    /// going sideways), to 1e-5 mm.
+    fn touch_material(mut e: Edges, solid: &dyn Fn([f64; 3]) -> bool) -> Edges {
+        let first = |from: Vec6, to: Vec6, lead: &dyn Fn(Vec6) -> [f64; 3]| {
+            let at = |t: f64| -> Vec6 { std::array::from_fn(|a| from[a] + (to[a] - from[a]) * t) };
+            let steps = 4000;
+            let k = (1..=steps).find(|&k| solid(lead(at(k as f64 / steps as f64))))?;
+            let (mut lo, mut hi) = ((k - 1) as f64 / steps as f64, k as f64 / steps as f64);
+            while (hi - lo) * 400. > 1e-5 {
+                let mid = (lo + hi) / 2.;
+                if solid(lead(at(mid))) {
+                    hi = mid
+                } else {
+                    lo = mid
+                }
+            }
+            Some(at(hi))
+        };
+        let mut at = e.start;
+        while let Some(i) = e.next() {
+            for step in e.plan(i) {
+                match step {
+                    Step::Go(moves, guard) => {
+                        if let Some(down) = guard {
+                            let from = *moves.last().unwrap();
+                            let landed = first(from, down, &|p| [p[0], p[1], p[2]]);
+                            assert!(landed.is_none(), "going down onto the stock at {landed:?}");
+                        }
+                        at = guard.or(moves.last().copied()).unwrap();
+                    }
+                    Step::Touch(i, to) => {
+                        let (k, dir, r) = (e.faces[i].axis, e.faces[i].dir, e.radius);
+                        let lead = |p: Vec6| {
+                            let mut q = [p[0], p[1], p[2]];
+                            if k < 2 {
+                                (q[k], q[2]) = (q[k] + dir * r, q[2] + r);
+                            }
+                            q
+                        };
+                        let p = first(at, to, &lead)
+                            .unwrap_or_else(|| panic!("missed the {}", e.faces[i].name));
+                        e.from = at;
+                        e.touches[i].push(p);
+                        at = p;
+                    }
+                }
+            }
+        }
+        e
+    }
+
+    /// For every work zero, on the raw stock of setup 1, and on the stock a
+    /// setup turned about Z and one flipped over start from after setup 1
+    /// faced and pocketed it: the probe, run against that material (the
+    /// original block less what earlier setups can have cut), sets the work
+    /// zero where the program has it (`post::datum`) within 0.01 mm, unless
+    /// the check refuses the zero because a spot it is found from was cut.
+    #[test]
+    fn the_probe_sets_the_programs_zero_on_every_stock_state() {
+        use crate::post::{ORIGINS, datum, fixture, probe_faces, zero_check};
+        let probe = Probe {
+            plate: None,
+            tip: Some(4.),
+            feed: 100.,
+            distance: 30.,
+            retract: 5.,
+        };
+        let raw = fixture::flipped_after(2);
+        let mut turned = fixture::flipped_after(2);
+        turned.0.setups[1].p.insert("rx".into(), "0".into());
+        turned.0.setups[1].p.insert("rz".into(), "90".into());
+        // Faced on the top, as setup 1 is.
+        turned.0.setups[1].operations[0].surfaces =
+            turned.0.setups[0].operations[0].surfaces.clone();
+        let mut refused = vec![];
+        for (state, (mut doc, mesh), si) in [
+            ("raw", raw.clone(), 0),
+            ("turned", turned, 1),
+            ("flipped", raw, 1),
+        ] {
+            doc.sync_stock_sources();
+            for origin in ORIGINS {
+                doc.setups[si].p.insert("origin".into(), origin.into());
+                let mut first = None;
+                crate::simulation::sequence(&doc, &mesh, None, |s, _, r| {
+                    if s == si && first.is_none() {
+                        first = Some(r);
+                    }
+                });
+                let first = first.unwrap().unwrap_or_else(|e| panic!("{state}: {e}"));
+                let (setup, stock) = (&doc.setups[si], first.plan.stock);
+                let found = zero_check(setup, stock, &first, &[]);
+                if !found.refused.is_empty() {
+                    refused.push(format!("{state} {origin}"));
+                    continue;
+                }
+                let refs = found.probe.unwrap();
+                let (volume, frame) =
+                    (first.initial_volume.as_ref().unwrap(), first.frame.unwrap());
+                let block = volume.transformed_bounds(frame);
+                let removed = crate::rest::Removed::new(volume, frame);
+                let solid = |p: [f64; 3]| {
+                    let q = p.map(|v| v as f32);
+                    (0..3).all(|a| q[a] >= block.min[a] && q[a] <= block.max[a]) && !removed.at(q)
+                };
+                // Started 5 mm above the middle of the top's spot.
+                let spot = probe_faces(stock, refs)[0].3;
+                let start = [
+                    ((spot.min[0] + spot.max[0]) / 2.) as f64,
+                    ((spot.min[1] + spot.max[1]) / 2.) as f64,
+                    (stock.max[2] + 5.) as f64,
+                    0.,
+                    0.,
+                    0.,
+                ];
+                let zero = datum(setup, stock, &mesh).unwrap();
+                let z = (stock.min[2] as f64 - 100., stock.max[2] as f64 + 100.);
+                let e = Edges::new(origin, refs, stock, zero, &probe, 4., start, z);
+                let (w, fixed) = touch_material(e, &solid).zero();
+                assert_eq!(fixed, [true; 3], "{state} {origin}");
+                assert!(
+                    (0..3).all(|a| (w[a] - zero[a] as f64).abs() < 0.01),
+                    "{state} {origin}: the probe set {w:?}, the program has {zero:?}"
+                );
+            }
+        }
+        // Setup 1's pocket is in the middle of its top: the top's centre
+        // where a centre zero is touched off once turned, the bottom under
+        // it once flipped over.
+        assert_eq!(
+            refused,
+            [
+                "turned Stock top center",
+                "turned Stock bottom center",
+                "flipped Stock bottom center"
+            ]
+        );
     }
 
     #[test]

@@ -104,21 +104,106 @@ impl PostSettings {
         }
     }
 }
-/// Program zero in the setup's plan coordinates (mm).
+/// Where a stock-based work zero lies along X or Y of the stock box: on its
+/// − side, midway between its sides, or on its + side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    Min,
+    Mid,
+    Max,
+}
+/// The work zeros a setup can have: a corner, the middle of an edge or the
+/// centre of the stock's top or bottom, in the box the setup starts from,
+/// and the part file's own origin.
+pub const ORIGINS: [&str; 19] = [
+    "Stock top center",
+    "Stock top front-left",
+    "Stock top front",
+    "Stock top front-right",
+    "Stock top left",
+    "Stock top right",
+    "Stock top back-left",
+    "Stock top back",
+    "Stock top back-right",
+    "Stock bottom center",
+    "Stock bottom front-left",
+    "Stock bottom front",
+    "Stock bottom front-right",
+    "Stock bottom left",
+    "Stock bottom right",
+    "Stock bottom back-left",
+    "Stock bottom back",
+    "Stock bottom back-right",
+    "Model origin",
+];
+/// The spots of the stock's top or bottom a work zero names, with where
+/// each lies along X and Y.
+const SPOTS: [(&str, [At; 2]); 9] = [
+    ("center", [At::Mid, At::Mid]),
+    ("front-left", [At::Min, At::Min]),
+    ("front", [At::Mid, At::Min]),
+    ("front-right", [At::Max, At::Min]),
+    ("left", [At::Min, At::Mid]),
+    ("right", [At::Max, At::Mid]),
+    ("back-left", [At::Min, At::Max]),
+    ("back", [At::Mid, At::Max]),
+    ("back-right", [At::Max, At::Max]),
+];
+/// A stock-based work zero (`ORIGINS`): where it lies along X and Y, and
+/// whether it is on the top (else the bottom). None for Model origin and
+/// anything else.
+pub fn stock_zero(origin: &str) -> Option<([At; 2], bool)> {
+    let (face, spot) = origin.strip_prefix("Stock ")?.split_once(' ')?;
+    let top = match face {
+        "top" => true,
+        "bottom" => false,
+        _ => return None,
+    };
+    SPOTS.iter().find(|s| s.0 == spot).map(|s| (s.1, top))
+}
+/// What finds a work zero on the stock: the stock top, and the sides that
+/// place X and Y (`At::Mid` takes both). A stock-based zero's own; Model
+/// origin is found from the front-left corner of the stock top and offset
+/// from it. None for anything else.
+pub fn references(origin: &str) -> Option<[At; 2]> {
+    match stock_zero(origin) {
+        Some((xy, _)) => Some(xy),
+        None => (origin == "Model origin").then_some([At::Min, At::Min]),
+    }
+}
+/// `v` along axis `k` of box `s` where `at` says.
+fn along(s: Bounds, k: usize, at: At) -> f32 {
+    match at {
+        At::Min => s.min[k],
+        At::Mid => (s.min[k] + s.max[k]) / 2.,
+        At::Max => s.max[k],
+    }
+}
+/// Program zero in the setup's plan coordinates (mm). A stock-based zero
+/// is a point of `stock`, the box the setup starts from.
 pub fn datum(setup: &Setup, stock: Bounds, mesh: &Mesh) -> Result<[f32; 3], String> {
-    match get(&setup.p, "origin") {
-        "Stock top center" => Ok([
-            (stock.min[0] + stock.max[0]) / 2.,
-            (stock.min[1] + stock.max[1]) / 2.,
-            stock.max[2],
-        ]),
-        "Stock top front-left" => Ok([stock.min[0], stock.min[1], stock.max[2]]),
+    let origin = get(&setup.p, "origin");
+    if let Some((xy, top)) = stock_zero(origin) {
+        let z = if top { stock.max[2] } else { stock.min[2] };
+        return Ok([along(stock, 0, xy[0]), along(stock, 1, xy[1]), z]);
+    }
+    match origin {
         "Model origin" => Ok(Placement::new(mesh, Some(setup))
             .transform(mesh.origin)
             .map(|v| v / mesh.display_scale())),
-        "Selected point (planned)" => Err("Selected-point work zeros are not implemented. Choose Stock top center, Stock top front-left or Model origin.".into()),
-        other => Err(format!("Unsupported work origin \"{other}\".")),
+        other => Err(format!(
+            "\"{other}\" is not a work zero: choose one under Work coordinate origin."
+        )),
     }
+}
+/// Where the operator touches off for the work zero of `origin` on `stock`
+/// (plan mm): the point of the stock top its `references` find, over a
+/// stock-based zero or at the top's front-left corner for Model origin.
+/// Its work coordinates (the point less the datum) are what is set there.
+/// None for anything else.
+pub fn touch_point(origin: &str, stock: Bounds) -> Option<[f32; 3]> {
+    let xy = references(origin)?;
+    Some([along(stock, 0, xy[0]), along(stock, 1, xy[1]), stock.max[2]])
 }
 /// The part's box in a setup's plan coordinates (mm).
 fn part_box(setup: &Setup, mesh: &Mesh) -> Bounds {
@@ -139,41 +224,103 @@ fn short_mm(v: f32) -> String {
         None => s,
     }
 }
+/// `v` mm to 0.001 mm, without trailing zeros: a coordinate to enter.
+pub(crate) fn exact_mm(v: f32) -> String {
+    let s = coord(v);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+/// The ends of X (left, right) and Y (front, back).
+pub(crate) const ENDS: [[&str; 2]; 2] = [["left", "right"], ["front", "back"]];
+/// The name of a corner of the stock top: "front-left" and the like.
+pub(crate) fn corner_name(xy: [At; 2]) -> String {
+    let end = |k: usize| ENDS[k][usize::from(xy[k] == At::Max)];
+    format!("{}-{}", end(1), end(0))
+}
+/// Where the faces of `references` are touched (`touch_spots`), in words:
+/// the stock top's spot, the X sides' and the Y sides'.
+///
+/// Each side's stretch, 5% to 15% of its length from the end nearer the
+/// work zero, is rounded inwards to 0.1 mm, so that it lies in the checked
+/// stretch.
+fn spot_words(refs: [At; 2], s: Bounds) -> (String, [String; 2]) {
+    let size = s.dimensions();
+    let area = short_mm(corner_area(s));
+    let top = match refs {
+        [At::Mid, At::Mid] => "at its centre".to_string(),
+        [At::Mid, _] | [_, At::Mid] => {
+            // The edge across the axis whose zero is not midway.
+            let k = usize::from(refs[0] == At::Mid);
+            format!(
+                "within {area} mm of the middle of its {} edge, at least 1 mm in from it",
+                ENDS[k][usize::from(refs[k] == At::Max)]
+            )
+        }
+        _ => format!(
+            "within {area} mm of the {} corner, at least 1 mm in from both edges",
+            corner_name(refs)
+        ),
+    };
+    let sides = std::array::from_fn(|k| {
+        let axis = ["X", "Y"][k];
+        let (which, both) = match refs[k] {
+            At::Min => (format!("the -{axis} side"), false),
+            At::Max => (format!("the +{axis} side"), false),
+            At::Mid => (format!("the -{axis} and +{axis} sides"), true),
+        };
+        let a = 1 - k;
+        let at = match refs[a] {
+            At::Mid if both => "near their middles".to_string(),
+            At::Mid => "near its middle".to_string(),
+            end => {
+                let length = size[a];
+                let from = (length * 0.05 * 10. - 0.001).ceil() / 10.;
+                let to = (length * 0.15 * 10. + 0.001).floor() / 10.;
+                format!(
+                    "between {} mm and {} mm from the {}",
+                    short_mm(from),
+                    short_mm(to),
+                    ENDS[a][usize::from(end == At::Max)]
+                )
+            }
+        };
+        format!("{which} {at}")
+    });
+    (top, sides)
+}
 /// Where the operator touches off a stock-based work zero (the spots
 /// `stock_zero_cut` checks), said after "Touch off" in the program header
 /// and in touch-off program 1's instruction. The help texts and the
 /// planner's rule use the same words. None for other work zeros.
 ///
-/// Front-left's stretch of each side, 5% to 15% of its length from the
-/// corner, is rounded inwards to 0.1 mm, so that it lies in the checked
-/// stretch; the -X and -Y sides are named apart when their stretches differ.
+/// A zero on the bottom is touched off on the top too, as the stock's
+/// height above it: the bottom sits on the workholding.
 pub(crate) fn touch_off_spots(origin: &str, stock: Bounds) -> Option<String> {
+    let (xy, top) = stock_zero(origin)?;
     let band = short_mm(side_band(stock));
-    match origin {
-        "Stock top center" => Some(format!(
-            "Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and {band} mm below the top"
-        )),
-        "Stock top front-left" => {
-            let stretch = |length: f32| {
-                let from = (length * 0.05 * 10. - 0.001).ceil() / 10.;
-                let to = (length * 0.15 * 10. + 0.001).floor() / 10.;
-                format!("between {} mm and {} mm", short_mm(from), short_mm(to))
-            };
-            // The -X side runs along Y, the -Y side along X.
-            let size = stock.dimensions();
-            let (x, y) = (stretch(size[1]), stretch(size[0]));
-            let sides = if x == y {
-                format!("the -X and -Y sides {x}")
-            } else {
-                format!("the -X side {x} and the -Y side {y}")
-            };
-            Some(format!(
-                "Z0 on the stock top within {} mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from {sides} from the front-left corner, between 1 mm and {band} mm below the top",
-                short_mm(corner_area(stock))
-            ))
-        }
-        _ => None,
-    }
+    let (spot, [x, y]) = spot_words(xy, stock);
+    let z = if top {
+        format!("Z0 on the stock top {spot}")
+    } else {
+        let height = exact_mm(stock.dimensions()[2]);
+        format!("Z{height} on the stock top {spot} (Z0 is the stock bottom, {height} mm below it)")
+    };
+    let sides = if xy == [At::Mid, At::Mid] {
+        "X0 Y0 from the four sides near their middles".to_string()
+    } else {
+        format!("X0 from {x} and Y0 from {y}")
+    };
+    // A spot said with a comma of its own is closed by one.
+    let and = if z.contains(',') { ", and" } else { " and" };
+    Some(format!(
+        "{z}{and} {sides}, between 1 mm and {band} mm below the top"
+    ))
+}
+/// Where a probe touches the stock to find a work zero of `references`
+/// `refs` on `stock` (`probe_faces`), in words.
+pub(crate) fn probe_spots(refs: [At; 2], stock: Bounds) -> String {
+    let band = short_mm(side_band(stock));
+    let (spot, [x, y]) = spot_words(refs, stock);
+    format!("the stock top {spot}, {x} and {y}, between 1 mm and {band} mm below the top")
 }
 /// What the header says of the retracts the jaws and clamps check leaves out.
 const MACHINE_HOME: &str = "Retracts to machine home are assumed to clear everything.";
@@ -915,19 +1062,18 @@ fn face_points(s: Bounds, k: usize, plane: f32) -> impl Iterator<Item = [f32; 3]
 fn in_box(p: [f32; 3], b: &Bounds) -> bool {
     (0..3).all(|a| p[a] >= b.min[a] - 0.001 && p[a] <= b.max[a] + 0.001)
 }
-/// The stock faces a stock-based work zero needs, as (name, axis, plane
-/// 0.01 mm inside the face): the top, and the sides that place X0 Y0.
-fn zero_faces(s: Bounds, center: bool) -> Vec<(&'static str, usize, f32)> {
-    let mut faces = vec![
-        ("top face", 2, s.max[2] - 0.01),
-        ("-X side", 0, s.min[0] + 0.01),
-    ];
-    if center {
-        faces.push(("+X side", 0, s.max[0] - 0.01));
-    }
-    faces.push(("-Y side", 1, s.min[1] + 0.01));
-    if center {
-        faces.push(("+Y side", 1, s.max[1] - 0.01));
+//// The stock faces a work zero is found from (`references`), as (name,
+/// axis, plane 0.01 mm inside the face): the top, and the sides that place
+/// X0 and Y0, in the order -X, +X, -Y, +Y.
+fn zero_faces(s: Bounds, refs: [At; 2]) -> Vec<(&'static str, usize, f32)> {
+    let mut faces = vec![("top face", 2, s.max[2] - 0.01)];
+    for (k, names) in [(0, ["-X side", "+X side"]), (1, ["-Y side", "+Y side"])] {
+        if refs[k] != At::Max {
+            faces.push((names[0], k, s.min[k] + 0.01));
+        }
+        if refs[k] != At::Min {
+            faces.push((names[1], k, s.max[k] - 0.01));
+        }
     }
     faces
 }
@@ -941,16 +1087,16 @@ fn up_to_10_mm(size: f32, fraction: f32) -> f32 {
 fn side_band(s: Bounds) -> f32 {
     up_to_10_mm(s.dimensions()[2], 0.25)
 }
-/// The side of the stock-top area at the front-left corner where Stock top
-/// front-left's Z0 is touched off (mm): 10 mm, or a quarter of the stock's
-/// shorter top side when that is less.
+/// The side of the stock-top area at a corner where a corner's Z0 is
+/// touched off (mm), and how far a probe stays clear of the stock: 10 mm,
+/// or a quarter of the stock's shorter top side when that is less.
 pub(crate) fn corner_area(s: Bounds) -> f32 {
     let size = s.dimensions();
     up_to_10_mm(size[0].min(size[1]), 0.25)
 }
 /// Faces of `zero_faces` with no sample point left outside every earlier cut box.
-fn stock_faces_cut(s: Bounds, cuts: &[Bounds], center: bool) -> Vec<&'static str> {
-    zero_faces(s, center)
+fn stock_faces_cut(s: Bounds, cuts: &[Bounds], refs: [At; 2]) -> Vec<&'static str> {
+    zero_faces(s, refs)
         .into_iter()
         .filter(|&(_, k, plane)| {
             face_points(s, k, plane).all(|p| cuts.iter().any(|b| in_box(p, b)))
@@ -970,61 +1116,90 @@ fn area_points(k: usize, lo: [f32; 3], hi: [f32; 3]) -> impl Iterator<Item = [f3
         p
     })
 }
+/// The stock top's spot where Z0 is touched off for `references` `refs`,
+/// along X and Y (mm): a square 10% of the top's shorter side at the middle
+/// of an axis whose zero is midway, otherwise `corner_area` on a side, 1 mm
+/// in from the edge, where a Z-setter or gauge block stands.
+fn top_spot(s: Bounds, refs: [At; 2]) -> [(f32, f32); 2] {
+    let size = s.dimensions();
+    std::array::from_fn(|a| match refs[a] {
+        At::Mid => {
+            let (c, half) = ((s.min[a] + s.max[a]) / 2., 0.05 * size[0].min(size[1]));
+            (c - half, c + half)
+        }
+        At::Min => (s.min[a] + 1., s.min[a] + 1. + corner_area(s)),
+        At::Max => (s.max[a] - 1. - corner_area(s), s.max[a] - 1.),
+    })
+}
 /// Where the operator touches off each face of `zero_faces`, with the words
 /// that name the spot.
 ///
 /// The sides are touched with an edge finder above the workholding, in a
-/// band from 1 mm to `side_band` below the stock top: for Stock top center
-/// over the middle 10% of each side's length, for Stock top front-left over
-/// 5% to 15% of the -X and -Y sides' length from the corner, clear of the
-/// corner's edge.
-///
-/// The top: for Stock top center a square 10% of its shorter side at its
-/// centre; for Stock top front-left a square `corner_area` on a side, 1 mm
-/// in from both edges at the corner, where a Z-setter or gauge block stands.
-fn touch_spots(s: Bounds, center: bool) -> Vec<(&'static str, Vec<[f32; 3]>)> {
+/// band from 1 mm to `side_band` below the stock top, near the end of each
+/// side nearer the work zero, 5% to 15% of its length from it, or over the
+/// middle 10% of its length when the zero is midway along it. The top at
+/// its `top_spot`.
+fn touch_spots(s: Bounds, refs: [At; 2]) -> Vec<(String, Vec<[f32; 3]>)> {
     let size = s.dimensions();
     let band = side_band(s);
-    zero_faces(s, center)
+    zero_faces(s, refs)
         .into_iter()
         .map(|(_, k, plane)| {
             let (mut lo, mut hi) = (s.min, s.max);
             (lo[k], hi[k]) = (plane, plane);
-            if k == 2 {
-                for a in 0..2 {
-                    (lo[a], hi[a]) = if center {
-                        let (c, half) = ((s.min[a] + s.max[a]) / 2., 0.05 * size[0].min(size[1]));
-                        (c - half, c + half)
-                    } else {
-                        (s.min[a] + 1., s.min[a] + 1. + corner_area(s))
-                    };
+            let words = if k == 2 {
+                for (a, (from, to)) in top_spot(s, refs).into_iter().enumerate() {
+                    (lo[a], hi[a]) = (from, to);
+                }
+                match refs {
+                    [At::Mid, At::Mid] => "at its centre".to_string(),
+                    [At::Mid, _] | [_, At::Mid] => {
+                        let k = usize::from(refs[0] == At::Mid);
+                        format!(
+                            "near the middle of its {} edge",
+                            ENDS[k][usize::from(refs[k] == At::Max)]
+                        )
+                    }
+                    _ => format!("near the {} corner", corner_name(refs)),
                 }
             } else {
                 // Along the side: Y for the X sides, X for the Y sides.
                 let along = 1 - k;
-                let (from, to) = if center { (0.45, 0.55) } else { (0.05, 0.15) };
+                let (from, to) = match refs[along] {
+                    At::Min => (0.05, 0.15),
+                    At::Mid => (0.45, 0.55),
+                    At::Max => (0.85, 0.95),
+                };
                 (lo[along], hi[along]) = (
                     s.min[along] + from * size[along],
                     s.min[along] + to * size[along],
                 );
                 (lo[2], hi[2]) = (s.max[2] - band, s.max[2] - band.min(1.));
-            }
-            let words = match (center, k) {
-                (true, 2) => "at its centre",
-                (true, _) => "near its centre",
-                _ => "near the front-left corner",
+                if refs[along] == At::Mid {
+                    "near its centre".to_string()
+                } else {
+                    // The corner of this side nearer the zero.
+                    let mut corner = refs;
+                    corner[k] = if plane > (s.min[k] + s.max[k]) / 2. {
+                        At::Max
+                    } else {
+                        At::Min
+                    };
+                    format!("near the {} corner", corner_name(corner))
+                }
             };
             (words, area_points(k, lo, hi).collect())
         })
         .collect()
 }
-/// The faces a probe touches for a stock-based work zero, in `zero_faces`'s
-/// order (the top first): its name, its axis, whether it is the stock's far
-/// side on that axis (+X, +Y, the top), and the box its `touch_spots` span.
-pub(crate) fn probe_faces(s: Bounds, center: bool) -> Vec<(&'static str, usize, bool, Bounds)> {
-    zero_faces(s, center)
+/// The faces a probe touches for a work zero of `references` `refs`, in
+/// `zero_faces`'s order (the top first): its name, its axis, whether it is
+/// the stock's far side on that axis (+X, +Y, the top), and the box its
+/// `touch_spots` span.
+pub(crate) fn probe_faces(s: Bounds, refs: [At; 2]) -> Vec<(&'static str, usize, bool, Bounds)> {
+    zero_faces(s, refs)
         .into_iter()
-        .zip(touch_spots(s, center))
+        .zip(touch_spots(s, refs))
         .map(|((name, k, plane), (_, points))| {
             let mut spot = Bounds {
                 min: [f32::INFINITY; 3],
@@ -1040,24 +1215,27 @@ pub(crate) fn probe_faces(s: Bounds, center: bool) -> Vec<(&'static str, usize, 
         })
         .collect()
 }
-/// The faces a stock-based work zero needs that earlier setups have cut
-/// where the operator touches off on them: a face counts when one of its
-/// `touch_spots` points lies where `rest::Removed` finds material can be
-/// gone. It is named alone when the whole face is cut (`stock_faces_cut`
-/// on `cut_boxes`), otherwise with the spot. `cut_boxes` reach a tool
-/// radius below each cut, so they only choose the words: a side cut lower
-/// down, where the workholding holds it, does not count.
+/// The faces a work zero of `references` `refs` needs that earlier setups
+/// have cut where the operator touches off on them: a face counts when one
+/// of its `touch_spots` points lies where `rest::Removed` finds material
+/// can be gone. It is named alone when the whole face is cut
+/// (`stock_faces_cut` on `cut_boxes`), otherwise with the spot. `cut_boxes`
+/// reach a tool radius below each cut, so they only choose the words: a
+/// side cut lower down, where the workholding holds it, does not count.
+/// With `bottom`, also the stock bottom under the top's spot, where a zero
+/// on the bottom lies.
 fn stock_zero_cut(
     stock: Bounds,
     volume: &crate::volume::Volume,
     frame: crate::volume::Frame,
-    center: bool,
+    refs: [At; 2],
+    bottom: bool,
 ) -> Vec<String> {
-    let whole = stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), center);
+    let whole = stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), refs);
     let removed = crate::rest::Removed::new(volume, frame);
-    zero_faces(stock, center)
+    let mut cut: Vec<String> = zero_faces(stock, refs)
         .into_iter()
-        .zip(touch_spots(stock, center))
+        .zip(touch_spots(stock, refs))
         .filter_map(|((face, ..), (spot, points))| {
             if !points.iter().any(|&p| removed.at(p)) {
                 None
@@ -1067,7 +1245,223 @@ fn stock_zero_cut(
                 Some(format!("{face} {spot}"))
             }
         })
+        .collect();
+    if bottom {
+        let [(x0, x1), (y0, y1)] = top_spot(stock, refs);
+        let z = stock.min[2] + 0.01;
+        if area_points(2, [x0, y0, z], [x1, y1, z]).any(|p| removed.at(p)) {
+            cut.push("bottom under the work zero".into());
+        }
+    }
+    cut
+}
+/// The stock-based work zeros (`ORIGINS`) whose faces earlier setups have
+/// not cut where they are touched off (`stock_zero_cut`), each spot looked
+/// at once.
+fn uncut_zeros(
+    stock: Bounds,
+    volume: &crate::volume::Volume,
+    frame: crate::volume::Frame,
+) -> Vec<&'static str> {
+    let removed = crate::rest::Removed::new(volume, frame);
+    let mut seen: Vec<(String, bool)> = vec![];
+    let mut cut = |key: String, points: &[[f32; 3]]| {
+        if let Some((_, c)) = seen.iter().find(|(k, _)| *k == key) {
+            return *c;
+        }
+        let c = points.iter().any(|&p| removed.at(p));
+        seen.push((key, c));
+        c
+    };
+    ORIGINS
+        .into_iter()
+        .filter(|origin| {
+            let Some((xy, top)) = stock_zero(origin) else {
+                return false;
+            };
+            let faces = zero_faces(stock, xy)
+                .into_iter()
+                .zip(touch_spots(stock, xy));
+            let sides = faces
+                .into_iter()
+                .any(|((face, ..), (spot, points))| cut(format!("{face} {spot}"), &points));
+            let [(x0, x1), (y0, y1)] = top_spot(stock, xy);
+            let z = stock.min[2] + 0.01;
+            let under: Vec<_> = area_points(2, [x0, y0, z], [x1, y1, z]).collect();
+            !sides && (top || !cut(format!("bottom {xy:?}"), &under))
+        })
         .collect()
+}
+/// `items` as a list: "a", "a and b", "a, b and c".
+fn listed(items: &[impl AsRef<str>]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.as_ref().to_string(),
+        [rest @ .., last] => format!(
+            "{} and {}",
+            rest.iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+            last.as_ref()
+        ),
+    }
+}
+/// The jaw or clamp of `boxes` in the way of a probe touching the faces of
+/// `refs` on `stock` (`probe_faces`), with the face and its spot: one in
+/// the column a probe goes down beside a side, from `corner_area` above
+/// the top to the bottom of the side's spot and out to `corner_area` from
+/// it, or over the top's spot up to that height. None when they are all
+/// clear.
+///
+/// ponytail: the column is `corner_area` wide, not the probe's clearance
+/// plus its tip; take the tip from the machine if a wide tip clips a jaw.
+fn in_the_way(stock: Bounds, refs: [At; 2], boxes: &[crate::holding::HoldBox]) -> Option<String> {
+    let clear = corner_area(stock);
+    let spots = probe_faces(stock, refs)
+        .into_iter()
+        .zip(touch_spots(stock, refs));
+    for ((face, k, far, spot), (words, _)) in spots {
+        let mut room = spot;
+        room.max[2] = stock.max[2] + clear;
+        if k < 2 {
+            (room.min[k], room.max[k]) = if far {
+                (stock.max[k], stock.max[k] + clear)
+            } else {
+                (stock.min[k] - clear, stock.min[k])
+            };
+        }
+        let overlaps =
+            |b: &Bounds| (0..3).all(|a| b.min[a] < room.max[a] && b.max[a] > room.min[a]);
+        if let Some(hold) = boxes.iter().find(|h| overlaps(&h.bounds)) {
+            return Some(format!(
+                "the {} is in the way of the {face} {words}",
+                hold.label
+            ));
+        }
+    }
+    None
+}
+/// What finds a setup's work zero on the stock it starts from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZeroCheck {
+    /// Why the work zero is not on that stock, named by the setup: export
+    /// and a run refuse the setup. Empty when it is.
+    pub refused: Vec<String>,
+    /// The faces a probe touches to find it (`references`), or why no
+    /// probe does: the operator touches it off by hand then.
+    pub probe: Result<[At; 2], String>,
+}
+/// Whether the work zero of `setup` is on `stock`, the box its first
+/// simulation `first` starts from (its `datum`'s box), and how a probe finds
+/// it there, with the jaws or clamps `boxes` round it.
+///
+/// A stock-based zero is refused when the stock was defined at an angle to
+/// the setup, or earlier setups have cut a face it is touched off on
+/// (`stock_zero_cut`, the bottom under it too for a zero on the bottom),
+/// naming the work zeros still on the stock. Model origin is found from the
+/// front-left corner of the stock top; when that is not on the stock, only
+/// the probe is refused: it is touched off by hand from the part. A jaw or
+/// clamp in the probe's way (`in_the_way`) refuses only the probe.
+pub(crate) fn zero_check(
+    setup: &Setup,
+    stock: Bounds,
+    first: &Simulation,
+    boxes: &[crate::holding::HoldBox],
+) -> ZeroCheck {
+    let origin = get(&setup.p, "origin");
+    let Some(refs) = references(origin) else {
+        return ZeroCheck {
+            refused: vec![],
+            probe: Err(format!(
+                "This setup's work zero is {origin}, which no probe finds: touch it off by hand."
+            )),
+        };
+    };
+    let model = stock_zero(origin).is_none();
+    // Why the zero is not on the stock, how far that is, and the
+    // stock-based zeros that are.
+    let mut off: Option<(String, &str, Vec<&str>)> = None;
+    if let (Some(volume), Some(frame)) = (&first.initial_volume, first.frame) {
+        if !volume.frame.square_to(frame) {
+            off = Some((
+                "the stock was defined in an orientation that is not square to this setup".into(),
+                "is not on a stock face",
+                vec![],
+            ));
+        } else {
+            let bottom = stock_zero(origin).is_some_and(|(_, top)| !top);
+            let cut = stock_zero_cut(stock, volume, frame, refs, bottom);
+            if !cut.is_empty() {
+                let usable = if model {
+                    vec![]
+                } else {
+                    uncut_zeros(stock, volume, frame)
+                };
+                off = Some((
+                    format!("earlier setups have cut the stock's {}", listed(&cut)),
+                    "is no longer on the stock",
+                    usable,
+                ));
+            }
+        }
+    }
+    if let Some((why, gone, usable)) = off {
+        let mut said = why.chars();
+        let said = said.next().map_or(String::new(), |c| {
+            c.to_uppercase().collect::<String>() + said.as_str()
+        });
+        if model {
+            return ZeroCheck {
+                refused: vec![],
+                probe: Err(format!(
+                    "{said}, where a probe finds Model origin from: touch it off by hand from the part."
+                )),
+            };
+        }
+        let choose = if usable.is_empty() {
+            "Choose Model origin for this setup.".to_string()
+        } else {
+            format!(
+                "Choose one that is, {}, or Model origin for this setup.",
+                listed(&usable)
+            )
+        };
+        return ZeroCheck {
+            refused: vec![format!(
+                "{}: {why}, so the {origin} work zero {gone}. {choose}",
+                setup.name()
+            )],
+            probe: Err(format!("{said}.")),
+        };
+    }
+    ZeroCheck {
+        refused: vec![],
+        probe: match in_the_way(stock, refs, boxes) {
+            Some(blocked) => Err(format!(
+                "A probe cannot find this work zero: {blocked}. Touch it off by hand, or choose a work zero whose spots are clear of the workholding."
+            )),
+            None => Ok(refs),
+        },
+    }
+}
+/// `zero_check` of setup `si` from its `sequence` results, as a run or
+/// export checks it with its workholding (`checked`). None when the setup
+/// cannot be walked.
+pub(crate) fn zero_checked(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<Simulation, String>)],
+) -> Option<ZeroCheck> {
+    let walk = walk(doc, mesh, si, sims, PostSettings::for_machine).ok()?;
+    let boxes = holding_boxes(doc, si, gripped(doc, mesh, si, &walk)).unwrap_or_default();
+    Some(zero_check(
+        &doc.setups[si],
+        walk.stock,
+        walk.simulations[0],
+        &boxes,
+    ))
 }
 /// Whether earlier setups have cut the stock's top face, wholly or in part:
 /// wholly by the stock-based zeros' test (`stock_faces_cut` on `cut_boxes`),
@@ -1080,7 +1474,8 @@ fn stock_top_cut(
     frame: crate::volume::Frame,
 ) -> bool {
     let removed = crate::rest::removal_boxes(volume, frame);
-    stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), false).contains(&"top face")
+    stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), [At::Min; 2])
+        .contains(&"top face")
         || face_points(stock, 2, stock.max[2] - 0.01).any(|p| removed.iter().any(|b| in_box(p, b)))
 }
 pub(crate) struct Prepared {
@@ -1389,12 +1784,15 @@ pub struct Checked {
     pub datum: [f32; 3],
     pub settings: PostSettings,
     pub offset: String,
-    /// The setup's work zero: Stock top center, Stock top front-left or Model origin.
+    /// The setup's work zero, one of `ORIGINS`.
     pub origin: String,
     /// (program, count, tool) when touch-off mode splits the setup.
     pub part: Option<(usize, usize, u32)>,
     /// A Model-origin zero located for the operator (`model_zero`).
     pub located: Option<(Bounds, Option<f32>)>,
+    /// The faces a probe touches to find the work zero, or why no probe
+    /// does (`ZeroCheck::probe`).
+    pub probe: Result<[At; 2], String>,
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
@@ -1466,29 +1864,9 @@ pub(crate) fn checked(
         return Err(pushed);
     }
     let origin = get(&setup.p, "origin");
-    if let (true, Some(volume), Some(frame)) = (
-        origin == "Stock top center" || origin == "Stock top front-left",
-        &simulations[0].initial_volume,
-        simulations[0].frame,
-    ) {
-        if !volume.frame.square_to(frame) {
-            return Err(vec![format!(
-                "{}: the stock was defined in an orientation that is not square to this setup, so the {origin} work zero is not on a stock face. Choose Model origin for this setup.",
-                setup.name()
-            )]);
-        }
-        let cut = stock_zero_cut(stock, volume, frame, origin == "Stock top center");
-        if let Some((last, rest)) = cut.split_last() {
-            let list = if rest.is_empty() {
-                last.to_string()
-            } else {
-                format!("{} and {last}", rest.join(", "))
-            };
-            return Err(vec![format!(
-                "{}: earlier setups have cut the stock's {list}, so the {origin} work zero is no longer on the stock. Choose Model origin for this setup.",
-                setup.name()
-            )]);
-        }
+    let found = zero_check(setup, stock, simulations[0], &boxes);
+    if !found.refused.is_empty() {
+        return Err(found.refused);
     }
     let located = model_zero(setup, mesh, simulations[0]);
     let count = groups.len();
@@ -1519,6 +1897,7 @@ pub(crate) fn checked(
             origin: origin.to_string(),
             part: (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool)),
             located,
+            probe: found.probe.clone(),
         });
     }
     Ok(out)
@@ -1930,7 +2309,7 @@ M2
             ),
             (
                 "Stock top front-left",
-                "Z0 on the stock top within 5 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X and -Y sides between 1 mm and 3 mm from the front-left corner, between 1 mm and 2.5 mm below the top",
+                "Z0 on the stock top within 5 mm of the front-left corner, at least 1 mm in from both edges, and X0 from the -X side between 1 mm and 3 mm from the front and Y0 from the -Y side between 1 mm and 3 mm from the left, between 1 mm and 2.5 mm below the top",
             ),
         ] {
             setup.p.insert("origin".into(), origin.into());
@@ -1987,7 +2366,13 @@ M2
         };
         assert_eq!(
             touch_off_spots("Stock top front-left", stock).unwrap(),
-            "Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner, between 1 mm and 10 mm below the top"
+            "Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 from the -X side between 4.2 mm and 12.6 mm from the front and Y0 from the -Y side between 6.2 mm and 18.6 mm from the left, between 1 mm and 10 mm below the top"
+        );
+        // An edge's middle is found from both sides across it; a zero on the
+        // bottom is touched off on the top, at the stock's height.
+        assert_eq!(
+            touch_off_spots("Stock bottom back", stock).unwrap(),
+            "Z47 on the stock top within 10 mm of the middle of its back edge, at least 1 mm in from it (Z0 is the stock bottom, 47 mm below it), and X0 from the -X and +X sides between 4.2 mm and 12.6 mm from the back and Y0 from the +Y side near its middle, between 1 mm and 10 mm below the top"
         );
         // Rounded to 0.1 mm inside the checked area: a 13 mm tall stock is
         // touched within 3.2 mm, and its 14.2 mm -X side from 0.71 to 2.13 mm
@@ -1999,7 +2384,7 @@ M2
         assert_eq!((side_band(low), corner_area(low)), (3.2, 3.5));
         assert_eq!(
             touch_off_spots("Stock top front-left", low).unwrap(),
-            "Z0 on the stock top within 3.5 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X side between 0.8 mm and 2.1 mm and the -Y side between 1.5 mm and 4.5 mm from the front-left corner, between 1 mm and 3.2 mm below the top"
+            "Z0 on the stock top within 3.5 mm of the front-left corner, at least 1 mm in from both edges, and X0 from the -X side between 0.8 mm and 2.1 mm from the front and Y0 from the -Y side between 1.5 mm and 4.5 mm from the left, between 1 mm and 3.2 mm below the top"
         );
         assert_eq!(touch_off_spots("Model origin", stock), None);
     }
@@ -2377,10 +2762,24 @@ M2
         ] {
             let (mut doc, mesh) = job_with_margin(side);
             let refused = setup_2(&mut doc, &mesh, "Stock top center");
+            // Every zero found from the other side of that axis is still on
+            // the stock, on the top and the bottom.
+            let (end, ends) = match side {
+                "stock_right" => ("left", ["front-left", "left", "back-left"]),
+                "stock_left" => ("right", ["front-right", "right", "back-right"]),
+                "stock_back" => ("front", ["front-left", "front", "front-right"]),
+                _ => ("back", ["back-left", "back", "back-right"]),
+            };
+            let usable: Vec<String> = ["top", "bottom"]
+                .iter()
+                .flat_map(|f| ends.map(|e| format!("Stock {f} {e}")))
+                .collect();
+            assert!(usable.iter().all(|u| u.contains(end)));
             assert_eq!(
                 refused,
                 vec![format!(
-                    "Later: earlier setups have cut the stock's {face}, so the Stock top center work zero is no longer on the stock. Choose Model origin for this setup."
+                    "Later: earlier setups have cut the stock's {face}, so the Stock top center work zero is no longer on the stock. Choose one that is, {}, or Model origin for this setup.",
+                    listed(&usable)
                 )],
                 "{side}"
             );
@@ -2390,7 +2789,8 @@ M2
                 assert_eq!(
                     front_left,
                     vec![format!(
-                        "Later: earlier setups have cut the stock's top face near the front-left corner and {face}, so the Stock top front-left work zero is no longer on the stock. Choose Model origin for this setup."
+                        "Later: earlier setups have cut the stock's top face near the front-left corner and {face}, so the Stock top front-left work zero is no longer on the stock. Choose one that is, {}, or Model origin for this setup.",
+                        listed(&usable)
                     )],
                     "{side}"
                 );
@@ -2442,7 +2842,9 @@ M2
         let first = results[1][0].1.as_ref().unwrap();
         let (volume, frame) = (first.initial_volume.as_ref().unwrap(), first.frame.unwrap());
         let stock = first.plan.stock;
-        assert!(stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), true).is_empty());
+        assert!(
+            stock_faces_cut(stock, &crate::rest::cut_boxes(volume, frame), [At::Mid; 2]).is_empty()
+        );
         let job = post_simulated(&doc, &mesh, &results);
         assert_eq!(
             job.setups[1].result.as_ref().err().cloned().unwrap_or_default(),
@@ -2614,7 +3016,7 @@ M2
                 ),
                 (
                     "Stock top front-left",
-                    "Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner",
+                    "Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 from the -X side between 4.2 mm and 12.6 mm from the front and Y0 from the -Y side between 6.2 mm and 18.6 mm from the left",
                 ),
             ] {
                 let (doc, mesh) = two_sided_job(bottom, origin);
@@ -2657,7 +3059,7 @@ M2
             stock_faces_cut(
                 first.plan.stock,
                 &crate::rest::cut_boxes(volume, frame),
-                true
+                [At::Mid; 2]
             )
             .is_empty()
         );
@@ -2669,7 +3071,7 @@ M2
                 .cloned()
                 .unwrap_or_default(),
             vec![
-                "Later: earlier setups have cut the stock's +X side near its centre, so the Stock top center work zero is no longer on the stock. Choose Model origin for this setup.".to_string()
+                "Later: earlier setups have cut the stock's +X side near its centre, so the Stock top center work zero is no longer on the stock. Choose one that is, Stock top front-left, Stock top left, Stock top back-left, Stock bottom front-left, Stock bottom left and Stock bottom back-left, or Model origin for this setup.".to_string()
             ]
         );
         // Stock top front-left does not use the +X side.
@@ -2775,6 +3177,43 @@ M2
         }
     }
     #[test]
+    fn a_jaw_or_clamp_in_the_probes_way_is_named() {
+        use crate::holding::HoldBox;
+        let stock = Bounds {
+            min: [0.; 3],
+            max: [100., 60., 40.],
+        };
+        let jaw = |top: f32| HoldBox {
+            label: "vise jaw on +X".into(),
+            bounds: Bounds {
+                min: [100., 0., -20.],
+                max: [115., 60., top],
+            },
+        };
+        // The sides are touched 1 to 10 mm below the top: a jaw up to 8 mm
+        // below it is in the way of a zero found from the +X side, not of
+        // one found from the -X side, and one 11 mm below is clear.
+        assert_eq!(
+            in_the_way(stock, [At::Mid; 2], &[jaw(32.)]).unwrap(),
+            "the vise jaw on +X is in the way of the +X side near its centre"
+        );
+        assert_eq!(in_the_way(stock, [At::Min; 2], &[jaw(32.)]), None);
+        assert_eq!(in_the_way(stock, [At::Mid; 2], &[jaw(29.)]), None);
+        // A clamp over the top's spot.
+        let clamp = HoldBox {
+            label: "clamp on -X (offset 0)".into(),
+            bounds: Bounds {
+                min: [-30., 25., 40.],
+                max: [6., 35., 55.],
+            },
+        };
+        assert_eq!(
+            in_the_way(stock, [At::Min, At::Mid], &[clamp.clone()]).unwrap(),
+            "the clamp on -X (offset 0) is in the way of the top face near the middle of its left edge"
+        );
+        assert_eq!(in_the_way(stock, [At::Max, At::Mid], &[clamp]), None);
+    }
+    #[test]
     fn touch_off_spots_follow_the_work_zero() {
         use crate::{simulation::CutterShape, volume::Volume};
         let (doc, mesh) = fixture::job();
@@ -2790,7 +3229,8 @@ M2
             for &(a, b) in path {
                 volume.cut(a, b, 3., 5., CutterShape::Flat, frame, (0, 0));
             }
-            [true, false].map(|center| stock_zero_cut(stock, &volume, frame, center))
+            [[At::Mid; 2], [At::Min; 2]]
+                .map(|refs| stock_zero_cut(stock, &volume, frame, refs, false))
         };
         let none = Vec::<String>::new();
         let one = |face: &str| vec![face.to_string()];
@@ -3007,7 +3447,7 @@ M2
                     .p
                     .insert("origin".into(), "Selected point (planned)".into());
             },
-            "Selected-point",
+            "is not a work zero",
         );
         refused(
             &|d| {
@@ -4210,7 +4650,7 @@ M2
         let whole = stock_faces_cut(
             first.plan.stock,
             &crate::rest::cut_boxes(volume, frame),
-            false,
+            [At::Min; 2],
         );
         assert!(!whole.contains(&"top face"), "{whole:?}");
         let text = &setup_texts(&post_simulated(&doc, &mesh, &results), 1)[0];

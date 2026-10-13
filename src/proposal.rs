@@ -10,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const ORIGINS: [&str; 3] = ["Stock top center", "Stock top front-left", "Model origin"];
+pub use crate::post::ORIGINS;
 const STRATEGIES: [(&str, Strategy); 6] = [
     ("Face", Strategy::Face),
     ("Pocket", Strategy::Pocket),

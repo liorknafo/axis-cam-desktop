@@ -140,7 +140,7 @@ The app opens on a start screen. Choose **New blank project** to begin with no m
 
 1. Click **Import your first model** and choose STEP/STP, 3MF, STL or OBJ. The part can be viewed before a setup exists.
 2. Choose **Create first setup**. With one saved machine the setup is created with it; with several, choose one in the Machine library; with none, the machine profile wizard opens and its **Save and create first setup** creates the setup.
-3. Work through the setup editor's four steps, each a tab under the setup name: **Machine** (the machine, work offset and origin), **Stock** (the project material, chosen from the material library, and the stock offsets or fixed dimensions), **Position** (flips, rotation and translation of the part) and **Holding** (the modelled vise or clamps and the fixture notes). A tab shows ✓ once its step needs nothing more and ○ until then: Machine once the machine profile has no issues and a work offset is chosen, Stock once a material is chosen and the stock box holds the part, Position while every rotation and translation is a number, Holding once a vise or clamps are modelled with nothing wrong. The editor stays on the step last opened, also after opening an operation. New setups contain no operations.
+3. Work through the setup editor's four steps, each a tab under the setup name: **Machine** (the machine, work offset and origin), **Stock** (the project material, chosen from the material library, and the stock offsets or fixed dimensions), **Position** (flips, rotation and translation of the part) and **Holding** (the modelled vise or clamps and the fixture notes). A tab shows ✓ once its step needs nothing more and ○ until then: Machine once the machine profile has no issues, a work offset is chosen and the work zero is on the stock (see **The work zero**), Stock once a material is chosen and the stock box holds the part, Position while every rotation and translation is a number, Holding once a vise or clamps are modelled with nothing wrong. The editor stays on the step last opened, also after opening an operation. New setups contain no operations.
 4. Choose an operation and configure its parameters. With no cutter yet, the operation opens the Tool library; its **Save and continue to** button (for example **Save and continue to Facing**), which sits under the form and stays in sight while its fields scroll, saves the cutter and adds the operation (LIO-147).
 
 An action that needs something you have not made yet sends you to make it and then finishes once it is saved. Leaving that page instead drops the action.
@@ -148,6 +148,19 @@ An action that needs something you have not made yet sends you to make it and th
 6. Use **Save project** to create a portable `.axis.json` file, and **Open** to restore it later.
 
 "Setup" means one thing: a **setup** is one position of the part on the machine, with its stock, work zero and holding. The reusable description of a machine is its **machine profile**, made in the Machine library with **New machine profile** (the machine profile wizard), and the UC100's profile form, pin tests, calibration and commissioning are **Controller configuration** in the MACHINE toolbar.
+
+### The work zero (LIO-166)
+
+The setup editor's **Machine** step chooses the setup's **Work coordinate origin**, the point its program and its runs are cut from: a corner, the middle of an edge or the centre of the stock's top or bottom ("Stock top center", "Stock top front-left", "Stock top back", "Stock bottom front-right" and so on: front is −Y, left is −X), or **Model origin**, the part file's own 0,0,0. A stock-based zero is a point of the box the setup starts from: setup 1's stock, and for a later setup the stock the earlier setups leave (see **The stock earlier setups leave**), in that setup's frame, so a flipped or turned setup has its own top, bottom, front and left. The editor says under the choice where it is touched off on that stock, and which probing routine on the Control page finds it.
+
+Every zero is found from the stock top and the sides it names: a corner from the top and the two sides at it, the middle of an edge from the top, the side at it and both sides across, the centre from the top and all four. A zero on the bottom is touched off on the top too, as the stock's height above the bottom: the bottom sits on the workholding. Model origin is found from the stock top's front-left corner and set off from it as the program has it. Each side is touched in a band 1 mm to 10 mm below the top (less on low stock), near the end nearer the zero (5–15 % of its length from it) or near its middle; the top over the zero (within 10 mm of a corner, at least 1 mm in from both edges). The program header, the help card, the Run panel's steps and the Control page's probe all name the same spots.
+
+The zero must be on material that is there. Once the background check of the active setup is back, the editor lists under the choice, in the words Run and export refuse it with:
+
+- **The work zero is not on the stock** when earlier setups have cut a spot it is touched off on, or the stock under a zero on the bottom, or when the stock is not square to the setup. The message names the spot and the work zeros still on the stock ("Later: earlier setups have cut the stock's top face at its centre, so the Stock top center work zero is no longer on the stock. Choose one that is, Stock top front-left, …, or Model origin for this setup."). Export and Run refuse the setup, and the Machine step keeps its ○.
+- **No probe finds this work zero** when a vise jaw or clamp stands where the probe would go down beside a side or onto the top's spot (the column out to 10 mm from the side, up to 10 mm above the top), or when the stock-top corner Model origin is found from was cut. The setup can still run: touch the zero off by hand.
+
+The same point is used everywhere: the program's coordinates (plan point − work zero), the simulation and a run's moves (plan point − work zero + the machine's work offset), the 3D view's **X0 Y0 Z0** marker (drawn on the stock the simulation starts from, or the box the editor knows for the setup), the header's touch-off words, the Run panel's steps and the probe.
 
 Six operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks beyond the vise jaws and clamps a setup models (see **Workholding**) and the five explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
 
@@ -391,36 +404,44 @@ Once the machine is Idle, the Control page has everything needed before a job:
   Machine library, on the machine's UC100 step. Put the plate on the stock top
   under the tool, clip the probe on and press **Probe Z**: Z feeds down until
   the tool touches the plate, at most the maximum distance and never below
-  the bottom of Z. Work Z at the contact becomes the plate's thickness, so
-  the stock top is Z 0, and the tool lifts by the retract. The machine stops
+  the bottom of Z. Work Z at the contact becomes the plate's thickness above
+  the stock top's Z: the program's for the setup picked in the Run panel (Z 0
+  for a zero on the top, the stock's height for one on the bottom, the stock
+  top's Z for Model origin), Z 0 without one. The tool then lifts by the
+  retract. With a Model origin whose stock top an earlier setup cut, Probe Z
+  is refused: touch off on a part face. The machine stops
   a little past the contact; the driver reports where the contact was, and
   that is what counts. Without contact nothing is set, and a refusal says
   why. Probe Z is offered while Idle with Z referenced, a probe input in the
   profile and that input not already active; otherwise the panel says what
   is missing. E-stop stops a probe.
-- **Probe corner and Probe centre.** The X, Y and Z work zero of the setup
-  picked in the Run panel, from its stock: **Probe corner** for **Stock top
-  front-left**, **Probe centre** for **Stock top center**. **Model origin**
-  cannot be found on the stock: touch it off by hand. With a touch probe in
+- **Probe corner, Probe edge and Probe centre.** The X, Y and Z work zero of
+  the setup picked in the Run panel, from its stock, exactly where its program
+  has it (LIO-166): **Probe corner** for a corner of the top or bottom and for
+  Model origin (found from the front-left corner), **Probe edge** for the
+  middle of an edge, **Probe centre** for the centre. With a touch probe in
   the spindle (or a tool, with the probe clipped onto conductive stock), set
   the **probe tip diameter** in the Machine library, select the setup's work
   system, jog the probe above the stock top over where Z0 is touched off and
-  press the button. It touches the top, then the −X and −Y sides (corner) or
-  all four (centre), at the spots the program header names: 1 mm to 10 mm
-  below the top (a quarter of the stock's height when that is less), 5–15 %
-  of each side's length from the corner or near each side's middle. Each
-  side's touch is corrected by the tip's radius. A face first touched off its
-  spot, because only the other touches tell where that is (the −X side when
-  the probe starts close to the corner, or the top when it starts off the
-  top's spot), is touched once more on it. The probe travels 10 mm above the
-  top (a quarter of the stock's shorter top side when that is less), goes
-  down that far outside where it expects each side, from the stock's size,
-  and probes up to that far past it: start within that distance of the spot.
-  Then it sets the work zero and backs off; Probe centre also gives the
-  stock's measured size. Anything touched on the way down, a miss, Stop or
-  E-stop ends it with nothing set. Every move in toward the stock is a probe
-  move at the probe feed. It needs X, Y and Z referenced, and the setup
-  checked since the last edit.
+  press the button. It touches the top, then the sides the zero is found
+  from, at the spots the program header names: 1 mm to 10 mm below the top
+  (a quarter of the stock's height when that is less), 5–15 % of each side's
+  length from the end nearer the zero, or near its middle. Each side's touch
+  is corrected by the tip's radius. A face first touched off its spot,
+  because only the other touches tell where that is (a side when the probe
+  starts close to a corner, or the top when it starts off the top's spot), is
+  touched once more on it. The probe travels 10 mm above the top (a quarter
+  of the stock's shorter top side when that is less), goes down that far
+  outside where it expects each side, from the stock's size, and probes up to
+  that far past it: start within that distance of the spot. Then it sets the
+  work position there to the program's (the stock's height in Z for a zero on
+  the bottom, the corner's coordinates for Model origin) and backs off; with
+  both sides of an axis touched it also gives the stock's measured size.
+  Anything touched on the way down, a miss, Stop or E-stop ends it with
+  nothing set. Every move in toward the stock is a probe move at the probe
+  feed. It needs X, Y and Z referenced, and the setup checked since the last
+  edit. When no probe can find the zero (a jaw or clamp in the way, or the
+  stock-top corner of a Model origin cut), the panel says why.
 - **Spindle and coolant.** CW at an RPM, Stop; CCW only when the profile has a
   direction output; Flood and Mist only for the outputs the profile has.
 - **Overrides.** Feed override 10–200 %; **Override limit switches** when the
@@ -482,8 +503,8 @@ panel, at once when that machine is connected, or when you press
    checks the setup again on its own once the edits pause, keeping its
    progress, as **Check again** does (LIO-150).
 2. Set machine zero, then the work zero (the setup's work offset must be the
-   active one): by hand, with **Probe Z** on a plate, or with **Probe corner**
-   or **Probe centre** for a stock-based work zero. **Cycle Start** stays grey, with the reasons listed, until the
+   active one): by hand, with **Probe Z** on a plate, or with **Probe corner**,
+   **Probe edge** or **Probe centre**. **Cycle Start** stays grey, with the reasons listed, until the
    tool run can start: the machine Idle, the AXIS CAM machine's X/Y/Z travel
    equal to the profile's soft limits, X, Y and Z with a machine position,
    the tool run inside the soft limits at this work zero, a spindle speed,
@@ -495,13 +516,17 @@ panel, at once when that machine is connected, or when you press
    Until the first tool run starts, **Work zero on the stock** below Cycle
    Start walks through it. It names the setup's work zero and work
    system and says whether X, Y and Z have a machine position and whether
-   that work system is active. Then: jog the tool tip over the centre (or the
-   front-left corner) of the stock top, lower it until it pinches a sheet of
-   paper, and press **Zero all**, which is there too. With a probe input it
-   names Probe centre, Probe corner or Probe Z instead. Simulated, it gives
-   the block and this setup's work zero on it in machine coordinates.
-   **Move there** rapids the tool tip up to the top of Z, over that point
-   and down onto it, so Zero all puts the work zero on the block. A tool run
+   that work system is active. Then: jog the tool tip over the spot of the
+   stock top the zero is touched off from (its centre, a corner, the middle
+   of an edge), lower it until it pinches a sheet of paper, and press the
+   button that is there too: **Zero all** for a zero on the top, or **Set X0
+   Y0 Z…** with the stock's height for a zero on the bottom (the corner's
+   coordinates for Model origin), which sets the work position there to the
+   program's. With a probe input it names the probe that does it, or why no
+   probe can and Probe Z. Simulated, it gives the block and this setup's work
+   zero on it in machine coordinates, and where it is touched off when that
+   differs. **Move there** rapids the tool tip up to the top of Z, over that
+   point and down onto it, so the button puts the work zero on the block. A tool run
    that would leave the soft limits says "Put the work zero on the stock:
    see Work zero on the stock below".
 3. **Cycle Start** turns the tool run into the driver's actions at the
@@ -541,14 +566,14 @@ wizard.
 
 Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis; a UC100 setup is refused with **Run on the machine** beside it, see **Running a setup**), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
 
-- Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (Stock top center, Stock top front-left or Model origin).
+- Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (see **The work zero**).
 - The header names the work zero, the stock, the modelled vise or clamps when the setup has them (a `Workholding:` comment) or else its fixture note when it has one (a `Fixture:` comment) and, when the setup has notes, the notes (a `Setup notes:` comment). LinuxCNC runs a comment that begins with `MSG,`, `LOGOPEN,`, `PROBEOPEN,` and the like as a command, so every comment that carries your text or the planner's (the job title, setup and operation names, notes, the fixture, tool and machine names) begins with a fixed word and a colon, such as `Job:`, `Operation 2:` or `Before starting:`. Such a comment is split over lines of at most 200 characters and never cut off; each later line begins with the same word and `, continued:`, such as `Setup notes, continued:` or `Before starting, continued:`.
 - For Model origin, which is a point in the CAD file, the header gives the part's box in work coordinates and the stock top's Z, and says to touch off on a part wall or the stock top and enter its coordinate. When an earlier setup has cut the stock top, wholly or in part, the stock top is left out and the header says "The stock top was cut by an earlier setup; touch off on a part face." The plan preview locates a Model-origin zero from the part's −X −Y corner and the stock top, or from the part's top with the same sentence when the stock top was cut.
 - Machine profile → Controller step → Postprocessor: tool table (`T# M6` + `G43 H#`) or touch off each tool (one program per tool run: run G49 in MDI before touching off, touch the first tool off at the work zero with AXIS Touch Off, not Tool Touch Off, note the Z of a fixed reference such as a vise jaw, and touch each later tool off on that reference; AXIS cannot touch off while a program is paused), safe retract (`G53 G0 Z0` or the setup clearance plane), path blending (`G64 P`, or `G61` at 0), spindle start dwell and the Air output (M7/M8). Setups keep a machine snapshot, so assign the profile again after editing it.
 - Tools have a number (T#) in the tool library. Tools without one (older libraries) are numbered 1, 2, 3… in library order when the project is opened; Open, Recover previous project, the workspace at start-up and `--export-gcode` then say so and ask you to check each tool against your LinuxCNC tool table.
-- Stock-based work zeros (Stock top center, Stock top front-left) are refused when earlier setups have cut the stock where you touch them off (see below), or when the stock was defined in an orientation that is not square to the setup (a rotation that is not a multiple of 90° about each axis), because the zero would not be on a stock face. Choose Model origin for that setup.
-- A stock-based zero needs the spots you touch off on to be intact, and the work-zero line of the header says where they are. Stock top center: "Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and N mm below the top." Stock top front-left: "Touch off Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 Y0 from the -X and -Y sides between A mm and B mm from the front-left corner, between 1 mm and N mm below the top." N is 10 mm, or a quarter of the stock's height when that is less: the band just below the top where an edge finder touches the sides above the vise. A and B are 5% and 15% of each side's length, rounded inwards to 0.1 mm; when the -X and -Y sides differ in length, each is given its own, as in "from the -X side between 4.2 mm and 12.6 mm and the -Y side between 6.2 mm and 18.6 mm from the front-left corner" on a 124 × 84 mm stock. The corner area is 10 mm square, or a quarter of the stock's shorter top side when that is less, and begins 1 mm in from both edges. A work-zero line too long for one comment goes on in a `Work zero, continued:` line. Program 1 in touch-off mode says the same, and the Stock top center and Stock top front-left help cards and the planner's rule use the same words, with "between 5% and 15% of each side's length" for A and B.
-- Export is refused when an earlier setup has cut one of those spots: the top at its centre or the middle 10% of a side in that band for Stock top center; the corner area, or 5% to 15% of the −X or −Y side from the corner in that band, for Stock top front-left. A side cut only lower down, where the vise holds it, does not count, so a two-sided job whose first setup contours only part of the height can use a stock-based zero on the flipped setup, also with a large cutter or a short stock: only the spots decide. An earlier Face inside the part outline, for example, leaves a rim of stock at full height but lowers the top's centre, and a narrow rim at the corner does not leave room for a Z-setter or gauge block either: a Z0 touched off there would send the program too deep. The message names the spot: "earlier setups have cut the stock's top face at its centre, …", "… top face near the front-left corner, …" or "… +X side near its centre, …", or the face alone ("… top face, …") when the earlier cuts, counted generously (a tool radius beyond each cut), cover the whole face.
+- Stock-based work zeros are refused when earlier setups have cut the stock where you touch them off (see below), or the stock under a zero on the bottom, or when the stock was defined in an orientation that is not square to the setup (a rotation that is not a multiple of 90° about each axis), because the zero would not be on a stock face. The message lists the work zeros still on the stock, and Model origin.
+- A stock-based zero needs the spots you touch off on to be intact, and the work-zero line of the header says where they are. Stock top center: "Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and N mm below the top." Stock top front-left: "Touch off Z0 on the stock top within 10 mm of the front-left corner, at least 1 mm in from both edges, and X0 from the -X side between A mm and B mm from the front and Y0 from the -Y side between C mm and D mm from the left, between 1 mm and N mm below the top." A zero on the bottom is touched off on the top at its height: "Touch off Z40 on the stock top … (Z0 is the stock bottom, 40 mm below it) and …". N is 10 mm, or a quarter of the stock's height when that is less: the band just below the top where an edge finder touches the sides above the vise. A to D are 5% and 15% of each side's length, rounded inwards to 0.1 mm, from the end nearer the zero. The corner area is 10 mm square, or a quarter of the stock's shorter top side when that is less, and begins 1 mm in from both edges. A work-zero line too long for one comment goes on in a `Work zero, continued:` line. Program 1 in touch-off mode says the same, and the help cards and the planner's rule use the same words.
+- Export is refused when an earlier setup has cut one of those spots: the top at its centre or the middle 10% of a side in that band for Stock top center; the corner area, or 5% to 15% of the −X or −Y side from the corner in that band, for Stock top front-left; likewise for the other corners and edges, and for a zero on the bottom the stock bottom under the top's spot. A side cut only lower down, where the vise holds it, does not count, so a two-sided job whose first setup contours only part of the height can use a stock-based zero on the flipped setup, also with a large cutter or a short stock: only the spots decide. An earlier Face inside the part outline, for example, leaves a rim of stock at full height but lowers the top's centre, and a narrow rim at the corner does not leave room for a Z-setter or gauge block either: a Z0 touched off there would send the program too deep. The message names the spot: "earlier setups have cut the stock's top face at its centre, …", "… top face near the front-left corner, …" or "… +X side near its centre, …", or the face alone ("… top face, …") when the earlier cuts, counted generously (a tool radius beyond each cut), cover the whole face.
 - A rapid may descend wholly beside the stock box, where there never was stock; a rapid that descends over the stock must be proven clear by earlier cuts. That check does not look at fixtures; the check of modelled jaws and clamps is separate (see **Workholding**).
 - Speeds and feeds outside the project material's cutting data are listed on this page, per enabled operation, as warnings (see **Materials**); they never stop an export. Operations that could not be checked are listed with the reason.
 - Not checked: for a setup without modelled workholding, fixtures, clamps and the machine body; for a setup with a vise or clamps, parallels, bolts, the table, the machine body and tool-change motion (its jaws and clamps are checked as boxes with a clearance gap, and the header's Not checked comment says which of the two holds, followed for such a setup by a comment that retracts to machine home are assumed to clear everything: see **Workholding**). LinuxCNC's own soft limits check absolute position. Preview each program in LinuxCNC and air-cut first.

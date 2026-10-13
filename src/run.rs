@@ -399,6 +399,9 @@ pub struct Ready {
     /// connected machine (`plan_problems`), export's refusal for a machine
     /// that is not a UC100. Empty when it can.
     pub problems: Vec<String>,
+    /// Whether its work zero is on the stock it starts from and how a probe
+    /// finds it (`post::zero_checked`). None when the setup cannot be walked.
+    pub zero: Option<crate::post::ZeroCheck>,
 }
 
 /// `Ready` of setup `si`: `plan_problems` (`post::checked` for a machine that
@@ -423,6 +426,7 @@ pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
             .collect(),
         held: crate::post::held_walked(doc, mesh, si, &sims).unwrap_or_default(),
         problems: problems.err().unwrap_or_default(),
+        zero: crate::post::zero_checked(doc, mesh, si, &sims),
     }
 }
 
@@ -626,6 +630,7 @@ mod tests {
             origin: "Stock top center".into(),
             part: Some((1, 1, 1)),
             located: None,
+            probe: Ok([crate::post::At::Mid; 2]),
         }
     }
 

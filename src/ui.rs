@@ -1931,7 +1931,14 @@ pub(crate) const SETUP_STEPS: [&str; 4] = ["Machine", "Stock", "Position", "Hold
 pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
     let s = app.doc.setup();
     match step {
-        "Machine" => s.machine.issues().is_empty() && !get(&s.p, "offset").is_empty(),
+        "Machine" => {
+            s.machine.issues().is_empty()
+                && !get(&s.p, "offset").is_empty()
+                && !app
+                    .current_ready()
+                    .and_then(|r| r.zero.as_ref())
+                    .is_some_and(|z| !z.refused.is_empty())
+        }
         "Stock" => {
             app.doc.selected_material().is_some()
                 && crate::stock::resolve(s, app.part_mesh())
@@ -2038,14 +2045,63 @@ fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             p,
             "origin",
             "Work coordinate origin",
-            &[
-                "Stock top center",
-                "Stock top front-left",
-                "Model origin",
-                "Selected point (planned)",
-            ],
+            &crate::post::ORIGINS,
             t,
         ))
+        .push(zero_note(app))
+}
+/// Where the active setup's work zero is on the stock it starts from, how
+/// it is touched off and probed, and what the checks before a run found of
+/// it (`run::Ready::zero`): that it is not on the stock, or that no probe
+/// finds it.
+fn zero_note(app: &App) -> Element<'_, Message> {
+    let si = app.doc.index();
+    let setup = app.doc.setup();
+    let origin = get(&setup.p, "origin");
+    let (Some(stock), known) = app.known_stock(si) else {
+        return column![].into();
+    };
+    let size = stock.dimensions();
+    let from = format!(
+        "{} × {} × {} mm{}",
+        crate::post::exact_mm(size[0]),
+        crate::post::exact_mm(size[1]),
+        crate::post::exact_mm(size[2]),
+        match (si, known) {
+            (0, _) => "",
+            (_, true) => ", as the earlier setups leave it",
+            _ => ", the original block until the stock the earlier setups leave is worked out",
+        }
+    );
+    let refs = crate::post::references(origin);
+    let mut lines = vec![match (crate::post::touch_off_spots(origin, stock), refs) {
+        (Some(spots), _) => {
+            format!("On the stock this setup starts from ({from}): touch off {spots}.")
+        }
+        (None, Some(refs)) => format!(
+            "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
+            crate::post::probe_spots(refs, stock)
+        ),
+        _ => "Choose a work zero.".into(),
+    }];
+    if let Some(refs) = refs {
+        lines.push(format!(
+            "On the Control page, {} sets exactly this work zero.",
+            crate::control::probe_name(refs)
+        ));
+    }
+    let mut c = column![muted(lines.join(" "))].spacing(8);
+    if let Some(zero) = app.current_ready().and_then(|r| r.zero.as_ref()) {
+        if !zero.refused.is_empty() {
+            c = c.push(caution(
+                "The work zero is not on the stock",
+                zero.refused.clone(),
+            ));
+        } else if let Err(why) = &zero.probe {
+            c = c.push(caution("No probe finds this work zero", vec![why.clone()]));
+        }
+    }
+    c.into()
 }
 fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let s = app.doc.setup();
@@ -3516,7 +3572,9 @@ fn control(app: &App) -> Element<'_, Message> {
             s.active_wcs == i,
         ));
     }
-    let blocked = c.probe_blocked();
+    let blocked = c.probe_z_blocked();
+    // The stock top's work Z the plate lies on.
+    let top = c.stock_top().unwrap_or_default();
     let mut probe = column![
         row![
             act(
@@ -3527,8 +3585,12 @@ fn control(app: &App) -> Element<'_, Message> {
             muted(match (&blocked, &c.probe) {
                 (Some(why), _) if !c.probing() => why.clone(),
                 (_, Ok(p)) => format!(
-                    "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, then the tool lifts {} mm.",
-                    p.feed, p.distance, p.plate.unwrap_or_default(), p.retract
+                    "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
+                    p.feed,
+                    p.distance,
+                    crate::post::exact_mm((top + p.plate.unwrap_or_default()) as f32),
+                    crate::post::exact_mm(top as f32),
+                    p.retract
                 ),
                 _ => String::new(),
             })
@@ -3538,9 +3600,9 @@ fn control(app: &App) -> Element<'_, Message> {
     ];
     probe = probe.push(match c.edges_setup() {
         Err(why) => Element::from(muted(why)),
-        Ok((center, p)) => {
+        Ok((refs, p)) => {
             let blocked = c.edges_blocked();
-            let name = if center { "Probe centre" } else { "Probe corner" };
+            let name = crate::control::probe_name(refs);
             row![
                 act(
                     name,
@@ -3550,8 +3612,12 @@ fn control(app: &App) -> Element<'_, Message> {
                 muted(match (&blocked, &c.probe) {
                     (Some(why), _) if !c.edging() => why.clone(),
                     (_, Ok(pr)) => format!(
-                        "Jog the probe above the stock top, over where Z0 is touched off, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero.",
-                        crate::post::touch_off_spots(&p.origin, p.stock).unwrap_or_default(),
+                        "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero there.",
+                        crate::control::probe_spot(refs),
+                        crate::post::touch_off_spots(&p.origin, p.stock).unwrap_or_else(|| format!(
+                            "{}, and puts X0 Y0 Z0 on Model origin from them",
+                            crate::post::probe_spots(refs, p.stock)
+                        )),
                         pr.tip.unwrap_or_default(),
                         pr.feed
                     ),
@@ -3948,11 +4014,19 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                 false,
             ));
         }
-        buttons = buttons.push(act(
-            "Zero all",
-            c.manual().then_some(Message::Machine(Action::WorkZero(None))),
-            false,
-        ));
+        buttons = buttons.push(match c.touch_off() {
+            Some((_, work)) => act(
+                touch_label(work),
+                c.manual().then_some(Message::Machine(Action::TouchOff)),
+                false,
+            ),
+            None => act(
+                "Zero all",
+                c.manual()
+                    .then_some(Message::Machine(Action::WorkZero(None))),
+                false,
+            ),
+        });
         body = body
             .push(bold("Work zero on the stock", 13))
             .push(note(steps.join("\n")))
@@ -3993,34 +4067,81 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     } else {
         format!("2. Select {} under Work zero.", p.offset)
     });
-    let paper = |spot: &str| {
-        format!("3. Jog the tool tip over {spot}, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top.")
-    };
-    steps.push(match p.origin.as_str() {
-        "Stock top center" => paper("the centre of the stock top"),
-        "Stock top front-left" => paper("the front-left corner of the stock top"),
-        _ => match work_zero_line(setup, p.located).split_once(" — ") {
-            Some((_, at)) => format!("3. Jog the tool tip to the work zero: {at}."),
-            None => "3. Jog the tool tip to the work zero.".into(),
-        },
-    });
-    steps.push("4. Zero all: that point becomes X0 Y0 Z0. The checks above then say whether every tool run fits the soft limits from there.".into());
+    let checks =
+        "The checks above then say whether every tool run fits the soft limits from there.";
+    match (c.touch_off(), crate::post::references(&p.origin)) {
+        (Some((_, work)), Some(refs)) => {
+            let spot = match crate::control::probe_spot(refs).as_str() {
+                "its centre" => "the centre".to_string(),
+                spot => spot.to_string(),
+            };
+            steps.push(format!("3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top."));
+            let zero = match crate::post::stock_zero(&p.origin) {
+                None => " on Model origin".to_string(),
+                Some((_, false)) => format!(
+                    " on the stock bottom, {} mm below the top",
+                    crate::post::exact_mm(work[2] as f32)
+                ),
+                Some(_) => String::new(),
+            };
+            steps.push(format!(
+                "4. {}: that point becomes {}, putting the work zero{zero}. {checks}",
+                touch_label(work),
+                work_words(work)
+            ));
+        }
+        _ => {
+            steps.push(match work_zero_line(setup, p.located).split_once(" — ") {
+                Some((_, at)) => format!("3. Jog the tool tip to the work zero: {at}."),
+                None => "3. Jog the tool tip to the work zero.".into(),
+            });
+            steps.push(format!(
+                "4. Zero all: that point becomes X0 Y0 Z0. {checks}"
+            ));
+        }
+    }
     if c.config.inputs.probe.is_some() {
-        steps.push(match c.edges_setup() {
-            Ok((center, _)) => format!(
+        steps.push(match (c.edges_setup(), c.stock_top()) {
+            (Ok((refs, _)), _) => format!(
                 "With the probe clipped on, {} under Work zero does 3 and 4.",
-                if center { "Probe centre" } else { "Probe corner" }
+                crate::control::probe_name(refs)
             ),
-            Err(_) => "With the touch plate on the stock top, Probe Z under Work zero sets Z0.".into(),
+            (Err(why), Ok(top)) => format!(
+                "{why} With the touch plate on the stock top, Probe Z under Work zero sets Z{}.",
+                crate::post::exact_mm(top as f32)
+            ),
+            (Err(why), Err(_)) => why,
         });
     }
-    if let (Some((lo, hi)), Some(z)) = (c.block, c.sim_zero()) {
+    if let (Some((lo, hi)), Some(z), Some(at)) = (c.block, c.sim_zero(), c.sim_touch()) {
+        let touched = if (0..3).all(|k| (at[k] - z[k]).abs() < 1e-6) {
+            String::new()
+        } else {
+            format!(
+                ", touched off at machine X {:.3} Y {:.3} Z {:.3}",
+                at[0], at[1], at[2]
+            )
+        };
         steps.push(format!(
-            "Simulated: the stock is a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}. This setup's work zero on it is at machine X {:.3} Y {:.3} Z {:.3}: Move there does 3.",
+            "Simulated: the stock is a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}. This setup's work zero on it is at machine X {:.3} Y {:.3} Z {:.3}{touched}: Move there does 3.",
             lo[0], hi[0], lo[1], hi[1], hi[2], z[0], z[1], z[2]
         ));
     }
     Some(steps)
+}
+/// A work position (mm) as it is said: "X0 Y0 Z12.5".
+fn work_words(work: [f64; 3]) -> String {
+    let axis = |a: usize| format!("{}{}", AXES[a], crate::post::exact_mm(work[a] as f32));
+    format!("{} {} {}", axis(0), axis(1), axis(2))
+}
+/// The button that sets the touch-off point's work position `work`
+/// (`control::Action::TouchOff`): Zero all for X0 Y0 Z0.
+fn touch_label(work: [f64; 3]) -> String {
+    if work.iter().all(|v| crate::post::exact_mm(*v as f32) == "0") {
+        "Zero all".into()
+    } else {
+        format!("Set {}", work_words(work))
+    }
 }
 /// How the last probe ended, or that one is under way.
 fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {

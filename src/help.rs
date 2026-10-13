@@ -694,13 +694,16 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         MdiText(_) => "One line of G-code, for example G0 X10 Y10.",
         MdiSend => "Run the line now. Works when Idle, or while a program is paused.",
         ProbeZ => {
-            "With the touch plate on the stock top under the tool and the probe clipped on, feed Z down until the tool touches the plate, up to the maximum probe distance. Work Z at the contact becomes the plate's thickness, so the stock top is Z 0; then the tool lifts. Without contact nothing is set."
+            "With the touch plate on the stock top under the tool and the probe clipped on, feed Z down until the tool touches the plate, up to the maximum probe distance. Work Z at the contact becomes the stock top's Z plus the plate's thickness, then the tool lifts. The stock top's Z is the program's for the setup picked in the Run panel (Z 0, or the stock's height for a work zero on the bottom), and Z 0 without one. Without contact nothing is set."
         }
         ProbeEdges => {
-            "Probe corner (Stock top front-left) or Probe centre (Stock top center) for the setup picked in the Run panel. With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero. A side whose first touch was off its spot is touched again on it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set."
+            "Probe corner, Probe edge or Probe centre, by the work zero of the setup picked in the Run panel. With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero exactly where the program has it: on the top or the bottom, and for Model origin from the front-left corner. A side whose first touch was off its spot is touched again on it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set."
+        }
+        TouchOff => {
+            "With the tool tip on the stock top over the spot the steps name, set the work position there to the program's: X0 Y0 Z0 for a zero on the top, the stock's height in Z for one on the bottom, the corner's coordinates for Model origin."
         }
         ToSimZero => {
-            "Simulated only: rapid the tool tip up to the top of Z, over this setup's work zero on the simulator's block, and down onto it. Then Zero all makes it the work zero, as touching off on real stock would."
+            "Simulated only: rapid the tool tip up to the top of Z, over where this setup is touched off on the simulator's block, and down onto it. Then the button beside it sets the work zero, as touching off on real stock would."
         }
     }
 }
@@ -1125,7 +1128,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "origin") => (
-            "Work zero for this setup's G-code. Choose a point you can reproduce when touching off the stock; arbitrary point selection is planned.",
+            "Work zero for this setup's G-code and runs: a corner, the middle of an edge or the centre of the stock's top or bottom, on the stock this setup starts from (what earlier setups leave, turned with it), or the part file's own origin. The probe on the Control page finds exactly this point; the editor says where it is touched off and whether it is still on the stock.",
             Some(Orientation),
         ),
         (_, "stock_type") => (

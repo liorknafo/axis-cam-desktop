@@ -270,6 +270,23 @@ impl Viewport<'_> {
             None => stock::resolve(setup, Some(self.mesh)).ok(),
         }
     }
+    /// The setup's work zero in plan coordinates (mm), as the program and a
+    /// run put it (`post::datum`) on the stock the simulation starts from,
+    /// or the stock the view shows when that is the real one. None without
+    /// a setup or a known stock, and for the example.
+    pub(crate) fn zero(&self) -> Option<[f32; 3]> {
+        let setup = self.setup.filter(|_| !self.sample)?;
+        let stock = match self.simulation {
+            Some(sim) => sim.plan.stock,
+            None => {
+                let resolved = self
+                    .resolved_stock()
+                    .filter(|_| self.stock_is_known(setup))?;
+                resolved.stock
+            }
+        };
+        crate::post::datum(setup, stock, self.mesh).ok()
+    }
     /// Whether `setup`'s stock is the real one, to be drawn without a
     /// simulation: the first setup's, the example's and a later setup's whose
     /// box is known. Otherwise it is the original block, which is not drawn.
@@ -1096,6 +1113,27 @@ impl canvas::Program<Event> for Viewport<'_> {
                 ..Text::default()
             });
         }
+        // The work zero: a small X/Y/Z cross where the program's X0 Y0 Z0 is.
+        if let Some(zero) = self.zero() {
+            let scale = self.mesh.display_scale();
+            let at = |d: [f32; 3]| p.p(std::array::from_fn(|k| (zero[k] + d[k]) * scale));
+            let o = at([0.; 3]);
+            for (d, c) in [
+                ([8., 0., 0.], Color::from_rgb8(205, 81, 85)),
+                ([0., 8., 0.], Color::from_rgb8(76, 154, 105)),
+                ([0., 0., 8.], Color::from_rgb8(67, 125, 196)),
+            ] {
+                line(&mut frame, &[o, at(d)], c, 2.);
+            }
+            frame.fill(&canvas::Path::circle(o, 3.5), Color::from_rgb8(30, 30, 30));
+            frame.fill_text(Text {
+                content: "X0 Y0 Z0".into(),
+                position: Point::new(o.x + 8., o.y + 4.),
+                color: Color::from_rgb8(30, 30, 30),
+                size: 11.into(),
+                ..Text::default()
+            });
+        }
         let origin = Point::new(45., bounds.height - 45.);
         let o = p.p([0., 0., 0.]);
         for (v, c, label) in [
@@ -1707,6 +1745,12 @@ mod tests {
                 .scene_boxes()
                 .contains(&left.scaled(scale))
         );
+        // The work zero marker is the program's, on the known box; on the
+        // original block it would not be, so none is drawn.
+        let zero = crate::post::datum(setup, left, &mesh).unwrap();
+        assert_eq!(view(true, Some(left)).zero(), Some(zero));
+        assert_eq!(view(false, Some(left)).zero(), Some(zero));
+        assert_eq!(view(true, None).zero(), None);
         // The first setup draws its own stock whether or not a box is passed
         // for it, since its source is "fresh".
         let first = Viewport {
