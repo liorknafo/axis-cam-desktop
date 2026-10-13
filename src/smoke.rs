@@ -3004,6 +3004,43 @@ flood = { pin = 8 }
         let _ = a.view();
     }
 
+    /// NC review hands a UC100 setup on to MACHINE, picked in the Run panel
+    /// once Connect opens the machine (LIO-142).
+    #[test]
+    fn nc_review_runs_a_uc100_setup_on_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let refused = crate::post::PostSettings::from_machine(&a.doc.setups[0].machine);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e[0].starts_with("G-code export is LinuxCNC only")
+                    && e[0].contains("from the MACHINE workspace")),
+            "{refused:?}"
+        );
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::Page(Page::Post));
+        a.post = Some(std::sync::Arc::new(crate::post::JobPost {
+            errors: vec![],
+            setups: vec![crate::post::SetupPost {
+                setup: 0,
+                name: a.doc.setups[0].name().into(),
+                result: Err(refused.unwrap_err()),
+            }],
+        }));
+        let _ = a.view();
+        let _ = a.update(Message::RunOnMachine(0));
+        assert_eq!((a.page, a.cam_page), (Page::Control, Page::Post));
+        assert!(
+            a.control.is_none(),
+            "Run on the machine never connects by itself"
+        );
+        let _ = a.update(Message::Connect);
+        assert_eq!(run_of(&a).setup, 0);
+        assert_eq!(a.doc.active, a.doc.setups[0].id);
+        let _ = a.view();
+    }
+
     #[test]
     fn first_launch_and_empty_project_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

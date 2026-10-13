@@ -156,6 +156,10 @@ pub enum Message {
     HoldKey,
     /// An action of the Run panel on the Control page.
     Run(run::Action),
+    /// NC review's Run on the machine for a UC100 setup: the MACHINE
+    /// workspace with this setup picked in the Run panel, at once when its
+    /// machine is connected, otherwise once Connect opens it.
+    RunOnMachine(usize),
     /// A setup's tool runs, checked for a UC100 run (the check's epoch).
     RunChecked(u64, std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>),
     EditTool(String),
@@ -595,6 +599,9 @@ pub struct App {
     pub profile_draft: Option<(String, Result<setup::Draft, String>)>,
     /// The UC100 machine chosen on the Control page (machine id).
     pub control_machine: Option<String>,
+    /// The setup (id) Run on the machine picked while disconnected: Connect
+    /// picks it in the Run panel.
+    run_on_connect: Option<String>,
     /// The jog key down on the Control page (axis, negative).
     pub jog_key: Option<(usize, bool)>,
     /// Counts the checks of setups to run, so a late answer is ignored.
@@ -865,6 +872,7 @@ impl App {
             machine_setup: false,
             profile_draft: None,
             control_machine: None,
+            run_on_connect: None,
             jog_key: None,
             run_epoch: 0,
             smoke_pending: false,
@@ -2648,6 +2656,12 @@ impl App {
                     Ok(c) => {
                         self.status = format!("Connecting to {}…", m.name());
                         self.control = Some(c);
+                        if let Some(si) = self.run_on_connect.take().and_then(|id| {
+                            (self.doc.setups.iter())
+                                .position(|s| s.id == id && s.machine.id == m.id)
+                        }) {
+                            return self.update(Message::Run(run::Action::Setup(si)));
+                        }
                     }
                     Err(e) => self.status = format!("Cannot connect to {}: {e}", m.name()),
                 }
@@ -2728,6 +2742,25 @@ impl App {
                     self.last_edit = Instant::now();
                 }
                 return self.check_run();
+            }
+            Message::RunOnMachine(si) => {
+                let Some(s) = self.doc.setups.get(si) else {
+                    return Task::none();
+                };
+                let (setup, machine) = (s.id.clone(), s.machine.id.clone());
+                let page = self.update(Message::Page(Page::Control));
+                return match &self.control {
+                    None => {
+                        self.control_machine = Some(machine);
+                        self.run_on_connect = Some(setup);
+                        page
+                    }
+                    Some(c) if c.machine_id == machine => {
+                        Task::batch([page, self.update(Message::Run(run::Action::Setup(si)))])
+                    }
+                    // Connected to another machine: its Run panel lists its own setups.
+                    Some(_) => page,
+                };
             }
             Message::Run(run::Action::Check) => {
                 self.run_epoch += 1;

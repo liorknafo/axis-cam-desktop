@@ -447,6 +447,14 @@ of the file.
 The **Run** panel on the Control page runs a setup directly on the machine,
 with no G-code file in between.
 
+From MANUFACTURE, the last step under the Work page's 3D view reads
+**04 Review & run** when the active setup's machine is a UC100 one (**04 NC
+review** otherwise). Its NC program page says "G-code export is LinuxCNC
+only" for each such setup and offers **Run on the machine**: it opens
+MACHINE with the setup's machine chosen and picks the setup in the Run
+panel, at once when that machine is connected, or when you press
+**Connect** (it never connects by itself).
+
 1. Pick one of the setups that use the connected machine. AXIS CAM simulates
    the job up to it and checks it as export would (stock, work zero, rapids,
    holder, jaws and clamps), makes it the active setup and shows it in the
@@ -495,7 +503,7 @@ wizard.
 
 ## LinuxCNC G-code export
 
-Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
+Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis; a UC100 setup is refused with **Run on the machine** beside it, see **Running a setup**), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
 
 - Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (Stock top center, Stock top front-left or Model origin).
 - The header names the work zero, the stock, the fixture, the modelled vise or clamps when the setup has them (a `Workholding:` comment) and, when the setup has notes, the notes (a `Setup notes:` comment). LinuxCNC runs a comment that begins with `MSG,`, `LOGOPEN,`, `PROBEOPEN,` and the like as a command, so every comment that carries your text or the planner's (the job title, setup and operation names, notes, the fixture, tool and machine names) begins with a fixed word and a colon, such as `Job:`, `Operation 2:` or `Before starting:`. Such a comment is split over lines of at most 200 characters and never cut off; each later line begins with the same word and `, continued:`, such as `Setup notes, continued:` or `Before starting, continued:`.

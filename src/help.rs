@@ -217,7 +217,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Return to the part viewport, setup browser and operation editor. Your current edits remain in the workspace."
         }
         Page(crate::Page::Post) => {
-            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; parallels, bolts, the table, the machine body and other fixtures are not checked. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export."
+            "Check each setup and export LinuxCNC G-code or a setup sheet. Checks cover generation, machine limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, the jaws or clamps as boxes with a clearance gap over every program move, links, approaches and retracts included; parallels, bolts, the table, the machine body and other fixtures are not checked. Speeds and feeds outside the project material's cutting data are listed as warnings and never block export. A UC100 machine takes no G-code file: Run on the machine runs its setup from MACHINE."
+        }
+        RunOnMachine(_) => {
+            "Open the MACHINE workspace with this setup picked in the Run panel, once you Connect if the machine is not connected yet. The UC100 runs the setup directly, one tool run at a time, after the same checks as export; no G-code file is written."
         }
         Page(crate::Page::Wizard) | NewMachine => {
             "Create a reusable machine profile in five steps: identity, travel, kinematics, controller and review."

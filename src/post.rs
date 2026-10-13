@@ -24,12 +24,16 @@ pub struct PostSettings {
 impl PostSettings {
     pub fn from_machine(m: &Machine) -> Result<Self, Vec<String>> {
         let mut e = vec![];
-        if get(&m.p, "controller") != "LinuxCNC" {
-            e.push(format!(
-                "{} uses the {} controller. Only the LinuxCNC postprocessor is implemented.",
-                m.name(),
-                get(&m.p, "controller")
-            ));
+        match get(&m.p, "controller") {
+            "LinuxCNC" => {}
+            "UC100" => e.push(format!(
+                "G-code export is LinuxCNC only. {} uses the UC100: run this setup on it from the MACHINE workspace.",
+                m.name()
+            )),
+            other => e.push(format!(
+                "{} uses the {other} controller. Only the LinuxCNC postprocessor is implemented.",
+                m.name()
+            )),
         }
         if m.axes() != 3 || get(&m.p, "mode") != "3-axis" {
             e.push(format!(

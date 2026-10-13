@@ -1148,6 +1148,9 @@ fn workspace(app: &App) -> Element<'_, Message> {
         playback = playback.push(empty);
     }
     let simulation = container(playback).padding([12, 16]).style(panel_style);
+    // A UC100 machine takes no G-code file: its setups run from MACHINE.
+    let uc100 =
+        (app.doc.active_setup()).is_some_and(|s| get(&s.machine.p, "controller") == "UC100");
     let workflow = container(
         row![
             btn("01  Setup", Message::SetupEditor, app.selected.is_none()),
@@ -1157,7 +1160,15 @@ fn workspace(app: &App) -> Element<'_, Message> {
                 app.selected.is_some()
             ),
             btn("03  Preview", Message::Generate, false),
-            btn("04  NC review", Message::Page(Page::Post), false)
+            btn(
+                if uc100 {
+                    "04  Review & run"
+                } else {
+                    "04  NC review"
+                },
+                Message::Page(Page::Post),
+                false
+            )
         ]
         .spacing(2),
     )
@@ -5174,6 +5185,14 @@ fn post(app: &App) -> Element<'_, Message> {
                         summary = summary
                             .push(bold(format!("!  {}", s.name), 13))
                             .push(warnings(problems.clone()));
+                        if (app.doc.setups.get(s.setup))
+                            .is_some_and(|x| get(&x.machine.p, "controller") == "UC100")
+                        {
+                            summary = summary.push(
+                                primary("Run on the machine", Message::RunOnMachine(s.setup))
+                                    .width(Fill),
+                            );
+                        }
                     }
                 }
             }

@@ -180,6 +180,17 @@ Other checks:
   - A profile already beside the workspace is not overwritten.
 - Adding the machine to a workspace with no machine happens only outside tests and smoke runs, so no test covers that step. Seen on Windows: the release build started on the real workspace, which had no machine, and added the Jingyan CNC4030 and `jy5800.toml`.
 
+## NC review leads a UC100 setup to MACHINE (LIO-142)
+
+- `nc_review_runs_a_uc100_setup_on_the_machine`:
+  - The export check refuses a UC100 machine with "G-code export is LinuxCNC only. … run this setup on it from the MACHINE workspace."
+  - The NC program page renders with that setup refused and its **Run on the machine** button.
+  - Run on the machine from the NC program page, with another setup active and the machine disconnected, opens the Control page (MANUFACTURE goes back to the NC program page) and does not connect.
+  - Connect then picks that setup in the Run panel and makes it the active setup.
+- The step strip's "04 Review & run" label for a UC100 setup and the connected path (Run on the machine picks the setup at once, as clicking it in the Run panel does) are not covered by a test.
+- Not inspected in the real window: the window is shared with other work on this PC.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 6 failed: the two STEP tests, as before, and four simulated-UC100 smoke tests that timed out under the load of parallel builds (`the_control_page_renders_in_every_state`, `a_jog_into_a_soft_limit_ends_at_the_limit`, `e_stop_stops_a_probe`, `keep_the_last_position_declares_where_the_machine_was_left`); each passes alone.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.
