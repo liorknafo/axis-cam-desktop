@@ -816,6 +816,9 @@ fn browser(app: &App) -> Element<'_, Message> {
             }
         }
     }
+    if let Some(block) = uncut_block(app) {
+        tree = tree.push(block);
+    }
     tree = tree
         .push(space().height(6))
         .push(btn("+ Add setup", Message::AddSetup, false).width(Fill));
@@ -832,6 +835,66 @@ fn browser(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .style(panel_style)
         .into()
+}
+/// What the whole job leaves uncut as worked out for the job as it is now
+/// (`LeftStock::uncut`): None while it is worked out, and without a setup or
+/// an imported part.
+fn job_uncut(app: &App) -> Option<&Result<std::sync::Arc<crate::uncut::Uncut>, String>> {
+    let key = app.left_key()?;
+    (app.left_stock.key == key)
+        .then_some(app.left_stock.uncut.as_ref())
+        .flatten()
+}
+/// One line on what the whole job leaves uncut, under the 3D views: None
+/// without a setup or an imported part.
+pub(crate) fn uncut_line(app: &App) -> Option<String> {
+    app.left_key()?;
+    Some(match job_uncut(app) {
+        None => "Completeness not checked yet.".into(),
+        Some(Err(why)) => format!("Completeness not checked: {why}"),
+        Some(Ok(found)) if found.regions.is_empty() => {
+            "Every face of the part is cut by the job.".into()
+        }
+        Some(Ok(found)) => format!(
+            "Magenta faces are still under stock after the whole job: {:.0}% of the part's surface.",
+            found.share * 100.
+        ),
+    })
+}
+/// The browser's list of the regions of the part the whole job leaves under
+/// stock, or why that is not checked.
+fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
+    let mut block = column![muted("STILL UNCUT").size(10)].spacing(4);
+    match job_uncut(app) {
+        Some(Ok(found)) if !found.regions.is_empty() => {
+            block = block.push(
+                text(format!(
+                    "{} region{}, {:.0}% of the part's surface, magenta in the 3D view:",
+                    found.regions.len(),
+                    if found.regions.len() == 1 { "" } else { "s" },
+                    found.share * 100.
+                ))
+                .size(11)
+                .color(Color::from_rgb8(166, 46, 124)),
+            );
+            for region in found.regions.iter().take(5) {
+                block = block.push(muted(format!("• {}", region.line())).size(10));
+            }
+            if found.regions.len() > 5 {
+                block =
+                    block.push(muted(format!("• and {} more", found.regions.len() - 5)).size(10));
+            }
+        }
+        _ => block = block.push(muted(uncut_line(app)?).size(11)),
+    }
+    Some(help::wrap(
+        container(block).padding([4, 10]),
+        Help::text(
+            "Still uncut",
+            "The faces of the part that the stock left after every setup still covers: what the job has not machined yet. Each face is sampled 0.5 mm outside itself against the simulated cuts, so a thinner finishing allowance counts as cut. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm. Until every enabled operation generates, completeness is not checked.",
+        ),
+        widget::tooltip::Position::Right,
+    ))
 }
 /// The picture of setup `si`'s stock in its jaws or clamps, for the browser.
 /// As it starts (`end` false): what the earlier setups left it
@@ -942,6 +1005,10 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         holding: holding_boxes(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
+        uncut: job_uncut(app)
+            .and_then(|found| found.as_ref().ok())
+            .map(|found| found.faces.as_slice())
+            .unwrap_or(&[]),
     })
     .width(Fill)
     .height(Fill)
@@ -1036,6 +1103,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
         column![
             toggles,
             muted(detail).size(10),
+            uncut_line(app).map(|line| muted(line).size(10)),
             muted(if app.picking {
                 "Click a highlighted feature to select it · drag to orbit"
             } else {
@@ -3078,7 +3146,8 @@ fn control(app: &App) -> Element<'_, Message> {
                     "Job",
                     column![
                         container(view).height(360),
-                        muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts.")
+                        muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts."),
+                        uncut_line(app).map(muted)
                     ]
                 )
             ]
@@ -4789,6 +4858,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         })
         .width(Fill)
         .height(380)

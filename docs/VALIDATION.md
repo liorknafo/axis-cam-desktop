@@ -240,6 +240,46 @@ Other checks:
 - Not inspected in the real window: the screen is shared with other work. The review's cases (Face opening the Tool library, the Geometry and Heights tabs, the Run panel's setup button) all go through `help::wrap`.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 818 passed, 4 failed: the two STEP tests, as before, and two simulated-UC100 smoke tests that timed out under the load of parallel builds (`probe_z_waits_for_a_probe_input_a_plate_and_a_free_input`, `the_control_page_renders_in_every_state`); each passes alone.
 
+## What the job leaves uncut (LIO-146)
+
+The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 2 mm on each side. Each face is sampled 0.5 mm outside itself against the exact cuts of the stock the last setup leaves.
+
+- `faces_left_under_stock_are_found_until_a_later_setup_cuts_them`:
+  - **Setup 1 faces the top.** No face of the top is under stock, but every face of the bottom and of the −X side is.
+    - The largest region is reached from −X, +X, −Y, +Y and the bottom. The through holes join it there.
+    - The next region is the pocket: "5868 mm² reached from the top: X 16–88, Y 20–60, Z 28–40".
+    - Between 30% and 100% of the surface is under stock (85.5% here).
+  - **Setup 2, flipped, faces the underside.**
+    - The bottom is no longer under stock, and less of the surface is (72.1%).
+    - The sides still are.
+    - The four through holes are regions of their own, each reached from the bottom and the top.
+- `completeness_is_not_checked_without_a_cut_or_after_a_failure`:
+  - A job without an operation says "No operation has cut the stock yet."
+  - A job whose operation has lost its tool names that operation.
+- `the_job_says_what_it_leaves_under_stock_once_it_is_simulated` (smoke), on the same two setups. The line under the 3D view:
+  - says "Completeness not checked yet." until the stock run;
+  - then says "Magenta faces are still under stock after the whole job: …", with more than one region;
+  - says "Completeness not checked: Flipped / Facing could not be generated." once setup 2's operation loses its tool.
+
+  The Work page renders each time. The example part says nothing.
+- `the_viewport_draws_the_same_pixels_after_the_split`: the pinned pixels do not change with no face marked. With every face marked uncut and the stock hidden, over 10,000 pixels are magenta.
+- Not a test, seen in a debug test build with a temporary print:
+  - **Fixture job, one setup** (Facing, Pocket, Contour, Drilling, Parallel, Waterline): 14 regions are left. These include:
+    - the bottom;
+    - the slot on −Y ("1231 mm² reached from −Y: X 48–72, Y 0–14, Z 8–32") and the one on +X;
+    - the four side holes;
+    - the top edge's chamfers;
+    - the walls of the Ø6.6 holes, which the Ø4 drill does not reach;
+    - two 2–3 mm² pocket-floor corners the Ø10 cutter does not reach.
+  - Slivers under 2 mm² are left out.
+  - The check took 0.65 s for its 10,676 faces and 18,726 cuts, and 0.22 s for the facing job's 200 cuts. It runs in the background stock run.
+- The real window was not opened: the screen is shared with other threads. The tint and the lines were checked through the tests above.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 814 passed, 11 failed. The failures:
+  - the two STEP tests, as before;
+  - nine simulated-UC100 smoke tests that timed out under the load of parallel builds.
+
+  Eight of the nine pass alone. `the_control_page_renders_in_every_state` timed out waiting for jogging even alone while the PC stayed loaded. Its app has no part or setup, so the new check never runs in it. `cargo fmt --check` flags only lines of LIO-149's.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

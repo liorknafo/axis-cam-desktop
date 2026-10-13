@@ -139,6 +139,10 @@ pub struct Viewport<'a> {
     /// The machine's tool while a tool run of this setup cuts: its tip in
     /// plan coordinates (mm), radius and stickout. Drawn over the scene.
     pub live: Option<([f32; 3], f32, f32)>,
+    /// Per face of the part (`Mesh::faces`): whether the whole job still
+    /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
+    /// `UNCUT`. Empty when that is not known.
+    pub uncut: &'a [bool],
 }
 pub(crate) struct Projector {
     camera: Camera,
@@ -406,11 +410,14 @@ impl Viewport<'_> {
         let mut plain = vec![false; cells as usize];
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
-        for face in if self.simulation.is_some() && self.show_stock {
+        for (fi, face) in if self.simulation.is_some() && self.show_stock {
             vec![]
         } else {
             self.transformed()
-        } {
+        }
+        .into_iter()
+        .enumerate()
+        {
             let normal = normal(&face.points);
             let light = (0.42 + normal[2].abs() * 0.27 + normal[0].abs() * 0.12 + face.tone * 0.13)
                 .clamp(0.2, 0.94);
@@ -431,6 +438,9 @@ impl Viewport<'_> {
                 [242, 190, 93, 255]
             } else if selected {
                 SELECTED
+            } else if self.uncut.get(fi) == Some(&true) {
+                let shade = |c: u8| (c as f32 * (light + 0.1).min(1.)) as u8;
+                [shade(UNCUT[0]), shade(UNCUT[1]), shade(UNCUT[2]), 255]
             } else {
                 [
                     (light * 0.80 * 255.) as u8,
@@ -1281,6 +1291,8 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
 }
 /// The tint of an operation's surfaces and of marked ones.
 const SELECTED: [u8; 4] = [92, 168, 223, 255];
+/// The colour of the part's faces the whole job leaves under stock.
+const UNCUT: [u8; 3] = [214, 72, 166];
 /// How a translucent box is painted: the tint of its top and bottom, of its
 /// X sides and of its Y sides, its edges (seen, and behind something), and
 /// how opaque it is over empty space and over the part.
@@ -1606,6 +1618,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1617,6 +1630,24 @@ mod tests {
         let (w, h, rgba) = view.pixels(&p, bounds, None);
         assert_eq!((w, h), (600, 450));
         assert_eq!(digest(&rgba), 11316679358304618149);
+        // Faces the job leaves under stock are magenta.
+        let magenta = |rgba: &[u8]| {
+            rgba.chunks(4)
+                .filter(|px| px[0] > px[1].saturating_add(60) && px[2] > px[1].saturating_add(40))
+                .count()
+        };
+        let bare = Viewport {
+            show_stock: false,
+            ..view
+        };
+        assert_eq!(magenta(&bare.pixels(&p, bounds, None).2), 0);
+        let all = vec![true; mesh.faces.len()];
+        let uncut = Viewport {
+            uncut: &all,
+            ..bare
+        };
+        let (_, _, rgba) = uncut.pixels(&p, bounds, None);
+        assert!(magenta(&rgba) > 10_000, "{}", magenta(&rgba));
     }
     #[test]
     fn a_later_setups_known_box_is_drawn_as_its_stock_and_otherwise_none_is() {
@@ -1641,6 +1672,7 @@ mod tests {
             holding: vec![],
             leftover,
             live: None,
+            uncut: &[],
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1707,6 +1739,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
         let tint = [92, 168, 223, 255];
@@ -1837,6 +1870,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
         let reference = v.projector(b);
@@ -1917,6 +1951,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let p = v.projector(b);
@@ -1972,6 +2007,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
         let bounds = clamp.bounds;
@@ -2014,6 +2050,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
         let p = v.projector(b);
@@ -2057,6 +2094,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let p = v.projector(b);
@@ -2091,6 +2129,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            uncut: &[],
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);

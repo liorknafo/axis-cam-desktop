@@ -36,6 +36,7 @@ mod storage;
 mod surface;
 mod three_mf;
 mod ui;
+mod uncut;
 mod viewport;
 mod volume;
 use iced::{Element, Size, Subscription, Task, Theme};
@@ -316,6 +317,10 @@ pub struct LeftStock {
         std::sync::Arc<volume::Volume>,
         std::sync::Arc<stock_surface::SurfaceMesh>,
     )>,
+    /// The faces of the part the stock the last setup leaves still covers
+    /// (`uncut::uncut`), or why that is not checked: no operation has cut
+    /// yet, or one could not be generated. None until worked out.
+    pub uncut: Option<Result<std::sync::Arc<uncut::Uncut>, String>>,
 }
 /// What the holding checks found for each setup of a job, worked out with
 /// `LeftStock` (`holding_checks`) for the job and its workholding whose
@@ -402,7 +407,8 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
 /// the first setup, and for a setup after an operation or setup that failed.
 /// A setup without an enabled operation has its box too. The whole job is
 /// simulated, for the stock each setup leaves too, and each stock is meshed
-/// for the browser's pictures. For the job whose fingerprint is `key`.
+/// for the browser's pictures. What the last stock still covers of the part
+/// is worked out too. For the job whose fingerprint is `key`.
 fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
     use std::{
         cell::{Cell, RefCell},
@@ -416,14 +422,17 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
     // what it starts from, then what each of its operations leaves.
     let after = RefCell::new(vec![None; doc.setups.len()]);
     let failed = Cell::new(false);
+    // The first operation that could not be generated.
+    let mut broken = None;
     simulation::sequence_walk(
         doc,
         mesh,
         None,
-        |si, _, result| {
+        |si, oi, result| {
             if result.is_err() {
                 failed.set(true);
                 after.borrow_mut()[si] = None;
+                broken.get_or_insert((si, oi));
             }
         },
         |si, _, stock| {
@@ -442,6 +451,15 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         },
     );
     let after = after.into_inner();
+    let uncut = Some(match (broken, last.into_inner()) {
+        (Some((si, oi)), _) => Err(format!(
+            "{} / {} could not be generated.",
+            doc.setups[si].name(),
+            doc.setups[si].operations[oi].name()
+        )),
+        (None, None) => Err("No operation has cut the stock yet.".into()),
+        (None, Some(stock)) => Ok(Arc::new(uncut::uncut(&stock, &doc.setups[0], mesh))),
+    });
     // A setup starts from the very stock the one before it leaves: each is
     // meshed once. ponytail: in the run the holding checks wait for; a run
     // of its own if that delay ever shows.
@@ -467,6 +485,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         before,
         after,
         surfaces,
+        uncut,
     }
 }
 /// The holding checks of each later setup of `doc` whose box `left` knows,

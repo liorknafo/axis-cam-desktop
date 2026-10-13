@@ -5191,6 +5191,36 @@ flood = { pin = 8 }
         assert_eq!(end(0, &sample), None);
     }
     #[test]
+    fn the_job_says_what_it_leaves_under_stock_once_it_is_simulated() {
+        let dir = tempfile::tempdir().unwrap();
+        // The top faced on setup 1 and the underside on setup 2: the 2 mm of
+        // stock on the sides and the top's pocket and holes are left.
+        let mut a = leftover_app(&dir);
+        let line = |a: &App| crate::ui::uncut_line(a).unwrap();
+        assert_eq!(line(&a), "Completeness not checked yet.");
+        let _ = a.refresh_left_stock();
+        assert!(
+            line(&a).starts_with("Magenta faces are still under stock after the whole job: "),
+            "{}",
+            line(&a)
+        );
+        let found = a.left_stock.uncut.clone().unwrap().unwrap();
+        assert!(found.regions.len() > 1 && found.faces.iter().any(|f| *f));
+        let _ = a.view();
+        // An operation that cannot be generated: not checked, and why.
+        a.doc.setups[1].operations[0].tool = "gone".into();
+        let _ = a.refresh_left_stock();
+        assert_eq!(
+            line(&a),
+            "Completeness not checked: Flipped / Facing could not be generated."
+        );
+        let _ = a.view();
+        // The example is not simulated: nothing is said.
+        let mut sample = app();
+        sample.doc = Document::sample();
+        assert_eq!(crate::ui::uncut_line(&sample), None);
+    }
+    #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = leftover_app(&dir);
@@ -5400,6 +5430,7 @@ flood = { pin = 8 }
             before: vec![],
             after: vec![],
             surfaces: vec![],
+            uncut: None,
         };
         let checks = crate::HoldingChecks {
             key: held,
