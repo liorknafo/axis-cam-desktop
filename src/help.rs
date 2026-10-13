@@ -1,7 +1,12 @@
 //! Contextual help shared by every command and form field.
 use crate::{Message, Target, model::Strategy};
 use iced::{
-    Border, Color, Element, Font, Length, Point, Rectangle, Renderer, Theme, mouse,
+    Border, Color, Element, Event, Font, Length, Point, Rectangle, Renderer, Size, Theme, Vector,
+    advanced::{
+        Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
+        widget::{Operation, Tree, tree},
+    },
+    mouse,
     widget::{self, canvas, column, container, mouse_area, text, tooltip},
 };
 use std::time::{Duration, Instant};
@@ -121,11 +126,12 @@ pub fn wrap<'a>(
     position: tooltip::Position,
 ) -> Element<'a, Message> {
     let animated = h.diagram.is_some();
-    let tip = tooltip(content, card(h), position)
-        .gap(9)
-        .padding(0)
-        .delay(Duration::from_millis(600))
-        .snap_within_viewport(true);
+    let tip = Dismissable(Some(
+        tooltip(content, card(h), position)
+            .gap(9)
+            .padding(0)
+            .snap_within_viewport(true),
+    ));
     if animated {
         mouse_area(tip)
             .on_enter(Message::HelpHover(true))
@@ -133,6 +139,158 @@ pub fn wrap<'a>(
             .into()
     } else {
         tip.into()
+    }
+}
+const HELP_DELAY: Duration = Duration::from_millis(600);
+/// Hover help that a click puts away (LIO-148). Pressing the control shuts its
+/// help, and it stays shut until the pointer leaves the control and comes back,
+/// so it never hides the page or result the click opened. Help on a control
+/// that appears under a resting pointer waits for it to come back the same way.
+struct Dismissable<'a>(Option<widget::Tooltip<'a, Message>>);
+/// Whether the pointer has been off the control since it appeared or was last
+/// pressed, so its help may open.
+struct Armed(bool);
+impl<'a> Dismissable<'a> {
+    fn tip(&self) -> &widget::Tooltip<'a, Message> {
+        self.0.as_ref().expect("put back after each update")
+    }
+    fn tip_mut(&mut self) -> &mut widget::Tooltip<'a, Message> {
+        self.0.as_mut().expect("put back after each update")
+    }
+}
+impl Widget<Message, Theme, Renderer> for Dismissable<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Armed>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(Armed(false))
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(self.tip() as &dyn Widget<_, _, _>)]
+    }
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&[self.tip() as &dyn Widget<_, _, _>]);
+    }
+    fn size(&self) -> Size<Length> {
+        self.tip().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.tip().size_hint()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.tip_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.tip().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        )
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.tip_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation)
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let Armed(armed) = tree.state.downcast_mut::<Armed>();
+        if !cursor.is_over(layout.bounds()) {
+            *armed = true;
+        } else if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
+            *armed = false;
+            tree.children[0].state = self.tip().state();
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
+        // ponytail: a day's delay keeps shut help from opening while the
+        // pointer stays, without redrawing to check.
+        let delay = if *armed {
+            HELP_DELAY
+        } else {
+            Duration::from_secs(86_400)
+        };
+        let mut tip = self
+            .0
+            .take()
+            .expect("put back after each update")
+            .delay(delay);
+        tip.update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        self.0 = Some(tip);
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.tip()
+            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.tip_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+impl<'a> From<Dismissable<'a>> for Element<'a, Message> {
+    fn from(d: Dismissable<'a>) -> Self {
+        Element::new(d)
     }
 }
 pub fn field<'a>(
@@ -2126,6 +2284,96 @@ mod tests {
             command(&Message::Page(crate::Page::Ai), "x".into())
                 .body
                 .contains("Sign in with ChatGPT")
+        );
+    }
+    #[test]
+    fn a_click_shuts_hover_help_until_the_pointer_comes_back() {
+        use futures_util::FutureExt;
+        use iced::{Pixels, window};
+        let renderer =
+            <Renderer as renderer::Headless>::new(Font::DEFAULT, Pixels(16.), Some("tiny-skia"))
+                .now_or_never()
+                .flatten()
+                .expect("tiny-skia renderer");
+        // The Face command's illustrated help, as the ribbon wraps it.
+        let mut face = wrap(
+            widget::button("Face").on_press(Message::Noop),
+            command(&Message::AddOp(Strategy::Face), "Face".into()),
+            tooltip::Position::Bottom,
+        );
+        let mut tree = Tree::new(&face);
+        let window = Size::new(800., 600.);
+        let node = face.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, window),
+        );
+        let viewport = Rectangle::with_size(window);
+        // Sends an event with the pointer at `at`: the messages, and whether the help shows.
+        let mut send = |event: Event, at: Point| {
+            let mut messages = vec![];
+            face.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let shown = face
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .is_some();
+            (messages, shown)
+        };
+        let moved = |at| Event::Mouse(mouse::Event::CursorMoved { position: at });
+        // Moves the pointer to `at` and leaves it there past the help's delay.
+        let rest = |send: &mut dyn FnMut(Event, Point) -> (Vec<Message>, bool), at| {
+            send(moved(at), at);
+            std::thread::sleep(HELP_DELAY + Duration::from_millis(100));
+            send(
+                Event::Window(window::Event::RedrawRequested(Instant::now())),
+                at,
+            )
+            .1
+        };
+        let (inside, outside) = (Point::new(5., 5.), Point::new(700., 500.));
+        assert!(
+            !rest(&mut send, inside),
+            "a control that appears under the resting pointer shows no help"
+        );
+        send(moved(outside), outside);
+        assert!(
+            rest(&mut send, inside),
+            "hovering the control shows its help"
+        );
+        let left = mouse::Button::Left;
+        assert!(
+            !send(Event::Mouse(mouse::Event::ButtonPressed(left)), inside).1,
+            "a click shuts it"
+        );
+        let (clicked, shown) = send(Event::Mouse(mouse::Event::ButtonReleased(left)), inside);
+        assert!(
+            matches!(clicked[..], [Message::Noop]),
+            "the click still clicks"
+        );
+        assert!(!shown);
+        assert!(
+            !rest(&mut send, Point::new(8., 6.)),
+            "it stays shut while the pointer stays"
+        );
+        send(moved(outside), outside);
+        assert!(
+            rest(&mut send, inside),
+            "it opens again once the pointer comes back"
         );
     }
 }

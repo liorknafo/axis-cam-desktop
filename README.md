@@ -254,6 +254,8 @@ Limits: 50 MB source file, 100 MB expanded 3MF XML, 200,000 displayed triangles,
 
 Hold the pointer over a button, field label/input, dropdown or toggle for about **0.6 seconds**. Command cards explain the action; field cards explain meaning, units and practical consequences. Relevant cards show a five-second looping native canvas illustration: facing, pocket clearing, drilling, finishing, rotary/indexed motion, tool tilt, clearance planes, pass spacing, layer depth or cutter dimensions. No GIF download or network connection is needed. Illustrations explain concepts; they are not computed toolpaths and do not depend on the current parameter value. Animation updates run at approximately 30 fps while an animated help target is hovered.
 
+A click puts the help away (LIO-148). Pressing a button, tab, field or other control shuts its card, and the card stays shut until the pointer leaves that control and comes back, so it never covers the page or result the click opened. A control that a click brings up under the resting pointer shows no help until the pointer moves off it and back.
+
 ## Materials
 
 The **Materials** page (in the toolbar, beside Tools) is the material library, built like the tool library: a list (name, group, surface speed range), an editor, **+ New material**, **Save material** and **Delete material**. Every field has hover help that explains surface speed (Vc) and chip load per tooth (fz).

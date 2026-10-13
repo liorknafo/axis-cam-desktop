@@ -229,6 +229,17 @@ Other checks:
 - The renderer's smoke run opens the Stock step for screens 22–25 and 92 and the Holding step for screen 88, where it scrolled the inspector before. It drives a real window, so it was not run here.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 818 passed, 3 failed: the two STEP tests, as before, and `the_control_page_renders_in_every_state`, which timed out waiting for jogging under the full suite's load and passes alone.
 
+## Hover help gets out of the way of a click (LIO-148)
+
+- `help::tests::a_click_shuts_hover_help_until_the_pointer_comes_back` drives the Face command's illustrated help, built by the shared `help::wrap` that every hover card goes through, with mouse events in a headless tiny-skia renderer and the real 0.6 s delay:
+  - A control that appears under a resting pointer shows no help.
+  - Once the pointer has been off it, hovering opens the help.
+  - Pressing the control shuts the help, and the release still sends the button's message.
+  - The help stays shut while the pointer rests or moves on the control.
+  - Moving off and back opens it again.
+- Not inspected in the real window: the screen is shared with other work. The review's cases (Face opening the Tool library, the Geometry and Heights tabs, the Run panel's setup button) all go through `help::wrap`.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 818 passed, 4 failed: the two STEP tests, as before, and two simulated-UC100 smoke tests that timed out under the load of parallel builds (`probe_z_waits_for_a_probe_input_a_plate_and_a_free_input`, `the_control_page_renders_in_every_state`); each passes alone.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.
