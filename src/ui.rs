@@ -372,7 +372,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .push(space().width(Fill))
         .push(
             text(if app.dirty {
-                "Saving workspaceâ€¦"
+                "Saving workspace…"
             } else {
                 "Workspace saved locally"
             })
@@ -5446,4 +5446,37 @@ fn operation_audit(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .height(Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    // Written as escapes so this file does not contain the text it hunts for.
+    const MOJIBAKE: [&str; 3] = ["\u{e2}\u{20ac}", "\u{c3}", "\u{c2}"];
+
+    fn scan(path: &Path, hits: &mut Vec<String>) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                scan(&entry.unwrap().path(), hits);
+            }
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("rs" | "md")) {
+            let text = std::fs::read_to_string(path).unwrap();
+            for (number, line) in text.lines().enumerate() {
+                if MOJIBAKE.iter().any(|bad| line.contains(bad)) {
+                    hits.push(format!("{}:{}", path.display(), number + 1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sources_and_docs_have_no_mojibake() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut hits = Vec::new();
+        for path in ["src", "docs", "README.md"] {
+            scan(&root.join(path), &mut hits);
+        }
+        assert!(hits.is_empty(), "mojibake found:\n{}", hits.join("\n"));
+    }
 }
