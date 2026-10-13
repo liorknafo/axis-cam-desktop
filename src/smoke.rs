@@ -2667,6 +2667,31 @@ flood = { pin = 8 }
     }
 
     #[test]
+    fn tab_and_shift_tab_move_between_fields_even_from_inside_one() {
+        use iced::keyboard::{Event, Key, Location, Modifiers, key};
+        let press = |named, modifiers| {
+            iced::Event::Keyboard(Event::KeyPressed {
+                key: Key::Named(named),
+                modified_key: Key::Named(named),
+                physical_key: key::Physical::Code(key::Code::Tab),
+                location: Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            })
+        };
+        let window = iced::window::Id::unique();
+        for status in [iced::event::Status::Ignored, iced::event::Status::Captured] {
+            let tab = crate::on_event(press(key::Named::Tab, Modifiers::empty()), status, window);
+            assert!(matches!(tab, Some(Message::TabKey(false))), "{status:?}: {tab:?}");
+            let back = crate::on_event(press(key::Named::Tab, Modifiers::SHIFT), status, window);
+            assert!(matches!(back, Some(Message::TabKey(true))), "{status:?}: {back:?}");
+        }
+        let enter = crate::on_event(press(key::Named::Enter, Modifiers::empty()), iced::event::Status::Ignored, window);
+        assert!(enter.is_none(), "{enter:?}");
+    }
+
+    #[test]
     fn work_zero_and_the_coordinate_systems() {
         use crate::control::Action;
         use uc100::controller::State;

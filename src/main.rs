@@ -156,6 +156,8 @@ pub enum Message {
     JogKeyUp,
     /// Space went down and no widget took it: Hold, or Resume.
     HoldKey,
+    /// Tab went down: the next text field, or the previous one with Shift.
+    TabKey(bool),
     /// An action of the Run panel on the Control page.
     Run(run::Action),
     /// NC review's Run on the machine for a UC100 setup: the MACHINE
@@ -2834,6 +2836,17 @@ impl App {
                     }
                 }
             }
+            // Fields in layout order, such as the stock offsets. Only from a
+            // field: a Tab elsewhere must not give one the jog keys.
+            Message::TabKey(back) => {
+                return iced::advanced::widget::operate(control::typing()).then(move |typing| {
+                    match (typing, back) {
+                        (false, _) => Task::none(),
+                        (true, false) => iced::widget::operation::focus_next(),
+                        (true, true) => iced::widget::operation::focus_previous(),
+                    }
+                });
+            }
             Message::JogKeyUp => {
                 if self.jog_key.take().is_some() {
                     if let Some(c) = &mut self.control {
@@ -4116,61 +4129,76 @@ impl App {
                 },
             )
             .map(|_| Message::Tick),
-            iced::event::listen_with(|event, status, window| match event {
-                iced::Event::Window(iced::window::Event::CloseRequested) => {
-                    Some(Message::Close(window))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }) if modifiers.command() && c.to_lowercase() == "s" => Some(Message::SaveProject),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }) if modifiers.command() && c.to_lowercase() == "o" => Some(Message::OpenProject),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
-                // E-stop from any page, even while typing; ignored when not connected.
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }) => Some(Message::MachineEStop),
-                // A focused text field takes Space as a character.
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
-                    repeat: false,
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::HoldKey),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(key),
-                    repeat,
-                    ..
-                }) if status == iced::event::Status::Ignored => {
-                    jog_key(key).map(|(axis, negative)| Message::JogKey(axis, negative, repeat))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
-                    key: iced::keyboard::Key::Named(key),
-                    ..
-                }) => jog_key(key).map(|_| Message::JogKeyUp),
-                // A held jog stops on any left-button release, wherever it
-                // happens, and when the window loses the focus.
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                ))
-                | iced::Event::Window(iced::window::Event::Unfocused) => {
-                    Some(Message::Machine(control::Action::JogRelease))
-                }
-                _ => None,
-            }),
+            iced::event::listen_with(on_event),
         ])
     }
     fn view(&self) -> Element<'_, Message> {
         ui::view(self)
+    }
+}
+/// The message a window event sends, if any: shortcuts, the E-stop, jog
+/// and hold keys, Tab between fields, and closing the window.
+fn on_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::CloseRequested) => {
+            Some(Message::Close(window))
+        }
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) if modifiers.command() && c.to_lowercase() == "s" => Some(Message::SaveProject),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) if modifiers.command() && c.to_lowercase() == "o" => Some(Message::OpenProject),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
+        // E-stop from any page, even while typing; ignored when not connected.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            ..
+        }) => Some(Message::MachineEStop),
+        // Tab and Shift+Tab move between text fields, even from inside one.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+            modifiers,
+            ..
+        }) => Some(Message::TabKey(modifiers.shift())),
+        // A focused text field takes Space as a character.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+            repeat: false,
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::HoldKey),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(key),
+            repeat,
+            ..
+        }) if status == iced::event::Status::Ignored => {
+            jog_key(key).map(|(axis, negative)| Message::JogKey(axis, negative, repeat))
+        }
+        iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+            key: iced::keyboard::Key::Named(key),
+            ..
+        }) => jog_key(key).map(|_| Message::JogKeyUp),
+        // A held jog stops on any left-button release, wherever it
+        // happens, and when the window loses the focus.
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        ))
+        | iced::Event::Window(iced::window::Event::Unfocused) => {
+            Some(Message::Machine(control::Action::JogRelease))
+        }
+        _ => None,
     }
 }
 /// The axis and direction a jog key moves: the arrows jog X and Y (up is
