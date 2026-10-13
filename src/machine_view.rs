@@ -30,6 +30,10 @@ pub struct MachineView {
     /// The tool-tip travel box: the profile's soft limits when X, Y and Z
     /// all have them, otherwise the assumed travel.
     pub envelope: [[f32; 3]; 2],
+    /// The simulator's block, which stands for the stock (min and max).
+    pub block: Option<[[f32; 3]; 2]>,
+    /// The active work zero (machine mm), marked once the position is set.
+    pub zero: [f32; 3],
 }
 
 impl MachineView {
@@ -419,7 +423,11 @@ impl canvas::Program<Message> for MachineView {
             (bounds.height - size.height * scale) / 2. - min(1) * scale,
         );
         let screen = |p: [f32; 2]| Point::new(origin.x + p[0] * scale, origin.y + p[1] * scale);
-        for (pts, color) in painted(&faces(self.pos, self.known), &view) {
+        let mut f = faces(self.pos, self.known);
+        if let Some([lo, hi]) = self.block {
+            boxed(&mut f, lo, hi, Color::from_rgb8(214, 184, 132), 2, "stock");
+        }
+        for (pts, color) in painted(&f, &view) {
             let path = canvas::Path::new(|b| {
                 b.move_to(screen(pts[0]));
                 for &p in &pts[1..] {
@@ -478,6 +486,20 @@ impl canvas::Program<Message> for MachineView {
                     .with_color(envelope)
                     .with_width(1.2),
             );
+        }
+        let green = Color::from_rgb8(39, 130, 93);
+        if self.known {
+            frame.stroke(
+                &canvas::Path::circle(screen(view.flat(self.zero)), 7.),
+                canvas::Stroke::default().with_color(green).with_width(2.),
+            );
+            frame.fill_text(canvas::Text {
+                content: "Red dot: the tool tip · green ring: the work zero".into(),
+                position: Point::new(10., 24.),
+                color: green,
+                size: 12.into(),
+                ..Default::default()
+            });
         }
         frame.fill(
             &canvas::Path::circle(screen(view.flat(self.pos)), 4.),

@@ -352,12 +352,13 @@ never get it. Step 1 is for any other machine.
 simulated UC100: no hardware is opened and nothing moves. It keeps its own
 saved offsets and position, separate from the real machine's. When the
 profile has soft limits on X, Y and Z, the simulator puts a block in the
-middle of the table for trying the probe, its top halfway down Z: up to
+middle of the table that stands for the stock, its top halfway down Z: up to
 100 × 100 mm, then the X/Y size of the stock of the setup picked in the Run
-panel once it is checked (the Work zero panel gives its place). The probe
-input reads active while the tool tip is inside it; it needs a probe input in
-the profile. The simulated probe is a point, so with a tip diameter set, Probe
-corner finds the corner a tip radius inside the block's.
+panel once it is checked. The Work zero panel gives its place and the machine
+model draws it. With a probe input in the profile, the probe input reads
+active while the tool tip is inside it. The simulated probe is a point, so
+with a tip diameter set, Probe corner finds the corner a tip radius inside
+the block's.
 
 Once the machine is Idle, the Control page has everything needed before a job:
 
@@ -421,8 +422,9 @@ Once the machine is Idle, the Control page has everything needed before a job:
 - **MDI.** One G-code line, sent with Enter or **Send**.
 - **The machine.** A model of the CNC4030 (gantry, carriage, spindle, T-slot
   table) moves with the live position, with the tool-tip travel box from the
-  soft limits; drag to turn it. It is amber until the machine position is
-  set. Its dimensions are **assumed** from a similar machine's spec sheet,
+  soft limits, the simulator's block, and a green ring at the active work
+  zero once the machine position is set; drag to turn it. It is amber until
+  the machine position is set. Its dimensions are **assumed** from a similar machine's spec sheet,
   as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
   the machine and correct both (`src/machine_view.rs`, the driver profile).
 
@@ -481,6 +483,19 @@ panel, at once when that machine is connected, or when you press
    the tool run inside the soft limits at this work zero, a spindle speed,
    direction and coolant the profile can give, and the setup checked since
    the last edit.
+
+   Until the first tool run starts, **Work zero on the stock** below Cycle
+   Start walks through it. It names the setup's work zero and work
+   system and says whether X, Y and Z have a machine position and whether
+   that work system is active. Then: jog the tool tip over the centre (or the
+   front-left corner) of the stock top, lower it until it pinches a sheet of
+   paper, and press **Zero all**, which is there too. With a probe input it
+   names Probe centre, Probe corner or Probe Z instead. Simulated, it gives
+   the block and this setup's work zero on it in machine coordinates.
+   **Move there** rapids the tool tip up to the top of Z, over that point
+   and down onto it, so Zero all puts the work zero on the block. A tool run
+   that would leave the soft limits says "Put the work zero on the stock:
+   see Work zero on the stock below".
 3. **Cycle Start** turns the tool run into the driver's actions at the
    current work zero (plan point − work zero + work offset, feeds in mm/s)
    and sends them as one job; the driver checks the soft limits again before

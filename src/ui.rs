@@ -3209,6 +3209,8 @@ fn control(app: &App) -> Element<'_, Message> {
         ],
         known: (0..3).all(|a| !c.axis(a) || s.referenced[a]),
         envelope: crate::machine_view::MachineView::envelope(&c.config),
+        block: c.block.map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
+        zero: std::array::from_fn(|k| s.work_offset[k] as f32),
     };
     let position = machine_panel(
         "Position",
@@ -3385,12 +3387,19 @@ fn control(app: &App) -> Element<'_, Message> {
     if let Some(note) = probe_note(c) {
         probe = probe.push(note);
     }
-    if c.config.inputs.probe.is_some()
-        && let Some((lo, hi)) = c.block
-    {
+    if let Some((lo, hi)) = c.block {
         probe = probe.push(muted(format!(
-            "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, trips the probe.",
-            lo[0], hi[0], lo[1], hi[1], hi[2]
+            "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, stands for the stock{}.",
+            lo[0],
+            hi[0],
+            lo[1],
+            hi[1],
+            hi[2],
+            if c.config.inputs.probe.is_some() {
+                " and trips the probe"
+            } else {
+                ""
+            }
         )));
     }
     let work_panel = machine_panel(
@@ -3739,6 +3748,27 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     } else if !problems.is_empty() && !crate::run::busy(state) {
         body = body.push(caution("Before Cycle Start", problems));
     }
+    if let Some(steps) = work_zero_steps(app, c) {
+        use crate::control::Action;
+        let mut buttons = row![].spacing(8);
+        if c.sim_zero().is_some() {
+            let ready = c.idle() && c.unset_limited_axes().is_empty();
+            buttons = buttons.push(act(
+                "Move there",
+                ready.then_some(Message::Machine(Action::ToSimZero)),
+                false,
+            ));
+        }
+        buttons = buttons.push(act(
+            "Zero all",
+            c.manual().then_some(Message::Machine(Action::WorkZero(None))),
+            false,
+        ));
+        body = body
+            .push(bold("Work zero on the stock", 13))
+            .push(note(steps.join("\n")))
+            .push(buttons);
+    }
     if let Some((ok, message)) = &run.outcome {
         body = body.push(text(message.clone()).size(12).color(if *ok {
             Color::from_rgb8(39, 130, 93)
@@ -3747,6 +3777,61 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         }));
     }
     machine_panel(&format!("Run · {}", run.name), body)
+}
+/// Work zero on the stock, in the Run panel until the setup's first tool run
+/// starts: how to put the work zero its tool runs are cut from on the stock,
+/// by hand or with the probe, and where the simulator's block is. The soft
+/// limits errors point here. None without a checked setup, or once a tool
+/// run has started.
+pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Option<Vec<String>> {
+    let run = c.run.as_ref().filter(|r| !r.started())?;
+    let p = run.checked()?.first()?;
+    let setup = app.doc.setups.get(run.setup)?;
+    let s = &c.snapshot;
+    let mut steps = vec![format!(
+        "Every tool run is cut from this setup's work zero, {} in {}. Before the first Cycle Start, put it on the stock:",
+        p.origin, p.offset
+    )];
+    steps.push(if (0..3).all(|a| s.referenced[a]) {
+        "1. X, Y and Z have a machine position.".into()
+    } else if c.home_switches() {
+        "1. Home under Position.".into()
+    } else {
+        "1. Set machine zero under Position: jog X to its left end, Y to its front end and Z to the top first.".into()
+    });
+    steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
+        format!("2. {} is the active work system.", p.offset)
+    } else {
+        format!("2. Select {} under Work zero.", p.offset)
+    });
+    let paper = |spot: &str| {
+        format!("3. Jog the tool tip over {spot}, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top.")
+    };
+    steps.push(match p.origin.as_str() {
+        "Stock top center" => paper("the centre of the stock top"),
+        "Stock top front-left" => paper("the front-left corner of the stock top"),
+        _ => match work_zero_line(setup, p.located).split_once(" — ") {
+            Some((_, at)) => format!("3. Jog the tool tip to the work zero: {at}."),
+            None => "3. Jog the tool tip to the work zero.".into(),
+        },
+    });
+    steps.push("4. Zero all: that point becomes X0 Y0 Z0. The checks above then say whether every tool run fits the soft limits from there.".into());
+    if c.config.inputs.probe.is_some() {
+        steps.push(match c.edges_setup() {
+            Ok((center, _)) => format!(
+                "With the probe clipped on, {} under Work zero does 3 and 4.",
+                if center { "Probe centre" } else { "Probe corner" }
+            ),
+            Err(_) => "With the touch plate on the stock top, Probe Z under Work zero sets Z0.".into(),
+        });
+    }
+    if let (Some((lo, hi)), Some(z)) = (c.block, c.sim_zero()) {
+        steps.push(format!(
+            "Simulated: the stock is a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}. This setup's work zero on it is at machine X {:.3} Y {:.3} Z {:.3}: Move there does 3.",
+            lo[0], hi[0], lo[1], hi[1], hi[2], z[0], z[1], z[2]
+        ));
+    }
+    Some(steps)
 }
 /// How the last probe ended, or that one is under way.
 fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {

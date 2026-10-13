@@ -695,6 +695,9 @@ fn machine_help(a: &crate::control::Action) -> &'static str {
         ProbeEdges => {
             "Probe corner (Stock top front-left) or Probe centre (Stock top center) for the setup picked in the Run panel. With the probe above the stock top where Z0 is touched off, it touches the top, then the sides at the spots the program header names, 1 mm to 10 mm below the top (less on low stock), allowing for the tip's radius, and sets the X, Y and Z work zero. A side whose first touch was off its spot is touched again on it. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set."
         }
+        ToSimZero => {
+            "Simulated only: rapid the tool tip up to the top of Z, over this setup's work zero on the simulator's block, and down onto it. Then Zero all makes it the work zero, as touching off on real stock would."
+        }
     }
 }
 

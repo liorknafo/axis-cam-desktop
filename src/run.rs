@@ -94,6 +94,11 @@ impl Run {
         }
     }
 
+    /// A tool run has started: X/Y work zero is kept from then on.
+    pub fn started(&self) -> bool {
+        self.xy.is_some()
+    }
+
     /// The checked programs, once the check passed.
     pub fn checked(&self) -> Option<&[Checked]> {
         self.programs.as_deref()?.as_deref().ok()
@@ -223,7 +228,7 @@ impl Run {
                 let (from, to) = (at(span.min[a]), at(span.max[a]));
                 if from < lo - 1e-6 || to > hi + 1e-6 {
                     e.push(format!(
-                        "At this work zero the tool would reach machine {} {from:.3} to {to:.3}, outside the soft limits {lo:.3} to {hi:.3}. Check the work zero.",
+                        "At this work zero the tool would reach machine {} {from:.3} to {to:.3}, outside the soft limits {lo:.3} to {hi:.3}. Put the work zero on the stock: see Work zero on the stock below.",
                         AXES[a]
                     ));
                 }

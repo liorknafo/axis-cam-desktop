@@ -288,6 +288,20 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
 - The review's case, clamp errors still listed after switching to a vise, goes through the same flag: a failed check is redone the same way. It is not tested on its own.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`), after rebasing on LIO-146: 819 passed, 6 failed: the two STEP tests, as before, and four simulated-UC100 smoke tests that timed out waiting for the simulator's machine zero, with the CPU at 100 % from the parallel builds (`a_tool_run_holds_resumes_and_stops`, `probe_z_sets_work_z_at_the_plate_and_lifts`, `probe_z_waits_for_a_probe_input_a_plate_and_a_free_input`, `the_3d_view_shows_the_machine_and_planning_waits_for_it`). Under that load each one passed alone at least once in three runs. That wait comes before any edit, and so before the check that is redone. Before the rebases, on a quieter PC: 816 passed, 2 failed (the STEP tests).
 
+## From the soft-limits errors to a work zero on the stock (LIO-140)
+
+- `the_soft_limits_errors_lead_to_a_work_zero_on_the_simulated_block`, through the simulated UC100 on FAST without a probe input, like the JY5800 profile, with the fixture's top setup (Stock top center, G54):
+  - Before machine zero, Work zero on the stock says to set it.
+  - After Set machine zero where the machine starts, as in the blind review, X, Y and Z each fall outside the soft limits. Each error ends "Put the work zero on the stock: see Work zero on the stock below".
+  - The guide names Stock top center in G54, says the axes have a machine position, says to jog over the centre of the stock top and press Zero all, and says nothing about a probe. It gives the block and the work zero on it: machine X 195 Y 140 Z −40, the top centre of the block sized to the stock.
+  - Move there brings the tool tip to that point. After Zero all, nothing stands before Cycle Start. Once the first tool run starts the guide is gone.
+  - The test presses Set machine zero again while an axis stays unset. About one run in three, the driver dropped the Y or Z declaration sent while it re-read the position after the one before (LIO-163). `probe_z_sets_work_z_at_the_plate_and_lifts` fails the same way. With the second press the test passed 8 runs in a row alone.
+- `the_control_page_renders_in_every_state` and the other Control page tests render the guide and the machine model with the block and the work-zero ring.
+- Not checked in the real window (it is shared with other work on this PC): the layout of the guide and the machine model's ring and block.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`), with about twelve parallel builds on the PC: 818 passed, 9 failed. Two are the STEP tests, as before. The other seven are simulated-UC100 smoke tests that timed out under the load, and six of them pass alone.
+- The seventh, `the_control_page_renders_in_every_state`, times out waiting for jogging when run alone too. origin/main without this change does the same (LIO-131).
+- In earlier runs, `calibration_measures_steps_per_mm_and_fills_the_profile` and `probe_corner_sets_the_work_zero_on_the_front_left_corner` each failed once alone, at their machine-zero wait (LIO-163).
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

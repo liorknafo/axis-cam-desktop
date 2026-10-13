@@ -493,6 +493,9 @@ pub enum Action {
     /// Probe corner or Probe centre: the X, Y and Z work zero of the setup
     /// picked in the Run panel, from its stock.
     ProbeEdges,
+    /// Simulated: rapid the tool tip onto the work zero of the setup picked
+    /// in the Run panel on the simulator's block (`Connection::sim_zero`).
+    ToSimZero,
 }
 
 /// Steps-per-mm calibration: one commanded move, then the travel measured
@@ -644,6 +647,36 @@ impl Connection {
             self.block = Some((min, max));
             self.send(Command::SimBlock(Some(Block { min, max })));
         }
+    }
+
+    /// Simulated: where the work zero of the setup to run is on the
+    /// simulator's block, which stands for its stock (machine mm). None until
+    /// the setup is checked.
+    pub fn sim_zero(&self) -> Option<[f64; 3]> {
+        let (lo, hi) = self.block.filter(|_| self.simulated)?;
+        let p = self.run.as_ref()?.checked()?.first()?;
+        let (s, d) = (p.stock, p.datum);
+        Some([
+            lo[0] + (d[0] - s.min[0]) as f64,
+            lo[1] + (d[1] - s.min[1]) as f64,
+            hi[2] + (d[2] - s.max[2]) as f64,
+        ])
+    }
+
+    /// Rapids the tool tip up to the top of Z, over the setup's work zero on
+    /// the simulator's block and down onto it, once X, Y and Z have a machine
+    /// position.
+    fn to_sim_zero(&mut self) -> Option<()> {
+        let to = self.sim_zero().filter(|_| self.idle() && self.unset_limited_axes().is_empty())?;
+        let now = self.snapshot.machine_pos;
+        let mut up = now;
+        up[2] = self.config.axes.get(2)?.soft_max?;
+        let mut over = up;
+        over[..2].copy_from_slice(&to[..2]);
+        let mut down = over;
+        down[2] = to[2];
+        self.send(job("To the work zero", moves_from(now, &[up, over, down])));
+        Some(())
     }
 
     /// The driver's program outcome and probe result counts now: the next
@@ -842,6 +875,9 @@ impl Connection {
             }
             Action::ProbeZ => self.start_probe(Touch::WorkZ),
             Action::ProbeEdges => self.start_edges(),
+            Action::ToSimZero => {
+                self.to_sim_zero();
+            }
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
                 self.forced.insert(pin, high);
                 self.send(Command::TestOutput {

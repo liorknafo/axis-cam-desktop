@@ -1795,6 +1795,84 @@ flood = { pin = 8 }
         assert!(has(&a, "Set machine zero again"), "{:?}", problems(&a));
     }
 
+    /// The blind review's dead end (LIO-140): machine zero where the machine
+    /// starts puts every tool run outside the soft limits. The errors point to
+    /// Work zero on the stock, which says where the simulator's block is;
+    /// Move there and Zero all put the work zero on it and Cycle Start can go.
+    #[test]
+    fn the_soft_limits_errors_lead_to_a_work_zero_on_the_simulated_block() {
+        use crate::control::Action;
+        use crate::ui::work_zero_steps;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        // No probe input, like the JY5800 profile.
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        check_run(&mut a, 0);
+        let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
+        assert!(steps(&a).contains("1. Set machine zero under Position"), "{}", steps(&a));
+        // ponytail: pressed again while an axis stays unset, since the driver
+        // can drop a declaration (LIO-163); drop the loop once that is fixed.
+        let set = |a: &App| conn(a).snapshot.referenced[..3].iter().all(|r| *r);
+        for _ in 0..5 {
+            let _ = a.update(Message::Machine(Action::MachineZero(None)));
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !set(&a) && std::time::Instant::now() < end {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if set(&a) {
+                break;
+            }
+        }
+        assert!(set(&a), "{:?}", conn(&a).snapshot.log);
+        let off: Vec<String> = (problems(&a).into_iter())
+            .filter(|p| p.contains("outside the soft limits"))
+            .collect();
+        assert!(
+            off.len() == 3 && off.iter().all(|p| p.contains("see Work zero on the stock below")),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.view();
+        let zero = conn(&a).sim_zero().unwrap();
+        assert!(
+            (0..3).all(|k| (zero[k] - [195., 140., -40.][k]).abs() < 1e-3),
+            "{zero:?}"
+        );
+        let text = steps(&a);
+        let on_block = format!(
+            "work zero on it is at machine X {:.3} Y {:.3} Z {:.3}: Move there",
+            zero[0], zero[1], zero[2]
+        );
+        for line in [
+            "work zero, Stock top center in G54",
+            "1. X, Y and Z have a machine position.",
+            "3. Jog the tool tip over the centre of the stock top",
+            "4. Zero all",
+            on_block.as_str(),
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert!(!text.contains("probe"), "{text}");
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        tick_until(&mut a, 10.0, "the move onto the block", |s| {
+            s.state == Some(State::Idle) && (0..3).all(|k| (s.machine_pos[k] - zero[k]).abs() < 0.06)
+        });
+        let _ = a.update(Message::Machine(Action::WorkZero(None)));
+        tick_until(&mut a, 2.0, "work zero", |s| {
+            s.work_pos[..3].iter().all(|v| v.abs() < 1e-6)
+        });
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.view();
+        // Once a tool run starts, the guide gives way.
+        let _ = a.update(Message::Run(crate::run::Action::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        assert!(work_zero_steps(&a, conn(&a)).is_none());
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+    }
+
     /// FAST with a probe input. Its simulated block (`control::sim_block`)
     /// is X 145…245, Y 90…190, its top at machine Z -40.
     fn probe_profile() -> String {
