@@ -4467,6 +4467,56 @@ flood = { pin = 8 }
             ["The clearance gap must be 0 or more."]
         );
     }
+    #[test]
+    fn the_setup_header_follows_the_modelled_holding_and_clamps_are_edited_by_row() {
+        use crate::holding::{clamp_rows, rows_text};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.update(Message::SetupStep("Holding"));
+        assert!(a.operation().is_none(), "the setup editor is shown");
+        let label = |a: &App| a.doc.holding_label(a.doc.setup());
+        // A new setup claims nothing holds it; a fixture note is said to be
+        // not modelled.
+        assert_eq!(label(&a), "No workholding modelled");
+        edit_setup(&mut a, &[("fixture", "Low profile clamps")]);
+        assert_eq!(label(&a), "Low profile clamps, not modelled");
+        let _ = a.view();
+        // A modelled vise or clamps say what holds the stock, in place of the
+        // note, in the header and on the setup sheet.
+        edit_setup(&mut a, &[("holding", "Vise")]);
+        assert_eq!(label(&a), "100 mm machine vise");
+        assert!(!a.doc.setup_sheet(None).contains("Low profile clamps"));
+        let _ = a.view();
+        edit_setup(&mut a, &[("holding", "Clamps")]);
+        assert_eq!(label(&a), "4 × Toe clamp 60 mm");
+        // A row per clamp: a side and an offset changed, a clamp removed.
+        let (typed, error) = a.clamps_field();
+        assert_eq!(error, None);
+        let mut rows = clamp_rows(&typed);
+        assert_eq!(rows.len(), 4);
+        rows[1] = ["-Y".into(), "12".into()];
+        rows.remove(3);
+        let _ = a.update(Message::SetClamps(rows_text(&rows)));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;-Y:12;-Y:0");
+        assert_eq!(label(&a), "3 × Toe clamp 60 mm");
+        // An offset being typed stays in its row, unsaved, with what is wrong;
+        // a separator typed into it never adds a clamp.
+        rows[0][1] = "-".into();
+        let _ = a.update(Message::SetClamps(rows_text(&rows)));
+        let (typed, error) = a.clamps_field();
+        assert_eq!(clamp_rows(&typed), rows);
+        assert_eq!(error.as_deref(), Some("A clamp offset must be a number."));
+        assert_eq!(get(&a.doc.setup().p, "clamps"), "-X:0;-Y:12;-Y:0");
+        let _ = a.view();
+        rows[0][1] = "5;+X:9".into();
+        assert_eq!(clamp_rows(&rows_text(&rows)).len(), 3);
+        // Back to None, the note is what the header says again.
+        edit_setup(&mut a, &[("holding", "None")]);
+        assert_eq!(label(&a), "Low profile clamps, not modelled");
+        let _ = a.view();
+    }
     /// The plans Suggest layout works from: those of setup `si` that generate.
     fn setup_plans(a: &App, si: usize) -> Vec<crate::simulation::Plan> {
         let mesh = a.imported_mesh.as_ref().unwrap();
@@ -5020,7 +5070,10 @@ flood = { pin = 8 }
         let id = a.doc.materials[0].id.clone();
         let _ = a.update(Message::PickMaterial(id));
         assert!(done(&a, "Stock"));
-        edit_setup(&mut a, &[("stock_type", "Fixed size box"), ("stock_x", "10")]);
+        edit_setup(
+            &mut a,
+            &[("stock_type", "Fixed size box"), ("stock_x", "10")],
+        );
         assert!(!done(&a, "Stock"));
         // An operation opened in between keeps the step for the way back.
         let _ = a.update(Message::SetupStep("Holding"));

@@ -153,6 +153,35 @@ pub fn clamps_text(clamps: &[(Side, f32)]) -> String {
         .collect::<Vec<_>>()
         .join(";")
 }
+/// The clamps of a clamp positions text as the editor shows them, one
+/// [side, offset] row each, whether or not they read: what was typed stays
+/// in its row.
+pub fn clamp_rows(text: &str) -> Vec<[String; 2]> {
+    text.split(';')
+        .filter(|s| !s.trim().is_empty())
+        .map(|part| {
+            let (side, offset) = part.split_once(':').unwrap_or((part, ""));
+            [side.trim().to_string(), offset.trim().to_string()]
+        })
+        .collect()
+}
+/// The clamp positions text of editor rows (`clamp_rows`). The separators
+/// typed into an offset are dropped, so an edit never adds or splits a clamp.
+pub fn rows_text(rows: &[[String; 2]]) -> String {
+    rows.iter()
+        .map(|[side, offset]| format!("{side}:{}", offset.replace([';', ':'], "")))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+/// A setup's fixture note: what it records as holding the stock while it
+/// models no vise or clamps. Never checked. None once a vise or clamps are
+/// modelled, which then say what holds the stock wherever the setup is
+/// described, and when the note is empty or None.
+pub fn fixture_note(setup: &Setup) -> Option<&str> {
+    let p = &setup.p;
+    Some(get(p, "fixture"))
+        .filter(|note| matches!(get(p, "holding"), "" | "None") && !matches!(*note, "" | "None"))
+}
 /// A number typed into a field: surrounding spaces are ignored.
 fn number(text: &str) -> Option<f32> {
     text.trim().parse::<f32>().ok().filter(|v| v.is_finite())

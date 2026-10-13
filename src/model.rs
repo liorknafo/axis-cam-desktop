@@ -807,7 +807,6 @@ impl Setup {
                 ("stock_z", "40"),
                 ("stock_source", "fresh"),
                 ("origin", "Stock top center"),
-                ("fixture", "Low profile clamps"),
                 ("clearance", "15"),
                 ("rx", "0"),
                 ("ry", "0"),
@@ -1248,6 +1247,23 @@ impl Document {
         (layout != Layout::None && refusal(&layout, entry).is_none())
             .then(|| sentence(&layout, entry))
     }
+    /// What holds a setup's stock, in a few words for its header: the
+    /// modelled vise or clamps ("4 × Toe clamp 60 mm"), else its fixture note
+    /// said to be not modelled, else that nothing is modelled.
+    pub fn holding_label(&self, setup: &Setup) -> String {
+        use crate::holding::{Layout, fixture_note, layout};
+        let name = |kind: &str| {
+            self.holder(get(&setup.p, "holder"))
+                .map_or(kind.to_string(), |h| h.name().to_string())
+        };
+        match layout(setup) {
+            Ok(Layout::None) => fixture_note(setup).map_or("No workholding modelled".into(), |n| {
+                format!("{n}, not modelled")
+            }),
+            Ok(Layout::Clamps { clamps, .. }) => format!("{} × {}", clamps.len(), name("clamp")),
+            _ => name(get(&setup.p, "holding")),
+        }
+    }
     /// After a setup's `holding` or `holder` changed: a vise or clamps setup
     /// points at a library entry of its kind (its own when it has one, else
     /// the first), a vise setup without a grip starts at the vise's grip, and
@@ -1486,14 +1502,16 @@ impl Document {
             .flatten()
             .collect();
             s += &format!(
-                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\nFixture: {}\n\n{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\n{}\n\n",
+                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\n{}\n\n",
                 setup.name(),
                 get(&setup.p, "offset"),
                 setup.machine.name(),
                 setup.machine.version,
                 crate::stock::sheet_description(setup, mesh),
                 get(&setup.p, "origin"),
-                get(&setup.p, "fixture"),
+                crate::holding::fixture_note(setup)
+                    .map(|note| format!("Fixture: {note}\n\n"))
+                    .unwrap_or_default(),
                 holding,
                 get(&setup.p, "rx"),
                 get(&setup.p, "ry"),
@@ -2247,18 +2265,18 @@ mod tests {
         assert_eq!(doc.holding_boxes(doc.setup(), narrow).unwrap().len(), 2);
     }
     #[test]
-    fn the_setup_sheet_describes_modelled_workholding_after_the_fixture() {
+    fn the_setup_sheet_describes_modelled_workholding_in_place_of_the_fixture_note() {
         let mut doc = doc_with_holding(&[]);
         let vise = starter(&doc, "Vise");
         let clamp = starter(&doc, "Clamp");
         assert!(!doc.setup_sheet(None).contains("Workholding"));
         assert_eq!(doc.holding_text(doc.setup()), None);
-        let fixture = get(&doc.setup().p, "fixture").to_string();
-        // What follows the fixture line, up to the rotation.
+        let origin = get(&doc.setup().p, "origin").to_string();
+        // What follows the origin line, up to the rotation.
         let after = |doc: &Document, paragraphs: &str| {
             let sheet = doc.setup_sheet(None);
             assert!(
-                sheet.contains(&format!("Fixture: {fixture}\n\n{paragraphs}Rotation:")),
+                sheet.contains(&format!("Origin: {origin}\n\n{paragraphs}Rotation:")),
                 "{sheet}"
             );
         };
@@ -2267,6 +2285,9 @@ mod tests {
                 doc.setup_mut().p.insert((*k).into(), (*v).into());
             }
         };
+        after(&doc, "");
+        set(&mut doc, &[("fixture", "Chuck")]);
+        after(&doc, "Fixture: Chuck\n\n");
         set(
             &mut doc,
             &[

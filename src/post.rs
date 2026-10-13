@@ -558,7 +558,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             get(&setup.p, "rz")
         ),
     );
-    w.wrapped("Fixture: ", get(&setup.p, "fixture"));
+    if let Some(note) = crate::holding::fixture_note(setup) {
+        w.wrapped("Fixture: ", note);
+    }
     if let Some(holding) = &h.holding {
         w.wrapped("Workholding: ", holding);
     }
@@ -1837,7 +1839,6 @@ mod tests {
 (Machine: Workshop Mill v1)
 (Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 2.5 mm below the top.)
 (Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
-(Fixture: Low profile clamps)
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
 (Operation 1: Face top - Facing - T1 - S8000)
 (Extents: X-15.000 to 15.000 Y-15.000 to -15.000 Z-1.000 to 15.000 mm)
@@ -3693,17 +3694,31 @@ M2
     fn the_header_and_the_setup_sheet_say_what_holds_the_stock() {
         let (mut doc, mesh) = pocket_job();
         let header = |doc: &Document| setup_texts(&post_job(doc, &mesh), 0).remove(0);
-        // Without workholding neither names any.
-        assert!(!header(&doc).contains("Workholding"));
-        assert!(!doc.setup_sheet(Some(&mesh)).contains("Workholding"));
+        // Without workholding neither names any, nor a fixture until the
+        // setup has a fixture note.
+        assert!(!header(&doc).contains("Workholding") && !header(&doc).contains("(Fixture:"));
+        let sheet = doc.setup_sheet(Some(&mesh));
+        assert!(!sheet.contains("Workholding") && !sheet.contains("Fixture:"));
+        doc.setups[0]
+            .p
+            .insert("fixture".into(), "Low profile clamps".into());
+        assert!(header(&doc).contains("deg.)\n(Fixture: Low profile clamps)\n(T1: "));
+        assert!(
+            doc.setup_sheet(Some(&mesh))
+                .contains("\n\nFixture: Low profile clamps\n\nRotation:")
+        );
+        // A modelled vise says what holds the stock in place of the note.
         hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
         let text = header(&doc);
         assert!(
-            text.contains("(Fixture: Low profile clamps)\n(Workholding: 100 mm machine vise on +-Y, grip 8 mm, offset 0 mm, gap 2 mm.)\n(T1: "),
+            text.contains("deg.)\n(Workholding: 100 mm machine vise on +-Y, grip 8 mm, offset 0 mm, gap 2 mm.)\n(T1: "),
             "{text}"
         );
+        let sheet = doc.setup_sheet(Some(&mesh));
         assert!(
-            doc.setup_sheet(Some(&mesh)).contains("Fixture: Low profile clamps\n\nWorkholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.\n\nRotation:")
+            sheet.contains("\n\nWorkholding: 100 mm machine vise on ±Y, grip 8 mm, offset 0 mm, gap 2 mm.\n\nRotation:")
+                && !sheet.contains("Fixture:"),
+            "{sheet}"
         );
         // Four clamps, and the setup's own notes after them under their own lead word. A library name
         // with active-comment words and brackets is written as text.
@@ -3721,7 +3736,7 @@ M2
             .insert("name".into(), "Toe (MSG,hello) clamp Ø60".into());
         let text = header(&doc);
         assert!(
-            text.contains("(Fixture: Low profile clamps)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Setup notes: Soft jaws)\n(T1: "),
+            text.contains("deg.)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Setup notes: Soft jaws)\n(T1: "),
             "{text}"
         );
         assert_comments_begin_with_app_words(&text);

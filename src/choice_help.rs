@@ -181,6 +181,9 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("post_air", "Not available") => {
             "This machine has no air blast output. Export is refused for operations set to Air."
         }
+        ("fixture", "None") => {
+            "Record no fixture. The setup's header says no workholding is modelled, and the setup sheet and the program header name none."
+        }
         ("fixture", "Low profile clamps") => {
             "Record clamps holding the part against a support. Plan access around clamp locations. This choice only describes the setup: to have clamps checked, model them under Modelled workholding."
         }

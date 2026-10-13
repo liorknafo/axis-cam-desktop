@@ -526,6 +526,10 @@ pub fn command(m: &Message, label: String) -> Help {
         SuggestLayout => {
             "Place this setup's vise jaws or clamps. A vise goes on the X or the Y sides, whichever its generated toolpaths leave clearer, at its grip or less. Clamps are chosen among the middle and quarter points of each side: four, or two on a small stock. The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again."
         }
+        SetClamps(_) if label == crate::ui::ADD_CLAMP => {
+            "Add a clamp at the middle of a side of the stock, the sides taken in turn. Change its side and offset in its row."
+        }
+        SetClamps(_) => "Take this clamp off the setup. The setup keeps at least one.",
         SetOpTool(_) => {
             "Use this saved cutter for the current operation. Check diameter, reach, feeds and speeds before generating a preview."
         }
@@ -853,7 +857,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "clamps") => (
-            "Where the clamps sit, written side:offset and separated by semicolons, for example -X:0; +X:20. The sides are -X, +X, -Y and +Y of the stock; the offset, in mm, moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides), and no more than half that side's length. Place 1 to 8 clamps. The text is saved only when every clamp reads correctly; what is wrong is shown under the field.",
+            "Where the clamps sit, a row each: the side of the stock, -X, +X, -Y or +Y, and the offset, in mm, that moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides), no more than half that side's length. Place 1 to 8 clamps with + Add clamp and Remove. The positions are saved only when every offset is a number; what is wrong is shown under the rows. The setup keeps them as side:offset separated by semicolons, for example -X:0;+X:20.",
             None,
         ),
         (_, "name") => (
@@ -1157,7 +1161,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (_, "fixture") => (
-            "Describes the workholding used in this setup: a vise, soft jaws, clamps, chuck or custom fixture. It is printed on the setup sheet and in the program header and is not checked; to have a vise's jaws or clamps checked, model them under Modelled workholding above.",
+            "A note of what holds the stock when nothing is modelled: a vise, soft jaws, clamps, chuck or custom fixture. It is shown in the setup's header as not modelled, printed on the setup sheet and in the program header, and is not checked. To have a vise's jaws or clamps checked, model them under Modelled workholding above: they then describe the setup everywhere and this note is set aside.",
             None,
         ),
         (_, "reposition") => (

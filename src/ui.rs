@@ -1025,7 +1025,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     s.map(|s| format!(
                         "{} / {} / {}",
                         get(&s.p, "offset"),
-                        get(&s.p, "fixture"),
+                        app.doc.holding_label(s),
                         get(&s.p, "origin")
                     ))
                     .unwrap_or_else(|| {
@@ -1955,18 +1955,26 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
         let mut r = Row::new().spacing(1);
         for &step in pair {
             let on = app.setup_step == step;
-            let mark = if setup_step_done(app, step) { "✓" } else { "○" };
+            let mark = if setup_step_done(app, step) {
+                "✓"
+            } else {
+                "○"
+            };
             let b = button(text(format!("{mark}  {step}")).size(12))
                 .on_press(Message::SetupStep(step))
                 .padding([7, 10])
                 .style(move |_, status| flat(on, status));
-            r = r.push(HelpButton::new(b, &Message::SetupStep(step), step).width(Length::FillPortion(1)));
+            r = r.push(
+                HelpButton::new(b, &Message::SetupStep(step), step).width(Length::FillPortion(1)),
+            );
         }
         steps = steps.push(r);
     }
     let c = column![
         bold("Setup", 20),
-        muted("One position of the part on the machine: its machine, stock, placement and holding."),
+        muted(
+            "One position of the part on the machine: its machine, stock, placement and holding."
+        ),
         field(p, "name", "Setup name", t),
         steps,
     ]
@@ -2162,19 +2170,6 @@ fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
         c = c.push(control);
     }
     c = c
-        .push(choice(
-            p,
-            "fixture",
-            "Fixture",
-            &[
-                "Low profile clamps",
-                "Vise",
-                "Soft jaws",
-                "Chuck",
-                "Custom fixture",
-            ],
-            t,
-        ))
         .push(field(p, "clearance", "Fixture clearance · mm", t))
         .push(choice(
             p,
@@ -2341,24 +2336,33 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         "Clamps" => {
             c.push(holder_picker(app, "Clamp"));
             let (typed, error) = app.clamps_field();
-            c.push(help::field(
-                column![
-                    muted("Clamp positions"),
-                    text_input("-X:0; +X:0", &typed)
-                        .on_input(Message::SetClamps)
-                        .padding([7, 9])
-                        .size(13)
-                ]
-                .spacing(5),
-                "clamps",
-                "Clamp positions",
-                t,
-            ));
+            c.push(clamp_editor(&typed));
             if let Some(error) = error {
                 c.push(text(error).size(12).color(WARN).into());
             }
         }
-        _ => {}
+        _ => {
+            // Only a description: a modelled vise or clamps replace it.
+            let note = match get(p, "fixture") {
+                "" => "None",
+                value => value,
+            };
+            c.push(choice_value(
+                p,
+                note,
+                "fixture",
+                "Fixture note · not checked",
+                &[
+                    "None",
+                    "Low profile clamps",
+                    "Vise",
+                    "Soft jaws",
+                    "Chuck",
+                    "Custom fixture",
+                ],
+                t,
+            ));
+        }
     }
     if holding != "None" {
         c.push(field(p, "holding_gap", "Clearance gap · mm", t));
@@ -2390,6 +2394,60 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         .into(),
     );
     c
+}
+/// What the button that adds a clamp says.
+pub(crate) const ADD_CLAMP: &str = "+ Add clamp";
+/// The active setup's clamp positions, a row per clamp of `typed` (what
+/// `App::clamps_field` shows): its side, its offset along that side and a
+/// Remove button while there is another clamp, then + Add clamp. Every edit
+/// sends the whole text (`Message::SetClamps`), which is saved once it reads.
+fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
+    use crate::holding::{MAX_CLAMPS, Side, clamp_rows, rows_text};
+    let rows = clamp_rows(typed);
+    let sides: Vec<String> = Side::ALL.iter().map(|s| s.label().to_string()).collect();
+    let mut c = column![muted("Clamp positions · side, offset along it in mm")].spacing(5);
+    for (i, [side, offset]) in rows.iter().enumerate() {
+        let edit = |cell: usize| {
+            let rows = rows.clone();
+            move |value: String| {
+                let mut rows = rows.clone();
+                rows[i][cell] = value;
+                Message::SetClamps(rows_text(&rows))
+            }
+        };
+        let clamp = row![
+            pick_list(sides.clone(), Some(side.clone()), edit(0))
+                .width(Length::FillPortion(1))
+                .padding([7, 9])
+                .text_size(13),
+            text_input("0", offset)
+                .on_input(edit(1))
+                .width(Length::FillPortion(1))
+                .padding([7, 9])
+                .size(13)
+        ]
+        .spacing(5);
+        let mut line = row![help::field(
+            clamp,
+            "clamps",
+            "Clamp positions",
+            Target::Setup
+        )]
+        .spacing(5)
+        .align_y(Alignment::Center);
+        if rows.len() > 1 {
+            let mut rest = rows.clone();
+            rest.remove(i);
+            line = line.push(btn("Remove", Message::SetClamps(rows_text(&rest)), false));
+        }
+        c = c.push(line);
+    }
+    if rows.len() < MAX_CLAMPS {
+        let mut more = rows.clone();
+        more.push([Side::ALL[rows.len() % 4].label().into(), "0".into()]);
+        c = c.push(btn(ADD_CLAMP, Message::SetClamps(rows_text(&more)), false).width(Fill));
+    }
+    c.into()
 }
 /// The picker of the library's vises or clamps (`kind`) for the active setup.
 fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
