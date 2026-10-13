@@ -72,6 +72,14 @@ impl Holder {
                 ));
             }
         }
+        // Optional: empty takes the typical force (`forces::VISE_FORCE`, `forces::CLAMP_FORCE`).
+        if !get(&self.p, "force").trim().is_empty()
+            && !num(&self.p, "force").is_some_and(|v| v > 0.)
+        {
+            e.push(
+                "The clamping force must be a positive number, or empty for a typical one.".into(),
+            );
+        }
         if self.kind() == "Clamp"
             && num(&self.p, "bite")
                 .zip(num(&self.p, "length"))
@@ -83,6 +91,8 @@ impl Holder {
     }
 }
 pub fn starters() -> Vec<Holder> {
+    let vise_force = crate::forces::VISE_FORCE.to_string();
+    let clamp_force = crate::forces::CLAMP_FORCE.to_string();
     let mut v = Holder::new("Vise", "100 mm machine vise");
     for (k, x) in [
         ("jaw_width", "100"),
@@ -90,6 +100,7 @@ pub fn starters() -> Vec<Holder> {
         ("jaw_thickness", "20"),
         ("max_opening", "120"),
         ("grip", "8"),
+        ("force", &vise_force),
     ] {
         v.p.insert(k.into(), x.into());
     }
@@ -99,6 +110,7 @@ pub fn starters() -> Vec<Holder> {
         ("width", "20"),
         ("height", "25"),
         ("bite", "12"),
+        ("force", &clamp_force),
     ] {
         c.p.insert(k.into(), x.into());
     }
@@ -1218,7 +1230,7 @@ pub fn operation_name(doc: &Document, setup: u16, operation: u16) -> String {
 }
 /// How far inside the stock box the holding checks look for material, mm:
 /// just inside the face a jaw, the table or a clamp touches.
-const INSIDE: f32 = 0.05;
+pub(crate) const INSIDE: f32 = 0.05;
 /// `n` values spread evenly over `lo..=hi`, the ends inset by 1 % of the span.
 fn spread(lo: f32, hi: f32, n: usize) -> Vec<f32> {
     let inset = (hi - lo) * 0.01;
@@ -1233,7 +1245,7 @@ fn spread(lo: f32, hi: f32, n: usize) -> Vec<f32> {
 /// The points of a rectangle on a face of the stock: `n` × `m` points
 /// spread over `first` and `second` (ranges on the axes `axes`), the third
 /// coordinate `at`. None when either range is empty.
-fn grid(
+pub(crate) fn grid(
     axes: [usize; 3],
     first: (f32, f32),
     second: (f32, f32),
@@ -1254,7 +1266,7 @@ fn grid(
     Some(points)
 }
 /// `a..b` clipped to `lo..hi`.
-fn clip((a, b): (f32, f32), lo: f32, hi: f32) -> (f32, f32) {
+pub(crate) fn clip((a, b): (f32, f32), lo: f32, hi: f32) -> (f32, f32) {
     (a.max(lo), b.min(hi))
 }
 /// The `points` without material: outside `stock` or removed by an earlier

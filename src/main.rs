@@ -5,6 +5,7 @@ mod choice_help;
 mod control;
 #[cfg(test)]
 mod fake_openai;
+mod forces;
 mod help;
 mod holding;
 mod look;
@@ -321,6 +322,9 @@ pub struct LeftStock {
         std::sync::Arc<volume::Volume>,
         std::sync::Arc<stock_surface::SurfaceMesh>,
     )>,
+    /// What each operation that generated cuts (`forces::bites`), by setup:
+    /// its index in the setup and its bites.
+    pub bites: Vec<Vec<(usize, Vec<forces::Bite>)>>,
     /// The faces of the part the stock the last setup leaves still covers
     /// (`uncut::uncut`), or why that is not checked: no operation has cut
     /// yet, or one could not be generated. None until worked out.
@@ -328,15 +332,15 @@ pub struct LeftStock {
 }
 /// What the holding checks found for each setup of a job, worked out with
 /// `LeftStock` (`holding_checks`) for the job and its workholding whose
-/// fingerprint is `key` (`App::holding_key`): one entry per setup, None for
-/// the first and wherever `LeftStock` knows no box. Only good for the job
-/// and the workholding it was worked out for.
+/// fingerprint is `key` (`App::holding_key`): one entry per setup, None
+/// wherever `LeftStock` knows no box (the first setup's is its own). Only
+/// good for the job and the workholding it was worked out for.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HoldingChecks {
     pub key: u64,
     pub setups: Vec<Option<SetupHolding>>,
 }
-/// The holding checks of a later setup.
+/// The holding checks of a setup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetupHolding {
     /// The box it starts from and the band its vise closes on
@@ -345,8 +349,12 @@ pub struct SetupHolding {
     /// What `holding::holdable` finds of its vise or clamps on what the
     /// earlier setups left, as the export does: empty when it holds, and
     /// when its workholding has a problem `Document::holding_issues_with`
-    /// says first.
+    /// says first. Then each operation's issue against the cutting forces
+    /// (`forces::issue`).
     pub problems: Vec<String>,
+    /// Each operation's margin against the cutting forces (`forces::line`),
+    /// once what it holds passes.
+    pub margins: Vec<String>,
 }
 /// Setup settings that decide how the setup is held and nothing the earlier
 /// setups' cuts leave behind: an edit of one keeps the stock worked out.
@@ -391,8 +399,9 @@ fn left_fingerprint(doc: &Document, mesh: &mesh::Mesh) -> Option<u64> {
     Some(hasher.finish())
 }
 /// A fingerprint of what the holding checks of `doc` depend on beyond the
-/// stock (`left`, its `left_fingerprint`): how each setup is held and the
-/// workholding library. None when it cannot be written.
+/// stock (`left`, its `left_fingerprint`): how each setup is held, the
+/// workholding library and the material the cutting forces are worked out
+/// for. None when it cannot be written.
 fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
@@ -403,6 +412,7 @@ fn holding_fingerprint(doc: &Document, left: u64) -> Option<u64> {
         serde_json::to_writer(&mut out, &held).ok()?;
     }
     serde_json::to_writer(&mut out, &doc.workholding).ok()?;
+    serde_json::to_writer(&mut out, &doc.selected_material()).ok()?;
     Some(hasher.finish())
 }
 /// The box each setup of `doc` starts from when the earlier ones are
@@ -428,12 +438,14 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
     let failed = Cell::new(false);
     // The first operation that could not be generated.
     let mut broken = None;
+    let mut bites = vec![vec![]; doc.setups.len()];
     simulation::sequence_walk(
         doc,
         mesh,
         None,
-        |si, oi, result| {
-            if result.is_err() {
+        |si, oi, result| match result {
+            Ok(sim) => bites[si].push((oi, forces::bites(&sim))),
+            Err(_) => {
                 failed.set(true);
                 after.borrow_mut()[si] = None;
                 broken.get_or_insert((si, oi));
@@ -489,15 +501,18 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         before,
         after,
         surfaces,
+        bites,
         uncut,
     }
 }
-/// The holding checks of each later setup of `doc` whose box `left` knows,
-/// as the export makes them (`post::held_walked`): the band its vise closes
-/// on, and, when `Document::holding_issues_with` finds nothing wrong with
-/// its workholding on that, what `holding::holdable` finds on the stock the
-/// earlier setups left and the part `mesh`. For the job and workholding
-/// whose fingerprint is `key`.
+/// The holding checks of each setup of `doc` whose box `left` knows (the
+/// first setup's being its own), as the export makes them
+/// (`post::held_walked`): the band its vise closes on, and, when
+/// `Document::holding_issues_with` finds nothing wrong with its workholding
+/// on that, what `holding::holdable` finds on the stock the earlier setups
+/// left and the part `mesh`, then, when that holds, each operation's margin
+/// against the cutting forces (`forces::margins`). For the job and
+/// workholding whose fingerprint is `key`.
 fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64) -> HoldingChecks {
     let names = |s, o| holding::operation_name(doc, s, o);
     let setups = doc
@@ -505,7 +520,10 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
         .iter()
         .enumerate()
         .map(|(si, setup)| {
-            let stock = left.boxes.get(si).copied().flatten().filter(|_| si > 0)?;
+            let stock = match si {
+                0 => doc.setup_stock(0, Some(mesh))?,
+                _ => left.boxes.get(si).copied().flatten()?,
+            };
             let before = left.before.get(si).cloned().flatten();
             let frame = volume::Frame::new(setup, mesh);
             let part = simulation::part_box(setup, mesh);
@@ -515,18 +533,29 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
                 .filter(|v| !v.cuts.is_empty())
                 .map(|v| holding::Bands::new(v, frame, part));
             let held = holding::held_by(doc, setup, stock, bands.as_ref());
-            let problems = match (layout, doc.holder(get(&setup.p, "holder"))) {
-                (Some(layout), Some(holder))
-                    if doc.holding_issues_with(si, Some(held)).is_empty() =>
-                {
-                    let removed = before
-                        .as_deref()
-                        .map(|v| rest::Removed::new(v, frame).with_part(part));
-                    holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
+            let (mut problems, mut margins) = (vec![], vec![]);
+            if let (Some(layout), Some(holder)) = (layout, doc.holder(get(&setup.p, "holder")))
+                && doc.holding_issues_with(si, Some(held)).is_empty()
+            {
+                let removed = before
+                    .as_deref()
+                    .map(|v| rest::Removed::new(v, frame).with_part(part));
+                problems = holding::holdable(si, &layout, holder, held, removed.as_ref(), &names);
+                let bites = left.bites.get(si).into_iter().flatten();
+                let bites = bites.map(|(oi, b)| (*oi, b.as_slice()));
+                if problems.is_empty() {
+                    for (oi, margin) in forces::margins(doc, si, bites, held, removed.as_ref()) {
+                        let name = setup.operations[oi].name();
+                        margins.push(forces::line(name, margin.as_ref()));
+                        problems.extend(margin.and_then(|m| forces::issue(name, &m)));
+                    }
                 }
-                _ => vec![],
-            };
-            Some(SetupHolding { held, problems })
+            }
+            Some(SetupHolding {
+                held,
+                problems,
+                margins,
+            })
         })
         .collect();
     HoldingChecks { key, setups }

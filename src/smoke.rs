@@ -5310,6 +5310,24 @@ flood = { pin = 8 }
             a.left_stock.before[1].as_ref().unwrap()
         ));
         assert!(a.current_checks().is_some());
+        // They hold the stock there, but 3 mm of grip does not hold it
+        // against setup 2's facing, 39 mm higher, with the vise's typical
+        // 5000 N (LIO-167). Tightened to 10 kN, it does.
+        let lines = crate::ui::holding_lines(&a);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Facing: the cut could tip the stock out of the vise: about 191 N, 39 mm above the top of the jaws' contact, which is 2.9 mm high"),
+            "{lines:?}"
+        );
+        assert_eq!(crate::ui::held(&a), Held::Mixed);
+        let vise = a
+            .doc
+            .workholding
+            .iter_mut()
+            .find(|h| h.kind() == "Vise")
+            .unwrap();
+        vise.p.insert("force".into(), "10000".into());
+        let _ = a.refresh_left_stock();
         assert_eq!(crate::ui::holding_lines(&a), Vec::<String>::new());
         assert_eq!(crate::ui::held(&a), Held::Every);
         // The jaws are drawn on those walls, the band 80.7 mm across them
@@ -5631,6 +5649,7 @@ flood = { pin = 8 }
             before: vec![],
             after: vec![],
             surfaces: vec![],
+            bites: vec![],
             uncut: None,
         };
         let checks = crate::HoldingChecks {
@@ -6221,7 +6240,7 @@ flood = { pin = 8 }
         assert_eq!(a.current_ready().unwrap().problems, refused);
         assert_eq!(marks(&a), [OpMark::Collides, OpMark::Collides]);
         let (heading, lines, ok) = run_check(&a).unwrap();
-        assert_eq!(heading, "Workholding in the way: Run will refuse Top");
+        assert_eq!(heading, "Workholding problem: Run will refuse Top");
         assert!(!ok);
         let hit = format!("{}: the tool hits the clamp on", a.doc.setups[0].operations[0].name());
         assert!(lines[0].starts_with(&hit), "{lines:?}");
@@ -6246,6 +6265,44 @@ flood = { pin = 8 }
         assert_eq!(heading, "Run will refuse Top");
         assert!(!ok);
         assert!(lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"), "{lines:?}");
+    }
+    #[test]
+    fn the_setup_editor_and_the_run_checks_say_whether_the_vise_holds_against_the_cut() {
+        use crate::ui::{OpMark, holding_lines, holding_margins, op_mark};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), LIMITED);
+        a.doc.adopt_holders();
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        let checked = |a: &mut App| {
+            let _ = a.refresh_left_stock();
+            let _ = a.refresh_ready();
+            let _ = a.view();
+        };
+        // The suggested vise holds: a margin for each operation, no issue.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        checked(&mut a);
+        assert!(holding_lines(&a).is_empty(), "{:?}", holding_lines(&a));
+        let margins = holding_margins(&a);
+        assert_eq!(margins.len(), 2, "{margins:?}");
+        assert!(margins[0].starts_with("Facing: holds ×"), "{margins:?}");
+        assert_eq!(
+            margins[1],
+            "Drilling: no cutting force sideways or up to hold against."
+        );
+        assert_eq!(op_mark(&a, a.current_ready(), 0), OpMark::Ready);
+        // Gripped 1 mm deep, the facing cut tips the stock out of the jaws.
+        let _ = a.update(Message::Edit(Target::Setup, "vise_grip", "1".into()));
+        checked(&mut a);
+        let lines = holding_lines(&a);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Facing: the cut could tip the stock out of the vise"),
+            "{lines:?}"
+        );
+        assert!(holding_margins(&a)[0].starts_with("Facing: only ×"));
+        assert_eq!(op_mark(&a, a.current_ready(), 0), OpMark::Collides);
+        assert_eq!(op_mark(&a, a.current_ready(), 1), OpMark::Generated);
     }
     #[test]
     fn the_3d_view_gets_the_boxes_only_when_the_stock_is_shown() {

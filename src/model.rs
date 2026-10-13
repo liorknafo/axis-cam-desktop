@@ -193,6 +193,7 @@ impl Machine {
             ("y", "400"),
             ("z", "300"),
             ("rpm", "12000"),
+            ("power", "800"),
             ("feed", "5000"),
             ("rotary_min", "-180"),
             ("rotary_max", "180"),
@@ -267,6 +268,10 @@ impl Machine {
         }
         for k in ["x", "y", "z", "rpm", "feed"] {
             positive(&self.p, k, &mut e)
+        }
+        // Optional: empty takes `forces::SPINDLE_POWER`.
+        if !get(&self.p, "power").trim().is_empty() {
+            positive(&self.p, "power", &mut e)
         }
         if !["3", "4", "5"].contains(&get(&self.p, "axes")) {
             e.push("Select 3, 4 or 5 axes.".into())

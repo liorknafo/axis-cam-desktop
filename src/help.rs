@@ -747,6 +747,10 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Maximum spindle speed allowed by this machine, in revolutions per minute. Operations above this limit are flagged.",
             None,
         ),
+        (Target::Machine, "power") => (
+            "The spindle's rated power, in watts. The check of whether a setup's vise or clamps hold the stock against each operation's cut takes no more force than this power drives at the spindle's top speed (the spindle keeps its torque below that speed). Empty: 800 W, a Jingyan CNC4030's spindle.",
+            None,
+        ),
         (Target::Machine, "feed") => (
             "Maximum feed rate in the machine profile's units per minute. Use the manufacturer's specification; operation feeds are in mm/min.",
             None,
@@ -828,12 +832,16 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Holder, "height") => ("Height of the clamp above the stock's top, in mm.", None),
+        (Target::Holder, "force") => (
+            "How hard the vise clamps the stock, or one clamp holds it down, in newtons. The check of each operation's cutting forces takes it as what the jaws' friction and the clamps' hold work with: measure or estimate yours, and raise it if yours is tightened harder. Empty: 5000 N for a vise, 2000 N for a clamp, typical when tightened by hand.",
+            None,
+        ),
         (Target::Holder, "bite") => (
             "How far the clamp reaches onto the stock from its edge, in mm. It must be shorter than the clamp's length.",
             None,
         ),
         (Target::Setup, "holding") => (
-            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description.",
+            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description.",
             None,
         ),
         (Target::Setup, "holder") => (
@@ -2095,6 +2103,7 @@ mod tests {
             "width",
             "height",
             "bite",
+            "force",
         ] {
             let body = field_help(key, "x", Target::Holder).body;
             assert_ne!(body, unknown, "{key}");

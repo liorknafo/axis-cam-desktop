@@ -1255,6 +1255,33 @@ fn unholdable(
         .map(|message| format!("{}: {message}", setup.name()))
         .collect()
 }
+/// What the cutting forces of setup `si`'s operations do against its vise or
+/// clamps holding `held` (`gripped`), given what earlier setups cut away
+/// (`forces::margins`): an issue for each operation held with a margin
+/// under `forces::SAFETY`, with its index in the setup.
+fn pushed(doc: &Document, si: usize, walk: &Walk, held: crate::holding::Gripped) -> Vec<Held> {
+    let first = walk.simulations[0];
+    let removed = first
+        .initial_volume
+        .as_ref()
+        .zip(first.frame)
+        .map(|(volume, frame)| crate::rest::Removed::new(volume, frame));
+    let bites = walk
+        .indexes
+        .iter()
+        .zip(&walk.simulations)
+        .map(|(oi, sim)| (*oi, sim.bites()));
+    crate::forces::margins(doc, si, bites, held, removed.as_ref())
+        .into_iter()
+        .filter_map(|(oi, margin)| {
+            let name = doc.setups[si].operations[oi].name();
+            Some(Held {
+                operation: Some(oi),
+                message: crate::forces::issue(name, &margin?)?,
+            })
+        })
+        .collect()
+}
 impl Walk<'_> {
     /// The plans of the operations of `group`, one of `groups`.
     fn plans(&self, group: &std::ops::Range<usize>) -> Vec<&Plan> {
@@ -1330,6 +1357,10 @@ pub(crate) fn held_walked(
             message,
         })
         .collect();
+    // Held where it is gripped, the stock must hold against the cut.
+    if found.is_empty() {
+        found = pushed(doc, si, &walk, held);
+    }
     // Nothing to hold against: no program need be walked.
     if boxes.is_empty() {
         return Some(found);
@@ -1426,6 +1457,13 @@ pub(crate) fn checked(
     let unholdable = unholdable(doc, mesh, si, &walk, held);
     if !unholdable.is_empty() {
         return Err(unholdable);
+    }
+    let pushed: Vec<String> = pushed(doc, si, &walk, held)
+        .into_iter()
+        .map(|h| h.message)
+        .collect();
+    if !pushed.is_empty() {
+        return Err(pushed);
     }
     let origin = get(&setup.p, "origin");
     if let (true, Some(volume), Some(frame)) = (
@@ -3273,10 +3311,15 @@ M2
         assert!(text.lines().all(|l| l.len() <= 202), "{text}");
     }
     /// The fixture job reduced to its Pocket (its path lies within X -39 to
-    /// 23 and Y -15 to 15 of the stock's centre), with the starter library.
+    /// 23 and Y -15 to 15 of the stock's centre), with the starter library,
+    /// its clamp tightened to hold the block alone (10 kN): the tests that
+    /// use one clamp are about where it sits, not how hard it holds.
     fn pocket_job() -> (Document, Mesh) {
         let (mut doc, mesh) = fixture::job();
         doc.adopt_holders();
+        for h in doc.workholding.iter_mut().filter(|h| h.kind() == "Clamp") {
+            h.p.insert("force".into(), "10000".into());
+        }
         doc.setups[0].operations.retain(|o| o.name() == "Pocket");
         (doc, mesh)
     }
@@ -3488,6 +3531,26 @@ M2
         assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
         // A setup export cannot walk has nothing to hold against.
         assert!(held(&doc, &mesh, 0, &[]).is_empty());
+    }
+    #[test]
+    fn the_pocket_holds_in_a_vise_gripping_8_mm_and_tips_the_stock_out_of_a_1_mm_grip() {
+        let (mut doc, mesh) = pocket_job();
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let posted = post_job(&doc, &mesh);
+        assert!(posted.ready(), "{:?}", errors(&posted));
+        // The same cut, the stock gripped 1 mm deep: refused, at the Pocket.
+        doc.setups[0].p.insert("vise_grip".into(), "1".into());
+        let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].operation, Some(0));
+        // No material: steel, and the spindle's 800 W at 12000 rpm limits
+        // the Ø10 cutter to 127 N, 191 N at its peak.
+        let said = &found[0].message;
+        assert_eq!(
+            said,
+            "Pocket: the cut could tip the stock out of the vise: about 191 N, 45 mm above the top of the jaws' contact, which is 1.0 mm high and 98 mm long (×0.5, under the ×2 wanted). Grip deeper, take a smaller stepdown or stepover or a lower feed, or choose another holder."
+        );
+        assert_eq!(errors(&post_job(&doc, &mesh)), [said.as_str()]);
     }
     /// `fixture::job`'s Facing, Pocket, Contour and Drilling in setup 1, held
     /// by nothing, then setup "Again" the same way up, drilling again, held

@@ -2387,6 +2387,14 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
             );
             c.push(caution(heading, lines));
         }
+        let margins = holding_margins(app);
+        if !margins.is_empty() {
+            let mut m = column![muted("Against the cutting forces").size(12)].spacing(3);
+            for line in margins {
+                m = m.push(muted(line).size(11));
+            }
+            c.push(m.into());
+        }
     }
     if let Some(note) = stock_note(app) {
         c.push(muted(note).into());
@@ -2575,7 +2583,8 @@ pub(crate) enum OpMark {
     /// before a run are still being worked out.
     Generated,
     /// Amber !: those checks refuse the setup's workholding for it, or for
-    /// the whole setup (its clearance plane): a jaw or clamp in the way.
+    /// the whole setup (its clearance plane): a jaw or clamp in the way, or
+    /// one that would not hold the stock against the operation's cut.
     Collides,
     /// Green ✓: those checks pass, so the setup will run.
     Ready,
@@ -2646,7 +2655,7 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
             true,
         )),
         OpMark::Collides => Some((
-            format!("Workholding in the way: {by} will refuse {name}"),
+            format!("Workholding problem: {by} will refuse {name}"),
             lines,
             false,
         )),
@@ -2716,6 +2725,20 @@ pub(crate) fn holding_lines_in(
         .and_then(|c| c.get(si)?.as_ref())
         .filter(|c| Some(c.held) == held)
         .map(|c| c.problems.clone())
+        .unwrap_or_default()
+}
+/// Each operation's margin against the cutting forces (`forces::line`), as
+/// the setup editor lists it under the workholding's issues: from the
+/// holding checks (`holding_lines_in`) once they are worked out for the job
+/// as it is and what the active setup's workholding holds passes.
+pub(crate) fn holding_margins(app: &App) -> Vec<String> {
+    let si = app.doc.index();
+    let checks = app.current_checks();
+    let held = app.known_held_in(app.left_boxes(), checks, si);
+    checks
+        .and_then(|c| c.get(si)?.as_ref())
+        .filter(|c| Some(c.held) == held)
+        .map(|c| c.margins.clone())
         .unwrap_or_default()
 }
 /// What the setup editor says of a stock box it shows that is the original
@@ -2850,6 +2873,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 ("y", "Y travel"),
                 ("z", "Z travel"),
                 ("rpm", "Maximum spindle speed · rpm"),
+                ("power", "Spindle power · W"),
                 ("feed", "Maximum feed · machine units/min"),
             ] {
                 form = form.push(field(p, k, l, t));
@@ -4206,18 +4230,20 @@ fn materials(app: &App) -> Element<'_, Message> {
     .height(Fill)
     .into()
 }
-const VISE_FIELDS: [(&str, &str); 5] = [
+const VISE_FIELDS: [(&str, &str); 6] = [
     ("jaw_width", "Jaw width · mm"),
     ("jaw_height", "Jaw height · mm"),
     ("jaw_thickness", "Jaw thickness · mm"),
     ("max_opening", "Maximum opening · mm"),
     ("grip", "Grip height · mm"),
+    ("force", "Clamping force · N"),
 ];
-const CLAMP_FIELDS: [(&str, &str); 4] = [
+const CLAMP_FIELDS: [(&str, &str); 5] = [
     ("length", "Length · mm"),
     ("width", "Width · mm"),
     ("height", "Height above the stock · mm"),
     ("bite", "Bite onto the stock · mm"),
+    ("force", "Clamping force · N"),
 ];
 /// A library entry's key sizes, for the list.
 fn holder_summary(h: &crate::holding::Holder) -> String {

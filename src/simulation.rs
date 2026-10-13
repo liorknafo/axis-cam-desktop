@@ -533,6 +533,9 @@ pub struct Simulation {
     pub position: [f32; 3],
     pub current: usize,
     pub revision: u64,
+    /// What the operation cuts, stretch by stretch (`forces::bites`), once
+    /// asked: the export and a run's checks both ask.
+    pub bites: std::sync::OnceLock<Vec<crate::forces::Bite>>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -557,7 +560,12 @@ impl Simulation {
             position,
             current: 0,
             revision: 0,
+            bites: Default::default(),
         }
+    }
+    /// `forces::bites` of this simulation, worked out once.
+    pub fn bites(&self) -> &[crate::forces::Bite] {
+        self.bites.get_or_init(|| crate::forces::bites(self))
     }
     pub fn removed_volume(&self) -> f32 {
         self.volume
