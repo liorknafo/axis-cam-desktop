@@ -302,6 +302,13 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
 - The seventh, `the_control_page_renders_in_every_state`, times out waiting for jogging when run alone too. origin/main without this change does the same (LIO-131).
 - In earlier runs, `calibration_measures_steps_per_mm_and_fills_the_profile` and `probe_corner_sets_the_work_zero_on_the_front_left_corner` each failed once alone, at their machine-zero wait (LIO-163).
 
+## Coolant that follows the machine (LIO-145)
+
+- `new_operations_take_the_coolant_the_machine_has`: a Facing added on a UC100 machine starts with Flood when the profile has a flood output, Mist when it has only mist, and Off on the owner's `jy5800.toml`, which has neither. The default is the first of `control::coolants`, the choices the machine has outputs for, which the planner's part report also gives the model (LIO-141), so `a_uc100_machine_is_planned_for_with_its_runs_checks_and_its_profiles_outputs` covers that list.
+- `cycle_start_waits_for_what_the_run_panel_lists`: with the drill on Mist and no mist output, **Set coolant to Off** lists only the drill, in tool run 2, not Facing's Flood, which the profile has. Pressing it sets the drill's coolant to Off and checks the setup again, and the "no mist output" reason is gone.
+- The Run panel was not inspected in the window. Twelve threads shared the PC, so the view and smoke tests stood in for it.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 823 passed, 5 failed: the two STEP tests, as before, and three simulated-UC100 smoke tests that timed out under the load of parallel builds, waiting for machine zero. Rerun alone, each passed, two of them only after two or three failed tries.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

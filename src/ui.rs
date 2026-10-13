@@ -3747,6 +3747,16 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             ));
     } else if !problems.is_empty() && !crate::run::busy(state) {
         body = body.push(caution("Before Cycle Start", problems));
+        let off = run.coolant_off(c, &app.doc);
+        if !off.is_empty() {
+            let ops = &app.doc.setups[run.setup].operations;
+            let names: Vec<&str> = off.iter().map(|&i| ops[i].name()).collect();
+            body = body.push(act(
+                format!("Set coolant to Off: {}", names.join(", ")),
+                msg(!running, R::CoolantOff),
+                false,
+            ));
+        }
     }
     if let Some(steps) = work_zero_steps(app, c) {
         use crate::control::Action;

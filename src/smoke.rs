@@ -1565,6 +1565,22 @@ flood = { pin = 8 }
         a
     }
 
+    #[test]
+    fn new_operations_take_the_coolant_the_machine_has() {
+        for (profile, coolant) in [
+            (FAST.to_string(), "Flood"),
+            (FAST.replace("flood", "mist"), "Mist"),
+            // The owner's JY5800 has neither output.
+            (include_str!("../assets/jy5800.toml").to_string(), "Off"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app_on(dir.path(), &profile);
+            let _ = a.update(Message::AddOp(Strategy::Face));
+            let op = &a.doc.setup().operations[a.selected.expect("added")];
+            assert_eq!(get(&op.p, "coolant"), coolant, "{}", a.status);
+        }
+    }
+
     /// Idle with machine zero set where the machine starts and the work
     /// zero (the stock top centre) at machine X195 Y140 Z-20.
     fn zeroed(a: &mut App) {
@@ -1788,6 +1804,21 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Run(R::Next(1)));
         assert!(has(&a, "no mist output"), "{:?}", problems(&a));
+        // Set coolant to Off turns off only the coolant the profile lacks,
+        // in any tool run, and checks again.
+        let _ = a.view();
+        assert_eq!(run_of(&a).coolant_off(conn(&a), &a.doc), [1]);
+        let _ = a.update(Message::Run(R::CoolantOff));
+        let ops = &a.doc.setups[0].operations;
+        assert_eq!(
+            (get(&ops[0].p, "coolant"), get(&ops[1].p, "coolant")),
+            ("Flood", "Off")
+        );
+        assert!(run_of(&a).programs.is_none());
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert!(!has(&a, "no mist output"), "{:?}", problems(&a));
         // An E-stop clears the machine position: Cycle Start waits for it.
         let _ = a.update(Message::MachineEStop);
         tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);

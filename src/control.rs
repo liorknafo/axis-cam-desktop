@@ -35,6 +35,41 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
+/// The coolant choices machine `m` has outputs for, in the order Flood,
+/// Mist, Air, Off: on a UC100 only what its profile can switch, as a run
+/// checks. Off is always one.
+pub fn coolants(m: &Machine) -> Result<Vec<&'static str>, String> {
+    // (mist, flood) outputs: LinuxCNC writes M7 and M8 on any machine.
+    let outputs = if get(&m.p, "controller") == "UC100" {
+        let out = profile(m)?.outputs;
+        (out.mist.is_some(), out.flood.is_some())
+    } else {
+        (true, true)
+    };
+    let air = crate::post::PostSettings::for_machine(m)
+        .ok()
+        .and_then(|s| s.air);
+    Ok([
+        ("Flood", Some((false, true))),
+        ("Mist", Some((true, false))),
+        ("Air", air),
+        ("Off", Some((false, false))),
+    ]
+    .into_iter()
+    .filter(|(_, uses)| {
+        uses.is_some_and(|(mist, flood)| (!mist || outputs.0) && (!flood || outputs.1))
+    })
+    .map(|(name, _)| name)
+    .collect())
+}
+
+/// The coolant a new operation on machine `m` starts with, the first it has
+/// outputs for: Flood, or on a UC100 Mist without a flood output and Off
+/// with neither. Flood when the profile cannot be read: Run says why.
+pub fn default_coolant(m: &Machine) -> &'static str {
+    coolants(m).map_or("Flood", |c| c[0])
+}
+
 /// The owner's machine, the Jingyan CNC4030-800W on its UC100, for a
 /// workspace whose library has no machine. Its profile, the driver's JY5800
 /// profile, is written to `dir` unless a file is there already: Setup may

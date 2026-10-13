@@ -1061,35 +1061,17 @@ fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, Stri
         1.
     };
     let mut max_rpm = num(&machine.p, "rpm").unwrap_or(0.);
-    // (mist, flood) outputs: LinuxCNC writes M7 and M8 on any machine.
-    let mut outputs = (true, true);
     if get(&machine.p, "controller") == "UC100" {
         let out = crate::control::profile(machine)?.outputs;
         if out.spindle_pwm.is_some() {
             max_rpm = max_rpm.min(out.spindle_max_rpm as f32);
         }
-        outputs = (out.mist.is_some(), out.flood.is_some());
     }
-    let air = crate::post::PostSettings::for_machine(machine)
-        .ok()
-        .and_then(|s| s.air);
-    let coolants = [
-        ("Flood", Some((false, true))),
-        ("Mist", Some((true, false))),
-        ("Air", air),
-        ("Off", Some((false, false))),
-    ]
-    .into_iter()
-    .filter(|(_, uses)| {
-        uses.is_some_and(|(mist, flood)| (!mist || outputs.0) && (!flood || outputs.1))
-    })
-    .map(|(name, _)| name)
-    .collect();
     Ok(MachineReport {
         max_rpm,
         max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
         travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
-        coolants,
+        coolants: crate::control::coolants(machine)?,
     })
 }
 /// The project's material and its cutting data, or why planning cannot use

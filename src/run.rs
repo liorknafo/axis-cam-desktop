@@ -34,6 +34,9 @@ pub enum Action {
     /// the reference surface: probes down onto it.
     ProbeReference,
     ProbeFromReference,
+    /// Set Off the coolant the profile has no output for (`coolant_off`),
+    /// then check again.
+    CoolantOff,
 }
 
 /// The tool run the machine is cutting.
@@ -251,6 +254,28 @@ impl Run {
             }
         }
         e
+    }
+
+    /// The enabled operations of the setup (indices) asking for a coolant the
+    /// UC100 profile has no output for, in any tool run: what Set coolant to
+    /// Off changes.
+    pub fn coolant_off(&self, c: &Connection, doc: &Document) -> Vec<usize> {
+        let Some(setup) = doc.setups.get(self.setup).filter(|s| s.id == self.setup_id) else {
+            return vec![];
+        };
+        let air = PostSettings::for_uc100(&setup.machine)
+            .ok()
+            .and_then(|s| s.air);
+        let out = &c.config.outputs;
+        (0..setup.operations.len())
+            .filter(|&i| {
+                let o = &setup.operations[i];
+                o.enabled
+                    && crate::post::coolant(o, air).is_some_and(|(mist, flood)| {
+                        mist && out.mist.is_none() || flood && out.flood.is_none()
+                    })
+            })
+            .collect()
     }
 
     /// Starts the next tool run when nothing stands in the way: lowers it with

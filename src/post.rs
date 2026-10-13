@@ -847,6 +847,17 @@ pub fn file_name(doc: &Document, index: usize, part: Option<(usize, usize, u32)>
         None => format!("{base}.ngc"),
     }
 }
+/// An operation's coolant as (mist, flood), Air being the machine's Air
+/// output `air`; None when there is no such output.
+pub fn coolant(op: &Operation, air: Option<(bool, bool)>) -> Option<(bool, bool)> {
+    match get(&op.p, "coolant") {
+        "Flood" => Some((false, true)),
+        "Mist" => Some((true, false)),
+        "Off" => Some((false, false)),
+        "Air" => air,
+        _ => None,
+    }
+}
 pub(crate) fn op_state(
     doc: &Document,
     op: &Operation,
@@ -861,13 +872,7 @@ pub(crate) fn op_state(
         .into_iter()
         .map(|x| format!("{}: {x}", op.name()))
         .collect();
-    let coolant = match get(&op.p, "coolant") {
-        "Flood" => Some((false, true)),
-        "Mist" => Some((true, false)),
-        "Off" => Some((false, false)),
-        "Air" => settings.and_then(|s| s.air),
-        _ => None,
-    };
+    let coolant = coolant(op, settings.and_then(|s| s.air));
     if coolant.is_none() {
         e.push(format!(
             "{}: coolant \"{}\" has no LinuxCNC output on this machine.",

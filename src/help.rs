@@ -730,6 +730,9 @@ fn run_help(a: &crate::run::Action) -> &'static str {
         ProbeFromReference => {
             "With the touch plate on the recorded reference surface and the new tool above it, probe down onto the plate and set work Z so that the surface is at the reference's Z. X and Y zero stay as they are."
         }
+        CoolantOff => {
+            "Set the coolant of the operations listed to Off, in every tool run of this setup: they ask for flood or mist coolant the UC100 profile has no output for. Then check the setup again."
+        }
     }
 }
 

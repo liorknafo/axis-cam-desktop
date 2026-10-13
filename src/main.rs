@@ -2360,6 +2360,10 @@ impl App {
                     return Task::none();
                 };
                 let mut operation = Operation::new(strategy, tool.id.clone());
+                operation.p.insert(
+                    "coolant".into(),
+                    control::default_coolant(&self.doc.setup().machine).into(),
+                );
                 if !self.is_sample() {
                     operation.geometry.clear();
                 }
@@ -2831,6 +2835,28 @@ impl App {
                 };
             }
             Message::Run(run::Action::Check) => return self.recheck_run(),
+            Message::Run(run::Action::CoolantOff) => {
+                let Some((c, r)) = self
+                    .control
+                    .as_ref()
+                    .and_then(|c| Some((c, c.run.as_ref()?)))
+                else {
+                    return Task::none();
+                };
+                let (si, ops) = (r.setup, r.coolant_off(c, &self.doc));
+                if ops.is_empty() || r.running.is_some() {
+                    return Task::none();
+                }
+                let mut names = vec![];
+                for i in ops {
+                    let o = &mut self.doc.setups[si].operations[i];
+                    o.p.insert("coolant".into(), "Off".into());
+                    names.push(o.name().to_string());
+                }
+                self.touch();
+                self.status = format!("Coolant set to Off: {}.", names.join(", "));
+                return self.recheck_run();
+            }
             Message::Run(action) => {
                 if matches!(action, run::Action::CycleStart) && self.planning_busy().is_some() {
                     return Task::none();
