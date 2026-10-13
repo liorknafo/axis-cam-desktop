@@ -341,7 +341,9 @@ never get it. Step 1 is for any other machine.
    speeds, limits, homing) and its **Connection**: **USB** for the real
    controller (macOS) or **Simulated**.
 2. Switch to the **MACHINE** workspace, pick the machine and press **Connect**. The machine
-   starts in E-stop; **Reset** enables it.
+   starts in E-stop; **Reset** enables it. The status bar reads "Connected to
+   <machine>: <state>" and follows the state (E-STOP, Idle, Run…) until
+   another message takes its place (LIO-150).
 3. While connected, a red **E-STOP** is in the toolbar on every page, and
    **Esc** sends E-stop from anywhere, even while typing. Leaving E-stop
    always needs Reset.
@@ -467,7 +469,10 @@ panel, at once when that machine is connected, or when you press
    the job up to it and checks it as export would (stock, work zero, rapids,
    holder, jaws and clamps), makes it the active setup and shows it in the
    **Job** view beside the Run panel, then lists its **tool runs**: one per run of the
-   same tool, as with touch-off G-code programs.
+   same tool, as with touch-off G-code programs. The checks follow the
+   project: after an edit, such as another workholding, the Control page
+   checks the setup again on its own once the edits pause, keeping its
+   progress, as **Check again** does (LIO-150).
 2. Set machine zero, then the work zero (the setup's work offset must be the
    active one): by hand, with **Probe Z** on a plate, or with **Probe corner**
    or **Probe centre** for a stock-based work zero. **Cycle Start** stays grey, with the reasons listed, until the

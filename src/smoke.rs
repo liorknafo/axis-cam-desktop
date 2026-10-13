@@ -1765,6 +1765,15 @@ flood = { pin = 8 }
         let _ = a.update(Message::Title("Edited".into()));
         assert!(has(&a, "project changed"), "{:?}", problems(&a));
         let _ = a.view();
+        // Once the edits pause, the Control page checks it again on its own
+        // (LIO-150), as Check again does.
+        let epoch = run_of(&a).epoch;
+        let _ = a.update(Message::Tick);
+        assert_eq!(run_of(&a).epoch, epoch, "rechecked mid-edit");
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert_ne!(run_of(&a).epoch, epoch);
+        assert!(!run_of(&a).stale && run_of(&a).programs.is_none());
         let epoch = run_of(&a).epoch;
         let _ = a.update(Message::Run(R::Check));
         assert_ne!(run_of(&a).epoch, epoch);
@@ -2308,10 +2317,15 @@ flood = { pin = 8 }
             s.state == Some(State::EStop)
         });
         assert_eq!(a.status, "Connected to JY5800: E-STOP");
-        // Later states do not overwrite other messages.
+        // It follows the state: Reset reads Idle (LIO-150).
         let _ = a.update(Message::MachineReset);
         tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
-        assert_eq!(a.status, "Connected to JY5800: E-STOP");
+        assert_eq!(a.status, "Connected to JY5800: Idle");
+        // Later states do not overwrite other messages.
+        a.status = "Another message: Idle".into();
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 3.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert_eq!(a.status, "Another message: Idle");
         assert!(conn(&a).config.axis_enabled(2));
     }
 

@@ -280,6 +280,14 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
 
   Eight of the nine pass alone. `the_control_page_renders_in_every_state` timed out waiting for jogging even alone while the PC stayed loaded. Its app has no part or setup, so the new check never runs in it. `cargo fmt --check` flags only lines of LIO-149's.
 
+## Live machine state and Run checks (LIO-150)
+
+- `the_status_line_shows_the_machine_state_once_connected`: after Reset the status line reads "Connected to JY5800: Idle", no longer the E-STOP it connected in. Once another message has replaced it, an E-stop leaves that message alone.
+- A connection lost after connecting reads "Lost the connection to <machine>; see the log on the Control page." The simulator does not drop its connection, so no test covers it.
+- `cycle_start_waits_for_what_the_run_panel_lists`: an edit marks the run's check out of date. A tick before the edits pause leaves the check alone; once they pause, the Control page checks the setup again on its own, as Check again does (a new check under way, no longer out of date).
+- The review's case, clamp errors still listed after switching to a vise, goes through the same flag: a failed check is redone the same way. It is not tested on its own.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`), after rebasing on LIO-146: 819 passed, 6 failed: the two STEP tests, as before, and four simulated-UC100 smoke tests that timed out waiting for the simulator's machine zero, with the CPU at 100 % from the parallel builds (`a_tool_run_holds_resumes_and_stops`, `probe_z_sets_work_z_at_the_plate_and_lifts`, `probe_z_waits_for_a_probe_input_a_plate_and_a_free_input`, `the_3d_view_shows_the_machine_and_planning_waits_for_it`). Under that load each one passed alone at least once in three runs. That wait comes before any edit, and so before the check that is redone. Before the rebases, on a quieter PC: 816 passed, 2 failed (the STEP tests).
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

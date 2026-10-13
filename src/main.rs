@@ -1617,6 +1617,14 @@ impl App {
             move |programs| Message::RunChecked(epoch, std::sync::Arc::new(programs)),
         )
     }
+    /// Checks the setup being run again, keeping its progress.
+    fn recheck_run(&mut self) -> Task<Message> {
+        self.run_epoch += 1;
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            (r.epoch, r.programs, r.stale) = (self.run_epoch, None, false);
+        }
+        self.check_run()
+    }
     fn invalidate_post(&mut self) {
         self.post = None;
         self.post_epoch = self.post_epoch.wrapping_add(1);
@@ -2822,13 +2830,7 @@ impl App {
                     Some(_) => page,
                 };
             }
-            Message::Run(run::Action::Check) => {
-                self.run_epoch += 1;
-                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
-                    (r.epoch, r.programs, r.stale) = (self.run_epoch, None, false);
-                }
-                return self.check_run();
-            }
+            Message::Run(run::Action::Check) => return self.recheck_run(),
             Message::Run(action) => {
                 if matches!(action, run::Action::CycleStart) && self.planning_busy().is_some() {
                     return Task::none();
@@ -3399,15 +3401,24 @@ impl App {
             Message::Tick => {
                 if let Some(c) = &mut self.control {
                     c.refresh();
-                    // "Connecting to <machine>…" until the driver reports a state.
-                    if let (Some(name), Some(state)) = (
-                        self.status.strip_prefix("Connecting to "),
-                        &c.snapshot.state,
-                    ) {
-                        let name = name.trim_end_matches('…');
+                    // "Connecting to <machine>…" until the driver reports a
+                    // state, then "Connected to <machine>: <state>" following
+                    // it until another message replaces it.
+                    let connecting = self
+                        .status
+                        .strip_prefix("Connecting to ")
+                        .map(|name| name.trim_end_matches('…'));
+                    let name = connecting.or_else(|| {
+                        Some(self.status.strip_prefix("Connected to ")?.rsplit_once(": ")?.0)
+                    });
+                    if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
+                        use uc100::controller::State;
                         self.status = match state {
-                            uc100::controller::State::Disconnected => format!(
+                            State::Disconnected if connecting.is_some() => format!(
                                 "Could not connect to {name}; see the log on the Control page."
+                            ),
+                            State::Disconnected => format!(
+                                "Lost the connection to {name}; see the log on the Control page."
                             ),
                             s => format!("Connected to {name}: {}", s.label()),
                         };
@@ -3458,11 +3469,23 @@ impl App {
                 } else {
                     Task::none()
                 };
+                // The Run panel's checks follow the project: a setup changed
+                // since it was checked is checked again once the edits pause.
+                let stale = self.control.as_ref().and_then(|c| c.run.as_ref());
+                let recheck = if paused
+                    && self.page == Page::Control
+                    && stale.is_some_and(|r| r.stale && r.running.is_none())
+                {
+                    self.recheck_run()
+                } else {
+                    Task::none()
+                };
                 return Task::batch([
                     close,
                     self.refresh_stock_surface(),
                     self.refresh_post(),
                     left,
+                    recheck,
                 ]);
             }
             Message::Plan => {
