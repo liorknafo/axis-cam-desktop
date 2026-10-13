@@ -5680,23 +5680,29 @@ flood = { pin = 8 }
         // Just edited: not yet.
         a.last_edit = std::time::Instant::now();
         let _ = a.update(Message::Tick);
-        assert_eq!(a.left_job, None);
-        // The pause is as long as the project's save waits.
+        assert_eq!((a.left_job, a.ready_job), (None, None));
+        // The pause is as long as the project's save waits. The checks
+        // before a run of the active setup start with the stock's run.
         a.last_edit = std::time::Instant::now() - std::time::Duration::from_millis(800);
         let _ = a.update(Message::Tick);
         assert_eq!(a.left_job, a.left_key());
         assert!(a.left_job.is_some());
+        let held = a.holding_key().unwrap();
+        assert_eq!(a.ready_job, Some(held));
         // Running: the ticks start no other.
         let running = a.left_job;
         let _ = a.update(Message::Tick);
-        assert_eq!(a.left_job, running);
+        assert_eq!((a.left_job, a.ready_job), (running, Some(held)));
         assert!(a.blocking_work());
-        let held = a.holding_key().unwrap();
         let _ = a.update(worked_out(running.unwrap(), held, vec![None, None]));
+        assert!(a.blocking_work());
+        let setup = a.doc.index();
+        let ready = crate::run::Ready { key: held, setup, ..Default::default() };
+        let _ = a.update(Message::Ready(Box::new(ready)));
         assert!(!a.blocking_work());
         // Done for this document: the ticks start none.
         let _ = a.update(Message::Tick);
-        assert_eq!(a.left_job, None);
+        assert_eq!((a.left_job, a.ready_job), (None, None));
     }
     #[test]
     fn a_setup_whose_earlier_setups_failed_keeps_the_original_stock_and_the_note() {
@@ -6163,6 +6169,58 @@ flood = { pin = 8 }
         a.doc.setups[0].p.insert("holding".into(), "None".into());
         assert_eq!(crate::ui::holding_warning(&a), None);
         let _ = a.view();
+    }
+    /// LIO-143: a generated operation showed a green check that Run then
+    /// refused for the clamps. Green now means the Run panel's own checks pass.
+    #[test]
+    fn the_browser_marks_an_operation_ready_only_when_the_run_checks_pass() {
+        use crate::ui::{OpMark, op_mark, run_check};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), LIMITED);
+        a.doc.adopt_holders();
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        let marks = |a: &App| -> Vec<OpMark> {
+            (0..2).map(|i| op_mark(a, a.current_ready(), i)).collect()
+        };
+        // The suggested toe clamps, as the reviewer had them.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        assert!(a.playback_ready(), "{}", a.status);
+        // Generated and not yet checked: grey, not the green of ready.
+        assert_eq!(marks(&a), [OpMark::Generated, OpMark::Pending]);
+        assert_eq!(run_check(&a).unwrap().0, "Checking Top as run will…");
+        let _ = a.refresh_ready();
+        let refused = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).unwrap_err();
+        assert_eq!(a.current_ready().unwrap().problems, refused);
+        assert_eq!(marks(&a), [OpMark::Collides, OpMark::Collides]);
+        let (heading, lines, ok) = run_check(&a).unwrap();
+        assert_eq!(heading, "Workholding in the way: Run will refuse Top");
+        assert!(!ok);
+        let hit = format!("{}: the tool hits the clamp on", a.doc.setups[0].operations[0].name());
+        assert!(lines[0].starts_with(&hit), "{lines:?}");
+        assert!(refused.iter().all(|r| lines.contains(r)), "{lines:?} {refused:?}");
+        let _ = a.view();
+        // The suggested vise instead: out of date until checked again, then
+        // green, and Run agrees.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        assert!(a.current_ready().is_none());
+        let _ = a.refresh_ready();
+        assert!(crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).is_ok());
+        assert_eq!(marks(&a), [OpMark::Ready, OpMark::Ready]);
+        let (heading, _, ok) = run_check(&a).unwrap();
+        assert_eq!(heading, "Ready to run: Run's checks of Top pass.");
+        assert!(ok);
+        let _ = a.view();
+        // Coolant the profile has no output for: generated, not ready.
+        let _ = a.update(Message::Edit(Target::Operation, "coolant", "Mist".into()));
+        let _ = a.refresh_ready();
+        assert_eq!(marks(&a), [OpMark::Generated, OpMark::Generated]);
+        let (heading, lines, ok) = run_check(&a).unwrap();
+        assert_eq!(heading, "Run will refuse Top");
+        assert!(!ok);
+        assert!(lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"), "{lines:?}");
     }
     #[test]
     fn the_3d_view_gets_the_boxes_only_when_the_stock_is_shown() {

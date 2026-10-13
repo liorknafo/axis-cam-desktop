@@ -358,10 +358,21 @@ fn op_of(b: &Block) -> Option<usize> {
 /// from a simulation of the job up to the end of that setup.
 pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, Vec<String>> {
     if doc.file.is_none() {
-        return Err(vec!["Import a part before running a setup. The example project's paths are illustrative and cannot be machined.".into()]);
+        return Err(vec![NO_PART.into()]);
     }
-    let setup = &doc.setups[si];
-    let last = setup.operations.iter().rposition(|o| o.enabled);
+    crate::post::checked(doc, mesh, si, &simulated(doc, mesh, si), PostSettings::for_uc100)
+}
+
+const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
+
+/// The `sequence` results of setup `si`'s enabled operations, from a
+/// simulation of the job up to the end of that setup.
+fn simulated(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+) -> Vec<(usize, Result<crate::simulation::Simulation, String>)> {
+    let last = doc.setups[si].operations.iter().rposition(|o| o.enabled);
     let mut sims = vec![];
     if let Some(oi) = last {
         crate::simulation::sequence(doc, mesh, Some((si, oi)), |s, oi, r| {
@@ -370,7 +381,49 @@ pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, 
             }
         });
     }
-    crate::post::checked(doc, mesh, si, &sims, PostSettings::for_uc100)
+    sims
+}
+
+/// What the checks before a run find for one setup, for the browser's marks
+/// and the simulation panel (`ui::op_mark`), worked out for the job whose
+/// fingerprint is `key` (`App::holding_key`).
+#[derive(Debug, Clone, Default)]
+pub struct Ready {
+    pub key: u64,
+    pub setup: usize,
+    /// The operations (index in the setup) that generated.
+    pub generated: Vec<usize>,
+    /// The workholding problems of its programs, each with its operation.
+    pub held: Vec<crate::post::Held>,
+    /// Why it cannot run: what a run refuses before Cycle Start without the
+    /// connected machine (`plan_problems`), export's refusal for a machine
+    /// that is not a UC100. Empty when it can.
+    pub problems: Vec<String>,
+}
+
+/// `Ready` of setup `si`: `plan_problems` (`post::checked` for a machine that
+/// is not a UC100), and what of its workholding they refuse, operation by
+/// operation (`post::held_walked`).
+pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
+    let sims = simulated(doc, mesh, si);
+    let problems = if doc.file.is_none() {
+        Err(vec![NO_PART.into()])
+    } else if crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100" {
+        plan_problems(doc, mesh, si, &sims)
+    } else {
+        crate::post::checked(doc, mesh, si, &sims, PostSettings::from_machine).map(|_| ())
+    };
+    Ready {
+        key,
+        setup: si,
+        generated: sims
+            .iter()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(oi, _)| *oi)
+            .collect(),
+        held: crate::post::held_walked(doc, mesh, si, &sims).unwrap_or_default(),
+        problems: problems.err().unwrap_or_default(),
+    }
 }
 
 /// What the UC100 profile's `out`puts refuse in a tool run's `ops`: a

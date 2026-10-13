@@ -747,27 +747,20 @@ fn browser(app: &App) -> Element<'_, Message> {
                 container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(10))
                     .padding([0, 16]),
             );
+            let checks = app.current_ready();
             for (i, o) in s.operations.iter().enumerate() {
                 let selected = app.selected == Some(i) && app.page == Page::Work;
-                let ready = o.preview
-                    || app
-                        .active_simulation()
-                        .is_some_and(|sim| sim.plan.operation == o.id);
-                let mark = if !o.enabled {
-                    "—"
-                } else if ready {
-                    "✓"
-                } else {
-                    "○"
+                let (mark, color) = match op_mark(app, checks, i) {
+                    OpMark::Suppressed => ("—", MUTED),
+                    OpMark::Pending => ("○", MUTED),
+                    OpMark::Generated => ("✓", MUTED),
+                    OpMark::Collides => ("!", Color::from_rgb8(196, 112, 22)),
+                    OpMark::Ready => ("✓", Color::from_rgb8(38, 146, 111)),
                 };
                 let content = row![
                     icon(app, o.strategy, 23.),
                     text(o.name()).size(12).width(Fill),
-                    text(mark).size(13).color(if ready {
-                        Color::from_rgb8(38, 146, 111)
-                    } else {
-                        MUTED
-                    })
+                    text(mark).size(13).color(color)
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center);
@@ -1142,6 +1135,20 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .spacing(8)
     ]
     .spacing(8);
+    if let Some((heading, lines, ok)) = run_check(app) {
+        let said: Element<'_, Message> = if ok {
+            let mut c = column![bold(heading, 12).color(GOOD)].spacing(3);
+            for line in lines {
+                c = c.push(muted(line).size(10));
+            }
+            c.into()
+        } else if lines.is_empty() {
+            muted(heading).size(11).into()
+        } else {
+            caution(heading, lines)
+        };
+        playback = playback.push(said);
+    }
     if ready {
         playback = playback.push(row![
             btn(if app.playing { "Pause" } else if app.progress >= 1. { "Replay" } else { "Play" }, Message::Play, app.playing),
@@ -2555,6 +2562,96 @@ pub(crate) fn holding_warning(app: &App) -> crate::HoldingNote {
     let note = holding_note(app, &sim.plan, op.name(), setup);
     *app.holding_note.borrow_mut() = Some((key, note.clone()));
     note
+}
+/// What the browser shows of an operation of the active setup.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OpMark {
+    /// —
+    Suppressed,
+    /// ○: not generated.
+    Pending,
+    /// Grey ✓: generated, but the setup will not run for a reason the
+    /// simulation panel lists, or its preview is on screen and the checks
+    /// before a run are still being worked out.
+    Generated,
+    /// Amber !: those checks refuse the setup's workholding for it, or for
+    /// the whole setup (its clearance plane): a jaw or clamp in the way.
+    Collides,
+    /// Green ✓: those checks pass, so the setup will run.
+    Ready,
+}
+/// The mark of operation `i` of the active setup from `checks`, the checks
+/// before a run of the setup when they are current (`App::current_ready`).
+/// Until they are, generated means its preview is on screen (or, for the
+/// example, its sample path), which is never Ready: nothing says it runs.
+pub(crate) fn op_mark(app: &App, checks: Option<&crate::run::Ready>, i: usize) -> OpMark {
+    let Some(o) = app.doc.active_setup().and_then(|s| s.operations.get(i)) else {
+        return OpMark::Pending;
+    };
+    if !o.enabled {
+        return OpMark::Suppressed;
+    }
+    let Some(r) = checks else {
+        let shown = o.preview
+            || app
+                .active_simulation()
+                .is_some_and(|sim| sim.plan.operation == o.id);
+        return if shown {
+            OpMark::Generated
+        } else {
+            OpMark::Pending
+        };
+    };
+    if r.held.iter().any(|h| h.operation.is_none_or(|k| k == i)) {
+        OpMark::Collides
+    } else if !r.generated.contains(&i) {
+        OpMark::Pending
+    } else if r.problems.is_empty() {
+        OpMark::Ready
+    } else {
+        OpMark::Generated
+    }
+}
+/// What the simulation panel says of the selected operation's setup above
+/// its controls: a heading, the lines of the checks before a run (the Run
+/// panel's, export's for a machine that is not a UC100; the selected
+/// operation's workholding problems first, then the setup's), and whether
+/// the setup will run. None for the example and a suppressed operation.
+pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
+    let i = app.selected?;
+    let setup = app.doc.active_setup()?;
+    let uc100 = get(&setup.machine.p, "controller") == "UC100";
+    let (by, verb) = if uc100 { ("Run", "run") } else { ("Export", "export") };
+    let name = setup.name();
+    let Some(r) = app.current_ready() else {
+        // Nothing is checked for the example.
+        app.holding_key()?;
+        return Some((format!("Checking {name} as {verb} will…"), vec![], false));
+    };
+    let mark = op_mark(app, Some(r), i);
+    let own = r.held.iter().filter(|h| h.operation == Some(i));
+    let setup_wide = r.held.iter().filter(|h| h.operation.is_none());
+    let mut lines: Vec<String> = vec![];
+    for problem in own.chain(setup_wide).map(|h| &h.message).chain(&r.problems) {
+        if !lines.contains(problem) {
+            lines.push(problem.clone());
+        }
+    }
+    let machine = "The machine's position and the work zero are checked on the Run panel.";
+    match mark {
+        OpMark::Suppressed => None,
+        OpMark::Ready => Some((
+            format!("Ready to {verb}: {by}'s checks of {name} pass."),
+            if uc100 { vec![machine.into()] } else { vec![] },
+            true,
+        )),
+        OpMark::Collides => Some((
+            format!("Workholding in the way: {by} will refuse {name}"),
+            lines,
+            false,
+        )),
+        _ => Some((format!("{by} will refuse {name}"), lines, false)),
+    }
 }
 /// `holding_warning` of the plan of the operation `name`, worked out.
 fn holding_note(

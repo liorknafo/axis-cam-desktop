@@ -223,6 +223,8 @@ pub enum Message {
     /// The stock each setup starts from and its holding checks, each worked
     /// out for the job with its fingerprint.
     LeftStock(Box<(LeftStock, HoldingChecks)>),
+    /// The checks before a run of the active setup, worked out (`run::ready`).
+    Ready(Box<run::Ready>),
     ExportGcode,
     /// None when no folder was chosen.
     GcodeExported(Option<Result<(PathBuf, usize), String>>),
@@ -552,6 +554,10 @@ pub struct App {
     /// The fingerprint of the job a background run is working out the stock
     /// for.
     left_job: Option<u64>,
+    /// The checks before a run of a setup, once worked out (`current_ready`).
+    pub ready: run::Ready,
+    /// The fingerprint of the job a background run is checking a setup of.
+    ready_job: Option<u64>,
     /// The workholding warning of the preview shown (`ui::holding_warning`)
     /// and what it was worked out from.
     holding_note: std::cell::RefCell<Option<(String, HoldingNote)>>,
@@ -928,6 +934,8 @@ impl App {
             left_stock: LeftStock::default(),
             holding_checks: HoldingChecks::default(),
             left_job: None,
+            ready: run::Ready::default(),
+            ready_job: None,
             holding_note: std::cell::RefCell::new(None),
             stock_pictures: Default::default(),
             post_epoch: 0,
@@ -1257,6 +1265,7 @@ impl App {
         self.plan_busy.running() > 0
             || self.post_busy
             || self.left_job.is_some()
+            || self.ready_job.is_some()
             || self.stock_mesh_job.is_some()
     }
     /// Work that must not be cut short by ending the process: a G-code
@@ -1344,7 +1353,11 @@ impl App {
     pub fn planning_busy(&self) -> Option<&'static str> {
         if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
             Some("The AI planner is working: wait for it, or cancel it.")
-        } else if self.stock_mesh_job.is_some() || self.post_busy || self.left_job.is_some() {
+        } else if self.stock_mesh_job.is_some()
+            || self.post_busy
+            || self.left_job.is_some()
+            || self.ready_job.is_some()
+        {
             Some("A preview or check is still being worked out: wait a moment.")
         } else {
             None
@@ -1803,6 +1816,52 @@ impl App {
                 })
             },
             |found| Message::LeftStock(Box::new(found)),
+        )
+    }
+    /// The checks before a run of the active setup, when they were worked out
+    /// for the job as it is now.
+    pub(crate) fn current_ready(&self) -> Option<&run::Ready> {
+        let key = self.holding_key()?;
+        (self.ready.key == key && self.ready.setup == self.doc.index()).then_some(&self.ready)
+    }
+    /// Checks the active setup as a run would (`run::ready`), when the job
+    /// changed since or another setup is active, as `refresh_left_stock` works
+    /// out the stock: on the blocking pool (in line in the smoke run), only in
+    /// the Manufacture workspace and not while the machine moves.
+    fn refresh_ready(&mut self) -> Task<Message> {
+        let Some(key) = self.holding_key() else {
+            return Task::none();
+        };
+        if self.ready_job.is_some()
+            || self.locked()
+            || self.page == Page::Control
+            || self.current_ready().is_some()
+        {
+            return Task::none();
+        }
+        let Some(mesh) = self.part_mesh().cloned() else {
+            return Task::none();
+        };
+        let (doc, si) = (self.doc.clone(), self.doc.index());
+        let check = move || run::ready(&doc, &mesh, si, key);
+        if self.smoke_dir.is_some() {
+            self.ready = check();
+            return Task::none();
+        }
+        self.ready_job = Some(key);
+        Task::perform(
+            async move {
+                // A check that failed is not run again for the same job.
+                tokio::task::spawn_blocking(check)
+                    .await
+                    .unwrap_or_else(|e| run::Ready {
+                        key,
+                        setup: si,
+                        problems: vec![format!("The check failed: {e}")],
+                        ..Default::default()
+                    })
+            },
+            |ready| Message::Ready(Box::new(ready)),
         )
     }
     fn write_settings(&self) -> Result<(), String> {
@@ -3491,7 +3550,7 @@ impl App {
                 // it happens when the wait is over.
                 let close = self.close_if_waiting();
                 let left = if paused {
-                    self.refresh_left_stock()
+                    Task::batch([self.refresh_left_stock(), self.refresh_ready()])
                 } else {
                     Task::none()
                 };
@@ -3739,6 +3798,12 @@ impl App {
                 if self.holding_key() == Some(checks.key) {
                     self.holding_checks = checks;
                 }
+            }
+            Message::Ready(ready) => {
+                // A job edited while it was checked gets a check of its own at
+                // the next pause (`current_ready`).
+                self.ready_job = None;
+                self.ready = *ready;
             }
             Message::PostChecked(epoch, job) => {
                 self.post_busy = false;

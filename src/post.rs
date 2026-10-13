@@ -1186,7 +1186,7 @@ fn walk<'a>(
 /// A workholding problem of one setup's programs: the operation it is about,
 /// an index in the setup's operations, and the message.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Held {
+pub struct Held {
     pub operation: Option<usize>,
     pub message: String,
 }

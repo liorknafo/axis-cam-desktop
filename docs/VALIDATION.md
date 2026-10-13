@@ -322,6 +322,27 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 824 passed, 4 failed. Two are the STEP tests, as before. The other two, `the_edge_test_is_quick_where_long_open_edges_meet` and `probe_z_waits_for_a_probe_input_a_plate_and_a_free_input`, ran late under the full suite's load and passed alone.
 - `the_control_page_renders_in_every_state` ("timed out waiting for jogging") passed in that run, but fails now and then alone while other builds keep the PC busy. Main without this change failed it 3 times in 3 at such a time.
 
+## Browser marks that match the Run checks (LIO-143)
+
+`the_browser_marks_an_operation_ready_only_when_the_run_checks_pass` replays the blind review's case on a simulated UC100 machine like the JY5800: the fixture block's Top setup with Facing and Drilling.
+
+- **Suggested toe clamps**
+  - Generated and not yet checked, Facing has the grey ✓ and Drilling ○. The simulation panel says "Checking Top as run will…".
+  - Once checked, the lines the app keeps are exactly `run::programs`' refusal, the list the Run panel shows. Both operations get the amber !, because the clearance plane is below the clamps.
+  - The panel's heading is "Workholding in the way: Run will refuse Top". Its first line is Facing's own clamp hit, and every line Run lists is there.
+- **The suggested vise instead**
+  - The check is out of date as soon as the holding changes.
+  - Checked again, `run::programs` passes and both operations get the green ✓. The panel says "Ready to run: Run's checks of Top pass.".
+- **Facing on mist coolant**, which the profile has no output for: both operations go back to the grey ✓. The panel says "Run will refuse Top" and lists the coolant line first.
+
+Other checks:
+
+- The check is `run::plan_problems` (LIO-141) for a UC100 machine: what a run refuses before Cycle Start, without the connected machine. For any other machine it is export's `post::checked`.
+
+- `the_simulation_waits_for_the_edits_to_pause_and_runs_one_at_a_time` now covers the new check too. It starts after the same pause as the stock's run, one at a time, and the app's blocking work ends only once both have answered.
+- Not inspected in the real window: the window is shared with other work on this PC.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 827 passed, 3 failed: the two STEP tests, as before, and `the_control_page_renders_in_every_state`, which timed out under the load of parallel builds and passes alone (LIO-131). In earlier runs under heavier load, other tests missed their time limits too, among them the two that run a setup through a tool change and `the_edge_test_is_quick_where_long_open_edges_meet`; each passed alone.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.
