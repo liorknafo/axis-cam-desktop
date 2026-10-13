@@ -4422,20 +4422,29 @@ pub(crate) fn work_zero_line(
     }
     line
 }
-/// The checks a plan passed before it is shown, as the preview lists them.
-pub(crate) fn plan_check_lines() -> [&'static str; 4] {
+/// The checks a plan passed before it is shown, as the preview lists them:
+/// a UC100 machine's (`uc100`) setups get a run's checks, not export's.
+pub(crate) fn plan_check_lines(uc100: bool) -> [&'static str; 4] {
     [
         "Every operation generates with the stock left by the ones before it",
-        "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance",
+        if uc100 {
+            "UC100 run checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs"
+        } else {
+            "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance"
+        },
         "No tool centre line cuts into the part, and nothing goes below the stock",
         "No gouging detected on the stock grid (coarse check)",
     ]
 }
 /// What the preview's checks leave out, under the check lines. A plan's
 /// setups all hold their stock the way setup 1 does, so they model their
-/// vise or clamps together or not at all.
-pub(crate) fn plan_not_checked(held: Held) -> &'static str {
+/// vise or clamps together or not at all. A UC100 machine's (`uc100`) runs
+/// retract to the clearance plane, which is checked, not to machine home.
+pub(crate) fn plan_not_checked(held: Held, uc100: bool) -> &'static str {
     match held {
+        Held::Every if uc100 => {
+            "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup, retracts to the clearance plane included. Speeds and feeds are checked against the material's cutting data, which are starting points."
+        }
         Held::Every => {
             "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
         }
@@ -4588,10 +4597,15 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
         c = c.push(muted(line));
     }
     let mut checks = column![].spacing(4);
-    for line in plan_check_lines() {
+    // Every setup of a plan uses setup 1's machine.
+    let uc100 = get(&job.setups[0].machine.p, "controller") == "UC100";
+    for line in plan_check_lines(uc100) {
         checks = checks.push(row![text("✓").size(13).color(GOOD), text(line).size(13)].spacing(8));
     }
-    checks = checks.push(muted(plan_not_checked(crate::holding::held(&job.setups))));
+    checks = checks.push(muted(plan_not_checked(
+        crate::holding::held(&job.setups),
+        uc100,
+    )));
     c = c.push(checks).push(actions());
     // The model's words are labelled as the planner's; the app's are not.
     if !proposal.summary.is_empty() {
@@ -5046,7 +5060,7 @@ fn plan_result(app: &App) -> Element<'_, Message> {
                 ),
                 muted("2. The model proposes setups, operations, tools and cutting parameters"),
                 muted(
-                    "3. The app generates and simulates every operation and runs the export checks"
+                    "3. The app generates and simulates every operation and runs the export checks, or a UC100 machine's run checks"
                 ),
                 muted("4. Problems go back to the model for correction, up to four requests"),
                 muted("5. You review the result and apply it; nothing changes before that"),

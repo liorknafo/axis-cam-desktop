@@ -80,6 +80,15 @@ impl PostSettings {
             ..Self::read(m)
         })
     }
+    /// What the planner checks a machine's setups with: a UC100 run's
+    /// settings for a UC100 machine, LinuxCNC export's for any other.
+    pub fn for_machine(m: &Machine) -> Result<Self, Vec<String>> {
+        if get(&m.p, "controller") == "UC100" {
+            Self::for_uc100(m)
+        } else {
+            Self::from_machine(m)
+        }
+    }
     fn read(m: &Machine) -> Self {
         let value = |k: &str| post_setting(&m.p, k).trim().parse::<f32>().unwrap_or(0.);
         Self {
@@ -1277,8 +1286,9 @@ impl Walk<'_> {
 /// Every workholding problem `prepare` finds for setup `si` from its
 /// `sequence` results, in every program (`prepare` stops at the first program
 /// with any problem, and before them all at a stock the workholding cannot
-/// hold), each once: the messages are those of `prepare`. Empty when the
-/// setup cannot be walked, which `prepare` reports.
+/// hold), each once: the messages are those of `prepare`, or of a UC100
+/// run's check for a UC100 machine (`PostSettings::for_machine`). Empty when
+/// the setup cannot be walked, which `prepare` reports.
 pub(crate) fn held(
     doc: &Document,
     mesh: &Mesh,
@@ -1295,7 +1305,7 @@ pub(crate) fn held_walked(
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Option<Vec<Held>> {
-    let walk = walk(doc, mesh, si, sims, PostSettings::from_machine).ok()?;
+    let walk = walk(doc, mesh, si, sims, PostSettings::for_machine).ok()?;
     let held = gripped(doc, mesh, si, &walk);
     let boxes = match holding_boxes(doc, si, held) {
         Ok(boxes) => boxes,

@@ -127,6 +127,8 @@ pub struct MachineReport {
     pub max_rpm: f32,
     pub max_feed: f32,
     pub travel: [f32; 3],
+    /// The coolant choices the machine has outputs for.
+    pub coolants: Vec<&'static str>,
 }
 /// The project material and its cutting data, as the model sees them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1022,9 +1024,10 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     });
     let setup = match doc.setups.first() {
         None => Some("Create setup 1 with your machine and stock.".to_string()),
-        Some(setup1) => crate::post::PostSettings::from_machine(&setup1.machine)
+        Some(setup1) => crate::post::PostSettings::for_machine(&setup1.machine)
             .err()
             .and_then(|e| e.into_iter().next())
+            .or_else(|| machine_report(&setup1.machine).err())
             .or_else(|| crate::stock::resolve(setup1, mesh).err())
             .or_else(|| {
                 up_axis(setup1).is_none().then(|| {
@@ -1043,10 +1046,51 @@ pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
     };
     vec![
         line("Imported part", part),
-        line("Setup 1: 3-axis LinuxCNC machine and stock", setup),
+        line("Setup 1: 3-axis LinuxCNC or UC100 machine and stock", setup),
         line("Material", material),
         line("Tool library", tools),
     ]
+}
+/// A machine's limits as the model is told them. A UC100 machine's profile
+/// limits them further, as a run checks: the spindle's maximum rpm, and the
+/// coolant it has outputs for.
+fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, String> {
+    let inch = if get(&machine.p, "units") == "inch" {
+        25.4
+    } else {
+        1.
+    };
+    let mut max_rpm = num(&machine.p, "rpm").unwrap_or(0.);
+    // (mist, flood) outputs: LinuxCNC writes M7 and M8 on any machine.
+    let mut outputs = (true, true);
+    if get(&machine.p, "controller") == "UC100" {
+        let out = crate::control::profile(machine)?.outputs;
+        if out.spindle_pwm.is_some() {
+            max_rpm = max_rpm.min(out.spindle_max_rpm as f32);
+        }
+        outputs = (out.mist.is_some(), out.flood.is_some());
+    }
+    let air = crate::post::PostSettings::for_machine(machine)
+        .ok()
+        .and_then(|s| s.air);
+    let coolants = [
+        ("Flood", Some((false, true))),
+        ("Mist", Some((true, false))),
+        ("Air", air),
+        ("Off", Some((false, false))),
+    ]
+    .into_iter()
+    .filter(|(_, uses)| {
+        uses.is_some_and(|(mist, flood)| (!mist || outputs.0) && (!flood || outputs.1))
+    })
+    .map(|(name, _)| name)
+    .collect();
+    Ok(MachineReport {
+        max_rpm,
+        max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
+        travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
+        coolants,
+    })
 }
 /// The project's material and its cutting data, or why planning cannot use
 /// the project's material. The user's text is cleaned and bounded.
@@ -1193,21 +1237,11 @@ fn describe(
             .map(|(up, _)| *up)
             .filter(|up| *up != first),
     );
-    let machine = &setup1.machine;
-    let inch = if get(&machine.p, "units") == "inch" {
-        25.4
-    } else {
-        1.
-    };
     Ok(PartReport {
         units: "mm",
         part_size: mesh.dimensions.map(r2),
         material: material_report(doc)?,
-        machine: MachineReport {
-            max_rpm: num(&machine.p, "rpm").unwrap_or(0.),
-            max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
-            travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
-        },
+        machine: machine_report(&setup1.machine)?,
         tools: doc
             .tools
             .iter()
@@ -1436,7 +1470,7 @@ pub(crate) mod tests {
         assert_eq!(
             unmet,
             [(
-                "Setup 1: 3-axis LinuxCNC machine and stock",
+                "Setup 1: 3-axis LinuxCNC or UC100 machine and stock",
                 problem.to_string()
             )]
         );
@@ -1629,7 +1663,7 @@ pub(crate) mod tests {
             unmet(&doc, None),
             vec![
                 "Imported part",
-                "Setup 1: 3-axis LinuxCNC machine and stock"
+                "Setup 1: 3-axis LinuxCNC or UC100 machine and stock"
             ]
         );
         let mut other = doc.clone();

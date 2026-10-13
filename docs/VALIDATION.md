@@ -201,6 +201,17 @@ Other checks:
 - Not a test: the window was not driven or looked at; the labels and the empty Tool library's text ("Facing needs a cutter. Create one: saving it adds Facing.") come from the same code.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 815 passed, 4 failed: the two STEP tests, as before, and two simulated-UC100 smoke tests that timed out under the load of parallel builds (`machine_zero_turns_the_soft_limits_on`, `the_control_page_renders_in_every_state`); each passes alone.
 
+## Planning for a UC100 machine (LIO-141)
+
+- Why the planner refused the UC100: its checklist and its export stage called the LinuxCNC post (`PostSettings::from_machine`), which refuses every other controller. Nothing else in planning depends on the controller, so the planner now checks a UC100 machine's setups with the checks a UC100 run already makes (`post::checked` with `PostSettings::for_uc100`, then the profile's outputs), not with the post.
+- `plan_check::tests::a_uc100_machine_is_planned_for_with_its_runs_checks_and_its_profiles_outputs`, on the example block's machine set to UC100 with the owner's `jy5800.toml` profile:
+  - The checklist is met, and the part report's `coolants` is only Off: the profile has no flood or mist output, and Air uses the mist output.
+  - The good plan, whose operations use Flood, is refused at the export stage, by operation, with the run's message ("uses flood coolant, but the UC100 profile has no flood output…"), and no problem names LinuxCNC.
+  - With every operation's coolant Off, it passes every stage.
+- The run's checks before Cycle Start keep their messages (`output_problems` is shared), as the run tests in `src/smoke.rs` and `src/run.rs` show.
+- Not covered: what needs the connected machine (the work offset, machine positions, the soft limits at the work zero, the profile's soft limits against the machine's travel) is checked when the setup is run, not when it is planned. A live planning run needs the owner's ChatGPT sign-in and was not made; the test checks the plan directly, with no model and no request to OpenAI.
+- `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 7 failed: the two STEP tests, as before, and five simulated-UC100 smoke tests that timed out under the load of parallel builds (`a_jog_into_a_soft_limit_ends_at_the_limit`, `cycle_start_waits_for_what_the_run_panel_lists`, `keep_the_last_position_declares_where_the_machine_was_left`, `probe_centre_sets_the_work_zero_on_the_middle_of_the_block`, `saving_while_connected_reconnects_with_the_new_profile`); the five pass alone.
+
 ## Planner analysis and checks (no AI)
 
 - Part report on the example block: the top plane with five holes (four Ø6.6 through with Ø11 openings, one Ø6 blind), counterbore rings, the 72 × 40 mm pocket at 12 mm depth with its fitting cutter, and the features of the other five orientations. A face is listed only when at least half of it is visible from above (a 40 × 20 mm face of 80 triangles under an overhang is listed whole at 85% and 60% visible, and not at 40% and 15%), and no surface is listed in two orientations. A plane's holes are listed completely or not at all, and a part that is not a closed solid is refused.

@@ -229,28 +229,7 @@ impl Run {
                 }
             }
         }
-        let out = &c.config.outputs;
-        for o in &p.ops {
-            if out.spindle_pwm.is_some() && o.rpm as f64 > out.spindle_max_rpm {
-                e.push(format!(
-                    "{}: S{} is above the UC100 profile's {:.0} rpm.",
-                    o.name,
-                    o.rpm.round(),
-                    out.spindle_max_rpm
-                ));
-            }
-            if !o.clockwise && !c.reversible() {
-                e.push(format!("{}: the spindle turns counterclockwise, but the UC100 profile has no spindle direction output.", o.name));
-            }
-            for (on, pin, what) in [
-                (o.coolant.1, out.flood, "flood"),
-                (o.coolant.0, out.mist, "mist"),
-            ] {
-                if on && pin.is_none() {
-                    e.push(format!("{}: uses {what} coolant, but the UC100 profile has no {what} output. Set its coolant to Off, or add the output to the profile.", o.name));
-                }
-            }
-        }
+        e.extend(output_problems(&c.config.outputs, &p.ops));
         if let Some((wcs, xy)) = self.xy {
             if wcs != s.active_wcs || (0..2).any(|a| (s.work_offset[a] - xy[a]).abs() > 1e-6) {
                 e.push("X/Y work zero changed since the first tool run started. Tool changes keep X/Y zero: put it back, or pick the setup again to start over.".into());
@@ -362,6 +341,53 @@ pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, 
         });
     }
     crate::post::checked(doc, mesh, si, &sims, PostSettings::for_uc100)
+}
+
+/// What the UC100 profile's `out`puts refuse in a tool run's `ops`: a
+/// spindle speed above its maximum, a counterclockwise spindle without a
+/// direction output, and coolant it has no output for.
+pub fn output_problems(out: &uc100::config::Outputs, ops: &[crate::post::OpState]) -> Vec<String> {
+    let mut e = vec![];
+    for o in ops {
+        if out.spindle_pwm.is_some() && o.rpm as f64 > out.spindle_max_rpm {
+            e.push(format!(
+                "{}: S{} is above the UC100 profile's {:.0} rpm.",
+                o.name,
+                o.rpm.round(),
+                out.spindle_max_rpm
+            ));
+        }
+        if !o.clockwise && out.spindle_dir.is_none() && out.spindle_ccw.is_none() {
+            e.push(format!("{}: the spindle turns counterclockwise, but the UC100 profile has no spindle direction output.", o.name));
+        }
+        for (on, pin, what) in [
+            (o.coolant.1, out.flood, "flood"),
+            (o.coolant.0, out.mist, "mist"),
+        ] {
+            if on && pin.is_none() {
+                e.push(format!("{}: uses {what} coolant, but the UC100 profile has no {what} output. Set its coolant to Off, or add the output to the profile.", o.name));
+            }
+        }
+    }
+    e
+}
+
+/// How the planner checks setup `si` of a UC100 machine, from the job's
+/// simulations `sims`: as a run checks it before Cycle Start, without the
+/// checks that need the connected machine (its work zero and position).
+pub(crate) fn plan_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<crate::simulation::Simulation, String>)],
+) -> Result<(), Vec<String>> {
+    let programs = crate::post::checked(doc, mesh, si, sims, PostSettings::for_uc100)?;
+    let config = crate::control::profile(&doc.setups[si].machine).map_err(|e| vec![e])?;
+    let e: Vec<String> = programs
+        .iter()
+        .flat_map(|p| output_problems(&config.outputs, &p.ops))
+        .collect();
+    if e.is_empty() { Ok(()) } else { Err(e) }
 }
 
 /// The driver actions of a tool run's `program`: plan points become machine

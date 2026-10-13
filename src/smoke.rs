@@ -9200,7 +9200,7 @@ flood = { pin = 8 }
         // The preview's check lines; the second names the machine limits
         // that speeds and feeds are held to.
         assert_eq!(
-            plan_check_lines(),
+            plan_check_lines(false),
             [
                 "Every operation generates with the stock left by the ones before it",
                 "LinuxCNC export checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance",
@@ -9212,14 +9212,31 @@ flood = { pin = 8 }
         // clamps for a plan without modelled workholding, parallels, bolts,
         // the table and the machine body when every setup has a vise or clamps.
         assert_eq!(
-            plan_not_checked(Held::No),
+            plan_not_checked(Held::No, false),
             "Not checked: cutting loads, tool deflection, fixtures, clamps and the machine body. Speeds and feeds are checked against the material's cutting data, which are starting points."
         );
         assert_eq!(
-            plan_not_checked(Held::Every),
+            plan_not_checked(Held::Every, false),
             "Not checked: cutting loads, tool deflection, parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps are checked as boxes with a clearance gap in every setup; retracts to machine home are assumed to clear everything. Speeds and feeds are checked against the material's cutting data, which are starting points."
         );
-        assert_eq!(plan_not_checked(Held::Mixed), plan_not_checked(Held::No));
+        assert_eq!(
+            plan_not_checked(Held::Mixed, false),
+            plan_not_checked(Held::No, false)
+        );
+        // A UC100 plan is checked as a run checks it, whose retracts go to
+        // the clearance plane, not to machine home.
+        assert_eq!(
+            plan_check_lines(true)[1],
+            "UC100 run checks pass: machine rpm and feed limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs"
+        );
+        assert!(
+            plan_not_checked(Held::Every, true)
+                .contains("in every setup, retracts to the clearance plane included.")
+        );
+        assert_eq!(
+            plan_not_checked(Held::No, true),
+            plan_not_checked(Held::No, false)
+        );
         // The page beside the Plan button says the cutting data are sent.
         assert!(
             crate::ui::SENT_TO_OPENAI.contains(

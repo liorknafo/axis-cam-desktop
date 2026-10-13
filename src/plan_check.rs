@@ -877,6 +877,21 @@ fn run(
         laid = laid_out(built, mesh, &results);
         let job_doc = laid.as_ref().unwrap_or(built);
         let job = crate::post::post_simulated(job_doc, mesh, &results);
+        // A UC100 machine runs the toolpaths through its driver, not as
+        // exported NC: its setups are checked as a run checks them.
+        let refused: Vec<(usize, Vec<String>)> = job
+            .setups
+            .iter()
+            .filter_map(|setup| {
+                let si = setup.setup;
+                match get(&job_doc.setups[si].machine.p, "controller") {
+                    "UC100" => crate::run::plan_problems(job_doc, mesh, si, &results[si]).err(),
+                    _ => setup.result.clone().err(),
+                }
+                .map(|e| (si, e))
+            })
+            .collect();
+        let ready = job.errors.is_empty() && !job.setups.is_empty() && refused.is_empty();
         // Every workholding problem is reported once, as such: export finds
         // the same messages, which are left out of its list.
         let held: Vec<(usize, crate::post::Held)> = (0..job_doc.setups.len())
@@ -896,12 +911,12 @@ fn run(
                 message: message.clone(),
             })
             .collect();
-        for setup in &job.setups {
-            let ops = &built.setups[setup.setup].operations;
-            for message in setup.result.as_ref().err().into_iter().flatten() {
+        for (setup, messages) in &refused {
+            let ops = &built.setups[*setup].operations;
+            for message in messages {
                 if held
                     .iter()
-                    .any(|(si, h)| *si == setup.setup && h.message == *message)
+                    .any(|(si, h)| si == setup && h.message == *message)
                 {
                     continue;
                 }
@@ -910,7 +925,7 @@ fn run(
                     .filter(|i| message.starts_with(&format!("{}: ", ops[*i].name())))
                     .collect();
                 export.push(Problem {
-                    setup: setup.setup + 1,
+                    setup: setup + 1,
                     operation: (named.len() == 1).then(|| named[0] + 1),
                     stage: "export",
                     message: message.clone(),
@@ -928,7 +943,7 @@ fn run(
                 })
                 .collect();
         }
-        if !job.ready() && export.is_empty() && held.is_empty() {
+        if !ready && export.is_empty() && held.is_empty() {
             export.push(Problem {
                 setup: 0,
                 operation: None,
@@ -1701,6 +1716,41 @@ mod tests {
                 .any(|m| m.starts_with("export 1/None: Pocket by planner: coolant")),
             "{found:?}"
         );
+    }
+    #[test]
+    fn a_uc100_machine_is_planned_for_with_its_runs_checks_and_its_profiles_outputs() {
+        // The good plan on a UC100 with the owner's profile: no flood or
+        // mist output, so Off is its only coolant.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("jy5800.toml");
+        std::fs::write(&profile, include_str!("../assets/jy5800.toml")).unwrap();
+        let (mut doc, mesh, _) = block();
+        let machine = &mut doc.setups[0].machine;
+        machine.p.insert("controller".into(), "UC100".into());
+        machine
+            .p
+            .insert("uc100_profile".into(), profile.display().to_string());
+        assert!(
+            crate::analysis::preconditions(&doc, Some(&mesh))
+                .iter()
+                .all(|p| p.ok)
+        );
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        assert_eq!(report.machine.coolants, ["Off"]);
+        // The plan's Flood is refused as a run refuses it, not by the post.
+        let mut job = proposal::build(&doc, &mesh, &report, &good(&report)).unwrap();
+        let found = stages(&check_built(&job, &mesh, &report));
+        assert!(
+            found.iter().any(|m| m.starts_with("export 1/Some(1): ")
+                && m.ends_with("uses flood coolant, but the UC100 profile has no flood output. Set its coolant to Off, or add the output to the profile.")),
+            "{found:?}"
+        );
+        assert!(found.iter().all(|m| !m.contains("LinuxCNC")), "{found:?}");
+        for op in job.setups.iter_mut().flat_map(|s| &mut s.operations) {
+            op.p.insert("coolant".into(), "Off".into());
+        }
+        let check = check_built(&job, &mesh, &report);
+        assert!(check.passed, "{:?}", stages(&check));
     }
     /// The -Z orientation's top plane: the part's original underside.
     fn underside(report: &PartReport) -> Vec<usize> {
