@@ -2,3 +2,7 @@
 /dist/
 /smoke-output/
 .DS_Store
+/help-output/
+.idea/
+.vscode/
+*.swp
