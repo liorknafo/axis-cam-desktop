@@ -11,6 +11,13 @@ use iced::{
     },
 };
 use std::cell::RefCell;
+/// Where the 3D view looks from. The viewer is at (sin yaw · cos pitch,
+/// −cos yaw · cos pitch, sin pitch) from the target: yaw 0 looks from the
+/// front (−Y), a positive yaw goes round to the right (+X) and a positive
+/// pitch rises above. The frame is right-handed, screen right (cos yaw,
+/// sin yaw, 0) and screen up +Z projected on the screen, so a top view
+/// (yaw 0, pitch π/2) shows +X to the right and +Y up, a front view +X to
+/// the right and +Z up, and a right view (yaw π/2) +Y to the right.
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     pub yaw: f32,
@@ -230,14 +237,15 @@ impl Projector {
         let (s, c) = self.camera.yaw.sin_cos();
         let (se, ce) = self.camera.pitch.sin_cos();
         Point::new(
-            self.center.x + (x * c - y * s) * self.scale,
-            self.center.y - (-x * s * se - y * c * se + z * ce) * self.scale,
+            self.center.x + (x * c + y * s) * self.scale,
+            self.center.y - (-x * s * se + y * c * se + z * ce) * self.scale,
         )
     }
+    /// How far toward the viewer: larger is nearer.
     pub(crate) fn depth(&self, v: [f32; 3]) -> f32 {
         let (s, c) = self.camera.yaw.sin_cos();
         let (se, ce) = self.camera.pitch.sin_cos();
-        v[0] * s * ce + v[1] * c * ce + v[2] * se
+        v[0] * s * ce - v[1] * c * ce + v[2] * se
     }
 }
 impl Viewport<'_> {
@@ -1667,7 +1675,7 @@ mod tests {
         let p = view.projector(bounds);
         let (w, h, rgba) = view.pixels(&p, bounds, None);
         assert_eq!((w, h), (600, 450));
-        assert_eq!(digest(&rgba), 11316679358304618149);
+        assert_eq!(digest(&rgba), 8741738974532346260);
         // Faces the job leaves under stock are magenta.
         let magenta = |rgba: &[u8]| {
             rgba.chunks(4)
@@ -2183,5 +2191,117 @@ mod tests {
         v.operation = Some(&d.setup().operations[0]);
         v.picking = false;
         assert_eq!(v.picked(bounds, v.projector(bounds).p(point)), None);
+    }
+
+    /// The frame is right-handed: in each of the camera buttons' views
+    /// (TOP, FRONT, RIGHT and ISO, the default) the axes go where a part
+    /// seen from there has them.
+    #[test]
+    fn the_named_views_project_the_axes_as_a_right_handed_frame() {
+        use std::f32::consts::FRAC_PI_2;
+        let view = |yaw, pitch| {
+            Projector::fit(
+                Camera {
+                    yaw,
+                    pitch,
+                    ..Default::default()
+                },
+                (400., 300.),
+                crate::mesh::Bounds {
+                    min: [-1.; 3],
+                    max: [1.; 3],
+                },
+            )
+        };
+        // Each unit axis from the origin: the sign of its screen motion
+        // (x to the right, y down) and of its depth (toward the viewer).
+        let axes = |p: &Projector| {
+            let o = p.p([0.; 3]);
+            let sign = |d: f32| if d.abs() < 1e-4 { 0 } else { d.signum() as i8 };
+            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|v| {
+                let q = p.p(v);
+                (
+                    sign((q.x - o.x) / p.scale),
+                    sign((q.y - o.y) / p.scale),
+                    sign(p.depth(v)),
+                )
+            })
+        };
+        // TOP: +X right, +Y up, +Z toward the viewer.
+        assert_eq!(
+            axes(&view(0., FRAC_PI_2)),
+            [(1, 0, 0), (0, -1, 0), (0, 0, 1)]
+        );
+        // FRONT, from -Y: +X right, +Y away, +Z up.
+        assert_eq!(axes(&view(0., 0.)), [(1, 0, 0), (0, 0, -1), (0, -1, 0)]);
+        // RIGHT, from +X: +X toward the viewer, +Y right, +Z up.
+        assert_eq!(
+            axes(&view(FRAC_PI_2, 0.)),
+            [(0, 0, 1), (1, 0, 0), (0, -1, 0)]
+        );
+        // ISO, from the front right and above: +X right and down, toward
+        // the viewer; +Y right and up, away; +Z up.
+        let iso = Camera::default();
+        assert_eq!(
+            axes(&view(iso.yaw, iso.pitch)),
+            [(1, 1, 1), (1, -1, -1), (0, -1, 1)]
+        );
+    }
+    /// The pixels agree with the projector: a box beyond the part's +X
+    /// side is drawn on the right of a top view and one beyond +Y above.
+    #[test]
+    fn a_top_view_draws_what_is_beyond_x_on_the_right_and_beyond_y_above() {
+        use crate::holding::HoldBox;
+        let d = crate::model::Document::sample();
+        let mesh = crate::mesh::sample();
+        let view = |holding| Viewport {
+            setup: Some(d.setup()),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: true,
+            camera: Camera {
+                yaw: 0.,
+                pitch: std::f32::consts::FRAC_PI_2,
+                ..Default::default()
+            },
+            picking: false,
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding,
+            leftover: None,
+            live: None,
+            uncut: &[],
+        };
+        let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
+        let hold = |min, max| HoldBox {
+            label: "box".into(),
+            bounds: crate::mesh::Bounds { min, max },
+        };
+        for (hold, beyond_x) in [
+            (hold([150., -10., 0.], [180., 10., 20.]), true),
+            (hold([-10., 120., 0.], [10., 150., 20.]), false),
+        ] {
+            let with = view(vec![hold]);
+            let p = with.projector(b);
+            let (w, h, plain) = view(vec![]).pixels(&p, b, None);
+            let (_, _, drawn) = with.pixels(&p, b, None);
+            let changed: Vec<(u32, u32)> = (0..w * h)
+                .filter(|k| {
+                    let k = *k as usize * 4;
+                    plain[k..k + 4] != drawn[k..k + 4]
+                })
+                .map(|k| (k % w, k / w))
+                .collect();
+            assert!(changed.len() > 100, "{}", changed.len());
+            assert!(
+                changed
+                    .iter()
+                    .all(|&(x, y)| if beyond_x { x > w / 2 } else { y < h / 2 }),
+                "{:?}",
+                changed.iter().take(4).collect::<Vec<_>>()
+            );
+        }
     }
 }

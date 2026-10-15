@@ -26,34 +26,29 @@ const FILL: f32 = 0.9;
 const TRIAD: [i32; 4] = [0, 0, 86, 86];
 /// The most surfaces one list may name.
 const MAX_IDS: usize = 200;
-/// Each angle: name, words, yaw and pitch of `viewport::Camera`. The
-/// projector puts the viewer at (sin yaw · cos pitch, cos yaw · cos pitch,
-/// sin pitch); its frame is a mirror image, so pictures are flipped.
+/// Each angle: name, words, yaw and pitch of `viewport::Camera`, whose
+/// yaw 0 looks from the front (-Y), a positive yaw round to the right (+X)
+/// and a positive pitch from above.
 const ANGLES: [(&str, &str, f32, f32); 9] = [
-    (
-        "top",
-        "top",
-        std::f32::consts::PI,
-        std::f32::consts::FRAC_PI_2,
-    ),
-    ("front", "front (from -Y)", std::f32::consts::PI, 0.),
-    ("back", "back (from +Y)", 0., 0.),
+    ("top", "top", 0., std::f32::consts::FRAC_PI_2),
+    ("front", "front (from -Y)", 0., 0.),
+    ("back", "back (from +Y)", std::f32::consts::PI, 0.),
     ("left", "left (from -X)", -std::f32::consts::FRAC_PI_2, 0.),
     ("right", "right (from +X)", std::f32::consts::FRAC_PI_2, 0.),
+    ("iso_front_left", "isometric front-left", -0.75, 0.62),
+    ("iso_front_right", "isometric front-right", 0.75, 0.62),
     (
-        "iso_front_left",
-        "isometric front-left",
+        "iso_back_left",
+        "isometric back-left",
         -(std::f32::consts::PI - 0.75),
         0.62,
     ),
     (
-        "iso_front_right",
-        "isometric front-right",
+        "iso_back_right",
+        "isometric back-right",
         std::f32::consts::PI - 0.75,
         0.62,
     ),
-    ("iso_back_left", "isometric back-left", -0.75, 0.62),
-    ("iso_back_right", "isometric back-right", 0.75, 0.62),
 ];
 /// What the pictures are drawn from.
 #[derive(Clone)]
@@ -306,10 +301,10 @@ impl View {
         })
     }
     /// Where a point (display units, setup frame) lands in the picture:
-    /// x, y in pixels after the flip, and its depth.
+    /// x, y in pixels, and its depth.
     pub(crate) fn screen(&self, v: [f32; 3]) -> (f32, f32, f32) {
         let q = self.projector.p(v);
-        (SIZE as f32 - q.x, q.y, self.projector.depth(v))
+        (q.x, q.y, self.projector.depth(v))
     }
 }
 /// The display-unit bounds of `ids`' faces in `setup`'s frame, 15 % larger;
@@ -372,7 +367,7 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
     let (w, h) = (SIZE, SIZE - CAPTION);
     let (rgba, depths) =
         viewport.render(&view.projector, (w, h), 1., None, &args.highlight_surfaces);
-    let mut canvas = Canvas::over(&rgba, w, h, true);
+    let mut canvas = Canvas::over(&rgba, w, h);
     draw_toolpaths(&mut canvas, view, &depths);
     // Tags go on before the caption strip is added, so none reaches into it.
     let tags = if args.labels {
@@ -464,10 +459,9 @@ fn draw_toolpaths(canvas: &mut Canvas, view: &View, depths: &[f32]) {
             if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
                 continue;
             }
-            // The viewport's tolerance for its depth-tested lines; the
-            // depths are those of the frame before it was flipped.
+            // The viewport's tolerance for its depth-tested lines.
             let z = a.2 + (b.2 - a.2) * t;
-            if z + 0.05 >= depths[y as usize * w + (w - 1 - x as usize)] {
+            if z + 0.05 >= depths[y as usize * w + x as usize] {
                 canvas.disc((x, y), 0.75, [34, 114, 176]);
             }
         }
@@ -548,7 +542,7 @@ fn draw_tags(canvas: &mut Canvas, scene: &Scene, view: &View, depths: &[f32]) ->
 }
 /// Where the tag reading `text` goes: the first of `points` (picture x, y
 /// and depth) that is in the `w` × `h` picture and not hidden behind what
-/// was drawn (`depths`, of the frame before it was flipped), and whose box
+/// was drawn (`depths`), and whose box
 /// lies inside the picture and clear of the `taken` boxes. None when no
 /// point will do.
 fn spot(
@@ -564,7 +558,7 @@ fn spot(
             if !(x >= 0. && y >= 0. && x < w as f32 && y < h as f32) {
                 return false;
             }
-            if z + 0.5 < depths[y as usize * w + (w - 1 - x as usize)] {
+            if z + 0.5 < depths[y as usize * w + x as usize] {
                 return false;
             }
             let rect = Canvas::tag_rect((x, y), text);
@@ -815,9 +809,8 @@ mod tests {
         let s = scene();
         let args = Args::parse(&args(serde_json::json!({}))).unwrap();
         let mut view = View::new(&s, &args).unwrap();
-        // The part drawn small around the triad's centre (the frame is
-        // flipped after drawing), so that every tag's point is near it.
-        // The overview's angle, isometric front-left.
+        // The part drawn small around the triad's centre, so that every
+        // tag's point is near it. The overview's angle, isometric front-left.
         let (_, _, yaw, pitch) = ANGLES[5];
         let camera = Camera {
             yaw,
@@ -826,7 +819,7 @@ mod tests {
             pan: [0., 0.],
         };
         let part = Placement::new(&s.mesh, Some(&view.setup)).bounds;
-        let corner = (2. * SIZE as f32 - 80., 80.);
+        let corner = (80., 80.);
         view.projector = Projector::filling(camera, corner, &[part], 0.9);
         let (x, y, _) = view.screen(std::array::from_fn(|k| (part.min[k] + part.max[k]) / 2.));
         assert!(
@@ -875,7 +868,7 @@ mod tests {
         assert_eq!(spot(&[(600., 500., 0.)], &[drawn]), Some((600., 500.)));
         // Hidden behind what was drawn nearer.
         let mut near = depths.clone();
-        near[300 * frame.0 + (frame.0 - 1 - 400)] = 10.;
+        near[300 * frame.0 + 400] = 10.;
         assert_eq!(
             super::spot([inside, (600., 500., 0.)], "12", &[], frame, &near),
             Some((600., 500.))
