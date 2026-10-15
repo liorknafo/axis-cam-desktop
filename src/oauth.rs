@@ -209,7 +209,7 @@ pub fn parse_callback(target: &str, state: &str) -> Option<Result<Callback, Stri
 }
 /// A client ID OpenAI issued at registration: 1 to 200 characters of
 /// `A-Z a-z 0-9 _ -`. The placeholder used to ask for one is never an answer.
-fn valid_client_id(id: &str) -> bool {
+pub(crate) fn valid_client_id(id: &str) -> bool {
     (1..=200).contains(&id.len())
         && id != FIRST_CLIENT
         && id

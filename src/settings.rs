@@ -17,14 +17,38 @@ pub struct Settings {
 pub fn path(state_path: &Path) -> PathBuf {
     state_path.with_file_name("settings.json")
 }
-/// Missing or unreadable settings start fresh. The host ID is created once. A
-/// saved ID that is not valid is repaired and saved: a bare version-4 UUID from
-/// an earlier build keeps its UUID, anything else gets a new ID.
+/// Missing settings start fresh. The host ID is created once. A saved ID that
+/// is not valid is repaired and saved: a bare version-4 UUID from an earlier
+/// build keeps its UUID, anything else gets a new ID.
+#[cfg(test)]
 pub fn load(path: &Path) -> Settings {
-    let mut settings: Settings = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    load_reporting(path).0
+}
+/// `load`, and a sentence for the user when the file was there but could not
+/// be read. Such a file is never written over: it is renamed to
+/// `settings-unreadable-<id>.json` beside it, and only the two IDs are taken
+/// from it, so the saved sign-in can still be found and used.
+pub fn load_reporting(path: &Path) -> (Settings, Option<String>) {
+    let mut note = None;
+    // `changed`: the file's place is to get this run's settings. `writable`:
+    // it may, because nothing there is left to lose.
+    let (mut changed, mut writable) = (false, true);
+    let mut settings = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            let (aside, moved) = set_aside(path);
+            (note, changed, writable) = (Some(aside), true, moved);
+            salvaged_ids(&bytes)
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        // A file that cannot be read now may be fine later: leave it alone.
+        Err(e) => {
+            note = Some(format!(
+                "The settings file could not be read ({e}), so the app started with fresh settings that are not saved."
+            ));
+            writable = false;
+            Settings::default()
+        }
+    };
     if !valid_host_id(&settings.host_id) {
         let prefixed = format!("urn:uuid:{}", settings.host_id);
         settings.host_id = if valid_host_id(&prefixed) {
@@ -32,9 +56,43 @@ pub fn load(path: &Path) -> Settings {
         } else {
             new_host_id()
         };
+        changed = true;
+    }
+    if changed && writable {
         let _ = save(path, &settings);
     }
-    settings
+    (settings, note)
+}
+/// Renames the unreadable file aside. Returns what to tell the user and
+/// whether the file was moved; one that could not be moved is left alone.
+fn set_aside(path: &Path) -> (String, bool) {
+    let name = format!("settings-unreadable-{}.json", uuid::Uuid::new_v4());
+    match std::fs::rename(path, path.with_file_name(&name)) {
+        Ok(()) => (
+            format!(
+                "The settings file could not be read, so the app started with fresh settings. The old file is kept beside it as {name}."
+            ),
+            true,
+        ),
+        Err(e) => (
+            format!(
+                "The settings file could not be read, and could not be set aside ({e}), so the app started with fresh settings that are not saved."
+            ),
+            false,
+        ),
+    }
+}
+/// The installation's IDs, if the file is JSON and holds them as text.
+fn salvaged_ids(bytes: &[u8]) -> Settings {
+    let value: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+    let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+    Settings {
+        host_id: text("host_id").unwrap_or_default(),
+        client_id: text("client_id")
+            .filter(|id| crate::oauth::valid_client_id(id))
+            .unwrap_or_default(),
+        ..Settings::default()
+    }
 }
 /// A host ID is `urn:uuid:` and a lowercase version-4 UUID, the form OpenAI's
 /// authorize endpoint accepts as `ext_agent_host_id`.
@@ -78,6 +136,34 @@ mod tests {
         std::fs::write(&file, b"not json").unwrap();
         let recovered = load(&file);
         assert!(recovered.client_id.is_empty() && valid_host_id(&recovered.host_id));
+    }
+    #[test]
+    fn an_unreadable_file_is_renamed_aside_and_its_ids_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let host = format!("urn:uuid:{V4}");
+        let broken = serde_json::json!({ "host_id": host, "client_id": "oaiapp_1", "model": 5 });
+        std::fs::write(&file, broken.to_string()).unwrap();
+        let (loaded, note) = load_reporting(&file);
+        assert_eq!(
+            (loaded.host_id.as_str(), loaded.client_id.as_str()),
+            (host.as_str(), "oaiapp_1")
+        );
+        assert!(loaded.model.is_empty());
+        let note = note.expect("the user is told");
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("settings-unreadable-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(note.contains(&aside[0]), "{note}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&aside[0])).unwrap(),
+            broken.to_string().into_bytes()
+        );
+        // Fresh settings are saved in its place; a readable file has no note.
+        assert_eq!(load_reporting(&file), (loaded, None));
     }
     #[test]
     fn pictures_are_on_unless_turned_off_and_the_choice_is_saved() {

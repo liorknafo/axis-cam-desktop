@@ -92,6 +92,25 @@ const PLAN_BUSY: &str = "The previous plan check is still finishing; try again i
 const DEFAULT_MODEL: &str = "gpt-6.1-sol";
 const NOT_GRANTED: &str =
     "ChatGPT plan usage was not granted. Sign out, then sign in again and allow plan usage.";
+/// A saved sign-in whose client ID is gone cannot be refreshed, and OpenAI
+/// only revokes a token for the client it was issued to.
+const LOST_CLIENT: &str = "A saved ChatGPT sign-in was found, but the app has lost the ID OpenAI gave it, so it can neither use the sign-in nor end it at OpenAI.";
+const LOST_CLIENT_CLEARED: &str = "A saved ChatGPT sign-in was found, but the app has lost the ID OpenAI gave it, so it can neither use the sign-in nor end it at OpenAI. It was deleted from this computer. Sign in again; OpenAI may still list the old access in your ChatGPT settings, where you can remove it.";
+/// Reads the saved sign-in. With no client ID (`client_lost`) a saved one is
+/// deleted instead, and the error says so.
+fn read_saved_session(
+    store: &dyn session::SessionStore,
+    client_lost: bool,
+) -> Result<Option<session::Session>, String> {
+    let saved = store.load();
+    if client_lost && matches!(saved, Ok(Some(_))) {
+        return Err(match store.clear() {
+            Ok(()) => LOST_CLIENT_CLEARED.into(),
+            Err(e) => format!("{LOST_CLIENT} It could not be deleted: {e}"),
+        });
+    }
+    saved
+}
 /// How long edits must pause before the project is saved and the stock the
 /// earlier setups left is worked out again.
 const EDIT_PAUSE: Duration = Duration::from_millis(700);
@@ -873,6 +892,7 @@ impl App {
         // never in the real settings file or the Keychain.
         let isolated = smoke_dir.is_some() || state_path != storage::state_path();
         let settings_path = settings::path(&state_path);
+        let (settings, settings_note) = settings::load_reporting(&settings_path);
         let store = session::default_store(
             state_path.parent().unwrap_or(std::path::Path::new(".")),
             isolated,
@@ -987,10 +1007,10 @@ impl App {
             holding_note: std::cell::RefCell::new(None),
             stock_pictures: Default::default(),
             post_epoch: 0,
-            settings: settings::load(&settings_path),
+            settings,
             settings_path,
             account: Account::SignedOut,
-            account_note: String::new(),
+            account_note: settings_note.unwrap_or_default(),
             account_busy: false,
             settings_failure: None,
             sign_out_pending: false,
@@ -2152,16 +2172,18 @@ impl App {
     /// signing in and out later never reads the saved session behind it.
     /// The read can take as long as that permission dialog stays open, so
     /// `restoring` keeps the user from signing in until it has reported.
+    /// Without a client ID a saved session cannot be refreshed or revoked, so
+    /// it is deleted in the same step and the result says so, as an error.
     fn restore_account(&mut self) -> Task<Message> {
-        if std::mem::replace(&mut self.account_restored, true) || self.settings.client_id.is_empty()
-        {
+        if std::mem::replace(&mut self.account_restored, true) {
             return Task::none();
         }
         self.restoring = true;
         let store = self.store.clone();
+        let client_lost = self.settings.client_id.is_empty();
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || store.load())
+                tokio::task::spawn_blocking(move || read_saved_session(&*store, client_lost))
                     .await
                     .unwrap_or_else(|e| Err(format!("Could not read the saved sign-in: {e}")))
             },
@@ -3965,6 +3987,10 @@ impl App {
                         return self.adopt_session(session);
                     }
                     Ok(_) => {}
+                    // The note about an unreadable settings file stays.
+                    Err(e) if !self.account_note.is_empty() => {
+                        self.account_note = format!("{} {e}", self.account_note)
+                    }
                     Err(e) => self.account_note = e,
                 }
             }
