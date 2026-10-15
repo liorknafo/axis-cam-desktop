@@ -971,7 +971,7 @@ fn orientation(
                     diameter: r2(h.diameter),
                     opening_diameter: r2(h.opening),
                     depth: r2(h.top - h.bottom),
-                    through: h.bottom <= model.min[2] + 0.01,
+                    through: h.through,
                 })
                 .collect();
             holes_left = holes_left.saturating_sub(plane.holes.len());

@@ -374,6 +374,8 @@ pub struct Hole {
     pub opening: f32,
     pub top: f32,
     pub bottom: f32,
+    /// The bottom is the model's bottom: nothing of the part is under it.
+    pub through: bool,
 }
 /// Circular holes bounded by the selected horizontal rim, verified against mesh rays.
 /// Noncircular openings and boss outlines are rejected, never converted to drills.
@@ -477,6 +479,7 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
             opening: radius * 2.,
             top,
             bottom,
+            through: bottom <= g.bounds.min[2] + 0.01,
         });
     }
     holes.sort_by(|a, b| {
@@ -546,6 +549,9 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     if !["Yes", "No"].contains(&get(&op.p, "through")) {
         return Err("Choose Yes or No for breakthrough.".into());
     }
+    // Breakthrough is travel past the exit of a hole that goes through the
+    // part. Under a blind hole's bottom is the part, so such a hole is
+    // refused rather than drilled into, as the planner's plans are.
     let through = get(&op.p, "through") == "Yes";
     let breakthrough = if through {
         number(op, "breakthrough")?
@@ -583,6 +589,12 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                 h.diameter
             ));
         }
+        if through && !h.through {
+            return Err(format!(
+                "The Ø{:.2} hole at X{:.2} Y{:.2} is blind: the part goes on under its bottom, so it cannot be drilled through. Set Through to No, or use the diameter filter to drill only the holes that go through.",
+                h.diameter, h.center[0], h.center[1]
+            ));
+        }
         let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
         let target = h.bottom + number(op, "bottom")? - breakthrough;
         if target >= h.top
@@ -590,7 +602,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             || target < b.plan.stock.min[2] - breakthrough - 0.001
             || top - target >= b.plan.flute_length
         {
-            return Err("Drilling depth must fit the flute length. Enable breakthrough explicitly to go below the hole bottom.".into());
+            return Err("Drilling depth must fit the flute length, and the bottom offset cannot take the drill below the hole bottom: only Through does, below a hole that goes through the part.".into());
         }
         let envelope = Bounds {
             min: [
@@ -1295,8 +1307,14 @@ mod tests {
         assert_plan(plan);
     }
     fn hole_part() -> Mesh {
+        cup(false)
+    }
+    /// A Ø8 bore 8 mm deep in a Ø24 x 10 mm disc: annulus, cylindrical wall
+    /// and floor, 64 sides. The floor is the lowest point of the open cup
+    /// (`base` false), so the bore goes through; on a base the bore is blind,
+    /// with 2 mm of part under its floor.
+    fn cup(base: bool) -> Mesh {
         let mut t = vec![];
-        // Annulus, cylindrical wall, blind floor; 64 sides.
         for i in 0..64 {
             let a = i as f32 * std::f32::consts::TAU / 64.;
             let b = (i + 1) as f32 * std::f32::consts::TAU / 64.;
@@ -1310,6 +1328,13 @@ mod tests {
                 [p(4., 10., a), p(4., 10., b), p(4., 2., b), p(4., 2., a)],
             );
             t.push([[0., 0., 2.], p(4., 2., a), p(4., 2., b)]);
+            if base {
+                quad(
+                    &mut t,
+                    [p(12., 0., a), p(12., 0., b), p(12., 10., b), p(12., 10., a)],
+                );
+                t.push([[0., 0., 0.], p(12., 0., b), p(12., 0., a)]);
+            }
         }
         mesh::normalize(t).unwrap()
     }
@@ -1370,6 +1395,44 @@ mod tests {
                 .unwrap_err()
                 .contains("filter")
         );
+    }
+    #[test]
+    fn a_blind_hole_is_not_drilled_past_its_floor() {
+        let mesh = cup(true);
+        let (setup, mut op, tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].through && (found[0].top - found[0].bottom - 8.).abs() < 0.001);
+        // A new operation starts with Through = No: the drill stops at the floor.
+        assert_eq!(get(&op.p, "through"), "No");
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - found[0].bottom).abs() < 0.001);
+        assert!(
+            plan.moves
+                .iter()
+                .all(|m| m.to[2] >= found[0].bottom - 0.001)
+        );
+        assert_plan(plan);
+        // Through = Yes with the 1 mm of breakthrough it starts with: the blind
+        // hole is refused by name, not drilled 1 mm into the part under its floor.
+        op.p.insert("through".into(), "Yes".into());
+        let refused = format!(
+            "The Ø{:.2} hole at X{:.2} Y{:.2} is blind: the part goes on under its bottom, so it cannot be drilled through. Set Through to No, or use the diameter filter to drill only the holes that go through.",
+            found[0].diameter, found[0].center[0], found[0].center[1]
+        );
+        assert_eq!(generate(&setup, &op, &tool, &mesh).unwrap_err(), refused);
+        // Whatever the breakthrough.
+        op.p.insert("breakthrough".into(), "0".into());
+        assert_eq!(generate(&setup, &op, &tool, &mesh).unwrap_err(), refused);
+        // The open cup's floor is its lowest point, so breakthrough applies there.
+        op.p.insert("breakthrough".into(), "1".into());
+        let open = hole_part();
+        select_top(&mut op, &open);
+        let floor = holes(&setup, &op, &open).unwrap()[0].clone();
+        assert!(floor.through);
+        let through = generate(&setup, &op, &tool, &open).unwrap();
+        assert!((through.target - (floor.bottom - 1.)).abs() < 0.001);
     }
     #[test]
     fn new_milling_parameters_change_motion_and_setup_placement_is_respected() {

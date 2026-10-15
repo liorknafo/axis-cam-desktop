@@ -77,10 +77,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Feed to the target, pause for the selected Dwell time at the bottom, then retract. The preview uses cylindrical removal with the saved tool diameter; it does not model a drill-point cone."
         }
         ("through", "Yes") => {
-            "Extend the drill target below the selected bottom by Breakthrough. That extra travel is included in the preview, and modelled vise jaws and clamps are checked as boxes with a clearance gap; the material, parallels or the table underneath are not collision checked."
+            "Extend the drill target below the bottom of each hole that goes through the part by Breakthrough. A selected hole that is blind is refused, since the part goes on under its bottom: set Through to No, or use the diameter filter to drill only the holes that go through. That extra travel is included in the preview, and modelled vise jaws and clamps are checked as boxes with a clearance gap; the material, parallels or the table underneath are not collision checked."
         }
         ("through", "No") => {
-            "Stop at the selected bottom plus Bottom offset. The Breakthrough distance is not added. This does not guarantee a full-diameter exit for a real conical drill tip."
+            "Stop at the selected bottom plus Bottom offset, for blind holes and holes that go through alike. The Breakthrough distance is not added. This does not guarantee a full-diameter exit for a real conical drill tip."
         }
         ("hole_order", "Optimize travel") => {
             "Visit the next nearby detected hole using a greedy travel order. This reduces local linking distance; it is not a global minimum-time route calculation."

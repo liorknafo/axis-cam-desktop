@@ -1419,11 +1419,12 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
                                 Ok(holes) => {
                                     for h in holes.iter().take(24) {
                                         c = c.push(muted(format!(
-                                            "Bore Ø{:.2} / opening Ø{:.2} · X{:.2} Y{:.2} · depth {:.2} mm",
+                                            "Bore Ø{:.2} / opening Ø{:.2} · X{:.2} Y{:.2} · depth {:.2} mm · {}",
                                             h.diameter, h.opening,
                                             h.center[0],
                                             h.center[1],
-                                            h.top - h.bottom
+                                            h.top - h.bottom,
+                                            if h.through { "through" } else { "blind" }
                                         )));
                                     }
                                 }
