@@ -801,21 +801,25 @@ fn tenth(v: f32) -> String {
 /// first rapid of a program starts wherever the tool was, at that height.
 /// `top` is the box's top, the plane, `datum_z` and `stock_top` are in the
 /// setup's frame; the heights are said in work coordinates, and the least
-/// clearance as the operation's field takes it, above the stock top.
+/// clearance as the operation's field takes it, above the stock top. The
+/// machine's `blend` tolerance is counted in the heights, not named: the
+/// gap help says it is added.
 pub fn plane_message(
     label: &str,
     plane: f32,
     gap: f32,
+    blend: f32,
     top: f32,
     datum_z: f32,
     stock_top: f32,
 ) -> String {
-    let limit = tenth(top + gap - datum_z);
+    let reach = gap + blend;
+    let limit = tenth(top + reach - datum_z);
     format!(
         "The setup clearance plane (Z{}) is not above the {label} and its {} mm gap (Z{limit}). Raise the operations' clearance above {} mm over the stock top (Z{limit}), or retract to machine home.",
         tenth(plane - datum_z),
         mm(gap),
-        tenth(top + gap - stock_top)
+        tenth(top + reach - stock_top)
     )
 }
 /// The boxes as the 3D view draws them: nothing lower than the bottom of
@@ -2844,17 +2848,17 @@ mod tests {
     #[test]
     fn a_plane_not_above_the_box_and_its_gap_reads_in_work_coordinates() {
         assert_eq!(
-            plane_message("clamp on -X (offset 0)", 62.5, 2., 72.5, 47.5, 47.5),
+            plane_message("clamp on -X (offset 0)", 62.5, 2., 0., 72.5, 47.5, 47.5),
             "The setup clearance plane (Z15.0) is not above the clamp on -X (offset 0) and its 2 mm gap (Z27.0). Raise the operations' clearance above 27.0 mm over the stock top (Z27.0), or retract to machine home."
         );
         assert_eq!(
-            plane_message("vise jaw on +Y", 0., 0.5, 8.43, 0., 0.),
+            plane_message("vise jaw on +Y", 0., 0.5, 0., 8.43, 0., 0.),
             "The setup clearance plane (Z0.0) is not above the vise jaw on +Y and its 0.5 mm gap (Z8.9). Raise the operations' clearance above 8.9 mm over the stock top (Z8.9), or retract to machine home."
         );
         // The work zero is not always the stock top: 3 mm below it, the
         // height is 3 mm less than the Z the clearance plane has to pass.
         assert_eq!(
-            plane_message("clamp on +X (offset 0)", 15., 2., 30., 3., 3. + 7.),
+            plane_message("clamp on +X (offset 0)", 15., 2., 0., 30., 3., 3. + 7.),
             "The setup clearance plane (Z12.0) is not above the clamp on +X (offset 0) and its 2 mm gap (Z29.0). Raise the operations' clearance above 22.0 mm over the stock top (Z29.0), or retract to machine home."
         );
     }
