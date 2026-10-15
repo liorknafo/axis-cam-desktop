@@ -505,6 +505,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "iced",
+ "iced_runtime",
  "jsonwebtoken",
  "png 0.17.16",
  "reqwest",

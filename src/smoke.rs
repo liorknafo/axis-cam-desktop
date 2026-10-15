@@ -11240,6 +11240,119 @@ flood = { pin = 8 }
         ));
         assert!(a.client.is_some());
     }
+    /// Runs `task` on the current runtime, handing each message it produces
+    /// to `tx`; `pending` counts the tasks that have not ended.
+    fn pump_task(
+        task: Task<Message>,
+        tx: tokio::sync::mpsc::UnboundedSender<Message>,
+        pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use futures_util::StreamExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(mut stream) = iced_runtime::task::into_stream(task) else {
+            return;
+        };
+        pending.fetch_add(1, SeqCst);
+        tokio::spawn(async move {
+            while let Some(action) = stream.next().await {
+                if let iced_runtime::Action::Output(message) = action {
+                    let _ = tx.send(message);
+                }
+            }
+            pending.fetch_sub(1, SeqCst);
+        });
+    }
+    #[test]
+    fn a_cancel_or_sign_out_after_the_token_endpoint_answered_loses_no_tokens() {
+        use crate::fake_openai::{Fake, Resp, claims, id_token, jwks, tokens};
+        use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering::SeqCst};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for sign_out in [false, true] {
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let mut a = fresh_app(&dir);
+                let id_claims = Arc::new(Mutex::new(serde_json::Value::Null));
+                let served = id_claims.clone();
+                // The token endpoint answers at once; the signing keys stall,
+                // so the exchange is still running when the user acts.
+                let fake = Fake::start(move |r| match r.path.as_str() {
+                    "/jwks" => Resp {
+                        delay_ms: 700,
+                        ..Resp::json(200, jwks())
+                    },
+                    "/token" => Resp::json(
+                        200,
+                        tokens(
+                            "access-1",
+                            "refresh-1",
+                            &id_token(served.lock().unwrap().clone()),
+                            &crate::session::sample().scope,
+                        ),
+                    ),
+                    _ => Resp::json(404, serde_json::json!({})),
+                })
+                .await;
+                a.endpoints = crate::oauth::Endpoints::local(&fake.base);
+                a.open_browser = Arc::new(move |url: &str| {
+                    let url = reqwest::Url::parse(url).unwrap();
+                    let get = |key: &str| {
+                        url.query_pairs()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.into_owned())
+                            .unwrap_or_default()
+                    };
+                    *id_claims.lock().unwrap() = claims("oaiapp_1", &get("nonce"));
+                    let callback = format!(
+                        "{}?code=code-1&state={}&client_id=oaiapp_1",
+                        get("redirect_uri"),
+                        get("state")
+                    );
+                    tokio::spawn(async move { reqwest::get(callback).await });
+                    Ok(())
+                });
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let pending = Arc::new(AtomicUsize::new(0));
+                pump_task(a.update(Message::SignIn), tx.clone(), pending.clone());
+                // The token endpoint has answered once the keys are asked for.
+                let mut waited = 0;
+                while fake.seen("/jwks").is_empty() {
+                    assert!(waited < 400, "the sign-in never reached the keys");
+                    waited += 1;
+                    while let Ok(message) = rx.try_recv() {
+                        pump_task(a.update(message), tx.clone(), pending.clone());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                assert_eq!(fake.seen("/token").len(), 1);
+                let act = if sign_out {
+                    Message::SignOut
+                } else {
+                    Message::SignInCancel
+                };
+                pump_task(a.update(act), tx.clone(), pending.clone());
+                loop {
+                    if let Ok(message) = rx.try_recv() {
+                        pump_task(a.update(message), tx.clone(), pending.clone());
+                    } else if pending.load(SeqCst) == 0 {
+                        break;
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+                // The issued refresh token is either kept or revoked.
+                let saved = a.store.load().unwrap().is_some();
+                let revoked = !fake.seen("/revoke").is_empty();
+                assert!(saved || revoked, "sign_out={sign_out}: tokens were lost");
+                assert!(
+                    saved != matches!(a.account, crate::Account::SignedOut),
+                    "sign_out={sign_out}: the account must match the saved sign-in"
+                );
+            });
+        }
+    }
     #[test]
     fn the_sign_out_note_says_nothing_while_waiting_and_confirms_afterwards() {
         let dir = tempfile::tempdir().unwrap();
