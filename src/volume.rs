@@ -127,17 +127,17 @@ impl Volume {
     pub fn transformed_bounds(&self, to: Frame) -> Bounds {
         self.frame.transfer_bounds(self.bounds, to)
     }
-    #[allow(clippy::too_many_arguments)]
-    pub fn cut(
-        &mut self,
+    /// The voxels, as index ranges, that a cutter of `radius` with `flute`
+    /// long flutes moving from `a` to `b` in `current` can sweep: None when
+    /// its box misses the stock, or when it goes nowhere.
+    fn ranges(
+        &self,
         a: [f32; 3],
         b: [f32; 3],
         radius: f32,
         flute: f32,
-        shape: CutterShape,
         current: Frame,
-        source: (u16, u16),
-    ) {
+    ) -> Option<[(usize, usize); 3]> {
         let lo = [
             a[0].min(b[0]) - radius,
             a[1].min(b[1]) - radius,
@@ -159,11 +159,66 @@ impl Volume {
             }
         }
         if (0..3).any(|k| high[k] < self.bounds.min[k] || low[k] > self.bounds.max[k]) {
-            return;
+            return None;
         }
         if (0..3).all(|k| (a[k] - b[k]).abs() < 1e-7) {
-            return;
+            return None;
         }
+        Some(std::array::from_fn(|k| {
+            (
+                ((low[k] - self.bounds.min[k]) / self.cell[k])
+                    .floor()
+                    .clamp(0., self.n[k] as f32) as usize,
+                ((high[k] - self.bounds.min[k]) / self.cell[k])
+                    .ceil()
+                    .clamp(0., self.n[k] as f32) as usize,
+            )
+        }))
+    }
+    /// Whether a cutter of `radius` with `flute` long flutes moving from
+    /// `a` to `b` in `current` sweeps the centre of a voxel that still has
+    /// material: what `cut` would remove, without removing it.
+    pub fn touches(
+        &self,
+        a: [f32; 3],
+        b: [f32; 3],
+        radius: f32,
+        flute: f32,
+        shape: CutterShape,
+        current: Frame,
+    ) -> bool {
+        let Some(ranges) = self.ranges(a, b, radius, flute, current) else {
+            return false;
+        };
+        for z in ranges[2].0..ranges[2].1 {
+            for y in ranges[1].0..ranges[1].1 {
+                for x in ranges[0].0..ranges[0].1 {
+                    if self.occupied[self.index([x, y, z])] == 0 {
+                        continue;
+                    }
+                    let p = self.frame.transfer(self.point([x, y, z], 0.5), current);
+                    if swept(p, a, b, radius, flute, shape) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn cut(
+        &mut self,
+        a: [f32; 3],
+        b: [f32; 3],
+        radius: f32,
+        flute: f32,
+        shape: CutterShape,
+        current: Frame,
+        source: (u16, u16),
+    ) {
+        let Some(ranges) = self.ranges(a, b, radius, flute, current) else {
+            return;
+        };
         let cut = crate::stock_surface::Cut {
             a,
             b,
@@ -178,16 +233,6 @@ impl Volume {
             cuts.push(cut);
         }
         self.version = self.version.wrapping_add(1);
-        let ranges: [(usize, usize); 3] = std::array::from_fn(|k| {
-            (
-                ((low[k] - self.bounds.min[k]) / self.cell[k])
-                    .floor()
-                    .clamp(0., self.n[k] as f32) as usize,
-                ((high[k] - self.bounds.min[k]) / self.cell[k])
-                    .ceil()
-                    .clamp(0., self.n[k] as f32) as usize,
-            )
-        });
         for z in ranges[2].0..ranges[2].1 {
             for y in ranges[1].0..ranges[1].1 {
                 for x in ranges[0].0..ranges[0].1 {

@@ -3994,6 +3994,32 @@ M2
         );
         assert_eq!(errors(&post_job(&doc, &mesh)), [said.as_str()]);
     }
+    #[test]
+    fn a_skim_too_thin_for_the_voxels_is_still_held_against_and_a_1_mm_grip_refuses_it() {
+        // The fixture job reduced to its Facing, stopped 3.7 mm above the
+        // part: a 0.3 mm skim, above the centres of the stock's 1.3 mm voxels.
+        let (mut doc, mesh) = fixture::job();
+        doc.adopt_holders();
+        doc.setups[0].operations.retain(|o| o.name() == "Facing");
+        doc.setups[0].operations[0]
+            .p
+            .insert("bottom".into(), "3.7".into());
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let posted = post_job(&doc, &mesh);
+        assert!(posted.ready(), "{:?}", errors(&posted));
+        // Gripped 1 mm deep: the skim, taken as the slot it cuts (75 N
+        // sideways at 1000 mm/min in steel), is refused at the Facing.
+        doc.setups[0].p.insert("vise_grip".into(), "1".into());
+        let found = held(&doc, &mesh, 0, &results(&doc, &mesh)[0]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].operation, Some(0));
+        let said = &found[0].message;
+        assert_eq!(
+            said,
+            "Facing: the cut could tip the stock out of the vise: about 75 N, 46 mm above the top of the jaws' contact, which is 1.0 mm high and 98 mm long (×1.4, under the ×2 wanted). Grip deeper, take a smaller stepdown or stepover or a lower feed, or choose another holder."
+        );
+        assert_eq!(errors(&post_job(&doc, &mesh)), [said.as_str()]);
+    }
     /// `fixture::job`'s Facing, Pocket, Contour and Drilling in setup 1, held
     /// by nothing, then setup "Again" the same way up, drilling again, held
     /// by the starter vise on ±Y at grip 8.

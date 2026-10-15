@@ -1,20 +1,22 @@
 //! Whether a setup's vise or clamps hold the stock against the cutting
 //! forces of its operations. Each operation is replayed on the stock it
 //! starts from, the earlier setups' cuts included (`bites`); what it removes
-//! over each stretch gives the cutting force there, the material's specific
-//! cutting force over the cutting speed, at most what the spindle drives
-//! (`pushes`). That force, sideways and upward at the height it acts, is set
-//! against what the jaws' or clamps' friction and leverage resist, the jaws
-//! over the contact the earlier cuts left them (`check`). A simple model, a
-//! peak per operation: every assumed number is named below, and a library
-//! entry's clamping force (`force`) and a machine's spindle power (`power`)
-//! can be typed in.
+//! over each stretch (a stretch too light for the stock's voxels to register
+//! counts as the most that can hide between them) gives the cutting force
+//! there, the material's specific cutting force over the cutting speed, at
+//! most what the spindle drives (`pushes`). That force, sideways and upward
+//! at the height it acts, is set against what the jaws' or clamps' friction
+//! and leverage resist, the jaws over the contact the earlier cuts left them
+//! (`check`). A simple model, a peak per operation: every assumed number is
+//! named below, and a library entry's clamping force (`force`) and a
+//! machine's spindle power (`power`) can be typed in.
 use crate::holding::{Gripped, Holder, Layout, Side, clip, grid};
 use crate::material::Material;
 use crate::mesh::Bounds;
 use crate::model::{Document, Machine, get, num};
 use crate::rest::Removed;
 use crate::simulation::{Motion, Simulation};
+use crate::volume::Volume;
 use std::f32::consts::PI;
 
 /// Friction between the stock and a jaw, the table or a clamp's toe: dry
@@ -68,9 +70,17 @@ pub struct Bite {
 /// long (a rapid or a dwell ends a run). A run removes at most a slot as
 /// wide as the cutter and as deep as its flutes reach below the stock's
 /// top: a pass lighter than the stock's voxels can take a whole layer of
-/// them. Empty without that stock, and for drilling, which pushes the
-/// stock down into its holding and twists it (not modelled), but not
-/// sideways or up.
+/// them. A run whose cutter touches material (comes within half a voxel of
+/// a voxel that has some, `Volume::touches`) but sweeps none of the
+/// voxels' centres, as a skim thinner than half a voxel does, is never
+/// taken as free: it counts as removing a skin a voxel thick along the
+/// run, as wide as the cutter or as tall as its depth in the stock,
+/// whichever is more (the most that can hide between the centres), and at
+/// most the slot (exactly the slot for such a skim). A run in the air,
+/// over what the setup's earlier operations already cut away or beside
+/// the stock, removes nothing. Empty without that stock, and
+/// for drilling, which pushes the stock down into its holding and twists
+/// it (not modelled), but not sideways or up.
 /// ponytail: a replay more than the simulation makes; keep what
 /// `Simulation::seek` removes per move if that time ever shows.
 pub fn bites(sim: &Simulation) -> Vec<Bite> {
@@ -82,9 +92,25 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     }
     let plan = &sim.plan;
     let cell: f32 = volume.cell.iter().product();
+    // A voxel's longest side, mm.
+    let thick = volume.cell.into_iter().fold(0., f32::max);
     let (top, reach) = (plan.stock.max[2], 4. * plan.radius);
-    // Each run's voxels removed, length (mm), minutes and lowest tip.
-    let fresh = (0, 0., 0., f32::INFINITY);
+    // Whether the cutter, from `from` to `to`, grown by half a voxel all
+    // round, sweeps the centre of a voxel that has material: it touched some.
+    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume| {
+        let lower = |p: [f32; 3]| [p[0], p[1], p[2] - thick / 2.];
+        volume.touches(
+            lower(from),
+            lower(to),
+            plan.radius + thick / 2.,
+            plan.flute_length + thick,
+            plan.shape,
+            frame,
+        )
+    };
+    // Each run's voxels removed, length (mm), minutes, lowest tip and
+    // whether it touched material.
+    let fresh = (0, 0., 0., f32::INFINITY, false);
     let (mut runs, mut run) = (vec![], fresh);
     for m in &plan.moves {
         if m.motion != Motion::Feed || m.feed <= 0. {
@@ -114,6 +140,9 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             run.1 += length / pieces;
             run.2 += length / pieces / m.feed;
             run.3 = run.3.min(from[2]).min(to[2]);
+            if run.0 == 0 && !run.4 {
+                run.4 = touches(from, to, &volume);
+            }
             if run.1 >= 0.999 * reach {
                 runs.push(std::mem::replace(&mut run, fresh));
             }
@@ -121,12 +150,20 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     }
     runs.push(run);
     runs.into_iter()
-        .filter(|&(removed, _, minutes, _)| removed > 0 && minutes > 0.)
-        .map(|(removed, length, minutes, low)| {
+        .filter(|&(removed, _, minutes, _, touched)| (removed > 0 || touched) && minutes > 0.)
+        .map(|(removed, length, minutes, low, _)| {
             let depth = (top - low).clamp(0., plan.flute_length);
             let slot = 2. * plan.radius * depth * length;
+            // What swept no voxel's centre is a skin at most a voxel thick
+            // along the run, as wide as the cutter or as tall as its depth,
+            // whichever is more: so much is taken.
+            let removed = if removed > 0 {
+                removed as f32 * cell
+            } else {
+                thick * (2. * plan.radius).max(depth) * length
+            };
             Bite {
-                rate: (removed as f32 * cell).min(slot) / (minutes * 60.),
+                rate: removed.min(slot) / (minutes * 60.),
                 feed: length / minutes,
                 z: low + depth / 2.,
             }
@@ -533,7 +570,7 @@ mod tests {
     use crate::holding::{Bands, holdable, starters};
     use crate::model::Setup;
     use crate::simulation::{CutterShape, Motion};
-    use crate::volume::{Frame, Volume};
+    use crate::volume::Frame;
     /// 100 × 60 × 40 mm, its bottom at Z0.
     const STOCK: Bounds = Bounds {
         min: [-50., -30., 0.],
@@ -586,6 +623,58 @@ mod tests {
             let push = pushes(&full, 10., 3., 8000., material, &machine)[0];
             assert!((push.side - 191.).abs() < 1., "{push:?}");
         }
+    }
+    #[test]
+    fn a_skim_thinner_than_a_voxel_still_pushes_and_a_shallow_grip_refuses_it() {
+        // A Ø10 skim 0.3 mm deep along X across the whole stock at 1000
+        // mm/min: its tip stays above the centres of the top voxels (about 1
+        // mm tall), so it sweeps none of them.
+        let skim = |y: f32| {
+            let mut plan = crate::post::fixture::plan(
+                [-60., y, 39.7],
+                &[(Motion::Feed, [60., y, 39.7], 1000.)],
+            );
+            (plan.stock, plan.radius, plan.flute_length) = (STOCK, 5., 20.);
+            let mut sim = Simulation::new(plan);
+            (sim.initial_volume, sim.frame) = (Some(Volume::new(STOCK, frame())), Some(frame()));
+            sim.bites().to_vec()
+        };
+        let bites = skim(0.);
+        // Taken as the slot it cuts: 10 × 0.3 mm² at 16.7 mm/s, its force
+        // 0.15 mm under the top.
+        assert!(
+            !bites.is_empty(),
+            "a skim thinner than a voxel removes nothing"
+        );
+        assert!(
+            bites.iter().all(|b| (b.rate - 50.).abs() < 0.5
+                && (b.feed - 1000.).abs() < 0.1
+                && (b.z - 39.85).abs() < 0.01),
+            "{bites:?}"
+        );
+        // The same move beside the stock, in the air, cuts nothing.
+        assert!(skim(40.).is_empty());
+        // In steel (no material) with 3 flutes at 8000 rpm: 50 N, 75 N sideways.
+        let push = pushes(&bites, 10., 3., 8000., None, &Machine::new(3));
+        assert!((push[0].side - 75.4).abs() < 0.5, "{push:?}");
+        // The starter vise gripping 1 mm of the stock on ±Y holds it ×1.6
+        // against tipping: refused.
+        let layout = Layout::Vise {
+            holder: String::new(),
+            axis_y: true,
+            offset: 0.,
+            grip: 1.,
+            gap: 2.,
+        };
+        let m = check(&layout, &starter("Vise"), STOCK.into(), None, &push).unwrap();
+        assert_eq!(
+            line("Facing", Some(&m)),
+            "Facing: only ×1.6 against tipping; ×2 is wanted."
+        );
+        assert_eq!(
+            issue("Facing", &m).unwrap(),
+            "Facing: the cut could tip the stock out of the vise: about 75 N, 39 mm above the top of the jaws' contact, which is 1.0 mm high and 98 mm long (×1.6, under the ×2 wanted). Grip deeper, take a smaller stepdown or stepover or a lower feed, or choose another holder."
+        );
     }
     #[test]
     fn earlier_cuts_that_lower_the_jaws_contact_leave_a_later_setup_unheld() {
