@@ -176,7 +176,8 @@ pub enum SpeedFeed {
 }
 /// Checks an operation's spindle speed and feed against `material`, for
 /// `tool` on `machine` (whose maximum rpm and feed count as in range when the
-/// material asks for more). 1 % slack on every limit absorbs rounding.
+/// material asks for more; on a UC100 machine the profile's spindle maximum
+/// counts when it is lower). 1 % slack on every limit absorbs rounding.
 pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine) -> SpeedFeed {
     let name = crate::proposal::clip(material.name(), NAME_LIMIT);
     let Some(data) = material.cutting_data() else {
@@ -198,7 +199,14 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
     } else {
         1.
     };
-    let max_rpm = num(&machine.p, "rpm").unwrap_or(f32::INFINITY);
+    // The same maximum the model is told (`analysis::machine_report`); a
+    // profile that cannot be read leaves the saved rpm.
+    let max_rpm = num(&machine.p, "rpm").unwrap_or(f32::INFINITY).min(
+        crate::control::spindle_cap(machine)
+            .ok()
+            .flatten()
+            .unwrap_or(f32::INFINITY),
+    );
     let max_feed = num(&machine.p, "feed").map_or(f32::INFINITY, |v| v * inch);
     let vc = std::f32::consts::PI * d * n / 1000.;
     let fz = f / (n * z);

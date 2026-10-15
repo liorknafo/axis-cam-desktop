@@ -1068,11 +1068,8 @@ fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, Stri
         1.
     };
     let mut max_rpm = num(&machine.p, "rpm").unwrap_or(0.);
-    if get(&machine.p, "controller") == "UC100" {
-        let out = crate::control::profile(machine)?.outputs;
-        if out.spindle_pwm.is_some() {
-            max_rpm = max_rpm.min(out.spindle_max_rpm as f32);
-        }
+    if let Some(cap) = crate::control::spindle_cap(machine)? {
+        max_rpm = max_rpm.min(cap);
     }
     Ok(MachineReport {
         max_rpm,
