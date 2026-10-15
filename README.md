@@ -501,7 +501,11 @@ panel, at once when that machine is connected, or when you press
    same tool, as with touch-off G-code programs. The checks follow the
    project: after an edit, such as another workholding, the Control page
    checks the setup again on its own once the edits pause, keeping its
-   progress, as **Check again** does (LIO-150).
+   progress, as **Check again** does (LIO-150). The run keeps to the setup
+   picked when setups are moved in MANUFACTURE; once that setup is deleted,
+   the panel says "This setup was removed from the project." in place of its
+   tool runs, and nothing is touched off or probed from it, until another
+   setup is picked.
 2. Set machine zero, then the work zero (the setup's work offset must be the
    active one): by hand, with **Probe Z** on a plate, or with **Probe corner**,
    **Probe edge** or **Probe centre**. **Cycle Start** stays grey, with the reasons listed, until the

@@ -1826,6 +1826,80 @@ flood = { pin = 8 }
         assert!(has(&a, "Set machine zero again"), "{:?}", problems(&a));
     }
 
+    /// A run names its setup by id: moving a setup in MANUFACTURE moves the
+    /// run with it, and the check is of the setup where it is now. Deleting
+    /// it leaves the run with nothing to check, which it says.
+    #[test]
+    fn the_run_keeps_to_its_setup_when_setups_are_moved_or_removed() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        // A copy of the first setup without its operations, after it; the
+        // run is for the first setup, two tool runs.
+        let _ = a.update(Message::DuplicateSetup);
+        a.doc.setups[1].operations.clear();
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        let id = a.doc.setups[0].id.clone();
+        let count = |a: &App| run_of(a).checked().map(|p| p.len());
+        let refusal = |a: &App| {
+            run_of(a)
+                .programs
+                .as_deref()
+                .and_then(|p| p.as_ref().err().cloned())
+        };
+        assert_eq!(count(&a), Some(2), "{:?}", refusal(&a));
+        // MANUFACTURE: the copy is moved before it.
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::MoveSetup(-1));
+        assert_eq!(a.doc.setups[1].id, id);
+        assert!(run_of(&a).stale);
+        assert_eq!(run_of(&a).setup, 1, "the run keeps to its setup");
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("removed")),
+            "{:?}",
+            problems(&a)
+        );
+        // Back on the Control page, once the edits pause, it is checked again
+        // where it is now: its two tool runs, not the copy's refusal.
+        a.page = Page::Control;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(!run_of(&a).stale && run_of(&a).programs.is_none());
+        assert_eq!(run_of(&a).setup, 1);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), run_of(&a).setup);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!(count(&a), Some(2), "{:?}", refusal(&a));
+        // Deleted: the run has nothing to check and says so, and nothing is
+        // touched off or probed from it.
+        let removed = "This setup was removed from the project.";
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::ConfirmDeleteSetup(true));
+        assert!(a.doc.setups.iter().all(|s| s.id != id));
+        assert_eq!(refusal(&a), Some(vec![removed.into()]));
+        assert_eq!(problems(&a), vec![removed.to_string()]);
+        assert!(conn(&a).touch_off().is_none());
+        assert!(conn(&a).stock_top().is_err());
+        assert!(conn(&a).edges_setup().is_err());
+        assert!(crate::ui::work_zero_steps(&a, conn(&a)).is_none());
+        // The check once the edits pause, and Check again, find the same.
+        a.page = Page::Control;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let epoch = run_of(&a).epoch;
+        let _ = a.update(Message::Tick);
+        assert_ne!(run_of(&a).epoch, epoch);
+        assert!(!run_of(&a).stale);
+        assert_eq!(refusal(&a), Some(vec![removed.into()]));
+        let _ = a.update(Message::Run(R::Check));
+        assert_eq!(refusal(&a), Some(vec![removed.into()]));
+        let _ = a.view();
+        // The check refuses an index past the end rather than failing on it.
+        let past = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 1);
+        assert_eq!(past.err(), Some(vec![removed.into()]));
+    }
+
     /// The blind review's dead end (LIO-140): machine zero where the machine
     /// starts puts every tool run outside the soft limits. The errors point to
     /// Work zero on the stock, which says where the simulator's block is;
