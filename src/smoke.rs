@@ -1865,6 +1865,56 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
+    /// The Run strip, fixed above the part of the Control page that scrolls,
+    /// holds Cycle Start, Hold, Resume and Stop however long the tool-run
+    /// list is; the list is under it, in the Tool runs panel (#71).
+    #[test]
+    fn the_run_strip_keeps_cycle_start_and_stop_above_a_long_tool_run_list() {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        /// The buttons in a widget tree: the nodes that keep a button's state.
+        fn buttons(t: &Tree, button: Tag) -> usize {
+            usize::from(t.tag == button)
+                + t.children.iter().map(|c| buttons(c, button)).sum::<usize>()
+        }
+        let button = Tree::new(
+            iced::Element::<Message>::from(iced::widget::button("Cycle Start")).as_widget(),
+        )
+        .tag;
+        let counts = |a: &App| {
+            let strip = crate::ui::run_strip(a, conn(a));
+            let runs = crate::ui::run_panel(a, conn(a)).expect("the tool runs");
+            (
+                buttons(&Tree::new(strip.as_widget()), button),
+                buttons(&Tree::new(runs.as_widget()), button),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        check_run(&mut a, 0);
+        let two = run_of(&a).checked().expect("checked").to_vec();
+        assert_eq!(two.len(), 2);
+        let _ = a.view();
+        let (strip, runs) = counts(&a);
+        // The setup's button, then Cycle Start, Hold, Resume and Stop.
+        let setups = a
+            .doc
+            .setups
+            .iter()
+            .filter(|x| x.machine.id == conn(&a).machine_id)
+            .count();
+        assert_eq!(strip, setups + 4);
+        assert!(runs >= 2, "{runs}");
+        // Twelve tool runs: the two, six times over.
+        let epoch = run_of(&a).epoch;
+        let many: Vec<_> = (0..6).flat_map(|_| two.clone()).collect();
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(Ok(many))));
+        assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(12));
+        let _ = a.view();
+        // The strip is the same; the ten more tool runs are in the list under it.
+        assert_eq!(counts(&a), (strip, runs + 10));
+    }
+
     #[test]
     fn cycle_start_waits_for_what_the_run_panel_lists() {
         use crate::run::Action as R;

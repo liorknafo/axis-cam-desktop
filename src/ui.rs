@@ -3315,12 +3315,17 @@ fn control(app: &App) -> Element<'_, Message> {
     if s.state == Some(State::EStop) {
         head = head.push(primary("Reset", Message::MachineReset));
     }
-    let mut main = column![head.push(estop())].spacing(12).width(Fill);
-    if s.state == Some(State::EStop) {
-        if let Some(reason) = &s.estop_reason {
-            main = main.push(text(reason.clone()).size(13));
-        }
+    // Fixed above the part of the page that scrolls: the state, the E-stop
+    // and the Run strip, so Cycle Start, Hold, Resume and Stop never scroll
+    // out of sight below the tool-run list or the manual controls (#71).
+    let mut fixed = column![head.push(estop())].spacing(12).width(Fill);
+    if s.state == Some(State::EStop)
+        && let Some(reason) = &s.estop_reason
+    {
+        fixed = fixed.push(text(reason.clone()).size(13));
     }
+    let fixed = fixed.push(run_strip(app, c));
+    let mut main = column![].spacing(12).width(Fill);
     if let Some(id) = &s.identity {
         let v = |o: &Option<String>| o.clone().unwrap_or_else(|| "?".into());
         main = main.push(muted(format!(
@@ -3366,7 +3371,7 @@ fn control(app: &App) -> Element<'_, Message> {
             .into()
     };
     main = main.push(limits);
-    // The setup picked to run, beside the Run panel, with the machine's tool
+    // The setup picked to run, beside its tool runs, with the machine's tool
     // while a tool run cuts: the Work page is out of reach while it moves.
     let job = c
         .run
@@ -3377,24 +3382,23 @@ fn control(app: &App) -> Element<'_, Message> {
                 .get(r.setup)
                 .is_some_and(|x| x.id == app.doc.active)
         })
-        .and_then(|_| scene(app));
-    main = main.push(match job {
-        Some(view) => Element::from(
-            row![
-                run_panel(app, c),
-                machine_panel(
-                    "Job",
-                    column![
-                        container(view).height(360),
-                        muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts."),
-                        uncut_line(app).map(muted)
-                    ]
-                )
-            ]
-            .spacing(12),
-        ),
-        None => run_panel(app, c),
-    });
+        .and_then(|_| scene(app))
+        .map(|view| {
+            machine_panel(
+                "Job",
+                column![
+                    container(view).height(360),
+                    muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts."),
+                    uncut_line(app).map(muted)
+                ],
+            )
+        });
+    main = match (run_panel(app, c), job) {
+        (Some(runs), Some(job)) => main.push(row![runs, job].spacing(12)),
+        (Some(runs), None) => main.push(runs),
+        (None, Some(job)) => main.push(job),
+        (None, None) => main,
+    };
     let enabled: Vec<usize> = (0..6).filter(|&a| s.axes_enabled[a]).collect();
     let mono = |v: String| text(v).size(14).font(Font::MONOSPACE).width(110);
     let mut table = column![row![
@@ -3778,11 +3782,20 @@ fn control(app: &App) -> Element<'_, Message> {
             muted("Runs the line when Idle, or while a program is paused. Enter sends it too.")
         ],
     ));
-    row![left, scrollable(main.padding(4)).height(Fill).width(Fill)]
-        .spacing(12)
-        .padding(12)
+    row![
+        left,
+        column![
+            fixed.padding(4),
+            scrollable(main.padding(4)).height(Fill).width(Fill)
+        ]
+        .spacing(4)
         .height(Fill)
-        .into()
+        .width(Fill)
+    ]
+    .spacing(12)
+    .padding(12)
+    .height(Fill)
+    .into()
 }
 /// The green Cycle Start button, greyed out without a message.
 fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
@@ -3814,10 +3827,18 @@ fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
     }
 }
 
-/// The Run panel: a setup of this machine run tool run by tool run, with
-/// Cycle Start, Hold, Resume and Stop, its progress, and the manual tool
-/// change between tool runs.
-fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
+/// The Run strip: the setup of this machine run tool run by tool run, with
+/// Cycle Start, Hold, Resume and Stop, fixed above the part of the Control
+/// page that scrolls, so they never scroll out of sight below the tool-run
+/// list or the manual controls (#71). It shows the setup picked, the tool
+/// run Cycle Start starts, the progress of the tool run being cut or what
+/// holds Cycle Start back, and how the last tool run ended. The tool runs
+/// themselves, the manual tool change between them and the work zero on
+/// the stock are in the Tool runs panel (`run_panel`), which scrolls.
+pub(crate) fn run_strip<'a>(
+    app: &'a App,
+    c: &'a crate::control::Connection,
+) -> Element<'a, Message> {
     use crate::run::Action as R;
     use uc100::controller::State;
     let s = &c.snapshot;
@@ -3867,6 +3888,97 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         }
         Some(Ok(programs)) => programs,
     };
+    let count = programs.len();
+    // The tool run Cycle Start starts: the list marks it "next" below.
+    if !running && let Some(p) = programs.get(run.next) {
+        body = body.push(muted(format!(
+            "Next tool run: {} of {count}, T{} {}",
+            run.next + 1,
+            p.ops[0].tool,
+            p.ops[0].tool_name
+        )));
+    }
+    let mut problems = run.problems(c, &app.doc);
+    problems.extend(app.planning_busy().map(String::from));
+    let state = s.state.as_ref();
+    body = body.push(
+        row![
+            cycle_start(problems.is_empty().then_some(Message::Run(R::CycleStart))),
+            act("Hold", msg(state == Some(&State::Run), R::Hold), false),
+            act(
+                "Resume",
+                msg(
+                    matches!(state, Some(State::Hold | State::Paused(_))),
+                    R::Resume
+                ),
+                false
+            ),
+            act("Stop", msg(crate::run::busy(state), R::Stop), false),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    );
+    body = body.push(muted(
+        "Space holds from any page while no text field is being edited, and resumes on this page.",
+    ));
+    if let Some((p, op, block)) = run.progress(s.current_line) {
+        let i = run.running.as_ref().map_or(0, |r| r.index);
+        body = body
+            .push(
+                text(format!(
+                    "Tool run {} of {count} · operation {} of {}: {} · block {} of {}",
+                    i + 1,
+                    op + 1,
+                    p.ops.len(),
+                    p.ops[op].name,
+                    block + 1,
+                    p.blocks.len()
+                ))
+                .size(13),
+            )
+            .push(widget::progress_bar(
+                0.0..=p.blocks.len() as f32,
+                block as f32 + 1.,
+            ));
+    } else if !problems.is_empty() && !crate::run::busy(state) {
+        body = body.push(caution("Before Cycle Start", problems));
+        let off = run.coolant_off(c, &app.doc);
+        if !off.is_empty() {
+            let ops = &app.doc.setups[run.setup].operations;
+            let names: Vec<&str> = off.iter().map(|&i| ops[i].name()).collect();
+            body = body.push(act(
+                format!("Set coolant to Off: {}", names.join(", ")),
+                msg(!running, R::CoolantOff),
+                false,
+            ));
+        }
+    }
+    if let Some((ok, message)) = &run.outcome {
+        body = body.push(text(message.clone()).size(12).color(if *ok {
+            Color::from_rgb8(39, 130, 93)
+        } else {
+            Color::from_rgb8(166, 101, 32)
+        }));
+    }
+    machine_panel(&format!("Run · {}", run.name), body)
+}
+
+/// The Tool runs panel, in the part of the Control page that scrolls, under
+/// the Run strip: the setup's tool runs (Cycle Start starts the one marked
+/// next), the manual tool change between tool runs, and the work zero on
+/// the stock before the first. None until the setup is checked; the Run
+/// strip says what is being done or why it cannot run.
+pub(crate) fn run_panel<'a>(
+    app: &'a App,
+    c: &'a crate::control::Connection,
+) -> Option<Element<'a, Message>> {
+    use crate::run::Action as R;
+    let s = &c.snapshot;
+    let run = c.run.as_ref()?;
+    let programs = run.checked()?;
+    let running = run.running.is_some();
+    let msg = |on: bool, a: R| on.then_some(Message::Run(a));
+    let mut body = column![].spacing(10);
     let count = programs.len();
     for (i, p) in programs.iter().enumerate() {
         let mark = if run.running.as_ref().is_some_and(|r| r.index == i) {
@@ -3955,61 +4067,6 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             }
         }
     }
-    let mut problems = run.problems(c, &app.doc);
-    problems.extend(app.planning_busy().map(String::from));
-    let state = s.state.as_ref();
-    body = body.push(
-        row![
-            cycle_start(problems.is_empty().then_some(Message::Run(R::CycleStart))),
-            act("Hold", msg(state == Some(&State::Run), R::Hold), false),
-            act(
-                "Resume",
-                msg(
-                    matches!(state, Some(State::Hold | State::Paused(_))),
-                    R::Resume
-                ),
-                false
-            ),
-            act("Stop", msg(crate::run::busy(state), R::Stop), false),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    );
-    body = body.push(muted(
-        "Space holds from any page while no text field is being edited, and resumes on this page.",
-    ));
-    if let Some((p, op, block)) = run.progress(s.current_line) {
-        let i = run.running.as_ref().map_or(0, |r| r.index);
-        body = body
-            .push(
-                text(format!(
-                    "Tool run {} of {count} · operation {} of {}: {} · block {} of {}",
-                    i + 1,
-                    op + 1,
-                    p.ops.len(),
-                    p.ops[op].name,
-                    block + 1,
-                    p.blocks.len()
-                ))
-                .size(13),
-            )
-            .push(widget::progress_bar(
-                0.0..=p.blocks.len() as f32,
-                block as f32 + 1.,
-            ));
-    } else if !problems.is_empty() && !crate::run::busy(state) {
-        body = body.push(caution("Before Cycle Start", problems));
-        let off = run.coolant_off(c, &app.doc);
-        if !off.is_empty() {
-            let ops = &app.doc.setups[run.setup].operations;
-            let names: Vec<&str> = off.iter().map(|&i| ops[i].name()).collect();
-            body = body.push(act(
-                format!("Set coolant to Off: {}", names.join(", ")),
-                msg(!running, R::CoolantOff),
-                false,
-            ));
-        }
-    }
     if let Some(steps) = work_zero_steps(app, c) {
         use crate::control::Action;
         let mut buttons = row![].spacing(8);
@@ -4039,14 +4096,7 @@ fn run_panel<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             .push(note(steps.join("\n")))
             .push(buttons);
     }
-    if let Some((ok, message)) = &run.outcome {
-        body = body.push(text(message.clone()).size(12).color(if *ok {
-            Color::from_rgb8(39, 130, 93)
-        } else {
-            Color::from_rgb8(166, 101, 32)
-        }));
-    }
-    machine_panel(&format!("Run · {}", run.name), body)
+    Some(machine_panel("Tool runs", body))
 }
 /// Work zero on the stock, in the Run panel until the setup's first tool run
 /// starts: how to put the work zero its tool runs are cut from on the stock,
