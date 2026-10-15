@@ -3828,7 +3828,7 @@ flood = { pin = 8 }
             .clone()
     }
     #[test]
-    fn the_material_picker_selects_by_id_and_every_state_renders() {
+    fn the_material_picker_selects_by_id_and_every_state_builds() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = fresh_app(&dir);
         a.replace_document(Document::sample(), None);
