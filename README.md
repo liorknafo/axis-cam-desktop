@@ -531,10 +531,13 @@ panel, at once when that machine is connected, or when you press
    tool run can start: the machine Idle, the AXIS CAM machine's X/Y/Z travel
    equal to the profile's soft limits, X, Y and Z with a machine position,
    the tool run inside the soft limits at this work zero, a spindle speed,
-   direction and coolant the profile can give, and the setup checked since
-   the last edit. When operations ask for flood or mist coolant the profile
-   has no output for, **Set coolant to Off** under the reasons names them,
-   sets each one's coolant to Off and checks the setup again (LIO-145).
+   direction and coolant the profile can give, the spindle stopped or
+   already turning the tool run's way (a spindle left running by hand the
+   other way must be stopped first: the driver E-stops a reversal), and the
+   setup checked since the last edit. When operations ask for flood or mist
+   coolant the profile has no output for, **Set coolant to Off** under the
+   reasons names them, sets each one's coolant to Off and checks the setup
+   again (LIO-145).
 
    Until the first tool run starts, **Work zero on the stock**, in the Tool
    runs panel, walks through it. It names the setup's work zero and work
