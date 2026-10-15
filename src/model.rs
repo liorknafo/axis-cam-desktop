@@ -706,8 +706,18 @@ impl Operation {
             ) {
                 positive(&self.p, "stepdown", &mut e)
             }
-            if matches!(s, Strategy::Face | Strategy::Indexed | Strategy::Pocket) {
+            if matches!(s, Strategy::Face | Strategy::Indexed) {
                 bounded(&self.p, "stepover", 0.01, 100., &mut e)
+            }
+            // The pocket generator refuses a stepover over half the tool diameter
+            // (offset contours must overlap), so the editor says so in its words.
+            if s == Strategy::Pocket
+                && !num(&self.p, "stepover").is_some_and(|n| (0.01..=50.).contains(&n))
+            {
+                e.push(
+                    "Pocket stepover must be between 0.01 and 50% for overlapping offset contours."
+                        .into(),
+                )
             }
             if matches!(
                 s,
@@ -1671,6 +1681,30 @@ mod tests {
             .p
             .insert("rpm".into(), "99999".into());
         assert!(d.issues().iter().any(|s| s.contains("exceeds")))
+    }
+    #[test]
+    fn a_pocket_stepover_over_50_percent_is_an_issue_but_a_facing_one_is_not() {
+        let d = Document::sample();
+        let s = d.setup();
+        let issues = |strategy, stepover: &str| {
+            let mut o = Operation::new(strategy, d.tools[0].id.clone());
+            o.p.insert("stepover".into(), stepover.into());
+            o.issues(&s.machine, &d.tools, &[])
+                .into_iter()
+                .filter(|x| x.contains("tepover"))
+                .collect::<Vec<_>>()
+        };
+        assert!(issues(Strategy::Pocket, "50").is_empty());
+        let over = issues(Strategy::Pocket, "60");
+        assert!(
+            over.iter()
+                .any(|x| x.contains("Pocket stepover") && x.contains("50%")),
+            "{over:?}"
+        );
+        assert!(!issues(Strategy::Pocket, "0").is_empty());
+        assert!(issues(Strategy::Face, "60").is_empty());
+        assert!(issues(Strategy::Face, "100").is_empty());
+        assert!(!issues(Strategy::Face, "101").is_empty());
     }
     #[test]
     fn drill_only_relevant_cycle_fields() {
