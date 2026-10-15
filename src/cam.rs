@@ -416,24 +416,57 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
         if bottom >= top - 0.01 {
             continue;
         }
+        let through = bottom <= g.bounds.min[2] + 0.01;
         // The selected opening may be counterbored. Measure the narrowest
         // vertical corridor above its bottom, instead of treating a shoulder
-        // as an obstruction for every smaller drill.
+        // as an obstruction for every smaller drill. A blind hole's drill
+        // stops with its point at the bottom, so the floor a 118° point
+        // leaves (a cone, a fillet, flat) is not in its way: only what rises
+        // above that cone is. Under a hole that goes through the drill goes
+        // on, so everything down to the bottom counts there.
+        let point = if through {
+            0.
+        } else {
+            31f32.to_radians().tan()
+        };
+        let above = |p: &[f32; 3]| {
+            p[2] - point * ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt()
+        };
         let mut corridor = radius;
         for triangle in &g.triangles {
-            let mut polygon = vec![];
-            let z = bottom + 0.02;
+            // Each edge is split at its point nearest the centre, where the
+            // cone is lowest under it, so that a ledge whose edge passes the
+            // centre closer than its ends is not taken for floor.
+            let mut outline = vec![];
             for (a, b) in triangle
                 .p
                 .iter()
                 .zip(triangle.p.iter().cycle().skip(1))
                 .take(3)
             {
-                if a[2] >= z {
+                outline.push(*a);
+                let v = [b[0] - a[0], b[1] - a[1]];
+                let l2 = v[0] * v[0] + v[1] * v[1];
+                if l2 >= 1e-12 {
+                    let t = ((center[0] - a[0]) * v[0] + (center[1] - a[1]) * v[1]) / l2;
+                    if t > 0. && t < 1. {
+                        outline.push(std::array::from_fn(|k| a[k] + t * (b[k] - a[k])));
+                    }
+                }
+            }
+            let mut polygon = vec![];
+            let z = bottom + 0.02;
+            for (a, b) in outline
+                .iter()
+                .zip(outline.iter().cycle().skip(1))
+                .take(outline.len())
+            {
+                let (above_a, above_b) = (above(a), above(b));
+                if above_a >= z {
                     polygon.push((a[0] as f64, a[1] as f64));
                 }
-                if (a[2] >= z) != (b[2] >= z) {
-                    let t = (z - a[2]) / (b[2] - a[2]);
+                if (above_a >= z) != (above_b >= z) {
+                    let t = (z - above_a) / (above_b - above_a);
                     polygon.push((
                         (a[0] + t * (b[0] - a[0])) as f64,
                         (a[1] + t * (b[1] - a[1])) as f64,
@@ -479,7 +512,7 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
             opening: radius * 2.,
             top,
             bottom,
-            through: bottom <= g.bounds.min[2] + 0.01,
+            through,
         });
     }
     holes.sort_by(|a, b| {
@@ -1314,29 +1347,44 @@ mod tests {
     /// (`base` false), so the bore goes through; on a base the bore is blind,
     /// with 2 mm of part under its floor.
     fn cup(base: bool) -> Mesh {
+        let section: &[(f32, f32)] = if base {
+            &[
+                (0., 0.),
+                (12., 0.),
+                (12., 10.),
+                (4., 10.),
+                (4., 2.),
+                (0., 2.),
+            ]
+        } else {
+            &[(12., 10.), (4., 10.), (4., 2.), (0., 2.)]
+        };
+        mesh::normalize(revolved(section)).unwrap()
+    }
+    /// `section` turned about Z, 64 sides: (radius, height) points along the
+    /// part's section, each pair a ring of quads, a point on the axis at
+    /// either end a fan to it.
+    fn revolved(section: &[(f32, f32)]) -> Vec<[[f32; 3]; 3]> {
         let mut t = vec![];
         for i in 0..64 {
             let a = i as f32 * std::f32::consts::TAU / 64.;
             let b = (i + 1) as f32 * std::f32::consts::TAU / 64.;
             let p = |r: f32, z: f32, a: f32| [r * a.cos(), r * a.sin(), z];
-            quad(
-                &mut t,
-                [p(12., 10., a), p(12., 10., b), p(4., 10., b), p(4., 10., a)],
-            );
-            quad(
-                &mut t,
-                [p(4., 10., a), p(4., 10., b), p(4., 2., b), p(4., 2., a)],
-            );
-            t.push([[0., 0., 2.], p(4., 2., a), p(4., 2., b)]);
-            if base {
-                quad(
-                    &mut t,
-                    [p(12., 0., a), p(12., 0., b), p(12., 10., b), p(12., 10., a)],
-                );
-                t.push([[0., 0., 0.], p(12., 0., b), p(12., 0., a)]);
+            for pair in section.windows(2) {
+                let ((r0, z0), (r1, z1)) = (pair[0], pair[1]);
+                if r0 == 0. {
+                    t.push([[0., 0., z0], p(r1, z1, b), p(r1, z1, a)]);
+                } else if r1 == 0. {
+                    t.push([[0., 0., z1], p(r0, z0, a), p(r0, z0, b)]);
+                } else {
+                    quad(
+                        &mut t,
+                        [p(r0, z0, a), p(r0, z0, b), p(r1, z1, b), p(r1, z1, a)],
+                    );
+                }
             }
         }
-        mesh::normalize(t).unwrap()
+        t
     }
     fn select_top(op: &mut Operation, mesh: &Mesh) {
         let top = mesh
@@ -1433,6 +1481,114 @@ mod tests {
         assert!(floor.through);
         let through = generate(&setup, &op, &tool, &open).unwrap();
         assert!((through.target - (floor.bottom - 1.)).abs() < 0.001);
+    }
+    #[test]
+    fn a_blind_holes_drill_point_or_fillet_floor_does_not_narrow_its_bore() {
+        // Each hole is a Ø8 bore 8 mm deep in a Ø24 disc on a base 4 mm under
+        // its floor, so that it is blind; the drill of a hole with a drill
+        // point stops with its point at the cone's apex.
+        let blind = |hole: &[(f32, f32)]| {
+            let mut section = vec![(0., -4.), (12., -4.)];
+            section.extend_from_slice(hole);
+            revolved(&section)
+        };
+        // The height of a 118° drill point under a bore of radius `r`.
+        let point = |r: f32| r * 31f32.to_radians().tan();
+        let mut fillet = vec![(12., 10.), (4., 10.), (4., 2.5)];
+        fillet.extend((1..=8).map(|i| {
+            let a = i as f32 * std::f32::consts::FRAC_PI_2 / 8.;
+            (3.5 + 0.5 * a.cos(), 2.5 - 0.5 * a.sin())
+        }));
+        fillet.push((0., 2.));
+        let mut pin = blind(&[(12., 10.), (4., 10.), (4., 2.), (0., 2.)]);
+        for i in 0..16 {
+            let a = i as f32 * std::f32::consts::TAU / 16.;
+            let b = (i + 1) as f32 * std::f32::consts::TAU / 16.;
+            let p = |z: f32, a: f32| [2. + 0.5 * a.cos(), 0.5 * a.sin(), z];
+            quad(&mut pin, [p(8., a), p(8., b), p(2., b), p(2., a)]);
+            pin.push([[2., 0., 8.], p(8., a), p(8., b)]);
+        }
+        // Ledges 1 mm tall either side of a 2 mm channel along X across the
+        // floor: their walls are under a Ø8 drill's point at their ends and
+        // above it in the middle, 1 mm from the centre.
+        let mut ledges = blind(&[(12., 10.), (4., 10.), (4., 2.), (0., 2.)]);
+        for (y, far) in [(1., 3.), (-1., -3.)] {
+            quad(
+                &mut ledges,
+                [[-3., y, 2.], [3., y, 2.], [3., y, 3.], [-3., y, 3.]],
+            );
+            quad(
+                &mut ledges,
+                [[-3., y, 3.], [3., y, 3.], [3., far, 3.], [-3., far, 3.]],
+            );
+        }
+        for (name, triangles, bore, opening, depth) in [
+            (
+                "a 118° drill-point floor",
+                blind(&[(12., 10.), (4., 10.), (4., 2.), (0., 2. - point(4.))]),
+                8.,
+                8.,
+                8. + point(4.),
+            ),
+            ("a 0.5 mm bottom fillet", blind(&fillet), 8., 8., 8.),
+            (
+                "a Ø5 bore 3 mm deep under the Ø8 bore",
+                blind(&[
+                    (12., 10.),
+                    (4., 10.),
+                    (4., 5.),
+                    (2.5, 5.),
+                    (2.5, 2.),
+                    (0., 2.),
+                ]),
+                5.,
+                8.,
+                8.,
+            ),
+            ("a Ø1 pin 2 mm off the centre, 6 mm tall", pin, 3., 8., 8.),
+            (
+                "ledges 1 mm tall either side of a 2 mm channel",
+                ledges,
+                2.,
+                8.,
+                8.,
+            ),
+            (
+                "a blind Ø11 counterbore over a drilled Ø6.6 bore",
+                blind(&[
+                    (12., 10.),
+                    (5.5, 10.),
+                    (5.5, 7.),
+                    (3.3, 7.),
+                    (3.3, 2.),
+                    (0., 2. - point(3.3)),
+                ]),
+                6.6,
+                11.,
+                8. + point(3.3),
+            ),
+        ] {
+            let mesh = mesh::normalize(triangles).unwrap();
+            let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+            select_top(&mut op, &mesh);
+            let found = holes(&setup, &op, &mesh).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(found.len(), 1, "{name}");
+            let h = &found[0];
+            assert!(!h.through, "{name}: {h:?}");
+            assert!((h.diameter - bore).abs() < 0.02, "{name}: {h:?}");
+            assert!((h.opening - opening).abs() < 0.02, "{name}: {h:?}");
+            assert!((h.top - h.bottom - depth).abs() < 0.001, "{name}: {h:?}");
+            // A drill just under the bore's size is accepted; 0.5 mm over is not.
+            tool.p.insert("diameter".into(), (bore - 0.05).to_string());
+            generate(&setup, &op, &tool, &mesh).unwrap_or_else(|e| panic!("{name}: {e}"));
+            tool.p.insert("diameter".into(), (bore + 0.5).to_string());
+            assert!(
+                generate(&setup, &op, &tool, &mesh)
+                    .unwrap_err()
+                    .contains("exceeds an opening"),
+                "{name}"
+            );
+        }
     }
     #[test]
     fn new_milling_parameters_change_motion_and_setup_placement_is_respected() {
