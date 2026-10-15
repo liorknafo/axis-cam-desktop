@@ -23,6 +23,8 @@ pub const ORIENTATIONS: [(&str, [f32; 3]); 6] = [
     ("-Y", [-90., 0., 0.]),
 ];
 const MAX_PLANES: usize = 40;
+/// Faces whose heights differ by no more than this (mm) are one plane.
+const PLANE_TOLERANCE: f32 = 0.01;
 const MAX_HOLES: usize = 100;
 /// cos 0.5°: a face this close to horizontal counts as planar-horizontal.
 const FLAT: f32 = 0.99996;
@@ -918,23 +920,37 @@ fn orientation(
             ];
         }
     }
-    // Coplanar visible faces at one height form one plane.
-    let mut planes: std::collections::BTreeMap<i64, PlaneReport> = Default::default();
-    for (id, face) in &faces {
-        if !face.flat || face.visible < face.area * 0.5 {
-            continue;
+    // Coplanar visible faces at one height form one plane. Heights are sorted
+    // and merged while neighbours are within PLANE_TOLERANCE, so faces a few
+    // µm apart are never split by where a fixed bin edge happens to fall.
+    let mut heights: Vec<(f32, usize)> = faces
+        .iter()
+        .filter(|(_, face)| face.flat && face.visible >= face.area * 0.5)
+        .map(|(id, face)| (face.z, *id))
+        .collect();
+    heights.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut cluster_of: std::collections::HashMap<usize, usize> = Default::default();
+    let mut cluster = 0;
+    for (i, (z, id)) in heights.iter().enumerate() {
+        if i > 0 && z - heights[i - 1].0 > PLANE_TOLERANCE {
+            cluster += 1;
         }
-        let plane = planes
-            .entry((face.z * 500.).round() as i64)
-            .or_insert(PlaneReport {
-                surfaces: vec![],
-                kind: "floor",
-                depth_below_top: model.max[2] - face.z,
-                area: 0.,
-                bbox: face.bbox,
-                max_cutter_diameter: None,
-                holes: vec![],
-            });
+        cluster_of.insert(*id, cluster);
+    }
+    let mut planes: std::collections::BTreeMap<usize, PlaneReport> = Default::default();
+    for (id, face) in &faces {
+        let Some(&cluster) = cluster_of.get(id) else {
+            continue;
+        };
+        let plane = planes.entry(cluster).or_insert(PlaneReport {
+            surfaces: vec![],
+            kind: "floor",
+            depth_below_top: model.max[2] - face.z,
+            area: 0.,
+            bbox: face.bbox,
+            max_cutter_diameter: None,
+            holes: vec![],
+        });
         plane.surfaces.push(*id);
         plane.area += face.area;
         plane.bbox = [
@@ -1588,6 +1604,20 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn coplanar_faces_a_few_microns_apart_are_one_plane_whichever_side_of_a_bucket_they_fall() {
+        let (doc, _) = block();
+        // The pairs 0.0002 mm apart cross each of the 0.002 mm boundaries.
+        for step in 0..20 {
+            let report = report(&doc, &blocks_with_tops_a_hair_apart(step)).unwrap();
+            let top = &report.orientations[0];
+            assert_eq!(top.up, "+Z");
+            assert_eq!(top.planes.len(), 1, "step {step}: {:?}", top.planes);
+            assert_eq!(top.planes[0].kind, "top");
+            assert_eq!(top.planes[0].surfaces.len(), 2);
+            assert_eq!(top.planes[0].area, 2400.);
+        }
+    }
+    #[test]
     fn setup_one_must_be_square_and_keeps_its_own_rotation() {
         let (mut doc, mesh) = block();
         doc.setups[0].p.insert("rz".into(), "90".into());
@@ -2102,6 +2132,16 @@ pub(crate) mod tests {
             }
         }
         t
+    }
+    /// Two 40 × 30 mm blocks side by side, 10 + `step` × 0.0001 and
+    /// 10 + (`step` + 2) × 0.0001 mm high: their tops are one plane to within
+    /// 0.0002 mm. Over `step` 0 to 9 the pair crosses every 0.002 mm boundary
+    /// of the part's z values.
+    pub(crate) fn blocks_with_tops_a_hair_apart(step: u32) -> Mesh {
+        let h = |n: u32| 10. + n as f32 * 0.0001;
+        let mut t = cuboid([0., 0., 0.], [40., 30., h(step)]);
+        t.extend(cuboid([50., 0., 0.], [90., 30., h(step + 2)]));
+        crate::mesh::normalize(t).unwrap()
     }
     /// An outward-facing box from `lo` to `hi`.
     fn cuboid(lo: [f32; 3], hi: [f32; 3]) -> Vec<Tri> {

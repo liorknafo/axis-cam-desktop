@@ -1071,6 +1071,20 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn a_plan_may_list_surfaces_of_coplanar_faces_a_few_microns_apart() {
+        let (doc, _, _) = block();
+        for step in 0..20 {
+            let mesh = analysis::tests::blocks_with_tops_a_hair_apart(step);
+            let report = analysis::report(&doc, &mesh).unwrap();
+            let top = &report.orientations[0];
+            let ids: Vec<usize> = top.planes.iter().flat_map(|p| p.surfaces.clone()).collect();
+            assert_eq!(ids.len(), 2);
+            let plane = plane_of(top, &ids)
+                .unwrap_or_else(|| panic!("step {step}: the tops are in different planes"));
+            assert_eq!(plane.kind, "top");
+        }
+    }
+    #[test]
     fn parsing_accepts_a_valid_proposal_and_rejects_extras_and_missing_fields() {
         let (_, _, report) = block();
         let proposal = good(&report);
