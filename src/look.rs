@@ -418,7 +418,7 @@ pub fn tool() -> crate::openai::Tool {
                     "description": "The report's orientation to draw the part in; null for setup 1's. Ignored when `operation` is set: an operation is drawn in its own setup."},
                 "angle": {"type": "string", "enum": ANGLES.map(|a| a.0)},
                 "focus_surfaces": {"type": "array", "items": {"type": "integer"}, "description": "Zoom to these surface IDs; empty for the whole part."},
-                "highlight_surfaces": {"type": "array", "items": {"type": "integer"}, "description": "Surface IDs drawn in blue."},
+                "highlight_surfaces": {"type": "array", "items": {"type": "integer"}, "description": "Surface IDs drawn in blue. Not drawn in an `operation` view with `show_stock` true (the stock left after the operation hides the part's surfaces); the description then says so. Set `show_stock` to false to see them."},
                 "show_stock": {"type": "boolean"},
                 "show_workholding": {"type": "boolean"},
                 "labels": {"type": "boolean", "description": "Tags with each listed plane's surface IDs and each hole's diameter."},
@@ -703,13 +703,29 @@ fn describe(view: &View, args: &Args, tags: &[String]) -> String {
     } else {
         "; vise or clamps shown"
     };
+    // The viewport leaves the part's faces out when it shows the stock left
+    // after an operation, so nothing is there to tint.
+    let highlights = if view.sim.is_some() && args.show_stock && !args.highlight_surfaces.is_empty()
+    {
+        let ids: Vec<String> = args
+            .highlight_surfaces
+            .iter()
+            .map(usize::to_string)
+            .collect();
+        format!(
+            "; highlight of surfaces {} not drawn (stock after the operation shown; hide the stock to see them)",
+            ids.join(", ")
+        )
+    } else {
+        String::new()
+    };
     let tags = if tags.is_empty() {
         "none".to_string()
     } else {
         tags.join(", ")
     };
     format!(
-        "{} up, {}, {scope}{after}; {stock}{holding}; tags: {tags}",
+        "{} up, {}, {scope}{after}; {stock}{holding}{highlights}; tags: {tags}",
         up_words(view),
         view.angle_words
     )
@@ -1097,6 +1113,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(out.contains("Setup 1 has no operation 99"), "{out}");
+    }
+    #[test]
+    fn highlights_are_reported_as_not_drawn_when_the_stock_after_an_operation_is_shown() {
+        let mut s = scene();
+        let (_, job) = crate::plan_check::evaluate(&s.doc, &s.mesh, &s.report, &good(&s.report));
+        s.job = job.map(Arc::new);
+        let pocket = s.report.orientations[0]
+            .planes
+            .iter()
+            .find(|p| p.kind == "floor")
+            .unwrap()
+            .surfaces[0];
+        let look = |stock: bool, highlight: Vec<usize>| {
+            draw(
+                &s,
+                &args(serde_json::json!({
+                    "operation": {"setup": 1, "operation": 1},
+                    "show_stock": stock,
+                    "highlight_surfaces": highlight,
+                })),
+            )
+            .unwrap()
+            .description
+        };
+        // The part's faces are not drawn then, so the model is told.
+        let hidden = look(true, vec![pocket]);
+        assert!(
+            hidden.contains(&format!("highlight of surfaces {pocket} not drawn")),
+            "{hidden}"
+        );
+        assert!(look(true, vec![]).find("not drawn").is_none());
+        // With the stock hidden the part is drawn and tinted, nothing to report.
+        let shown = look(false, vec![pocket]);
+        assert!(shown.find("not drawn").is_none(), "{shown}");
     }
     #[test]
     fn the_purpose_is_cleaned_and_clipped() {
