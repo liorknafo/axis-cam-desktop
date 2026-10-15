@@ -4117,6 +4117,57 @@ flood = { pin = 8 }
         assert!(d.dirty);
     }
     #[test]
+    fn an_unreadable_workspace_is_set_aside_and_the_recovery_workspace_is_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.json");
+        let broken = b"{ not a project";
+        std::fs::write(&path, broken).unwrap();
+        let mut a = App::from_workspace(path.clone(), None);
+        a.doc.title = "Recovered edits".into();
+        a.dirty = true;
+        a.persist();
+        assert!(!a.dirty, "{}", a.status);
+        // The unreadable file is kept, aside, and the status says where.
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("workspace-unreadable-")
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), broken);
+        assert!(
+            a.status.contains(&aside[0].display().to_string()),
+            "{}",
+            a.status
+        );
+        // The next launch resumes what the first one saved, with no new file.
+        let b = App::from_workspace(path.clone(), None);
+        assert_eq!(b.doc.title, "Recovered edits", "{}", b.status);
+        assert_eq!(b.state_path, path);
+        assert!(!b.status.contains("unreadable"), "{}", b.status);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with("workspace-recovery-")),
+            "{names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("workspace-unreadable-"))
+                .count(),
+            1,
+            "{names:?}"
+        );
+    }
+    #[test]
     fn new_project_and_explore_example_carry_materials_without_duplicates() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);

@@ -911,15 +911,23 @@ impl App {
                     !notes.is_empty(),
                 ),
                 Err(e) => {
-                    state_path =
-                        state_path.with_file_name(format!("workspace-recovery-{}.json", id()));
-                    (
-                        Document::default(),
-                        format!(
-                            "{e} Original file preserved. A separate recovery workspace will be used."
-                        ),
-                        false,
-                    )
+                    // The unreadable file is moved aside, so the recovery
+                    // workspace is saved as `workspace.json` and the next
+                    // start resumes it. When it cannot be moved, a separate
+                    // file is used for this start only.
+                    let aside =
+                        state_path.with_file_name(format!("workspace-unreadable-{}.json", id()));
+                    let kept = match std::fs::rename(&state_path, &aside) {
+                        Ok(()) => format!("Original file preserved as {}.", aside.display()),
+                        Err(re) => {
+                            state_path = state_path
+                                .with_file_name(format!("workspace-recovery-{}.json", id()));
+                            format!(
+                                "Original file preserved (it could not be moved aside: {re}). A separate recovery workspace will be used."
+                            )
+                        }
+                    };
+                    (Document::default(), format!("{e} {kept}"), false)
                 }
             }
         } else {
