@@ -406,8 +406,9 @@ Once the machine is Idle, the Control page has everything needed before a job:
   up is +Y, away from you) and **Page Up/Down** (Z), and let go to stop. A
   release anywhere, leaving the button, or the window losing focus stops the
   jog too; a jog that a soft limit or E-stop ended needs a new press. Keys do
-  nothing while a text field is being edited. **0.01/0.1/1/10 mm** move one
-  step per press; the speed slider is a share of each axis's maximum speed.
+  nothing in the Controller configuration view, which hides these controls,
+  or while a text field is being edited. **0.01/0.1/1/10 mm** move one step
+  per press; the speed slider is a share of each axis's maximum speed.
 - **Work zero.** **Zero X/Y/Z/all** in the active coordinate system;
   **G54–G59** pick it (while Idle).
 - **Probe Z.** With a touch plate: set its **thickness** (measure it), the
@@ -549,7 +550,8 @@ panel, at once when that machine is connected, or when you press
    and sends them as one job; the driver checks the soft limits again before
    anything moves. **Hold**, **Resume** and **Stop** (decelerate, then spindle
    and coolant off). **Space** holds from any page while no text field is
-   being edited, and resumes from that hold on the Control page only. The
+   being edited, and resumes from that hold only on the Control page with
+   the run panel on screen, not in the Controller configuration view. The
    panel shows the tool run, operation and block being cut, and how the tool
    run ended.
 4. Between tool runs with different tools: the last one ended with the

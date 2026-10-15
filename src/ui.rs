@@ -3557,7 +3557,7 @@ fn control(app: &App) -> Element<'_, Message> {
             pad,
             speed,
             muted(
-                "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. Keys work on this page while no text field is being edited."
+                "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The arrow and Page keys jog while these controls are on screen and no text field is being edited."
             )
         ],
     );

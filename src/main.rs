@@ -2861,12 +2861,17 @@ impl App {
                     c.act(action);
                 }
             }
-            // Keys jog on the Control page only, and not while a text field
-            // has the focus: iced's text field keeps the left and right
-            // arrows but lets up, down and Page Up/Down through.
+            // Keys jog only while the Control page shows the jog controls,
+            // not in its Controller configuration view, and not while a
+            // text field has the focus: iced's text field keeps the left and
+            // right arrows but lets up, down and Page Up/Down through.
             Message::JogKey(axis, negative, repeat) => {
                 // A held key is kept going by the tick; a step is one per press.
-                if repeat || self.page != Page::Control || self.control.is_none() {
+                if repeat
+                    || self.page != Page::Control
+                    || self.machine_setup
+                    || self.control.is_none()
+                {
                     return Task::none();
                 }
                 self.jog_key = Some((axis, negative));
@@ -2876,7 +2881,11 @@ impl App {
             Message::JogKeyChecked(axis, negative, typing) => {
                 // The key must still be down: a release before the answer
                 // must not start a jog that nothing would stop.
-                if !typing && self.jog_key == Some((axis, negative)) && self.page == Page::Control {
+                if !typing
+                    && self.jog_key == Some((axis, negative))
+                    && self.page == Page::Control
+                    && !self.machine_setup
+                {
                     if let Some(c) = &mut self.control {
                         c.act(control::Action::JogPress(axis, negative));
                     }
@@ -2906,14 +2915,17 @@ impl App {
                 }
             }
             // Space holds a job or move from any page, and resumes from that
-            // hold only on the Control page, so a Space meant for something
-            // else cannot start the machine.
+            // hold only on the Control page with its run panel on screen, not
+            // in the Controller configuration view, so a Space meant for
+            // something else cannot start the machine.
             Message::HoldKey => {
                 use uc100::controller::{Command, State};
                 if let Some(c) = &self.control {
                     match c.snapshot.state {
                         Some(State::Run) => c.send(Command::FeedHold),
-                        Some(State::Hold) if self.page == Page::Control => c.send(Command::Resume),
+                        Some(State::Hold) if self.page == Page::Control && !self.machine_setup => {
+                            c.send(Command::Resume)
+                        }
                         _ => {}
                     }
                 }
