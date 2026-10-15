@@ -66,6 +66,9 @@ pub struct Run {
     /// The work system and X/Y work offset when the first tool run started:
     /// tool changes keep X/Y zero.
     xy: Option<(usize, [f64; 2])>,
+    /// The setup's work zero when the first tool run started (`Checked::origin`
+    /// and `datum`): what the machine's work offset was touched off for.
+    zero: Option<(String, [f32; 3])>,
     /// The reference surface's work Z.
     pub reference: Option<f64>,
     /// The tool of the last tool run started and the Z work offset then.
@@ -90,6 +93,7 @@ impl Run {
             done: vec![],
             running: None,
             xy: None,
+            zero: None,
             reference: None,
             last: None,
             touched: false,
@@ -243,6 +247,26 @@ impl Run {
                 e.push("X/Y work zero changed since the first tool run started. Tool changes keep X/Y zero: put it back, or pick the setup again to start over.".into());
             }
         }
+        if let Some((origin, datum)) = &self.zero {
+            let moved: Vec<String> = (0..3)
+                .filter(|&a| (p.datum[a] - datum[a]).abs() > 1e-3)
+                .map(|a| format!("{} {:.3}", AXES[a], p.datum[a] - datum[a]))
+                .collect();
+            if !moved.is_empty() {
+                let what = if p.origin == *origin {
+                    format!("{origin} moved {} mm in the project", moved.join(" "))
+                } else {
+                    format!(
+                        "{origin} then, {} now, {} mm apart",
+                        p.origin,
+                        moved.join(" ")
+                    )
+                };
+                e.push(format!(
+                    "The setup's work zero moved since the first tool run started: {what}. The machine's work zero was touched off for the old one, so this tool run would cut that far from where the first one did. Put the setup back as it was, or pick it again to start over and touch off the new work zero."
+                ));
+            }
+        }
         if let Some((tool, z)) = &self.last {
             if *tool != p.ops[0].tool_id && !self.touched && (s.work_offset[2] - z).abs() < 1e-6 {
                 e.push(format!(
@@ -289,6 +313,7 @@ impl Run {
         let s = &c.snapshot;
         let actions = lower(p, s.work_offset, s.machine_pos);
         let tool = p.ops[0].tool_id.clone();
+        let zero = (p.origin.clone(), p.datum);
         let name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
         self.running = Some(Running {
             index: self.next,
@@ -297,6 +322,7 @@ impl Run {
         });
         self.xy
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
+        self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
         self.touched = false;
         self.outcome = None;
@@ -722,6 +748,7 @@ mod tests {
                 offset: [0.; 6],
             }),
             xy: None,
+            zero: None,
             reference: None,
             last: None,
             touched: false,
