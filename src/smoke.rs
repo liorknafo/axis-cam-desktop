@@ -1731,6 +1731,84 @@ flood = { pin = 8 }
         assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
     }
 
+    /// The setup's work zero moved in the project between tool runs (its
+    /// origin picked anew, or the stock moved under the same origin), but the
+    /// machine's work offset was touched off for the old one: a later tool
+    /// run would cut shifted by the difference. Cycle Start refuses it once
+    /// the setup is checked again, until it is put back or picked again.
+    #[test]
+    fn a_work_zero_moved_in_the_project_between_tool_runs_is_refused() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        // Tool run 1 starts, which keeps the work zero from then on, and is
+        // stopped: the machine is Idle again with the same tool next.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).started());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // An edit, then the Control page's own check once the edits pause.
+        let recheck = |a: &mut App| {
+            let _ = a.update(Message::Title("Edited".into()));
+            assert!(has(a, "project changed"), "{:?}", problems(a));
+            a.last_edit -= crate::EDIT_PAUSE * 2;
+            let _ = a.update(Message::Tick);
+            let epoch = run_of(a).epoch;
+            let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+            assert!(programs.is_ok(), "{:?}", programs.err());
+            let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+            assert!(!run_of(a).stale);
+        };
+        // The work zero moves to a corner: refused, with both zeros and the
+        // distance, and Cycle Start does nothing.
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        recheck(&mut a);
+        let moved: Vec<String> = problems(&a)
+            .into_iter()
+            .filter(|p| p.contains("work zero moved since the first tool run started"))
+            .collect();
+        assert_eq!(moved.len(), 1, "{:?}", problems(&a));
+        for text in [
+            "Stock top center then, Stock top front-left now",
+            "pick it again to start over and touch off the new work zero",
+        ] {
+            assert!(moved[0].contains(text), "{text}: {}", moved[0]);
+        }
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // Put back, it runs again.
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top center".into());
+        recheck(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // The same origin on a stock grown 10 mm to the right: its centre,
+        // the zero, moved 5 mm in X.
+        a.doc.setups[0].p.insert("stock_right".into(), "12".into());
+        recheck(&mut a);
+        assert!(
+            has(&a, "Stock top center moved X 5.000 mm"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // Picking the setup again starts over: the new zero is touched off.
+        check_run(&mut a, 0);
+        assert!(!run_of(&a).started());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
     #[test]
     fn cycle_start_waits_for_what_the_run_panel_lists() {
         use crate::run::Action as R;
