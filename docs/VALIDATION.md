@@ -277,6 +277,7 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
 
   The Work page renders each time. The example part says nothing.
 - `the_viewport_draws_the_same_pixels_after_the_split`: the pinned pixels do not change with no face marked. With every face marked uncut and the stock hidden, over 10,000 pixels are magenta.
+- `the_raster_is_drawn_again_when_the_uncut_result_changes`: the 3D view draws its raster again only when the key it is cached under changes, and that key now holds the uncut result's identity (where its faces are and how many). It is the same for the same inputs, and differs with no face marked and every face marked, with the result gone and with the result worked out again. Found in the project-wide review (issue #8): the key left the result out, so the magenta faces appeared, or went away after an edit, only once the camera moved or the stock was toggled.
 - Not a test, seen in a debug test build with a temporary print:
   - **Fixture job, one setup** (Facing, Pocket, Contour, Drilling, Parallel, Waterline): 14 regions are left. These include:
     - the bottom;

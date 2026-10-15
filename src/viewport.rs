@@ -399,6 +399,41 @@ impl Viewport<'_> {
         let (w, h, rgba) = self.pixels(p, bounds, hovered);
         RasterFrame::from_rgba(w, h, &rgba)
     }
+    /// What the cached raster (`State::raster`) was drawn from: `draw` keeps
+    /// it while this stays the same and draws it again when it changes, so
+    /// everything the pixels depend on is in it. The mesh and the uncut faces
+    /// are in it by identity, as each is replaced whole (the faces by
+    /// `Message::LeftStock`, in the background) and never edited in place.
+    fn raster_key(&self, bounds: Rectangle, hovered: Option<usize>) -> String {
+        let key = format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:p}",
+            self.camera,
+            bounds,
+            self.setup.map(|s| &s.p),
+            self.operation.map(|o| &o.geometry),
+            hovered,
+            self.picking,
+            (self.mesh.faces.as_ptr())
+        );
+        let key = format!(
+            "{key}|{}|{:?}|{:?}|{}|{:?}|{}|{:?}",
+            self.show_paths,
+            self.progress,
+            self.operation.map(|o| o.strategy),
+            self.show_stock,
+            self.operation.map(|o| &o.surfaces),
+            self.sample,
+            self.simulation.map(|s| (s.id.as_str(), s.revision))
+        );
+        format!(
+            "{key}|{:?}|{:?}|{:?}|{:?}|{}",
+            self.holding,
+            self.leftover,
+            self.live,
+            self.uncut.first().map(std::ptr::from_ref),
+            self.uncut.len()
+        )
+    }
     /// The scene as RGBA pixels, `w` by `h`.
     fn pixels(
         &self,
@@ -1043,30 +1078,7 @@ impl canvas::Program<Event> for Viewport<'_> {
             .filter(|_| state.drag.is_none())
             .and_then(|pt| self.picked(bounds, pt));
         let background = frame.into_geometry();
-        let key = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:p}",
-            self.camera,
-            bounds,
-            self.setup.map(|s| &s.p),
-            self.operation.map(|o| &o.geometry),
-            hovered,
-            self.picking,
-            (self.mesh.faces.as_ptr())
-        );
-        let key = format!(
-            "{key}|{}|{:?}|{:?}|{}|{:?}|{}|{:?}",
-            self.show_paths,
-            self.progress,
-            self.operation.map(|o| o.strategy),
-            self.show_stock,
-            self.operation.map(|o| &o.surfaces),
-            self.sample,
-            self.simulation.map(|s| (s.id.as_str(), s.revision))
-        );
-        let key = format!(
-            "{key}|{:?}|{:?}|{:?}",
-            self.holding, self.leftover, self.live
-        );
+        let key = self.raster_key(bounds, hovered);
         let mut cached = state.raster.borrow_mut();
         if cached.as_ref().is_none_or(|(previous, _)| *previous != key) {
             *cached = Some((key, self.raster(&p, bounds, hovered)));
@@ -1694,6 +1706,47 @@ mod tests {
         };
         let (_, _, rgba) = uncut.pixels(&p, bounds, None);
         assert!(magenta(&rgba) > 10_000, "{}", magenta(&rgba));
+    }
+    #[test]
+    fn the_raster_is_drawn_again_when_the_uncut_result_changes() {
+        let (doc, mesh) = crate::post::fixture::job();
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 400.,
+            height: 300.,
+        };
+        let key = |uncut: &[bool]| {
+            Viewport {
+                setup: doc.setups.first(),
+                operation: None,
+                mesh: &mesh,
+                simulation: None,
+                sample: false,
+                camera: Camera::default(),
+                picking: false,
+                show_stock: true,
+                show_paths: false,
+                progress: None,
+                holding: vec![],
+                leftover: None,
+                live: None,
+                uncut,
+            }
+            .raster_key(bounds, None)
+        };
+        let all = vec![true; mesh.faces.len()];
+        // The same inputs keep the raster.
+        assert_eq!(key(&[]), key(&[]));
+        assert_eq!(key(&all), key(&all));
+        // The check finishing (`Message::LeftStock`) changes nothing but the
+        // uncut faces: the raster is drawn again, so the magenta appears
+        // without a camera move.
+        assert_ne!(key(&[]), key(&all));
+        // The job edited, so the result no longer counts, and the result
+        // worked out again, a new allocation whether or not the same faces.
+        assert_ne!(key(&all), key(&[]));
+        assert_ne!(key(&all), key(&all.clone()));
     }
     #[test]
     fn a_later_setups_known_box_is_drawn_as_its_stock_and_otherwise_none_is() {
