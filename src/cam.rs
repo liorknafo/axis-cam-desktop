@@ -1692,6 +1692,9 @@ mod tests {
     #[test]
     fn real_step_and_3mf_new_operations_generate_and_survive_save_reload() {
         for ext in ["step", "3mf"] {
+            if ext == "step" && crate::step::skip_without_helper() {
+                continue;
+            }
             let mesh = mesh::load(
                 &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join(format!("examples/four-setup-block.{ext}")),

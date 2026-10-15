@@ -679,6 +679,9 @@ mod tests {
     #[test]
     fn actual_step_and_3mf_pocket_with_boss_generate_and_leave_the_boss() {
         for extension in ["step", "3mf"] {
+            if extension == "step" && crate::step::skip_without_helper() {
+                continue;
+            }
             let mesh = mesh::load(
                 &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join(format!("examples/four-setup-block.{extension}")),

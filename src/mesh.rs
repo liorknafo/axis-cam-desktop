@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn step_and_3mf_test_block_have_same_mm_bounds() {
         for format in ["step", "3mf"] {
-            if format == "step" && option_env!("AXIS_BUILT_STEP_HELPER").is_none() {
+            if format == "step" && crate::step::skip_without_helper() {
                 continue;
             }
             let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -507,7 +507,7 @@ mod tests {
     }
     #[test]
     fn step_converts_inches_and_places_assembly_components() {
-        if option_env!("AXIS_BUILT_STEP_HELPER").is_none() {
+        if crate::step::skip_without_helper() {
             return;
         }
         for (file, expected) in [
