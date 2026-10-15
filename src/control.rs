@@ -530,6 +530,8 @@ fn job(name: &str, actions: Vec<Do>) -> Command {
 /// How often a held jog is sent again: the driver ends a jog that is not
 /// refreshed within 400 ms, so a lost release cannot run an axis away.
 const JOG_RESEND: Duration = Duration::from_millis(100);
+/// The driver's own limit: it ends a jog not sent again within this.
+const JOG_KEEPALIVE: Duration = Duration::from_millis(400);
 /// A held jog that has not started by then was refused by the driver.
 const JOG_START: Duration = Duration::from_millis(400);
 
@@ -642,6 +644,9 @@ struct Held {
     sent: Instant,
     /// The driver has reported Jog since the press.
     started: bool,
+    /// The driver's log count at the press. It logs a jog it ends at a
+    /// soft limit, so a line since means this jog is over.
+    log_seq: u64,
 }
 
 /// A running driver controller for one machine.
@@ -821,6 +826,11 @@ impl Connection {
 
     pub fn refresh(&mut self) {
         self.snapshot = self.controller.snapshot();
+        self.observe();
+    }
+
+    /// Acts on the snapshot `refresh` read.
+    fn observe(&mut self) {
         if let Some(run) = &mut self.run {
             run.refresh(self.snapshot.program_outcome.as_ref());
         }
@@ -852,7 +862,15 @@ impl Connection {
         if let Some(h) = &mut self.held {
             if jogging {
                 h.started = true;
-                if h.sent.elapsed() >= JOG_RESEND {
+                // Sent again only while this is still the jog the press
+                // started: the driver has logged nothing since (it logs a
+                // jog it ends at a soft limit) and its keepalive cannot
+                // have lapsed. The driver ends a jog itself and goes Idle a
+                // few of its loops later, with Jog in the snapshots between;
+                // a resend from one of those would reach it Idle and start
+                // a new jog, which must take a new press.
+                let same = h.log_seq == self.snapshot.log_seq && h.sent.elapsed() <= JOG_KEEPALIVE;
+                if same && h.sent.elapsed() >= JOG_RESEND {
                     h.sent = Instant::now();
                     self.controller.send(Command::JogStart {
                         axis: h.axis,
@@ -905,6 +923,7 @@ impl Connection {
                             negative,
                             sent: Instant::now(),
                             started: false,
+                            log_seq: self.snapshot.log_seq,
                         });
                     }
                     None => {}
@@ -1598,6 +1617,136 @@ pub fn select_focused() -> impl iced::advanced::widget::Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Like the JY5800: X, Y, Z with soft limits and no switches.
+    const LIMITED: &str = r#"
+[controller]
+step_rate = "100kHz"
+[axes.x]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 390.0
+[axes.y]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 280.0
+[axes.z]
+steps_per_unit = 400.0
+max_velocity = 1000.0
+acceleration = 200.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -55.0
+soft_max = 0.0
+"#;
+
+    /// Refreshes `c` until `ok` holds of its snapshot; fails once the
+    /// driver has looped for `secs` (4 ms a loop, later under load), or
+    /// ten times that on the clock.
+    fn until(c: &mut Connection, secs: f64, what: &str, ok: impl Fn(&Snapshot) -> bool) {
+        let loops = (secs * 250.) as u64;
+        let cap = Instant::now() + Duration::from_secs_f64(secs * 10.).max(Duration::from_secs(60));
+        let (mut seen, mut last) = (0, None);
+        loop {
+            c.refresh();
+            if ok(&c.snapshot) {
+                return;
+            }
+            if let Some(timer) = c.snapshot.status.map(|st| st.timer) {
+                seen += u64::from(timer.wrapping_sub(last.unwrap_or(timer)));
+                last = Some(timer);
+            }
+            assert!(
+                seen <= loops && Instant::now() < cap,
+                "timed out waiting for {what}: {:?} {:?}",
+                c.snapshot.state,
+                c.snapshot.log
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The driver ends a jog itself at a soft limit and goes Idle a few of
+    /// its loops later; until then its snapshot still says Jog, with the
+    /// limit logged. A tick that read such a snapshot and acts on it once
+    /// the driver is Idle must not send the jog again: the driver would
+    /// start a new one. A new press jogs again.
+    #[test]
+    fn a_jog_the_driver_ended_is_not_restarted_by_the_keepalive() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("limited.toml");
+        std::fs::write(&profile, LIMITED).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let mut c = Connection::open(&m, dir.path()).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        c.send(Command::Mdi("G0 X3".into()));
+        until(&mut c, 5.0, "X at 3", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[0] - 3.).abs() < 1e-3
+        });
+        let hits = |s: &Snapshot| s.log.iter().filter(|l| *l == "Soft limit reached").count();
+        c.act(Action::JogPress(0, true));
+        let pressed = c.held.as_ref().expect("held").log_seq;
+        until(&mut c, 3.0, "the jog to end at the limit", |s| {
+            s.state == Some(State::Idle) && hits(s) == 1
+        });
+        assert_eq!(c.held(), None);
+        assert!(
+            c.snapshot.machine_pos[0].abs() < 0.05,
+            "{:?}",
+            c.snapshot.machine_pos
+        );
+        // The snapshot the driver published while it stopped the jog, read
+        // by a tick with the key still held and the resend due.
+        c.snapshot.state = Some(State::Jog);
+        c.held = Some(Held {
+            axis: 0,
+            negative: true,
+            sent: Instant::now() - JOG_RESEND,
+            started: true,
+            log_seq: pressed,
+        });
+        c.observe();
+        // Nothing starts over the driver's next 75 loops (300 ms).
+        let (seq, from) = (
+            c.snapshot.log_seq,
+            c.snapshot.status.map_or(0, |st| st.timer),
+        );
+        until(&mut c, 3.0, "75 driver loops", |s| {
+            assert_eq!(s.state, Some(State::Idle), "{:?}", s.log);
+            assert_eq!(s.log_seq, seq, "the jog was sent again: {:?}", s.log);
+            s.status.is_some_and(|st| st.timer.wrapping_sub(from) >= 75)
+        });
+        assert_eq!((c.held(), hits(&c.snapshot)), (None, 1));
+        c.act(Action::JogPress(0, false));
+        until(&mut c, 3.0, "jogging +X", |s| {
+            s.state == Some(State::Jog) && s.machine_pos[0] > 0.5
+        });
+        c.act(Action::JogRelease);
+        until(&mut c, 3.0, "Idle after the release", |s| {
+            s.state == Some(State::Idle)
+        });
+    }
 
     #[test]
     fn a_tab_into_a_field_selects_its_value() {
