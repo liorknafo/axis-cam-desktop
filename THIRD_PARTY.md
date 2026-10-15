@@ -10,6 +10,7 @@ The distributed macOS STEP helper links dynamically to unmodified Homebrew Open 
 | oneTBB | 2023.1.0 | Apache 2.0 | [oneTBB](https://github.com/uxlfoundation/oneTBB) |
 | FreeType | 2.14.3 | FreeType License | [FreeType VER-2-14-3](https://github.com/freetype/freetype/tree/VER-2-14-3) |
 | libpng | 1.6.58 | libpng license | [libpng](https://github.com/pnggroup/libpng) |
+| UC100 driver (`uc100` crate) | git commit pinned in `Cargo.toml` | None stated in the driver's repository | [UC100-driver](https://github.com/liorknafo/UC100-driver), a private repository: building needs read access to it |
 
 Portions of this software are copyright © 2026 The FreeType Project (www.freetype.org). All rights reserved.
 

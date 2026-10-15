@@ -19,6 +19,8 @@ cargo run --release --locked
 
 The build was tested with Rust 1.97.1 on Apple Silicon. The STEP helper uses a C++17 compiler and Open CASCADE 7.9. The HTTPS client builds aws-lc, which needs a C compiler and CMake. Set `OCCT_PREFIX` to a custom installation prefix if needed. `AXIS_SKIP_STEP=1` explicitly builds without STEP support; the macOS packaging script requires it. Windows and Linux builds have not been verified and may need platform-specific helper build/link changes.
 
+The build also needs read access to a private repository. `Cargo.toml` pins the `uc100` dependency to a commit of the private GitHub repository [liorknafo/UC100-driver](https://github.com/liorknafo/UC100-driver), and `.cargo/config.toml` sets `git-fetch-with-cli = true`, so cargo fetches it with the `git` command line and uses whatever login that has. Sign in with `gh auth login`, or set up an SSH key that GitHub accepts for that repository (and make `git` use it for `https://github.com/` addresses), before the first build. Without access, `cargo` stops while fetching the driver and nothing compiles, with or without `AXIS_SKIP_STEP=1`. The driver's source is not published with this repository and no licence is stated for it (see `THIRD_PARTY.md`).
+
 Create a macOS bundle:
 
 ```sh
@@ -341,7 +343,8 @@ stops": nothing of the job can be opened, edited or previewed until then.
 ## Machine control (UC100)
 
 AXIS CAM can drive a CNCdrive UC100 itself, through the
-[UC100 driver](https://github.com/liorknafo/UC100-driver) (pinned in `Cargo.toml`).
+[UC100 driver](https://github.com/liorknafo/UC100-driver) (pinned in `Cargo.toml`;
+a private repository, so building needs access to it, see **Run**).
 It is the one program for daily use: the driver's own egui app
 (`uc100-gui`, built only with the driver's `gui` feature) is a developer and
 bench tool. What only that app does: open and run a G-code file made
