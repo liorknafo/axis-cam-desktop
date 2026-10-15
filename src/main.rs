@@ -708,6 +708,9 @@ pub struct App {
     signing_out: Option<std::sync::Arc<openai::Client>>,
     /// G-code exports started and not yet reported (folder choice and write).
     gcode_exports: usize,
+    /// The folder a test app is rooted in, removed when the app is dropped.
+    #[cfg(test)]
+    test_dir: Option<tempfile::TempDir>,
 }
 pub const LOCKED: &str = "The machine is running: planning is locked until it stops.";
 /// What still works while planning is locked (`App::locked`): the Machine
@@ -1034,6 +1037,8 @@ impl App {
             closing: None,
             signing_out: None,
             gcode_exports: 0,
+            #[cfg(test)]
+            test_dir: None,
         }
     }
     fn boot() -> (Self, Task<Message>) {
