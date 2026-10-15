@@ -1823,6 +1823,50 @@ mod tests {
         let check = check_built(&job, &mesh, &report);
         assert!(check.passed, "{:?}", stages(&check));
     }
+    #[test]
+    fn a_uc100_plan_at_the_profiles_spindle_maximum_passes_the_minimum_surface_speed() {
+        // The saved rpm (30000) is above the profile's spindle maximum
+        // (24000), which is what the model is told and stage 1 enforces. A
+        // Ø1 mm tool in aluminium (150 m/min and up) cannot reach its
+        // minimum surface speed, so running at that maximum counts as in range.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("jy5800.toml");
+        std::fs::write(&profile, include_str!("../assets/jy5800.toml")).unwrap();
+        let (mut doc, mesh, _) = block();
+        let machine = &mut doc.setups[0].machine;
+        machine.p.insert("controller".into(), "UC100".into());
+        machine
+            .p
+            .insert("uc100_profile".into(), profile.display().to_string());
+        machine.p.insert("rpm".into(), "30000".into());
+        let report = crate::analysis::report(&doc, &mesh).unwrap();
+        assert_eq!(report.machine.max_rpm, 24000.);
+        let mut job = proposal::build(&doc, &mesh, &report, &good(&report)).unwrap();
+        job.tools[0].p.insert("diameter".into(), "1".into());
+        job.tools[0].p.insert("flutes".into(), "2".into());
+        let tool = job.tools[0].id.clone();
+        let run_at = |job: &mut Document, rpm: &str, feed: &str| {
+            for op in job.setups.iter_mut().flat_map(|s| &mut s.operations) {
+                if op.tool == tool {
+                    op.p.insert("rpm".into(), rpm.into());
+                    op.p.insert("feed".into(), feed.into());
+                }
+            }
+            cutting_data_problems(job)
+                .into_iter()
+                .map(|p| p.message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run_at(&mut job, "24000", "960"), Vec::<String>::new());
+        // Below the maximum the speed is still refused.
+        let found = run_at(&mut job, "20000", "800");
+        assert!(!found.is_empty(), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|m| m.starts_with("Surface speed 63 m/min is below "))
+        );
+    }
     /// The -Z orientation's top plane: the part's original underside.
     fn underside(report: &PartReport) -> Vec<usize> {
         report.orientations[1]

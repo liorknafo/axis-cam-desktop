@@ -35,6 +35,20 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
+/// The spindle speed a UC100 machine's profile caps the machine's rpm to, as a
+/// run checks: its maximum at full PWM. None on any other machine, or when the
+/// profile has no spindle PWM output.
+pub fn spindle_cap(m: &Machine) -> Result<Option<f32>, String> {
+    if get(&m.p, "controller") != "UC100" {
+        return Ok(None);
+    }
+    let out = profile(m)?.outputs;
+    Ok(out
+        .spindle_pwm
+        .is_some()
+        .then_some(out.spindle_max_rpm as f32))
+}
+
 /// The coolant choices machine `m` has outputs for, in the order Flood,
 /// Mist, Air, Off: on a UC100 only what its profile can switch, as a run
 /// checks. Off is always one.
