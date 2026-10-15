@@ -287,6 +287,14 @@ pub struct Gripped {
     /// 1, without earlier cuts, for clamps, and wherever the earlier cuts
     /// are not known. Its heights are `stock`'s.
     pub band: Bounds,
+    /// The highest the bottom of the material a vise's jaws close on can
+    /// lie, which the grip is measured up from: `stock`'s bottom, raised
+    /// past the layer earlier cuts of any cutter shape can have removed from
+    /// it between the jaws, which the box keeps when they do not prove it
+    /// removed whole (`Bands::bottom`). `stock`'s bottom for setup 1,
+    /// without earlier cuts, for clamps, and wherever the earlier cuts are
+    /// not known.
+    pub bottom: f32,
 }
 /// A box whose jaws close on the whole of it (`Gripped::whole`): setup 1's,
 /// or one whose earlier cuts are not known.
@@ -296,9 +304,13 @@ impl From<Bounds> for Gripped {
     }
 }
 impl Gripped {
-    /// `stock` whose jaws close on its whole box.
+    /// `stock` whose jaws close on its whole box, from its bottom.
     pub fn whole(stock: Bounds) -> Self {
-        Self { stock, band: stock }
+        Self {
+            stock,
+            band: stock,
+            bottom: stock.min[2],
+        }
     }
     /// The box a layout's jaws or clamps sit against: the band for a vise,
     /// the stock for clamps.
@@ -349,16 +361,43 @@ impl Bands {
             (*offset, width),
         )
     }
+    /// The highest the bottom of what a vise placed as `layout`, with jaws
+    /// as wide as `holder`'s, closes on (`band`, from `at`) can lie: the
+    /// band's bottom, raised past the layer earlier cuts of any cutter shape
+    /// can have removed from it between the jaws, over their reach along
+    /// them (`rest::RestStock::bottom`). The band's bottom for clamps or no
+    /// workholding, and for jaws beside the band, which `position_issue`
+    /// refuses.
+    pub fn bottom(&self, band: Bounds, layout: &Layout, holder: &Holder) -> f32 {
+        let Layout::Vise { axis_y, offset, .. } = layout else {
+            return band.min[2];
+        };
+        let along = usize::from(!*axis_y);
+        let width = num(&holder.p, "jaw_width").unwrap_or(0.);
+        let middle = (band.min[along] + band.max[along]) / 2. + offset;
+        let mut footprint = band;
+        footprint.min[along] = band.min[along].max(middle - width / 2.);
+        footprint.max[along] = band.max[along].min(middle + width / 2.);
+        if footprint.min[along] >= footprint.max[along] {
+            return band.min[2];
+        }
+        self.rest.bottom(footprint)
+    }
 }
 /// What `layout`, with `holder`'s jaws, holds of `stock`: for a vise, the
-/// band it closes on as `bands` tells it (`Bands::at`; the whole box when
+/// band it closes on and the highest its bottom can lie as `bands` tells
+/// them (`Bands::at`, `Bands::bottom`; the whole box, from its bottom, when
 /// they are not known), otherwise the box.
 pub fn gripped(layout: &Layout, holder: &Holder, stock: Bounds, bands: Option<&Bands>) -> Gripped {
     match (layout, bands) {
-        (Layout::Vise { .. }, Some(bands)) => Gripped {
-            stock,
-            band: bands.at(stock, layout, holder),
-        },
+        (Layout::Vise { .. }, Some(bands)) => {
+            let band = bands.at(stock, layout, holder);
+            Gripped {
+                stock,
+                band,
+                bottom: bands.bottom(band, layout, holder),
+            }
+        }
         _ => Gripped::whole(stock),
     }
 }
@@ -462,9 +501,10 @@ pub fn position_issue(
 /// The jaws or clamps of `layout`, in the frame of `held` (the stock the
 /// setup starts from): the jaws on the faces of the band they close on,
 /// centred on it along their axis, from far below the stock's bottom up to
-/// the grip; the clamps on the stock's sides and top. Without the clearance
-/// gap. Refuses a holder of the other kind or one whose dimensions are not
-/// usable (`refusal`).
+/// the grip above the highest the material's bottom can lie
+/// (`Gripped::bottom`: the real jaws are never higher); the clamps on the
+/// stock's sides and top. Without the clearance gap. Refuses a holder of
+/// the other kind or one whose dimensions are not usable (`refusal`).
 pub fn boxes(
     layout: &Layout,
     holder: &Holder,
@@ -473,7 +513,8 @@ pub fn boxes(
     if let Some(refused) = refusal(layout, holder) {
         return Err(refused);
     }
-    let stock = held.into().on(layout);
+    let held = held.into();
+    let stock = held.on(layout);
     let n = |k| num(&holder.p, k).unwrap_or(0.);
     let centre = [
         (stock.min[0] + stock.max[0]) / 2.,
@@ -488,7 +529,7 @@ pub fn boxes(
             ..
         } => {
             let (w, t) = (n("jaw_width"), n("jaw_thickness"));
-            let (z0, z1) = (stock.min[2] - JAW_DEPTH, stock.min[2] + grip);
+            let (z0, z1) = (stock.min[2] - JAW_DEPTH, held.bottom + grip);
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             [(false, "-"), (true, "+")]
                 .into_iter()
@@ -3010,6 +3051,79 @@ mod tests {
         let suggested = vise_gripping(grip);
         let on = gripped(&suggested, &narrow, left, Some(&bands));
         assert_eq!(opening_issue(&suggested, &narrow, on), None);
+    }
+    #[test]
+    fn jaws_reach_above_the_layer_a_ball_facing_took_off_the_bottom_a_turned_over_setup_rests_on() {
+        // Setup 1 faces the whole top with a Ø10 ball end mill, 2 mm deep
+        // (tips at 38 on the 40 mm stock), a pass every 4 mm: the box keeps
+        // the layer, since only flat constant-height sweeps prove one gone.
+        let (mut v, f, flipped) = untouched();
+        for i in 0..16 {
+            let y = -30. + 4. * i as f32;
+            v.cut(
+                [-60., y, 38.],
+                [60., y, 38.],
+                5.,
+                10.,
+                CutterShape::Ball,
+                f,
+                (0, 0),
+            );
+        }
+        let part = f.transfer_bounds(PART, flipped);
+        let left = RestStock::new(&v, flipped).left(part);
+        assert_eq!(left, v.transformed_bounds(flipped));
+        // Turned over, the stock rests on the faced surface, 2 mm above the
+        // box's bottom, and the grip is measured from there: the jaws reach
+        // 8 mm above it, 10 mm above the box's bottom.
+        let bands = Bands::new(&v, flipped, part);
+        let layout = vise_gripping(8.);
+        let held = gripped(&layout, &vise(), left, Some(&bands));
+        assert_eq!(held.band, left);
+        assert!((held.bottom - (left.min[2] + 2.)).abs() < 0.001, "{held:?}");
+        let jaws = boxes(&layout, &vise(), held).unwrap();
+        assert!(
+            jaws.iter()
+                .all(|j| (j.bounds.max[2] - (left.min[2] + 10.)).abs() < 0.001),
+            "{jaws:?}"
+        );
+        // A Ø10 cutter along the +Y jaw's face, over the stock's edge, 11 mm
+        // above the box's bottom: within the 2 mm gap of the real jaws.
+        let x = (left.min[0] + left.max[0]) / 2.;
+        let (y, z) = (left.max[1] - 3., left.min[2] + 11.);
+        let move_along = [([x - 20., y, z], [x + 20., y, z])];
+        let hits = hits_segments(&move_along, 5., 30., 10., &jaws, 2.);
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.label.as_str(), h.part))
+                .collect::<Vec<_>>(),
+            [("vise jaw on +Y", "tool")]
+        );
+        // Without the earlier cuts the jaws reach the grip above the box's
+        // bottom, and so they do when setup 1 faced only the middle of the
+        // top (passes from x = -20 to 20): the stock stands on its uncut
+        // ends, and the same move is clear.
+        let whole = boxes(&layout, &vise(), left).unwrap();
+        assert!(whole.iter().all(|j| j.bounds.max[2] == left.min[2] + 8.));
+        let (mut v, f, flipped) = untouched();
+        for i in 0..16 {
+            let y = -30. + 4. * i as f32;
+            v.cut(
+                [-20., y, 38.],
+                [20., y, 38.],
+                5.,
+                10.,
+                CutterShape::Ball,
+                f,
+                (0, 0),
+            );
+        }
+        let bands = Bands::new(&v, flipped, part);
+        let held = gripped(&layout, &vise(), left, Some(&bands));
+        assert_eq!(held, Gripped::whole(left));
+        let jaws = boxes(&layout, &vise(), held).unwrap();
+        assert_eq!(jaws, whole);
+        assert!(hits_segments(&move_along, 5., 30., 10., &jaws, 2.).is_empty());
     }
     #[test]
     fn the_advice_for_the_jaws_band_depends_on_where_it_lies_in_the_earlier_setup() {

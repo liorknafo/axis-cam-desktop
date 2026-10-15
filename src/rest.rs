@@ -28,6 +28,9 @@ pub struct RestStock {
     current: Frame,
     extent: Bounds,
     cuts: Vec<Capsule>,
+    /// Where every earlier cut, of any cutter shape, can have removed
+    /// material (`removal_boxes`, in `current`): what `bottom` reads.
+    removal: Vec<Bounds>,
 }
 fn corners(b: Bounds) -> [[f32; 3]; 8] {
     std::array::from_fn(|mask| {
@@ -237,6 +240,64 @@ impl<'a> Removed<'a> {
             .map(|(cut, _)| cut.source)
     }
 }
+/// Whether some column of the rectangle `lo..hi` (XY, mm) lies in none of
+/// the rectangles `boxes`: Some(true) when one does, Some(false) when the
+/// boxes cover the whole rectangle, None when `budget` runs out first. A
+/// rectangle inside one box is covered; one whose centre lies in no box is
+/// not; any other is split in two, along the axis it most exceeds a typical
+/// box on (the median of the overlapping boxes' spans), down to 0.001 mm,
+/// below which a sliver is taken as covered. Each box looked at costs a unit
+/// of `budget`.
+fn uncovered(
+    lo: [f32; 2],
+    hi: [f32; 2],
+    boxes: &[([f32; 2], [f32; 2])],
+    budget: &mut usize,
+) -> Option<bool> {
+    let mut overlapping: Vec<([f32; 2], [f32; 2])> = vec![];
+    for &(a, b) in boxes {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        if (0..2).all(|k| a[k] < hi[k] && b[k] > lo[k]) {
+            overlapping.push((a, b));
+        }
+    }
+    if overlapping.is_empty() {
+        return Some(true);
+    }
+    if overlapping
+        .iter()
+        .any(|(a, b)| (0..2).all(|k| a[k] <= lo[k] && b[k] >= hi[k]))
+    {
+        return Some(false);
+    }
+    let centre = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.];
+    if !overlapping
+        .iter()
+        .any(|(a, b)| (0..2).all(|k| a[k] <= centre[k] && centre[k] <= b[k]))
+    {
+        return Some(true);
+    }
+    let span = |k: usize| {
+        let mut spans: Vec<f32> = overlapping.iter().map(|(a, b)| b[k] - a[k]).collect();
+        let mid = spans.len() / 2;
+        *spans.select_nth_unstable_by(mid, f32::total_cmp).1
+    };
+    let ratio = |k: usize| (hi[k] - lo[k]) / span(k).max(0.01);
+    let k = if ratio(0) >= ratio(1) { 0 } else { 1 };
+    if hi[k] - lo[k] < 0.001 {
+        return Some(false);
+    }
+    let (mut first_hi, mut second_lo) = (hi, lo);
+    first_hi[k] = centre[k];
+    second_lo[k] = centre[k];
+    match uncovered(lo, first_hi, &overlapping, budget) {
+        Some(false) => uncovered(second_lo, hi, &overlapping, budget),
+        other => other,
+    }
+}
 impl RestStock {
     pub fn new(volume: &Volume, current: Frame) -> Self {
         let cuts = volume
@@ -271,6 +332,7 @@ impl RestStock {
             current,
             extent: volume.transformed_bounds(current),
             cuts,
+            removal: removal_boxes(volume, current),
         }
     }
     /// Whether `region` lies wholly beside the stock box, where no stock ever was.
@@ -400,6 +462,115 @@ impl RestStock {
         }
         (band.min[2], band.max[2]) = (stock.min[2], stock.max[2]);
         band
+    }
+    /// The highest the bottom of the material under `footprint` (current
+    /// frame, mm; its heights the stock's) can lie, which a vise's grip is
+    /// measured up from when the stock stands on that material: the
+    /// footprint's bottom, raised past the layer earlier cuts of any cutter
+    /// shape can have removed from it. The box a later setup starts from
+    /// (`left`) keeps a layer that was cut but not provably removed whole, a
+    /// ball-cut or ramped facing for one, so the material's bottom can lie
+    /// above the box's; it never lies below it. Each column of the footprint
+    /// can have lost its material from the bottom up to where the cuts'
+    /// boxes (`removal_boxes`) stacked on it without a break stop, and the
+    /// stock stands on the lowest material left: the least of those heights
+    /// over the footprint. Found exactly, as the lowest of the heights a
+    /// stack can stop at (the bottom, then the boxes' tops) at which some
+    /// column lies in no box reaching past it, each height proven by
+    /// splitting the footprint, with `BUDGET` units of work in all; when they
+    /// run out, the least over the columns at 8 × 8 fixed points instead,
+    /// which is never below the true least. Never above the footprint's top.
+    pub fn bottom(&self, footprint: Bounds) -> f32 {
+        self.bottom_within(footprint, BUDGET)
+    }
+    /// `bottom` with `budget` units of work for the proof.
+    fn bottom_within(&self, footprint: Bounds, budget: usize) -> f32 {
+        const GUARD: f32 = 0.001;
+        let (floor, ceiling) = (footprint.min[2], footprint.max[2]);
+        if !floor.is_finite() || !ceiling.is_finite() || floor >= ceiling {
+            return floor;
+        }
+        // The boxes over the footprint that reach more than a guard above its
+        // bottom: `left` keeps a face a hair under a proven cut's.
+        let boxes: Vec<Bounds> = self
+            .removal
+            .iter()
+            .filter(|b| {
+                (0..2).all(|k| b.min[k] < footprint.max[k] && b.max[k] > footprint.min[k])
+                    && b.max[2] > floor + GUARD
+                    && b.min[2] <= ceiling
+            })
+            .copied()
+            .collect();
+        if boxes.is_empty() {
+            return floor;
+        }
+        let xy = |b: &Bounds| ([b.min[0], b.min[1]], [b.max[0], b.max[1]]);
+        let (lo, hi) = xy(&footprint);
+        // A column's stack of boxes passes `level` in a box reaching past it
+        // from no more than a guard above it, which bridges the float error
+        // between stacked boxes.
+        let through = |level: f32| -> Vec<([f32; 2], [f32; 2])> {
+            boxes
+                .iter()
+                .filter(|b| b.min[2] <= level + GUARD && b.max[2] > level)
+                .map(xy)
+                .collect()
+        };
+        // The heights a stack can stop at, lowest first: the bottom, then the
+        // boxes' tops.
+        let mut levels: Vec<f32> = boxes
+            .iter()
+            .map(|b| b.max[2])
+            .filter(|z| *z > floor && *z < ceiling)
+            .collect();
+        levels.sort_by(f32::total_cmp);
+        levels.dedup();
+        levels.insert(0, floor);
+        let mut budget = budget;
+        let mut proven = true;
+        for &level in &levels {
+            match uncovered(lo, hi, &through(level), &mut budget) {
+                Some(true) => return level,
+                Some(false) => {}
+                None => {
+                    proven = false;
+                    break;
+                }
+            }
+        }
+        if proven {
+            // Every column's stack passes every height below the top.
+            return ceiling;
+        }
+        let mut least = ceiling;
+        for i in 0..8 {
+            for j in 0..8 {
+                let x = lo[0] + (hi[0] - lo[0]) * (i as f32 + 0.5) / 8.;
+                let y = lo[1] + (hi[1] - lo[1]) * (j as f32 + 0.5) / 8.;
+                let mut z = floor;
+                while z < ceiling {
+                    let next = boxes
+                        .iter()
+                        .filter(|b| {
+                            b.min[0] <= x
+                                && x <= b.max[0]
+                                && b.min[1] <= y
+                                && y <= b.max[1]
+                                && b.min[2] <= z + GUARD
+                                && b.max[2] > z
+                        })
+                        .map(|b| b.max[2])
+                        .reduce(f32::max);
+                    match next {
+                        Some(top) => z = top,
+                        None => break,
+                    }
+                }
+                least = least.min(z);
+            }
+        }
+        least.min(ceiling)
     }
     /// `start` (current frame, mm) with each of `sides` (axis, and whether
     /// its high side), in order, moved in past every layer earlier cuts
@@ -1127,6 +1298,119 @@ mod tests {
         let rest = RestStock::new(&ball, flipped);
         let part = f.transfer_bounds(PART, flipped);
         assert_eq!(rest.band(part, stock, 8., 1, LONG), stock);
+    }
+    #[test]
+    fn the_bottom_rises_past_the_layer_cuts_of_any_shape_can_have_taken_off_it() {
+        // Nothing cut: the box's bottom.
+        let (v, f, b, mut s, mesh) = fixture();
+        assert_eq!(RestStock::new(&v, f).bottom(b), b.min[2]);
+        // A Ø5 ball end mill faces the whole top 2 mm deep (tips at 10), a
+        // pass every 2 mm: the box keeps the layer, since ball cuts prove
+        // nothing, but turned over, the stock stands on the faced surface,
+        // 2 mm above the box's bottom.
+        let ys = [-10., -8., -6., -4., -2., 0., 2., 4., 6., 8., 10.];
+        let ball_face = |v: &mut Volume, f: Frame, x: [f32; 2], z: f32| {
+            for &y in &ys {
+                v.cut(
+                    [x[0], y, z],
+                    [x[1], y, z],
+                    2.5,
+                    5.,
+                    CutterShape::Ball,
+                    f,
+                    (0, 0),
+                );
+            }
+        };
+        let (mut ball, f, b, _, _) = fixture();
+        ball_face(&mut ball, f, [-15., 15.], 10.);
+        s.p.insert("rx".into(), "180".into());
+        let flipped = Frame::new(&s, &mesh);
+        let part = f.transfer_bounds(PART, flipped);
+        let rest = RestStock::new(&ball, flipped);
+        let stock = rest.left(part);
+        assert_eq!(stock, ball.transformed_bounds(flipped));
+        let bottom = rest.bottom(stock);
+        assert!(
+            (bottom - (stock.min[2] + 2.)).abs() < 0.001,
+            "{bottom} {stock:?}"
+        );
+        // Seen the same way up, the faced layer is at the top: the bottom stays.
+        assert_eq!(RestStock::new(&ball, f).bottom(b), b.min[2]);
+        // A second ball facing 2 mm deeper stacks on the first: 4 mm.
+        ball_face(&mut ball, f, [-15., 15.], 8.);
+        let rest = RestStock::new(&ball, flipped);
+        let bottom = rest.bottom(stock);
+        assert!(
+            (bottom - (stock.min[2] + 4.)).abs() < 0.001,
+            "{bottom} {stock:?}"
+        );
+        // Flat passes prove the layer gone and the box's bottom follows it:
+        // nothing is left to raise it past...
+        let (mut flat, f, _, _, _) = fixture();
+        face(&mut flat, f, 10., &[-10., -6., -2., 2., 6., 10.], 10.);
+        let rest = RestStock::new(&flat, flipped);
+        let stock = rest.left(part);
+        let carried = flat.transformed_bounds(flipped);
+        assert!(
+            (stock.min[2] - (carried.min[2] + 2.)).abs() < 0.001,
+            "{stock:?}"
+        );
+        assert_eq!(rest.bottom(stock), stock.min[2]);
+        // ...until a ball finishing pass takes another 0.5 mm off the faced
+        // top, which the box keeps.
+        ball_face(&mut flat, f, [-15., 15.], 9.5);
+        let rest = RestStock::new(&flat, flipped);
+        assert_eq!(rest.left(part), stock);
+        let bottom = rest.bottom(stock);
+        assert!(
+            (bottom - (stock.min[2] + 0.5)).abs() < 0.001,
+            "{bottom} {stock:?}"
+        );
+        // Faced only between y = -4 and 4 (the passes reach 2.5 mm out), the
+        // stock stands on its uncut ends: the bottom stays.
+        let (mut partial, f, _, _, _) = fixture();
+        for y in [-4., -2., 0., 2., 4.] {
+            partial.cut(
+                [-15., y, 10.],
+                [15., y, 10.],
+                2.5,
+                5.,
+                CutterShape::Ball,
+                f,
+                (0, 0),
+            );
+        }
+        let rest = RestStock::new(&partial, flipped);
+        let stock = rest.left(part);
+        assert_eq!(rest.bottom(stock), stock.min[2]);
+        // So it does under a footprint that leaves 0.3 mm of those ends,
+        // which the 64 fixed columns all miss: the proof finds the rim
+        // exactly, and without a work budget the columns raise the bottom.
+        let mut narrow = stock;
+        (narrow.min[1], narrow.max[1]) = (-6.8, 6.8);
+        assert_eq!(rest.bottom(narrow), stock.min[2]);
+        let sampled = rest.bottom_within(narrow, 0);
+        assert!(
+            (sampled - (stock.min[2] + 2.)).abs() < 0.001,
+            "{sampled} {stock:?}"
+        );
+        // Cut through everywhere (tips below the bottom, flutes past the
+        // top), nothing stands: the box's top.
+        let (mut gone, f, _, _, _) = fixture();
+        for &y in &ys {
+            gone.cut(
+                [-15., y, -1.],
+                [15., y, -1.],
+                2.5,
+                14.,
+                CutterShape::Ball,
+                f,
+                (0, 0),
+            );
+        }
+        let stock = gone.transformed_bounds(flipped);
+        assert_eq!(RestStock::new(&gone, flipped).bottom(stock), stock.max[2]);
     }
     #[test]
     fn the_leftover_box_never_reaches_into_the_part() {
