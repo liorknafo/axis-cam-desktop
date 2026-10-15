@@ -370,11 +370,25 @@ The estimate is a model, not a measurement: every number it assumes is named at 
 - **Existing tests.** Three collision tests hold the fixture block with one toe clamp on −X. With the starter's 2000 N the Pocket would tip the block over that edge (×1.3), so `post::tests::pocket_job` gives its clamp 10 kN: those tests are about where the clamp sits.
 - **Limits of the model**, by construction and not tested:
   - One peak per operation, pushing in whichever direction is worst.
-  - The removal rate is read from the simulation's voxels (the longest stock side divided by 96), so a pass lighter than a voxel can count a whole layer. The slot cap keeps that within reason.
+  - The removal rate is read from the simulation's voxels (the longest stock side divided by 96), so a pass lighter than a voxel can count a whole layer. The slot cap keeps that within reason. Until #60 (below) a pass that swept none of the voxels' centres counted nothing, and passed.
   - Drilling, and any cutter's twist about the spindle, are not counted.
   - Friction, the clamping forces and kc are typical values: measure or estimate yours.
 - Not inspected in the real window: the window is shared with other work on this PC, so this was checked with tests only.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 834 passed, 3 failed. Two are the STEP tests, as before. The third, `the_control_page_renders_in_every_state`, timed out waiting for jogging under the load of other builds and passed alone; its app has no part or setup, so this change does not reach it.
+
+## A cut too light for the voxels still pushes (#60)
+
+A pass thinner than about half a voxel (a 0.3 mm underside skim, a wall's finishing allowance) sweeps none of the voxels' centres. `forces::bites` dropped such runs, so the operation had no push, its margin line read "no cutting force sideways or up to hold against" and it passed on any grip. Now a run whose cutter touches material (grown by half a voxel all round, it sweeps the centre of a voxel that still has material: `Volume::touches`, the read-only half of `Volume::cut`) but removes no voxel counts as a skin a voxel thick along the run, as wide as the cutter or as tall as its depth in the stock, whichever is more (the most that can hide between the centres), at most the slot: for a skim that is exactly the slot, 2r × depth × length; for a finishing pass along a deep wall, a voxel's thickness over the wall's height. A run in the air is still nothing, whether beside the stock or over what the setup's earlier operations cut away, and drilling is still not counted.
+
+- **The force.** `forces::tests::a_skim_thinner_than_a_voxel_still_pushes_and_a_shallow_grip_refuses_it`, on the 100 × 60 × 40 mm stock whose voxels are about 1 mm:
+  - A Ø10 skim 0.3 mm deep across the stock at 1000 mm/min, its tip above the top voxels' centres, removes 50 mm³/s in every stretch (10 × 0.3 mm² at 16.7 mm/s), its force 0.15 mm under the top. The same move 10 mm beside the stock gives no bite.
+  - In steel with 3 flutes at 8000 rpm that is 50 N tangential, 75 N sideways. The starter vise gripping 1 mm holds that ×1.6 against tipping: the line reads "Facing: only ×1.6 against tipping; ×2 is wanted." and the issue names the 75 N, 39 mm above the 1.0 mm contact.
+  - Before the fix the test fails at its first assertion: the skim gives no bites.
+- **A setup whose only cut is the skim.** `post::tests::a_skim_too_thin_for_the_voxels_is_still_held_against_and_a_1_mm_grip_refuses_it`: the fixture block's Facing stopped 3.7 mm above the part (a 0.3 mm skim; the block's voxels are 1.3 mm) exports in the starter vise at grip 8, and at grip 1 `post::held` pins one problem on the Facing, which export refuses with exactly that line: "Facing: the cut could tip the stock out of the vise: about 75 N, 46 mm above the top of the jaws' contact, which is 1.0 mm high and 98 mm long (×1.4, under the ×2 wanted). Grip deeper, take a smaller stepdown or stepover or a lower feed, or choose another holder." Before the fix the setup exports at grip 1 too.
+- The three LIO-167 tests and the smoke tests are unchanged: a cut that sweeps voxels is counted as before, and "Drilling: no cutting force sideways or up to hold against." still stands for drilling.
+- **The planner's good plan still passes its check**, held in a vise (`smoke::tests::apply_brings_back_a_workholding_entry_deleted_after_the_preview` and `undo_brings_back_a_workholding_entry_deleted_after_apply` apply it). A first version of the skin also allowed a voxel's advance of the cutter's whole cross-section, which gave a pocket's link moves of 2 to 4 mm, in cleared stock but beside a wall, a capped 191 N: the Top setup's Pocket, gripped 3 mm, was refused at ×1.9. The skin's rate does not depend on the run's length.
+- Not inspected in the real window: checked with tests only.
+- `cargo test --locked` on Linux (16 October 2026, three other builds sharing the machine): 843 passed, 0 failed, 0 ignored in 328 seconds; 841 at main plus the two tests above. `cargo clippy --all-targets --locked`: the same 53 warning lines as at main, none in the changed code. `cargo fmt` was run on the changed files; five files main leaves unformatted were left as they are.
 
 ## The work zero on any stock, and the probe that finds it (LIO-166)
 
