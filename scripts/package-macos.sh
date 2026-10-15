@@ -16,6 +16,7 @@ cp assets/Info.plist "$app_dir/Contents/Info.plist"
 cp assets/AppIcon.icns "$app_dir/Contents/Resources/AppIcon.icns"
 mkdir -p "$app_dir/Contents/Resources/Licenses"
 cp licenses/*.txt "$app_dir/Contents/Resources/Licenses/"
+cp licenses/NOTICES.md "$app_dir/Contents/Resources/ThirdParty/NOTICES.md"
 # Finder metadata in synced Documents folders can prevent local code signing.
 # Remove only signing-incompatible metadata, preserving other attributes.
 xattr -dr com.apple.FinderInfo "$app_dir" 2>/dev/null || true
