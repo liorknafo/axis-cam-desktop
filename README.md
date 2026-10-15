@@ -496,7 +496,14 @@ of the file.
 ### Running a setup
 
 The **Run** panel on the Control page runs a setup directly on the machine,
-with no G-code file in between.
+with no G-code file in between. It is a strip fixed under the machine's state
+and the E-STOP, above the part of the page that scrolls, so **Cycle Start**,
+**Hold**, **Resume** and **Stop** stay in sight whatever is scrolled to under
+them (#71). It holds the setup picked, which tool run is next, those buttons,
+the progress of the tool run being cut or what holds Cycle Start back, and
+how the last tool run ended. The **Tool runs** panel under it scrolls with the
+jog, work zero, spindle and MDI controls: the list of tool runs, the tool
+change between them and the work zero on the stock before the first.
 
 From MANUFACTURE, the last step under the Work page's 3D view reads
 **04 Review & run** when the active setup's machine is a UC100 one (**04 NC
@@ -509,8 +516,8 @@ panel, at once when that machine is connected, or when you press
 1. Pick one of the setups that use the connected machine. AXIS CAM simulates
    the job up to it and checks it as export would (stock, work zero, rapids,
    holder, jaws and clamps), makes it the active setup and shows it in the
-   **Job** view beside the Run panel, then lists its **tool runs**: one per run of the
-   same tool, as with touch-off G-code programs. The checks follow the
+   **Job** view beside the **Tool runs** panel, which lists its **tool runs**: one
+   per run of the same tool, as with touch-off G-code programs. The checks follow the
    project: after an edit, such as another workholding, the Control page
    checks the setup again on its own once the edits pause, keeping its
    progress, as **Check again** does (LIO-150). The run keeps to the setup
@@ -529,8 +536,8 @@ panel, at once when that machine is connected, or when you press
    has no output for, **Set coolant to Off** under the reasons names them,
    sets each one's coolant to Off and checks the setup again (LIO-145).
 
-   Until the first tool run starts, **Work zero on the stock** below Cycle
-   Start walks through it. It names the setup's work zero and work
+   Until the first tool run starts, **Work zero on the stock**, in the Tool
+   runs panel, walks through it. It names the setup's work zero and work
    system and says whether X, Y and Z have a machine position and whether
    that work system is active. Then: jog the tool tip over the spot of the
    stock top the zero is touched off from (its centre, a corner, the middle
@@ -552,10 +559,11 @@ panel, at once when that machine is connected, or when you press
    and coolant off). **Space** holds from any page while no text field is
    being edited, and resumes from that hold only on the Control page with
    the run panel on screen, not in the Controller configuration view. The
-   panel shows the tool run, operation and block being cut, and how the tool
-   run ended.
-4. Between tool runs with different tools: the last one ended with the
-   spindle and coolant off at the setup's clearance plane. Touch the old tool
+   Run strip shows the tool run, operation and block being cut, and how the
+   tool run ended.
+4. Between tool runs with different tools, the Tool runs panel gives the
+   steps: the last one ended with the spindle and coolant off at the setup's
+   clearance plane. Touch the old tool
    on a surface that stays put and press **Record reference** (this can be
    done any time a tool is zeroed, also before the first tool run), change
    the tool, touch the new one on the same surface and press **Set Z from
