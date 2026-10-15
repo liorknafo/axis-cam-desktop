@@ -2084,6 +2084,65 @@ flood = { pin = 8 }
         assert_eq!(past.err(), Some(vec![removed.into()]));
     }
 
+    /// A spindle the operator left running by hand the other way (issue
+    /// #41): Cycle Start refuses it before anything moves, saying to stop
+    /// it, since the driver E-stops a reversal after the first retract.
+    /// Stopped, or running the tool run's way, it starts.
+    #[test]
+    fn cycle_start_refuses_a_spindle_running_the_other_way() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::{controller::State, gcode::Spindle};
+        let dir = tempfile::tempdir().unwrap();
+        // FAST with a reverse relay: the spindle can run CCW.
+        let profile = format!("{FAST}spindle_ccw = {{ pin = 14 }}\n");
+        let mut a = run_app_on(dir.path(), &profile);
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        assert!(conn(&a).reversible());
+        assert!(run_of(&a).checked().unwrap()[0].ops[0].clockwise);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Machine(Action::Rpm("8000".into())));
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Ccw)));
+        tick_until(&mut a, 2.0, "CCW", |s| s.spindle == Some(Spindle::Ccw));
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 300);
+        // Nothing ran: no E-stop, so the machine position is kept.
+        let s = conn(&a).snapshot.clone();
+        assert_eq!(
+            (s.state.clone(), s.spindle, s.referenced[..3].to_vec()),
+            (Some(State::Idle), Some(Spindle::Ccw), vec![true; 3]),
+            "{:?} {:?}",
+            s.estop_reason,
+            s.log
+        );
+        assert!(run_of(&a).running.is_none() && run_of(&a).outcome.is_none());
+        assert!(
+            problems(&a).iter().any(|p| {
+                p.contains(
+                    "The spindle is running counterclockwise, but tool run 1 starts it clockwise",
+                ) && p.contains("Stop it first")
+            }),
+            "{:?}",
+            problems(&a)
+        );
+        // Stopped, or already running clockwise (the program sets its rpm),
+        // it starts.
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Off)));
+        tick_until(&mut a, 2.0, "off", |s| s.spindle == Some(Spindle::Off));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Machine(Action::Spindle(Spindle::Cw)));
+        tick_until(&mut a, 2.0, "CW", |s| s.spindle == Some(Spindle::Cw));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        assert_eq!(conn(&a).snapshot.estop_reason, None);
+    }
+
     /// The blind review's dead end (LIO-140): machine zero where the machine
     /// starts puts every tool run outside the soft limits. The errors point to
     /// Work zero on the stock, which says where the simulator's block is;

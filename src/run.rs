@@ -258,6 +258,26 @@ impl Run {
             }
         }
         e.extend(output_problems(&c.config.outputs, &p.ops));
+        // A spindle left running by hand the other way: the driver E-stops a
+        // reversal, so it must be stopped first. Running the tool run's way
+        // it stays, as the program sets its rpm.
+        let way = |clockwise: bool| {
+            if clockwise {
+                "clockwise"
+            } else {
+                "counterclockwise"
+            }
+        };
+        if let Some(turning @ (Spindle::Cw | Spindle::Ccw)) = s.spindle
+            && (turning == Spindle::Cw) != p.ops[0].clockwise
+        {
+            e.push(format!(
+                "The spindle is running {}, but tool run {} starts it {}. Stop it first (Stop under Spindle): the driver E-stops a reversal.",
+                way(turning == Spindle::Cw),
+                self.next + 1,
+                way(p.ops[0].clockwise)
+            ));
+        }
         if let Some((wcs, xy)) = self.xy {
             if wcs != s.active_wcs || (0..2).any(|a| (s.work_offset[a] - xy[a]).abs() > 1e-6) {
                 e.push("X/Y work zero changed since the first tool run started. Tool changes keep X/Y zero: put it back, or pick the setup again to start over.".into());
