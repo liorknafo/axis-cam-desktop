@@ -2527,6 +2527,91 @@ flood = { pin = 8 }
         let _ = a.view();
     }
 
+    /// After an edit, until the setup is checked again, Move there and the
+    /// touch-off button wait as Probe Z does: both act on the checked setup
+    /// the steps are from, which the edit may have changed (#39).
+    #[test]
+    fn the_touch_off_and_move_there_wait_for_the_check_as_probe_z_does() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        // A plate for Probe Z and a tip for Probe edge, set before connecting.
+        let mut a = run_app_on(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert("probe_tip".into(), "4".into());
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock bottom back".into());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let (lo, hi) = conn(&a).block.unwrap();
+        let height = run_of(&a).checked().unwrap()[0].stock.dimensions()[2] as f64;
+        let zero = [(lo[0] + hi[0]) / 2., hi[1], hi[2] - height];
+        let set = format!("4. Set X0 Y0 Z{}", crate::post::exact_mm(height as f32));
+        let steps = |a: &App| {
+            crate::ui::work_zero_steps(a, conn(a))
+                .expect("the guide")
+                .join("\n")
+        };
+        assert!(steps(&a).contains(&set), "{}", steps(&a));
+        assert_eq!(conn(&a).probe_z_blocked(), None);
+        assert_eq!(edges_blocked(&a), "");
+        // An edit: the setup is out of date until it is checked again. The
+        // edits never pause here, so the Control page does not check it
+        // again on its own (LIO-150) under the presses.
+        let _ = a.update(Message::Title("Edited".into()));
+        a.last_edit = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(run_of(&a).stale);
+        let why = conn(&a).run_program().expect_err("out of date");
+        assert!(why.contains("check it again"), "{why}");
+        assert_eq!(conn(&a).probe_z_blocked().as_deref(), Some(why.as_str()));
+        assert_eq!(edges_blocked(&a), why);
+        // The steps still end with the old button; it and Move there wait.
+        assert!(steps(&a).contains(&set), "{}", steps(&a));
+        let _ = a.view();
+        let at = conn(&a).snapshot.machine_pos;
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        // A line sent after the press is taken once the press has been.
+        mdi(&mut a, "G54");
+        let now = conn(&a).snapshot.machine_pos;
+        assert!(
+            (0..3).all(|k| (now[k] - at[k]).abs() < 1e-6),
+            "Move there moved the tool from {at:?} to {now:?} while out of date"
+        );
+        // Away from the work zero, the touch-off would set the offset here.
+        mdi(&mut a, "G53 G0 X100 Y100 Z-10");
+        let _ = a.update(Message::Machine(Action::TouchOff));
+        mdi(&mut a, "G54");
+        work_offset(&a, [195., 140., -20.]);
+        assert!(!run_of(&a).touched);
+        // Checked again, as Check again does, both work.
+        let _ = a.update(Message::Run(R::Check));
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert!(!run_of(&a).stale && conn(&a).run_program().is_ok());
+        assert_eq!(conn(&a).probe_z_blocked(), None);
+        assert!(steps(&a).contains(&set), "{}", steps(&a));
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        tick_until(&mut a, 10.0, "the move onto the block", |s| {
+            s.state == Some(State::Idle)
+                && (s.machine_pos[2] - hi[2]).abs() < 0.06
+                && (s.machine_pos[1] - hi[1]).abs() < 0.06
+        });
+        let _ = a.update(Message::Machine(Action::TouchOff));
+        tick_until(&mut a, 2.0, "the touch-off", |s| {
+            s.work_pos[1].abs() < 1e-3 && (s.work_pos[2] - height).abs() < 1e-3
+        });
+        work_offset(&a, zero);
+        assert!(run_of(&a).touched);
+        let _ = a.view();
+    }
+
     #[test]
     fn probing_the_edges_needs_a_stock_zero_a_tip_and_its_work_system() {
         use crate::control::Action;

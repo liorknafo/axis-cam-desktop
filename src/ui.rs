@@ -4071,28 +4071,35 @@ pub(crate) fn run_panel<'a>(
     }
     if let Some(steps) = work_zero_steps(app, c) {
         use crate::control::Action;
-        let mut buttons = row![].spacing(8);
+        // The buttons act on the checked setup the steps are from, which an
+        // edit may have changed: like the probes, they wait while its check
+        // is out of date, and say so (#39).
+        let checked = c.run_program();
+        let mut buttons = row![].spacing(8).align_y(Alignment::Center);
         if c.sim_zero().is_some() {
-            let ready = c.idle() && c.unset_limited_axes().is_empty();
+            let ready = checked.is_ok() && c.idle() && c.unset_limited_axes().is_empty();
             buttons = buttons.push(act(
                 "Move there",
                 ready.then_some(Message::Machine(Action::ToSimZero)),
                 false,
             ));
         }
+        let manual = checked.is_ok() && c.manual();
         buttons = buttons.push(match c.touch_off() {
             Some((_, work)) => act(
                 touch_label(work),
-                c.manual().then_some(Message::Machine(Action::TouchOff)),
+                manual.then_some(Message::Machine(Action::TouchOff)),
                 false,
             ),
             None => act(
                 "Zero all",
-                c.manual()
-                    .then_some(Message::Machine(Action::WorkZero(None))),
+                manual.then_some(Message::Machine(Action::WorkZero(None))),
                 false,
             ),
         });
+        if let Err(why) = checked {
+            buttons = buttons.push(muted(why));
+        }
         body = body
             .push(bold("Work zero on the stock", 13))
             .push(note(steps.join("\n")))
