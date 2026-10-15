@@ -360,7 +360,13 @@ pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, 
     if doc.file.is_none() {
         return Err(vec![NO_PART.into()]);
     }
-    crate::post::checked(doc, mesh, si, &simulated(doc, mesh, si), PostSettings::for_uc100)
+    crate::post::checked(
+        doc,
+        mesh,
+        si,
+        &simulated(doc, mesh, si),
+        PostSettings::for_uc100,
+    )
 }
 
 const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
