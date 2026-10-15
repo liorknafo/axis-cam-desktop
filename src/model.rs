@@ -1435,20 +1435,19 @@ impl Document {
         self.sync_stock_sources();
         Ok(())
     }
-    pub fn remove_setup(&mut self, i: usize) -> Result<(), String> {
+    /// Removes setup `i`. The setup that took its stock from it is chained to
+    /// the one before, and the returned line says so (its notes are the
+    /// user's and stay as typed).
+    pub fn remove_setup(&mut self, i: usize) -> Result<Option<String>, String> {
         if i >= self.setups.len() {
             return Err("Setup is missing.".into());
         }
         let old = self.setups.remove(i);
-        for s in &mut self.setups {
-            if get(&s.p, "stock_source") == old.id {
-                s.p.insert("stock_source".into(), "fresh".into());
-                s.p.insert(
-                    "notes".into(),
-                    "Stock source was removed. Recheck stock and workholding.".into(),
-                );
-            }
-        }
+        let rechained = self
+            .setups
+            .iter()
+            .find(|s| get(&s.p, "stock_source") == old.id)
+            .map(|s| s.name().to_string());
         if self.active == old.id {
             self.active = self
                 .setups
@@ -1457,7 +1456,15 @@ impl Document {
                 .unwrap_or_default()
         }
         self.sync_stock_sources();
-        Ok(())
+        Ok(rechained.map(|name| {
+            let from = match i.checked_sub(1).and_then(|p| self.setups.get(p)) {
+                Some(previous) => previous.name().to_string(),
+                None => "fresh stock".to_string(),
+            };
+            format!(
+                "Stock source was removed: {name} now takes its stock from {from}. Recheck stock and workholding."
+            )
+        }))
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
@@ -1620,6 +1627,42 @@ mod tests {
         assert_eq!(get(&d.setups[1].p, "stock_source"), d.setups[0].id);
         d.remove_setup(0).unwrap();
         assert_eq!(get(&d.setup().p, "stock_source"), "fresh")
+    }
+    #[test]
+    fn removing_a_setup_keeps_the_next_setups_notes() {
+        let mut d = Document::sample();
+        d.setups.push(d.setup().duplicate("G55"));
+        d.sync_stock_sources();
+        d.setups[1]
+            .p
+            .insert("notes".into(), "Clamp on the soft jaws.".into());
+        d.remove_setup(0).unwrap();
+        assert_eq!(get(&d.setups[0].p, "notes"), "Clamp on the soft jaws.");
+        assert_eq!(get(&d.setups[0].p, "stock_source"), "fresh")
+    }
+    #[test]
+    fn removing_a_setup_reports_the_stock_source_change() {
+        let mut d = Document::sample();
+        d.setups.push(d.setup().duplicate("G55"));
+        d.setups.push(d.setup().duplicate("G56"));
+        for (s, name) in d.setups.iter_mut().zip(["One", "Two", "Three"]) {
+            s.p.insert("name".into(), name.into());
+        }
+        d.sync_stock_sources();
+        let first = d.setups[0].id.clone();
+        // The setup after the removed one is chained to the one before it.
+        let note = d.remove_setup(1).unwrap().unwrap();
+        assert!(note.contains("Three") && note.contains("One"), "{note}");
+        assert_eq!(get(&d.setups[1].p, "stock_source"), first);
+        // Removing the first sends the next one back to the stock blank.
+        let note = d.remove_setup(0).unwrap().unwrap();
+        assert!(
+            note.contains("Three") && note.contains("fresh stock"),
+            "{note}"
+        );
+        assert_eq!(get(&d.setups[0].p, "stock_source"), "fresh");
+        // The last setup has no successor, so there is nothing to report.
+        assert_eq!(d.remove_setup(0).unwrap(), None);
     }
     #[test]
     fn machine_limit_checked() {
