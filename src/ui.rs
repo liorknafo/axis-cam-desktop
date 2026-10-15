@@ -2741,10 +2741,12 @@ fn holding_note(
         }
     };
     let gap = crate::holding::gap(setup).unwrap_or_default();
+    // As export checks: the machine's blend tolerance is added to the gap.
+    let reach = gap + crate::post::blend(&setup.machine);
     let datum = app
         .part_mesh()
         .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok());
-    let lines: Vec<String> = crate::holding::hits(plan, &boxes, gap)
+    let lines: Vec<String> = crate::holding::hits(plan, &boxes, reach)
         .iter()
         .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
         .collect();

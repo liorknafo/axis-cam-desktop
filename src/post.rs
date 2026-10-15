@@ -52,7 +52,8 @@ impl PostSettings {
     /// program per tool run, the tool changed by hand in between), retracts
     /// to the setup clearance plane, which the checks prove clear of the
     /// stock and the jaws, and the machine's spindle start dwell and Air
-    /// output. The driver blends corners with the profile's own setting.
+    /// output. The driver blends corners with the profile's own setting:
+    /// nothing writes it, and the checks allow for it as export's do.
     pub fn for_uc100(m: &Machine) -> Result<Self, Vec<String>> {
         let mut e = vec![];
         if get(&m.p, "controller") != "UC100" {
@@ -76,7 +77,6 @@ impl PostSettings {
         Ok(Self {
             tool_table: false,
             machine_home: false,
-            blend: 0.,
             ..Self::read(m)
         })
     }
@@ -94,7 +94,7 @@ impl PostSettings {
         Self {
             tool_table: post_setting(&m.p, "post_tool_length") == POST_TOOL_LENGTH[0],
             machine_home: post_setting(&m.p, "post_retract") == POST_RETRACT[0],
-            blend: value("post_blend"),
+            blend: blend(m),
             dwell: value("post_dwell"),
             air: match post_setting(&m.p, "post_air") {
                 "M7" => Some((true, false)),
@@ -103,6 +103,17 @@ impl PostSettings {
             },
         }
     }
+}
+/// The path blending tolerance of machine `m`'s profile (`post_blend`, written
+/// as G64 P), in mm: how far the controller may leave the programmed path at
+/// a corner. The checks add it to the setup's clearance gap around the jaws
+/// and clamps and to the cutter's radius in the rapid-descent proof. 0 when
+/// the field does not read as a number (`post_setting_issues` refuses it).
+pub fn blend(m: &Machine) -> f32 {
+    post_setting(&m.p, "post_blend")
+        .trim()
+        .parse::<f32>()
+        .map_or(0., |v| v.max(0.))
 }
 /// Where a stock-based work zero lies along X or Y of the stock box: on its
 /// − side, midway between its sides, or on its + side.
@@ -3822,6 +3833,86 @@ M2
         // Moved along the side, clear of the pocket, it exports again.
         doc.setups[0].p.insert("clamps".into(), "-X:42".into());
         assert!(post_job(&doc, &mesh).ready());
+    }
+    #[test]
+    fn the_profiles_blend_is_added_to_the_gap_at_export_and_on_a_uc100_run() {
+        let (mut doc, mesh) = pocket_job();
+        // A toe clamp on -X, no clearance gap, and a clearance plane above
+        // the clamp (25 mm over the stock top) and any blend.
+        hold(
+            &mut doc,
+            "Clamp",
+            &[("clamps", "-X:0"), ("holding_gap", "0")],
+        );
+        doc.setups[0].operations[0]
+            .p
+            .insert("clearance".into(), "30".into());
+        let sims = results(&doc, &mesh);
+        let plan = &sims[0][0].1.as_ref().unwrap().plan;
+        let stock = plan.stock;
+        // The clamp is centred on the Pocket's move nearest the -X side, and
+        // bites onto the stock until its inner face is 0.5 mm from the tool's
+        // edge there.
+        let (left, y) = plan
+            .moves
+            .iter()
+            .flat_map(|m| [m.from, m.to])
+            .map(|p| (p[0], p[1]))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap();
+        let bite = left - plan.radius - 0.5 - stock.min[0];
+        assert!((12. ..60.).contains(&bite), "{bite}");
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        doc.workholding
+            .iter_mut()
+            .find(|h| h.id == id)
+            .unwrap()
+            .p
+            .insert("bite".into(), format!("{bite:.2}"));
+        let offset = y - (stock.min[1] + stock.max[1]) / 2.;
+        doc.setups[0]
+            .p
+            .insert("clamps".into(), format!("-X:{offset:.2}"));
+        // With the default blend (G64 P0.010) the tool stays clear: exported.
+        let posted = post_job(&doc, &mesh);
+        assert!(posted.ready(), "{:?}", errors(&posted));
+        // With G64 P1 the controller may leave the programmed path by up to
+        // 1 mm: the tool may come within 0.5 mm of the clamp, so the setup is
+        // refused, and the message says the setup's gap.
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_blend".into(), "1".into());
+        let posted = post_job(&doc, &mesh);
+        assert!(!posted.ready());
+        let refused = errors(&posted);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("Pocket: the tool hits the clamp on -X (offset ")
+                && refused[0].ends_with(" (within the 0 mm gap)."),
+            "{refused:?}"
+        );
+        // A UC100 run checks the same, with the profile's blend.
+        for (k, v) in [("controller", "UC100"), ("uc100_profile", "jy5800.json")] {
+            doc.setups[0].machine.p.insert(k.into(), v.into());
+        }
+        let sims = results(&doc, &mesh);
+        assert_eq!(
+            checked(&doc, &mesh, 0, &sims[0], PostSettings::for_uc100).err(),
+            Some(refused.clone())
+        );
+        assert_eq!(
+            held(&doc, &mesh, 0, &sims[0])
+                .into_iter()
+                .map(|h| h.message)
+                .collect::<Vec<_>>(),
+            refused
+        );
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_blend".into(), "0".into());
+        assert!(checked(&doc, &mesh, 0, &sims[0], PostSettings::for_uc100).is_ok());
     }
     #[test]
     fn workholding_that_cannot_be_modelled_refuses_the_setup_with_the_editors_line() {

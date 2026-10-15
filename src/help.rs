@@ -864,7 +864,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "holding_gap") => (
-            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. A move whose cutter or holder comes within it is warned of in the operation preview (that operation's own toolpath) and refused at export (every program move, the links between operations, approaches and retracts included).",
+            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. The machine profile's path blending tolerance (G64 P) is added to it, since the controller may leave the programmed path by that much at a corner. A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export (every program move, the links between operations, approaches and retracts included).",
             None,
         ),
         (Target::Setup, "clamps") => (
@@ -1096,7 +1096,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "post_blend") => (
-            "Path blending tolerance for LinuxCNC's trajectory planner. A positive value writes G64 P with this tolerance in mm, so corners may round by up to that much at speed. 0 writes G61 exact path.",
+            "Path blending tolerance for LinuxCNC's trajectory planner. A positive value writes G64 P with this tolerance in mm, so corners may round by up to that much at speed. 0 writes G61 exact path. The checks allow for it: it is added to the setup's clearance gap around the jaws and clamps and to the cutter's radius when a rapid descent is proven clear of the stock, also for a UC100 run.",
             None,
         ),
         (_, "post_dwell") => (
@@ -2167,7 +2167,12 @@ mod tests {
         }
         assert_eq!(
             field_help("holding_gap", "x", Target::Setup).body,
-            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. A move whose cutter or holder comes within it is warned of in the operation preview (that operation's own toolpath) and refused at export (every program move, the links between operations, approaches and retracts included)."
+            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. The machine profile's path blending tolerance (G64 P) is added to it, since the controller may leave the programmed path by that much at a corner. A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export (every program move, the links between operations, approaches and retracts included)."
+        );
+        let blend = field_help("post_blend", "x", Target::Machine).body;
+        assert!(
+            blend.contains("added to the setup's clearance gap") && blend.contains("UC100 run"),
+            "{blend}"
         );
         // What the check is, and what it is not, in the field that chooses it.
         let holding = field_help("holding", "x", Target::Setup).body;

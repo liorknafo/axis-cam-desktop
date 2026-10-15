@@ -159,7 +159,9 @@ pub fn check_setup(
                 .is_some_and(|z| *z <= low + EPS);
             let proven = || {
                 rests[op].as_ref().is_some_and(|r| {
-                    let radius = o.diameter / 2.;
+                    // The controller may leave the path by the blend
+                    // tolerance at the corners: the column is that much wider.
+                    let radius = o.diameter / 2. + settings.blend;
                     let column = Bounds {
                         min: [to[0] - radius, to[1] - radius, low],
                         max: [to[0] + radius, to[1] + radius, top],
@@ -202,9 +204,12 @@ pub fn check_setup(
 /// to, in mm: the home height is not known, and it is above everything.
 const HOME_CLEARANCE: f32 = 10_000.;
 /// What the program's motion does to the jaws or clamps in `boxes` (each grown
-/// by `gap`): one problem per operation and part of its tool (`hits_segments`
-/// with the operation's own tool). Every stretch the tool tip travels counts,
-/// in plan coordinates: the moves and the links between operations, the
+/// by `gap` and by the blend tolerance of `settings`, since the controller may
+/// leave the programmed path by that much at every corner; the messages say
+/// the setup's gap): one problem per operation and part of its tool
+/// (`hits_segments` with the operation's own tool). Every stretch the tool
+/// tip travels counts, in plan coordinates: the moves and the links between
+/// operations, the
 /// retracts (straight up from where the tip is to the retract height, the
 /// clearance plane or, for the machine's Z home, far above every box), the
 /// approach after a tool change (across at the retract height from where the
@@ -233,17 +238,27 @@ pub fn holding_problems(
     let top = highest.bounds.max[2];
     let plane = clearance_plane(blocks);
     let mut problems = Problems::default();
+    // The path may leave the programmed one by the blend: the boxes are kept
+    // that much farther than the gap.
+    let reach = gap + settings.blend;
     // The program's first rapid starts from wherever the tool was, at the
     // clearance plane: it has to clear every box and its gap (a tip exactly
     // at the top and gap touches, as in the hits).
-    if !settings.machine_home && plane <= top + gap {
+    if !settings.machine_home && plane <= top + reach {
         let stock_top = plans.first().map_or(datum[2], |plan| plan.stock.max[2]);
-        let message =
-            crate::holding::plane_message(&highest.label, plane, gap, top, datum[2], stock_top);
+        let message = crate::holding::plane_message(
+            &highest.label,
+            plane,
+            gap,
+            settings.blend,
+            top,
+            datum[2],
+            stock_top,
+        );
         problems.add(None, "plane", message);
     }
     let high = if settings.machine_home {
-        (top + gap + HOME_CLEARANCE).max(plane)
+        (top + reach + HOME_CLEARANCE).max(plane)
     } else {
         plane
     };
@@ -290,7 +305,7 @@ pub fn holding_problems(
             plan.tool_length,
             plan.holder_radius,
             boxes,
-            gap,
+            reach,
         );
         for hit in hits {
             let message = crate::holding::message(&ops[k].name, &hit, gap, datum);
@@ -898,6 +913,143 @@ mod tests {
             [
                 "Wide: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap)."
             ]
+        );
+    }
+    /// `Machine::new(3)` with the path blending tolerance `blend`.
+    fn blended(blend: &str) -> Machine {
+        let mut machine = Machine::new(3);
+        machine.p.insert("post_blend".into(), blend.into());
+        machine
+    }
+    #[test]
+    fn the_profiles_blend_is_added_to_the_gap() {
+        // A Ø10 tool whose edge passes 0.5 mm from the clamp's inner face
+        // (X30): its centre at X24.5, within the clamp's heights. The setup
+        // keeps no gap, so the reach is the radius, 5.
+        let plan = fixture::plan(
+            [24.5, 0., 25.],
+            &[
+                (Motion::Feed, [24.5, 0., 20.], 250.),
+                (Motion::Feed, [24.5, 5., 20.], 1000.),
+                (Motion::Rapid, [24.5, 5., 25.], 6000.),
+            ],
+        );
+        let problems = |machine: Machine| -> Vec<String> {
+            let settings = PostSettings::from_machine(&machine).unwrap();
+            let op = fixture::facing_op();
+            let blocks = blocks(std::slice::from_ref(&op), &[&plan], &settings);
+            holding_problems(
+                &[op],
+                &[&plan],
+                &blocks,
+                &settings,
+                &low_clamp(),
+                0.,
+                [0., 0., 10.],
+            )
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+        };
+        assert_eq!(problems(blended("0")), Vec::<String>::new());
+        assert_eq!(problems(Machine::new(3)), Vec::<String>::new());
+        // With G64 P1 the controller may leave the programmed path by up to
+        // 1 mm at every corner: the tool may come 0.5 mm closer than proven.
+        let found = problems(blended("1"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .starts_with("Face top: the tool hits the clamp on +X (offset 0) at X24.5 Y0.0")
+                && found[0].ends_with("(within the 0 mm gap)."),
+            "{found:?}"
+        );
+        // At the clearance plane the blend counts too: a plane exactly at
+        // the clamp's top passes with no gap and no blend, not with a blend.
+        let [clamp] = low_clamp();
+        let plane_at = |z: f32| fixture::plan([0., 0., z], &[(Motion::Feed, [5., 0., z], 500.)]);
+        let plane = |blend: &str, z: f32| -> Vec<String> {
+            let mut machine = blended(blend);
+            machine
+                .p
+                .insert("post_retract".into(), crate::model::POST_RETRACT[1].into());
+            let settings = PostSettings::from_machine(&machine).unwrap();
+            let op = fixture::facing_op();
+            let plan = plane_at(z);
+            let blocks = blocks(std::slice::from_ref(&op), &[&plan], &settings);
+            holding_problems(
+                &[op],
+                &[&plan],
+                &blocks,
+                &settings,
+                std::slice::from_ref(&clamp),
+                0.,
+                [0., 0., 10.],
+            )
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+        };
+        assert_eq!(plane("0", 35.5), Vec::<String>::new());
+        assert_eq!(
+            plane("1", 35.5),
+            [
+                "The setup clearance plane (Z25.5) is not above the clamp on +X (offset 0) and its 0 mm gap (Z26.0). Raise the operations' clearance above 26.0 mm over the stock top (Z26.0), or retract to machine home."
+            ]
+        );
+        assert_eq!(plane("1", 36.5), Vec::<String>::new());
+    }
+    #[test]
+    fn the_profiles_blend_widens_the_rapid_column() {
+        let (doc, mesh) = fixture::job();
+        let mut sims = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| sims.push(r.unwrap()));
+        let top = sims[0].plan.stock.max[2];
+        // In the Pocket (T1, Ø10, after the 4 mm Facing with the same tool)
+        // a rapid 6 mm deep, 2 mm below the facing, whose column touches the
+        // stock box (X-62 from the work zero) at its -X side: wholly beside
+        // it, where there never was stock. Nothing of the facing was that
+        // deep, so only the rest-stock proof can accept it.
+        let problems = |blend: &str| -> Vec<String> {
+            let mut setup = doc.setups[0].clone();
+            setup.machine.p.insert("post_blend".into(), blend.into());
+            let settings = PostSettings::from_machine(&setup.machine).unwrap();
+            let ops: Vec<OpState> = sims
+                .iter()
+                .zip(&setup.operations)
+                .map(|(s, op)| crate::post::op_state(&doc, op, &s.plan, Some(&settings)).unwrap())
+                .collect();
+            let zero = crate::post::datum(&setup, sims[0].plan.stock, &mesh).unwrap();
+            let mut sims = sims.clone();
+            let plan = &mut sims[1].plan;
+            assert_eq!(plan.radius, 5.);
+            let p0 = plan.moves[0].to;
+            let hi = [-67. + zero[0], -35. + zero[1], p0[2]];
+            let lo = [hi[0], hi[1], top - 6.];
+            let rapid = |from, to| Move {
+                from,
+                to,
+                motion: Motion::Rapid,
+                cutting_pass: false,
+                feed: 0.,
+                start: 0.,
+                end: 0.,
+            };
+            plan.moves.splice(
+                1..1,
+                [rapid(p0, hi), rapid(hi, lo), rapid(lo, hi), rapid(hi, p0)],
+            );
+            let plans: Vec<&Plan> = sims.iter().map(|s| &s.plan).collect();
+            let blocks = blocks(&ops, &plans, &settings);
+            let refs: Vec<&Simulation> = sims.iter().collect();
+            check_setup(&setup, &ops, &refs, &blocks, &settings, zero)
+        };
+        assert_eq!(problems("0"), Vec::<String>::new());
+        // With G64 P1 the column is 1 mm wider: it overlaps the stock, where
+        // only the 4 mm of the facing is proven removed.
+        let found = problems("1");
+        assert!(
+            found.iter().any(|p| p.contains("not proven removed")),
+            "{found:?}"
         );
     }
 }
