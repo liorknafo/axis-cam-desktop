@@ -1706,13 +1706,12 @@ mod tests {
             ..Resp::answer("{\"ok\":true}")
         })
         .await;
-        let started = std::time::Instant::now();
         let reply = r.client.respond(&request()).await.unwrap();
         assert_eq!(reply.text, "{\"ok\":true}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "waited {:?} for a connection that was held open",
-            started.elapsed()
+        assert_eq!(
+            r.fake.closed(),
+            0,
+            "the reply waited for the server to close the connection"
         );
     }
     #[tokio::test]

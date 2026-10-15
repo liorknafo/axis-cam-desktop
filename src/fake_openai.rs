@@ -1,5 +1,6 @@
 //! Test-only stand-in for OpenAI's sign-in and API servers on a loopback port.
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -108,21 +109,35 @@ impl Resp {
 pub struct Fake {
     pub base: String,
     pub requests: Arc<Mutex<Vec<Req>>>,
+    answered: Arc<AtomicUsize>,
+    closed: Arc<AtomicUsize>,
+}
+/// Counts a connection closed when its task ends, however it ends.
+struct Closing(Arc<AtomicUsize>);
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 impl Fake {
     pub async fn start(handler: impl Fn(&Req) -> Resp + Send + Sync + 'static) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(vec![]));
+        let (answered, closed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let log = requests.clone();
+        let (answers, closes) = (answered.clone(), closed.clone());
         let handler = Arc::new(handler);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let handler = handler.clone();
                 let log = log.clone();
+                let answers = answers.clone();
+                let closing = Closing(closes.clone());
                 // Each connection on its own task, so a delayed answer does
                 // not hold up other requests.
                 tokio::spawn(async move {
+                    let _closing = closing;
                     let Some(request) = read(&mut socket).await else {
                         return;
                     };
@@ -148,13 +163,30 @@ impl Fake {
                     );
                     let _ = socket.write_all(head.as_bytes()).await;
                     let _ = socket.write_all(response.body.as_bytes()).await;
+                    answers.fetch_add(1, Ordering::SeqCst);
                     if let Some(ms) = response.cut_after_ms {
                         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     }
                 });
             }
         });
-        Self { base, requests }
+        Self {
+            base,
+            requests,
+            answered,
+            closed,
+        }
+    }
+    /// Requests the fake has answered (head and body written) so far: a
+    /// reply the client gave before that is its own, such as a limit's.
+    pub fn answered(&self) -> usize {
+        self.answered.load(Ordering::SeqCst)
+    }
+    /// Connections the fake has finished with so far, a held one once its
+    /// hold is over: a reply the client gave before that did not wait for
+    /// the close.
+    pub fn closed(&self) -> usize {
+        self.closed.load(Ordering::SeqCst)
     }
     pub fn seen(&self, path: &str) -> Vec<Req> {
         self.requests

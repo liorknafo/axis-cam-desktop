@@ -452,6 +452,9 @@ struct Closure {
     encloses_volume: bool,
     /// A coordinate lies beyond `FAR` or is not finite.
     far: bool,
+    /// Ends of open edges the split looked at, for the test that keeps it
+    /// far below every end for every open edge.
+    looked: usize,
 }
 /// How far apart two points may be and still be one point, in a part whose
 /// coordinates reach `largest` mm: 8 f32 steps at that coordinate (float
@@ -495,6 +498,7 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
             open_edges: 3 * triangles.len(),
             encloses_volume: false,
             far: true,
+            looked: 0,
         };
     }
     let tol = tolerance(largest);
@@ -548,6 +552,7 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
             open_edges: 0,
             encloses_volume,
             far: false,
+            looked: 0,
         };
     }
     // Only the ends of open edges can split one.
@@ -555,12 +560,13 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
     ends.sort_unstable();
     ends.dedup();
     let tree = Tree::new(&points, ends);
-    let (mut pieces, mut cuts) = (vec![], vec![]);
+    let (mut pieces, mut cuts, mut looked) = (vec![], vec![], 0);
     for &(a, b) in &open {
         let (pa, pb) = (points[a as usize], points[b as usize]);
         let d = sub(pb, pa);
         cuts.clear();
         tree.near(pa, pb, tol, |v| {
+            looked += 1;
             let p = points[v as usize];
             let t = (dot(sub(p, pa), d) / dot(d, d)).clamp(0., 1.);
             let off = sub(p, std::array::from_fn(|k| pa[k] + d[k] * t));
@@ -581,6 +587,7 @@ fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
         open_edges: odd(pieces).len(),
         encloses_volume,
         far: false,
+        looked,
     }
 }
 /// The edges that occur an odd number of times in `edges`.
@@ -2371,10 +2378,13 @@ pub(crate) mod tests {
     fn the_edge_test_is_quick_where_long_open_edges_meet() {
         let t = fan_cylinder(3750);
         assert_eq!(t.len(), 20_000);
-        let start = std::time::Instant::now();
-        assert_eq!(count(&t), 0);
-        let took = start.elapsed();
-        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        let t: Vec<_> = t.iter().map(|p| p.map(|q| q.map(f64::from))).collect();
+        let c = closure(&t, 0.);
+        assert_eq!(c.open_edges, 0);
+        // The split of each open edge looks only near it: about 30 ends per
+        // open edge here (15,000 of them, with 11,272 ends), not every end
+        // for every open edge, 170 million.
+        assert!(c.looked < 64 * 3 * t.len(), "{}", c.looked);
     }
     #[test]
     fn the_example_models_are_closed_surfaces() {
