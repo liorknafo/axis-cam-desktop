@@ -78,11 +78,15 @@ impl Endpoints {
     }
 }
 /// Refresh failures: `Fatal` means the tokens are unusable and the user must
-/// sign in again; `Retry` is a network or server problem.
+/// sign in again; `Retry` is a server problem or a request that never reached
+/// OpenAI (nothing listened); `Unanswered` is a request that may have reached
+/// it without an answer, after which OpenAI may have rotated the refresh
+/// token, so the same one is not sent again.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthError {
     Fatal(String),
     Retry(String),
+    Unanswered(String),
 }
 /// The HTTP client for sign-in and API calls: it never follows redirects (so
 /// tokens and codes only go where they were sent) and gives up after two
@@ -400,13 +404,19 @@ async fn post_form(
     form: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<(u16, Value), String> {
-    let response = http
-        .post(url)
-        .form(form)
-        .timeout(timeout)
-        .send()
+    post_form_sent(http, url, form, timeout)
         .await
-        .map_err(|_| "Could not reach OpenAI.".to_string())?;
+        .map_err(|_| "Could not reach OpenAI.".to_string())
+}
+/// [`post_form`] with the transport error kept, to tell a connect failure
+/// from a request that may have reached the server.
+async fn post_form_sent(
+    http: &reqwest::Client,
+    url: &str,
+    form: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, Value), reqwest::Error> {
+    let response = http.post(url).form(form).timeout(timeout).send().await?;
     let status = response.status().as_u16();
     let text = response.text().await.unwrap_or_default();
     Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
@@ -524,7 +534,7 @@ async fn refresh_with(
     session: &Session,
     timeout: Duration,
 ) -> Result<Session, AuthError> {
-    let (status, body) = post_form(
+    let (status, body) = post_form_sent(
         http,
         &e.token,
         &[
@@ -536,7 +546,13 @@ async fn refresh_with(
         timeout,
     )
     .await
-    .map_err(AuthError::Retry)?;
+    .map_err(|e| {
+        if e.is_connect() {
+            AuthError::Retry("Could not reach OpenAI.".into())
+        } else {
+            AuthError::Unanswered("OpenAI did not answer. The refresh was not repeated.".into())
+        }
+    })?;
     if status != 200 {
         return Err(refresh_failure(status, error_code(&body)));
     }
@@ -1625,7 +1641,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn a_stalled_token_endpoint_fails_as_retry_in_bounded_time() {
+    async fn a_stalled_token_endpoint_fails_unanswered_in_bounded_time() {
         assert_eq!(ENDPOINT_TIMEOUT, Duration::from_secs(30));
         let fake = Fake::start(|_| Resp {
             delay_ms: 10_000,
@@ -1640,9 +1656,13 @@ mod tests {
             Duration::from_millis(200),
         )
         .await;
-        // Retry, not the token the fake would give, and given before it did:
-        // the 200 ms limit ended the wait, once.
-        assert!(matches!(result, Err(AuthError::Retry(_))), "{result:?}");
+        // Unanswered (the request arrived, so the refresh token is not to be
+        // sent again), not the token the fake would give, and given before it
+        // did: the 200 ms limit ended the wait, once.
+        assert!(
+            matches!(result, Err(AuthError::Unanswered(_))),
+            "{result:?}"
+        );
         assert_eq!(fake.answered(), 0);
         assert_eq!(fake.seen("/token").len(), 1);
     }

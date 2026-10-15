@@ -587,20 +587,22 @@ impl Client {
             // rotated tokens; presenting the refresh token it spent would
             // look like reuse to OpenAI. Its saved set is used instead, and
             // refreshed only if it is close to expiry itself (or refused).
+            // Read again before every attempt: a copy may have saved a set
+            // while an attempt failed.
             let mut current = current;
-            if let Ok(Some(saved)) = store_load(&store).await
-                && newer_saved(&saved, &current, &spent)
-            {
-                if rejected.as_deref() != Some(saved.access_token.as_str())
-                    && !saved.expires_within(300, now())
-                {
-                    let token = saved.access_token.clone();
-                    *session = Some(saved);
-                    return Ok(token);
-                }
-                current = saved;
-            }
             for attempt in 1..=3 {
+                if let Ok(Some(saved)) = store_load(&store).await
+                    && newer_saved(&saved, &current, &spent)
+                {
+                    if rejected.as_deref() != Some(saved.access_token.as_str())
+                        && !saved.expires_within(300, now())
+                    {
+                        let token = saved.access_token.clone();
+                        *session = Some(saved);
+                        return Ok(token);
+                    }
+                    current = saved;
+                }
                 match oauth::refresh(&http, &endpoints, &client_id, &current).await {
                     Ok(new) => {
                         // The old refresh token is spent now. If the store
@@ -635,6 +637,12 @@ impl Client {
                         }
                         *session = None;
                         return Err(ApiError::SignedOut(message));
+                    }
+                    // The request may have reached OpenAI, which may have
+                    // rotated the token: sending it again could revoke the
+                    // grant.
+                    Err(AuthError::Unanswered(message)) => {
+                        return Err(ApiError::Unavailable(message));
                     }
                     Err(AuthError::Retry(message)) if attempt == 3 => {
                         return Err(ApiError::Unavailable(message));
@@ -2085,6 +2093,71 @@ mod tests {
             ["Bearer access-2", "Bearer access-3", "Bearer access-4"]
         );
         assert_eq!(r.store.load().unwrap().unwrap().refresh_token, "refresh-4");
+    }
+    #[tokio::test]
+    async fn a_refresh_that_may_have_reached_openai_is_not_resent() {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        // The token endpoint reads the request and hangs up: OpenAI may have
+        // rotated refresh-1, so it is presented once.
+        let r = rig(soon.clone(), |_| Resp::hangup()).await;
+        assert_eq!(
+            r.client.respond(&request()).await.unwrap_err(),
+            ApiError::Unavailable("OpenAI did not answer. The refresh was not repeated.".into())
+        );
+        assert_eq!(r.fake.seen("/token").len(), 1);
+        assert!(r.fake.seen("/v1/responses").is_empty());
+        // Nothing listens on port 9: the request never reached OpenAI, so it
+        // is retried (up to three times) and then reported.
+        let mut client = Client::new(
+            Endpoints::local("http://127.0.0.1:9"),
+            "oaiapp_1".into(),
+            r.store.clone(),
+            soon,
+        );
+        client.backoff = Duration::ZERO;
+        assert_eq!(
+            client.models().await.unwrap_err(),
+            ApiError::Unavailable("Could not reach OpenAI.".into())
+        );
+    }
+    #[tokio::test]
+    async fn the_store_is_read_again_before_a_refresh_is_retried() {
+        let soon = Session {
+            expires_at: now() + 60,
+            ..sample()
+        };
+        // The token endpoint answers 503 and, meanwhile, another copy of the
+        // app saves a newer sign-in.
+        let store: Arc<std::sync::Mutex<Option<Arc<TestStore>>>> = Arc::default();
+        let other = store.clone();
+        let r = rig(soon, move |req| match req.path.as_str() {
+            "/token" => {
+                if let Some(store) = other.lock().unwrap().as_ref() {
+                    store
+                        .file
+                        .save(&Session {
+                            access_token: "access-2".into(),
+                            refresh_token: "refresh-2".into(),
+                            expires_at: now() + 3600,
+                            ..sample()
+                        })
+                        .unwrap();
+                }
+                Resp::json(503, json!({}))
+            }
+            _ => Resp::answer("{}"),
+        })
+        .await;
+        *store.lock().unwrap() = Some(r.store.clone());
+        r.client.respond(&request()).await.unwrap();
+        // refresh-1 was presented once; the retry adopted refresh-2's set.
+        let refreshes = r.fake.seen("/token");
+        assert_eq!(refreshes.len(), 1);
+        assert_eq!(refreshes[0].field("refresh_token"), "refresh-1");
+        assert_eq!(r.fake.seen("/v1/responses")[0].auth, "Bearer access-2");
     }
     #[tokio::test]
     async fn a_fatal_refresh_does_not_adopt_an_older_saved_sign_in() {
