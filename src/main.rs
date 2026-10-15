@@ -2696,9 +2696,12 @@ impl App {
                 if yes {
                     let i = self.doc.index();
                     match self.doc.remove_setup(i) {
-                        Ok(()) => {
+                        Ok(rechained) => {
                             self.stop_selection();
-                            self.touch()
+                            self.touch();
+                            if let Some(line) = rechained {
+                                self.status = line;
+                            }
                         }
                         Err(e) => self.status = e,
                     }

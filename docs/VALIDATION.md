@@ -555,7 +555,7 @@ Each statement names the test behind it (in the module it is in; `smoke::tests::
 - Pocket's starting stock exactly matches completed Facing stock. Restart returns to that inherited baseline; reverse scrub and incremental/direct playback agree.
 - The next setup retains the complete prior cut history and empty occupancy cells after a 180° flip and translation. Its nominal stock offsets do not refill cavities. Frame roundtrips and finite-flute checks pass.
 - Editing an earlier operation rebuilds downstream stock. Suppression skips the operation; an upstream generation failure blocks dependent previews with an explanation. Saved JSON regenerates the same baseline. Temporary stock bounds are not persisted.
-- Setup reorder/delete relinks inherited stock sources. The first setup defines the initial blank; subsequent setups carry the same material.
+- Setup reorder/delete relinks inherited stock sources. The first setup defines the initial blank; subsequent setups carry the same material. Deleting a setup leaves the next setup's notes as typed and says in the status line which setup it now takes its stock from, or that it starts from fresh stock (`model::tests::removing_a_setup_keeps_the_next_setups_notes`, `model::tests::removing_a_setup_reports_the_stock_source_change`).
 - A renderer job with seven operations in the first setup and underside Facing in a flipped second setup verifies inherited start, partial removal, completion and restart. The whole-job report checks every enabled operation. The timeline remains per operation. New cap-coverage planning skips fully cleared top levels; general leftover-region rest machining is still unavailable.
 
 ## Automatic cutting start after earlier operations
