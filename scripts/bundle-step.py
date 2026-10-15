@@ -6,15 +6,26 @@ def replace_copy(source,dest):
     shutil.copy2(source,dest)
     dest.chmod(dest.stat().st_mode | 0o200)
 app = pathlib.Path(sys.argv[1]).resolve()
-target = pathlib.Path(sys.argv[2])
+messages = pathlib.Path(sys.argv[2])
 binary = app / 'Contents/MacOS/axis-step'
 frameworks = app / 'Contents/Frameworks'
 frameworks.mkdir(parents=True, exist_ok=True)
-# Cargo's active build-script output identifies the helper used by this build.
-helpers = list((target / 'release/build').glob('axis-cam-*/out/axis-step'))
+# build.rs exports the helper's path as AXIS_BUILT_STEP_HELPER; cargo reports it for the build just made.
+helpers = []
+for line in messages.read_text().splitlines():
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if message.get('reason') == 'build-script-executed':
+        helpers += [value for key, value in message.get('env', []) if key == 'AXIS_BUILT_STEP_HELPER']
 if not helpers:
     raise SystemExit('No compiled STEP helper; package requires Open CASCADE support.')
-helper = max(helpers, key=lambda p: p.stat().st_mtime)
+if len(set(helpers)) > 1:
+    raise SystemExit('Cargo reported several STEP helpers: ' + ', '.join(sorted(set(helpers))))
+helper = pathlib.Path(helpers[0])
+if not helper.is_file():
+    raise SystemExit(f'STEP helper reported by cargo is missing: {helper}')
 replace_copy(helper, binary)
 prefix = pathlib.Path(os.environ.get('OCCT_PREFIX', '/opt/homebrew/opt/opencascade'))
 search = [prefix / 'lib', pathlib.Path('/opt/homebrew/lib')]
