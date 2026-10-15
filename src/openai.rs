@@ -299,8 +299,9 @@ impl SseParser {
 /// The most reply text (output, refusal and call arguments) one request may
 /// stream.
 const MAX_REPLY: usize = 4 * 1024 * 1024;
-/// The most function calls one reply keeps.
-const MAX_CALLS: usize = 16;
+/// The most function calls of one reply that are run; the later ones are
+/// kept so that each gets an answer, as the API requires.
+pub const MAX_CALLS: usize = 16;
 /// A function call item as the API sends it; its item `id` is not kept.
 fn call(item: &Value) -> Option<ToolCall> {
     Some(ToolCall {
@@ -377,7 +378,6 @@ impl Accumulator {
             }
             _ => {}
         }
-        self.calls.truncate(MAX_CALLS);
         let arguments: usize = self.calls.iter().map(|c| c.arguments.len()).sum();
         if self.text.len() + self.refusal.len() + arguments > MAX_REPLY {
             self.text = String::new();
@@ -1694,6 +1694,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[tokio::test]
+    async fn calls_past_the_limit_are_all_kept_for_an_answer() {
+        let items: Vec<Value> = (0..18)
+            .map(|i| json!({"type": "function_call", "call_id": format!("c{i}"), "name": "view_model", "arguments": "{}"}))
+            .collect();
+        let events: Vec<Value> = items
+            .iter()
+            .map(|item| json!({"type": "response.output_item.done", "item": item}))
+            .chain([json!({"type": "response.completed", "response": {"output": items}})])
+            .collect();
+        let r = rig(sample(), move |_| Resp::sse(&events)).await;
+        let calls = r.client.respond(&request()).await.unwrap().calls;
+        let ids: Vec<&str> = calls.iter().map(|c| c.call_id.as_str()).collect();
+        assert_eq!(ids, (0..18).map(|i| format!("c{i}")).collect::<Vec<_>>());
+        assert!(calls.len() > MAX_CALLS);
     }
     #[tokio::test]
     async fn an_http_400_without_a_known_code_is_a_bad_request() {

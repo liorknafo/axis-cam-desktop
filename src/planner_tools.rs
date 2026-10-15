@@ -9,7 +9,7 @@ use crate::{
     analysis::{self, PartReport, PlaneReport},
     cam::Geometry,
     holding, look, material,
-    openai::Tool,
+    openai::{MAX_CALLS, Tool},
     plan_check::{self, Checked, CheckedSetup, hundredths, plain},
     planner::{MAX_PICTURES_PER_REQUEST, MAX_PICTURES_PER_RUN, MAX_TOOL_ROUNDS},
     proposal::{self, clip},
@@ -182,7 +182,7 @@ pub fn instructions(pictures: bool) -> String {
         String::new()
     };
     format!("TOOLS
-- Before you answer you may call these functions. A request is the part report, or a check report the program sends back, and you answer each with a proposal. Each reply of yours with calls is one round, and a request allows at most {MAX_TOOL_ROUNDS} rounds; after that, reply with the proposal. An answer is JSON text, or one sentence when the call cannot be answered.
+- Before you answer you may call these functions. A request is the part report, or a check report the program sends back, and you answer each with a proposal. Each reply of yours with calls is one round, and a request allows at most {MAX_TOOL_ROUNDS} rounds; after that, reply with the proposal. The program runs at most {MAX_CALLS} calls per reply: each call after the {MAX_CALLS}th gets a sentence and is not run, so make the rest in your next reply. An answer is JSON text, or one sentence when the call cannot be answered.
 {view}- `check_plan` (`proposal`, a full proposal in the schema of your reply): checks the draft as your answer will be checked, which takes some seconds, and answers with the same check report: `passed`, `problems` by setup and operation, `operations`, `coverage`, `total_minutes`, and `stocks`, the stock before each setup (as `stock_after`). The draft becomes the latest draft: `stock_after`, `check_holding` and the operation views read it, as they read your answer once it has been checked. At most {MAX_CHECKS_PER_REQUEST} per request and {MAX_CHECKS_PER_RUN} in the run.
 - `stock_after` (`setup`, a setup number of the latest draft): the stock that setup starts from, in its axes: `size`, `box_from_part_corner` [x0, y0, z0, x1, y1, z1] from the model's -X/-Y/bottom corner, how much the earlier setups `removed` whole from each side (top, bottom, -X, +X, -Y, +Y, mm) and `by` which operations. Needs a checked draft or answer. No limit.
 - `check_holding` (`setup`, and `holder`, a `number` from `workholding_library`): whether that entry can hold the stock that setup starts from: the layout the program would suggest for the setup's toolpaths (a vise's `jaws_on` sides and `grip`, or the `clamps`' sides and offsets), `holds`, and the `problems` your answer would get at the stage `workholding` for that setup with that `holder` (the entry refused, stock it cannot hold, moves within its gap), empty when it holds. Setup 1 keeps the user's holder: for it only setup 1's own entry is checked, as placed. Needs a checked draft or answer. No limit.
@@ -190,6 +190,13 @@ pub fn instructions(pictures: bool) -> String {
 - `surface_info` (`surface`, an ID from `planes`): every orientation whose planes list the surface, with the plane's kind, depth, area, bbox, `max_cutter_diameter` and holes, and the surface's own area (`surface_area`, mm²) and `mean_normal` in setup 1's frame. No limit.
 
 ")
+}
+
+/// The answer to a call past the reply's limit (`MAX_CALLS`), which is not run.
+pub fn over_the_limit() -> Answer {
+    Answer::sentence(format!(
+        "Only the first {MAX_CALLS} calls of a reply are run; this one was not. Call it again in your next reply."
+    ))
 }
 
 /// Answers the call of tool `name` with the JSON text `arguments`. May take
@@ -853,6 +860,13 @@ mod tests {
     /// `value` as the tool writes it: f32 numbers in their shortest form.
     fn as_json<T: serde::Serialize>(value: &T) -> Value {
         serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+    }
+    #[test]
+    fn the_instructions_state_the_limit_of_calls_per_reply() {
+        for pictures in [true, false] {
+            assert!(instructions(pictures).contains("runs at most 16 calls per reply"));
+        }
+        assert_eq!(MAX_CALLS, 16);
     }
     fn near(value: &Value, expected: f64, tolerance: f64) {
         let v = value

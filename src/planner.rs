@@ -6,7 +6,7 @@ use crate::{
     look,
     mesh::Mesh,
     model::Document,
-    openai::{ApiError, Item, Part, Reply, Role, Tool, ToolChoice},
+    openai::{ApiError, Item, MAX_CALLS, Part, Reply, Role, Tool, ToolChoice},
     plan_check::{self, CheckReport},
     planner_tools::{self, ToolState},
     proposal::{self, Problem, Proposal},
@@ -818,27 +818,33 @@ async fn ask(
             ));
         }
         let mut pictures = vec![];
-        for call in reply.calls {
-            // The tool works on a copy of the state (which shares the part
-            // and the drafts), and a call that panics is caught there: the
-            // copy comes back as the tool left it, so a draft check or a view
-            // counts against its limits even when it fails (see
-            // `planner_tools::answer`).
-            let (name, arguments, mut copy) =
-                (call.name.clone(), call.arguments.clone(), state.clone());
-            let answer = blocking(busy, move || {
-                let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    planner_tools::answer(&name, &arguments, &mut copy)
-                }));
-                (answer.ok(), copy)
-            })
-            .await;
-            let answer = match answer {
-                Ok((answer, copy)) => {
-                    *state = copy;
-                    answer.unwrap_or_else(|| planner_tools::crashed(&call.name))
+        for (index, call) in reply.calls.into_iter().enumerate() {
+            // The model sees an answer for every call it made; the ones past
+            // the limit are not run.
+            let answer = if index >= MAX_CALLS {
+                planner_tools::over_the_limit()
+            } else {
+                // The tool works on a copy of the state (which shares the part
+                // and the drafts), and a call that panics is caught there: the
+                // copy comes back as the tool left it, so a draft check or a view
+                // counts against its limits even when it fails (see
+                // `planner_tools::answer`).
+                let (name, arguments, mut copy) =
+                    (call.name.clone(), call.arguments.clone(), state.clone());
+                let answer = blocking(busy, move || {
+                    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        planner_tools::answer(&name, &arguments, &mut copy)
+                    }));
+                    (answer.ok(), copy)
+                })
+                .await;
+                match answer {
+                    Ok((answer, copy)) => {
+                        *state = copy;
+                        answer.unwrap_or_else(|| planner_tools::crashed(&call.name))
+                    }
+                    Err(_) => planner_tools::crashed(&call.name),
                 }
-                Err(_) => planner_tools::crashed(&call.name),
             };
             conversation.push(Item::Call(call.clone()));
             conversation.push(Item::Output {
@@ -3932,6 +3938,29 @@ pub(crate) mod tests {
         assert_eq!(turns[3].1, Some(ToolChoice::Auto));
     }
     #[tokio::test]
+    async fn calls_past_the_limit_each_get_a_sentence_and_are_not_run() {
+        let (doc, mesh, report) = block();
+        let eighteen = (0..18).map(|i| cutting_call(&format!("c{i}"), 3)).collect();
+        let script = Script::calls(vec![calls(eighteen), text(&good(&report))]);
+        plan(&script, doc, mesh, &Busy::default(), |_| {})
+            .await
+            .unwrap();
+        let turns = script.turns.lock().unwrap();
+        let outputs: Vec<(&str, &str)> = turns[1]
+            .0
+            .iter()
+            .filter_map(|i| match i {
+                Item::Output { call_id, output } => Some((call_id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 18, "every call has an answer");
+        for (i, (id, output)) in outputs.iter().enumerate() {
+            assert_eq!(*id, format!("c{i}"));
+            assert_eq!(output.contains("Only the first 16 calls"), i >= MAX_CALLS);
+        }
+    }
+    #[tokio::test]
     async fn after_the_runs_last_picture_view_model_is_refused_and_the_other_tools_stay_open() {
         let (doc, mesh, report) = block();
         let script = Script::calls(vec![
@@ -4518,7 +4547,9 @@ pub(crate) mod tests {
             tools
                 .contains("A request is the part report, or a check report the program sends back")
         );
-        assert!(!text.contains("per reply") && !text.contains("a reply allows"));
+        assert!(!text.contains("a reply allows"));
+        // The limit of calls is the model's: per reply.
+        assert!(tools.contains("runs at most 16 calls per reply"));
         assert!(tools.contains("No limit"));
         let checks = format!(
             "At most {} per request and {} in the run",
