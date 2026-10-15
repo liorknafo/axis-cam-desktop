@@ -11,6 +11,7 @@ const PROD: &str = "http://schemas.microsoft.com/3dmanufacturing/production/2015
 const REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const MODEL_REL: &str = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel";
 const LIMIT: usize = 200_000;
+const XML_LIMIT: u64 = 100_000_000;
 #[derive(Clone, Copy, Debug)]
 struct Transform([f64; 12]);
 impl Transform {
@@ -248,42 +249,43 @@ fn model(s: &str, path: &str, root: &str) -> Result<Model, String> {
     })
 }
 pub fn load(bytes: &[u8]) -> Result<Vec<Tri>, String> {
+    read(bytes, XML_LIMIT)
+}
+// `limit` caps the XML read from the package, counted as it inflates: an entry's
+// declared size is the archive author's claim and bounds nothing.
+fn read(bytes: &[u8], limit: u64) -> Result<Vec<Tri>, String> {
     let mut zip =
         zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("Invalid 3MF ZIP: {e}"))?;
     if zip.len() > 4096 {
         return Err("3MF has too many package entries".into());
     }
-    let mut parts = HashMap::new();
-    let mut names = HashSet::new();
-    let mut total = 0u64;
+    let mut entries = HashMap::new();
     for i in 0..zip.len() {
-        let f = zip.by_index(i).map_err(|e| e.to_string())?;
+        let f = zip.by_index_raw(i).map_err(|e| e.to_string())?;
         if f.is_dir() {
             continue;
         }
-        let name = package_path("", f.name())?;
-        if !names.insert(name.clone()) {
+        if entries.insert(package_path("", f.name())?, i).is_some() {
             return Err("Duplicate 3MF package entry".into());
         }
-        if !(name.ends_with(".model") || name.ends_with(".rels")) {
-            continue;
-        }
-        total = total.checked_add(f.size()).ok_or("3MF package too large")?;
-        if total > 100_000_000 {
+    }
+    // Only the parts the root relationship reaches are read, each only as far as the limit leaves.
+    let mut total = 0u64;
+    let mut part = |name: &str, missing: &str| -> Result<String, String> {
+        let mut s = vec![];
+        zip.by_index(*entries.get(name).ok_or(missing)?)
+            .map_err(|e| e.to_string())?
+            .take(limit + 1 - total)
+            .read_to_end(&mut s)
+            .map_err(|e| format!("Cannot read 3MF XML: {e}"))?;
+        total += s.len() as u64;
+        if total > limit {
             return Err("3MF expanded XML exceeds 100 MB".into());
         }
-        let mut s = String::new();
-        f.take(100_000_001)
-            .read_to_string(&mut s)
-            .map_err(|e| format!("Cannot read 3MF XML: {e}"))?;
-        if s.len() > 100_000_000 {
-            return Err("3MF XML too large".into());
-        }
-        parts.insert(name, s);
-    }
-    let rels = xml(parts
-        .get("_rels/.rels")
-        .ok_or("3MF is missing package relationships")?)?;
+        String::from_utf8(s).map_err(|_| "3MF XML is not UTF-8".into())
+    };
+    let rels = part("_rels/.rels", "3MF is missing package relationships")?;
+    let rels = xml(&rels)?;
     let roots: Vec<_> = rels
         .descendants()
         .filter(|n| n.has_tag_name((REL, "Relationship")) && n.attribute("Type") == Some(MODEL_REL))
@@ -295,11 +297,7 @@ pub fn load(bytes: &[u8]) -> Result<Vec<Tri>, String> {
         return Err("External 3MF URLs are unsupported".into());
     }
     let root = package_path("", attr(roots[0], "Target")?)?;
-    let root_model = model(
-        parts.get(&root).ok_or("3MF root model is missing")?,
-        &root,
-        &root,
-    )?;
+    let root_model = model(&part(&root, "3MF root model is missing")?, &root, &root)?;
     let build = root_model.build.clone();
     let mut models = HashMap::from([(root.clone(), root_model)]);
     let mut pending = vec![root.clone()];
@@ -317,9 +315,7 @@ pub fn load(bytes: &[u8]) -> Result<Vec<Tri>, String> {
                     return Err("Too many 3MF model parts".into());
                 }
                 let m = model(
-                    parts
-                        .get(&r.path)
-                        .ok_or("Referenced 3MF model part is missing")?,
+                    &part(&r.path, "Referenced 3MF model part is missing")?,
                     &r.path,
                     &root,
                 )?;
@@ -497,5 +493,64 @@ mod tests {
         assert!(load(b"not a zip").is_err());
         assert!(Transform::parse(Some("NaN 0 0 0 1 0 0 0 1 0 0 0")).is_err());
         assert!(package_path("", "../../x").is_err());
+    }
+
+    // The archive's declared sizes are the author's claim; the limit must count what inflates.
+    fn declaring_one_byte(mut z: Vec<u8>) -> Vec<u8> {
+        let u32_at =
+            |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        let u16_at =
+            |b: &[u8], i: usize| u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as usize;
+        let end = z.len() - 22;
+        assert_eq!(&z[end..end + 4], b"PK\x05\x06");
+        let mut cd = u32_at(&z, end + 16);
+        for _ in 0..u16_at(&z, end + 10) {
+            assert_eq!(&z[cd..cd + 4], b"PK\x01\x02");
+            let local = u32_at(&z, cd + 42);
+            assert_eq!(&z[local..local + 4], b"PK\x03\x04");
+            z[local + 22..local + 26].copy_from_slice(&1u32.to_le_bytes());
+            z[cd + 24..cd + 28].copy_from_slice(&1u32.to_le_bytes());
+            cd += 46 + u16_at(&z, cd + 28) + u16_at(&z, cd + 30) + u16_at(&z, cd + 32);
+        }
+        z
+    }
+    #[test]
+    fn inflated_parts_count_as_read_not_as_declared() {
+        let pad = " ".repeat(400_000);
+        let root = doc(
+            "",
+            &format!(
+                "<item objectid='1' p:path='/3D/a.model'/><item objectid='1' p:path='/3D/b.model'/>{pad}"
+            ),
+            "requiredextensions='p'",
+        );
+        let part = doc(&format!("{MESH}{pad}"), "<item objectid='1'/>", "");
+        let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
+        let opt = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in [
+            (
+                "_rels/.rels",
+                format!(
+                    "<Relationships xmlns='{REL}'><Relationship Id='r' Type='{MODEL_REL}' Target='/3D/custom.model'/></Relationships>"
+                ),
+            ),
+            ("3D/custom.model", root),
+            ("3D/a.model", part.clone()),
+            ("3D/b.model", part),
+        ] {
+            w.start_file(name, opt).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        let z = declaring_one_byte(w.finish().unwrap().into_inner());
+        println!("archive bytes: {}", z.len());
+        assert!(z.len() < 20_000);
+        // The archive is valid: with room for its 1.2 MB it loads.
+        assert_eq!(read(&z, 2_000_000).unwrap().len(), 2);
+        // Over the limit it is refused once the bytes read pass it, whatever the entries declare.
+        assert_eq!(
+            read(&z, 1_000_000).unwrap_err(),
+            "3MF expanded XML exceeds 100 MB"
+        );
     }
 }

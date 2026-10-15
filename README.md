@@ -275,7 +275,7 @@ Older saved projects whose relative mode contained only overall dimensions reope
 
 **3MF:** Uses the package root relationship, not an assumed filename. Only printable root build items are displayed, with referenced components, nested transforms and winding correction for reflections. Geometry-only support excludes material/color/texture and printer-specific settings, boolean union of overlapping parts, and non-mesh extensions. Unknown required extensions and mixed units across external model parts are rejected rather than guessed. Production geometry references are supported; this is not a complete 3MF conformance implementation. Percent-encoded package URIs are currently unsupported.
 
-Limits: 50 MB source file, 100 MB expanded 3MF XML, 200,000 displayed triangles, 4,096 archive entries, 128 model parts and 64 levels of component nesting. Large meshes are rejected rather than previewed with missing triangles. OBJ fan triangulation assumes convex polygon faces. Saved imports reopen in the background; a missing or invalid original file is reported explicitly.
+Limits: 50 MB source file, 100 MB expanded 3MF XML (counted as the parts the root model reaches inflate, not as the archive declares them), 200,000 displayed triangles, 4,096 archive entries, 128 model parts and 64 levels of component nesting. Large meshes are rejected rather than previewed with missing triangles. OBJ fan triangulation assumes convex polygon faces. Saved imports reopen in the background; a missing or invalid original file is reported explicitly.
 
 ### Tooltips and animated help
 
