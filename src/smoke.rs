@@ -2743,6 +2743,92 @@ flood = { pin = 8 }
         assert!(enter.is_none(), "{enter:?}");
     }
 
+    /// A key press as the window sends it, for `on_event`.
+    fn key_press(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> iced::Event {
+        use iced::keyboard::{Event, Location, key};
+        iced::Event::Keyboard(Event::KeyPressed {
+            modified_key: key.clone(),
+            key,
+            physical_key: key::Physical::Code(key::Code::KeyA),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn escape_sends_the_estop_from_anywhere_even_while_typing() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        let window = iced::window::Id::unique();
+        // Captured is a text field with the focus; Ignored is nothing typing.
+        for status in [iced::event::Status::Captured, iced::event::Status::Ignored] {
+            let esc = crate::on_event(
+                key_press(Key::Named(Named::Escape), Modifiers::empty()),
+                status,
+                window,
+            );
+            assert!(
+                matches!(esc, Some(Message::MachineEStop)),
+                "{status:?}: {esc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn space_holds_the_job_only_when_no_text_field_takes_it() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        let window = iced::window::Id::unique();
+        let space = || key_press(Key::Named(Named::Space), Modifiers::empty());
+        let typed = crate::on_event(space(), iced::event::Status::Captured, window);
+        assert!(
+            typed.is_none(),
+            "a focused field takes Space as a character: {typed:?}"
+        );
+        let held = crate::on_event(space(), iced::event::Status::Ignored, window);
+        assert!(matches!(held, Some(Message::HoldKey)), "{held:?}");
+    }
+
+    #[test]
+    fn command_n_s_and_o_start_save_and_open_a_project() {
+        use iced::keyboard::{Key, Modifiers};
+        let window = iced::window::Id::unique();
+        let status = iced::event::Status::Ignored;
+        // Cmd on macOS, Ctrl elsewhere; the other one is not the shortcut key.
+        let (command, other) = if cfg!(target_os = "macos") {
+            (Modifiers::LOGO, Modifiers::CTRL)
+        } else {
+            (Modifiers::CTRL, Modifiers::LOGO)
+        };
+        let press = |letter: &str, modifiers| {
+            crate::on_event(
+                key_press(Key::Character(letter.into()), modifiers),
+                status,
+                window,
+            )
+        };
+        let save = press("s", command);
+        assert!(matches!(save, Some(Message::SaveProject)), "{save:?}");
+        let new = press("n", command);
+        assert!(matches!(new, Some(Message::NewProject)), "{new:?}");
+        let open = press("o", command);
+        assert!(matches!(open, Some(Message::OpenProject)), "{open:?}");
+        // Caps Lock or Shift gives an upper-case letter; it is the same shortcut.
+        let shifted = press("S", command | Modifiers::SHIFT);
+        assert!(matches!(shifted, Some(Message::SaveProject)), "{shifted:?}");
+        // Without the command key, or with the wrong one, a letter does nothing.
+        for (letter, modifiers) in [
+            ("s", Modifiers::empty()),
+            ("n", other),
+            ("o", Modifiers::ALT),
+        ] {
+            let none = press(letter, modifiers);
+            assert!(none.is_none(), "{letter} with {modifiers:?}: {none:?}");
+        }
+        let other_letter = press("q", command);
+        assert!(other_letter.is_none(), "{other_letter:?}");
+    }
+
     #[test]
     fn work_zero_and_the_coordinate_systems() {
         use crate::control::Action;
