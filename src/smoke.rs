@@ -7221,9 +7221,9 @@ flood = { pin = 8 }
     fn app() -> App {
         // Root the app in its own folder, not the real workspace folder:
         // settings and the saved sign-in live beside the workspace file.
-        let dir = std::env::temp_dir().join(format!("axis-test-{}", id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut a = App::from_workspace(dir.join("workspace.json"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.test_dir = Some(dir);
         a.doc = Document::sample();
         a.selected = Some(0);
         a.page = Page::Work;
