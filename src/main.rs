@@ -893,9 +893,11 @@ impl App {
         let isolated = smoke_dir.is_some() || state_path != storage::state_path();
         let settings_path = settings::path(&state_path);
         let (settings, settings_note) = settings::load_reporting(&settings_path);
+        let shared = storage::data_dir().1;
         let store = session::default_store(
             state_path.parent().unwrap_or(std::path::Path::new(".")),
             isolated,
+            shared,
         );
         // A load that changed something has notes; the workspace is then
         // saved once, so they are not repeated and what the load added, a
@@ -937,6 +939,9 @@ impl App {
                 false,
             )
         };
+        if shared && !isolated {
+            status += " No home directory was found, so the workspace is in the shared temp directory and signing in is unavailable.";
+        }
         // A blank workspace has the starter materials and workholding too.
         doc.adopt_materials();
         doc.adopt_holders();

@@ -50,6 +50,8 @@ pub trait SessionStore: Send + Sync {
     fn save(&self, session: &Session) -> Result<(), String>;
     fn clear(&self) -> Result<(), String>;
 }
+/// Why a sign-in is not saved when the app has no data directory of its own.
+pub const NO_HOME: &str = "Signing in is unavailable: this account has no home directory, so the sign-in cannot be kept privately. Set HOME or XDG_DATA_HOME and start the app again.";
 /// Owner-only file, written atomically. Used off macOS and by isolated runs.
 pub struct FileStore(pub PathBuf);
 impl SessionStore for FileStore {
@@ -133,13 +135,36 @@ impl SessionStore for KeychainStore {
 }
 /// The Keychain for the real workspace on macOS; a file beside an isolated
 /// (test or smoke) workspace and on other platforms.
-pub fn default_store(data_dir: &Path, isolated: bool) -> Arc<dyn SessionStore> {
+pub fn default_store(data_dir: &Path, isolated: bool, shared: bool) -> Arc<dyn SessionStore> {
     #[cfg(target_os = "macos")]
     if !isolated {
         return Arc::new(KeychainStore::saved_sign_in());
     }
-    let _ = isolated;
+    file_store(data_dir, shared && !isolated)
+}
+
+/// The sign-in file in `data_dir`. When `data_dir` is the shared temp
+/// directory, which the app falls back to with no home directory, another
+/// local user may own it, so nothing is saved there and sign-in fails with
+/// `NO_HOME`.
+pub fn file_store(data_dir: &Path, shared: bool) -> Arc<dyn SessionStore> {
+    if shared {
+        return Arc::new(NoHomeStore);
+    }
     Arc::new(FileStore(data_dir.join("chatgpt-session.json")))
+}
+/// Holds nothing and saves nothing: there is no private place for a sign-in.
+struct NoHomeStore;
+impl SessionStore for NoHomeStore {
+    fn load(&self) -> Result<Option<Session>, String> {
+        Ok(None)
+    }
+    fn save(&self, _: &Session) -> Result<(), String> {
+        Err(NO_HOME.into())
+    }
+    fn clear(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Starts deleting the saved sign-in on Tokio's blocking pool and returns at
@@ -180,6 +205,20 @@ mod tests {
         }
     }
     #[test]
+    fn a_sign_in_is_refused_under_the_shared_temp_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = file_store(dir.path(), true);
+        let error = store.save(&sample()).unwrap_err();
+        assert_eq!(error, NO_HOME);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(store.load().unwrap(), None);
+        store.clear().unwrap();
+        // The same directory is fine when it is the user's own.
+        let own = file_store(dir.path(), false);
+        own.save(&sample()).unwrap();
+        assert_eq!(own.load().unwrap(), Some(sample()));
+    }
+    #[test]
     fn a_clear_started_just_before_the_runtime_ends_still_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SlowClear(FileStore(dir.path().join("session.json"))));
@@ -213,7 +252,7 @@ mod tests {
     #[test]
     fn file_store_roundtrips_with_owner_only_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let store = default_store(dir.path(), true);
+        let store = default_store(dir.path(), true, false);
         assert_eq!(store.load().unwrap(), None);
         store.save(&sample()).unwrap();
         assert_eq!(store.load().unwrap().unwrap().refresh_token, "refresh-1");

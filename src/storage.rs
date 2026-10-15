@@ -4,11 +4,19 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+/// The OS local data directory, and whether it is missing, so that the shared
+/// temp directory stands in for it.
+pub fn data_dir() -> (PathBuf, bool) {
+    data_dir_or_temp(dirs::data_local_dir())
+}
+fn data_dir_or_temp(local: Option<PathBuf>) -> (PathBuf, bool) {
+    match local {
+        Some(dir) => (dir, false),
+        None => (std::env::temp_dir(), true),
+    }
+}
 pub fn state_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("AXIS CAM Studio")
-        .join("workspace.json")
+    data_dir().0.join("AXIS CAM Studio").join("workspace.json")
 }
 /// First of the notes `load_reporting` returns when it numbered the tools.
 pub const NUMBERED_TOOLS: &str = "Tools in this project had no tool numbers and were numbered T1–Tn in library order. Check each one against your LinuxCNC tool table before exporting.";
@@ -125,6 +133,12 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_local_data_directory_falls_back_to_the_temp_directory() {
+        assert_eq!(super::data_dir_or_temp(None), (std::env::temp_dir(), true));
+        let own = PathBuf::from("/home/someone/.local/share");
+        assert_eq!(super::data_dir_or_temp(Some(own.clone())), (own, false));
+    }
     use super::*;
     #[test]
     fn atomic_roundtrip() {
