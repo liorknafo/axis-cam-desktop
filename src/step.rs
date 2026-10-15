@@ -45,8 +45,14 @@ pub fn skip_without_helper() -> bool {
     skip
 }
 
+const TIMEOUT: Duration = Duration::from_secs(120);
+
 pub fn load(path: &Path) -> Result<Vec<[[f32; 3]; 3]>, String> {
-    let helper = helper()?;
+    convert(&helper()?, path, TIMEOUT)
+}
+
+// Split from `load` so a test can run a stand-in converter under a short timeout.
+fn convert(helper: &Path, path: &Path, timeout: Duration) -> Result<Vec<[[f32; 3]; 3]>, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let bundled = executable.components().any(|p| p.as_os_str() == "Contents");
     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -78,7 +84,7 @@ pub fn load(path: &Path) -> Result<Vec<[[f32; 3]; 3]>, String> {
                 return Err(e.to_string());
             }
         }
-        if start.elapsed() > Duration::from_secs(120) {
+        if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
             return Err("STEP conversion exceeded two minutes; try a smaller model.".into());
@@ -98,4 +104,48 @@ pub fn load(path: &Path) -> Result<Vec<[[f32; 3]; 3]>, String> {
     }
     let bytes = fs::read(result).map_err(|e| format!("STEP preview missing: {e}"))?;
     super::mesh::stl(&bytes)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    type Tri = [[f32; 3]; 3];
+
+    // The shell is the stand-in converter: it is run as `sh <path> <result>`, so the
+    // "STEP file" is the script. No executable has to be written, which can fail with
+    // "text file busy" while other tests fork.
+    fn run(script: &str, timeout: Duration) -> (Result<Vec<Tri>, String>, Duration) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("converter.sh");
+        fs::write(&path, script).unwrap();
+        let start = Instant::now();
+        let result = convert(Path::new("/bin/sh"), &path, timeout);
+        (result, start.elapsed())
+    }
+
+    #[test]
+    fn a_converter_that_outlives_the_timeout_is_killed() {
+        let (result, took) = run("exec sleep 60", Duration::from_millis(300));
+        assert_eq!(
+            result.unwrap_err(),
+            "STEP conversion exceeded two minutes; try a smaller model."
+        );
+        // Returned when the timeout passed, not when the 60 s sleep ended.
+        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_converter_that_fails_without_a_message_is_reported_by_its_exit_status() {
+        let (result, _) = run("exit 3", Duration::from_secs(60));
+        assert_eq!(
+            result.unwrap_err(),
+            "STEP import failed: converter exited with exit status: 3"
+        );
+    }
+
+    #[test]
+    fn a_converter_that_fails_with_a_message_is_reported_by_it() {
+        let (result, _) = run("echo 'no solids' >&2; exit 1", Duration::from_secs(60));
+        assert_eq!(result.unwrap_err(), "STEP import failed: no solids\n");
+    }
 }
