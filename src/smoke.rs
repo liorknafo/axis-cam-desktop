@@ -10897,6 +10897,95 @@ flood = { pin = 8 }
         assert_eq!(a.account_note, "Keychain: denied");
         assert!(!a.restoring);
     }
+    /// The files beside a workspace that are an unreadable settings file kept aside.
+    fn settings_kept_aside(dir: &tempfile::TempDir) -> Vec<std::path::PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with("settings-unreadable-") && name.ends_with(".json")
+            })
+            .collect();
+        found.sort();
+        found
+    }
+    #[test]
+    fn an_unreadable_settings_file_is_kept_aside_and_the_saved_sign_in_still_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = signed_in_app(&dir);
+        // One wrong-typed field: serde rejects the whole document.
+        let file = dir.path().join("settings.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        doc["model"] = serde_json::json!(5);
+        std::fs::write(&file, doc.to_string()).unwrap();
+        let mut a = fresh_app(&dir);
+        let kept = settings_kept_aside(&dir);
+        assert_eq!(
+            kept.len(),
+            1,
+            "the unreadable file is renamed, not replaced"
+        );
+        assert_eq!(
+            std::fs::read(&kept[0]).unwrap(),
+            doc.to_string().into_bytes()
+        );
+        let name = kept[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(a.account_note.contains("could not be read") && a.account_note.contains(&name));
+        // The client ID was read from the broken file, so the sign-in is used.
+        assert_eq!(a.settings.client_id, "oaiapp_1");
+        let _ = a.update(Message::Page(Page::Ai));
+        let saved = crate::session::default_store(dir.path(), true).load();
+        let _ = a.update(Message::AccountRestored(saved));
+        assert!(matches!(
+            a.account,
+            crate::Account::SignedIn { granted: true, .. }
+        ));
+        // The new settings file was written, and a second start keeps it.
+        let _ = fresh_app(&dir);
+        assert_eq!(settings_kept_aside(&dir).len(), 1);
+    }
+    #[test]
+    fn a_saved_sign_in_with_no_client_id_is_reported_and_deleted_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = signed_in_app(&dir);
+        // The client ID itself is wrong-typed, so nothing of it can be kept.
+        let file = dir.path().join("settings.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        doc["client_id"] = serde_json::json!(5);
+        std::fs::write(&file, doc.to_string()).unwrap();
+        let mut a = fresh_app(&dir);
+        assert_eq!(settings_kept_aside(&dir).len(), 1);
+        assert!(a.settings.client_id.is_empty());
+        assert_eq!(
+            a.update(Message::Page(Page::Ai)).units(),
+            1,
+            "the store is read"
+        );
+        assert!(a.restoring);
+        let store = crate::session::default_store(dir.path(), true);
+        let result = crate::read_saved_session(&*store, true);
+        let _ = a.update(Message::AccountRestored(result));
+        assert!(!a.restoring && a.account == crate::Account::SignedOut && a.client.is_none());
+        assert!(
+            a.account_note.contains("could not be read"),
+            "{}",
+            a.account_note
+        );
+        assert!(
+            a.account_note.contains("deleted from this computer"),
+            "{}",
+            a.account_note
+        );
+        assert_eq!(store.load().unwrap(), None);
+        assert_eq!(a.update(Message::SignIn).units(), 1);
+        // With a client ID the saved sign-in is only read.
+        let _ = signed_in_app(&dir);
+        assert!(crate::read_saved_session(&*store, false).unwrap().is_some());
+        assert!(store.load().unwrap().is_some());
+    }
     #[test]
     fn a_restore_result_is_ignored_when_no_restore_is_pending() {
         let dir = tempfile::tempdir().unwrap();
@@ -11098,7 +11187,10 @@ flood = { pin = 8 }
         // and out afterwards never reads the saved session behind it.
         let dir = tempfile::tempdir().unwrap();
         let mut a = fresh_app(&dir);
-        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 0);
+        // With no client ID the store is still read, in case a sign-in is
+        // saved that the app can no longer use; here there is none.
+        assert_eq!(a.update(Message::Page(Page::Ai)).units(), 1);
+        let _ = a.update(Message::AccountRestored(Ok(None)));
         assert!(!a.restoring, "nothing is being read");
         sign_in_with(&mut a, &dir, crate::session::sample());
         assert!(matches!(a.account, crate::Account::SignedIn { .. }));
