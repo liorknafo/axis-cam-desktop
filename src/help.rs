@@ -1024,7 +1024,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Parallel)),
         ),
         (_, "stepover") => (
-            "Sideways spacing of adjacent passes, as a percentage of cutter diameter. For a 10 mm tool, 40% means 4 mm. Smaller spacing increases overlap and pass count.",
+            "Sideways spacing of adjacent passes, as a percentage of cutter diameter. For a 10 mm tool, 40% means 4 mm. Smaller spacing increases overlap and pass count. Pocket accepts up to 50%.",
             Some(Stepover),
         ),
         (_, "surface_stepover") => (

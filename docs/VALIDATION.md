@@ -420,6 +420,13 @@ A pass thinner than about half a voxel (a 0.3 mm underside skim, a wall's finish
 - Not inspected in the real window: checked with tests only.
 - `cargo test --locked` on Linux (16 October 2026, three other builds sharing the machine): 843 passed, 0 failed, 0 ignored in 328 seconds; 841 at main plus the two tests above. `cargo clippy --all-targets --locked`: the same 53 warning lines as at main, none in the changed code. `cargo fmt` was run on the changed files; five files main leaves unformatted were left as they are.
 
+## A Pocket stepover over 50 % is reported in the editor (#31)
+
+`Operation::issues` checked the stepover of Face, Indexed and Pocket against 0.01–100 %, but the pocket generator refuses anything over 50 % (offset contours must overlap), so a Pocket at 60 % showed no warning and failed only at Generate or export.
+
+- Pocket now has its own bound, 0.01–50 %, with the generator's words: "Pocket stepover must be between 0.01 and 50% for overlapping offset contours." Face and Indexed keep 0.01–100 %. The stepover help says Pocket accepts up to 50 %.
+- `model::tests::a_pocket_stepover_over_50_percent_is_an_issue_but_a_facing_one_is_not`: a Pocket at 50 % has no stepover issue, at 60 % and at 0 % it has one; a Face at 60 % and 100 % has none and at 101 % has one. Before the fix the Pocket at 60 % gave no issue and the test failed.
+
 ## The work zero on any stock, and the probe that finds it (LIO-166)
 
 - Choices: `post::ORIGINS`, a corner, an edge's middle or the centre of the stock's top or bottom (18) and Model origin. "Selected point (planned)" is gone; a project saved with it is refused with "… is not a work zero: choose one under Work coordinate origin." (`unsafe_or_unsupported_jobs_are_refused_with_reasons`). A stock-based zero is a point of the box the setup starts from (`simulation::leftover_box` for a later setup), and each zero is found from the stock top and the sides it names (`post::references`; Model origin from the front-left corner).
