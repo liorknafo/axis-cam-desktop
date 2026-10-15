@@ -4592,6 +4592,17 @@ fn main() -> iced::Result {
         }
         std::process::exit(exit_code(&outcome))
     }
+    // The renderer smoke run imports the STEP fixture at screen 11; --help-only
+    // stops before it.
+    if args.get(1).map(String::as_str) == Some("--smoke-test")
+        && !args.iter().any(|arg| arg == "--help-only")
+        && !step::available()
+    {
+        eprintln!(
+            "The renderer smoke run needs Open CASCADE for its STEP screens, and this build has no STEP helper (AXIS_SKIP_STEP). Rebuild with Open CASCADE, or run it with --help-only."
+        );
+        std::process::exit(2)
+    }
     iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))
         .theme(Theme::custom(

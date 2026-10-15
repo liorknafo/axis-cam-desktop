@@ -2387,7 +2387,7 @@ pub(crate) mod tests {
             "placed-assembly.step",
             "preview-cube.obj",
         ] {
-            if file.ends_with(".step") && option_env!("AXIS_BUILT_STEP_HELPER").is_none() {
+            if file.ends_with(".step") && crate::step::skip_without_helper() {
                 continue;
             }
             let mesh = crate::mesh::load(&examples.join(file)).unwrap();
