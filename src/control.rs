@@ -587,10 +587,12 @@ pub enum Action {
     ProbeEdges,
     /// Sets the work position where the tool tip is to that of the setup
     /// picked in the Run panel's touch-off point (`Connection::touch_off`):
-    /// the tip is on the stock top there.
+    /// the tip is on the stock top there. Like Probe Z, it waits while the
+    /// setup's check is out of date (`Connection::run_program`).
     TouchOff,
     /// Simulated: rapid the tool tip onto the work zero of the setup picked
     /// in the Run panel on the simulator's block (`Connection::sim_zero`).
+    /// Waits as TouchOff does.
     ToSimZero,
 }
 
@@ -991,7 +993,9 @@ impl Connection {
                 }
             }
             Action::ProbeEdges => self.start_edges(),
-            Action::TouchOff if self.manual() => {
+            // Both act on the checked setup, which an edit may have changed:
+            // like the probes, they wait while its check is out of date (#39).
+            Action::TouchOff if self.manual() && self.run_program().is_ok() => {
                 if let Some((_, work)) = self.touch_off() {
                     for (a, value) in work.into_iter().enumerate() {
                         self.send(Command::SetWork { axis: a, value });
@@ -1001,7 +1005,7 @@ impl Connection {
                     }
                 }
             }
-            Action::ToSimZero => {
+            Action::ToSimZero if self.run_program().is_ok() => {
                 self.to_sim_zero();
             }
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
