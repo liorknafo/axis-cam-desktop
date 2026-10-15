@@ -1937,11 +1937,14 @@ pub(crate) mod tests {
         assert_eq!(partial(escape).summary.as_deref(), Some("a"));
         let unicode = "{\"summary\":\"a\\u00";
         assert_eq!(partial(unicode).summary.as_deref(), Some("a"));
+        // A reply past the limit is read up to it, not whole.
         let huge = format!("{{\"summary\":\"{}", "x".repeat(4 << 20));
-        let started = std::time::Instant::now();
-        let draft = partial(&huge);
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
-        assert!(draft.summary.is_some());
+        let summary = partial(&huge).summary.expect("the summary so far");
+        assert!(
+            (PARTIAL_LIMIT / 2..=PARTIAL_LIMIT).contains(&summary.len()),
+            "{}",
+            summary.len()
+        );
     }
     #[test]
     fn a_long_array_of_numbers_keeps_everything_before_it() {

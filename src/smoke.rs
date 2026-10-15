@@ -1404,13 +1404,31 @@ mist = { pin = 9 }
         tick_until(a, 3.0, "Idle after Reset", |s| s.state == Some(State::Idle));
     }
 
+    /// An MDI line the driver refuses in every state, and how: busy while a
+    /// line runs, unsupported otherwise.
+    const MDI_MARK: &str = "G999";
+    const MDI_MARK_REFUSED: [&str; 2] = ["MDI: machine is busy", "MDI: unsupported G999"];
+
     /// Runs one MDI line and waits until the machine is Idle again.
     fn mdi(a: &mut App, line: &str) {
         use uc100::controller::{Command, State};
+        let seq = conn(a).snapshot.log_seq;
         conn(a).send(Command::Mdi(line.into()));
-        // The line leaves Idle (Run) and comes back; the log shows a refusal.
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        tick_until(a, 5.0, line, |s| s.state == Some(State::Idle));
+        // A line that runs may leave Idle for a single 4 ms driver loop, and
+        // a refused one never leaves it. The driver takes commands in order,
+        // so the refusal of a line sent after it says it has been taken up,
+        // and Idle from then on says it is done.
+        conn(a).send(Command::Mdi(MDI_MARK.into()));
+        tick_until(a, 5.0, line, |s| {
+            let new = usize::try_from(s.log_seq - seq).unwrap_or(usize::MAX);
+            let taken = s
+                .log
+                .iter()
+                .rev()
+                .take(new)
+                .any(|l| MDI_MARK_REFUSED.contains(&l.as_str()));
+            taken && s.state == Some(State::Idle)
+        });
     }
 
     /// An app with one simulated UC100 machine with the given profile.
@@ -1427,14 +1445,52 @@ mist = { pin = 9 }
         a
     }
 
-    /// Ticks until the machine snapshot satisfies `ok`; fails after `secs`.
+    /// A wait's limit: `secs` of the driver's time. The simulated
+    /// controller's timer counts the driver's 4 ms loops, which a loaded PC
+    /// runs late while the simulated machine still moves in real time, so a
+    /// limit in loops leaves a wait the time the load takes (#9). Wall time
+    /// bounds it at ten times that, and a minute at least, should the driver
+    /// stop.
+    struct Deadline {
+        loops: u64,
+        seen: u64,
+        last: Option<u16>,
+        cap: std::time::Instant,
+    }
+
+    impl Deadline {
+        fn new(secs: f64) -> Self {
+            let wall = std::time::Duration::from_secs_f64(secs * 10.)
+                .max(std::time::Duration::from_secs(60));
+            Self {
+                loops: (secs * 250.) as u64,
+                seen: 0,
+                last: None,
+                cap: std::time::Instant::now() + wall,
+            }
+        }
+
+        /// Counts the loops up to `s`; false once the limit has passed.
+        fn within(&mut self, s: &uc100::controller::Snapshot) -> bool {
+            if let Some(timer) = s.status.map(|st| st.timer) {
+                if let Some(last) = self.last {
+                    self.seen += u64::from(timer.wrapping_sub(last));
+                }
+                self.last = Some(timer);
+            }
+            self.seen <= self.loops && std::time::Instant::now() < self.cap
+        }
+    }
+
+    /// Ticks until the machine snapshot satisfies `ok`; fails after `secs`
+    /// of the driver's time (see `Deadline`).
     fn tick_until(
         a: &mut App,
         secs: f64,
         what: &str,
         ok: impl Fn(&uc100::controller::Snapshot) -> bool,
     ) {
-        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        let mut deadline = Deadline::new(secs);
         loop {
             let _ = a.update(Message::Tick);
             let s = &a.control.as_ref().expect("connected").snapshot;
@@ -1442,7 +1498,7 @@ mist = { pin = 9 }
                 return;
             }
             assert!(
-                std::time::Instant::now() < end,
+                deadline.within(s),
                 "timed out waiting for {what}: {:?} {:?}",
                 s.state,
                 s.log
@@ -1619,7 +1675,7 @@ flood = { pin = 8 }
 
     /// Ticks until the run satisfies `ok`; fails after `secs`.
     fn run_until(a: &mut App, secs: f64, what: &str, ok: impl Fn(&crate::run::Run) -> bool) {
-        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        let mut deadline = Deadline::new(secs);
         loop {
             let _ = a.update(Message::Tick);
             let _ = a.view();
@@ -1628,7 +1684,7 @@ flood = { pin = 8 }
             }
             let s = &conn(a).snapshot;
             assert!(
-                std::time::Instant::now() < end,
+                deadline.within(s),
                 "timed out waiting for {what}: {:?} line {:?} at {:?} feed {} {:?} {:?}",
                 s.state,
                 s.current_line,
@@ -3168,8 +3224,11 @@ flood = { pin = 8 }
                 crate::control::Action::MachineZero(None)
             };
             let _ = a.update(Message::Machine(zero));
-            tick_until(&mut a, 10.0, "X, Y and Z set", |s| {
-                s.referenced[..3].iter().all(|r| *r)
+            // Homing marks its last axis referenced two driver loops before
+            // it is back in Idle, and a jog pressed while the driver still
+            // reports Homing is rightly dropped (#9).
+            tick_until(&mut a, 10.0, "X, Y and Z set, Idle", |s| {
+                s.state == Some(State::Idle) && s.referenced[..3].iter().all(|r| *r)
             });
             let _ = a.update(Message::Machine(crate::control::Action::Rpm("abc".into())));
             let _ = a.update(Message::Machine(crate::control::Action::MdiText(
