@@ -82,13 +82,12 @@ impl Canvas {
         let i = ((y * self.w + x) * 3) as usize;
         [self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]
     }
-    /// `rgba` laid over the background; mirrored left to right when `flip`.
-    pub(crate) fn over(rgba: &[u8], w: u32, h: u32, flip: bool) -> Self {
+    /// `rgba` laid over the background.
+    pub(crate) fn over(rgba: &[u8], w: u32, h: u32) -> Self {
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for y in 0..h {
             for x in 0..w {
-                let sx = if flip { w - 1 - x } else { x };
-                let i = ((y * w + sx) * 4) as usize;
+                let i = ((y * w + x) * 4) as usize;
                 let a = rgba[i + 3] as f32 / 255.;
                 for k in 0..3 {
                     rgb.push(
@@ -240,12 +239,12 @@ mod tests {
         }
     }
     #[test]
-    fn composite_flips_and_fills_the_background() {
+    fn composite_fills_the_background() {
         // A 2 × 1 frame: left pixel red and opaque, right pixel empty.
         let rgba = [255, 0, 0, 255, 0, 0, 0, 0];
-        let c = Canvas::over(&rgba, 2, 1, true);
-        assert_eq!(c.at(0, 0), [239, 243, 247]);
-        assert_eq!(c.at(1, 0), [255, 0, 0]);
+        let c = Canvas::over(&rgba, 2, 1);
+        assert_eq!(c.at(0, 0), [255, 0, 0]);
+        assert_eq!(c.at(1, 0), [239, 243, 247]);
         let png = c.png();
         assert_eq!(&png[1..4], b"PNG");
     }

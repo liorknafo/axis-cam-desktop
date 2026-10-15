@@ -819,7 +819,8 @@ pub(crate) async fn run_plan_with(
 fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
     match *event {
         viewport::Event::Orbit(x, y) => {
-            camera.yaw += x;
+            // The model follows the mouse, as in the machine view.
+            camera.yaw -= x;
             camera.pitch = (camera.pitch + y).clamp(-1.5, 1.57)
         }
         viewport::Event::Pan(x, y) => {
