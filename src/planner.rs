@@ -1002,7 +1002,12 @@ where
                 ));
             }
         };
-        let parsed = proposal::parse(json_object(&text));
+        let empty = text.trim().is_empty();
+        let parsed = if empty {
+            Err("The reply was empty.".to_string())
+        } else {
+            proposal::parse(json_object(&text))
+        };
         if let Err(error) = &parsed {
             let unreadable = StepResult::Unreadable(proposal::clip(error, 300));
             progress(Event::Checked(request, unreadable));
@@ -1017,7 +1022,9 @@ where
                     stage: "format",
                     message: error.clone(),
                 }];
-                conversation.push(Item::text(Role::Assistant, text));
+                // The API may refuse an assistant message with no content.
+                let echoed = if empty { "(empty reply)".into() } else { text };
+                conversation.push(Item::text(Role::Assistant, echoed));
                 conversation.push(Item::text(Role::User, format!("{error} Reply with the full proposal as one JSON object that matches the schema.")));
                 stage = Progress::Repairing;
                 continue;
@@ -3324,6 +3331,57 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(roles, ["system", "user", "assistant", "user"]);
         assert!(sent[1].json()["text"].is_null() && sent[2].json()["text"].is_null());
+    }
+    #[tokio::test]
+    async fn an_empty_reply_is_not_echoed_back_as_an_empty_assistant_message() {
+        use crate::fake_openai::{Fake, Resp};
+        use crate::session::SessionStore;
+        // Every reply completes with no text and no calls.
+        let fake = Fake::start(|_| {
+            Resp::sse(&[
+                serde_json::json!({"type": "response.created"}),
+                serde_json::json!({"type": "response.completed", "response": {"status": "completed"}}),
+            ])
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        let client = crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        );
+        let backend = OpenAiBackend::new(
+            std::sync::Arc::new(client),
+            "gpt-6.1-sol".into(),
+            std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            false,
+        );
+        let (doc, mesh, _) = block();
+        let mut events = vec![];
+        let _ = plan(&backend, doc, mesh, &Busy::default(), |e| events.push(e)).await;
+        let Some(Event::Checked(1, StepResult::Unreadable(why))) =
+            events.iter().find(|e| matches!(e, Event::Checked(1, _)))
+        else {
+            panic!("{events:?}")
+        };
+        assert!(why.contains("empty"), "{why}");
+        let sent = fake.seen("/v1/responses");
+        assert!(sent.len() >= 2, "the correction round was sent");
+        let second = sent[1].json();
+        let input = second["input"].as_array().unwrap();
+        assert!(
+            input.iter().all(|m| {
+                m["role"] != "assistant" || m["content"].as_str().is_none_or(|c| !c.is_empty())
+            }),
+            "{input:?}"
+        );
+        let last = input.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"].to_string().contains("empty"), "{last}");
     }
     #[tokio::test]
     async fn blocking_work_is_counted_until_it_ends_even_when_nobody_waits() {
