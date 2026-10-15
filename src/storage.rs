@@ -1,4 +1,4 @@
-use crate::model::Document;
+use crate::model::{Document, get};
 use std::{
     fs,
     io::Write,
@@ -54,6 +54,15 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
             }
             for (key, _) in crate::stock::OFFSETS {
                 setup.p.insert(key.into(), "0".into());
+            }
+        }
+        // "Selection order" was the same order as "By X then Y", since the
+        // holes are sorted before they are drilled; it is no longer offered.
+        for operation in &mut setup.operations {
+            if get(&operation.p, "hole_order") == "Selection order" {
+                operation
+                    .p
+                    .insert("hole_order".into(), "By X then Y".into());
             }
         }
     }
@@ -300,6 +309,35 @@ mod tests {
         save(&path, &reopened).unwrap();
         let restored = load(&path).unwrap();
         assert_eq!(restored.setup().p, reopened.setup().p);
+    }
+    #[test]
+    fn a_saved_selection_order_loads_as_by_x_then_y() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("old.axis.json");
+        let mut d = Document::sample();
+        let drill = d
+            .setups
+            .iter_mut()
+            .flat_map(|s| s.operations.iter_mut())
+            .find(|o| o.p.contains_key("hole_order"))
+            .unwrap();
+        drill
+            .p
+            .insert("hole_order".into(), "Selection order".into());
+        save(&p, &d).unwrap();
+        let loaded = load(&p).unwrap();
+        let orders: Vec<_> = loaded
+            .setups
+            .iter()
+            .flat_map(|s| s.operations.iter())
+            .filter_map(|o| o.p.get("hole_order").cloned())
+            .collect();
+        // Only the saved one changes; the others keep their order.
+        assert_eq!(orders[0], "By X then Y");
+        assert!(
+            orders[1..].iter().all(|o| o == "Optimize travel"),
+            "{orders:?}"
+        );
     }
     #[test]
     fn legacy_sample_loads_but_new_empty_document_stays_empty() {

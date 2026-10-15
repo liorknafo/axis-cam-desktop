@@ -85,7 +85,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("hole_order", "Optimize travel") => {
             "Visit the next nearby detected hole using a greedy travel order. This reduces local linking distance; it is not a global minimum-time route calculation."
         }
-        ("hole_order", "By X then Y" | "Selection order") => {
+        ("hole_order", "By X then Y") => {
             "Sort detected hole centers by setup X, then Y. This gives a predictable geometric sequence independent of the order in which rim faces were clicked."
         }
         ("boundary", "Selected geometry") => {
@@ -785,7 +785,7 @@ mod tests {
                 .body
                 .starts_with("Saved parameter")
         );
-        for key in ["post_blend", "post_dwell"] {
+        for key in ["post_blend", "post_dwell", "uc100_profile"] {
             assert!(
                 !crate::help::field_help(key, "Post", Target::Machine)
                     .body
