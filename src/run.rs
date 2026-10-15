@@ -106,6 +106,22 @@ impl Run {
         self.xy.is_some()
     }
 
+    /// Keeps up with the project after an edit: the setup's index, since
+    /// setups may have been moved. None once the setup was removed: the run
+    /// then has nothing to check, and says so instead of its programs.
+    pub fn follow(&mut self, doc: &Document) -> Option<usize> {
+        match doc.setups.iter().position(|s| s.id == self.setup_id) {
+            Some(i) => {
+                self.setup = i;
+                Some(i)
+            }
+            None => {
+                self.checked_as(Arc::new(Err(vec![REMOVED.into()])));
+                None
+            }
+        }
+    }
+
     /// The checked programs, once the check passed.
     pub fn checked(&self) -> Option<&[Checked]> {
         self.programs.as_deref()?.as_deref().ok()
@@ -148,7 +164,7 @@ impl Run {
     /// Why Cycle Start cannot start the next tool run now; empty when it can.
     pub fn problems(&self, c: &Connection, doc: &Document) -> Vec<String> {
         let Some(setup) = doc.setups.get(self.setup).filter(|s| s.id == self.setup_id) else {
-            return vec!["This setup was removed from the project.".into()];
+            return vec![REMOVED.into()];
         };
         let programs = match self.programs.as_deref() {
             None => return vec!["Checking the setup…".into()],
@@ -383,6 +399,9 @@ fn op_of(b: &Block) -> Option<usize> {
 /// The checked programs of setup `si` for a UC100 run, one per tool run,
 /// from a simulation of the job up to the end of that setup.
 pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, Vec<String>> {
+    if si >= doc.setups.len() {
+        return Err(vec![REMOVED.into()]);
+    }
     if doc.file.is_none() {
         return Err(vec![NO_PART.into()]);
     }
@@ -396,6 +415,7 @@ pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, 
 }
 
 const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
+const REMOVED: &str = "This setup was removed from the project.";
 
 /// The `sequence` results of setup `si`'s enabled operations, from a
 /// simulation of the job up to the end of that setup.

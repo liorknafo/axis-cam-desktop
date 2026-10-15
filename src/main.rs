@@ -1274,9 +1274,10 @@ impl App {
             _ => {}
         }
         self.drop_plan();
-        // A setup being run was checked as it was.
+        // A setup being run was checked as it was, and may have been moved.
         if let Some(run) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
             run.stale = true;
+            run.follow(&self.doc);
         }
         self.dirty = true;
         self.project_dirty = true;
@@ -1640,10 +1641,15 @@ impl App {
     /// Checks the setup being run, in the background: simulates the job up to
     /// it and checks its tool runs as export would.
     fn check_run(&mut self) -> Task<Message> {
-        let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) else {
+        let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) else {
             return Task::none();
         };
-        let (si, epoch) = (r.setup, r.epoch);
+        // The setup is checked where it is now: setups may have been moved,
+        // or it removed, since it was picked.
+        let Some(si) = r.follow(&self.doc) else {
+            return Task::none();
+        };
+        let epoch = r.epoch;
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
         let check = move || match mesh {
