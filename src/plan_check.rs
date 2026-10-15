@@ -333,6 +333,17 @@ impl PartGrid {
         }
         Self { inside, deep }
     }
+    /// The part (`mesh`, placed as setup 1 of `doc` places it) on `stock`'s
+    /// grid: the stock the simulation keeps is in setup 1's frame
+    /// (`simulation::sequence_walk`), whichever setup reads it.
+    pub fn in_job(stock: &Volume, doc: &Document, mesh: &Mesh) -> Self {
+        Self::new(stock, &Geometry::new(&doc.setups[0], mesh))
+    }
+    /// Whether the cell at `index` (`Volume::index`) has its centre inside
+    /// the part.
+    pub fn inside(&self, index: usize) -> bool {
+        self.inside[index]
+    }
     /// Cells well inside the part that the simulation has removed, and their bounds.
     pub fn gouged(&self, stock: &Volume) -> (usize, [[f32; 3]; 2]) {
         let mut count = 0;
@@ -353,6 +364,60 @@ impl PartGrid {
             }
         }
         (count, bounds)
+    }
+}
+#[cfg(test)]
+impl PartGrid {
+    /// The solid of `triangles` (mm, facing out) on `stock`'s grid, placed
+    /// where they are: `mesh::normalize` centres a part on X and Y and lifts
+    /// it to 4 display units, which a setup's `tx`, `ty` and `tz` move back.
+    pub(crate) fn of(stock: &Volume, triangles: Vec<[[f32; 3]; 3]>) -> Self {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for p in triangles.iter().flatten() {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let mesh = crate::mesh::normalize(triangles).unwrap();
+        let at = [
+            (lo[0] + hi[0]) / 2.,
+            (lo[1] + hi[1]) / 2.,
+            lo[2] - 4. / mesh.display_scale(),
+        ];
+        let mut setup = crate::model::Setup::new(crate::model::Machine::new(3), "G54");
+        for (key, v) in ["tx", "ty", "tz"].into_iter().zip(at) {
+            setup.p.insert(key.into(), v.to_string());
+        }
+        Self::new(stock, &Geometry::new(&setup, &mesh))
+    }
+    /// The box `b` as a part on `stock`'s grid (`of`).
+    pub(crate) fn boxed(stock: &Volume, b: Bounds) -> Self {
+        // Bits 0, 1 and 2 of a corner's number pick its X, Y and Z maximum.
+        let corner = |n: usize| -> [f32; 3] {
+            std::array::from_fn(|k| {
+                if n & (1 << k) == 0 {
+                    b.min[k]
+                } else {
+                    b.max[k]
+                }
+            })
+        };
+        // Each face by its corners, counter-clockwise seen from outside.
+        let faces = [
+            [0, 2, 3, 1],
+            [4, 5, 7, 6],
+            [0, 1, 5, 4],
+            [2, 6, 7, 3],
+            [0, 4, 6, 2],
+            [1, 3, 7, 5],
+        ];
+        let triangles = faces
+            .iter()
+            .flat_map(|&[a, b, c, d]| [[a, b, c], [a, c, d]].map(|t| t.map(corner)))
+            .collect();
+        Self::of(stock, triangles)
     }
 }
 /// Whether an operation that takes the gouged cells from `before` to `after`

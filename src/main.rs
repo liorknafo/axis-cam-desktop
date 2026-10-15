@@ -515,6 +515,9 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
 /// workholding whose fingerprint is `key`.
 fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64) -> HoldingChecks {
     let names = |s, o| holding::operation_name(doc, s, o);
+    // The part on the stock's grid, once: the stock every setup starts from
+    // is on setup 1's grid (`leftover_stock`).
+    let mut grid: Option<plan_check::PartGrid> = None;
     let setups = doc
         .setups
         .iter()
@@ -537,9 +540,11 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
             if let (Some(layout), Some(holder)) = (layout, doc.holder(get(&setup.p, "holder")))
                 && doc.holding_issues_with(si, Some(held)).is_empty()
             {
-                let removed = before
-                    .as_deref()
-                    .map(|v| rest::Removed::new(v, frame).with_part(part));
+                let removed = before.as_deref().map(|v| {
+                    let grid =
+                        grid.get_or_insert_with(|| plan_check::PartGrid::in_job(v, doc, mesh));
+                    rest::Removed::new(v, frame).with_part(grid)
+                });
                 problems = holding::holdable(si, &layout, holder, held, removed.as_ref(), &names);
                 let bites = left.bites.get(si).into_iter().flatten();
                 let bites = bites.map(|(oi, b)| (*oi, b.as_slice()));

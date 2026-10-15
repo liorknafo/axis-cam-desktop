@@ -1638,12 +1638,14 @@ fn unholdable(
         return vec![];
     };
     let first = walk.simulations[0];
-    let part = crate::simulation::part_box(setup, mesh);
     let removed = first
         .initial_volume
         .as_ref()
         .zip(first.frame)
-        .map(|(volume, frame)| crate::rest::Removed::new(volume, frame).with_part(part));
+        .map(|(volume, frame)| {
+            let part = crate::plan_check::PartGrid::in_job(volume, doc, mesh);
+            crate::rest::Removed::new(volume, frame).with_part(&part)
+        });
     let names = |s, o| crate::holding::operation_name(doc, s, o);
     crate::holding::holdable(si, &layout, holder, held, removed.as_ref(), &names)
         .into_iter()

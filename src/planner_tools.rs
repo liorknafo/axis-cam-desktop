@@ -432,10 +432,10 @@ fn workholding(
     ) else {
         return vec![];
     };
-    let removed = start
-        .before
-        .as_deref()
-        .map(|v| crate::rest::Removed::new(v, start.frame).with_part(start.part));
+    let removed = start.before.as_deref().map(|v| {
+        let part = crate::plan_check::PartGrid::in_job(v, job, mesh);
+        crate::rest::Removed::new(v, start.frame).with_part(&part)
+    });
     let names = |s, o| holding::operation_name(job, s, o);
     holding::holdable(si, &layout, entry, held, removed.as_ref(), &names)
         .into_iter()
