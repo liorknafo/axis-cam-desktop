@@ -4,6 +4,7 @@
 use crate::{
     mesh::Bounds,
     model::Setup,
+    plan_check::PartGrid,
     simulation::CutterShape,
     stock_surface::Cut,
     volume::{Frame, Volume},
@@ -127,28 +128,25 @@ impl<'a> Removed<'a> {
             joined: None,
         }
     }
-    /// `self` knowing the part, whose bounds are `part` (current frame, mm):
-    /// which of the stock's voxels still hold material joined to it
-    /// (`joined`). A flood fill through the occupied voxels (6-connectivity)
-    /// from those whose centres lie within `part`, each voxel visited once
-    /// (at most 96³). Nothing is filled without earlier cuts, the stock then
-    /// being one piece, nor when no material is left within `part`.
-    pub fn with_part(mut self, part: Bounds) -> Self {
+    /// `self` knowing the part, `part` being it on the stock's grid (the
+    /// voxels whose centres lie inside the model, `PartGrid`): which of the
+    /// stock's voxels still hold material joined to it (`joined`). A flood
+    /// fill through the occupied voxels (6-connectivity) from the part's
+    /// own, each voxel visited once (at most 96³). Nothing is filled without
+    /// earlier cuts, the stock then being one piece, nor when no material is
+    /// left inside the part.
+    pub fn with_part(mut self, part: &PartGrid) -> Self {
         let v = self.volume;
         if v.cuts.is_empty() {
             return self;
         }
-        let part = transformed(part, self.current, v.frame);
         let mut joined = vec![false; v.occupied.len()];
         let mut stack = vec![];
         for z in 0..v.n[2] {
             for y in 0..v.n[1] {
                 for x in 0..v.n[0] {
                     let i = v.index([x, y, z]);
-                    let c = v.point([x, y, z], 0.5);
-                    if v.occupied[i] != 0
-                        && (0..3).all(|k| c[k] >= part.min[k] && c[k] <= part.max[k])
-                    {
+                    if v.occupied[i] != 0 && part.inside(i) {
                         joined[i] = true;
                         stack.push([x, y, z]);
                     }
@@ -828,7 +826,7 @@ pub fn start(setup: &Setup, region: Bounds, target: f32, original: f32, offset: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{mesh, model::Machine};
+    use crate::{mesh, model::Machine, plan_check::PartGrid};
     fn fixture() -> (Volume, Frame, Bounds, Setup, crate::mesh::Mesh) {
         let mesh = mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
         let setup = Setup::new(Machine::new(3), "G54");
@@ -960,16 +958,17 @@ mod tests {
             max: [4., 4., 12.],
         };
         let (mut v, f, _, mut s, mesh) = fixture();
+        let grid = PartGrid::boxed(&v, part);
         // Without earlier cuts the stock is one piece: nothing is said.
         assert_eq!(
-            Removed::new(&v, f).with_part(part).joined([9., 0., 6.]),
+            Removed::new(&v, f).with_part(&grid).joined([9., 0., 6.]),
             None
         );
         ring(&mut v, f, 6., &[-1., 2., 5., 8., 11.]);
         let removed = Removed::new(&v, f);
         // Not knowing the part, nothing is said either.
         assert_eq!(removed.joined([0., 0., 6.]), None);
-        let removed = removed.with_part(part);
+        let removed = removed.with_part(&grid);
         assert_eq!(removed.joined([0., 0., 6.]), Some(true));
         assert_eq!(removed.joined([9.5, 0., 0.5]), Some(false));
         assert_eq!(removed.joined([-9.5, 9.5, 11.5]), Some(false));
@@ -979,7 +978,7 @@ mod tests {
         // The same from a flipped setup.
         s.p.insert("rx".into(), "180".into());
         let flipped = Frame::new(&s, &mesh);
-        let turned = Removed::new(&v, flipped).with_part(f.transfer_bounds(part, flipped));
+        let turned = Removed::new(&v, flipped).with_part(&grid);
         assert_eq!(turned.joined(f.transfer([0., 0., 6.], flipped)), Some(true));
         assert_eq!(
             turned.joined(f.transfer([9.5, 0., 0.5], flipped)),
@@ -988,7 +987,7 @@ mod tests {
         // Stopped 2 mm above the bottom, the ring leaves a skin joining them.
         let (mut v, f, _, _, _) = fixture();
         ring(&mut v, f, 6., &[2., 5., 8., 11.]);
-        let removed = Removed::new(&v, f).with_part(part);
+        let removed = Removed::new(&v, f).with_part(&PartGrid::boxed(&v, part));
         assert_eq!(removed.joined([9.5, 0., 6.]), Some(true));
         assert_eq!(removed.joined([6., 0., 6.]), None);
         // A part where no stock is left cannot be told apart from the rest.
@@ -996,8 +995,9 @@ mod tests {
             min: [5.8, -1., 6.],
             max: [6.2, 1., 7.],
         };
+        let gone = PartGrid::boxed(&v, gone);
         assert_eq!(
-            Removed::new(&v, f).with_part(gone).joined([9.5, 0., 6.]),
+            Removed::new(&v, f).with_part(&gone).joined([9.5, 0., 6.]),
             None
         );
     }

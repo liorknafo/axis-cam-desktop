@@ -1616,6 +1616,7 @@ pub fn holdable(
 mod tests {
     use super::*;
     use crate::model::{Machine, Setup};
+    use crate::plan_check::PartGrid;
     use crate::rest::{Removed, RestStock};
     use crate::simulation::{CutterShape, Motion, Move, Plan};
     use crate::volume::{Frame, Volume};
@@ -3029,7 +3030,7 @@ mod tests {
         );
         assert!(jaws.iter().all(|j| j.bounds.max[2] == left.min[2] + 8.));
         // There is material at both jaws and under them: it holds.
-        let removed = Removed::new(&v, flipped).with_part(part);
+        let removed = Removed::new(&v, flipped).with_part(&PartGrid::boxed(&v, PART));
         assert!(holdable(1, &layout, &vise(), held, Some(&removed), &names).is_empty());
         // A vise opening to 55 mm takes the walls, not the whole box.
         let mut narrow = vise();
@@ -3384,10 +3385,15 @@ mod tests {
     /// contour by setup 1's operation 3.
     fn around(v: &mut Volume, f: Frame, half: [f32; 2], tips: &[f32]) {
         let [x, y] = half;
-        let corners = [[-x, -y], [x, -y], [x, y], [-x, y]];
+        outline(v, f, &[[-x, -y], [x, -y], [x, y], [-x, y]], tips);
+    }
+    /// Flat Ø10 passes, 5 mm of flute each, round the closed polygon of
+    /// `corners` at each tip height of `tips`: an outside contour by setup
+    /// 1's operation 3.
+    fn outline(v: &mut Volume, f: Frame, corners: &[[f32; 2]], tips: &[f32]) {
         for &z in tips {
-            for k in 0..4 {
-                let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            for k in 0..corners.len() {
+                let (a, b) = (corners[k], corners[(k + 1) % corners.len()]);
                 v.cut(
                     [a[0], a[1], z],
                     [b[0], b[1], z],
@@ -3399,6 +3405,39 @@ mod tests {
                 );
             }
         }
+    }
+    /// The part of `a_part_cut_free_from_what_the_jaws_or_clamps_hold_cannot_be_held`
+    /// with its +X+Y corner cut away: the box less x > 0, y > 0, an L of
+    /// 20 triangles facing out.
+    fn l_part() -> Vec<[[f32; 3]; 3]> {
+        // Counter-clockwise seen from above.
+        let rim = [
+            [-30., -15.],
+            [30., -15.],
+            [30., 0.],
+            [0., 0.],
+            [0., 15.],
+            [-30., 15.],
+        ];
+        let (lo, hi) = (0., 37.);
+        let at = |p: [f32; 2], z: f32| [p[0], p[1], z];
+        let mut tris = vec![];
+        for k in 0..rim.len() {
+            let (a, b) = (rim[k], rim[(k + 1) % rim.len()]);
+            tris.push([at(a, lo), at(b, lo), at(b, hi)]);
+            tris.push([at(a, lo), at(b, hi), at(a, hi)]);
+        }
+        // The caps, as the two rectangles the L is made of.
+        for [a, b, c, d] in [
+            [[-30., -15.], [0., -15.], [0., 15.], [-30., 15.]],
+            [[0., -15.], [30., -15.], [30., 0.], [0., 0.]],
+        ] {
+            tris.push([at(a, hi), at(b, hi), at(c, hi)]);
+            tris.push([at(a, hi), at(c, hi), at(d, hi)]);
+            tris.push([at(a, lo), at(c, lo), at(b, lo)]);
+            tris.push([at(a, lo), at(d, lo), at(c, lo)]);
+        }
+        tris
     }
     #[test]
     fn a_part_cut_free_from_what_the_jaws_or_clamps_hold_cannot_be_held() {
@@ -3418,7 +3457,7 @@ mod tests {
         );
         let left = RestStock::new(&v, f).left(part);
         assert_eq!(left, stock());
-        let removed = Removed::new(&v, f).with_part(part);
+        let removed = Removed::new(&v, f).with_part(&PartGrid::boxed(&v, part));
         let advice = "Leave material joining them (for example a `bottom_offset` above the stock's bottom, or a skin under the part) and cut it free in the last setup. Setup 1, operation 3 is Contour \"Outside\".";
         // The jaws grip the frame: material, but not the part's.
         assert_eq!(
@@ -3450,9 +3489,74 @@ mod tests {
             [35., 20.],
             &[3., 8., 13., 18., 23., 28., 33., 38.],
         );
-        let removed = Removed::new(&v, f).with_part(part);
+        let removed = Removed::new(&v, f).with_part(&PartGrid::boxed(&v, part));
         assert!(holdable(1, &vise_gripping(8.), &vise(), left, Some(&removed), &names).is_empty());
         assert!(holdable(1, &clamps, &clamp(), left, Some(&removed), &names).is_empty());
+    }
+    #[test]
+    fn a_part_cut_free_along_its_own_outline_cannot_be_held_whatever_its_box_keeps() {
+        // The part above with its +X+Y corner cut away (`l_part`), and an
+        // outside contour 10 mm wide round its outline, down past the
+        // bottom: it leaves a frame cut free from the part, joined to the
+        // block the corner left (x 10 to 40, y 10 to 20), which lies within
+        // the part's box but outside the part.
+        let path = [
+            [-35., -20.],
+            [35., -20.],
+            [35., 5.],
+            [5., 5.],
+            [5., 20.],
+            [-35., 20.],
+        ];
+        let deep = [-1., 4., 9., 14., 19., 24., 29., 34., 39.];
+        let (mut v, f, _) = untouched();
+        outline(&mut v, f, &path, &deep);
+        let removed = Removed::new(&v, f).with_part(&PartGrid::of(&v, l_part()));
+        let advice = "Leave material joining them (for example a `bottom_offset` above the stock's bottom, or a skin under the part) and cut it free in the last setup. Setup 1, operation 3 is Contour \"Outside\".";
+        assert_eq!(
+            holdable(
+                1,
+                &vise_gripping(8.),
+                &vise(),
+                stock(),
+                Some(&removed),
+                &names
+            ),
+            [format!(
+                "Setup 2 cannot be held in the vise: setup 1, operation 3 cut the part free from the material the jaws grip on ±Y. {advice}"
+            )]
+        );
+        // The corner's block is stock, not the part's material.
+        assert_eq!(removed.joined([-20., 10., 20.]), Some(true));
+        assert_eq!(removed.joined([20., 15., 20.]), Some(false));
+        let clamps = clamp_layout(&[(Side::MinusX, 0.), (Side::PlusX, 0.)]);
+        let said = |side: &str| {
+            format!(
+                "Setup 2 cannot be held by the clamp on {side} (offset 0): setup 1, operation 3 cut the part free from the stock under its bite. {advice}"
+            )
+        };
+        assert_eq!(
+            holdable(1, &clamps, &clamp(), stock(), Some(&removed), &names),
+            [said("-X"), said("+X")]
+        );
+        // Stopped 3 mm above the bottom, the contour leaves a skin joining
+        // the frame to the part: both hold.
+        let (mut v, f, _) = untouched();
+        outline(&mut v, f, &path, &[3., 8., 13., 18., 23., 28., 33., 38.]);
+        let removed = Removed::new(&v, f).with_part(&PartGrid::of(&v, l_part()));
+        assert_eq!(removed.joined([20., 15., 20.]), Some(true));
+        assert!(
+            holdable(
+                1,
+                &vise_gripping(8.),
+                &vise(),
+                stock(),
+                Some(&removed),
+                &names
+            )
+            .is_empty()
+        );
+        assert!(holdable(1, &clamps, &clamp(), stock(), Some(&removed), &names).is_empty());
     }
     #[test]
     fn the_suggested_grip_leaves_a_millimetre_of_a_thin_stock_above_the_jaws() {
