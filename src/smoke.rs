@@ -1841,7 +1841,11 @@ flood = { pin = 8 }
         idle(&mut a);
         check_run(&mut a, 0);
         let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
-        assert!(steps(&a).contains("1. Set machine zero under Position"), "{}", steps(&a));
+        assert!(
+            steps(&a).contains("1. Set machine zero under Position"),
+            "{}",
+            steps(&a)
+        );
         // ponytail: pressed again while an axis stays unset, since the driver
         // can drop a declaration (LIO-163); drop the loop once that is fixed.
         let set = |a: &App| conn(a).snapshot.referenced[..3].iter().all(|r| *r);
@@ -1861,7 +1865,10 @@ flood = { pin = 8 }
             .filter(|p| p.contains("outside the soft limits"))
             .collect();
         assert!(
-            off.len() == 3 && off.iter().all(|p| p.contains("see Work zero on the stock below")),
+            off.len() == 3
+                && off
+                    .iter()
+                    .all(|p| p.contains("see Work zero on the stock below")),
             "{:?}",
             problems(&a)
         );
@@ -1888,7 +1895,8 @@ flood = { pin = 8 }
         assert!(!text.contains("probe"), "{text}");
         let _ = a.update(Message::Machine(Action::ToSimZero));
         tick_until(&mut a, 10.0, "the move onto the block", |s| {
-            s.state == Some(State::Idle) && (0..3).all(|k| (s.machine_pos[k] - zero[k]).abs() < 0.06)
+            s.state == Some(State::Idle)
+                && (0..3).all(|k| (s.machine_pos[k] - zero[k]).abs() < 0.06)
         });
         let _ = a.update(Message::Machine(Action::WorkZero(None)));
         tick_until(&mut a, 2.0, "work zero", |s| {
@@ -2735,11 +2743,21 @@ flood = { pin = 8 }
         let window = iced::window::Id::unique();
         for status in [iced::event::Status::Ignored, iced::event::Status::Captured] {
             let tab = crate::on_event(press(key::Named::Tab, Modifiers::empty()), status, window);
-            assert!(matches!(tab, Some(Message::TabKey(false))), "{status:?}: {tab:?}");
+            assert!(
+                matches!(tab, Some(Message::TabKey(false))),
+                "{status:?}: {tab:?}"
+            );
             let back = crate::on_event(press(key::Named::Tab, Modifiers::SHIFT), status, window);
-            assert!(matches!(back, Some(Message::TabKey(true))), "{status:?}: {back:?}");
+            assert!(
+                matches!(back, Some(Message::TabKey(true))),
+                "{status:?}: {back:?}"
+            );
         }
-        let enter = crate::on_event(press(key::Named::Enter, Modifiers::empty()), iced::event::Status::Ignored, window);
+        let enter = crate::on_event(
+            press(key::Named::Enter, Modifiers::empty()),
+            iced::event::Status::Ignored,
+            window,
+        );
         assert!(enter.is_none(), "{enter:?}");
     }
 
@@ -5793,7 +5811,11 @@ flood = { pin = 8 }
         let _ = a.update(worked_out(running.unwrap(), held, vec![None, None]));
         assert!(a.blocking_work());
         let setup = a.doc.index();
-        let ready = crate::run::Ready { key: held, setup, ..Default::default() };
+        let ready = crate::run::Ready {
+            key: held,
+            setup,
+            ..Default::default()
+        };
         let _ = a.update(Message::Ready(Box::new(ready)));
         assert!(!a.blocking_work());
         // Done for this document: the ticks start none.
@@ -6276,9 +6298,8 @@ flood = { pin = 8 }
         a.doc.adopt_holders();
         a.smoke_dir = Some(dir.path().to_path_buf());
         a.page = Page::Work;
-        let marks = |a: &App| -> Vec<OpMark> {
-            (0..2).map(|i| op_mark(a, a.current_ready(), i)).collect()
-        };
+        let marks =
+            |a: &App| -> Vec<OpMark> { (0..2).map(|i| op_mark(a, a.current_ready(), i)).collect() };
         // The suggested toe clamps, as the reviewer had them.
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
         let _ = a.update(Message::SelectOp(0));
@@ -6294,9 +6315,15 @@ flood = { pin = 8 }
         let (heading, lines, ok) = run_check(&a).unwrap();
         assert_eq!(heading, "Workholding problem: Run will refuse Top");
         assert!(!ok);
-        let hit = format!("{}: the tool hits the clamp on", a.doc.setups[0].operations[0].name());
+        let hit = format!(
+            "{}: the tool hits the clamp on",
+            a.doc.setups[0].operations[0].name()
+        );
         assert!(lines[0].starts_with(&hit), "{lines:?}");
-        assert!(refused.iter().all(|r| lines.contains(r)), "{lines:?} {refused:?}");
+        assert!(
+            refused.iter().all(|r| lines.contains(r)),
+            "{lines:?} {refused:?}"
+        );
         let _ = a.view();
         // The suggested vise instead: out of date until checked again, then
         // green, and Run agrees.
@@ -6316,7 +6343,10 @@ flood = { pin = 8 }
         let (heading, lines, ok) = run_check(&a).unwrap();
         assert_eq!(heading, "Run will refuse Top");
         assert!(!ok);
-        assert!(lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"), "{lines:?}");
+        assert!(
+            lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"),
+            "{lines:?}"
+        );
     }
     #[test]
     fn the_setup_editor_and_the_run_checks_say_whether_the_vise_holds_against_the_cut() {

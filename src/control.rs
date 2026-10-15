@@ -1597,7 +1597,9 @@ mod tests {
 
     #[test]
     fn a_tab_into_a_field_selects_its_value() {
-        use iced::advanced::widget::operation::{Focusable, Operation, Outcome, TextInput, focusable};
+        use iced::advanced::widget::operation::{
+            Focusable, Operation, Outcome, TextInput, focusable,
+        };
         #[derive(Default)]
         struct Field {
             focused: bool,
@@ -1643,15 +1645,25 @@ mod tests {
                 }
             }
         }
-        let state = |f: &[Field]| f.iter().map(|f| (f.focused, f.selected)).collect::<Vec<_>>();
+        let state = |f: &[Field]| {
+            f.iter()
+                .map(|f| (f.focused, f.selected))
+                .collect::<Vec<_>>()
+        };
         let mut fields: Vec<Field> = (0..3).map(|_| Field::default()).collect();
         fields[0].focused = true;
         run(Box::new(focusable::focus_next()), &mut fields);
         run(Box::new(select_focused()), &mut fields);
-        assert_eq!(state(&fields), [(false, false), (true, true), (false, false)]);
+        assert_eq!(
+            state(&fields),
+            [(false, false), (true, true), (false, false)]
+        );
         run(Box::new(focusable::focus_previous()), &mut fields);
         run(Box::new(select_focused()), &mut fields);
-        assert_eq!(state(&fields), [(true, true), (false, false), (false, false)]);
+        assert_eq!(
+            state(&fields),
+            [(true, true), (false, false), (false, false)]
+        );
     }
 
     fn uc100(profile: &str, connection: &str) -> Machine {

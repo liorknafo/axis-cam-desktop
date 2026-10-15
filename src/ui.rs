@@ -2686,7 +2686,11 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
     let i = app.selected?;
     let setup = app.doc.active_setup()?;
     let uc100 = get(&setup.machine.p, "controller") == "UC100";
-    let (by, verb) = if uc100 { ("Run", "run") } else { ("Export", "export") };
+    let (by, verb) = if uc100 {
+        ("Run", "run")
+    } else {
+        ("Export", "export")
+    };
     let name = setup.name();
     let Some(r) = app.current_ready() else {
         // Nothing is checked for the example.
@@ -3444,7 +3448,9 @@ fn control(app: &App) -> Element<'_, Message> {
         ],
         known: (0..3).all(|a| !c.axis(a) || s.referenced[a]),
         envelope: crate::machine_view::MachineView::envelope(&c.config),
-        block: c.block.map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
+        block: c
+            .block
+            .map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
         zero: std::array::from_fn(|k| s.work_offset[k] as f32),
     };
     let position = machine_panel(

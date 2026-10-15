@@ -3541,7 +3541,12 @@ impl App {
                         .strip_prefix("Connecting to ")
                         .map(|name| name.trim_end_matches('…'));
                     let name = connecting.or_else(|| {
-                        Some(self.status.strip_prefix("Connected to ")?.rsplit_once(": ")?.0)
+                        Some(
+                            self.status
+                                .strip_prefix("Connected to ")?
+                                .rsplit_once(": ")?
+                                .0,
+                        )
                     });
                     if let (Some(name), Some(state)) = (name, &c.snapshot.state) {
                         use uc100::controller::State;
@@ -4178,9 +4183,7 @@ fn on_event(
     window: iced::window::Id,
 ) -> Option<Message> {
     match event {
-        iced::Event::Window(iced::window::Event::CloseRequested) => {
-            Some(Message::Close(window))
-        }
+        iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close(window)),
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Character(c),
             modifiers,
@@ -4226,9 +4229,7 @@ fn on_event(
         }) => jog_key(key).map(|_| Message::JogKeyUp),
         // A held jog stops on any left-button release, wherever it
         // happens, and when the window loses the focus.
-        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-            iced::mouse::Button::Left,
-        ))
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))
         | iced::Event::Window(iced::window::Event::Unfocused) => {
             Some(Message::Machine(control::Action::JogRelease))
         }
