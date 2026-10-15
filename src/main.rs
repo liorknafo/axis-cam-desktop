@@ -208,7 +208,6 @@ pub enum Message {
     SuggestLayout,
     SetOpTool(String),
     RestSource(String),
-    StockSource(String),
     SaveProject,
     OpenProject,
     OpenHistory,
@@ -2270,7 +2269,6 @@ impl App {
                     | Message::ConfirmDeleteSetup(_)
                     | Message::MoveSetup(_)
                     | Message::Flip(_)
-                    | Message::StockSource(_)
                     | Message::SetClamps(_)
                     | Message::SuggestLayout
                     | Message::Plan
@@ -3274,10 +3272,6 @@ impl App {
                 if let Some(o) = self.operation_mut() {
                     o.p.insert("rest_source".into(), id);
                 }
-                self.touch()
-            }
-            Message::StockSource(id) => {
-                self.doc.setup_mut().p.insert("stock_source".into(), id);
                 self.touch()
             }
             Message::SaveProject => {

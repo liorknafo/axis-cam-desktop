@@ -259,6 +259,12 @@ Other checks:
 - Not inspected in the real window: the screen is shared with other work. The review's cases (Face opening the Tool library, the Geometry and Heights tabs, the Run panel's setup button) all go through `help::wrap`.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 818 passed, 4 failed: the two STEP tests, as before, and two simulated-UC100 smoke tests that timed out under the load of parallel builds (`probe_z_waits_for_a_probe_input_a_plate_and_a_free_input`, `the_control_page_renders_in_every_state`); each passes alone.
 
+## Help texts match the controls (issues #34, #35, #36)
+
+- The machine wizard's UC100 profile file field has its own help card (path of the driver profile, Browse…, the Control page's Setup view), not the generic "Saved parameter" text (`choice_help::tests::choice_help_keeps_implemented_and_saved_preferences_distinct`).
+- The Hole order card says what the code does: Optimize travel drills the nearest remaining hole next, a greedy route that is not a global optimum; By X then Y drills in setup X then Y order. "Selection order" is no longer accepted by `cam::drill` or described; a project saved with it loads as By X then Y (`storage::tests::a_saved_selection_order_loads_as_by_x_then_y`).
+- The help cards and the message handler for a stock-source control are deleted; no control sends it, and each later setup's stock source is set by `Document::sync_stock_sources`.
+
 ## What the job leaves uncut (LIO-146)
 
 The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 2 mm on each side. Each face is sampled 0.5 mm outside itself against the exact cuts of the stock the last setup leaves.

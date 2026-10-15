@@ -536,12 +536,6 @@ pub fn command(m: &Message, label: String) -> Help {
         RestSource(_) => {
             "Choose the earlier operation whose remaining material should guide rest machining. Earlier cuts automatically lower the cutting start when the area above it is fully cleared. Selecting isolated leftover regions for rest machining is not implemented."
         }
-        StockSource(s) if s == "fresh" => {
-            "Begin this setup from the defined stock dimensions instead of inheriting a previous setup's remaining material."
-        }
-        StockSource(_) => {
-            "Imported jobs automatically inherit all earlier enabled operations and setups in browser order. Setup rotation and translation reposition that same remaining material."
-        }
         Export("sheet") => {
             "Save a Markdown setup sheet with machine, workholding, repositioning instructions and operation parameters."
         }
@@ -756,6 +750,10 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Machine, "feed") => (
             "Maximum feed rate in the machine profile's units per minute. Use the manufacturer's specification; operation feeds are in mm/min.",
+            None,
+        ),
+        (Target::Machine, "uc100_profile") => (
+            "Path of the UC100 driver profile (TOML) this machine runs with. Browse… picks it; the Control page's Setup view edits it in place.",
             None,
         ),
         (Target::Machine, "direction" | "direction2") => (
@@ -988,7 +986,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "hole_order") => (
-            "Visit holes in their selection order or request shorter travel between them. Route optimization is a future CAM-engine feature.",
+            "Optimize travel drills the nearest remaining hole next, a greedy route that is not a global optimum. By X then Y drills the holes in setup X then Y order.",
             None,
         ),
         (_, "ramp") => (

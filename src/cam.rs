@@ -595,7 +595,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         return Err("Breakthrough cannot be negative.".into());
     }
     b.plan.milling_direction = "Drilling · axial feed";
-    if !["Optimize travel", "Selection order", "By X then Y"].contains(&get(&op.p, "hole_order")) {
+    if !["Optimize travel", "By X then Y"].contains(&get(&op.p, "hole_order")) {
         return Err("Choose a valid hole order.".into());
     }
     while !holes.is_empty() {
