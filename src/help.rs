@@ -932,11 +932,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Offsets),
         ),
         (_, "through") => (
-            "Request extra drill travel through the selected bottom. Check the extra depth and the material or fixture underneath.",
+            "Add Breakthrough below the bottom of each hole that goes through the part. A blind hole is refused with Yes, since the part goes on under its bottom. Check the extra depth and the material or fixture underneath.",
             Some(Operation(Strategy::Drill)),
         ),
         (_, "breakthrough") => (
-            "Additional drill travel past the bottom reference, in mm. The real required distance also depends on drill-point geometry.",
+            "Additional drill travel past the exit of a hole that goes through, in mm; it is never added under a blind hole. The real required distance also depends on drill-point geometry.",
             Some(Operation(Strategy::Drill)),
         ),
         (_, "angle_a" | "angle_b") => (

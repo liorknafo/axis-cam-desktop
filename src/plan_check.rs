@@ -1593,17 +1593,25 @@ mod tests {
         let unaltered = check_built(&job, &mesh, &report);
         assert!(unaltered.passed && unaltered.problems.is_empty());
         // The reviewers' case: a Ø1 drill sent 25 mm past the Ø6 x 8 hole.
+        // The drill cycle refuses the blind hole before the tool axis is checked.
         let tool = thin_drill(&mut job);
         let drill = &mut job.setups[0].operations[3];
         drill.tool = tool;
         // 0.02 mm per tooth at 12000 rpm: inside the material's band for a Ø1 tool.
         drill.p.insert("feed".into(), "720".into());
         drill_through(drill, "6", "25");
+        let found = stages(&check_built(&job, &mesh, &report));
         assert_eq!(
-            stages(&check_built(&job, &mesh, &report)),
-            vec![
-                "gouge 1/Some(4): The tool's centre line passes through 25.00 mm of the part at X 42.0, Y 40.0, 33.0 mm below the model top (this setup's axes, measured from the model's -X/-Y corner): the cut is deeper than the surface there."
-            ]
+            found[0],
+            "generation 1/Some(4): The Ø6.00 hole at X-18.00 Y0.00 is blind: the part goes on under its bottom, so it cannot be drilled through. Set Through to No, or use the diameter filter to drill only the holes that go through."
+        );
+        // Setup 2 starts from the stock the failed drill leaves unknown.
+        assert!(
+            found.len() == 3
+                && found[1..]
+                    .iter()
+                    .all(|m| m.starts_with("generation 2/Some(") && m.contains("Cannot inherit")),
+            "{found:?}"
         );
     }
     #[test]
@@ -1618,7 +1626,7 @@ mod tests {
         );
     }
     #[test]
-    fn the_tool_axis_check_works_in_each_setups_frame() {
+    fn a_blind_hole_in_a_later_setup_is_refused_in_that_setups_frame() {
         let (doc, mesh, report) = block();
         let mut plan = good(&report);
         let mut drill = plan.setups[0].operations[3].clone();
@@ -1632,11 +1640,9 @@ mod tests {
         drill.tool = tool;
         drill_through(drill, "5", "25");
         let found = stages(&check_built(&job, &mesh, &report));
-        assert!(
-            found.iter().any(|m| m.starts_with(
-                "gouge 2/Some(3): The tool's centre line passes through 25.00 mm of the part"
-            )),
-            "{found:?}"
+        assert_eq!(
+            found[0],
+            "generation 2/Some(3): The Ø5.00 hole at X-50.00 Y0.00 is blind: the part goes on under its bottom, so it cannot be drilled through. Set Through to No, or use the diameter filter to drill only the holes that go through."
         );
         assert!(found.iter().all(|m| !m.contains(" 1/")), "{found:?}");
     }
