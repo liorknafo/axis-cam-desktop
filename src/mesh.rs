@@ -458,6 +458,23 @@ mod tests {
         assert!(normalize(t).is_ok())
     }
     #[test]
+    fn a_file_over_50_mb_is_refused_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["big.stl", "big.obj", "big.3mf", "big.step"] {
+            let path = dir.path().join(name);
+            // Sparse: one byte over the cap, none of it written.
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(50_000_001)
+                .unwrap();
+            assert_eq!(
+                load(&path).err().unwrap(),
+                "Mesh preview accepts files up to 50 MB.",
+                "{name}"
+            );
+        }
+    }
+    #[test]
     fn bad_obj_rejected() {
         assert!(obj("v 0 0 0\nf 1 2 3").is_err())
     }

@@ -553,4 +553,111 @@ mod tests {
             "3MF expanded XML exceeds 100 MB"
         );
     }
+
+    // The package limits: each test sits one past the limit, with the largest passing size beside it where that is cheap.
+    fn zip_of(files: &[(String, String)]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
+        let opt = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in files {
+            w.start_file(name, opt).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+    fn rels() -> (String, String) {
+        (
+            "_rels/.rels".into(),
+            format!(
+                "<Relationships xmlns='{REL}'><Relationship Id='r' Type='{MODEL_REL}' Target='/3D/custom.model'/></Relationships>"
+            ),
+        )
+    }
+    #[test]
+    fn more_than_4096_package_entries_are_refused() {
+        let mut files = vec![
+            rels(),
+            (
+                "3D/custom.model".into(),
+                doc(MESH, "<item objectid='1'/>", ""),
+            ),
+        ];
+        files.extend((files.len()..4096).map(|i| (format!("extra/{i}.txt"), String::new())));
+        assert_eq!(files.len(), 4096);
+        assert_eq!(load(&zip_of(&files)).unwrap().len(), 1);
+        files.push(("extra/one-more.txt".into(), String::new()));
+        assert_eq!(
+            load(&zip_of(&files)).unwrap_err(),
+            "3MF has too many package entries"
+        );
+    }
+    #[test]
+    fn more_than_64_levels_of_component_nesting_are_refused() {
+        // Object 1 is the mesh; object n holds object n - 1.
+        let chain = |levels: u32| {
+            let mut rs = MESH.to_string();
+            for n in 2..=levels {
+                rs += &format!(
+                    "<object id='{n}'><components><component objectid='{}'/></components></object>",
+                    n - 1
+                );
+            }
+            archive(&doc(&rs, &format!("<item objectid='{levels}'/>"), ""), None)
+        };
+        assert_eq!(load(&chain(64)).unwrap().len(), 1);
+        assert_eq!(
+            load(&chain(65)).unwrap_err(),
+            "3MF component nesting/instance limit exceeded"
+        );
+    }
+    #[test]
+    fn more_than_128_model_parts_are_refused() {
+        // The root model plus `parts` Production parts, each holding one triangle.
+        let package = |parts: usize| {
+            let items: String = (0..parts)
+                .map(|i| format!("<item objectid='1' p:path='/3D/p{i}.model'/>"))
+                .collect();
+            let mut files = vec![
+                rels(),
+                (
+                    "3D/custom.model".into(),
+                    doc("", &items, "requiredextensions='p'"),
+                ),
+            ];
+            let part = doc(MESH, "<item objectid='999'/>", "");
+            files.extend((0..parts).map(|i| (format!("3D/p{i}.model"), part.clone())));
+            zip_of(&files)
+        };
+        assert_eq!(load(&package(127)).unwrap().len(), 127);
+        assert_eq!(load(&package(128)).unwrap_err(), "Too many 3MF model parts");
+    }
+    #[test]
+    fn more_than_200000_triangles_are_refused() {
+        // One mesh over a few vertices, its triangles all the same; deflate makes the archive small.
+        let mesh = |triangles: usize| {
+            format!(
+                "<object id='1'><mesh><vertices><vertex x='0' y='0' z='0'/><vertex x='1' y='0' z='0'/><vertex x='0' y='1' z='0'/></vertices><triangles>{}</triangles></mesh></object>",
+                "<triangle v1='0' v2='1' v3='2'/>".repeat(triangles)
+            )
+        };
+        let one =
+            |triangles: usize| archive(&doc(&mesh(triangles), "<item objectid='1'/>", ""), None);
+        assert_eq!(
+            load(&one(200_001)).unwrap_err(),
+            "3MF exceeds the 200,000-triangle preview limit"
+        );
+        // Each mesh is within the limit; the build instances it twice.
+        let twice = archive(
+            &doc(
+                &mesh(100_001),
+                "<item objectid='1'/><item objectid='1'/>",
+                "",
+            ),
+            None,
+        );
+        assert_eq!(
+            load(&twice).unwrap_err(),
+            "Expanded 3MF exceeds the 200,000-triangle preview limit"
+        );
+    }
 }
