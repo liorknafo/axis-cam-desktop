@@ -8207,7 +8207,7 @@ flood = { pin = 8 }
     /// The save step writes the session before it reports, and unit tests do
     /// not run tasks, so the write happens here.
     fn sign_in_with(a: &mut App, dir: &tempfile::TempDir, session: crate::session::Session) {
-        crate::session::default_store(dir.path(), true)
+        crate::session::default_store(dir.path(), true, false)
             .save(&session)
             .unwrap();
         let _ = a.update(Message::SignIn);
@@ -10933,7 +10933,7 @@ flood = { pin = 8 }
         assert_eq!(a.account, crate::Account::SignedOut);
         assert!(a.restoring);
         // Unit tests do not run tasks; deliver the restore result directly.
-        let saved = crate::session::default_store(dir.path(), true).load();
+        let saved = crate::session::default_store(dir.path(), true, false).load();
         let _ = a.update(Message::AccountRestored(saved));
         assert!(matches!(
             a.account,
@@ -10987,7 +10987,7 @@ flood = { pin = 8 }
         // The client ID was read from the broken file, so the sign-in is used.
         assert_eq!(a.settings.client_id, "oaiapp_1");
         let _ = a.update(Message::Page(Page::Ai));
-        let saved = crate::session::default_store(dir.path(), true).load();
+        let saved = crate::session::default_store(dir.path(), true, false).load();
         let _ = a.update(Message::AccountRestored(saved));
         assert!(matches!(
             a.account,
@@ -11016,7 +11016,7 @@ flood = { pin = 8 }
             "the store is read"
         );
         assert!(a.restoring);
-        let store = crate::session::default_store(dir.path(), true);
+        let store = crate::session::default_store(dir.path(), true, false);
         let result = crate::read_saved_session(&*store, true);
         let _ = a.update(Message::AccountRestored(result));
         assert!(!a.restoring && a.account == crate::Account::SignedOut && a.client.is_none());
@@ -11230,7 +11230,7 @@ flood = { pin = 8 }
         let mut a = fresh_app(&dir);
         assert_eq!(a.update(Message::Page(Page::Home)).units(), 0);
         assert_eq!(a.update(Message::Page(Page::Ai)).units(), 1);
-        let saved = crate::session::default_store(dir.path(), true).load();
+        let saved = crate::session::default_store(dir.path(), true, false).load();
         let _ = a.update(Message::AccountRestored(saved));
         let _ = a.update(Message::Page(Page::Home));
         assert_eq!(a.update(Message::Page(Page::Ai)).units(), 0);
