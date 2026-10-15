@@ -2934,6 +2934,66 @@ flood = { pin = 8 }
         tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
+    /// The Controller configuration view hides the jog controls and the run
+    /// panel, so no key may jog or resume while it is open.
+    #[test]
+    fn keys_do_not_jog_or_resume_while_the_setup_view_hides_the_jog_controls() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::HoldKey);
+        tick_until(&mut a, 2.0, "Hold by Space", |s| {
+            s.state == Some(State::Hold)
+        });
+        // Space still holds with the Setup view open, but does not resume.
+        let _ = a.update(Message::ControlSetup(true));
+        let _ = a.view();
+        let _ = a.update(Message::HoldKey);
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Hold), "Setup is open");
+        let _ = a.update(Message::ControlSetup(false));
+        let _ = a.update(Message::HoldKey);
+        tick_until(&mut a, 2.0, "Run by Space", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::HoldKey);
+        tick_until(&mut a, 2.0, "Hold again", |s| s.state == Some(State::Hold));
+        let _ = a.update(Message::ControlSetup(true));
+        let _ = a.update(Message::HoldKey);
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Hold), "Setup is open");
+        let _ = a.update(Message::ControlSetup(false));
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let held = |a: &App| conn(a).held();
+        let _ = a.update(Message::ControlSetup(true));
+        let _ = a.view();
+        let _ = a.update(Message::JogKey(0, false, false));
+        assert_eq!(a.jog_key, None, "Setup is open");
+        let _ = a.update(Message::JogKeyChecked(0, false, false));
+        assert_eq!(held(&a), None, "Setup is open");
+        // Setup opened between the key going down and the focus answer.
+        let _ = a.update(Message::ControlSetup(false));
+        let _ = a.update(Message::JogKey(0, false, false));
+        let _ = a.update(Message::ControlSetup(true));
+        let _ = a.update(Message::JogKeyChecked(0, false, false));
+        assert_eq!(held(&a), None, "Setup opened before the answer");
+        let _ = a.update(Message::JogKeyUp);
+        let _ = a.update(Message::ControlSetup(false));
+        let _ = a.view();
+        let _ = a.update(Message::JogKey(0, false, false));
+        let _ = a.update(Message::JogKeyChecked(0, false, false));
+        assert_eq!(held(&a), Some((0, false)), "the jog controls are back");
+        let _ = a.update(Message::JogKeyUp);
+        assert_eq!((held(&a), a.jog_key), (None, None));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
     #[test]
     fn tab_and_shift_tab_move_between_fields_even_from_inside_one() {
         use iced::keyboard::{Event, Key, Location, Modifiers, key};
