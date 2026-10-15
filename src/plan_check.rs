@@ -420,10 +420,14 @@ impl PartGrid {
         Self::of(stock, triangles)
     }
 }
-/// Whether an operation that takes the gouged cells from `before` to `after`
-/// (all operations so far) is flagged.
-fn gouge_added(before: usize, after: usize) -> bool {
-    after >= GOUGE_CELLS && after > before
+/// The operations to name, given the deep part cells each one removed: none
+/// while the total is under `GOUGE_CELLS`, and then every operation that
+/// removed some.
+fn gouging_operations(removed: &[usize]) -> Vec<usize> {
+    if removed.iter().sum::<usize>() < GOUGE_CELLS {
+        return vec![];
+    }
+    (0..removed.len()).filter(|&i| removed[i] > 0).collect()
 }
 fn volume_text(mm3: f32) -> String {
     if mm3 < 1000. {
@@ -865,7 +869,10 @@ fn run(
     let mut starts: Vec<Option<(Bounds, Option<Arc<Volume>>)>> = vec![None; built.setups.len()];
     let mut operations = vec![];
     let mut problems = vec![];
-    let mut gouges = vec![];
+    // What each operation that removed deep part cells would be named for,
+    // and how many it removed: named once the total reaches `GOUGE_CELLS`.
+    let mut candidates = vec![];
+    let mut removed = vec![];
     // Kept for the export stage, so the job is not simulated twice.
     let mut results: Vec<Vec<(usize, Result<Simulation, String>)>> =
         vec![vec![]; built.setups.len()];
@@ -904,9 +911,10 @@ fn run(
         |si, oi, stock| {
             let part = part.get_or_insert_with(|| PartGrid::new(stock, &geometries[0]));
             let (count, bounds) = part.gouged(stock);
-            if gouge_added(gouged, count) {
+            if count > gouged {
                 let size = geometries[0].bounds;
-                gouges.push(Problem {
+                removed.push(count - gouged);
+                candidates.push(Problem {
                     setup: si + 1,
                     operation: Some(oi + 1),
                     stage: "gouge",
@@ -931,6 +939,9 @@ fn run(
             }
         },
     );
+    let gouges = gouging_operations(&removed)
+        .into_iter()
+        .map(|i| candidates[i].clone());
     let last = last.into_inner();
     out.total_minutes = (operations.iter().map(|o| o.minutes).sum::<f32>() * 10.).round() / 10.;
     out.operations = operations;
@@ -1725,12 +1736,20 @@ mod tests {
     }
     #[test]
     fn coarse_gouges_count_every_operation_together() {
-        assert!(!gouge_added(0, 2));
-        assert!(gouge_added(2, 4));
-        assert!(!gouge_added(4, 4));
-        assert!(gouge_added(4, 5));
+        assert!(gouging_operations(&[1, 1]).is_empty());
+        assert_eq!(gouging_operations(&[0, 2, 2, 0, 1]), [1, 2, 4]);
+        assert_eq!(gouging_operations(&[0, 4, 0]), [1]);
         assert_eq!(volume_text(250.), "250 mm3");
         assert_eq!(volume_text(1500.), "1.5 cm3");
+    }
+    #[test]
+    fn every_operation_that_removes_deep_cells_is_named_once_the_total_is_reached() {
+        // A removes 2 cells, B removes 1: the total reaches 3 at B, and both are named.
+        assert_eq!(gouging_operations(&[2, 1]), [0, 1]);
+        // Operations that remove nothing are not named.
+        assert_eq!(gouging_operations(&[0, 1, 0, 2]), [1, 3]);
+        // Under the threshold in all, no operation is named.
+        assert!(gouging_operations(&[1, 1]).is_empty());
     }
     #[test]
     fn coverage_sides_leave_out_the_reported_planes() {
