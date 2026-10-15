@@ -58,6 +58,8 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     d.validate_structure()?;
     Ok((d, notes))
 }
+/// Archives kept in the history folder; older ones are removed after an archive.
+pub const HISTORY_LIMIT: usize = 50;
 pub fn archive(state_path: &Path, doc: &Document) -> Result<PathBuf, String> {
     let folder = state_path
         .parent()
@@ -75,7 +77,31 @@ pub fn archive(state_path: &Path, doc: &Document) -> Result<PathBuf, String> {
         uuid::Uuid::new_v4()
     ));
     save(&path, doc)?;
+    prune_history(&folder, &path);
     Ok(path)
+}
+/// Keeps the newest `HISTORY_LIMIT` archives (by modification time) in the
+/// history folder, always including the one just written, and removes the
+/// older `*.axis.json` files. Best effort: the archive already succeeded.
+fn prune_history(folder: &Path, newest: &Path) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    let mut older: Vec<_> = entries
+        .flatten()
+        .filter(|e| {
+            let path = e.path();
+            path != newest && path.to_string_lossy().ends_with(".axis.json")
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            meta.is_file().then(|| (meta.modified().ok(), e.path()))
+        })
+        .collect();
+    older.sort_by(|a, b| b.cmp(a));
+    for (_, path) in older.into_iter().skip(HISTORY_LIMIT - 1) {
+        let _ = fs::remove_file(path);
+    }
 }
 pub fn save(path: &Path, doc: &Document) -> Result<(), String> {
     let data = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
@@ -108,6 +134,48 @@ mod tests {
         let restored = load(&p).unwrap();
         assert_eq!(d.title, restored.title);
         fs::remove_file(p).unwrap();
+    }
+    #[test]
+    fn the_history_keeps_the_newest_50_archives_and_nothing_else_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("workspace.json");
+        let history = dir.path().join("history");
+        fs::create_dir_all(&history).unwrap();
+        let now = std::time::SystemTime::now();
+        // 55 older archives; the file name's order is the reverse of their age.
+        for i in 0..55u64 {
+            let path = history.join(format!("old-{:02}.axis.json", 99 - i));
+            fs::write(&path, b"{}").unwrap();
+            let age = std::time::Duration::from_secs(1000 - i);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        fs::write(history.join("notes.txt"), b"keep").unwrap();
+        fs::write(history.join("old.axis.json.bak"), b"keep").unwrap();
+        let newest = archive(&state, &Document::default()).unwrap();
+        let mut kept: Vec<_> = fs::read_dir(&history)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".axis.json"))
+            .collect();
+        kept.sort();
+        assert_eq!(kept.len(), HISTORY_LIMIT);
+        assert!(newest.exists());
+        // The 49 newest older archives stay: i = 6..55, named old-93 down to old-45.
+        for i in 6..55u64 {
+            assert!(
+                kept.contains(&format!("old-{:02}.axis.json", 99 - i)),
+                "{i}"
+            );
+        }
+        assert!(!history.join("old-99.axis.json").exists());
+        assert!(!history.join("old-94.axis.json").exists());
+        assert!(history.join("notes.txt").exists());
+        assert!(history.join("old.axis.json.bak").exists());
     }
     #[test]
     fn bad_file_not_replaced() {
