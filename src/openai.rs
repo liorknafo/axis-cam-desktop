@@ -73,11 +73,15 @@ fn api_error(status: u16, body: &Value) -> ApiError {
         _ if status == 401 => {
             ApiError::SignedOut("Your ChatGPT sign-in was rejected. Sign in again.".into())
         }
-        _ if status == 400 => ApiError::BadRequest(if message.is_empty() {
-            "OpenAI returned HTTP 400.".into()
-        } else {
-            message
-        }),
+        _ if status == 400 => {
+            let param = error["param"].as_str().unwrap_or("");
+            ApiError::BadRequest(match (message.is_empty(), param.is_empty()) {
+                (true, true) => "OpenAI returned HTTP 400.".into(),
+                (true, false) => format!("OpenAI returned HTTP 400 (parameter: {param})."),
+                (false, true) => message,
+                (false, false) => format!("{message} (parameter: {param})"),
+            })
+        }
         _ if message.is_empty() && status == 0 => {
             ApiError::Other("OpenAI reported an error.".into())
         }
@@ -1698,6 +1702,25 @@ mod tests {
             r.client.respond(&request()).await,
             Err(ApiError::BadRequest(_))
         ));
+    }
+    #[test]
+    fn a_bad_requests_parameter_is_part_of_its_text() {
+        let body = |error: Value| json!({ "error": error });
+        assert_eq!(
+            api_error(
+                400,
+                &body(json!({"message": "Unknown parameter.", "param": "tools[0]"}))
+            ),
+            ApiError::BadRequest("Unknown parameter. (parameter: tools[0])".into())
+        );
+        assert_eq!(
+            api_error(400, &body(json!({"message": "Bad."}))),
+            ApiError::BadRequest("Bad.".into())
+        );
+        assert_eq!(
+            api_error(400, &body(json!({"param": "input"}))),
+            ApiError::BadRequest("OpenAI returned HTTP 400 (parameter: input).".into())
+        );
     }
     /// An HTTP client that waits only a second and a half for data, far
     /// below its total limit, in place of the two minutes the app allows.

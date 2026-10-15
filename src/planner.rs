@@ -744,9 +744,19 @@ struct Sight {
     /// The conversation carries the overview: it was drawn.
     overview: bool,
 }
+/// Whether the text of an HTTP 400 (its message, and its parameter when it
+/// names one) says the tools or the pictures are what was refused. Any other
+/// 400, such as a context that is too long, would fail again without them.
+fn refuses_tools_or_pictures(message: &str) -> bool {
+    let message = message.to_lowercase();
+    ["tool", "function", "image", "picture"]
+        .iter()
+        .any(|word| message.contains(word))
+}
 /// One planner request: sends the conversation, answers the model's tool
-/// calls, and returns the text of the first reply without calls. A refused
-/// send is made again without the tools, then without pictures.
+/// calls, and returns the text of the first reply without calls. A send
+/// OpenAI refuses for its tools or pictures is made again without the
+/// tools, then without pictures.
 async fn ask(
     backend: &(impl Backend + Sync),
     sight: &mut Sight,
@@ -778,8 +788,13 @@ async fn ask(
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
         let reply = match backend.reply(&messages, &tools, choice).await {
             Ok(reply) => reply,
-            Err(ApiError::Unsupported(_) | ApiError::BadRequest(_))
-                if sight.tool || sight.pictures =>
+            Err(error)
+                if (sight.tool || sight.pictures)
+                    && match &error {
+                        ApiError::Unsupported(_) => true,
+                        ApiError::BadRequest(m) => refuses_tools_or_pictures(m),
+                        _ => false,
+                    } =>
             {
                 let dropped = if sight.tool {
                     sight.tool = false;
@@ -4344,6 +4359,74 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(drops, vec![(1, Dropped::Tool), (1, Dropped::Pictures)]);
+    }
+    #[tokio::test]
+    async fn a_bad_request_that_names_neither_tools_nor_pictures_ends_the_run_at_once() {
+        use crate::fake_openai::{Fake, Resp};
+        use crate::session::SessionStore;
+        let fake = Fake::start(|_| {
+            Resp::json(
+                400,
+                serde_json::json!({"error": {
+                    "message": "Invalid 'max_output_tokens': integer below minimum value.",
+                    "type": "invalid_request_error",
+                    "param": "max_output_tokens",
+                    "code": "integer_below_min_value",
+                }}),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        let client = crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        );
+        let backend = OpenAiBackend::new(
+            std::sync::Arc::new(client),
+            "gpt-6.1-sol".into(),
+            std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            true,
+        );
+        let (doc, mesh, _) = block();
+        let mut events = vec![];
+        let failure = plan(&backend, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&failure.api, Some(ApiError::BadRequest(m)) if m.contains("max_output_tokens")),
+            "{failure:?}"
+        );
+        assert_eq!(fake.seen("/v1/responses").len(), 1, "no re-sends");
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Dropped(..))),
+            "{events:?}"
+        );
+    }
+    #[test]
+    fn only_a_bad_request_naming_tools_functions_or_pictures_is_a_refusal_of_them() {
+        for named in [
+            "tools",
+            "Unknown parameter: 'tools[0].strict'.",
+            "Invalid schema for function 'view_model'",
+            "Invalid value: 'input_image'.",
+            "images are not supported (parameter: input)",
+            "Pictures are not supported",
+        ] {
+            assert!(refuses_tools_or_pictures(named), "{named}");
+        }
+        for unrelated in [
+            "OpenAI returned HTTP 400.",
+            "Invalid 'max_output_tokens': integer below minimum value.",
+            "This model's maximum context length is 200000 tokens. (parameter: messages)",
+            "The model `gpt-9` does not exist. (parameter: model)",
+        ] {
+            assert!(!refuses_tools_or_pictures(unrelated), "{unrelated}");
+        }
     }
     #[tokio::test]
     async fn without_tools_or_pictures_a_refusal_is_the_requests_error() {
