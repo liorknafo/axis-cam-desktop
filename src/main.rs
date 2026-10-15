@@ -95,6 +95,8 @@ const NOT_GRANTED: &str =
 /// How long edits must pause before the project is saved and the stock the
 /// earlier setups left is worked out again.
 const EDIT_PAUSE: Duration = Duration::from_millis(700);
+/// Sends the user to a URL in their browser; see `App::open_browser`.
+type BrowserOpener = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// A loaded project, its path, and the notes of the load (`load_reporting`).
 type Opened = Result<(Document, PathBuf, Vec<String>), String>;
 #[derive(Debug, Clone)]
@@ -234,6 +236,9 @@ pub enum Message {
     AccountRestored(Result<Option<session::Session>, String>),
     SignIn,
     SignInCancel,
+    /// The browser step of a sign-in; see `oauth::approve`.
+    Approved(Result<oauth::Approval, String>),
+    /// The exchange of an approved sign-in; see `oauth::complete`.
     SignedIn(Result<(session::Session, String), String>),
     /// The result of saving a finished sign-in; see `oauth::save_session`.
     SessionSaved(Result<session::Session, String>),
@@ -625,6 +630,8 @@ pub struct App {
     store: std::sync::Arc<dyn session::SessionStore>,
     client: Option<std::sync::Arc<openai::Client>>,
     sign_in: Option<iced::task::Handle>,
+    /// Sends the user to the sign-in page; tests replace it.
+    open_browser: BrowserOpener,
     account_restored: bool,
     pub machine_draft: Machine,
     pub wizard_step: usize,
@@ -759,6 +766,7 @@ fn while_locked(m: &Message) -> bool {
             | AccountRestored(_)
             | SignIn
             | SignInCancel
+            | Approved(_)
             | SignedIn(_)
             | SessionSaved(_)
             | SignOut
@@ -994,6 +1002,7 @@ impl App {
             store,
             client: None,
             sign_in: None,
+            open_browser: std::sync::Arc::new(oauth::open_browser),
             account_restored: false,
             camera: viewport::Camera::default(),
             sample_mesh: mesh::sample(),
@@ -3968,29 +3977,50 @@ impl App {
                 self.account = Account::SigningIn;
                 self.account_note.clear();
                 let (endpoints, settings) = (self.endpoints.clone(), self.settings.clone());
+                let open = self.open_browser.clone();
+                // Only the wait for the browser is abortable: the exchange
+                // that follows may already hold issued tokens.
                 let (task, handle) = Task::perform(
                     async move {
-                        let http = oauth::http_client(Duration::from_secs(60));
                         let limit = Duration::from_secs(300);
-                        oauth::sign_in(
-                            &http,
-                            &endpoints,
-                            &settings,
-                            None,
-                            limit,
-                            oauth::open_browser,
-                        )
-                        .await
+                        oauth::approve(&endpoints, &settings, None, limit, |url| open(url)).await
                     },
-                    Message::SignedIn,
+                    Message::Approved,
                 )
                 .abortable();
                 self.sign_in = Some(handle);
                 return task;
             }
+            // The browser step is done. The exchange is a step of its own
+            // that cannot be aborted, so the tokens it gets are never
+            // dropped: a cancel or sign-out during it only means that its
+            // result arrives with nobody waiting and is revoked, below. The
+            // handle stays until then, so Cancel still works.
+            Message::Approved(Ok(approval))
+                if self.account == Account::SigningIn && self.sign_in.is_some() =>
+            {
+                let endpoints = self.endpoints.clone();
+                return Task::perform(
+                    async move {
+                        let http = oauth::http_client(Duration::from_secs(60));
+                        oauth::complete(&http, &endpoints, approval).await
+                    },
+                    Message::SignedIn,
+                );
+            }
+            // An approval nobody is waiting for holds no token; it is dropped.
+            Message::Approved(Ok(_)) => {}
+            Message::Approved(Err(e)) => {
+                if self.account == Account::SigningIn && self.sign_in.is_some() {
+                    self.sign_in = None;
+                    self.account = Account::SignedOut;
+                    self.account_note = e;
+                }
+            }
             Message::SignInCancel => {
-                // Only the browser step can be cancelled. Once the sign-in
-                // is being saved there is no handle, and the save finishes.
+                // Only the browser step and the exchange can be cancelled.
+                // Once the sign-in is being saved there is no handle, and the
+                // save finishes.
                 let Some(handle) = self.sign_in.take() else {
                     return Task::none();
                 };

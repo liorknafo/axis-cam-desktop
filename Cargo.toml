@@ -40,3 +40,7 @@ strip = true
 opt-level = 2
 [profile.dev.package.fidget-mesh]
 opt-level = 2
+
+[dev-dependencies]
+# Lets a test run an Iced `Task` to its messages (`task::into_stream`).
+iced_runtime = "0.14"

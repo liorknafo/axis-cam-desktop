@@ -625,17 +625,31 @@ fn launch(
         .map_err(|e| format!("Could not open the browser: {e}"))?;
     Ok(std::thread::spawn(move || child.wait().ok()))
 }
-/// The whole sign-in: listen, send the user to the browser, wait for the
-/// redirect, exchange the code and validate the ID token. Returns the session
-/// and the client ID to remember.
-pub async fn sign_in(
-    http: &reqwest::Client,
+/// What the browser step of a sign-in leaves: the authorization code, the
+/// client it was issued to and the attempt it belongs to. No token has been
+/// issued yet, so dropping it loses nothing.
+#[derive(Clone)]
+pub struct Approval {
+    code: String,
+    client_id: String,
+    attempt: Attempt,
+}
+impl fmt::Debug for Approval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Approval")
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+/// The first step of signing in, the only one that can be cancelled: listen,
+/// send the user to the browser and wait for the redirect.
+pub async fn approve(
     e: &Endpoints,
     settings: &Settings,
     id_token_hint: Option<&str>,
     limit: Duration,
     open: impl FnOnce(&str) -> Result<(), String>,
-) -> Result<(Session, String), String> {
+) -> Result<Approval, String> {
     let listener = Listener::bind().await?;
     let attempt = Attempt::new(listener.redirect_uri());
     open(&authorize_url(e, settings, &attempt, id_token_hint))?;
@@ -647,8 +661,42 @@ pub async fn sign_in(
             .filter(|id| !id.is_empty())
             .ok_or("OpenAI did not register this app. Try again.")?,
     };
-    let session = exchange(http, e, &client_id, &callback.code, &attempt).await?;
+    Ok(Approval {
+        code: callback.code,
+        client_id,
+        attempt,
+    })
+}
+/// The second step, which must not be cancelled half way: exchanges the code
+/// and validates the ID token. Once the token endpoint has answered, the
+/// refresh token it issued is the caller's to save or revoke. Returns the
+/// session and the client ID to remember.
+pub async fn complete(
+    http: &reqwest::Client,
+    e: &Endpoints,
+    approval: Approval,
+) -> Result<(Session, String), String> {
+    let Approval {
+        code,
+        client_id,
+        attempt,
+    } = approval;
+    let session = exchange(http, e, &client_id, &code, &attempt).await?;
     Ok((session, client_id))
+}
+/// The whole sign-in: `approve`, then `complete`. The app runs the two as
+/// separate tasks; tests run them as one.
+#[cfg(test)]
+pub async fn sign_in(
+    http: &reqwest::Client,
+    e: &Endpoints,
+    settings: &Settings,
+    id_token_hint: Option<&str>,
+    limit: Duration,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(Session, String), String> {
+    let approval = approve(e, settings, id_token_hint, limit, open).await?;
+    complete(http, e, approval).await
 }
 /// Revokes a refresh token nobody will use, without waiting on the outcome
 /// mattering: the user has nothing to do about a failed revoke.
