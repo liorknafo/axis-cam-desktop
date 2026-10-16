@@ -797,7 +797,7 @@ impl Connection {
     /// Rapids the tool tip up to the top of Z, over where the setup is
     /// touched off on the simulator's block and down onto it (`sim_touch`),
     /// once X, Y and Z have a machine position.
-    fn to_sim_zero(&mut self) -> Option<()> {
+    fn move_to_sim_zero(&mut self) -> Option<()> {
         let to = self
             .sim_touch()
             .filter(|_| self.idle() && self.unset_limited_axes().is_empty())?;
@@ -1039,7 +1039,7 @@ impl Connection {
                 }
             }
             Action::ToSimZero if self.run_program().is_ok() => {
-                self.to_sim_zero();
+                self.move_to_sim_zero();
             }
             Action::TestOutput(pin, Some(high)) if self.can_force(pin) => {
                 self.forced.insert(pin, high);

@@ -425,10 +425,8 @@ pub fn facing_setting_issues(p: &Fields) -> Vec<String> {
         ("facing_milling", FACING_MILLING),
     ]
     .into_iter()
-    .filter_map(|(key, values)| {
-        (!values.contains(&facing_setting(p, key)))
-            .then(|| format!("Choose a valid {} setting.", key.replace('_', " ")))
-    })
+    .filter(|&(key, values)| !values.contains(&facing_setting(p, key)))
+    .map(|(key, _values)| format!("Choose a valid {} setting.", key.replace('_', " ")))
     .collect()
 }
 pub const TOOL_NUMBER_MAX: u32 = 9999;
@@ -881,7 +879,7 @@ impl Setup {
 /// (Windows), which serde's own `PathBuf` refuses to write.
 mod path_json {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     #[derive(Serialize, Deserialize)]
     #[serde(untagged)]
     enum Repr {
@@ -891,7 +889,7 @@ mod path_json {
         #[cfg(windows)]
         Wide(Vec<u16>),
     }
-    pub fn serialize<S: Serializer>(path: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
         if let Some(text) = path.to_str() {
             return Repr::Text(text.to_owned()).serialize(s);
         }
@@ -1638,7 +1636,6 @@ fn range_equal(p: &Fields, a: &str, b: &str, e: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
 #[test]
 fn the_model_path_is_read_from_a_string_and_written_as_one_when_it_is_text() {
     let file: ModelFile =
@@ -1665,6 +1662,7 @@ fn a_model_path_that_is_not_utf8_survives_a_save_and_load() {
     let back: ModelFile = serde_json::from_str(&json).unwrap();
     assert_eq!(back.path, path);
 }
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

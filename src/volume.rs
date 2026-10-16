@@ -64,9 +64,9 @@ impl Frame {
                 }
             });
             let p = self.transfer(p, to);
-            for k in 0..3 {
-                out.min[k] = out.min[k].min(p[k]);
-                out.max[k] = out.max[k].max(p[k]);
+            for (k, &v) in p.iter().enumerate() {
+                out.min[k] = out.min[k].min(v);
+                out.max[k] = out.max[k].max(v);
             }
         }
         out

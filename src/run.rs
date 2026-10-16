@@ -278,10 +278,10 @@ impl Run {
                 way(p.ops[0].clockwise)
             ));
         }
-        if let Some((wcs, xy)) = self.xy {
-            if wcs != s.active_wcs || (0..2).any(|a| (s.work_offset[a] - xy[a]).abs() > 1e-6) {
-                e.push("X/Y work zero changed since the first tool run started. Tool changes keep X/Y zero: put it back, or pick the setup again to start over.".into());
-            }
+        if let Some((wcs, xy)) = self.xy
+            && (wcs != s.active_wcs || (0..2).any(|a| (s.work_offset[a] - xy[a]).abs() > 1e-6))
+        {
+            e.push("X/Y work zero changed since the first tool run started. Tool changes keep X/Y zero: put it back, or pick the setup again to start over.".into());
         }
         if let Some((origin, datum)) = &self.zero {
             let moved: Vec<String> = (0..3)
@@ -303,15 +303,17 @@ impl Run {
                 ));
             }
         }
-        if let Some((tool, z)) = &self.last {
-            if *tool != p.ops[0].tool_id && !self.touched && (s.work_offset[2] - z).abs() < 1e-6 {
-                e.push(format!(
-                    "Tool run {} uses T{} {}: touch off its Z first (Set Z from reference, or Zero Z).",
-                    self.next + 1,
-                    p.ops[0].tool,
-                    p.ops[0].tool_name
-                ));
-            }
+        if let Some((tool, z)) = &self.last
+            && *tool != p.ops[0].tool_id
+            && !self.touched
+            && (s.work_offset[2] - z).abs() < 1e-6
+        {
+            e.push(format!(
+                "Tool run {} uses T{} {}: touch off its Z first (Set Z from reference, or Zero Z).",
+                self.next + 1,
+                p.ops[0].tool,
+                p.ops[0].tool_name
+            ));
         }
         e
     }

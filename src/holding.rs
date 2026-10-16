@@ -1732,7 +1732,7 @@ mod tests {
             ]))
             .is_err()
         );
-        let nine = vec!["-X:0"; 9].join(";");
+        let nine = ["-X:0"; 9].join(";");
         assert!(
             layout(&setup(&[
                 ("holding", "Clamps"),

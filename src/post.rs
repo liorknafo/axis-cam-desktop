@@ -610,9 +610,9 @@ pub fn extents(blocks: &[Block]) -> Bounds {
         _ => vec![],
     });
     for p in points {
-        for k in 0..3 {
-            b.min[k] = b.min[k].min(p[k]);
-            b.max[k] = b.max[k].max(p[k]);
+        for (k, &v) in p.iter().enumerate() {
+            b.min[k] = b.min[k].min(v);
+            b.max[k] = b.max[k].max(v);
         }
     }
     b
@@ -1087,7 +1087,7 @@ fn face_points(s: Bounds, k: usize, plane: f32) -> impl Iterator<Item = [f32; 3]
 fn in_box(p: [f32; 3], b: &Bounds) -> bool {
     (0..3).all(|a| p[a] >= b.min[a] - 0.001 && p[a] <= b.max[a] + 0.001)
 }
-//// The stock faces a work zero is found from (`references`), as (name,
+/// The stock faces a work zero is found from (`references`), as (name,
 /// axis, plane 0.01 mm inside the face): the top, and the sides that place
 /// X0 and Y0, in the order -X, +X, -Y, +Y.
 fn zero_faces(s: Bounds, refs: [At; 2]) -> Vec<(&'static str, usize, f32)> {
@@ -1231,9 +1231,9 @@ pub(crate) fn probe_faces(s: Bounds, refs: [At; 2]) -> Vec<(&'static str, usize,
                 max: [f32::NEG_INFINITY; 3],
             };
             for p in points {
-                for a in 0..3 {
-                    spot.min[a] = spot.min[a].min(p[a]);
-                    spot.max[a] = spot.max[a].max(p[a]);
+                for (a, &v) in p.iter().enumerate() {
+                    spot.min[a] = spot.min[a].min(v);
+                    spot.max[a] = spot.max[a].max(v);
                 }
             }
             (name, k, plane > (s.min[k] + s.max[k]) / 2., spot)
@@ -2113,8 +2113,10 @@ pub(crate) mod fixture {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let path = manifest.join("examples/four-setup-block.3mf");
         let mesh = crate::mesh::load(&path).unwrap();
-        let mut doc = Document::default();
-        doc.title = "Fixture block".into();
+        let mut doc = Document {
+            title: "Fixture block".into(),
+            ..Default::default()
+        };
         let mut tools = vec![
             Tool::new("Flat 10", "Flat end mill", "10"),
             Tool::new("Ball 6", "Ball end mill", "6"),
@@ -3296,7 +3298,7 @@ M2
             },
         };
         assert_eq!(
-            in_the_way(stock, [At::Min, At::Mid], &[clamp.clone()]).unwrap(),
+            in_the_way(stock, [At::Min, At::Mid], std::slice::from_ref(&clamp)).unwrap(),
             "the clamp on -X (offset 0) is in the way of the top face near the middle of its left edge"
         );
         assert_eq!(in_the_way(stock, [At::Max, At::Mid], &[clamp]), None);

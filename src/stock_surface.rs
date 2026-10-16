@@ -117,9 +117,8 @@ impl Cut {
         let half = (Tree::from(r * r) - v.square()).max(0.).sqrt();
         let mut lo = ((u.clone() - half.clone()) / l).max(0.).min(1.);
         let mut hi = ((u.clone() + half.clone()) / l).max(0.).min(1.);
-        let lower;
-        let upper;
-        if self.shape == CutterShape::Ball {
+
+        let lower = if self.shape == CutterShape::Ball {
             // Constrain the minimizer to instants where the point is below the
             // finite flute top, then solve the spherical lower envelope.
             if d[2] > 1e-7 {
@@ -130,18 +129,18 @@ impl Cut {
             let t = (u.clone() / l - half * (d[2] / (l * (l * l + d[2] * d[2]).sqrt())))
                 .max(lo.clone())
                 .min(hi.clone());
-            lower = t.clone() * d[2] + r
+            t.clone() * d[2] + r
                 - (Tree::from(r * r) - (u - t * l).square() - v.square())
                     .max(0.)
-                    .sqrt();
+                    .sqrt()
         } else {
-            lower = if d[2] < 0. {
+            if d[2] < 0. {
                 hi.clone() * d[2]
             } else {
                 lo.clone() * d[2]
-            };
-        }
-        upper = if d[2] < 0. {
+            }
+        };
+        let upper = if d[2] < 0. {
             lo * d[2] + self.flute
         } else {
             hi * d[2] + self.flute

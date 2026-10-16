@@ -20,22 +20,20 @@ pub fn parameter_issues(setup: &Setup) -> Vec<String> {
     if relative(setup) {
         OFFSETS
             .iter()
-            .filter_map(|(key, label)| {
-                (!num(&setup.p, key).is_some_and(|v| v >= 0.)).then(|| {
-                    format!("{label} stock offset must be a finite number of 0 mm or more.")
-                })
+            .filter(|&(key, _label)| !num(&setup.p, key).is_some_and(|v| v >= 0.))
+            .map(|(_key, label)| {
+                format!("{label} stock offset must be a finite number of 0 mm or more.")
             })
             .collect()
     } else if get(&setup.p, "stock_type") == "Fixed size box" {
         ["stock_x", "stock_y", "stock_z"]
             .iter()
-            .filter_map(|key| {
-                (!num(&setup.p, key).is_some_and(|v| v > 0.)).then(|| {
-                    format!(
-                        "{} must be a finite number greater than zero.",
-                        key.replace('_', " ")
-                    )
-                })
+            .filter(|&key| !num(&setup.p, key).is_some_and(|v| v > 0.))
+            .map(|key| {
+                format!(
+                    "{} must be a finite number greater than zero.",
+                    key.replace('_', " ")
+                )
             })
             .collect()
     } else {
@@ -212,9 +210,9 @@ mod tests {
         for face in &mesh.faces {
             for point in &face.points {
                 let point = placed.transform(*point);
-                for axis in 0..3 {
-                    assert!(point[axis] >= displayed_stock.min[axis] - 0.001);
-                    assert!(point[axis] <= displayed_stock.max[axis] + 0.001);
+                for (axis, &v) in point.iter().enumerate() {
+                    assert!(v >= displayed_stock.min[axis] - 0.001);
+                    assert!(v <= displayed_stock.max[axis] + 0.001);
                 }
             }
         }

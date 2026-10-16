@@ -1381,24 +1381,24 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
                     let selection = o.surfaces.as_ref();
                     let count = selection.map_or(0, |s| s.ids.len());
                     c = c.push(muted(format!("{count} surface(s) selected")));
-                    if let (Some(selected), Some(mesh)) = (selection, &app.imported_mesh) {
-                        if selected.matches(mesh) {
-                            for &id in selected.ids.iter().take(64) {
-                                if let Some(surface) = mesh.surfaces.get(id) {
-                                    c = c.push(
-                                        btn(
-                                            format!(
-                                                "✓ Surface {} · {:.1} {}² · remove",
-                                                id + 1,
-                                                surface.area / mesh.display_scale().powi(2),
-                                                mesh.units
-                                            ),
-                                            Message::Surface(id),
-                                            true,
-                                        )
-                                        .width(Fill),
-                                    );
-                                }
+                    if let (Some(selected), Some(mesh)) = (selection, &app.imported_mesh)
+                        && selected.matches(mesh)
+                    {
+                        for &id in selected.ids.iter().take(64) {
+                            if let Some(surface) = mesh.surfaces.get(id) {
+                                c = c.push(
+                                    btn(
+                                        format!(
+                                            "✓ Surface {} · {:.1} {}² · remove",
+                                            id + 1,
+                                            surface.area / mesh.display_scale().powi(2),
+                                            mesh.units
+                                        ),
+                                        Message::Surface(id),
+                                        true,
+                                    )
+                                    .width(Fill),
+                                );
                             }
                         }
                     }

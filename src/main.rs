@@ -2941,10 +2941,9 @@ impl App {
                     && self.jog_key == Some((axis, negative))
                     && self.page == Page::Control
                     && !self.machine_setup
+                    && let Some(c) = &mut self.control
                 {
-                    if let Some(c) = &mut self.control {
-                        c.act(control::Action::JogPress(axis, negative));
-                    }
+                    c.act(control::Action::JogPress(axis, negative));
                 }
             }
             // Fields in layout order, such as the stock offsets, arriving with
@@ -2964,10 +2963,10 @@ impl App {
                 });
             }
             Message::JogKeyUp => {
-                if self.jog_key.take().is_some() {
-                    if let Some(c) = &mut self.control {
-                        c.act(control::Action::JogRelease);
-                    }
+                if self.jog_key.take().is_some()
+                    && let Some(c) = &mut self.control
+                {
+                    c.act(control::Action::JogRelease);
                 }
             }
             // Space holds a job or move from any page, and resumes from that
@@ -3586,29 +3585,31 @@ impl App {
                 if self.stock_mesh_job.as_ref() == Some(&key) {
                     self.stock_mesh_job = None;
                 }
-                if let Some(sim) = &mut self.simulation {
-                    if sim.id == key.0 && sim.stock_epoch == key.1 && self.stock_detail == key.3 {
-                        match result {
-                            Ok(surface) => {
-                                if self.smoke_dir.is_some() {
-                                    eprintln!(
-                                        "Stock surface: {} cuts, {} triangles, {:.3} mm, {} ms",
-                                        sim.volume.as_ref().map_or(0, |v| v.cuts.len()),
-                                        surface.triangles.len(),
-                                        surface.cell_mm,
-                                        surface.milliseconds
-                                    );
-                                }
-                                sim.stock_surface = Some(surface);
-                                sim.stock_surface_version = key.2;
-                                sim.stock_surface_detail = key.3;
-                                sim.stock_surface_seconds = seconds;
-                                sim.revision = sim.revision.wrapping_add(1);
+                if let Some(sim) = &mut self.simulation
+                    && sim.id == key.0
+                    && sim.stock_epoch == key.1
+                    && self.stock_detail == key.3
+                {
+                    match result {
+                        Ok(surface) => {
+                            if self.smoke_dir.is_some() {
+                                eprintln!(
+                                    "Stock surface: {} cuts, {} triangles, {:.3} mm, {} ms",
+                                    sim.volume.as_ref().map_or(0, |v| v.cuts.len()),
+                                    surface.triangles.len(),
+                                    surface.cell_mm,
+                                    surface.milliseconds
+                                );
                             }
-                            Err(e) => {
-                                self.status = e;
-                                self.stock_mesh_failed = Some(key);
-                            }
+                            sim.stock_surface = Some(surface);
+                            sim.stock_surface_version = key.2;
+                            sim.stock_surface_detail = key.3;
+                            sim.stock_surface_seconds = seconds;
+                            sim.revision = sim.revision.wrapping_add(1);
+                        }
+                        Err(e) => {
+                            self.status = e;
+                            self.stock_mesh_failed = Some(key);
                         }
                     }
                 }
