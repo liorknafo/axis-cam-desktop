@@ -216,7 +216,7 @@ pub enum Message {
     FileImported(Option<Result<(ModelFile, Option<mesh::Mesh>), String>>),
     ProjectOpened(Option<Opened>),
     ModelRestored(Result<mesh::Mesh, String>),
-    Saved(Option<Result<PathBuf, String>>),
+    Saved(Option<PathBuf>),
     Export(&'static str),
     ToggleStock,
     TogglePaths,
@@ -679,6 +679,8 @@ pub struct App {
     pub speed: f32,
     pub last_tick: Instant,
     pub dirty: bool,
+    /// Why the last automatic save of the workspace failed, until one succeeds.
+    pub save_error: Option<String>,
     pub last_edit: Instant,
     pub state_path: PathBuf,
     /// The machine controller, while connected.
@@ -1056,6 +1058,7 @@ impl App {
             speed: 1.,
             last_tick: Instant::now(),
             dirty: migrated,
+            save_error: None,
             last_edit: Instant::now(),
             state_path,
             project_path: None,
@@ -1557,9 +1560,14 @@ impl App {
         match storage::save(&self.state_path, &self.doc) {
             Ok(()) => {
                 self.dirty = false;
+                self.save_error = None;
             }
             Err(e) => {
-                self.status = format!("Could not save the workspace: {e}");
+                // The retry after each pause fails the same way; say it once.
+                if self.save_error.as_deref() != Some(e.as_str()) {
+                    self.status = format!("Could not save the workspace: {e}");
+                    self.save_error = Some(e);
+                }
                 self.last_edit = Instant::now();
             }
         }
@@ -3285,7 +3293,6 @@ impl App {
                     return Task::none();
                 }
                 self.save_busy = true;
-                let doc = self.doc.clone();
                 let filename = format!("{}.axis.json", sanitize_name(&self.doc.title));
                 return Task::perform(
                     async move {
@@ -3295,8 +3302,7 @@ impl App {
                             .add_filter("AXIS project", &["json"])
                             .save_file()
                             .await?;
-                        let p = file.path().to_path_buf();
-                        Some(storage::save(&p, &doc).map(|()| p))
+                        Some(file.path().to_path_buf())
                     },
                     Message::Saved,
                 );
@@ -3455,15 +3461,18 @@ impl App {
             Message::ProjectOpened(None) => {
                 self.import_busy = false;
             }
-            Message::Saved(Some(Ok(p))) => {
+            Message::Saved(Some(p)) => {
                 self.save_busy = false;
-                self.status = format!("Saved {}", p.display());
-                self.project_path = Some(p);
-                self.project_dirty = false;
-            }
-            Message::Saved(Some(Err(e))) => {
-                self.save_busy = false;
-                self.status = format!("Save failed: {e}");
+                // The document as it is now: edits made while the dialog was
+                // open are in the file.
+                match storage::save(&p, &self.doc) {
+                    Ok(()) => {
+                        self.status = format!("Saved {}", p.display());
+                        self.project_path = Some(p);
+                        self.project_dirty = false;
+                    }
+                    Err(e) => self.status = format!("Save failed: {e}"),
+                }
             }
             Message::Saved(None) => {
                 self.save_busy = false;

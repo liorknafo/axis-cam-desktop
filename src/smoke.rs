@@ -8203,6 +8203,79 @@ flood = { pin = 8 }
     fn fresh_app(dir: &tempfile::TempDir) -> App {
         App::from_workspace(dir.path().join("workspace.json"), None)
     }
+    #[test]
+    fn an_edit_made_while_the_save_dialog_is_open_is_in_the_saved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.replace_document(Document::sample(), None);
+        let _ = a.update(Message::SaveProject);
+        assert!(a.save_busy);
+        // The dialog does not block the window: the job changes meanwhile.
+        a.doc.title = "Edited while the dialog was open".into();
+        a.project_dirty = true;
+        let file = dir.path().join("job.axis.json");
+        let _ = a.update(Message::Saved(Some(file.clone())));
+        assert!(!a.save_busy && !a.project_dirty);
+        assert_eq!(a.project_path.as_deref(), Some(file.as_path()));
+        assert_eq!(a.status, format!("Saved {}", file.display()));
+        let saved = crate::storage::load(&file).unwrap();
+        assert_eq!(saved.title, "Edited while the dialog was open");
+        // A path that cannot be written is reported, and the job stays unsaved.
+        a.project_dirty = true;
+        a.project_path = None;
+        let _ = a.update(Message::SaveProject);
+        let blocked = file.join("job.axis.json");
+        let _ = a.update(Message::Saved(Some(blocked)));
+        assert!(!a.save_busy && a.project_dirty && a.project_path.is_none());
+        assert!(a.status.starts_with("Save failed: "), "{}", a.status);
+        // Cancelling the dialog changes nothing.
+        let _ = a.update(Message::SaveProject);
+        let _ = a.update(Message::Saved(None));
+        assert!(!a.save_busy && a.project_dirty);
+    }
+    #[test]
+    fn a_failing_workspace_save_is_said_once_and_shown_in_the_header_until_it_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let good = a.state_path.clone();
+        // A file where the directory should be: the write cannot succeed.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file").unwrap();
+        a.state_path = blocker.join("workspace.json");
+        a.dirty = true;
+        a.persist();
+        assert!(a.dirty);
+        let error = a.save_error.clone().expect("the failure is kept");
+        assert_eq!(a.status, format!("Could not save the workspace: {error}"));
+        // Another message is not replaced by the retry with the same error.
+        a.status = "Preview ready.".into();
+        a.persist();
+        a.persist();
+        assert_eq!(a.status, "Preview ready.");
+        assert_eq!(a.save_error.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            crate::ui::workspace_note(&a),
+            format!("Workspace not saved: {error}")
+        );
+        let _ = a.view();
+        // A different error is a new thing to say.
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        a.state_path = blocker.clone();
+        a.persist();
+        let second = a.save_error.clone().unwrap();
+        assert_ne!(second, error);
+        assert_eq!(a.status, format!("Could not save the workspace: {second}"));
+        // A save that works clears it.
+        a.state_path = good.clone();
+        a.persist();
+        assert!(!a.dirty && a.save_error.is_none());
+        assert!(good.exists());
+        assert_eq!(crate::ui::workspace_note(&a), "Workspace saved locally");
+        a.dirty = true;
+        assert_eq!(crate::ui::workspace_note(&a), "Saving workspace…");
+        let _ = a.view();
+    }
     /// Plays a whole sign-in: the browser result, then the save step's result.
     /// The save step writes the session before it reports, and unit tests do
     /// not run tasks, so the write happens here.

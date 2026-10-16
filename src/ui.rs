@@ -307,6 +307,14 @@ fn icon<'a>(app: &App, s: Strategy, size: f32) -> widget::Svg<'a> {
     svg(app.icons[s.index()].clone()).width(size).height(size)
 }
 
+/// The header's line on the automatic save of the workspace.
+pub fn workspace_note(app: &App) -> String {
+    match (&app.save_error, app.dirty) {
+        (Some(e), _) => format!("Workspace not saved: {e}"),
+        (None, true) => "Saving workspace…".into(),
+        (None, false) => "Workspace saved locally".into(),
+    }
+}
 pub fn view(app: &App) -> Element<'_, Message> {
     if app.smoke_dir.is_some() && (13..=14).contains(&app.smoke_step) {
         return help::gallery(u8::from(app.smoke_step == 14));
@@ -371,13 +379,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let brand = brand
         .push(space().width(Fill))
         .push(
-            text(if app.dirty {
-                "Saving workspace…"
-            } else {
-                "Workspace saved locally"
-            })
-            .size(11)
-            .color(Color::from_rgb8(183, 204, 222)),
+            text(workspace_note(app))
+                .size(11)
+                .color(Color::from_rgb8(183, 204, 222)),
         )
         .push(space().width(10))
         .push(
