@@ -293,7 +293,11 @@ impl Machine {
         {
             e.push("Choose the machine's UC100 profile file.".into())
         }
-        e.extend(crate::control::pins_settings(&self.p).err().unwrap_or_default());
+        e.extend(
+            crate::control::pins_settings(&self.p)
+                .err()
+                .unwrap_or_default(),
+        );
         e
     }
     pub fn fill_post_defaults(&mut self) {

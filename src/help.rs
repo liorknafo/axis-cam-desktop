@@ -930,6 +930,20 @@ pub fn command(m: &Message, label: String) -> Help {
             &crate::model::Fields::new(),
         );
     }
+    // A drill's Holes: found in the part, or a later setup's pin holes.
+    if let Edit(Target::Operation, "hole_source", id) = m {
+        return if id.is_empty() {
+            Help::text(
+                label,
+                "Drill the holes found in the part: circular openings found along setup Z, narrowed by the hole diameter filter.",
+            )
+        } else {
+            Help::text(
+                label,
+                "Drill the holes the later setup's fixture pins go into, not holes found in the part: each pin where that setup puts it, carried back into this setup's frame, its full diameter for the pin's height and 1 mm from the face the later setup sits on, or through the stock with Drill tip through bottom. The drill must be the pins' diameter to 0.2 mm over, so that the part is located by them. Drill them in the waste or in the part; the later setup's work zero check then finds them.",
+            )
+        };
+    }
     if let StockDetail(detail) = m {
         return crate::choice_help::selected(
             "stock_detail",
@@ -2052,6 +2066,26 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "probe_plate") => (
             "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Leave it empty without a plate.",
             "",
+            None,
+        ),
+        (_, "pins") => (
+            "The fixture plate's dowel pins, as drilled, in the plate's own X Y (mm), pin 1 first: \"0 0; 120 0\" for two pins 120 mm apart along X. Pin 1 is the reference pin, pin 2 gives the turn. Leave it empty without pins.",
+            "The plate is taken as square to the machine's X and Y: Record the pins' place on the Control page measures how far off it is. A setup that sits on the pins gets its X and Y work offset from pin 1's recorded place.",
+            None,
+        ),
+        (_, "pin_diameter") => (
+            "The pins' diameter, in mm: measure it. The holes a part drops over them by must be this to 0.2 mm over: a wider hole leaves the part free to move. The checks keep tools clear of a pin-sized box per pin.",
+            "",
+            None,
+        ),
+        (_, "pin_height") => (
+            "How far the pins stand above the plate, in mm: measure it. Pin holes are drilled this and 1 mm deep at full diameter, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
+            "",
+            None,
+        ),
+        (_, "pin1_x" | "pin1_y") => (
+            "Where pin 1 stands in this setup's work coordinates, in mm: the spot of the part whose hole drops over pin 1. With pin 1's recorded machine place it gives the work offset exactly: X/Y offset = pin 1's machine place − this.",
+            "For holes drilled by an earlier setup with Holes set to Pin holes for this setup, it is where those holes are put; for holes made off the machine, read it off the part's drawing from this setup's work zero.",
             None,
         ),
         (_, "probe_tip") => (

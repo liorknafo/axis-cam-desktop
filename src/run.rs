@@ -707,7 +707,6 @@ pub fn busy(state: Option<&State>) -> bool {
     )
 }
 
-
 /// Why a setup that sits on the pins (`Checked::pins`) cannot start on
 /// `c` yet: the connected machine's pins are not the setup's, their place
 /// is not recorded, X and Y are not referenced from pin 1 since the last
@@ -726,13 +725,17 @@ fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec
         }
     };
     let mut e = vec![];
-    if !(crate::control::pins_settings(&setup.machine.p).ok().flatten())
-        .is_some_and(|own| own.same_pins(pins))
+    if !(crate::control::pins_settings(&setup.machine.p)
+        .ok()
+        .flatten())
+    .is_some_and(|own| own.same_pins(pins))
     {
         e.push("This setup's snapshot of the machine has other fixture pins than the Machine library: use Assign to current setup there, then check the setup again.".into());
     }
     let Some(at) = pins.reference else {
-        e.push("The pins' place is not recorded: Record the pins' place under Position first.".into());
+        e.push(
+            "The pins' place is not recorded: Record the pins' place under Position first.".into(),
+        );
         return e;
     };
     if !c.pin_referenced {
@@ -783,6 +786,7 @@ mod tests {
             probe: Ok([crate::post::At::Mid; 2]),
             probe_from: vec![],
             holds: vec![],
+            pins: None,
         }
     }
 

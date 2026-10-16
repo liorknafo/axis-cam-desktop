@@ -2740,6 +2740,431 @@ flood = { pin = 8 }
         tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
     }
 
+    /// `post::fixture::pinned_flip("rx", true)` on a simulated FAST machine
+    /// with a probe input and the setups' fixture pins (Ø4, 6 mm tall, 80 mm
+    /// apart along X): setup 1 drills the pin holes, setup 2 ("Flipped", G55)
+    /// sits on the pins flipped about X with pin 1 at X-40 Y-25, so that the
+    /// part on the simulator's pins is on the table. A Ø2 probe tip and a
+    /// touch plate of no thickness.
+    fn pins_app(dir: &std::path::Path) -> App {
+        let mut a = profile_app(dir, &probe_profile());
+        let mut m = a.doc.machines.pop().unwrap();
+        for (k, v) in [
+            ("x", "390"),
+            ("y", "280"),
+            ("z", "80"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+            ("pins", "0 0; 80 0"),
+            ("pin_diameter", "4"),
+            ("pin_height", "6"),
+            ("probe_tip", "2"),
+            ("probe_plate", "0"),
+            ("probe_feed", "1000"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        let (mut doc, mesh) = crate::post::fixture::pinned_flip("rx", true);
+        for s in &mut doc.setups {
+            s.machine = m.clone();
+        }
+        doc.machines = vec![m];
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Control;
+        a
+    }
+
+    /// Ticks until Record the pins' place or Reference X Y from pin 1 has
+    /// ended and declared what it does; how it ended.
+    fn pinned(a: &mut App) -> (bool, String) {
+        use uc100::controller::State;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let _ = a.update(Message::Tick);
+            let _ = a.view();
+            let c = conn(a);
+            if c.pinning().is_none()
+                && c.snapshot.state == Some(State::Idle)
+                && let Some(said) = c.pin_said.clone()
+                && (said.0 || !c.pin_referenced)
+            {
+                // A Reference is said once X and Y are declared from the pin.
+                if !said.1.starts_with("X and Y referenced") || c.pin_referenced {
+                    return said;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for the pins: {:?} at {:?} {:?}",
+                c.snapshot.state,
+                c.snapshot.machine_pos,
+                c.snapshot.log.iter().rev().take(5).collect::<Vec<_>>()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Sets machine zero where the machine is, pressed again while an axis
+    /// stays unset (the driver can drop a declaration, LIO-163).
+    fn machine_zero(a: &mut App) {
+        use crate::control::Action;
+        let set = |a: &App| conn(a).snapshot.referenced[..3].iter().all(|r| *r);
+        for _ in 0..5 {
+            let _ = a.update(Message::Machine(Action::MachineZero(None)));
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !set(a) && std::time::Instant::now() < end {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if set(a) {
+                break;
+            }
+        }
+        assert!(set(a), "{:?}", conn(a).snapshot.log);
+    }
+
+    /// The fixture pins on the simulated UC100, end to end: the pins' place
+    /// is recorded; after an E-stop and a machine zero 1.3 mm and 0.7 mm off,
+    /// Cycle Start waits until Reference X Y from pin 1 declares X and Y back
+    /// by exactly that; the flipped setup on the pins then gets X and Y from
+    /// them, Z from Probe Z, and every pin of it lands where the pins stand.
+    #[test]
+    fn a_flipped_setup_on_the_pins_runs_with_x_y_from_them_after_an_e_stop() {
+        use crate::control::Action;
+        use crate::ui::work_zero_steps;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = pins_app(dir.path());
+        idle(&mut a);
+        machine_zero(&mut a);
+        // The simulator's pins stand in front of its block, 6 mm tall on
+        // the bottom of Z.
+        let pin1 = conn(&a).sim_pin1().expect("simulated pins");
+        assert_eq!(pin1, [155., 45.]);
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-71", pin1[0] + 0.4, pin1[1] - 0.3),
+        );
+        assert_eq!(conn(&a).record_blocked(), None);
+        let _ = a.update(Message::Machine(Action::RecordPins));
+        let (ok, said) = pinned(&mut a);
+        assert!(ok, "{said}");
+        assert!(said.contains("over 80.0 mm"), "{said}");
+        // The app keeps pin 1's place in the machine's profile.
+        let _ = a.update(Message::Tick);
+        let kept = ["pin_ref_x", "pin_ref_y"]
+            .map(|k| get(&a.doc.machines[0].p, k).parse::<f64>().unwrap());
+        assert!((0..2).all(|k| (kept[k] - pin1[k]).abs() < 0.06), "{kept:?}");
+
+        // Off to near the ends, E-stop, and a machine zero 1.3 mm and 0.7 mm
+        // from where the first one was.
+        mdi(&mut a, "G53 G0 Z0");
+        mdi(&mut a, "G53 G0 X1.3 Y0.7");
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        machine_zero(&mut a);
+        assert!(!conn(&a).pin_referenced);
+        let off = conn(&a).sim_pin1().unwrap();
+        assert!(
+            (off[0] - (pin1[0] - 1.3)).abs() < 0.06 && (off[1] - (pin1[1] - 0.7)).abs() < 0.06,
+            "{off:?}"
+        );
+        check_run(&mut a, 1);
+        let _ = a.view();
+        let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
+        assert!(
+            steps(&a).contains("Reference X Y from pin 1 under Position"),
+            "{}",
+            steps(&a)
+        );
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.starts_with("X and Y are not referenced from pin 1")),
+            "{:?}",
+            problems(&a)
+        );
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{}", off[0] + 0.5, off[1] + 0.4),
+        );
+        mdi(&mut a, "G53 G0 Z-71");
+        let _ = a.update(Message::Machine(Action::ReferencePins));
+        let (ok, said) = pinned(&mut a);
+        assert!(ok, "{said}");
+        assert!(
+            said.contains("declared moved by +1.30") && said.contains("and +0.70"),
+            "{said}"
+        );
+        assert!(conn(&a).pin_referenced);
+        let back = conn(&a).sim_pin1().unwrap();
+        assert!(
+            (0..2).all(|k| (back[k] - kept[k]).abs() < 0.06),
+            "{back:?} {kept:?}"
+        );
+
+        // G55, X Y from the pins: the offset is pin 1's place less X-40 Y-25.
+        // Pressed again while the driver re-anchors after the declarations.
+        for _ in 0..10 {
+            if conn(&a).snapshot.active_wcs == 1 {
+                break;
+            }
+            let _ = a.update(Message::Machine(Action::Wcs(1)));
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while conn(&a).snapshot.active_wcs != 1 && std::time::Instant::now() < end {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            conn(&a).snapshot.active_wcs,
+            1,
+            "{:?}",
+            conn(&a).snapshot.log
+        );
+        let want = conn(&a).pin_offset().unwrap();
+        assert!(
+            (want[0] - (kept[0] + 40.)).abs() < 1e-9 && (want[1] - (kept[1] + 25.)).abs() < 1e-9
+        );
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("press Set X Y from the pins")),
+            "{:?}",
+            problems(&a)
+        );
+        // Pressed again should the driver still be taking the MDI line.
+        let set = |a: &App| {
+            let s = &conn(a).snapshot;
+            (0..2).all(|k| (s.work_offset[k] - want[k]).abs() < 1e-3)
+        };
+        for _ in 0..10 {
+            if set(&a) {
+                break;
+            }
+            let _ = a.update(Message::Machine(Action::PinZero));
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while !set(&a) && std::time::Instant::now() < end {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(set(&a), "{:?}", conn(&a).snapshot.work_offset);
+        let _ = a.view();
+        assert!(
+            steps(&a).contains("3. X and Y are set from the pins"),
+            "{}",
+            steps(&a)
+        );
+        // Z: the part is on the pins now; the touch plate on the stock top.
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        let at = conn(&a).sim_touch().unwrap();
+        tick_until(&mut a, 10.0, "the move onto the block", |s| {
+            s.state == Some(State::Idle) && (0..3).all(|k| (s.machine_pos[k] - at[k]).abs() < 0.06)
+        });
+        mdi(&mut a, &format!("G53 G0 Z{}", at[2] + 5.));
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, said) = probed(&mut a);
+        assert!(ok, "{said}");
+        // Work Z on the stock top, at machine Z -40.
+        tick_until(&mut a, 5.0, "work Z and the retract", |s| {
+            (s.work_offset[2] - -40.).abs() < 0.06 && s.state == Some(State::Idle)
+        });
+        let offset = conn(&a).snapshot.work_offset;
+        assert!(
+            (0..2).all(|k| (offset[k] - want[k]).abs() < 1e-3),
+            "Probe Z kept X Y: {offset:?}"
+        );
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Every pin of the setup, in its work coordinates, lands on the
+        // machine where the simulator's pins stand.
+        let p = conn(&a).run_program().unwrap().clone();
+        let on = p.pins.clone().unwrap();
+        for (i, c) in on.places.iter().enumerate() {
+            let machine: Vec<f64> = (0..2)
+                .map(|k| (c[k] - p.datum[k]) as f64 + offset[k])
+                .collect();
+            let stands = [back[0] + 80. * i as f64, back[1]];
+            assert!(
+                (0..2).all(|k| (machine[k] - stands[k]).abs() < 0.06),
+                "pin {}: {machine:?} {stands:?}",
+                i + 1
+            );
+        }
+        let _ = a.update(Message::Run(crate::run::Action::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+    }
+
+    /// Draws `a`'s whole window, `size` px, headless (tiny-skia) to `path`.
+    fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
+        use futures_util::FutureExt;
+        use iced::advanced::renderer::{self, Headless};
+        let mut renderer = <iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(16.),
+            Some("tiny-skia"),
+        )
+        .now_or_never()
+        .flatten()
+        .expect("tiny-skia renderer");
+        let mut ui = iced_runtime::UserInterface::build(
+            a.view(),
+            size,
+            iced_runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        ui.draw(
+            &mut renderer,
+            &iced::Theme::Light,
+            &renderer::Style {
+                text_color: iced::Color::BLACK,
+            },
+            iced::mouse::Cursor::Unavailable,
+        );
+        let physical = iced::Size::new(size.width as u32, size.height as u32);
+        let rgba = renderer.screenshot(physical, 1., iced::Color::WHITE);
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(std::fs::File::create(path).unwrap()),
+            physical.width,
+            physical.height,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&rgba)
+            .unwrap();
+        eprintln!("Rendered {}", path.display());
+    }
+
+    /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
+    /// setup's Work zero step with the pins in the 3D view, the drill's pin
+    /// holes, and the Control page's Run steps before and after X Y from the
+    /// pins. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_fixture_pins() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/fp-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1600., 1000.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = pins_app(dir.path());
+        // The Machine library's UC100 step.
+        a.page = Page::Machines;
+        let id = a.doc.machines[0].id.clone();
+        let _ = a.update(Message::EditMachine(id));
+        let _ = a.update(Message::WizardStep(3));
+        render_png(
+            &a,
+            iced::Size::new(1600., 2600.),
+            &out.join("1-machine-pins.png"),
+        );
+        // The flipped setup's Work zero step, the stock setup 1 leaves.
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupStep("Work zero"));
+        // Worked out in line, as in the smoke run.
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.refresh_left_stock();
+        a.smoke_dir = None;
+        let key = a.holding_key().unwrap();
+        a.ready = crate::run::ready(&a.doc, a.part_mesh().unwrap(), 1, key);
+        let _ = a.view();
+        let tall = iced::Size::new(1600., 1700.);
+        render_png(&a, tall, &out.join("2-work-zero-step.png"));
+        // Setup 1's drill of the pin holes.
+        let _ = a.update(Message::SelectSetup(0));
+        let drill = a.doc.setups[0].operations.len() - 1;
+        let _ = a.update(Message::SelectOp(drill));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-drill-pin-holes.png"));
+        let _ = a.update(Message::SelectSetup(1));
+        // Control: pins recorded, then an E-stop: the Run steps for the
+        // flipped setup on the pins.
+        a.page = Page::Control;
+        idle(&mut a);
+        machine_zero(&mut a);
+        let pin1 = conn(&a).sim_pin1().unwrap();
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-71", pin1[0] + 0.4, pin1[1] - 0.3),
+        );
+        let _ = a.update(Message::Machine(Action::RecordPins));
+        assert!(pinned(&mut a).0);
+        let _ = a.update(Message::Tick);
+        mdi(&mut a, "G53 G0 Z0");
+        mdi(&mut a, "G53 G0 X1.3 Y0.7");
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        machine_zero(&mut a);
+        check_run(&mut a, 1);
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-run-steps-after-e-stop.png"));
+        let at = conn(&a).sim_pin1().unwrap();
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-71", at[0] + 0.5, at[1] + 0.4),
+        );
+        let _ = a.update(Message::Machine(Action::ReferencePins));
+        let (ok, said) = pinned(&mut a);
+        assert!(ok, "{said}");
+        for _ in 0..10 {
+            if conn(&a).snapshot.active_wcs == 1 {
+                break;
+            }
+            let _ = a.update(Message::Machine(Action::Wcs(1)));
+            for _ in 0..25 {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let _ = a.view();
+        render_png(&a, size, &out.join("5-run-steps-referenced.png"));
+        let want = conn(&a).pin_offset().unwrap();
+        for _ in 0..10 {
+            if (0..2).all(|k| (conn(&a).snapshot.work_offset[k] - want[k]).abs() < 1e-3) {
+                break;
+            }
+            let _ = a.update(Message::Machine(Action::PinZero));
+            for _ in 0..25 {
+                let _ = a.update(Message::Tick);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        let touch = conn(&a).sim_touch().unwrap();
+        tick_until(&mut a, 10.0, "onto the block", |s| {
+            s.state == Some(State::Idle)
+                && (0..3).all(|k| (s.machine_pos[k] - touch[k]).abs() < 0.06)
+        });
+        let _ = a.update(Message::Machine(Action::TouchOff));
+        for _ in 0..25 {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.view();
+        render_png(&a, size, &out.join("6-run-steps-ready.png"));
+        let _ = a.update(Message::MachineEStop);
+    }
+
     /// FAST with a probe input. Its simulated block (`control::sim_block`)
     /// is X 145…245, Y 90…190, its top at machine Z -40.
     fn probe_profile() -> String {

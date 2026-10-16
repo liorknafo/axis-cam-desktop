@@ -207,7 +207,7 @@ pub struct Pins {
 
 impl Pins {
     /// Where pin `i` stands from pin 1.
-    pub fn from_first(&self, i: usize) -> [f64; 2] {
+    pub fn offset(&self, i: usize) -> [f64; 2] {
         [self.at[i][0] - self.at[0][0], self.at[i][1] - self.at[0][1]]
     }
 
@@ -237,11 +237,16 @@ pub fn pins_settings(p: &Fields) -> Result<Option<Pins>, Vec<String>> {
         })
         .collect();
     let at = at.unwrap_or_else(|| {
-        e.push("Fixture pins must be X Y pairs separated by semicolons, such as \"0 0; 100 0\".".into());
+        e.push(
+            "Fixture pins must be X Y pairs separated by semicolons, such as \"0 0; 100 0\"."
+                .into(),
+        );
         vec![]
     });
     if !at.is_empty() && at.len() < 2 {
-        e.push("Fixture pins need at least two pins: one places the part, the second its turn.".into());
+        e.push(
+            "Fixture pins need at least two pins: one places the part, the second its turn.".into(),
+        );
     }
     let mut value = |key, what: &str, lo: f64, hi: f64| {
         let text = get(p, key).trim();
@@ -273,13 +278,15 @@ pub fn pins_settings(p: &Fields) -> Result<Option<Pins>, Vec<String>> {
     }
     let reference = match ["pin_ref_x", "pin_ref_y"].map(|k| get(p, k).trim()) {
         ["", ""] => None,
-        [x, y] => match (x.parse::<f64>(), y.parse::<f64>()) {
-            (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Some([x, y]),
-            _ => {
-                e.push("The pins' recorded place does not read: record it again on the Control page.".into());
-                None
+        [x, y] => {
+            match (x.parse::<f64>(), y.parse::<f64>()) {
+                (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Some([x, y]),
+                _ => {
+                    e.push("The pins' recorded place does not read: record it again on the Control page.".into());
+                    None
+                }
             }
-        },
+        }
     };
     if e.is_empty() {
         Ok(Some(Pins {
@@ -867,6 +874,9 @@ struct Routine {
     reach: f64,
     /// How far below a boss's top its sides are probed.
     depth: f64,
+    /// The moves back over the feature (`last`) are made as legs: the
+    /// routine ends once they are, for a purpose that acts from there.
+    backed: bool,
     /// Where each touch was made, as the driver reports it.
     touches: Vec<Vec6>,
     legs: VecDeque<Leg>,
@@ -885,6 +895,7 @@ impl Routine {
             distance: probe.distance,
             reach: probe.distance,
             depth: BOSS_DEPTH,
+            backed: false,
             touches: vec![],
             legs: VecDeque::new(),
             sent: None,
@@ -999,8 +1010,9 @@ impl Routine {
             }
             (Feature::Boss, 0) => vec![Touch(Self::by(s, 2, -d))],
             // Up off the top or out from the side before, over beside the
-            // next side, down, and in toward the middle: it touches before
-            // reaching it.
+            // next side, down (a probe move: a boss wider than expected, or
+            // anything beside it, stops it), and in toward the middle: it
+            // touches before reaching it.
             (Feature::Boss, 1..=4) => {
                 let mut legs = if n == 1 {
                     vec![Rapid(s)]
@@ -1008,7 +1020,7 @@ impl Routine {
                     self.boss_out(n - 1).map(Rapid).to_vec()
                 };
                 let [low, high] = self.boss_out(n);
-                legs.extend([Rapid(high), Rapid(low), Touch(self.boss_mid(n))]);
+                legs.extend([Rapid(high), Guard(low), Touch(self.boss_mid(n))]);
                 legs
             }
             _ => return None,
@@ -1124,13 +1136,17 @@ impl Routine {
 /// `first` and `second`: whether pin 2 is within 0.05 mm of the line the
 /// plate puts it on, and what is said of it.
 pub fn squareness(pins: &Pins, first: [f64; 2], second: [f64; 2]) -> (bool, String) {
-    let d = pins.from_first(1);
+    let d = pins.offset(1);
     let length = d[0].hypot(d[1]);
     let u = [d[0] / length, d[1] / length];
     let f = [second[0] - first[0], second[1] - first[1]];
     let off = u[0] * f[1] - u[1] * f[0];
     let along = u[0] * f[0] + u[1] * f[1] - length;
-    let across = if u[0].abs() >= u[1].abs() { "in Y" } else { "in X" };
+    let across = if u[0].abs() >= u[1].abs() {
+        "in Y"
+    } else {
+        "in X"
+    };
     let said = format!(
         "Pin 2 is {:.3} mm off the line {across} over {length:.1} mm (the plate is turned {:.3}° to the machine) and {:+.3} mm along it.",
         off.abs(),
@@ -1150,17 +1166,26 @@ pub fn squareness(pins: &Pins, first: [f64; 2], second: [f64; 2]) -> (bool, Stri
 }
 
 /// Where the simulator's pin 1 stands before its place is recorded: the
-/// pins centred on the middle of the table.
+/// pins centred between the front of the table and the default block
+/// (`sim_block`), or between its left end and the block when they spread
+/// further along Y, so that the block is not over them.
 fn sim_pins(cfg: &MachineConfig, pins: &Pins) -> [f64; 2] {
-    let mid = |a: usize| {
-        let x = cfg.axes.get(a);
-        (x.and_then(|x| x.soft_min).unwrap_or(0.) + x.and_then(|x| x.soft_max).unwrap_or(0.)) / 2.
+    let Some((lo, hi)) = sim_block(cfg, None) else {
+        return [0., 0.];
     };
-    let span = |a: usize| {
-        let v = (0..pins.at.len()).map(|i| pins.from_first(i)[a]);
-        (v.clone().fold(f64::INFINITY, f64::min) + v.fold(f64::NEG_INFINITY, f64::max)) / 2.
+    let ends = |a: usize| {
+        let v = (0..pins.at.len()).map(|i| pins.offset(i)[a]);
+        (
+            v.clone().fold(f64::INFINITY, f64::min),
+            v.fold(f64::NEG_INFINITY, f64::max),
+        )
     };
-    [mid(0) - span(0), mid(1) - span(1)]
+    let spread = |a: usize| ends(a).1 - ends(a).0;
+    let mut c = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.];
+    let k = usize::from(spread(0) >= spread(1));
+    let end = cfg.axes.get(k).and_then(|x| x.soft_min).unwrap_or(lo[k]);
+    c[k] = (end + lo[k]) / 2.;
+    [0, 1].map(|a| c[a] - (ends(a).0 + ends(a).1) / 2.)
 }
 
 /// Rapid moves through `points` from `at`, leaving out any that go nowhere.
@@ -1401,9 +1426,6 @@ pub struct Connection {
     /// Reference X Y from pin 1 waits for X and Y to be declared where they
     /// are before it probes.
     pin_start: bool,
-    /// Once the probe is back over pin 1: declare X and Y moved by this, and
-    /// say this.
-    pin_declare: Option<([f64; 2], String)>,
     /// The pin 1 declarations are in `declare`: once sent, X and Y are
     /// referenced from it and this is said.
     referencing: Option<String>,
@@ -1450,7 +1472,9 @@ impl Connection {
         let block = sim_block(&cfg, None).filter(|_| simulated);
         let pins = pins_settings(&m.p);
         let sim_pins = match (&pins, block) {
-            (Ok(Some(pins)), Some(_)) => Some(pins.reference.unwrap_or_else(|| sim_pins(&cfg, pins))),
+            (Ok(Some(pins)), Some(_)) => {
+                Some(pins.reference.unwrap_or_else(|| sim_pins(&cfg, pins)))
+            }
             _ => None,
         };
         let mut c = Self {
@@ -1490,7 +1514,6 @@ impl Connection {
             recorded: None,
             pin_said: None,
             pin_start: false,
-            pin_declare: None,
             referencing: None,
             sim_pins,
             sim_sent: vec![],
@@ -1499,19 +1522,28 @@ impl Connection {
         Ok(c)
     }
 
-    /// Simulated: the blocks the probe touches. The stock's block, unless a
-    /// pin is being probed (the part is off the pins then), and a block of
-    /// each pin's size from the bottom of Z, pin 1 at `sim_pins`.
+    /// Simulated: the blocks the probe touches. The stock's block, unless
+    /// the part is off the pins: while a pin is probed, and for a setup that
+    /// sits on them until X and Y are referenced from pin 1 (it is put on
+    /// them after); and a block of each pin's size from the bottom of Z, pin
+    /// 1 at `sim_pins`.
     fn sim_world(&self) -> Vec<Block> {
         let mut out = vec![];
-        let pin_probe = self.routine.as_ref().is_some_and(|r| r.purpose != Purpose::Work);
-        if let Some((min, max)) = self.block.filter(|_| !pin_probe) {
+        let pin_probe = self
+            .routine
+            .as_ref()
+            .is_some_and(|r| r.purpose != Purpose::Work);
+        let on_pins = (self.run.as_ref())
+            .and_then(|r| r.checked()?.first())
+            .is_some_and(|p| p.pins.is_some());
+        let off = pin_probe || (on_pins && !self.pin_referenced);
+        if let Some((min, max)) = self.block.filter(|_| !off) {
             out.push(Block { min, max });
         }
         if let (Some(at), Ok(Some(pins)), Some((lo, _))) = (self.sim_pins, &self.pins, self.block) {
             let r = pins.diameter / 2.;
             for i in 0..pins.at.len() {
-                let d = pins.from_first(i);
+                let d = pins.offset(i);
                 let c = [at[0] + d[0], at[1] + d[1]];
                 out.push(Block {
                     min: [c[0] - r, c[1] - r, lo[2]],
@@ -1520,6 +1552,11 @@ impl Connection {
             }
         }
         out
+    }
+
+    /// Simulated: pin 1's machine X Y, where the simulator's pins stand.
+    pub fn sim_pin1(&self) -> Option<[f64; 2]> {
+        self.sim_pins.filter(|_| self.simulated)
     }
 
     /// Simulated: sends the blocks when they changed since last sent.
@@ -1663,13 +1700,6 @@ impl Connection {
         }
         self.edges_step();
         self.routine_step();
-        if self.idle()
-            && let Some((by, said)) = self.pin_declare.take()
-        {
-            let at = self.snapshot.machine_pos;
-            self.declare.extend([(0, at[0] + by[0]), (1, at[1] + by[1])]);
-            self.referencing = Some(said);
-        }
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
@@ -1691,17 +1721,24 @@ impl Connection {
             }
         } else {
             self.declare.clear();
-            if self.referencing.take().is_some() || self.pin_declare.take().is_some() {
+            if self.referencing.take().is_some() {
                 self.pin_said = Some((
                     false,
                     "The machine stopped before X and Y were declared from pin 1: reference them again.".into(),
                 ));
             }
         }
-        // Reference X Y from pin 1 probes once X and Y have a position.
-        if self.pin_start && self.declare.is_empty() && self.idle() {
-            self.pin_start = false;
-            if (0..2).all(|a| self.snapshot.referenced[a]) {
+        // Reference X Y from pin 1 probes once X and Y have a position: the
+        // driver reports it a loop or two after the declarations.
+        if self.pin_start && self.declare.is_empty() {
+            if !self.idle() {
+                self.pin_start = false;
+                self.pin_said = Some((
+                    false,
+                    "The machine stopped before X and Y were declared where they show: reference them again.".into(),
+                ));
+            } else if (0..2).all(|a| self.snapshot.referenced[a]) {
+                self.pin_start = false;
                 self.start_pins(Purpose::Reference);
             }
         }
@@ -1892,7 +1929,12 @@ impl Connection {
             // like the probes, they wait while its check is out of date (#39).
             Action::TouchOff if self.manual() && self.run_program().is_ok() => {
                 if let Some((_, work)) = self.touch_off() {
+                    // On the pins, the pins set X and Y: the touch-off is Z's.
+                    let pins = self.run_program().is_ok_and(|p| p.pins.is_some());
                     for (a, value) in work.into_iter().enumerate() {
+                        if pins && a < 2 {
+                            continue;
+                        }
                         self.send(Command::SetWork { axis: a, value });
                     }
                     if let Some(run) = &mut self.run {
@@ -2302,7 +2344,12 @@ impl Connection {
         let (Ok(pins), Ok(probe)) = (self.pins_set(), self.probe.clone()) else {
             return;
         };
-        self.routine = Some(Routine::pin(pins, &probe, self.snapshot.machine_pos, purpose));
+        self.routine = Some(Routine::pin(
+            pins,
+            &probe,
+            self.snapshot.machine_pos,
+            purpose,
+        ));
         self.pin_said = None;
         self.send_sim_blocks();
         self.routine_step();
@@ -2318,7 +2365,10 @@ impl Connection {
         };
         let pins = self.pins_set()?;
         let Some(at) = pins.reference else {
-            return Err("The pins' place is not recorded yet: Record the pins' place under Position.".into());
+            return Err(
+                "The pins' place is not recorded yet: Record the pins' place under Position."
+                    .into(),
+            );
         };
         Ok([0, 1].map(|a| at[a] - on.pin1[a] as f64))
     }
@@ -2364,10 +2414,15 @@ impl Connection {
             let failed = match (leg, tripped) {
                 _ if !ok => Some(message),
                 (Leg::Guard(_), Some(p)) => Some(format!(
-                    "The probe touched something at machine X {:.3} Y {:.3} Z {:.3} stepping along the side before it probes the other. {}",
+                    "The probe touched something at machine X {:.3} Y {:.3} Z {:.3} {}. {}",
                     p[0],
                     p[1],
                     p[2],
+                    if r.feature == Feature::Boss {
+                        "going down beside the boss: it is wider than the probe goes out, or something stands beside it"
+                    } else {
+                        "stepping along the side before it probes the other"
+                    },
                     r.how()
                 )),
                 (Leg::Touch(_), Some(p)) => {
@@ -2393,6 +2448,14 @@ impl Connection {
             if r.legs.is_empty() {
                 match r.plan() {
                     Some(legs) => r.legs = legs.into(),
+                    // The pins' place is recorded and X and Y declared
+                    // from where the tip ends up, back over the pin and
+                    // stopped there.
+                    None if r.purpose != Purpose::Work && !r.backed => {
+                        r.backed = true;
+                        r.legs = r.last().into_iter().map(Leg::Rapid).collect();
+                        continue;
+                    }
                     None => return self.routine_done(r),
                 }
             }
@@ -2439,11 +2502,11 @@ impl Connection {
             return;
         }
         let w = r.zero();
+        // A pin routine is back over the pin already (`Routine::backed`).
         let now = self.snapshot.machine_pos;
-        let back: Vec<Vec6> = r.last().into_iter().map(|p| self.inside(p)).collect();
-        let name = format!("Probe {}", r.feature.label());
         match r.purpose {
             Purpose::Work => {
+                let back: Vec<Vec6> = r.last().into_iter().map(|p| self.inside(p)).collect();
                 for &a in r.feature.axes() {
                     self.send(Command::SetWork {
                         axis: a,
@@ -2454,6 +2517,10 @@ impl Connection {
                     run.touched = true;
                 }
                 self.probed = Some((true, r.found()));
+                let moves = moves_from(now, &back);
+                if !moves.is_empty() {
+                    self.send(job(&format!("Probe {}", r.feature.label()), moves));
+                }
             }
             Purpose::Record(None) => {
                 // Pin 1 found: on to pin 2 where the plate puts it, over the
@@ -2461,7 +2528,7 @@ impl Connection {
                 let Ok(pins) = self.pins_set() else {
                     return;
                 };
-                let d = pins.from_first(1);
+                let d = pins.offset(1);
                 let mut next = r.start;
                 (next[0], next[1]) = (w[0] + d[0], w[1] + d[1]);
                 let mut second =
@@ -2471,12 +2538,11 @@ impl Connection {
                     p[2] = top.unwrap_or(p[2]).max(p[2]);
                     p
                 };
-                let mut legs: Vec<Leg> = back[..2].iter().map(|&p| Leg::Rapid(p)).collect();
-                legs.extend([Leg::Rapid(high(back[1])), Leg::Rapid(high(next)), Leg::Rapid(next)]);
-                second.legs = legs.into();
+                second.legs = [high(now), high(next), next]
+                    .map(|p| Leg::Rapid(self.inside(p)))
+                    .into();
                 self.routine = Some(second);
                 self.routine_step();
-                return;
             }
             Purpose::Record(Some(first)) => {
                 let Ok(pins) = self.pins_set() else {
@@ -2497,7 +2563,7 @@ impl Connection {
                 ));
             }
             Purpose::Reference => {
-                let Ok(Pins {
+                let Ok(&Pins {
                     reference: Some(at),
                     ..
                 }) = self.pins_set()
@@ -2505,19 +2571,15 @@ impl Connection {
                     return;
                 };
                 let by = [at[0] - w[0], at[1] - w[1]];
-                // Declared once the probe is back over the pin and Idle.
-                self.pin_declare = Some((
-                    by,
-                    format!(
-                        "X and Y referenced from pin 1: it was found at machine X {:.3} Y {:.3}, {:.3} mm and {:.3} mm from its recorded place X {:.3} Y {:.3}, so X and Y are declared moved by {:+.3} and {:+.3} mm. Every saved work offset, the soft limits and the pins' place hold again.",
-                        w[0], w[1], -by[0], -by[1], at[0], at[1], by[0], by[1]
-                    ),
+                // Stopped over the pin: X and Y are declared moved by `by`
+                // from here, one a tick (`declare`).
+                self.declare
+                    .extend([(0, now[0] + by[0]), (1, now[1] + by[1])]);
+                self.referencing = Some(format!(
+                    "X and Y referenced from pin 1: it was found at machine X {:.3} Y {:.3}, {:.3} mm and {:.3} mm from its recorded place X {:.3} Y {:.3}, so X and Y are declared moved by {:+.3} and {:+.3} mm. Every saved work offset, the soft limits and the pins' place hold again.",
+                    w[0], w[1], -by[0], -by[1], at[0], at[1], by[0], by[1]
                 ));
             }
-        }
-        let moves = moves_from(now, &back);
-        if !moves.is_empty() {
-            self.send(job(&name, moves));
         }
     }
 
@@ -3853,7 +3915,8 @@ soft_max = 0.0
                 });
                 let first = first.unwrap().unwrap_or_else(|e| panic!("{state}: {e}"));
                 let (setup, stock) = (&doc.setups[si], first.plan.stock);
-                let found = zero_check(setup, stock, &first, &[]);
+                let zero = datum(setup, stock, &mesh).unwrap();
+                let found = zero_check(setup, stock, zero, &first, &[]);
                 if !found.refused.is_empty() {
                     refused.push(format!("{state} {origin}"));
                     continue;
@@ -4202,5 +4265,330 @@ probe = { pin = 13, active_low = true }
         let missing = dir.path().join("missing.toml");
         let e = profile(&uc100(missing.to_str().unwrap(), "")).unwrap_err();
         assert!(e.contains("cannot read"), "{e}");
+    }
+
+    fn pinned(extra: &[(&str, &str)]) -> Fields {
+        let mut m = Machine::new(3);
+        for (k, v) in [
+            ("pins", "0 0; 100 0"),
+            ("pin_diameter", "6"),
+            ("pin_height", "8"),
+        ]
+        .iter()
+        .chain(extra)
+        {
+            m.p.insert(k.to_string(), v.to_string());
+        }
+        m.p
+    }
+
+    #[test]
+    fn pin_settings_read_the_plate_and_refuse_what_does_not_place_a_part() {
+        assert_eq!(pins_settings(&Machine::new(3).p), Ok(None));
+        let pins = pins_settings(&pinned(&[("pins", " 10 5 ; 110,5; 10 85 ")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pins.at, vec![[10., 5.], [110., 5.], [10., 85.]]);
+        assert_eq!((pins.diameter, pins.height, pins.reference), (6., 8., None));
+        assert_eq!(pins.offset(2), [0., 80.]);
+        let recorded = pins_settings(&pinned(&[("pin_ref_x", "120.5"), ("pin_ref_y", "88")]));
+        assert_eq!(recorded.unwrap().unwrap().reference, Some([120.5, 88.]));
+        for (fields, said) in [
+            (vec![("pins", "0 0")], "at least two pins"),
+            (vec![("pins", "0 0; 100")], "X Y pairs"),
+            (vec![("pins", "0 0; 4 0")], "closer than their diameter"),
+            (vec![("pin_diameter", "")], "Pin diameter is not set"),
+            (
+                vec![("pin_height", "0")],
+                "Pin height must be from 1 to 100 mm.",
+            ),
+            (
+                vec![("pin_ref_x", "1"), ("pin_ref_y", "y")],
+                "record it again",
+            ),
+        ] {
+            let e = pins_settings(&pinned(&fields)).unwrap_err();
+            assert!(e.iter().any(|e| e.contains(said)), "{fields:?}: {e:?}");
+        }
+        // A machine's own issues say what is wrong with them.
+        let mut m = Machine::new(3);
+        m.p = pinned(&[("pins", "0 0")]);
+        assert!(m.issues().iter().any(|e| e.contains("at least two pins")));
+    }
+
+    /// Boss centre and Pin centre touch the top, then each side at its
+    /// equator below it from outside, find the centre whatever the tip's
+    /// radius and where it started over the boss, and leave the tip over it.
+    #[test]
+    fn a_boss_or_pin_is_found_from_over_it_with_the_tips_radius() {
+        let probe = Probe {
+            plate: None,
+            tip: Some(4.),
+            feed: 100.,
+            distance: 20.,
+            retract: 5.,
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        // A Ø6 pin, 8 mm tall, centred at X150 Y90 on a plate at Z-60.
+        let pin = |p: [f64; 3]| {
+            (p[2] <= -60.)
+                || (p[2] <= -52. && ((p[0] - 150.).powi(2) + (p[1] - 90.).powi(2)).sqrt() <= 3.)
+        };
+        let pins = pins_settings(&pinned(&[])).unwrap().unwrap();
+        for start in [[150., 90., -48.], [151.5, 89., -49.], [148.2, 91.7, -50.]] {
+            let s = [start[0], start[1], start[2], 0., 0., 0.];
+            let mut r = Routine::pin(&pins, &probe, s, Purpose::Work);
+            // Out past both radii and as much again, the sides 3 mm down.
+            assert!(
+                near(r.reach, 11.) && near(r.depth, 3.),
+                "{} {}",
+                r.reach,
+                r.depth
+            );
+            let end = walk_routine(&mut r, &pin);
+            let w = r.zero();
+            assert!(
+                near(w[0], 150.) && near(w[1], 90.) && near(w[2], -52.),
+                "{start:?}: {w:?}"
+            );
+            assert!(
+                near(end[0], 150.) && near(end[1], 90.) && near(end[2], start[2]),
+                "{end:?}"
+            );
+            // The sides were touched at the tip's equator, below the top.
+            for t in &r.touches[1..] {
+                assert!(near(t[2] + 2., -53.), "{t:?}");
+            }
+            // Across Y through the centre; across X where the tip started,
+            // a chord when that was off the centre in Y.
+            let s = r.found();
+            let chord = 2. * (9. - (start[1] - 90f64).powi(2)).sqrt();
+            assert!(s.contains("6.000 mm across Y"), "{s}");
+            assert!(s.contains(&format!("{chord:.3} mm across X")), "{s}");
+        }
+        // A short pin is probed at half its height.
+        let short = pins_settings(&pinned(&[("pin_height", "4")]))
+            .unwrap()
+            .unwrap();
+        let s = [150., 90., -50., 0., 0., 0.];
+        assert!(near(
+            Routine::pin(&short, &probe, s, Purpose::Work).depth,
+            2.
+        ));
+        // Boss centre, without pins, goes out by the maximum probe
+        // distance: a Ø30 boss.
+        let boss = |p: [f64; 3]| {
+            (p[2] <= -60.)
+                || (p[2] <= -40. && ((p[0] - 150.).powi(2) + (p[1] - 90.).powi(2)).sqrt() <= 15.)
+        };
+        let mut r = Routine::new(Feature::Boss, &probe, [152., 88., -35., 0., 0., 0.]);
+        walk_routine(&mut r, &boss);
+        let w = r.zero();
+        assert!(near(w[0], 150.) && near(w[1], 90.), "{w:?}");
+        assert!(r.found().contains("30.000 mm across Y"), "{}", r.found());
+    }
+
+    #[test]
+    fn squareness_measures_pin_2_off_the_line_from_pin_1() {
+        let pins = pins_settings(&pinned(&[])).unwrap().unwrap();
+        let (ok, said) = squareness(&pins, [100., 50.], [200.02, 50.04]);
+        assert!(ok, "{said}");
+        assert!(
+            said.starts_with("Pin 2 is 0.040 mm off the line in Y over 100.0 mm"),
+            "{said}"
+        );
+        assert!(said.contains("+0.020 mm along it"), "{said}");
+        let (ok, said) = squareness(&pins, [100., 50.], [200., 49.93]);
+        assert!(
+            !ok && said.contains("0.070 mm off") && said.contains("square the plate"),
+            "{said}"
+        );
+        // Pins along Y are off the line in X.
+        let along_y = pins_settings(&pinned(&[("pins", "0 0; 0 80")]))
+            .unwrap()
+            .unwrap();
+        let (_, said) = squareness(&along_y, [0., 0.], [0.03, 80.]);
+        assert!(
+            said.contains("0.030 mm off the line in X over 80.0 mm"),
+            "{said}"
+        );
+    }
+
+    /// Opens the simulated `PROBED` machine with the pins of `pinned`,
+    /// Idle with machine zero set where it stands.
+    fn pinned_machine(dir: &Path) -> Connection {
+        let profile = dir.join("probed.toml");
+        std::fs::write(&profile, PROBED).unwrap();
+        let mut m = Machine::new(3);
+        m.p = pinned(&[
+            ("probe_tip", "2"),
+            ("probe_feed", "1000"),
+            ("probe_distance", "20"),
+        ]);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let mut c = Connection::open(&m, dir).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        c
+    }
+
+    /// Runs `c` until a pin routine has ended and what it declares is sent.
+    fn pinned_end(c: &mut Connection, what: &str) -> (bool, String) {
+        let cap = Instant::now() + Duration::from_secs(120);
+        loop {
+            c.refresh();
+            if c.pinning().is_none()
+                && c.referencing.is_none()
+                && c.declare.is_empty()
+                && c.snapshot.state == Some(State::Idle)
+                && let Some(said) = c.pin_said.clone()
+            {
+                return said;
+            }
+            assert!(
+                Instant::now() < cap,
+                "timed out waiting for {what}: {:?} {:?}",
+                c.snapshot.state,
+                c.snapshot.log
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Rapids `c` to machine `at` and waits there.
+    fn rapid_to(c: &mut Connection, at: [f64; 3]) {
+        c.send(Command::Mdi(format!(
+            "G53 G0 X{:.3} Y{:.3} Z{:.3}",
+            at[0], at[1], at[2]
+        )));
+        until(c, 10.0, "the rapid", |s| {
+            s.state == Some(State::Idle) && (0..3).all(|a| (s.machine_pos[a] - at[a]).abs() < 1e-3)
+        });
+    }
+
+    /// On the simulator, Record the pins' place finds pin 1 and pin 2 and
+    /// keeps pin 1's place; after an E-stop and a machine zero 1.3 mm and
+    /// -0.7 mm off, Reference X Y from pin 1 declares X and Y back by
+    /// exactly that, also from X and Y without a machine position.
+    #[test]
+    fn the_pins_place_is_recorded_and_references_x_and_y_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = pinned_machine(dir.path());
+        assert!(!c.pin_referenced);
+        assert_eq!(
+            c.reference_blocked().as_deref(),
+            Some(
+                "The pins' place is not recorded yet: set machine zero, then Record the pins' place."
+            )
+        );
+        // The simulator's pins stand in front of its block, pin 1 at X145
+        // Y45, 8 mm tall on the bottom of Z.
+        let pin1 = c.sim_pins.expect("simulated pins");
+        assert_eq!(pin1, [145., 45.]);
+        let (lo, _) = c.block.unwrap();
+        assert!(pin1[1] + 3. < lo[1], "{lo:?}");
+        rapid_to(&mut c, [145.6, 44.5, -69.]);
+        assert_eq!(c.record_blocked(), None);
+        c.act(Action::RecordPins);
+        assert_eq!(c.pinning(), Some(true));
+        let (ok, said) = pinned_end(&mut c, "Record the pins' place");
+        assert!(ok, "{said}");
+        let at = c.recorded.take().expect("pin 1's place to keep");
+        assert!((0..2).all(|a| (at[a] - pin1[a]).abs() < 0.01), "{at:?}");
+        assert!(
+            said.contains("Pin 2 is 0.00") && said.contains("off the line in Y over 100.0 mm"),
+            "{said}"
+        );
+        assert!(c.pin_referenced);
+        let reference = match &c.pins {
+            Ok(Some(p)) => p.reference.unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reference, at);
+        // It ends over pin 2.
+        let s = c.snapshot.machine_pos;
+        assert!(
+            (s[0] - 245.).abs() < 0.01 && (s[1] - 45.).abs() < 0.01,
+            "{s:?}"
+        );
+
+        // An E-stop clears the reference; a rough machine zero is off by
+        // X +1.3 Y -0.7: the pins stay put on the table, so in the new
+        // machine coordinates they are that far off.
+        c.send(Command::EStop);
+        until(&mut c, 3.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert!(!c.pin_referenced);
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        let now = c.snapshot.machine_pos;
+        c.declared(&[(0, now[0] + 1.3), (1, now[1] - 0.7), (2, now[2])]);
+        until(&mut c, 3.0, "X, Y and Z declared", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        let off = c.sim_pins.unwrap();
+        assert!((off[0] - (at[0] + 1.3)).abs() < 0.01 && (off[1] - (at[1] - 0.7)).abs() < 0.01);
+        rapid_to(&mut c, [off[0] - 0.8, off[1] + 0.3, -69.]);
+        assert_eq!(c.reference_blocked(), None);
+        c.act(Action::ReferencePins);
+        let (ok, said) = pinned_end(&mut c, "Reference X Y from pin 1");
+        assert!(ok, "{said}");
+        assert!(
+            said.contains("declared moved by -1.30") && said.contains("+0.70"),
+            "{said}"
+        );
+        assert!(c.pin_referenced);
+        let back = c.sim_pins.unwrap();
+        assert!(
+            (0..2).all(|a| (back[a] - at[a]).abs() < 0.01),
+            "{back:?} {at:?}"
+        );
+        // It ends over pin 1, which is where it was recorded, once the
+        // driver has taken both declarations.
+        until(&mut c, 3.0, "over pin 1 where it was recorded", |s| {
+            (0..2).all(|a| (s.machine_pos[a] - at[a]).abs() < 0.01)
+        });
+
+        // After another E-stop, X and Y need no machine position: Z does.
+        c.send(Command::EStop);
+        until(&mut c, 3.0, "E-stop", |s| s.state == Some(State::EStop));
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert!(
+            c.reference_blocked()
+                .unwrap()
+                .contains("Z has no machine position")
+        );
+        let z = c.snapshot.machine_pos[2];
+        c.declared(&[(2, z)]);
+        until(&mut c, 3.0, "Z declared", |s| s.referenced[2]);
+        assert!(!c.snapshot.referenced[0]);
+        assert_eq!(c.reference_blocked(), None);
+        c.act(Action::ReferencePins);
+        let (ok, said) = pinned_end(&mut c, "Reference X Y from pin 1 unset");
+        assert!(ok, "{said}");
+        assert!(c.pin_referenced && c.snapshot.referenced[..3].iter().all(|r| *r));
+        let back = c.sim_pins.unwrap();
+        assert!(
+            (0..2).all(|a| (back[a] - at[a]).abs() < 0.01),
+            "{back:?} {at:?}"
+        );
+        // Declaring X another way is not from the pin.
+        c.act(Action::MachineZero(Some(0)));
+        assert!(!c.pin_referenced);
     }
 }

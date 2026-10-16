@@ -259,9 +259,15 @@ impl View {
                         })
                     });
                     let held = crate::holding::held_by(doc, &setup, stock, bands.as_ref());
-                    doc.holding_boxes(&setup, held)
+                    let mut boxes = doc
+                        .holding_boxes(&setup, held)
                         .map(|b| crate::holding::shown(&b, stock))
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    let on = crate::post::datum(&setup, stock, mesh)
+                        .ok()
+                        .and_then(|datum| crate::post::on_pins(&setup, datum));
+                    boxes.extend(crate::holding::pin_boxes(on.as_ref(), stock));
+                    boxes
                 }
                 _ => vec![],
             }

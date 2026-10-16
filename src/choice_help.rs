@@ -122,6 +122,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 "",
             )
         }
+        ("on_pins", "Yes") => (
+            "The part drops over the machine's fixture pins by holes in it, so its place and turn are known: the pins give this setup's X and Y work offset (Set X Y from the pins on the Control page), with no probing. Z is still touched off on the stock. The pins are kept clear of as workholding; the vise or clamps still hold the part down.",
+            "Cycle Start waits until X and Y are referenced from pin 1 since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
+        ),
+        ("on_pins", "No") => (
+            "The part does not sit on the fixture pins: its X and Y work zero is touched off or probed on the stock.",
+            "",
+        ),
         ("through", "Yes") => (
             "Extend the drill target below the bottom of each hole that goes through the part by Breakthrough. A selected hole that is blind is refused, since the part goes on under its bottom: set Through to No, or use the diameter filter to drill only the holes that go through.",
             "That extra travel is included in the preview, and modelled vise jaws and clamps are checked as boxes with a clearance gap; the material, parallels or the table underneath are not collision checked.",

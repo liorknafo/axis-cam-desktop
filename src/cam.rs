@@ -686,7 +686,9 @@ pub fn pin_holes(
     use crate::volume::{Frame, Volume};
     let setup = &doc.setups[si];
     let Some((ti, on)) = (doc.setups.iter().enumerate()).find(|(_, s)| s.id == target) else {
-        return Err("The setup these pin holes were for is gone: choose another under Holes.".into());
+        return Err(
+            "The setup these pin holes were for is gone: choose another under Holes.".into(),
+        );
     };
     let name = on.name();
     if ti <= si || !crate::post::sits_on_pins(on) {
@@ -748,13 +750,27 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             .clone()
             .unwrap_or_else(|| Err("Pin holes are worked out as the job is simulated.".into()))?;
         let diameter = b.plan.radius * 2.;
-        if let Some(p) = pins.first()
-            && diameter < p.diameter - 0.001
-        {
-            return Err(format!(
-                "The Ø{:.2} drill is smaller than the Ø{:.2} pins: the part would not drop over them. Choose a drill of at least Ø{:.2}.",
-                diameter, p.diameter, p.diameter
-            ));
+        if let Some(p) = pins.first() {
+            let fit = crate::post::PIN_FIT;
+            if diameter < p.diameter - 0.001 {
+                return Err(format!(
+                    "The Ø{:.2} drill is smaller than the Ø{:.2} pins: the part would not drop over them. Choose a drill of Ø{:.2} to Ø{:.2}.",
+                    diameter,
+                    p.diameter,
+                    p.diameter,
+                    p.diameter + fit
+                ));
+            }
+            if diameter > p.diameter + fit + 0.001 {
+                return Err(format!(
+                    "The Ø{:.2} drill is {:.2} mm wider than the Ø{:.2} pins: the part would move on them by that much. Choose a drill of Ø{:.2} to Ø{:.2}.",
+                    diameter,
+                    diameter - p.diameter,
+                    p.diameter,
+                    p.diameter,
+                    p.diameter + fit
+                ));
+            }
         }
         let through = get(&op.p, "through") == "Yes";
         // Full diameter for the pin's height and 1 mm, the drill's point
