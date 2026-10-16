@@ -35,18 +35,54 @@ pub fn profile(m: &Machine) -> Result<MachineConfig, String> {
     MachineConfig::load(Path::new(path)).map_err(|e| e.to_string())
 }
 
+/// The spindle cap of each profile file read so far, by path and the file's
+/// modification time: a view asks for it on every redraw, and the file is
+/// read and parsed again only when it has changed.
+static CAPS: std::sync::Mutex<BTreeMap<std::path::PathBuf, (std::time::SystemTime, Capped)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+type Capped = Result<Option<f32>, String>;
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has read a profile for its cap.
+    static CAP_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The spindle speed a UC100 machine's profile caps the machine's rpm to, as a
 /// run checks: its maximum at full PWM. None on any other machine, or when the
-/// profile has no spindle PWM output.
+/// profile has no spindle PWM output. The profile is read once per path and
+/// modification time (`CAPS`): this is called from view code.
 pub fn spindle_cap(m: &Machine) -> Result<Option<f32>, String> {
     if get(&m.p, "controller") != "UC100" {
         return Ok(None);
     }
-    let out = profile(m)?.outputs;
-    Ok(out
-        .spindle_pwm
-        .is_some()
-        .then_some(out.spindle_max_rpm as f32))
+    let read = |m: &Machine| {
+        #[cfg(test)]
+        CAP_READS.with(|n| n.set(n.get() + 1));
+        let out = profile(m)?.outputs;
+        Ok(out
+            .spindle_pwm
+            .is_some()
+            .then_some(out.spindle_max_rpm as f32))
+    };
+    let path = Path::new(get(&m.p, "uc100_profile").trim());
+    // A profile whose time cannot be read (missing, no path) is not kept: it
+    // is read, and refused, as before.
+    let Some(modified) = std::fs::metadata(path)
+        .and_then(|f| f.modified())
+        .ok()
+        .filter(|_| !path.as_os_str().is_empty())
+    else {
+        return read(m);
+    };
+    let mut caps = CAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((time, cap)) = caps.get(path)
+        && *time == modified
+    {
+        return cap.clone();
+    }
+    let cap = read(m);
+    caps.insert(path.to_path_buf(), (modified, cap.clone()));
+    cap
 }
 
 /// The coolant choices machine `m` has outputs for, in the order Flood,
@@ -1738,6 +1774,62 @@ dir = { pin = 7 }
 soft_min = -55.0
 soft_max = 0.0
 "#;
+
+    fn capped(profile: &Path, rpm: u32) {
+        let text =
+            format!("{LIMITED}[outputs]\nspindle_pwm = {{ pin = 16 }}\nspindle_max_rpm = {rpm}\n");
+        std::fs::write(profile, text).unwrap();
+    }
+
+    #[test]
+    fn the_spindle_cap_is_read_once_per_profile_file_and_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("capped.toml");
+        capped(&profile, 12000);
+        let m = uc100(&profile.display().to_string(), "Simulated");
+        let reads = || CAP_READS.with(|n| n.get());
+        let before = reads();
+        // A view asks on every redraw, and the NC page once per operation.
+        for _ in 0..5 {
+            assert_eq!(spindle_cap(&m), Ok(Some(12000.)));
+        }
+        assert_eq!(reads() - before, 1);
+        // Saved with another maximum: read again, once.
+        capped(&profile, 9000);
+        let file = std::fs::File::options().write(true).open(&profile).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(spindle_cap(&m), Ok(Some(9000.)));
+        }
+        assert_eq!(reads() - before, 2);
+        // Another path is another entry.
+        let other = dir.path().join("other.toml");
+        capped(&other, 6000);
+        let n = uc100(&other.display().to_string(), "Simulated");
+        assert_eq!(spindle_cap(&n), Ok(Some(6000.)));
+        assert_eq!(spindle_cap(&m), Ok(Some(9000.)));
+        assert_eq!(reads() - before, 3);
+    }
+
+    #[test]
+    fn a_profile_that_is_missing_is_refused_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("gone.toml");
+        let m = uc100(&profile.display().to_string(), "Simulated");
+        assert!(spindle_cap(&m).is_err());
+        // Written afterwards, it is used at once.
+        capped(&profile, 8000);
+        assert_eq!(spindle_cap(&m), Ok(Some(8000.)));
+        // And a machine that is not a UC100 reads no file.
+        let mut other = Machine::new(3);
+        other
+            .p
+            .insert("uc100_profile".into(), "/no/such/file.toml".into());
+        let before = CAP_READS.with(|n| n.get());
+        assert_eq!(spindle_cap(&other), Ok(None));
+        assert_eq!(CAP_READS.with(|n| n.get()), before);
+    }
 
     /// Refreshes `c` until `ok` holds of its snapshot; fails once the
     /// driver has looped for `secs` (4 ms a loop, later under load), or
