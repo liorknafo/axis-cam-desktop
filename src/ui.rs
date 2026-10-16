@@ -4100,6 +4100,10 @@ fn control(app: &App) -> Element<'_, Message> {
                 Err(e) => left.push(warnings(vec![e])),
             },
         };
+    } else if app.control.is_some() {
+        // The machine left the library while connected: the connection is
+        // still live and still ends here.
+        left = left.push(btn("Disconnect", Message::Disconnect, false));
     }
     let Some(c) = &app.control else {
         let main: Element<_> = if app.machine_setup {

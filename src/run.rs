@@ -137,6 +137,8 @@ impl Run {
                 Some(i)
             }
             None => {
+                // Out of range, so that no setup the project has is shown as picked.
+                self.setup = usize::MAX;
                 self.checked_as(Arc::new(Err(vec![REMOVED.into()])));
                 None
             }
@@ -921,5 +923,22 @@ mod tests {
         assert!(run.running.is_some());
         run.refresh(Some(&o(1, true)));
         assert!(run.running.is_none() && run.done[0] && run.next == 1);
+    }
+
+    #[test]
+    fn a_removed_setup_leaves_no_setup_of_the_project_picked() {
+        let (mut doc, _) = fixture::flipped_job();
+        let mut run = Run::new(&doc, 1, 0);
+        assert_eq!(run.follow(&doc), Some(1));
+        // Another setup moves up to the removed one's index.
+        doc.setups.remove(1);
+        doc.setups.push(doc.setups[0].duplicate(&doc.next_offset()));
+        assert_eq!(doc.setups.len(), 2);
+        assert_eq!(run.follow(&doc), None);
+        assert!((0..doc.setups.len()).all(|si| run.setup != si));
+        assert_eq!(
+            run.programs.as_deref().and_then(|p| p.as_ref().err()),
+            Some(&vec![REMOVED.to_string()])
+        );
     }
 }

@@ -556,7 +556,11 @@ panel, at once when that machine is connected, or when you press
    picked when setups are moved in MANUFACTURE; once that setup is deleted,
    the panel says "This setup was removed from the project." in place of its
    tool runs, and nothing is touched off or probed from it, until another
-   setup is picked.
+   setup is picked; no setup is shown as picked in the meantime, whichever
+   setup takes the deleted one's place in the list. The machine connected
+   cannot be removed from the Machine library (the status says to disconnect
+   first), and the Control page keeps **Disconnect** for as long as a
+   connection is live.
 2. Set machine zero, then the work zero (the setup's work offset must be the
    active one): by hand, with **Probe Z** on a plate, or with **Probe corner**,
    **Probe edge** or **Probe centre**. **Cycle Start** stays grey, with the reasons listed, until the
@@ -633,7 +637,7 @@ wizard.
 
 ## LinuxCNC G-code export
 
-Open **NC review**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis; a UC100 setup takes no G-code file and gets the checks of a run on the machine instead, with **Run on the machine** on its own card, see **Running a setup**), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps, one problem for each operation, jaw or clamp and part of the tool (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
+Open **NC review**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis; a UC100 setup takes no G-code file and gets the checks of a run on the machine instead, with **Run on the machine** on its own card, see **Running a setup**), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps, one problem for each operation, jaw or clamp and part of the tool (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails. In a job that mixes controllers, a UC100 setup passes by its run checks and writes no file, so the LinuxCNC programs export once every setup passes; a job of UC100 setups alone has no export.
 
 - Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (see **The work zero**).
 - Each operation begins with its comment, then its spindle (`S` with `M3` or `M4`) and coolant when they differ from the operation before, and the profile's start dwell after every spindle start. A tool change switches the coolant and the spindle off (`M9`, `M5`) and retracts first. A change of spindle rotation between two operations of the same tool switches them off too, so the spindle stops before it is started the other way: after `M5` the program dwells the profile's start dwell once more (`G4`) for the spindle to stand still, since the start dwell is sized for a spin-up from rest and LinuxCNC without a wired at-speed pin feeds after it regardless; then the new `S` word with `M4` or `M3`, the coolant and the start dwell follow. The header says so in a `Spindle reversal before operation N:` comment, also when the dwell is 0 and nothing waits; the replay insists on the dwell after `M5` with the spindle off. A UC100 run waits the same between the spindle's Off and its reversed start (issues #62, #160).
