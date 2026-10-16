@@ -5855,6 +5855,17 @@ fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>>
         )),
     };
     col = col.push(state);
+    if let Some(top) = c.sim_pin1_top() {
+        col = col.push(muted(format!(
+            "Simulated: the simulator's pin 1 stands at machine X {:.3} Y {:.3}, its top at Z {:.3}. The MDI line G53 G0 X{:.1} Y{:.1} Z{:.1} puts the tip 3 mm over it.",
+            top[0],
+            top[1],
+            top[2],
+            top[0],
+            top[1],
+            top[2] + 3.
+        )));
+    }
     if let Some((ok, said)) = &c.pin_said {
         col = col.push(text(said.clone()).size(12).color(if *ok {
             green

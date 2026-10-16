@@ -1559,6 +1559,17 @@ impl Connection {
         self.sim_pins.filter(|_| self.simulated)
     }
 
+    /// Simulated: where the top of the simulator's pin 1 is (machine X, Y
+    /// and Z), for jogging over it.
+    pub fn sim_pin1_top(&self) -> Option<[f64; 3]> {
+        let at = self.sim_pin1()?;
+        let (lo, _) = self.block?;
+        let Ok(Some(pins)) = &self.pins else {
+            return None;
+        };
+        Some([at[0], at[1], lo[2] + pins.height])
+    }
+
     /// Simulated: sends the blocks when they changed since last sent.
     fn send_sim_blocks(&mut self) {
         if !self.simulated {
