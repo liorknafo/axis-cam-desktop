@@ -399,7 +399,9 @@ Once the machine is Idle, the Control page has everything needed before a job:
   takes the position AXIS CAM saved at the last disconnect, for when nothing
   moved the machine since. Until every axis with a soft limit has a machine
   position, an amber box says the soft limits are **OFF**: nothing stops an
-  axis at the end of its travel. Every E-stop clears the machine position, so
+  axis at the end of its travel. The same amber box shows for good when the
+  profile sets no soft limits at all, and then says to add `soft_min` and
+  `soft_max` to the profile. Every E-stop clears the machine position, so
   set it again after one. **Home** appears when every axis has a home switch;
   an axis with a switch gets its position only by homing.
 - **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys (X, Y;
@@ -463,7 +465,9 @@ Once the machine is Idle, the Control page has everything needed before a job:
   table) moves with the live position, with the tool-tip travel box from the
   soft limits, the simulator's block, and a green ring at the active work
   zero once the machine position is set; drag to turn it. It is amber until
-  the machine position is set. Its dimensions are **assumed** from a similar machine's spec sheet,
+  the machine position is set. When the profile lacks soft limits on X, Y or
+  Z, the box is the assumed travel instead, drawn dashed and captioned
+  "travel not configured", whether or not the position is set. Its dimensions are **assumed** from a similar machine's spec sheet,
   as are the JY5800 profile's soft limits (travel 390 × 280 × 55 mm): measure
   the machine and correct both (`src/machine_view.rs`, the driver profile).
 

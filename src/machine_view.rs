@@ -30,23 +30,69 @@ pub struct MachineView {
     /// The tool-tip travel box: the profile's soft limits when X, Y and Z
     /// all have them, otherwise the assumed travel.
     pub envelope: [[f32; 3]; 2],
+    /// The envelope is the assumed travel, not the profile's soft limits:
+    /// drawn dashed and captioned as assumed, whether or not the position is
+    /// set (#73).
+    pub assumed: bool,
     /// The simulator's block, which stands for the stock (min and max).
     pub block: Option<[[f32; 3]; 2]>,
     /// The active work zero (machine mm), marked once the position is set.
     pub zero: [f32; 3],
 }
 
+/// What a caption says, which sets its colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Caption {
+    /// The profile's soft-limit box.
+    Travel,
+    /// The assumed travel box.
+    Assumed,
+    /// The model does not show the machine.
+    Unset,
+    /// The tool tip and the work zero.
+    Zero,
+}
+
 impl MachineView {
-    /// The travel box from the profile's soft limits, or the assumed travel.
-    pub fn envelope(config: &uc100::config::MachineConfig) -> [[f32; 3]; 2] {
+    /// The travel box from the profile's soft limits, or the assumed travel,
+    /// and whether it is the assumed one.
+    pub fn envelope(config: &uc100::config::MachineConfig) -> ([[f32; 3]; 2], bool) {
         let limit = |a: usize| {
             let x = config.axes.get(a)?;
             Some((x.soft_min? as f32, x.soft_max? as f32))
         };
         match (limit(0), limit(1), limit(2)) {
-            (Some(x), Some(y), Some(z)) => [[x.0, y.0, z.0], [x.1, y.1, z.1]],
-            _ => [[0., 0., -TRAVEL[2]], [TRAVEL[0], TRAVEL[1], 0.]],
+            (Some(x), Some(y), Some(z)) => ([[x.0, y.0, z.0], [x.1, y.1, z.1]], false),
+            _ => ([[0., 0., -TRAVEL[2]], [TRAVEL[0], TRAVEL[1], 0.]], true),
         }
+    }
+
+    /// The captions at the top left, in order. The box's caption depends on
+    /// whether it is the assumed travel, never on the position: an assumed
+    /// box is never called where the tool tip can travel.
+    pub fn captions(&self) -> Vec<(Caption, &'static str)> {
+        let mut lines = vec![];
+        if !self.known {
+            lines.push((
+                Caption::Unset,
+                "Machine position not set: the model follows the step counters, not the machine",
+            ));
+        }
+        if self.assumed {
+            lines.push((
+                Caption::Assumed,
+                "Dashed box: assumed travel, travel not configured in the profile",
+            ));
+        } else if self.known {
+            lines.push((Caption::Travel, "Box: where the tool tip can travel"));
+        }
+        if self.known {
+            lines.push((
+                Caption::Zero,
+                "Red dot: the tool tip · green ring: the work zero",
+            ));
+        }
+        lines
     }
 }
 
@@ -447,17 +493,15 @@ impl canvas::Program<Message> for MachineView {
             );
         }
         // The tool tip's travel, and the tool tip.
-        let (envelope, label) = if self.known {
-            (
-                Color::from_rgba8(33, 107, 181, 0.8),
-                "Box: where the tool tip can travel",
-            )
+        let amber = Color::from_rgb8(196, 120, 20);
+        let envelope = if self.assumed {
+            Color { a: 0.75, ..amber }
+        } else if self.known {
+            Color::from_rgba8(33, 107, 181, 0.8)
         } else {
-            (
-                Color::from_rgb8(196, 120, 20),
-                "Machine position not set: the model follows the step counters, not the machine",
-            )
+            amber
         };
+        let dash = [6., 4.];
         let [elo, ehi] = self.envelope;
         let corner = |i: usize| {
             view.flat([
@@ -482,9 +526,19 @@ impl canvas::Program<Message> for MachineView {
         ] {
             frame.stroke(
                 &canvas::Path::line(screen(corner(a)), screen(corner(b))),
-                canvas::Stroke::default()
-                    .with_color(envelope)
-                    .with_width(1.2),
+                canvas::Stroke {
+                    line_dash: if self.assumed {
+                        canvas::LineDash {
+                            segments: &dash,
+                            offset: 0,
+                        }
+                    } else {
+                        canvas::LineDash::default()
+                    },
+                    ..canvas::Stroke::default()
+                        .with_color(envelope)
+                        .with_width(1.2)
+                },
             );
         }
         let green = Color::from_rgb8(39, 130, 93);
@@ -493,25 +547,24 @@ impl canvas::Program<Message> for MachineView {
                 &canvas::Path::circle(screen(view.flat(self.zero)), 7.),
                 canvas::Stroke::default().with_color(green).with_width(2.),
             );
-            frame.fill_text(canvas::Text {
-                content: "Red dot: the tool tip · green ring: the work zero".into(),
-                position: Point::new(10., 24.),
-                color: green,
-                size: 12.into(),
-                ..Default::default()
-            });
         }
         frame.fill(
             &canvas::Path::circle(screen(view.flat(self.pos)), 4.),
             Color::from_rgb8(214, 40, 40),
         );
-        frame.fill_text(canvas::Text {
-            content: label.into(),
-            position: Point::new(10., 8.),
-            color: envelope,
-            size: 12.into(),
-            ..Default::default()
-        });
+        for (i, (kind, content)) in self.captions().into_iter().enumerate() {
+            frame.fill_text(canvas::Text {
+                content: content.into(),
+                position: Point::new(10., 8. + 16. * i as f32),
+                color: match kind {
+                    Caption::Travel => envelope,
+                    Caption::Assumed | Caption::Unset => amber,
+                    Caption::Zero => green,
+                },
+                size: 12.into(),
+                ..Default::default()
+            });
+        }
         frame.fill_text(canvas::Text {
             content: "CNC4030, assumed dimensions · drag to turn".into(),
             position: Point::new(10., bounds.height - 20.),
