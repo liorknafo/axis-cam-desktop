@@ -44,3 +44,6 @@ opt-level = 2
 [dev-dependencies]
 # Lets a test run an Iced `Task` to its messages (`task::into_stream`).
 iced_runtime = "0.14"
+# Generates the fake sign-in server's RSA key at test time (already in the tree
+# through jsonwebtoken and rustls).
+aws-lc-rs = "1"
