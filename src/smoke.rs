@@ -5123,6 +5123,49 @@ flood = { pin = 8 }
         }
     }
 
+    /// The operation editor's Delete asks first, as a setup's does: Cancel
+    /// keeps the operation, another selection closes the question, and
+    /// Delete operation removes it. The question shows in place of the
+    /// editor's commands, and the footer knows the page its status is from.
+    #[test]
+    fn deleting_an_operation_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("w.json"), None);
+        let _ = a.update(Message::OpenSample);
+        let _ = a.update(Message::SelectOp(0));
+        let count = a.doc.setup().operations.len();
+        let _ = a.update(Message::AskRemoveOp);
+        assert!(a.confirm_delete_op);
+        let _ = a.view();
+        let _ = a.update(Message::ConfirmDeleteOp(false));
+        assert!(!a.confirm_delete_op);
+        assert_eq!(a.doc.setup().operations.len(), count);
+        let _ = a.update(Message::AskRemoveOp);
+        let _ = a.update(Message::SelectOp(1));
+        assert!(
+            !a.confirm_delete_op,
+            "another operation closes the question"
+        );
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::AskRemoveOp);
+        let _ = a.update(Message::ConfirmDeleteOp(true));
+        assert!(!a.confirm_delete_op);
+        assert_eq!(a.doc.setup().operations.len(), count - 1);
+        // A status belongs to the page it was set on: one that a page change
+        // leaves as it was is an earlier page's.
+        let _ = a.update(Message::Page(Page::Work));
+        assert_eq!(a.status_page, Page::Work);
+        let before = a.status.clone();
+        let _ = a.update(Message::Page(Page::Tools));
+        let expected = if a.status == before {
+            Page::Work
+        } else {
+            Page::Tools
+        };
+        assert_eq!(a.status_page, expected);
+        let _ = a.view();
+    }
+
     #[test]
     fn the_machine_workspace_goes_back_to_the_manufacture_page_left() {
         let dir = tempfile::tempdir().unwrap();

@@ -325,6 +325,7 @@ fn pin<'a>(d: &Draft, path: String, name: &str, pins: &[u8]) -> Element<'a, Mess
             move |c: PinChoice| { edit(Edit::Pin(to.clone(), c.0)) }
         )
         .text_size(12)
+        .style(crate::ui::choice_style)
         .padding([5, 8])
         .width(110)
     ]
@@ -541,6 +542,7 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
                     r
                 )))
                 .text_size(12)
+                .style(crate::ui::choice_style)
                 .padding([5, 8])
                 .width(110)
             ]

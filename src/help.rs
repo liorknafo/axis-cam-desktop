@@ -1056,8 +1056,12 @@ pub fn command(m: &Message, label: String) -> Help {
             "Copy this operation, including its tool, geometry and cutting settings, into the current setup. Adjust the copy for another pass.",
             "",
         ),
-        RemoveOp => (
+        RemoveOp | AskRemoveOp | ConfirmDeleteOp(true) => (
             "Delete this operation from the current setup. References from later rest-machining operations are cleared.",
+            "",
+        ),
+        ConfirmDeleteOp(false) => (
+            "Keep this operation and close the deletion confirmation.",
             "",
         ),
         MoveOp(n) if *n < 0 => (
@@ -3703,6 +3707,9 @@ mod tests {
             SelectOp(0),
             DuplicateOp,
             RemoveOp,
+            AskRemoveOp,
+            ConfirmDeleteOp(true),
+            ConfirmDeleteOp(false),
             MoveOp(-1),
             MoveOp(1),
             PickMode,

@@ -983,10 +983,13 @@ impl Default for Document {
 impl Document {
     pub fn sample() -> Self {
         let machines = vec![Machine::new(3), Machine::new(4), Machine::new(5)];
+        let mut drill = Tool::new("Twist drill · Ø8", "Drill", "8");
+        // A twist drill has two flutes, not an end mill's three.
+        drill.p.insert("flutes".into(), "2".into());
         let tools = vec![
             Tool::new("Flat end mill · Ø10", "Flat end mill", "10"),
             Tool::new("Ball end mill · Ø6", "Ball end mill", "6"),
-            Tool::new("Twist drill · Ø8", "Drill", "8"),
+            drill,
         ];
         let mut s = Setup::new(machines[0].clone(), "G54");
         for (key, value) in [
