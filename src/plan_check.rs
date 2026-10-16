@@ -2417,8 +2417,18 @@ mod tests {
             get(&job.unwrap().setups[0].operations[0].p, "clearance"),
             "60"
         );
-        // One that takes the program past it is refused, as export does.
+        // One above the machine's Z travel is refused with the proposal.
         let (refused, job) = with(400.);
+        assert!(!refused.passed && job.is_none());
+        assert_eq!(
+            stages(&refused),
+            [
+                "structure 1/Some(1): clearance 400 is above the largest this machine allows, 300 mm."
+            ]
+        );
+        // One within it that takes the program past the travel (the drill
+        // goes down through the stock) is refused, as export does.
+        let (refused, job) = with(290.);
         assert!(!refused.passed && job.is_none());
         let found = stages(&refused);
         assert_eq!(found.len(), 1, "{found:?}");

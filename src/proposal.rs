@@ -31,6 +31,17 @@ const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
 pub const MAX_OPERATIONS: usize = 40;
 const MAX_SURFACES: usize = 500;
+/// The largest `clearance` when the machine's Z travel is not known (0).
+const UNKNOWN_TRAVEL_CLEARANCE: f32 = 300.;
+/// The largest `clearance` an operation may ask for: the machine's Z travel
+/// when the report has one (never below the default), else
+/// [`UNKNOWN_TRAVEL_CLEARANCE`].
+pub fn clearance_cap(report: &PartReport) -> f32 {
+    match report.machine.travel[2] {
+        z if z > 0. => z.max(CLEARANCE),
+        _ => UNKNOWN_TRAVEL_CLEARANCE,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -456,6 +467,15 @@ fn operation(
     if p.clearance.is_some_and(|v| v.is_finite() && v < CLEARANCE) {
         wrong.push(format!(
             "clearance can only raise the default of {CLEARANCE} mm."
+        ));
+    }
+    // ... and not above what the machine can reach, or a few hundred mm when
+    // its Z travel is not known: a sky-high plane makes rapids to Z+500 m.
+    let cap = clearance_cap(report);
+    if p.clearance.is_some_and(|v| v.is_finite() && v > cap) {
+        wrong.push(format!(
+            "clearance {} is above the largest this machine allows, {cap} mm.",
+            p.clearance.unwrap_or_default()
         ));
     }
     if p.rpm.is_finite() && !(p.rpm >= 100. && p.rpm <= report.machine.max_rpm) {
@@ -1333,6 +1353,34 @@ pub(crate) mod tests {
             found,
             ["Setup 1: holder must be null: setup 1's workholding is the user's."]
         );
+    }
+    #[test]
+    fn clearance_is_capped_by_the_machines_z_travel_or_300_mm() {
+        let (doc, mesh, mut report) = block();
+        let mut proposal = good(&report);
+        let ask = |proposal: &mut Proposal, report: &PartReport, clearance: f32| {
+            proposal.setups[0].operations[0].clearance = Some(clearance);
+            build(&doc, &mesh, report, proposal).map_or_else(|p| messages(Err(p)), |_| vec![])
+        };
+        // Z travel unknown: 300 mm is accepted, a hair above it is not.
+        report.machine.travel[2] = 0.;
+        assert_eq!(clearance_cap(&report), 300.);
+        assert!(ask(&mut proposal, &report, 300.).is_empty());
+        assert_eq!(
+            ask(&mut proposal, &report, 500_000.),
+            ["1/Some(1): clearance 500000 is above the largest this machine allows, 300 mm."]
+        );
+        // Known: the travel is the cap, even above 300.
+        report.machine.travel[2] = 450.;
+        assert_eq!(clearance_cap(&report), 450.);
+        assert!(ask(&mut proposal, &report, 450.).is_empty());
+        assert_eq!(
+            ask(&mut proposal, &report, 450.5),
+            ["1/Some(1): clearance 450.5 is above the largest this machine allows, 450 mm."]
+        );
+        // A travel under the default still leaves the default usable.
+        report.machine.travel[2] = 10.;
+        assert_eq!(clearance_cap(&report), CLEARANCE);
     }
     #[test]
     fn clearance_is_the_proposals_to_raise_and_never_below_the_default() {
