@@ -13,6 +13,64 @@ pub struct Settings {
     pub plan_notice_shown: bool,
     /// The AI planner may not show the model pictures of the part.
     pub plan_pictures_off: bool,
+    /// The Work page's layout as the user left it.
+    pub layout: Layout,
+}
+/// The browser or the inspector: the sidebars beside the Work page's 3D view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Browser,
+    Inspector,
+}
+/// The Work page's layout as the user left it: each sidebar's width and
+/// whether it is open, and whether the operation inspector's About
+/// disclosure is open. The widths are what was dragged; `ui::fitted` gives
+/// what the window has room for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layout {
+    pub browser_width: f32,
+    pub inspector_width: f32,
+    pub browser_open: bool,
+    pub inspector_open: bool,
+    pub strategy_help_open: bool,
+}
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            browser_width: crate::ui::BROWSER.default,
+            inspector_width: crate::ui::INSPECTOR.default,
+            browser_open: true,
+            inspector_open: true,
+            strategy_help_open: false,
+        }
+    }
+}
+impl Layout {
+    pub fn width(&self, side: Side) -> f32 {
+        match side {
+            Side::Browser => self.browser_width,
+            Side::Inspector => self.inspector_width,
+        }
+    }
+    pub fn width_mut(&mut self, side: Side) -> &mut f32 {
+        match side {
+            Side::Browser => &mut self.browser_width,
+            Side::Inspector => &mut self.inspector_width,
+        }
+    }
+    pub fn open(&self, side: Side) -> bool {
+        match side {
+            Side::Browser => self.browser_open,
+            Side::Inspector => self.inspector_open,
+        }
+    }
+    pub fn open_mut(&mut self, side: Side) -> &mut bool {
+        match side {
+            Side::Browser => &mut self.browser_open,
+            Side::Inspector => &mut self.inspector_open,
+        }
+    }
 }
 pub fn path(state_path: &Path) -> PathBuf {
     state_path.with_file_name("settings.json")
@@ -181,6 +239,54 @@ mod tests {
         )
         .unwrap();
         assert!(!load(&path).plan_pictures_off);
+    }
+    /// The Work page's layout is saved with the settings, and a file saved
+    /// before it existed, or with some of its fields, reads as the defaults
+    /// for what it lacks (#76, #77).
+    #[test]
+    fn the_work_page_layout_is_saved_and_a_file_without_it_reads_as_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let fresh = load(&path).layout;
+        assert_eq!(fresh, Layout::default());
+        assert!(fresh.browser_open && fresh.inspector_open && !fresh.strategy_help_open);
+        assert_eq!(
+            (fresh.browser_width, fresh.inspector_width),
+            (crate::ui::BROWSER.default, crate::ui::INSPECTOR.default)
+        );
+        let mut s = load(&path);
+        s.layout = Layout {
+            browser_width: 300.,
+            inspector_width: 400.,
+            browser_open: false,
+            inspector_open: true,
+            strategy_help_open: true,
+        };
+        save(&path, &s).unwrap();
+        assert_eq!(load(&path), s);
+        for (side, width, open) in [(Side::Browser, 300., false), (Side::Inspector, 400., true)] {
+            assert_eq!(s.layout.width(side), width);
+            assert_eq!(s.layout.open(side), open);
+        }
+        std::fs::write(
+            &path,
+            br#"{"host_id":"urn:uuid:3b241101-e2bb-4255-8caf-4136c566a962","layout":{"inspector_width":500}}"#,
+        )
+        .unwrap();
+        let partial = load(&path).layout;
+        assert_eq!(
+            partial,
+            Layout {
+                inspector_width: 500.,
+                ..Layout::default()
+            }
+        );
+        std::fs::write(
+            &path,
+            br#"{"host_id":"urn:uuid:3b241101-e2bb-4255-8caf-4136c566a962","model":"gpt-6.1-sol"}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&path).layout, Layout::default());
     }
     const V4: &str = "3f2b8c1e-9d4a-4e6f-a1b2-0c9d8e7f6a5b";
     fn saved_with(host_id: &str) -> (tempfile::TempDir, PathBuf) {

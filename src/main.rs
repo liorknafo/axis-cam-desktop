@@ -114,6 +114,11 @@ fn read_saved_session(
 /// How long edits must pause before the project is saved and the stock the
 /// earlier setups left is worked out again.
 const EDIT_PAUSE: Duration = Duration::from_millis(700);
+/// The window's size when it opens, and the least it can be made: the Work
+/// page's sidebars leave the 3D view `ui::VIEW_MIN` wide at the least
+/// (`ui::fitted`).
+pub(crate) const WINDOW: Size = Size::new(1440., 930.);
+pub(crate) const MIN_WINDOW: Size = Size::new(1120., 720.);
 /// Sends the user to a URL in their browser; see `App::open_browser`.
 type BrowserOpener = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 /// A loaded project, its path, and the notes of the load (`load_reporting`).
@@ -224,7 +229,18 @@ pub enum Message {
     ToggleStock,
     ToggleUncut,
     TogglePaths,
+    /// A named view of the 3D view, or "FIT": the scene fitted again in the
+    /// view it has.
     Camera(&'static str),
+    /// Opens or closes the browser or the inspector beside the 3D view.
+    ToggleSidebar(settings::Side),
+    /// A sidebar's handle dragged to this width; true once the drag has
+    /// ended, when the layout is saved.
+    SidebarWidth(settings::Side, f32, bool),
+    /// Opens or closes the operation inspector's About disclosure.
+    ToggleStrategyHelp,
+    /// The window is this wide, in logical pixels.
+    Resized(f32),
     Viewport(viewport::Event),
     /// Orbit, pan or zoom in the plan preview's 3D view.
     PlanViewport(viewport::Event),
@@ -683,6 +699,9 @@ pub struct App {
     /// does not read correctly; the setup keeps its last good text.
     pub clamps_draft: Option<ClampsDraft>,
     pub camera: viewport::Camera,
+    /// The window's width, in logical pixels, from its last resize; the
+    /// Work page's sidebars are fitted to it (`ui::fitted`).
+    pub window_width: f32,
     pub sample_mesh: mesh::Mesh,
     pub imported_mesh: Option<mesh::Mesh>,
     pub import_busy: bool,
@@ -799,6 +818,10 @@ fn while_locked(m: &Message) -> bool {
             | ToggleUncut
             | TogglePaths
             | Camera(_)
+            | ToggleSidebar(_)
+            | SidebarWidth(..)
+            | ToggleStrategyHelp
+            | Resized(_)
             | Viewport(_)
             | PlanViewport(_)
             | Speed(_)
@@ -1080,6 +1103,7 @@ impl App {
             open_browser: std::sync::Arc::new(oauth::open_browser),
             account_restored: false,
             camera: viewport::Camera::default(),
+            window_width: WINDOW.width,
             sample_mesh: mesh::sample(),
             imported_mesh,
             import_busy: false,
@@ -3566,6 +3590,12 @@ impl App {
             Message::TogglePaths => self.paths = !self.paths,
             Message::Camera(view) => {
                 self.camera = match view {
+                    // The scene fitted again, from where the view looks.
+                    "FIT" => viewport::Camera {
+                        zoom: 1.,
+                        pan: [0., 0.],
+                        ..self.camera
+                    },
                     "TOP" => viewport::Camera {
                         yaw: 0.,
                         pitch: std::f32::consts::FRAC_PI_2,
@@ -3584,6 +3614,24 @@ impl App {
                     _ => Default::default(),
                 };
             }
+            Message::ToggleSidebar(side) => {
+                let open = self.settings.layout.open_mut(side);
+                *open = !*open;
+                self.save_settings();
+            }
+            Message::SidebarWidth(side, width, done) => {
+                let layout = &mut self.settings.layout;
+                *layout.width_mut(side) = ui::clamped(layout, side, width, self.window_width);
+                if done {
+                    self.save_settings();
+                }
+            }
+            Message::ToggleStrategyHelp => {
+                let layout = &mut self.settings.layout;
+                layout.strategy_help_open = !layout.strategy_help_open;
+                self.save_settings();
+            }
+            Message::Resized(width) => self.window_width = width,
             Message::PlanViewport(e) => steer(&mut self.plan_camera, &e),
             Message::Viewport(e) => match e {
                 viewport::Event::Orbit(..)
@@ -4376,6 +4424,9 @@ fn on_event(
 ) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Close(window)),
+        iced::Event::Window(
+            iced::window::Event::Resized(size) | iced::window::Event::Opened { size, .. },
+        ) => Some(Message::Resized(size.width)),
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Character(c),
             modifiers,
@@ -4811,8 +4862,8 @@ fn main() -> iced::Result {
         ))
         .subscription(App::subscription)
         .window(iced::window::Settings {
-            size: Size::new(1440., 930.),
-            min_size: Some(Size::new(1120., 720.)),
+            size: WINDOW,
+            min_size: Some(MIN_WINDOW),
             exit_on_close_request: false,
             ..Default::default()
         })

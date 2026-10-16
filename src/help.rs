@@ -554,7 +554,19 @@ pub fn command(m: &Message, label: String) -> Help {
             "Look down the setup Z axis onto its XY plane. This changes the camera, not the machining setup."
         }
         Camera("FRONT") => "View the setup from the front along Y. This changes the camera only.",
+        Camera("FIT") => {
+            "Fit the scene in the 3D view again from where it looks: the zoom and the pan go back, the direction stays. The part, the stock and the modelled workholding fill the view."
+        }
         Camera(_) => "View the setup from its right side along X. This changes the camera only.",
+        ToggleSidebar(crate::settings::Side::Browser) => {
+            "Hide the browser to give the 3D view its width, or show it again from the strip at the left edge. Drag the line between the browser and the 3D view to make it wider or narrower. Both are saved."
+        }
+        ToggleSidebar(crate::settings::Side::Inspector) => {
+            "Hide the inspector to give the 3D view its width, or show it again from the strip at the right edge. Drag the line between the 3D view and the inspector to make it wider or narrower. Both are saved."
+        }
+        ToggleStrategyHelp => {
+            "Show or hide what this strategy does and what it is available for in this build. The choice is saved and holds for every operation."
+        }
         Play => {
             "Play or pause cutter motion. For imported Facing or Pocket, generate the preview if needed and show sampled stock removal. Other imported strategies are not supported yet. The example project uses illustrative motion."
         }

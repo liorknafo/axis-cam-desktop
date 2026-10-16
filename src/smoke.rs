@@ -9197,9 +9197,9 @@ flood = { pin = 8 }
         a.page = Page::Work;
         let before = crate::ui::browser(&a);
         let (outside, scrolls) = outside_scrolls(before);
-        // The browser holds no button outside its scroll: the count and the
-        // footer are text.
-        assert_eq!((outside, scrolls), (0, 1));
+        // The browser holds one button outside its scroll, Hide (#76): the
+        // count and the footer are text.
+        assert_eq!((outside, scrolls), (1, 1));
         let ops = a.doc.setups[0].operations.len();
         assert!(ops > 0);
         a.doc.setups[0].operations[0]
@@ -9207,7 +9207,7 @@ flood = { pin = 8 }
             .insert("name".into(), long.into());
         a.doc.setups[0].p.insert("name".into(), long.into());
         let _ = a.view();
-        assert_eq!(outside_scrolls(crate::ui::browser(&a)), (0, 1));
+        assert_eq!(outside_scrolls(crate::ui::browser(&a)), (1, 1));
     }
 
     fn fresh_app(dir: &tempfile::TempDir) -> App {
@@ -13258,5 +13258,234 @@ flood = { pin = 8 }
                 .setup_sheet(None)
                 .contains("Requested fixture clearance (not checked): not set\n\n")
         );
+    }
+    /// The example on the Work page, in its own folder, so that the settings
+    /// saved beside it can be read back.
+    fn sample_in(dir: &tempfile::TempDir) -> App {
+        let mut a = fresh_app(dir);
+        a.doc = Document::sample();
+        a.selected = Some(0);
+        a.page = Page::Work;
+        a
+    }
+    /// Beside the 3D view the browser and the inspector fold to a strip and
+    /// resize by their handles; the 3D view keeps its least width in the
+    /// window at its least; the layout is saved with the settings and a new
+    /// app starts with it (#76).
+    #[test]
+    fn the_sidebars_fold_and_resize_and_the_layout_is_saved() {
+        use crate::settings::{self, Side};
+        use iced::advanced::widget::Tree;
+        fn nodes(t: &Tree) -> usize {
+            1 + t.children.iter().map(nodes).sum::<usize>()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let settings_file = settings::path(&dir.path().join("workspace.json"));
+        let mut a = sample_in(&dir);
+        let layout = |a: &App| a.settings.layout.clone();
+        assert_eq!(layout(&a), settings::Layout::default());
+        let browser = |a: &App| nodes(&Tree::new(crate::ui::browser(a).as_widget()));
+        let inspector = |a: &App| nodes(&Tree::new(crate::ui::inspector(a).as_widget()));
+        let (open_browser, open_inspector) = (browser(&a), inspector(&a));
+        // Hide: each sidebar becomes its strip, with the Show button only.
+        let _ = a.update(Message::ToggleSidebar(Side::Browser));
+        assert!(!layout(&a).browser_open && layout(&a).inspector_open);
+        assert!(browser(&a) < open_browser);
+        assert_eq!(inspector(&a), open_inspector);
+        let _ = a.update(Message::ToggleSidebar(Side::Inspector));
+        assert!(!layout(&a).inspector_open);
+        assert!(inspector(&a) < open_inspector);
+        let _ = a.view();
+        // Both choices are saved at once.
+        assert_eq!(settings::load(&settings_file).layout, layout(&a));
+        // Show again.
+        let _ = a.update(Message::ToggleSidebar(Side::Browser));
+        let _ = a.update(Message::ToggleSidebar(Side::Inspector));
+        assert_eq!(layout(&a), settings::Layout::default());
+        assert_eq!((browser(&a), inspector(&a)), (open_browser, open_inspector));
+        // A drag moves the width while it goes and saves it when it ends.
+        let _ = a.update(Message::SidebarWidth(Side::Browser, 300., false));
+        assert_eq!(layout(&a).browser_width, 300.);
+        assert_eq!(
+            settings::load(&settings_file).layout.browser_width,
+            crate::ui::BROWSER.default
+        );
+        let _ = a.update(Message::SidebarWidth(Side::Browser, 310., true));
+        assert_eq!(settings::load(&settings_file).layout.browser_width, 310.);
+        // Dragged past its range, a sidebar stops at the range's end.
+        let _ = a.update(Message::SidebarWidth(Side::Inspector, 9999., true));
+        assert_eq!(layout(&a).inspector_width, crate::ui::INSPECTOR.max);
+        let _ = a.update(Message::SidebarWidth(Side::Inspector, 1., true));
+        assert_eq!(layout(&a).inspector_width, crate::ui::INSPECTOR.min);
+        let _ = a.update(Message::SidebarWidth(Side::Browser, 9999., true));
+        assert_eq!(layout(&a).browser_width, crate::ui::BROWSER.max);
+        // In the window at its least width the 3D view keeps its least: the
+        // browser, as drawn, gives way first.
+        let least = crate::MIN_WINDOW.width;
+        let _ = a.update(Message::Resized(least));
+        assert_eq!(a.window_width, least);
+        let l = layout(&a);
+        let (b, i) = crate::ui::fitted(&l, least);
+        assert!(b < l.browser_width && i == l.inspector_width, "{b} {i}");
+        assert!(crate::ui::view_width(&l, least) >= crate::ui::VIEW_MIN);
+        // The inspector dragged wide there pushes the browser to its least
+        // and stops where the view keeps its least; the browser's saved
+        // width is kept for a wider window.
+        let _ = a.update(Message::SidebarWidth(Side::Inspector, 9999., true));
+        let l = layout(&a);
+        assert!(
+            l.inspector_width > crate::ui::INSPECTOR.min
+                && l.inspector_width < crate::ui::INSPECTOR.max,
+            "{}",
+            l.inspector_width
+        );
+        assert_eq!(
+            crate::ui::fitted(&l, least),
+            (crate::ui::BROWSER.min, l.inspector_width)
+        );
+        assert_eq!(crate::ui::view_width(&l, least), crate::ui::VIEW_MIN);
+        assert_eq!(l.browser_width, crate::ui::BROWSER.max);
+        assert_eq!(
+            crate::ui::fitted(&l, 1920.),
+            (l.browser_width, l.inspector_width)
+        );
+        // The page builds at both window widths.
+        let _ = a.view();
+        let _ = a.update(Message::Resized(1920.));
+        let _ = a.view();
+        // A new app on the same workspace starts with the saved layout.
+        assert_eq!(fresh_app(&dir).settings.layout, l);
+    }
+    /// Fit beside the camera views puts the scene back in the 3D view from
+    /// where it looks: the zoom and the pan go back, the direction stays
+    /// (#76).
+    #[test]
+    fn fit_refits_the_scene_and_keeps_the_views_direction() {
+        use crate::viewport::Event;
+        let mut a = app();
+        let start = a.camera;
+        for e in [
+            Event::Orbit(0.3, 0.2),
+            Event::Zoom(0.5),
+            Event::Pan(30., -20.),
+        ] {
+            let _ = a.update(Message::Viewport(e));
+        }
+        let moved = a.camera;
+        assert!(moved.zoom != 1. && moved.pan != [0., 0.] && moved.yaw != start.yaw);
+        let _ = a.update(Message::Camera("FIT"));
+        assert_eq!((a.camera.zoom, a.camera.pan), (1., [0., 0.]));
+        assert_eq!((a.camera.yaw, a.camera.pitch), (moved.yaw, moved.pitch));
+        // The named views still set the direction.
+        let _ = a.update(Message::Camera("TOP"));
+        assert_eq!(a.camera.pitch, std::f32::consts::FRAC_PI_2);
+        // The button has its own help, and the page builds with it.
+        let help = crate::help::command(&Message::Camera("FIT"), "Fit".into()).body;
+        assert!(
+            help.contains("zoom") && help.contains("direction stays"),
+            "{help}"
+        );
+        let _ = a.view();
+    }
+    /// The operation inspector pins the operation's identity and one row of
+    /// tabs above a scrolling body of parameters, and the checks, Generate
+    /// and the operation's actions under it; the strategy's explanation is
+    /// behind a disclosure, closed unless opened, and the choice is saved.
+    /// The setup editor pins its title and steps and its actions the same
+    /// way (#77).
+    #[test]
+    fn the_inspector_pins_the_identity_tabs_and_generate_and_scrolls_the_parameters() {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        /// The buttons in a widget tree, by the state a button keeps.
+        fn buttons(t: &Tree, button: Tag) -> usize {
+            usize::from(t.tag == button)
+                + t.children.iter().map(|c| buttons(c, button)).sum::<usize>()
+        }
+        /// The subtrees that are scrollables.
+        fn scrollables<'t>(t: &'t Tree, scrollable: Tag, found: &mut Vec<&'t Tree>) {
+            if t.tag == scrollable {
+                found.push(t);
+            }
+            for c in &t.children {
+                scrollables(c, scrollable, found);
+            }
+        }
+        fn nodes(t: &Tree) -> usize {
+            1 + t.children.iter().map(nodes).sum::<usize>()
+        }
+        let button =
+            Tree::new(iced::Element::<Message>::from(iced::widget::button("x")).as_widget()).tag;
+        let scrollable = Tree::new(
+            iced::Element::<Message>::from(iced::widget::scrollable(iced::widget::text("x")))
+                .as_widget(),
+        )
+        .tag;
+        let dir = tempfile::tempdir().unwrap();
+        let settings_file = crate::settings::path(&dir.path().join("workspace.json"));
+        let mut a = sample_in(&dir);
+        // The buttons pinned outside the one scrolling body, and those in it.
+        let split = |a: &App| {
+            let tree = Tree::new(crate::ui::inspector(a).as_widget());
+            let mut scrolls = Vec::new();
+            scrollables(&tree, scrollable, &mut scrolls);
+            assert_eq!(scrolls.len(), 1, "one scrolling body");
+            let inside = buttons(scrolls[0], button);
+            (buttons(&tree, button) - inside, inside)
+        };
+        let strategy = a.operation().unwrap().strategy;
+        assert_eq!(strategy, Strategy::Face);
+        let tabs = strategy.tabs();
+        assert_eq!(tabs.len(), 5);
+        // Pinned: Hide, the five tabs, Generate, Duplicate, Suppress, Delete,
+        // Move up and Move down; scrolling: the About disclosure, the tools
+        // and the tool library at least.
+        let (pinned, scrolled) = split(&a);
+        assert_eq!(pinned, 1 + 5 + 1 + 3 + 2);
+        assert!(scrolled >= 2 + a.doc.tools.len(), "{scrolled}");
+        for t in &tabs {
+            let _ = a.update(Message::Tab(t.to_string()));
+            assert_eq!(split(&a).0, 12, "{t}");
+            let _ = a.view();
+        }
+        let _ = a.update(Message::Tab("Tool".into()));
+        // The strategy's explanation: behind the disclosure, closed at first,
+        // and the choice is saved.
+        assert!(!a.settings.layout.strategy_help_open);
+        let closed = nodes(&Tree::new(crate::ui::inspector(&a).as_widget()));
+        let _ = a.update(Message::ToggleStrategyHelp);
+        assert!(a.settings.layout.strategy_help_open);
+        assert!(nodes(&Tree::new(crate::ui::inspector(&a).as_widget())) > closed);
+        assert_eq!(split(&a), (pinned, scrolled));
+        assert!(
+            crate::settings::load(&settings_file)
+                .layout
+                .strategy_help_open
+        );
+        assert!(fresh_app(&dir).settings.layout.strategy_help_open);
+        let _ = a.view();
+        let _ = a.update(Message::ToggleStrategyHelp);
+        assert_eq!(
+            nodes(&Tree::new(crate::ui::inspector(&a).as_widget())),
+            closed
+        );
+        assert!(
+            !crate::settings::load(&settings_file)
+                .layout
+                .strategy_help_open
+        );
+        // The setup editor: Hide, the four steps, Duplicate setup, Move up,
+        // Move down and Delete setup… pinned; the step's fields scroll.
+        let _ = a.update(Message::SetupEditor);
+        let (pinned, scrolled) = split(&a);
+        assert_eq!(pinned, 1 + crate::ui::SETUP_STEPS.len() + 1 + 2 + 1);
+        assert!(scrolled >= 1, "{scrolled}");
+        let _ = a.view();
+        // With no setup, the inspector still has its one scrolling body.
+        a.doc = Document::default();
+        a.doc.sample_model = true;
+        a.selected = None;
+        let (pinned, scrolled) = split(&a);
+        assert_eq!((pinned, scrolled), (1, 2));
+        let _ = a.view();
     }
 }

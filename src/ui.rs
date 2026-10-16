@@ -5,15 +5,16 @@ use crate::{
     material::SpeedFeed,
     model::*,
     planner::Dropped,
+    settings::{Layout, Side},
     viewport::{self, Viewport},
 };
 use iced::{
     Alignment, Border, Color, Element, Font,
     Length::{self, Fill},
-    Theme,
+    Point, Rectangle, Theme, mouse,
     widget::{
-        self, Column, Row, button, canvas, checkbox, column, container, mouse_area, pick_list, row,
-        rule, scrollable, slider, space, svg, text, text::Wrapping, text_input,
+        self, Action, Column, Row, button, canvas, checkbox, column, container, mouse_area,
+        pick_list, row, rule, scrollable, slider, space, svg, text, text::Wrapping, text_input,
     },
 };
 const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
@@ -469,10 +470,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let body: Element<_> = match app.page {
         Page::Home => start_screen(app),
         Page::Work if !app.doc.has_model() && app.doc.setups.is_empty() => blank_project(app),
-        Page::Work => row![browser(app), workspace(app), inspector(app)]
-            .spacing(0)
-            .height(Fill)
-            .into(),
+        Page::Work => work_page(app),
         Page::Machines => machines(app),
         Page::Control => control(app),
         Page::Wizard => wizard(app),
@@ -611,14 +609,19 @@ fn blank_project(app: &App) -> Element<'_, Message> {
     .center(Fill)
     .into()
 }
-fn first_setup(app: &App) -> Element<'_, Message> {
-    column![
-        bold("No setups yet", 22),
-        text("Your model is ready to view. Choose the machine and workholding for its first machining position.").size(14),
-        primary("Create first setup",Message::AddSetup).width(Fill),
-        btn(if app.doc.machines.is_empty() {"New machine profile"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)},false).width(Fill),
-        note("Each setup starts with zero operations. Add another setup when the part needs to be flipped, indexed or reclamped.")
-    ].spacing(18).into()
+fn first_setup(app: &App) -> Panel<'_> {
+    Panel {
+        head: row![bold("No setups yet", 22).width(Fill), fold(app, Side::Inspector)]
+            .align_y(Alignment::Center)
+            .into(),
+        body: column![
+            text("Your model is ready to view. Choose the machine and workholding for its first machining position.").size(14),
+            primary("Create first setup",Message::AddSetup).width(Fill),
+            btn(if app.doc.machines.is_empty() {"New machine profile"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)},false).width(Fill),
+            note("Each setup starts with zero operations. Add another setup when the part needs to be flipped, indexed or reclamped.")
+        ].spacing(18).into(),
+        foot: None,
+    }
 }
 fn ribbon(app: &App) -> Element<'_, Message> {
     let mut groups = Row::new().spacing(9).align_y(Alignment::Center);
@@ -714,15 +717,250 @@ pub(crate) fn ellipsize(name: &str, max: usize) -> String {
     let kept: String = name.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", kept.trim_end())
 }
+/// A sidebar's widths: the least it can be dragged to, what it starts at,
+/// and the most.
+pub(crate) struct Widths {
+    pub min: f32,
+    pub default: f32,
+    pub max: f32,
+}
+pub(crate) const BROWSER: Widths = Widths {
+    min: 170.,
+    default: 230.,
+    max: 420.,
+};
+pub(crate) const INSPECTOR: Widths = Widths {
+    min: 320.,
+    default: 350.,
+    max: 560.,
+};
+/// The least the 3D view is wide between the sidebars, whatever the window.
+pub(crate) const VIEW_MIN: f32 = 500.;
+/// The handle between a sidebar and the 3D view.
+const GRIP: f32 = 7.;
+/// A closed sidebar: the strip that holds its Show button.
+const STRIP: f32 = 28.;
+/// The inspector's padding; its scrolling body keeps `SCROLLBAR_GUTTER` too.
+const INSPECTOR_PAD: f32 = 15.;
+fn widths(side: Side) -> Widths {
+    match side {
+        Side::Browser => BROWSER,
+        Side::Inspector => INSPECTOR,
+    }
+}
+/// What a sidebar takes before the view's room is counted: its strip when
+/// closed, else its saved width cut to its range.
+fn wanted(layout: &Layout, side: Side) -> f32 {
+    if layout.open(side) {
+        let w = widths(side);
+        layout.width(side).clamp(w.min, w.max)
+    } else {
+        STRIP
+    }
+}
+/// The least a sidebar can be narrowed to: its strip when closed, else its
+/// minimum.
+fn least(layout: &Layout, side: Side) -> f32 {
+    if layout.open(side) {
+        widths(side).min
+    } else {
+        STRIP
+    }
+}
+/// The widths the Work page gives the browser and the inspector in a window
+/// `window` wide: what each wants (`wanted`), and when that leaves the 3D
+/// view between them less than `VIEW_MIN`, the browser narrowed to its
+/// least first and the inspector after it. At the window's least width
+/// (`crate::MIN_WINDOW`) the defaults leave the view wider than `VIEW_MIN`.
+pub(crate) fn fitted(layout: &Layout, window: f32) -> (f32, f32) {
+    let room = window - VIEW_MIN - 2. * GRIP;
+    let (mut b, mut i) = (
+        wanted(layout, Side::Browser),
+        wanted(layout, Side::Inspector),
+    );
+    if b + i > room {
+        b = b.min((room - i).max(least(layout, Side::Browser)));
+    }
+    if b + i > room {
+        i = i.min((room - b).max(least(layout, Side::Inspector)));
+    }
+    (b, i)
+}
+/// What the 3D view is wide between the sidebars in a window `window` wide,
+/// the handles of the open sidebars counted.
+#[cfg(test)]
+pub(crate) fn view_width(layout: &Layout, window: f32) -> f32 {
+    let (b, i) = fitted(layout, window);
+    let grips = [Side::Browser, Side::Inspector]
+        .into_iter()
+        .filter(|&s| layout.open(s))
+        .count() as f32;
+    window - b - i - grips * GRIP
+}
+/// `width` as a sidebar may be dragged to in a window `window` wide: within
+/// its range, and leaving the 3D view `VIEW_MIN`. The inspector may push the
+/// browser down to its least (`fitted` narrows the browser first); the
+/// browser stops where the inspector keeps its width.
+pub(crate) fn clamped(layout: &Layout, side: Side, width: f32, window: f32) -> f32 {
+    let w = widths(side);
+    let keep = match side {
+        Side::Browser => wanted(layout, Side::Inspector),
+        Side::Inspector => least(layout, Side::Browser),
+    };
+    let most = (window - VIEW_MIN - 2. * GRIP - keep).min(w.max).max(w.min);
+    width.clamp(w.min, most)
+}
+/// The handle between a sidebar and the 3D view: dragging it sets the
+/// sidebar's width. `width` is what the sidebar is drawn at, which a drag
+/// starts from.
+struct Grip {
+    side: Side,
+    width: f32,
+}
+/// Where the pointer pressed and the sidebar's width then, while it drags.
+#[derive(Default)]
+struct GripDrag(Option<(f32, f32)>);
+impl Grip {
+    /// The sidebar's width with the pointer moved from `from` to `x`: the
+    /// browser's edge follows the pointer, the inspector's goes the other
+    /// way.
+    fn dragged(&self, from: f32, width: f32, x: f32) -> f32 {
+        match self.side {
+            Side::Browser => width + (x - from),
+            Side::Inspector => width - (x - from),
+        }
+    }
+}
+impl canvas::Program<Message> for Grip {
+    type State = GripDrag;
+    fn update(
+        &self,
+        state: &mut GripDrag,
+        event: &canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<Action<Message>> {
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let p = cursor.position_over(bounds)?;
+                state.0 = Some((p.x, self.width));
+                Some(Action::capture())
+            }
+            // The drag goes on wherever the pointer is, as in the 3D view.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let (from, width) = state.0?;
+                let p = cursor.position()?;
+                Some(
+                    Action::publish(Message::SidebarWidth(
+                        self.side,
+                        self.dragged(from, width, p.x),
+                        false,
+                    ))
+                    .and_capture(),
+                )
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                let (from, width) = state.0.take()?;
+                let to = cursor
+                    .position()
+                    .map_or(width, |p| self.dragged(from, width, p.x));
+                Some(Action::publish(Message::SidebarWidth(self.side, to, true)).and_capture())
+            }
+            _ => None,
+        }
+    }
+    fn draw(
+        &self,
+        state: &GripDrag,
+        renderer: &iced::Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let live = state.0.is_some() || cursor.is_over(bounds);
+        let width = if live { 3. } else { 1. };
+        frame.fill_rectangle(
+            Point::new(((bounds.width - width) / 2.).floor(), 0.),
+            iced::Size::new(width, bounds.height),
+            if live { BLUE } else { LINE },
+        );
+        vec![frame.into_geometry()]
+    }
+    fn mouse_interaction(
+        &self,
+        state: &GripDrag,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if state.0.is_some() || cursor.is_over(bounds) {
+            mouse::Interaction::ResizingHorizontally
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+}
+fn grip<'a>(side: Side, width: f32) -> Element<'a, Message> {
+    canvas(Grip { side, width }).width(GRIP).height(Fill).into()
+}
+/// A sidebar's Hide or Show button: ‹ and › point the way the sidebar goes.
+fn fold<'a>(app: &App, side: Side) -> Element<'a, Message> {
+    let (glyph, label) = match (side, app.settings.layout.open(side)) {
+        (Side::Browser, true) => ("‹", "Hide the browser"),
+        (Side::Browser, false) => ("›", "Show the browser"),
+        (Side::Inspector, true) => ("›", "Hide the inspector"),
+        (Side::Inspector, false) => ("‹", "Show the inspector"),
+    };
+    let msg = Message::ToggleSidebar(side);
+    let b = button(text(glyph).size(15).align_x(Alignment::Center).width(Fill))
+        .on_press(msg.clone())
+        .padding([1, 2])
+        .width(22)
+        .style(|_, st| flat(false, st));
+    HelpButton::new(b, &msg, label).into()
+}
+/// A closed sidebar: a strip at the window's edge with its Show button.
+fn strip<'a>(app: &App, side: Side) -> Element<'a, Message> {
+    container(fold(app, side))
+        .padding([10, 3])
+        .width(STRIP)
+        .height(Fill)
+        .style(panel_style)
+        .into()
+}
+/// The Work page: the browser, the 3D view and the inspector, with a handle
+/// between the view and each open sidebar.
+fn work_page(app: &App) -> Element<'_, Message> {
+    let layout = &app.settings.layout;
+    let (bw, iw) = fitted(layout, app.window_width);
+    let mut r = Row::new().height(Fill).push(browser(app));
+    if layout.open(Side::Browser) {
+        r = r.push(grip(Side::Browser, bw));
+    }
+    r = r.push(workspace(app));
+    if layout.open(Side::Inspector) {
+        r = r.push(grip(Side::Inspector, iw));
+    }
+    r.push(inspector(app)).into()
+}
 pub(crate) fn browser(app: &App) -> Element<'_, Message> {
-    // The count and the rule stay put above the scrolling tree, so the
-    // scrollbar, drawn over the content's right edge, never covers the count.
+    let layout = &app.settings.layout;
+    if !layout.open(Side::Browser) {
+        return strip(app, Side::Browser);
+    }
+    let (width, _) = fitted(layout, app.window_width);
+    // The count, the Hide button and the rule stay put above the scrolling
+    // tree, so the scrollbar, drawn over the content's right edge, never
+    // covers them.
     let header = column![
         row![
             bold("BROWSER", 11),
             space().width(Fill),
-            muted(format!("{} setups", app.doc.setups.len()))
-        ],
+            muted(format!("{} setups", app.doc.setups.len())),
+            fold(app, Side::Browser)
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
         rule::horizontal(1)
     ]
     .spacing(9);
@@ -873,7 +1111,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
     });
     container(column![header, scrollable(tree).height(Fill), footer].spacing(12))
         .padding(14)
-        .width(230)
+        .width(width)
         .height(Fill)
         .style(panel_style)
         .into()
@@ -1128,6 +1366,8 @@ fn workspace(app: &App) -> Element<'_, Message> {
             ]
             .spacing(3),
             space().width(Fill),
+            btn("Fit", Message::Camera("FIT"), false),
+            space().width(6),
             btn("ISO", Message::Camera("ISO"), false),
             btn("TOP", Message::Camera("TOP"), false),
             btn("FRONT", Message::Camera("FRONT"), false),
@@ -1372,51 +1612,107 @@ pub(crate) fn stock_surface_details(app: &App) -> Option<String> {
         None => Some("Building stock surface…".into()),
     }
 }
-fn inspector(app: &App) -> Element<'_, Message> {
-    let content = if app.doc.active_setup().is_none() {
+/// What the inspector shows: `head` and `foot` stay put, `body` scrolls.
+struct Panel<'a> {
+    head: Element<'a, Message>,
+    body: Element<'a, Message>,
+    foot: Option<Element<'a, Message>>,
+}
+pub(crate) fn inspector(app: &App) -> Element<'_, Message> {
+    let layout = &app.settings.layout;
+    if !layout.open(Side::Inspector) {
+        return strip(app, Side::Inspector);
+    }
+    let (_, width) = fitted(layout, app.window_width);
+    let panel = if app.doc.active_setup().is_none() {
         first_setup(app)
     } else if let Some(o) = app.operation() {
         operation_editor(app, o)
     } else {
         setup_editor(app)
     };
-    container(
-        scrollable(container(content).width(304))
+    // The body's scrollbar is drawn over its right edge: the content stops
+    // short of it, and the fixed parts line up with the content.
+    let inner = width - 2. * INSPECTOR_PAD - SCROLLBAR_GUTTER;
+    let mut c = column![
+        container(panel.head).width(inner),
+        scrollable(container(panel.body).width(inner))
             .id("inspector")
             .width(Fill)
-            .height(Fill),
-    )
-    .padding(15)
-    .width(350)
-    .height(Fill)
-    .style(panel_style)
-    .into()
-}
-fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
-    let mut c = column![
-        row![
-            icon(app, o.strategy, 30.),
-            column![bold(o.strategy.name(), 17), muted("Operation parameters")].spacing(2)
-        ]
-        .spacing(9)
-        .align_y(Alignment::Center),
-        field(&o.p, "name", "Operation name", Target::Operation),
-        note(o.strategy.help())
+            .height(Fill)
     ]
-    .spacing(13);
-    let mut tabs = Column::new().spacing(2);
+    .spacing(12);
+    if let Some(foot) = panel.foot {
+        c = c.push(container(foot).width(inner));
+    }
+    container(c)
+        .padding(INSPECTOR_PAD)
+        .width(width)
+        .height(Fill)
+        .style(panel_style)
+        .into()
+}
+/// A tab of the operation inspector: its label centred, so that a row of
+/// them, each a `FillPortion`, reads as one width.
+fn tab<'a>(label: &'static str, active: bool) -> HelpButton<'a> {
+    let msg = Message::Tab(label.to_string());
+    let b = button(text(label).size(11).align_x(Alignment::Center).width(Fill))
+        .on_press(msg.clone())
+        .padding([7, 2])
+        .style(move |_, st| flat(active, st));
+    HelpButton::new(b, &msg, label).width(Length::FillPortion(1))
+}
+/// A row that opens or closes what follows it: ▸ closed, ▾ open.
+fn about<'a>(label: String, open: bool) -> Element<'a, Message> {
+    let msg = Message::ToggleStrategyHelp;
+    let b = button(
+        row![
+            text(if open { "▾" } else { "▸" }).size(11),
+            text(label.clone()).size(12)
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press(msg.clone())
+    .padding([5, 8])
+    .width(Fill)
+    .style(|_, st| flat(false, st));
+    HelpButton::new(b, &msg, label).into()
+}
+fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
+    // Pinned: the operation's identity and its tabs, in rows of one width.
+    let identity = row![
+        icon(app, o.strategy, 30.),
+        column![bold(o.strategy.name(), 17), muted("Operation parameters")]
+            .spacing(2)
+            .width(Fill),
+        fold(app, Side::Inspector)
+    ]
+    .spacing(9)
+    .align_y(Alignment::Center);
     let all = o.strategy.tabs();
-    for chunk in all.chunks(3) {
+    let mut tabs = Column::new().spacing(2);
+    // Five tabs fit one row; the sixth, Orientation, takes two rows of three.
+    for chunk in all.chunks(if all.len() > 5 { 3 } else { all.len().max(1) }) {
         let mut r = Row::new().spacing(1);
         for t in chunk {
-            r = r.push(
-                btn(*t, Message::Tab(t.to_string()), app.tab == *t).width(Length::FillPortion(1)),
-            );
+            r = r.push(tab(t, app.tab == *t));
         }
         tabs = tabs.push(r)
     }
-    c = c.push(tabs).push(rule::horizontal(1));
-    c = c.push(note(o.strategy.availability()));
+    let head = column![identity, tabs, rule::horizontal(1)].spacing(13);
+    let mut c = column![field(&o.p, "name", "Operation name", Target::Operation)].spacing(13);
+    // The strategy's explanation and availability, behind a disclosure that
+    // stays as it was left.
+    let open = app.settings.layout.strategy_help_open;
+    c = c.push(about(format!("About {}", o.strategy.name()), open));
+    if open {
+        c = c.push(note(format!(
+            "{}\n\n{}",
+            o.strategy.help(),
+            o.strategy.availability()
+        )));
+    }
     let p = &o.p;
     let t = Target::Operation;
     match app.tab.as_str() {
@@ -1820,11 +2116,12 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
         }
         _ => {}
     }
-    c = c.push(rule::horizontal(1)).push(warnings(app.op_issues()));
+    // Pinned under the body: the checks, Generate and the operation's actions.
+    let mut foot = column![rule::horizontal(1), warnings(app.op_issues())].spacing(13);
     if let Some((heading, lines)) = holding_warning(app) {
-        c = c.push(caution(heading, lines));
+        foot = foot.push(caution(heading, lines));
     }
-    c = c
+    foot = foot
         .push(
             primary(
                 if app.is_sample() {
@@ -1857,7 +2154,11 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> 
             ]
             .spacing(5),
         );
-    c.into()
+    Panel {
+        head: head.into(),
+        body: c.into(),
+        foot: Some(foot.into()),
+    }
 }
 fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     let p = &o.p;
@@ -2079,7 +2380,7 @@ fn outside_fixed_stock(s: &Setup, resolved: &crate::stock::ResolvedStock) -> boo
             })
         })
 }
-fn setup_editor(app: &App) -> Element<'_, Message> {
+fn setup_editor(app: &App) -> Panel<'_> {
     let s = app.doc.setup();
     let p = &s.p;
     let t = Target::Setup;
@@ -2103,37 +2404,43 @@ fn setup_editor(app: &App) -> Element<'_, Message> {
         }
         steps = steps.push(r);
     }
-    let c = column![
-        bold("Setup", 20),
+    // Pinned: the title and the steps; the step's fields scroll under them.
+    let head = column![
+        row![bold("Setup", 20).width(Fill), fold(app, Side::Inspector)].align_y(Alignment::Center),
         muted(
             "One position of the part on the machine: its machine, stock, placement and holding."
         ),
-        field(p, "name", "Setup name", t),
         steps,
     ]
     .spacing(12);
-    let mut c = match app.setup_step {
+    let c = column![field(p, "name", "Setup name", t)].spacing(12);
+    let c = match app.setup_step {
         "Stock" => setup_stock(app, c),
         "Position" => setup_position(app, c),
         "Holding" => setup_holding(app, c),
         _ => setup_machine(app, c),
     };
-    c = c
-        .push(warnings(s.issues()))
-        .push(btn("Duplicate setup", Message::DuplicateSetup, false).width(Fill))
-        .push(
-            row![
-                btn("Move up", Message::MoveSetup(-1), false),
-                btn("Move down", Message::MoveSetup(1), false)
-            ]
-            .spacing(5),
-        );
+    // Pinned under the body: the checks and the setup's actions.
+    let mut foot = column![
+        warnings(s.issues()),
+        btn("Duplicate setup", Message::DuplicateSetup, false).width(Fill),
+        row![
+            btn("Move up", Message::MoveSetup(-1), false),
+            btn("Move down", Message::MoveSetup(1), false)
+        ]
+        .spacing(5)
+    ]
+    .spacing(12);
     if app.confirm_delete_setup {
-        c=c.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![btn("Cancel",Message::ConfirmDeleteSetup(false),false),primary("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
+        foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![btn("Cancel",Message::ConfirmDeleteSetup(false),false),primary("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
     } else {
-        c = c.push(btn("Delete setup…", Message::RemoveSetup, false).width(Fill));
+        foot = foot.push(btn("Delete setup…", Message::RemoveSetup, false).width(Fill));
     }
-    c.into()
+    Panel {
+        head: head.into(),
+        body: c.into(),
+        foot: Some(foot.into()),
+    }
 }
 fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let s = app.doc.setup();
@@ -6692,6 +6999,65 @@ mod tests {
         }
     }
 
+    /// The browser and the inspector leave the 3D view its least width in
+    /// the window at its least: the browser gives way first (#76).
+    #[test]
+    fn the_3d_view_keeps_its_least_width_beside_the_sidebars() {
+        use super::*;
+        use crate::settings::{Layout, Side};
+        let d = Layout::default();
+        let min = crate::MIN_WINDOW.width;
+        // The defaults fit the window at its least, the view wider than its least.
+        assert_eq!(fitted(&d, min), (BROWSER.default, INSPECTOR.default));
+        assert!(view_width(&d, min) > VIEW_MIN);
+        // Both at their most: the browser gives way first, down to its
+        // least, then the inspector; the view keeps its least exactly.
+        let wide = Layout {
+            browser_width: BROWSER.max,
+            inspector_width: INSPECTOR.max,
+            ..d.clone()
+        };
+        let (b, i) = fitted(&wide, min);
+        assert_eq!(b, BROWSER.min);
+        assert!(i < INSPECTOR.max && i > INSPECTOR.min, "{i}");
+        assert_eq!(view_width(&wide, min), VIEW_MIN);
+        // A wide window gives both their widths.
+        assert_eq!(fitted(&wide, 1920.), (BROWSER.max, INSPECTOR.max));
+        // A closed sidebar is its strip, narrower than its least.
+        let closed = Layout {
+            browser_open: false,
+            ..wide.clone()
+        };
+        let (b, i) = fitted(&closed, min);
+        assert!(b < BROWSER.min);
+        assert_eq!(i, INSPECTOR.max);
+        assert!(view_width(&closed, min) > VIEW_MIN);
+        // Saved widths outside the range are cut to it.
+        let odd = Layout {
+            browser_width: 5.,
+            inspector_width: 5000.,
+            ..d.clone()
+        };
+        assert_eq!(fitted(&odd, 1920.), (BROWSER.min, INSPECTOR.max));
+        // A drag is cut to the range, and to the view's least: the browser
+        // stops where the inspector keeps its width, the inspector where the
+        // browser is at its least.
+        assert_eq!(clamped(&d, Side::Browser, 9999., 1920.), BROWSER.max);
+        assert_eq!(clamped(&d, Side::Inspector, 0., 1920.), INSPECTOR.min);
+        assert_eq!(
+            clamped(&d, Side::Browser, 9999., min),
+            min - VIEW_MIN - 2. * GRIP - INSPECTOR.default
+        );
+        assert_eq!(
+            clamped(&d, Side::Inspector, 9999., min),
+            min - VIEW_MIN - 2. * GRIP - BROWSER.min
+        );
+        for (side, width) in [(Side::Browser, 9999.), (Side::Inspector, 9999.)] {
+            let mut l = d.clone();
+            *l.width_mut(side) = clamped(&d, side, width, min);
+            assert!(view_width(&l, min) >= VIEW_MIN, "{side:?}");
+        }
+    }
     #[test]
     fn sources_and_docs_have_no_mojibake() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
