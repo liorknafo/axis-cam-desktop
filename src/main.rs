@@ -759,6 +759,7 @@ fn while_locked(m: &Message) -> bool {
             | JogKeyChecked(..)
             | JogKeyUp
             | HoldKey
+            | TabKey(_)
             | Run(_)
             | RunChecked(..)
             | ToggleStock
