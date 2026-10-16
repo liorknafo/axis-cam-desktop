@@ -259,6 +259,40 @@ mod tests {
             Ok(crate::holding::Layout::None)
         );
     }
+    // Not cfg-gated: a project written on Linux holds a byte array, one written on Windows UTF-16
+    // units, and either must load here without losing the rest of the project.
+    #[test]
+    fn a_model_path_saved_as_bytes_or_utf16_units_loads_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.axis.json");
+        let mut doc = Document::sample();
+        doc.title = "Kept".into();
+        doc.file = Some(crate::model::ModelFile {
+            name: "part.stl".into(),
+            path: PathBuf::from("/models/part.stl"),
+            format: "stl".into(),
+            bytes: 10,
+        });
+        let value = serde_json::to_value(&doc).unwrap();
+        for units in [
+            serde_json::json!([47, 109, 47, 112, 255, 46, 115, 116, 108]),
+            serde_json::json!([47, 109, 47, 112, 55_357, 46, 115, 116, 108]),
+        ] {
+            let mut value = value.clone();
+            value["file"]["path"] = units;
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.title, "Kept");
+            let file = loaded.file.unwrap();
+            assert_eq!((file.name.as_str(), file.bytes), ("part.stl", 10));
+            assert!(
+                file.path.to_string_lossy().starts_with("/m/p"),
+                "{:?}",
+                file.path
+            );
+            assert!(!loaded.setups.is_empty());
+        }
+    }
     #[test]
     fn a_workholding_library_with_entries_is_loaded_as_it_is() {
         use crate::holding::Holder;

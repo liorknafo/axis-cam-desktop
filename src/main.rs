@@ -1648,8 +1648,12 @@ impl App {
                 iced::window::close(id)
             }
             // The workspace and History are written synchronously, so
-            // nothing is lost.
-            CloseAction::Exit => std::process::exit(0),
+            // nothing is lost. A STEP converter of an import in progress
+            // would outlive the process, so it is ended first.
+            CloseAction::Exit => {
+                step::kill_running();
+                std::process::exit(0)
+            }
         }
     }
     /// Starts deleting the saved sign-in for a close that stopped waiting

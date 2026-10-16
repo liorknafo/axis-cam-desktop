@@ -3,6 +3,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/step_preview.cpp");
     println!("cargo:rerun-if-env-changed=OCCT_PREFIX");
     println!("cargo:rerun-if-env-changed=AXIS_SKIP_STEP");
+    println!("cargo:rerun-if-env-changed=CXX");
     if env::var_os("AXIS_SKIP_STEP").is_some() {
         println!(
             "cargo:warning=STEP helper disabled explicitly; STEP imports will report unavailable."
@@ -18,6 +19,15 @@ fn main() {
                 PathBuf::from("/usr")
             }
         });
+    // An upgrade of Open CASCADE renames the versioned libraries the helper
+    // links through its rpath, so it must be built again.
+    println!(
+        "cargo:rerun-if-changed={}",
+        prefix
+            .join("include/opencascade/Standard_Version.hxx")
+            .display()
+    );
+    println!("cargo:rerun-if-changed={}", prefix.join("lib").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("axis-step");
     let include = prefix.join("include/opencascade");
     assert!(
