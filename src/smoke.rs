@@ -223,7 +223,7 @@ impl App {
                 self.doc.adopt_materials();
                 let info = crate::model::ModelFile {
                     name: format!("four-setup-block.{format}"),
-                    path: path.to_string_lossy().into_owned(),
+                    path: path.clone(),
                     format: format.into(),
                     bytes: std::fs::metadata(path).unwrap().len(),
                 };
@@ -248,7 +248,7 @@ impl App {
                 vec![Message::FileImported(Some(Ok((
                     crate::model::ModelFile {
                         name: "four-setup-block.3mf".into(),
-                        path: path.to_string_lossy().into_owned(),
+                        path: path.clone(),
                         format: "3mf".into(),
                         bytes: std::fs::metadata(path).unwrap().len(),
                     },
@@ -7437,6 +7437,65 @@ flood = { pin = 8 }
         assert_eq!(a.close_decision(id, after(34.)), Close);
         assert!(a.closing.is_none());
     }
+    #[test]
+    fn a_model_import_in_flight_ends_the_app_on_close() {
+        use crate::CloseAction::*;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let id = iced::window::Id::unique();
+        let now = std::time::Instant::now();
+        assert_eq!(a.close_decision(id, now), Close);
+        // The conversion runs under spawn_blocking, which the runtime would
+        // wait for (up to two minutes for a STEP file) after the window is gone.
+        a.import_busy = true;
+        assert!(a.blocking_work());
+        assert_eq!(a.close_decision(id, now), Exit);
+        // A G-code export still finishes first.
+        a.gcode_exports = 1;
+        assert_eq!(a.close_decision(id, now), Close);
+    }
+    #[test]
+    fn importing_from_the_start_screen_keeps_the_project_until_a_file_is_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = || std::fs::read_dir(dir.path().join("history")).map_or(0, |d| d.count());
+        let mut a = fresh_app(&dir);
+        a.doc.title = "Resumable job".into();
+        a.page = Page::Home;
+        let _ = a.update(Message::Import);
+        assert!(a.import_busy);
+        assert_eq!((a.page, history()), (Page::Home, 0));
+        // The dialog is cancelled: the job is still there to continue.
+        let _ = a.update(Message::FileImported(None));
+        assert!(!a.import_busy);
+        assert_eq!(
+            (a.page, a.doc.title.as_str(), history()),
+            (Page::Home, "Resumable job", 0)
+        );
+        let _ = a.update(Message::ResumeProject);
+        assert_eq!(
+            (a.page, a.doc.title.as_str()),
+            (Page::Work, "Resumable job")
+        );
+        // A chosen file starts the new project, the old one going to History.
+        a.page = Page::Home;
+        let _ = a.update(Message::Import);
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/preview-cube.obj");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let info = crate::model::ModelFile {
+            name: "preview-cube.obj".into(),
+            path: path.clone(),
+            format: "obj".into(),
+            bytes: std::fs::metadata(&path).unwrap().len(),
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((info, Some(mesh))))));
+        assert!(!a.import_busy);
+        assert_eq!(
+            (a.page, a.doc.title.as_str(), history()),
+            (Page::Work, "preview-cube", 1)
+        );
+        assert_eq!(a.doc.file.as_ref().unwrap().path, path);
+    }
     #[tokio::test]
     async fn a_close_that_stops_waiting_deletes_through_the_signing_out_client() {
         use crate::fake_openai::{Fake, Req, Resp};
@@ -7732,7 +7791,7 @@ flood = { pin = 8 }
         let mesh = crate::mesh::load(&path).unwrap();
         let file = ModelFile {
             name: "part.3mf".into(),
-            path: path.to_string_lossy().into_owned(),
+            path: path.clone(),
             format: "3mf".into(),
             bytes: 1,
         };
@@ -9770,7 +9829,7 @@ flood = { pin = 8 }
         apply_checked_plan(&mut a);
         let file = ModelFile {
             name: "other.stl".into(),
-            path: dir.path().join("other.stl").to_string_lossy().into_owned(),
+            path: dir.path().join("other.stl"),
             format: "stl".into(),
             bytes: 1,
         };
