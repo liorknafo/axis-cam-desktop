@@ -7,7 +7,7 @@ use iced::{
         widget::{Operation, Tree, tree},
     },
     mouse,
-    widget::{self, canvas, column, container, text, tooltip},
+    widget::{self, canvas, column, container, row, text, tooltip},
     window,
 };
 use std::time::{Duration, Instant};
@@ -625,11 +625,234 @@ pub fn field<'a>(
     label: &str,
     target: Target,
 ) -> Element<'a, Message> {
-    wrap(
-        content,
-        field_help(key, label, target),
-        tooltip::Position::Left,
-    )
+    Element::new(Field {
+        content: wrap(
+            content,
+            field_help(key, label, target),
+            tooltip::Position::Left,
+        ),
+        tag: FieldTag {
+            target,
+            key: key.into(),
+            label: label.into(),
+        },
+    })
+}
+/// A form field as the keyboard finds it: the setting it edits and the name
+/// over it, for the help the F1 key pins (`focused_field`) and the field a
+/// Tab with nothing focused enters (`control::focus_first`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldTag {
+    pub target: Target,
+    pub key: String,
+    pub label: String,
+}
+impl FieldTag {
+    /// The field's help, the card its hover shows.
+    pub fn help(&self) -> Help {
+        field_help(&self.key, &self.label, self.target)
+    }
+}
+/// The widget round a form field and its hover help that offers the field's
+/// `FieldTag` to widget operations (`Operation::custom`) before the field.
+struct Field<'a> {
+    content: Element<'a, Message>,
+    tag: FieldTag,
+}
+impl Widget<Message, Theme, Renderer> for Field<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        )
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        let mut tag = self.tag.clone();
+        operation.custom(None, layout.bounds(), &mut tag);
+        operation.traverse(&mut |operation| {
+            self.content
+                .as_widget_mut()
+                .operate(&mut tree.children[0], layout, renderer, operation)
+        });
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        )
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+/// A widget operation that finds the form field with the keyboard focus, if
+/// one has it: the F1 key pins its help.
+pub fn focused_field() -> impl Operation<Option<FieldTag>> {
+    use iced::advanced::widget::{
+        Id,
+        operation::{Focusable, Outcome},
+    };
+    #[derive(Default)]
+    struct Focused {
+        /// The tag a field just offered, for the traverse of its content.
+        offered: Option<FieldTag>,
+        /// The field whose content is being traversed.
+        inside: Option<FieldTag>,
+        found: Option<FieldTag>,
+    }
+    impl Operation<Option<FieldTag>> for Focused {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<FieldTag>>)) {
+            match self.offered.take() {
+                Some(tag) => {
+                    let outer = self.inside.replace(tag);
+                    operate(self);
+                    self.inside = outer;
+                }
+                None => operate(self),
+            }
+        }
+        fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            self.offered = state.downcast_ref::<FieldTag>().cloned();
+        }
+        fn focusable(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Focusable) {
+            if state.is_focused()
+                && let Some(tag) = &self.inside
+            {
+                self.found = Some(tag.clone());
+            }
+        }
+        fn finish(&self) -> Outcome<Option<FieldTag>> {
+            Outcome::Some(self.found.clone())
+        }
+    }
+    Focused::default()
+}
+/// The help the F1 key pinned for a field, for a corner of the window: its
+/// card, open to its More… text unless Less was clicked (no hover overlay
+/// takes the card's toggles here: `Message::HelpMore` and `HelpPause` reach
+/// the app), and how it goes away.
+pub fn pinned<'a>(tag: &FieldTag, expanded: bool, paused: bool) -> Element<'a, Message> {
+    let close = widget::button(text("Close").size(12))
+        .on_press(Message::HelpFor(None))
+        .padding([4, 9])
+        .style(|_, status| widget::button::Style {
+            background: Some(
+                if matches!(status, widget::button::Status::Hovered) {
+                    Color::from_rgb8(201, 222, 241)
+                } else {
+                    Color::from_rgb8(223, 237, 249)
+                }
+                .into(),
+            ),
+            text_color: Color::from_rgb(0.13, 0.20, 0.28),
+            border: Border {
+                radius: 4.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    column![
+        card(tag.help(), expanded, paused),
+        row![
+            text("F1 pins the focused field's help · Esc closes it")
+                .size(12)
+                .color(Color::from_rgb(0.30, 0.37, 0.44))
+                .width(Length::Fill),
+            close
+        ]
+        .spacing(9)
+        .align_y(iced::Alignment::Center)
+    ]
+    .spacing(6)
+    .width(304)
+    .into()
 }
 pub fn command(m: &Message, label: String) -> Help {
     use Message::*;

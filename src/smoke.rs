@@ -3701,10 +3701,321 @@ flood = { pin = 8 }
                 window,
             );
             assert!(
-                matches!(esc, Some(Message::MachineEStop)),
+                matches!(esc, Some(Message::EscapeKey)),
                 "{status:?}: {esc:?}"
             );
+            // F1 pins the focused field's help, even while typing.
+            let f1 = crate::on_event(
+                key_press(Key::Named(Named::F1), Modifiers::empty()),
+                status,
+                window,
+            );
+            assert!(matches!(f1, Some(Message::HelpKey)), "{status:?}: {f1:?}");
         }
+    }
+
+    #[test]
+    fn escape_is_the_estop_while_a_machine_is_connected() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        // Off the Control page too, and the pinned help is not what it closes.
+        a.page = Page::Work;
+        let tag = crate::help::FieldTag {
+            target: Target::Setup,
+            key: "stock_top".into(),
+            label: "Stock top".into(),
+        };
+        let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        let _ = a.update(Message::EscapeKey);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert_eq!(a.pinned_help, Some(tag));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none());
+    }
+
+    /// A view laid out without a window, as `ui::probe` lays one out, for
+    /// widget operations over its tree: what the keys find there.
+    struct Laid<'a> {
+        ui: iced_runtime::user_interface::UserInterface<'a, Message, iced::Theme, iced::Renderer>,
+        renderer: iced::Renderer,
+    }
+    fn laid(a: &App) -> Laid<'_> {
+        let mut renderer = iced_renderer::fallback::Renderer::Secondary(
+            iced_tiny_skia::Renderer::new(iced::Font::DEFAULT, iced::Pixels(16.)),
+        );
+        let ui = iced_runtime::user_interface::UserInterface::build(
+            a.view(),
+            WINDOW,
+            iced_runtime::user_interface::Cache::default(),
+            &mut renderer,
+        );
+        Laid { ui, renderer }
+    }
+    /// The window the views are laid out in.
+    const WINDOW: iced::Size = iced::Size::new(1440., 900.);
+    impl Laid<'_> {
+        /// Runs `op` over the tree, each pass of a chain, for its outcome.
+        fn run<T: Send + 'static>(
+            &mut self,
+            op: impl iced::advanced::widget::Operation<T> + 'static,
+        ) -> Option<T> {
+            use iced::advanced::widget::{Operation, operation};
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let put = slot.clone();
+            let mut op: Box<dyn Operation> =
+                Box::new(operation::map(op, move |x| *put.lock().unwrap() = Some(x)));
+            loop {
+                self.ui.operate(&self.renderer, &mut op);
+                match op.finish() {
+                    operation::Outcome::Chain(next) => op = next,
+                    _ => break,
+                }
+            }
+            slot.lock().unwrap().take()
+        }
+    }
+    /// The texts of the app's view, in tree order.
+    fn page_texts(a: &App) -> Vec<String> {
+        crate::ui::probe::texts(a.view(), WINDOW)
+    }
+
+    #[test]
+    fn a_pocket_stepover_over_50_percent_is_shown_under_the_stepover_field() {
+        let mut a = app();
+        let _ = a.update(Message::AddOp(Strategy::Pocket));
+        let pocket = (a.doc.setup().operations.iter())
+            .position(|o| o.strategy == Strategy::Pocket)
+            .unwrap();
+        let _ = a.update(Message::SelectOp(pocket));
+        let _ = a.update(Message::Edit(Target::Operation, "stepover", "60".into()));
+        let _ = a.update(Message::Tab("Passes".into()));
+        let checks = crate::ui::editor_checks(&a);
+        let stepover = (checks.list.iter())
+            .find(|c| c.text.contains("Pocket stepover"))
+            .unwrap_or_else(|| panic!("{:?}", checks.list))
+            .clone();
+        assert_eq!(
+            (stepover.error, stepover.key, stepover.label()),
+            (true, Some("stepover"), "Error")
+        );
+        assert!(checks.drawn.contains(&"stepover"), "{:?}", checks.drawn);
+        assert!(!checks.rest().contains(&&stepover));
+        // In the widget tree the message follows the field's label, labelled.
+        let texts = page_texts(&a);
+        let at = (texts.iter())
+            .position(|t| t == "Stepover · % tool diameter")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        assert_eq!(
+            (texts[at + 1].as_str(), texts[at + 2].as_str()),
+            ("Error", stepover.text.as_str())
+        );
+        // On Tool, which has no stepover field, the list under the form keeps it.
+        let _ = a.update(Message::Tab("Tool".into()));
+        let checks = crate::ui::editor_checks(&a);
+        assert!(!checks.drawn.contains(&"stepover"));
+        assert!(checks.rest().contains(&&stepover), "{:?}", checks.rest());
+        let texts = page_texts(&a);
+        assert!(texts.contains(&stepover.text), "{texts:?}");
+    }
+
+    #[test]
+    fn a_warning_and_an_error_have_different_labels() {
+        let mut a = app();
+        if a.doc.selected_material().is_none() {
+            a.doc.materials = crate::material::starters();
+            let id = a.doc.materials[0].id.clone();
+            let _ = a.update(Message::PickMaterial(id));
+        }
+        assert!(a.doc.selected_material().is_some());
+        // The Face operation: a feed of 1 mm/min is a chip load under the
+        // material's band, a warning; a stepover of 0 is an error.
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "1".into()));
+        let _ = a.update(Message::Edit(Target::Operation, "stepover", "0".into()));
+        let checks = crate::ui::op_checks(&a);
+        let warning = (checks.iter())
+            .find(|c| c.text.starts_with("Chip load"))
+            .unwrap_or_else(|| panic!("{checks:?}"));
+        let error = (checks.iter())
+            .find(|c| c.text.starts_with("stepover"))
+            .unwrap_or_else(|| panic!("{checks:?}"));
+        assert_eq!(
+            (warning.label(), warning.error, warning.key),
+            ("Warning", false, Some("feed"))
+        );
+        assert_eq!(
+            (error.label(), error.error, error.key),
+            ("Error", true, Some("stepover"))
+        );
+        // Each at its field: the warning on Tool, where the feed is, with the
+        // error listed under the form.
+        let _ = a.update(Message::Tab("Tool".into()));
+        let texts = page_texts(&a);
+        let at = (texts.iter())
+            .position(|t| t == "Cutting feed · mm/min")
+            .unwrap_or_else(|| panic!("{texts:?}"));
+        assert_eq!(
+            (texts[at + 1].as_str(), texts[at + 2].as_str()),
+            ("Warning", warning.text.as_str())
+        );
+        assert!(
+            texts.contains(&"1 error stops Generate and export".to_string())
+                && texts.contains(&error.text),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "1200".into()));
+        let _ = a.update(Message::Edit(Target::Operation, "stepover", "40".into()));
+        assert!(
+            crate::ui::op_checks(&a).iter().all(|c| !c.error),
+            "{:?}",
+            crate::ui::op_checks(&a)
+        );
+    }
+
+    #[test]
+    fn an_audit_row_opens_its_operation_at_the_tab_its_line_names() {
+        let mut a = imported_app();
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let top = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| s.normal[2].abs() > 0.99999)
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        let _ = a.update(Message::Edit(Target::Operation, "rpm", "0".into()));
+        assert!(
+            a.doc.setup().issues().is_empty(),
+            "{:?}",
+            a.doc.setup().issues()
+        );
+        assert_eq!(
+            a.op_issues().first().map(String::as_str),
+            Some("rpm must be greater than zero.")
+        );
+        let _ = a.update(Message::Tab("Passes".into()));
+        let _ = a.update(Message::GenerateAll);
+        assert_eq!(a.page, Page::Audit);
+        let (i, row) = (a.audit_report.iter().enumerate())
+            .find(|(_, r)| !r.ok)
+            .map(|(i, r)| (i, r.clone()))
+            .unwrap_or_else(|| panic!("{:?}", a.audit_report));
+        assert_eq!((row.setup, row.operation), (0, 0));
+        assert!(row.detail.starts_with("rpm must"), "{row:?}");
+        let _ = a.view();
+        let _ = a.update(Message::AuditRow(i));
+        assert_eq!(
+            (a.page, a.selected, a.tab.as_str()),
+            (Page::Work, Some(0), "Tool")
+        );
+        assert_eq!(a.doc.active, a.doc.setups[0].id);
+        for (issue, tab) in [
+            ("rpm must be greater than zero.", Some("Tool")),
+            (
+                "Pocket stepover must be between 0.01 and 50% for overlapping offset contours.",
+                Some("Passes"),
+            ),
+            ("Clearance must be above retract height.", Some("Heights")),
+            (
+                "Select at least one machining feature or surface.",
+                Some("Geometry"),
+            ),
+            ("Choose a tool from the library.", Some("Tool")),
+            ("Give this operation a name.", None),
+            (
+                "Generated 12 moves · 0.3 min · inherits stock after 0 operations",
+                None,
+            ),
+        ] {
+            assert_eq!(crate::ui::issue_tab(issue), tab, "{issue}");
+        }
+    }
+
+    #[test]
+    fn tab_with_nothing_focused_enters_the_form_unless_the_keys_jog() {
+        use crate::{TabMove, tab_move};
+        assert_eq!(tab_move(false, false, false), TabMove::First);
+        assert_eq!(tab_move(false, true, false), TabMove::First);
+        assert_eq!(tab_move(false, false, true), TabMove::Stay);
+        assert_eq!(tab_move(true, false, true), TabMove::Next);
+        assert_eq!(tab_move(true, true, true), TabMove::Previous);
+        // The key's message starts the focus task.
+        let mut a = app();
+        for back in [false, true] {
+            assert_eq!(a.update(Message::TabKey(back)).units(), 1, "back: {back}");
+        }
+        // Over the Work page's widget tree: nothing is focused, so the first
+        // Tab lands in the inspector's first field, the operation's name,
+        // which F1 then finds.
+        let mut laid = laid(&a);
+        assert_eq!(laid.run(crate::control::typing()), Some(false));
+        assert_eq!(laid.run(crate::help::focused_field()), Some(None));
+        laid.run(crate::control::focus_first());
+        assert_eq!(laid.run(crate::control::typing()), Some(true));
+        let tag = (laid.run(crate::help::focused_field()).flatten()).expect("a focused form field");
+        assert_eq!(
+            (tag.target, tag.key.as_str(), tag.label.as_str()),
+            (Target::Operation, "name", "Operation name")
+        );
+    }
+
+    #[test]
+    fn f1_pins_the_focused_fields_help_and_esc_puts_it_away_where_it_is_not_the_estop() {
+        let mut a = app();
+        // The spindle speed: a card with a More… text.
+        let tag = crate::help::FieldTag {
+            target: Target::Operation,
+            key: "rpm".into(),
+            label: "Spindle speed · rpm".into(),
+        };
+        let help = tag.help();
+        assert!(
+            help.body.contains("revolutions") || !help.body.is_empty(),
+            "{help:?}"
+        );
+        let shows_help = |a: &App| page_texts(a).contains(&help.body);
+        assert!(!shows_help(&a));
+        let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        assert_eq!(a.pinned_help.as_ref(), Some(&tag));
+        assert!(
+            shows_help(&a),
+            "the pinned help shows the field's hover text"
+        );
+        // Open to its More… text; the card's Less and More… toggles, which
+        // no hover overlay takes here, close and open it.
+        assert!(!help.more.is_empty(), "{help:?}");
+        assert!(page_texts(&a).contains(&help.more), "and its More… text");
+        let _ = a.update(Message::HelpMore(false));
+        assert!(!page_texts(&a).contains(&help.more) && shows_help(&a));
+        let _ = a.update(Message::HelpMore(true));
+        assert!(page_texts(&a).contains(&help.more));
+        // F1 on the same field puts it away; on another, switches to it; with
+        // no field focused, puts it away.
+        let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        assert!(a.pinned_help.is_none() && !shows_help(&a));
+        let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        let other = crate::help::FieldTag {
+            target: Target::Operation,
+            key: "stepover".into(),
+            label: "Stepover · % tool diameter".into(),
+        };
+        let _ = a.update(Message::HelpFor(Some(other.clone())));
+        assert_eq!(a.pinned_help.as_ref(), Some(&other));
+        let _ = a.update(Message::HelpFor(None));
+        assert!(a.pinned_help.is_none());
+        // Esc puts it away on the Work page, where nothing is connected; on
+        // the Control page Esc is kept for the E-stop and leaves it.
+        let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        let _ = a.update(Message::EscapeKey);
+        assert!(a.pinned_help.is_none());
+        let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        a.page = Page::Control;
+        let _ = a.update(Message::EscapeKey);
+        assert_eq!(a.pinned_help.as_ref(), Some(&tag));
+        // Leaving for another page puts it away.
+        let _ = a.update(Message::Page(Page::Work));
+        assert!(a.pinned_help.is_none());
     }
 
     #[test]
@@ -8894,7 +9205,7 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::GenerateAll);
         assert_eq!(a.audit_report.len(), 4);
-        assert!(a.audit_report.iter().all(|r| r.1), "{:?}", a.audit_report);
+        assert!(a.audit_report.iter().all(|r| r.ok), "{:?}", a.audit_report);
         assert_eq!(a.page, Page::Audit);
         drop(a.view());
         let saved: Document =
@@ -8913,7 +9224,7 @@ flood = { pin = 8 }
         a.doc.setups.push(second);
         let _ = a.update(Message::GenerateAll);
         assert_eq!(a.audit_report.len(), 8);
-        assert_eq!(a.audit_report.iter().filter(|r| !r.1).count(), 4);
+        assert_eq!(a.audit_report.iter().filter(|r| !r.ok).count(), 4);
         let _ = a.update(Message::SelectOp(0));
         let _ = a.update(Message::Edit(Target::Operation, "feed", "900".into()));
         assert!(a.audit_report.is_empty());

@@ -1628,6 +1628,83 @@ pub fn select_focused() -> impl iced::advanced::widget::Operation {
     operation::then(count(), |count| SelectAt(count.focused, 0))
 }
 
+/// A widget operation that gives the keyboard focus to the form's first text
+/// field, for a Tab with nothing focused: the first in the inspector
+/// (`ui::INSPECTOR_ID`) when the page has one, else the first form field of the
+/// page (one with a `help::FieldTag`), else the first text field there is.
+pub fn focus_first() -> impl iced::advanced::widget::Operation {
+    use crate::help::FieldTag;
+    use iced::advanced::widget::{
+        Id, Operation,
+        operation::{self, Focusable, Outcome, Scrollable},
+    };
+    /// Counts the text fields, noting the first in the inspector and the
+    /// first in a form field.
+    #[derive(Default)]
+    struct Scan {
+        count: usize,
+        inspector: Option<usize>,
+        field: Option<usize>,
+        /// The inspector or a field was just announced: its content follows.
+        enter_inspector: bool,
+        enter_field: bool,
+        in_inspector: bool,
+        in_field: bool,
+    }
+    impl Operation<Option<usize>> for Scan {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<usize>>)) {
+            let was = (self.in_inspector, self.in_field);
+            self.in_inspector |= std::mem::take(&mut self.enter_inspector);
+            self.in_field |= std::mem::take(&mut self.enter_field);
+            operate(self);
+            (self.in_inspector, self.in_field) = was;
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            _: iced::Rectangle,
+            _: iced::Rectangle,
+            _: iced::Vector,
+            _: &mut dyn Scrollable,
+        ) {
+            self.enter_inspector = id == Some(&Id::new(crate::ui::INSPECTOR_ID));
+        }
+        fn custom(&mut self, _: Option<&Id>, _: iced::Rectangle, state: &mut dyn std::any::Any) {
+            self.enter_field = state.is::<FieldTag>();
+        }
+        fn focusable(&mut self, _: Option<&Id>, _: iced::Rectangle, _: &mut dyn Focusable) {
+            if self.in_inspector {
+                self.inspector.get_or_insert(self.count);
+            }
+            if self.in_field {
+                self.field.get_or_insert(self.count);
+            }
+            self.count += 1;
+        }
+        fn finish(&self) -> Outcome<Option<usize>> {
+            Outcome::Some(
+                self.inspector
+                    .or(self.field)
+                    .or((self.count > 0).then_some(0)),
+            )
+        }
+    }
+    /// Focuses the text field at the index, counting the fields passed.
+    struct FocusAt(Option<usize>, usize);
+    impl Operation for FocusAt {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self)
+        }
+        fn focusable(&mut self, _: Option<&Id>, _: iced::Rectangle, state: &mut dyn Focusable) {
+            if self.0 == Some(self.1) {
+                state.focus()
+            }
+            self.1 += 1
+        }
+    }
+    operation::then(Scan::default(), |target| FocusAt(target, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
