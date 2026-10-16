@@ -554,7 +554,7 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
             "Audit",
             column![
                 text(uc100::diagnostics::setup_report(cfg))
-                    .size(11)
+                    .size(12)
                     .font(Font::MONOSPACE),
                 muted("The driver's report on the profile as edited above."),
             ],
@@ -717,7 +717,7 @@ fn inputs(c: &Connection) -> Element<'_, Message> {
                 "{t:8.2} s  pin {pin} → {}",
                 if *high { "HIGH" } else { "LOW" }
             ))
-            .size(11)
+            .size(12)
             .font(Font::MONOSPACE),
         );
     }
