@@ -66,13 +66,18 @@ impl<'a> HelpButton<'a> {
             help: command(message, label.into()),
         }
     }
-    pub fn operation(button: widget::Button<'a, Message>, strategy: Strategy, name: &str) -> Self {
+    pub fn operation(
+        button: widget::Button<'a, Message>,
+        strategy: Strategy,
+        name: &str,
+        mark: String,
+    ) -> Self {
         Self {
             button,
             help: Help::text(
                 name,
                 format!(
-                    "{}\n\nClick to edit this operation's tool, geometry and cutting parameters.",
+                    "{}\n\n{mark}\n\nClick to edit this operation's tool, geometry and cutting parameters.",
                     strategy.help()
                 ),
             )

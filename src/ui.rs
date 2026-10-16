@@ -754,17 +754,12 @@ fn browser(app: &App) -> Element<'_, Message> {
             let checks = app.current_ready();
             for (i, o) in s.operations.iter().enumerate() {
                 let selected = app.selected == Some(i) && app.page == Page::Work;
-                let (mark, color) = match op_mark(app, checks, i) {
-                    OpMark::Suppressed => ("—", MUTED),
-                    OpMark::Pending => ("○", MUTED),
-                    OpMark::Generated => ("✓", MUTED),
-                    OpMark::Collides => ("!", Color::from_rgb8(196, 112, 22)),
-                    OpMark::Ready => ("✓", Color::from_rgb8(38, 146, 111)),
-                };
+                let mark = op_mark(app, checks, i);
+                let (glyph, color) = (mark.glyph(), mark.color());
                 let content = row![
                     icon(app, o.strategy, 23.),
                     text(o.name()).size(12).width(Fill),
-                    text(mark).size(13).color(color)
+                    text(glyph).size(13).color(color)
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center);
@@ -793,6 +788,7 @@ fn browser(app: &App) -> Element<'_, Message> {
                         }),
                     o.strategy,
                     o.name(),
+                    mark_help(app, checks, i, mark),
                 ));
             }
             if let Some(picture) = stock_picture(app, si, true) {
@@ -2634,16 +2630,19 @@ pub(crate) fn holding_warning(app: &App) -> crate::HoldingNote {
     *app.holding_note.borrow_mut() = Some((key, note.clone()));
     note
 }
-/// What the browser shows of an operation of the active setup.
+/// What the browser shows of an operation of the active setup. Each state
+/// has a glyph of its own as well as a colour (`OpMark::glyph`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum OpMark {
     /// —
     Suppressed,
     /// ○: not generated.
     Pending,
-    /// Grey ✓: generated, but the setup will not run for a reason the
-    /// simulation panel lists, or its preview is on screen and the checks
-    /// before a run are still being worked out.
+    /// Grey …: generated (its preview is on screen) and the checks before a
+    /// run are still being worked out.
+    Checking,
+    /// Grey ✓·: generated, but the setup will not run for a reason the
+    /// simulation panel lists, or (the example) cannot be run at all.
     Generated,
     /// Amber !: those checks refuse the setup's workholding for it, or for
     /// the whole setup (its clearance plane): a jaw or clamp in the way, or
@@ -2651,6 +2650,45 @@ pub(crate) enum OpMark {
     Collides,
     /// Green ✓: those checks pass, so the setup will run.
     Ready,
+}
+impl OpMark {
+    #[cfg(test)]
+    pub(crate) const ALL: [OpMark; 6] = [
+        OpMark::Suppressed,
+        OpMark::Pending,
+        OpMark::Checking,
+        OpMark::Generated,
+        OpMark::Collides,
+        OpMark::Ready,
+    ];
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            OpMark::Suppressed => "—",
+            OpMark::Pending => "○",
+            OpMark::Checking => "…",
+            OpMark::Generated => "✓·",
+            OpMark::Collides => "!",
+            OpMark::Ready => "✓",
+        }
+    }
+    pub(crate) fn color(self) -> Color {
+        match self {
+            OpMark::Collides => Color::from_rgb8(196, 112, 22),
+            OpMark::Ready => Color::from_rgb8(38, 146, 111),
+            _ => MUTED,
+        }
+    }
+    /// The state in words, as the hover help starts.
+    pub(crate) fn state(self) -> &'static str {
+        match self {
+            OpMark::Suppressed => "Suppressed",
+            OpMark::Pending => "Not generated",
+            OpMark::Checking => "Generated, being checked",
+            OpMark::Generated => "Generated, will not run",
+            OpMark::Collides => "Workholding refused",
+            OpMark::Ready => "Ready to run",
+        }
+    }
 }
 /// The mark of operation `i` of the active setup from `checks`, the checks
 /// before a run of the setup when they are current (`App::current_ready`).
@@ -2668,10 +2706,13 @@ pub(crate) fn op_mark(app: &App, checks: Option<&crate::run::Ready>, i: usize) -
             || app
                 .active_simulation()
                 .is_some_and(|sim| sim.plan.operation == o.id);
-        return if shown {
-            OpMark::Generated
-        } else {
+        return if !shown {
             OpMark::Pending
+        } else if app.holding_key().is_some() {
+            OpMark::Checking
+        } else {
+            // The example is never checked: its sample paths cannot be run.
+            OpMark::Generated
         };
     };
     if r.held.iter().any(|h| h.operation.is_none_or(|k| k == i)) {
@@ -2683,6 +2724,76 @@ pub(crate) fn op_mark(app: &App, checks: Option<&crate::run::Ready>, i: usize) -
     } else {
         OpMark::Generated
     }
+}
+/// The hover help of operation `i`'s mark: its glyph and state in words, and
+/// for a mark that refuses the setup, the Run panel's reason (the lines the
+/// simulation panel lists, the first three of them).
+pub(crate) fn mark_help(
+    app: &App,
+    checks: Option<&crate::run::Ready>,
+    i: usize,
+    mark: OpMark,
+) -> String {
+    let head = format!("Mark {}: {}.", mark.glyph(), mark.state());
+    let Some(setup) = app.doc.active_setup() else {
+        return head;
+    };
+    let uc100 = get(&setup.machine.p, "controller") == "UC100";
+    let (by, verb) = if uc100 {
+        ("Run", "run")
+    } else {
+        ("Export", "export")
+    };
+    let name = setup.name();
+    match mark {
+        OpMark::Suppressed => {
+            format!("{head} The operation is switched off and left out of the job.")
+        }
+        OpMark::Pending => {
+            format!("{head} Generate it to see its toolpath and have {name} checked.")
+        }
+        OpMark::Checking => {
+            format!("{head} Checking {name} as {verb} will; the mark changes when that is done.")
+        }
+        OpMark::Ready => format!("{head} {by}'s checks of {name} pass."),
+        OpMark::Collides | OpMark::Generated => {
+            let Some(r) = checks else {
+                return format!("{head} The example's sample paths cannot be run.");
+            };
+            let lines = refusal_lines(r, i);
+            let mut help = format!("{head} {by} will refuse {name}");
+            if lines.is_empty() {
+                help.push('.');
+            } else {
+                help.push(':');
+            }
+            for line in lines.iter().take(3) {
+                help.push_str("\n- ");
+                help.push_str(line);
+            }
+            if lines.len() > 3 {
+                help.push_str(&format!(
+                    "\n- and {} more, listed above the playback controls.",
+                    lines.len() - 3
+                ));
+            }
+            help
+        }
+    }
+}
+/// What the checks before a run refuse of operation `i`'s setup, in the Run
+/// panel's words: the operation's own workholding lines first, then the
+/// setup's, then the other problems, none twice.
+fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
+    let own = r.held.iter().filter(|h| h.operation == Some(i));
+    let setup_wide = r.held.iter().filter(|h| h.operation.is_none());
+    let mut lines: Vec<String> = vec![];
+    for problem in own.chain(setup_wide).map(|h| &h.message).chain(&r.problems) {
+        if !lines.contains(problem) {
+            lines.push(problem.clone());
+        }
+    }
+    lines
 }
 /// What the simulation panel says of the selected operation's setup above
 /// its controls: a heading, the lines of the checks before a run (the Run
@@ -2705,14 +2816,7 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
         return Some((format!("Checking {name} as {verb} will…"), vec![], false));
     };
     let mark = op_mark(app, Some(r), i);
-    let own = r.held.iter().filter(|h| h.operation == Some(i));
-    let setup_wide = r.held.iter().filter(|h| h.operation.is_none());
-    let mut lines: Vec<String> = vec![];
-    for problem in own.chain(setup_wide).map(|h| &h.message).chain(&r.problems) {
-        if !lines.contains(problem) {
-            lines.push(problem.clone());
-        }
-    }
+    let lines = refusal_lines(r, i);
     let machine = "The machine's position and the work zero are checked on the Run panel.";
     match mark {
         OpMark::Suppressed => None,
