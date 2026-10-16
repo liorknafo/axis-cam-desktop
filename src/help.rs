@@ -341,6 +341,8 @@ impl Widget<Message, Theme, Renderer> for HoverHelp<'_> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
+        // The card it shows, for the tests that look for a control's help.
+        operation.custom(None, layout.bounds(), &mut self.help.clone());
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation)
@@ -1081,7 +1083,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         DuplicateSetup => (
-            "Copy this setup and its operations to prepare a second machining position. Set its new orientation, stock source and work offset.",
+            "Copy this setup and its operations to prepare a second machining position. Set its new orientation and work offset; its stock is what the setups before it leave.",
             "",
         ),
         RemoveSetup | ConfirmDeleteSetup(true) => (
@@ -1098,11 +1100,11 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         Flip("rx") => (
-            "Set the part rotation to 180° about X to expose the opposite side. Review the origin, fixture and stock source after reclamping.",
+            "Set the part rotation to 180° about X to expose the opposite side. Review the origin and fixture after reclamping; the stock is what the setups before it leave.",
             "",
         ),
         Flip(_) => (
-            "Set the part rotation to 90° about Y to expose a side. Review the origin, fixture and stock source for this position.",
+            "Set the part rotation to 90° about Y to expose a side. Review the origin and fixture for this position; the stock is what the setups before it leave.",
             "",
         ),
         AssignMachine(_) => (
@@ -1528,10 +1530,27 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Machine, "uc100_profile") => (
-            "Path of the UC100 driver profile (TOML) this machine runs with. Browse… picks it; the Control page's Setup view edits it in place.",
+            "Path of the UC100 driver profile (TOML) this machine runs with. Browse… picks it; MACHINE → Controller configuration on the Control page edits it in place.",
             "",
             None,
         ),
+        // The Control page's typed fields say what their commands say.
+        (Target::Machine, "control_rpm") => {
+            let (body, more) = machine_help(&crate::control::Action::Rpm(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "mdi_line") => {
+            let (body, more) = machine_help(&crate::control::Action::MdiText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "cal_distance") => {
+            let (body, more) = machine_help(&crate::control::Action::CalDistance(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "cal_measured") => {
+            let (body, more) = machine_help(&crate::control::Action::CalMeasured(String::new()));
+            (body, more, None)
+        }
         (Target::Machine, "direction" | "direction2") => (
             "Choose the sign convention for this rotary axis from the machine documentation. It affects how a positive angle is interpreted.",
             "",
@@ -3824,31 +3843,31 @@ mod tests {
             assert!(h.more.is_empty() || h.more != h.body, "{id}");
         }
     }
-    /// No card lost text in the split (issue #89): every sentence of each
-    /// card's text from before, in `help_before_89.tsv`, is still in its
-    /// hover text or its More… text.
+    /// No card names a control the app no longer has (issues #194, #36, #88):
+    /// the stock source, the Setup view and the old page and field names.
     #[test]
-    fn no_card_lost_text_in_the_split() {
-        let cards: std::collections::BTreeMap<String, Help> = every_card().into_iter().collect();
-        let mut checked = 0;
-        for line in include_str!("help_before_89.tsv").lines() {
-            if line.starts_with('#') || line.is_empty() {
-                continue;
+    fn no_card_names_a_control_that_is_gone() {
+        let gone = [
+            "stock source",
+            "Setup view",
+            "Program review",
+            "Work page",
+            "NC program",
+            "Clearance gap",
+            "Fixture clearance ·",
+            "Selection order",
+        ];
+        let mut found = vec![];
+        for (id, h) in every_card() {
+            // "LinuxCNC program" is the current name; only a bare "NC program" is stale.
+            let text = all(&h).replace("LinuxCNC", "LinuxCnc");
+            for name in gone {
+                if text.contains(name) {
+                    found.push(format!("{id}: {name}"));
+                }
             }
-            let (id, old) = line.split_once('\t').expect(line);
-            let old = old.replace("\\n", "\n").replace("\\t", "\t");
-            let card = cards.get(id).unwrap_or_else(|| panic!("no card {id}"));
-            let now = all(card);
-            for sentence in old.split("\n\n").flat_map(|p| p.split(". ")) {
-                let sentence = sentence.trim();
-                assert!(
-                    sentence.is_empty() || now.contains(sentence),
-                    "{id} lost: {sentence}\n\nnow: {now}"
-                );
-            }
-            checked += 1;
         }
-        assert!(checked > 600, "{checked} cards checked");
+        assert!(found.is_empty(), "{}", found.join("\n"));
     }
     /// The card stays open while the pointer is on it, More… expands it,
     /// Pause holds its animation, and both are forgotten when it closes
