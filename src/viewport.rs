@@ -150,6 +150,10 @@ pub struct Viewport<'a> {
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
     pub uncut: &'a [bool],
+    /// Whether those faces are drawn in `UNCUT` at all ("Show uncut faces").
+    /// With a simulation and the stock shown the part itself is not drawn, so
+    /// then just these faces are, after the stock and depth-tested against it.
+    pub show_uncut: bool,
 }
 pub(crate) struct Projector {
     camera: Camera,
@@ -421,12 +425,13 @@ impl Viewport<'_> {
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             self.holding,
             self.leftover,
             self.live,
             self.uncut.first().map(std::ptr::from_ref),
-            self.uncut.len()
+            self.uncut.len(),
+            self.show_uncut
         )
     }
     /// The scene as RGBA pixels, `w` by `h`.
@@ -467,18 +472,15 @@ impl Viewport<'_> {
         let mut solid = SolidBuffers::default();
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
-        for (fi, face) in if self.simulation.is_some() && self.show_stock {
+        // Only the faces still under stock are drawn then, after the stock.
+        let behind_stock = self.simulation.is_some() && self.show_stock;
+        let faces = if behind_stock && !self.show_uncut {
             vec![]
         } else {
             self.transformed()
-        }
-        .into_iter()
-        .enumerate()
-        {
-            let normal = normal(&face.points);
-            let light = (0.42 + normal[2].abs() * 0.27 + normal[0].abs() * 0.12 + face.tone * 0.13)
-                .clamp(0.2, 0.94);
-            let selected = face.feature.is_some_and(|f| {
+        };
+        let selected_by = |face: &Face| {
+            face.feature.is_some_and(|f| {
                 self.operation.is_some_and(|o| {
                     if self.sample {
                         self.picking && o.geometry.contains(&f)
@@ -488,16 +490,38 @@ impl Viewport<'_> {
                             .is_some_and(|s| s.matches(self.mesh) && s.ids.contains(&f))
                     }
                 })
-            }) || face.feature.is_some_and(|f| marked.contains(&f));
+            }) || face.feature.is_some_and(|f| marked.contains(&f))
+        };
+        let project = |face: &Face| -> Vec<(Point, f32)> {
+            face.points
+                .iter()
+                .map(|v| {
+                    let pt = p.p(*v);
+                    (Point::new(pt.x * ratio, pt.y * ratio), p.depth(*v))
+                })
+                .collect()
+        };
+        // A selected face still under stock keeps its magenta and gets its
+        // outline in the selection colour, drawn once the faces are.
+        let mut outlines: Vec<Vec<(Point, f32)>> = vec![];
+        for (fi, face) in faces.iter().enumerate() {
+            if behind_stock {
+                break;
+            }
+            let light = face_light(face);
+            let selected = selected_by(face);
             let hover = face.feature.is_some() && face.feature == hovered;
             let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
+            let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
             let color = if hover {
                 [242, 190, 93, 255]
+            } else if uncut {
+                if selected {
+                    outlines.push(project(face));
+                }
+                uncut_color(light)
             } else if selected {
                 SELECTED
-            } else if self.uncut.get(fi) == Some(&true) {
-                let shade = |c: u8| (c as f32 * (light + 0.1).min(1.)) as u8;
-                [shade(UNCUT[0]), shade(UNCUT[1]), shade(UNCUT[2]), 255]
             } else {
                 [
                     (light * 0.80 * 255.) as u8,
@@ -506,14 +530,7 @@ impl Viewport<'_> {
                     255,
                 ]
             };
-            let v: Vec<_> = face
-                .points
-                .iter()
-                .map(|v| {
-                    let pt = p.p(*v);
-                    (Point::new(pt.x * ratio, pt.y * ratio), p.depth(*v))
-                })
-                .collect();
+            let v = project(face);
             for i in 1..v.len() - 1 {
                 let tri = [v[0], v[i], v[i + 1]];
                 let minx = tri
@@ -560,6 +577,26 @@ impl Viewport<'_> {
         }
         if let Some(simulation) = self.simulation {
             self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
+            for (fi, face) in faces.iter().enumerate() {
+                if !behind_stock || self.uncut.get(fi) != Some(&true) {
+                    continue;
+                }
+                let v = project(face);
+                let light = face_light(face);
+                for i in 1..v.len() - 1 {
+                    raster_triangle(
+                        &mut rgba,
+                        &mut depths,
+                        w,
+                        h,
+                        [v[0], v[i], v[i + 1]],
+                        uncut_color(light),
+                    );
+                }
+                if selected_by(face) {
+                    outlines.push(v);
+                }
+            }
         } else if self.show_stock
             && let Some(setup) = self.setup
             && self.stock_is_known(setup)
@@ -577,6 +614,12 @@ impl Viewport<'_> {
             // so the translucent box must not dim them.
             for (index, _) in plain.iter().enumerate().filter(|(_, kept)| **kept) {
                 rgba[index * 4..index * 4 + 4].copy_from_slice(&SELECTED);
+            }
+        }
+        for outline in &outlines {
+            for (i, a) in outline.iter().enumerate() {
+                let b = outline[(i + 1) % outline.len()];
+                raster_depth_line(&mut rgba, &depths, w, h, *a, b, SELECTED, ratio);
             }
         }
         if !self.holding.is_empty() {
@@ -1351,6 +1394,16 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
 const SELECTED: [u8; 4] = [92, 168, 223, 255];
 /// The colour of the part's faces the whole job leaves under stock.
 const UNCUT: [u8; 3] = [214, 72, 166];
+/// `UNCUT` as a face of brightness `light` is drawn.
+fn uncut_color(light: f32) -> [u8; 4] {
+    let shade = |c: u8| (c as f32 * (light + 0.1).min(1.)) as u8;
+    [shade(UNCUT[0]), shade(UNCUT[1]), shade(UNCUT[2]), 255]
+}
+/// How bright the part's `face` is drawn, from its normal and tone.
+fn face_light(face: &Face) -> f32 {
+    let normal = normal(&face.points);
+    (0.42 + normal[2].abs() * 0.27 + normal[0].abs() * 0.12 + face.tone * 0.13).clamp(0.2, 0.94)
+}
 /// How a translucent box is painted: the tint of its top and bottom, of its
 /// X sides and of its Y sides, its edges (seen, and behind something), and
 /// how opaque it is over empty space and over the part.
@@ -1706,6 +1759,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1736,6 +1790,124 @@ mod tests {
         let (_, _, rgba) = uncut.pixels(&p, bounds, None);
         assert!(magenta(&rgba) > 10_000, "{}", magenta(&rgba));
     }
+    /// The pixels of `view` that are magenta, as a face under stock is drawn.
+    fn magenta(view: &Viewport, size: (u32, u32)) -> usize {
+        let p = Projector::fit(
+            view.camera,
+            (size.0 as f32, size.1 as f32),
+            view.scene_bounds(),
+        );
+        let (rgba, _) = view.render(&p, size, 1., None, &[]);
+        rgba.chunks(4)
+            .filter(|px| px[0] > px[1].saturating_add(60) && px[2] > px[1].saturating_add(40))
+            .count()
+    }
+    #[test]
+    fn faces_under_stock_are_magenta_over_the_simulated_stock_when_shown() {
+        let (doc, mesh, report) = crate::proposal::tests::block();
+        let good = crate::proposal::tests::good(&report);
+        let job = crate::proposal::build(&doc, &mesh, &report, &good).unwrap();
+        let sim =
+            crate::planner::view_after(&job, &mesh, 0, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        let all = vec![true; mesh.faces.len()];
+        let view = Viewport {
+            setup: job.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation: Some(&sim),
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+            live: None,
+            uncut: &all,
+            show_uncut: true,
+        };
+        let size = (300, 200);
+        // The part is not drawn over the simulated stock, but its faces still
+        // under stock are, where the stock does not hide them.
+        let shown = magenta(&view, size);
+        assert!(shown > 0, "{shown}");
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 300.,
+            height: 200.,
+        };
+        let on_key = view.raster_key(bounds, None);
+        let off = Viewport {
+            show_uncut: false,
+            ..view
+        };
+        assert_eq!(magenta(&off, size), 0);
+        // The toggle is in the key the raster is cached under.
+        assert_ne!(on_key, off.raster_key(bounds, None));
+        // Nothing marked uncut: nothing magenta either.
+        let none = Viewport {
+            uncut: &[],
+            show_uncut: true,
+            ..off
+        };
+        assert_eq!(magenta(&none, size), 0);
+    }
+    #[test]
+    fn a_selected_face_under_stock_keeps_its_magenta_and_is_outlined() {
+        let (doc, mesh) = crate::post::fixture::job();
+        let all = vec![true; mesh.faces.len()];
+        let view = Viewport {
+            setup: doc.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+            live: None,
+            uncut: &all,
+            show_uncut: true,
+        };
+        let size = (300, 200);
+        let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
+        let features: Vec<usize> = mesh.faces.iter().filter_map(|f| f.feature).collect();
+        assert!(!features.is_empty());
+        let (plain, _) = view.render(&p, size, 1., None, &[]);
+        let (marked, _) = view.render(&p, size, 1., None, &features);
+        let tinted = |rgba: &[u8]| rgba.chunks(4).filter(|px| **px == SELECTED).count();
+        // Selected, the faces are still magenta, with a line round each in the
+        // selection colour; they are no longer filled with it.
+        assert_eq!(tinted(&plain), 0);
+        assert!(tinted(&marked) > 0);
+        assert!(magenta(&view, size) > 0);
+        let fill = |rgba: &[u8]| {
+            rgba.chunks(4)
+                .filter(|px| px[0] > px[1].saturating_add(60) && px[2] > px[1].saturating_add(40))
+                .count()
+        };
+        // The lines take some of it; most is still magenta.
+        assert!(
+            fill(&marked) * 4 > fill(&plain),
+            "{} {}",
+            fill(&marked),
+            fill(&plain)
+        );
+        // Without the toggle the selection fills the face, as it did.
+        let off = Viewport {
+            show_uncut: false,
+            ..view
+        };
+        let (filled, _) = off.render(&p, size, 1., None, &features);
+        assert!(tinted(&filled) > tinted(&marked));
+    }
     #[test]
     fn the_raster_is_drawn_again_when_the_uncut_result_changes() {
         let (doc, mesh) = crate::post::fixture::job();
@@ -1761,6 +1933,7 @@ mod tests {
                 leftover: None,
                 live: None,
                 uncut,
+                show_uncut: true,
             }
             .raster_key(bounds, None)
         };
@@ -1801,6 +1974,7 @@ mod tests {
             leftover,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -1874,6 +2048,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
         let tint = [92, 168, 223, 255];
@@ -2005,6 +2180,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
         let reference = v.projector(b);
@@ -2096,6 +2272,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let p = v.projector(b);
@@ -2152,6 +2329,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
         let bounds = clamp.bounds;
@@ -2195,6 +2373,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
         let p = v.projector(b);
@@ -2239,6 +2418,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let p = v.projector(b);
@@ -2274,6 +2454,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);
@@ -2365,6 +2546,7 @@ mod tests {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let hold = |min, max| HoldBox {

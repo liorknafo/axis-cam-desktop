@@ -848,11 +848,59 @@ pub(crate) fn uncut_line(app: &App) -> Option<String> {
         Some(Ok(found)) if found.regions.is_empty() => {
             "Every face of the part is cut by the job.".into()
         }
-        Some(Ok(found)) => format!(
+        Some(Ok(found)) if app.show_uncut => format!(
             "Magenta faces are still under stock after the whole job: {:.0}% of the part's surface.",
             found.share * 100.
         ),
+        Some(Ok(found)) => format!(
+            "{:.0}% of the part's surface is still under stock after the whole job; Show uncut faces is off.",
+            found.share * 100.
+        ),
     })
+}
+/// The "Show uncut faces" checkbox, beside Stock: None unless the job leaves
+/// some of the part under stock, as there is nothing to show then.
+pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
+    job_uncut(app)?
+        .as_ref()
+        .ok()
+        .filter(|found| found.faces.iter().any(|f| *f))?;
+    Some(help::wrap(
+        checkbox(app.show_uncut)
+            .label("Show uncut faces")
+            .on_toggle(|_| Message::ToggleUncut)
+            .text_size(11),
+        crate::choice_help::selected(
+            "uncut_visibility",
+            "Show uncut faces",
+            if app.show_uncut { "Shown" } else { "Hidden" },
+            Target::Setup,
+            &Fields::new(),
+        ),
+        widget::tooltip::Position::Top,
+    ))
+}
+/// One line on what the colours of the 3D view mean: tan original stock,
+/// green cut faces, and magenta faces still under stock while those are
+/// shown. None with the stock hidden and nothing magenta.
+pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
+    let magenta = app.show_uncut && uncut_toggle(app).is_some();
+    if !app.stock && !magenta {
+        return None;
+    }
+    let key = |colour: Color, name: &'static str| {
+        row![text("■").size(10).color(colour), muted(name).size(10)].spacing(3)
+    };
+    let mut legend = row![].spacing(10);
+    if app.stock {
+        legend = legend
+            .push(key(Color::from_rgb8(219, 183, 113), "original stock"))
+            .push(key(Color::from_rgb8(103, 181, 151), "cut faces"));
+    }
+    if magenta {
+        legend = legend.push(key(Color::from_rgb8(214, 72, 166), "still under stock"));
+    }
+    Some(legend.into())
 }
 /// The browser's list of the regions of the part the whole job leaves under
 /// stock, or why that is not checked.
@@ -1004,6 +1052,7 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
             .and_then(|found| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
+        show_uncut: app.show_uncut,
     })
     .width(Fill)
     .height(Fill)
@@ -1072,6 +1121,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             ),
             widget::tooltip::Position::Top
         ),
+        uncut_toggle(app),
         help::wrap(
             checkbox(app.paths)
                 .label(if app.is_sample() {
@@ -1099,6 +1149,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             toggles,
             muted(detail).size(10),
             uncut_line(app).map(|line| muted(line).size(10)),
+            uncut_legend(app),
             muted(if app.picking {
                 "Click a highlighted feature to select it · drag to orbit"
             } else {
@@ -3524,7 +3575,8 @@ fn control(app: &App) -> Element<'_, Message> {
                 column![
                     container(view).height(360),
                     muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts."),
-                    uncut_line(app).map(muted)
+                    uncut_line(app).map(muted),
+                    uncut_legend(app)
                 ],
             )
         });
@@ -5457,6 +5509,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         })
         .width(Fill)
         .height(380)

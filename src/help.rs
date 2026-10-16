@@ -564,6 +564,9 @@ pub fn command(m: &Message, label: String) -> Help {
         ToggleStock => {
             "Show or hide stock. During Facing or Pocket simulation this displays the remaining sampled stock; hide Stock to see the finished reference model. Outside simulation it shows the transparent stock box. Relative stock extends from each side of the placed part by its offset; fixed stock uses explicit dimensions. The box and part share the same display scale."
         }
+        ToggleUncut => {
+            "Show or hide the faces of the part that the stock still covers after every setup, in magenta. With the simulated stock shown, just those faces are drawn over it, where the stock surface does not hide them. A selected one keeps its magenta and gets a blue outline. Off, the part is drawn as it is without them."
+        }
         TogglePaths => {
             "Show or hide the cutter path. Pocket shows cuts on the current depth layer; Facing shows the latest cutting pass. Both show the active rapid; the example project shows illustrative paths."
         }

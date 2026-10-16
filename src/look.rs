@@ -283,6 +283,7 @@ impl View {
             leftover: None,
             live: None,
             uncut: &[],
+            show_uncut: true,
         };
         let boxes = focus_bounds(mesh, &setup, &args.focus_surfaces)
             .map(|b| vec![b])
@@ -363,6 +364,7 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         leftover: None,
         live: None,
         uncut: &[],
+        show_uncut: true,
     };
     let (w, h) = (SIZE, SIZE - CAPTION);
     let (rgba, depths) =

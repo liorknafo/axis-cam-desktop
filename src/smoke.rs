@@ -6267,6 +6267,51 @@ flood = { pin = 8 }
         assert_eq!(crate::ui::uncut_line(&sample), None);
     }
     #[test]
+    fn the_3d_view_has_a_show_uncut_faces_toggle_and_a_legend_that_match_the_line() {
+        use iced::advanced::widget::Tree;
+        /// The nodes of a widget tree.
+        fn nodes(t: &Tree) -> usize {
+            1 + t.children.iter().map(nodes).sum::<usize>()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        // Not checked yet: nothing is magenta, so no toggle and no magenta key.
+        assert!(crate::ui::uncut_toggle(&a).is_none());
+        let legend = |a: &App| crate::ui::uncut_legend(a).map(|l| nodes(&Tree::new(l.as_widget())));
+        let toggle = |a: &App| crate::ui::uncut_toggle(a).map(|t| nodes(&Tree::new(t.as_widget())));
+        let without = legend(&a).expect("tan and green");
+        let _ = a.refresh_left_stock();
+        // The job leaves faces under stock: the checkbox is there, on or off.
+        assert!(toggle(&a).is_some());
+        // On by default: the line promises magenta and the legend names it.
+        assert!(a.show_uncut);
+        assert!(
+            crate::ui::uncut_line(&a)
+                .unwrap()
+                .starts_with("Magenta faces")
+        );
+        assert!(legend(&a) > Some(without));
+        let _ = a.view();
+        // Off: the line no longer promises magenta, and the legend drops it.
+        let _ = a.update(Message::ToggleUncut);
+        assert!(!a.show_uncut);
+        let line = crate::ui::uncut_line(&a).unwrap();
+        assert!(
+            !line.contains("Magenta") && line.contains("Show uncut faces is off"),
+            "{line}"
+        );
+        assert_eq!(legend(&a), Some(without));
+        assert!(toggle(&a).is_some());
+        let _ = a.view();
+        // Stock hidden and the faces off: nothing to name.
+        let _ = a.update(Message::ToggleStock);
+        assert!(crate::ui::uncut_legend(&a).is_none());
+        // The example is not simulated: no toggle.
+        let mut sample = app();
+        sample.doc = Document::sample();
+        assert!(crate::ui::uncut_toggle(&sample).is_none());
+    }
+    #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = leftover_app(&dir);
