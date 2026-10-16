@@ -53,9 +53,9 @@ const FRAMES: u32 = 2;
 /// How long a step's frame may take to come before the run fails.
 const FRAME_WAIT: Duration = Duration::from_secs(15);
 /// The sharp edges per 1,000 drawn pixels, at the window's scale, under
-/// which a screen has no text: labelled screens measure 18 (the Control page
-/// before Connect) to 120, the stale frames of #90 3.5 to 3.8, and one that
-/// kept some of its labels 8.7.
+/// which a screen has no text: labelled screens measure 15.9 (the Tools page,
+/// screen 07) to 120, the stale frames of #90 3.5 to 3.8, and one that kept
+/// some of its labels 8.7.
 const TEXT_EDGES: f64 = 12.;
 /// The window's frames and sizes, for the smoke run: a message for each
 /// frame drawn while the run waits for one, and for each size the window
