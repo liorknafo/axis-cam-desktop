@@ -3,7 +3,7 @@
 use crate::control::{Action, Connection};
 use crate::model::{Machine, get};
 use crate::ui::{act, bold, btn, caution, machine_panel, muted, note};
-use crate::{App, Message};
+use crate::{App, Message, Target, help};
 use iced::widget::{
     Column, checkbox, column, container, pick_list, row, scrollable, text, text_input,
 };
@@ -581,14 +581,19 @@ fn calibration(c: &Connection) -> Element<'_, Message> {
             i == axis,
         ));
     }
-    let field = |name: &str, value: &str, f: fn(String) -> Action| {
+    let field = |name: &str, key: &str, value: &str, f: fn(String) -> Action| {
         row![
             label(name),
-            text_input("mm", value)
-                .on_input(move |v| Message::Machine(f(v)))
-                .width(110)
-                .padding([5, 8])
-                .size(12)
+            help::field(
+                text_input("mm", value)
+                    .on_input(move |v| Message::Machine(f(v)))
+                    .width(110)
+                    .padding([5, 8])
+                    .size(12),
+                key,
+                name,
+                Target::Machine
+            )
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -597,8 +602,13 @@ fn calibration(c: &Connection) -> Element<'_, Message> {
     let spu = c.config.axes.get(axis).map_or(1., |a| a.steps_per_unit);
     let mut body = column![
         axes,
-        field("Commanded travel · mm", &cal.distance, Action::CalDistance)
-            .push(act("Move", go, false)),
+        field(
+            "Commanded travel · mm",
+            "cal_distance",
+            &cal.distance,
+            Action::CalDistance
+        )
+        .push(act("Move", go, false)),
     ];
     if let Some(pulses) = c.cal_pulses() {
         body = body.push(muted(format!(
@@ -609,6 +619,7 @@ fn calibration(c: &Connection) -> Element<'_, Message> {
     }
     body = body.push(field(
         "Measured travel · mm",
+        "cal_measured",
         &cal.measured,
         Action::CalMeasured,
     ));

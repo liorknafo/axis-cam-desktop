@@ -4367,10 +4367,14 @@ fn control(app: &App) -> Element<'_, Message> {
         ))
         .size(12)
         .width(190),
-        slider(1.0..=100.0, c.jog_speed, |v| Message::Machine(
-            Action::JogSpeed(v)
-        ))
-        .step(1.0_f32)
+        help::wrap(
+            slider(1.0..=100.0, c.jog_speed, |v| Message::Machine(
+                Action::JogSpeed(v)
+            ))
+            .step(1.0_f32),
+            help::command(&Message::Machine(Action::JogSpeed(0.)), "Jog speed".into()),
+            widget::tooltip::Position::Right,
+        )
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -4494,11 +4498,16 @@ fn control(app: &App) -> Element<'_, Message> {
             .then_some(Message::Machine(Action::Spindle(state)))
     };
     let mut spindle_row = row![
-        text_input("RPM", &c.rpm)
-            .on_input(|v| Message::Machine(Action::Rpm(v)))
-            .width(90)
-            .padding([7, 9])
-            .size(13),
+        help::field(
+            text_input("RPM", &c.rpm)
+                .on_input(|v| Message::Machine(Action::Rpm(v)))
+                .width(90)
+                .padding([7, 9])
+                .size(13),
+            "control_rpm",
+            "Spindle speed · RPM",
+            Target::Machine
+        ),
         act("CW", start(Spindle::Cw), s.spindle == Some(Spindle::Cw))
     ]
     .spacing(6)
@@ -4552,10 +4561,17 @@ fn control(app: &App) -> Element<'_, Message> {
             text(format!("Feed override {:.0} %", c.feed_override))
                 .size(12)
                 .width(140),
-            slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
-                Action::FeedOverride(v)
-            ))
-            .step(5.0_f32)
+            help::wrap(
+                slider(10.0..=200.0, c.feed_override, |v| Message::Machine(
+                    Action::FeedOverride(v)
+                ))
+                .step(5.0_f32),
+                help::command(
+                    &Message::Machine(Action::FeedOverride(100.)),
+                    "Feed override".into()
+                ),
+                widget::tooltip::Position::Right,
+            )
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -4590,11 +4606,16 @@ fn control(app: &App) -> Element<'_, Message> {
         "MDI",
         column![
             row![
-                text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
-                    .on_input(|v| Message::Machine(Action::MdiText(v)))
-                    .on_submit_maybe(send.clone())
-                    .padding([7, 9])
-                    .size(13),
+                help::field(
+                    text_input("One G-code line, for example G0 X10 Y10", &c.mdi)
+                        .on_input(|v| Message::Machine(Action::MdiText(v)))
+                        .on_submit_maybe(send.clone())
+                        .padding([7, 9])
+                        .size(13),
+                    "mdi_line",
+                    "MDI line",
+                    Target::Machine
+                ),
                 act("Send", send, false)
             ]
             .spacing(6)

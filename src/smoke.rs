@@ -3781,6 +3781,92 @@ flood = { pin = 8 }
         crate::ui::probe::texts(a.view(), WINDOW)
     }
 
+    /// What a view offers to widget operations: the form fields' tags and
+    /// the titles of the hover cards (`help::HoverHelp`).
+    #[derive(Default)]
+    struct Helps {
+        tags: Vec<crate::help::FieldTag>,
+        cards: Vec<crate::help::Help>,
+    }
+    impl iced::advanced::widget::Operation<(Vec<crate::help::FieldTag>, Vec<crate::help::Help>)>
+        for Helps
+    {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(
+                &mut dyn iced::advanced::widget::Operation<(
+                    Vec<crate::help::FieldTag>,
+                    Vec<crate::help::Help>,
+                )>,
+            ),
+        ) {
+            operate(self)
+        }
+        fn custom(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(tag) = state.downcast_ref::<crate::help::FieldTag>() {
+                self.tags.push(tag.clone());
+            }
+            if let Some(card) = state.downcast_ref::<crate::help::Help>() {
+                self.cards.push(card.clone());
+            }
+        }
+        fn finish(
+            &self,
+        ) -> iced::advanced::widget::operation::Outcome<(
+            Vec<crate::help::FieldTag>,
+            Vec<crate::help::Help>,
+        )> {
+            iced::advanced::widget::operation::Outcome::Some((
+                self.tags.clone(),
+                self.cards.clone(),
+            ))
+        }
+    }
+
+    /// The Control page's RPM, MDI, jog speed, feed override and calibration
+    /// fields have their help (#195): the typed fields are form fields that
+    /// F1 pins and the sliders have hover cards, each with the text of its
+    /// command.
+    #[test]
+    fn the_control_pages_typed_fields_and_sliders_have_help() {
+        use crate::control::Action as Ctl;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let (tags, cards) = laid(&a).run(Helps::default()).expect("the Control page");
+        for (key, command) in [
+            ("control_rpm", Ctl::Rpm(String::new())),
+            ("mdi_line", Ctl::MdiText(String::new())),
+        ] {
+            let tag = tags
+                .iter()
+                .find(|t| t.key == key)
+                .unwrap_or_else(|| panic!("{key} is no form field: {tags:?}"));
+            let card = tag.help();
+            let command = crate::help::command(&Message::Machine(command), tag.label.clone());
+            assert_eq!(card.body, command.body, "{key}");
+            assert!(!card.body.is_empty(), "{key}");
+        }
+        for title in ["Jog speed", "Feed override"] {
+            let card = (cards.iter().find(|c| c.title == title))
+                .unwrap_or_else(|| panic!("no card {title}"));
+            assert!(!card.body.is_empty(), "{title}");
+        }
+        // The calibration fields are in the Controller configuration view.
+        let _ = a.update(Message::ControlSetup(true));
+        let (tags, _) = laid(&a).run(Helps::default()).expect("the Setup view");
+        for key in ["cal_distance", "cal_measured"] {
+            let tag = (tags.iter().find(|t| t.key == key))
+                .unwrap_or_else(|| panic!("{key} is no form field: {tags:?}"));
+            assert!(!tag.help().body.is_empty(), "{key}");
+        }
+    }
+
     #[test]
     fn a_pocket_stepover_over_50_percent_is_shown_under_the_stepover_field() {
         let mut a = app();

@@ -776,7 +776,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-eight 
 - `src/mesh.rs`: sample model, STL/OBJ readers and preview normalization.
 - `src/three_mf.rs`: bounded 3MF package and mesh/component reader.
 - `src/step.rs`, `native/step_preview.cpp`, `build.rs`: isolated Open CASCADE STEP converter.
-- `src/help.rs`: shared hover cards (a short hover text, the rest under More…), the hover widget that keeps a card open under the pointer, and operation illustrations; `src/help_before_89.tsv` holds the texts from before the split for the test that no sentence was lost.
+- `src/help.rs`: shared hover cards (a short hover text, the rest under More…), the hover widget that keeps a card open under the pointer, and operation illustrations.
 - `src/choice_help.rs`, `src/choice_diagram.rs`: selected-value descriptions, related-setting context and matching native animations.
 - `src/storage.rs`: project loading and atomic persistence.
 - `src/rest.rs`: conservative continuous-sweep coverage for automatic cutting start heights, also used by export to prove a rapid's descent clear and to find the stock faces earlier setups cut, and (`RestStock::left`) the box a later setup starts from, and (`Removed`) where earlier cuts removed material, which operation did and whether the part is still joined to the material a holder grips.
