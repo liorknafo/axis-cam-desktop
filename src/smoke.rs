@@ -2822,6 +2822,31 @@ flood = { pin = 8 }
     }
 
     #[test]
+    fn tab_moves_the_focus_while_the_machine_moves() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        assert!(a.locked());
+        // The Control page's fields stay editable, so Tab and Shift+Tab move
+        // between them: the focus task is started and the status stays clear.
+        a.status.clear();
+        for back in [false, true] {
+            let task = a.update(Message::TabKey(back));
+            assert_eq!(task.units(), 1, "back: {back}");
+            assert_ne!(a.status, crate::LOCKED, "back: {back}");
+        }
+        assert!(a.status.is_empty());
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    #[test]
     fn a_tool_run_holds_resumes_and_stops() {
         use crate::run::Action as R;
         use uc100::controller::State;
