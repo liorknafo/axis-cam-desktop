@@ -9464,6 +9464,268 @@ flood = { pin = 8 }
         a.drop_plan();
         assert!(a.plan_overview.is_none() && a.plan_timeline.is_empty());
     }
+    /// A grey PNG, as the planner's pictures are.
+    fn picture(width: u32, height: u32) -> std::sync::Arc<Vec<u8>> {
+        let mut out = vec![];
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![200; (width * height * 3) as usize])
+            .unwrap();
+        drop(writer);
+        std::sync::Arc::new(out)
+    }
+    const PAGE: iced::Size = iced::Size::new(1000., 800.);
+    /// A run on its first request that has sent the overview, `steps` more
+    /// stages, and looked at one picture in the first request.
+    fn running_plan_app(dir: &tempfile::TempDir, steps: usize) -> App {
+        use crate::planner::{Event, Look, Progress};
+        let mut a = signed_in_planning_app(dir);
+        a.page = Page::Ai;
+        a.planner = crate::Planner::Running(Progress::Asking(1));
+        a.record_plan_event(Event::Overview(Look {
+            description: "+Z up, isometric; stock shown; tags: none".into(),
+            purpose: String::new(),
+            png: Some(picture(300, 200)),
+        }));
+        a.record_plan_event(Event::Stage(Progress::Analyzing));
+        a.record_plan_event(Event::Stage(Progress::Asking(1)));
+        a.record_plan_event(Event::Looked(
+            1,
+            Look {
+                description: "+Z up, top, whole part; stock shown; tags: none".into(),
+                purpose: "overview".into(),
+                png: Some(picture(300, 200)),
+            },
+        ));
+        for n in 0..steps {
+            a.record_plan_event(Event::Stage(Progress::Checking(n % 4 + 1)));
+        }
+        a
+    }
+    fn index_of(texts: &[String], start: &str) -> usize {
+        texts
+            .iter()
+            .position(|t| t.starts_with(start))
+            .unwrap_or_else(|| panic!("no text starts with {start:?} in {texts:?}"))
+    }
+    #[test]
+    fn the_running_page_has_its_stage_time_and_cancel_before_the_scrolling_timeline() {
+        use crate::ui::probe::{Seen, id, seen};
+        let dir = tempfile::tempdir().unwrap();
+        let before = |a: &App| {
+            let items = seen(crate::ui::plan_side(a), PAGE);
+            let text = |start: &str| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, Seen::Text(t) if t.starts_with(start)))
+                    .unwrap_or_else(|| panic!("no text starts with {start:?}"))
+            };
+            let timeline = items
+                .iter()
+                .position(
+                    |i| matches!(i, Seen::Scroll(scroll, _) if *scroll == id("plan-timeline")),
+                )
+                .expect("the timeline scrolls on its own");
+            let crate::Planner::Running(progress) = a.planner else {
+                panic!("running")
+            };
+            let running = crate::ui::running_text(a, progress);
+            let (stage, since, cancel) = (
+                text(&running),
+                text("0 s since the run started"),
+                text("Cancel"),
+            );
+            // The stage, the time and Cancel come first, in the pinned part.
+            assert!(stage < cancel && since < cancel && cancel < timeline);
+            // What scrolls: the overview picture and the timeline rows, the
+            // open request's among them (the stage above it says the same).
+            for later in [
+                "The AI starts with this picture",
+                "Analyzed the part",
+                &running,
+            ] {
+                assert!(
+                    items.iter().enumerate().any(|(at, i)| at > timeline
+                        && matches!(i, Seen::Text(t) if t.starts_with(later))),
+                    "{later} is in the scrolling part"
+                );
+            }
+            // The waiting note stays with Cancel.
+            assert!(text("This can take a few minutes") < timeline);
+            (cancel, timeline)
+        };
+        // However long the timeline grows, Cancel keeps its place in the tree
+        // and in front of the rows.
+        let short = before(&running_plan_app(&dir, 0));
+        let long = before(&running_plan_app(&dir, 40));
+        assert_eq!(short, long);
+    }
+    #[test]
+    fn a_finished_page_has_the_outcome_and_its_actions_before_the_timeline() {
+        use crate::ui::probe::{Seen, id, seen, texts};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = running_plan_app(&dir, 3);
+        // The failure: its message, then Try again and Dismiss, then the steps.
+        a.planner = crate::Planner::Failed(crate::planner::Failure {
+            message: "The model never gave a plan that passed.".into(),
+            problems: vec![],
+            api: None,
+            requests: 4,
+        });
+        let lines = texts(crate::ui::plan_side(&a), PAGE);
+        let (head, again, dismiss, tried, row) = (
+            index_of(&lines, "No plan this time"),
+            index_of(&lines, "Try again"),
+            index_of(&lines, "Dismiss"),
+            index_of(&lines, "What the planner tried"),
+            index_of(&lines, "Analyzed the part"),
+        );
+        assert!(head < again && again < dismiss && dismiss < tried && tried < row);
+        // The preview: the outcome, the actions and the 3D heading, then the
+        // timeline in a scrollable of its own.
+        a.planner = crate::Planner::Preview(checked_preview(&a, false));
+        let items = seen(crate::ui::plan_side(&a), PAGE);
+        let at = |start: &str| {
+            items
+                .iter()
+                .position(|i| matches!(i, Seen::Text(t) if t.starts_with(start)))
+                .unwrap_or_else(|| panic!("no text starts with {start:?}"))
+        };
+        let timeline = items
+            .iter()
+            .position(|i| matches!(i, Seen::Scroll(scroll, _) if *scroll == id("plan-timeline")))
+            .expect("the finished timeline scrolls on its own");
+        let (outcome, apply, made, row) = (
+            at("Plan ready to review"),
+            at("Apply plan"),
+            at("How the plan was made"),
+            at("Analyzed the part"),
+        );
+        assert!(outcome < apply && apply < made && made < timeline && timeline < row);
+        // Every action is still on the page: Apply and Discard twice.
+        let texts = texts(crate::ui::plan_side(&a), PAGE);
+        assert_eq!(texts.iter().filter(|t| *t == "Apply plan").count(), 2);
+        assert_eq!(texts.iter().filter(|t| *t == "Discard").count(), 2);
+    }
+    #[test]
+    fn a_thumbnail_click_opens_the_picture_at_full_size_and_a_second_click_closes_it() {
+        use crate::planner::Progress;
+        use crate::ui::PlanPicture;
+        use crate::ui::probe::{Seen, clicks, seen, texts};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = running_plan_app(&dir, 0);
+        let enlarged = |a: &App| {
+            texts(crate::ui::plan_side(a), PAGE)
+                .iter()
+                .any(|t| t == "The picture at full size")
+        };
+        assert!(!enlarged(&a));
+        // Clicking the overview and the look sends each its own toggle.
+        let sent = clicks(crate::ui::plan_side(&a), PAGE);
+        let picked = |picture| {
+            sent.iter()
+                .any(|m| matches!(m, Message::PlanPicture(p) if *p == picture))
+        };
+        let look = PlanPicture::Look { step: 1, look: 0 };
+        assert!(picked(PlanPicture::Overview) && picked(look));
+        let _ = a.update(Message::PlanPicture(look));
+        assert_eq!(a.plan_enlarged, Some(look));
+        assert!(enlarged(&a));
+        // The picture is in the page at its natural size, in a scrollable.
+        let items = seen(crate::ui::plan_side(&a), PAGE);
+        let sizes: Vec<iced::Size> = items
+            .iter()
+            .filter_map(|i| match i {
+                Seen::Scroll(None, size) => Some(*size),
+                _ => None,
+            })
+            .collect();
+        assert!(sizes.contains(&iced::Size::new(300., 200.)), "{sizes:?}");
+        // The stage and Cancel stay above it, and a Close button sends the
+        // same toggle as the thumbnail.
+        let lines = texts(crate::ui::plan_side(&a), PAGE);
+        assert!(index_of(&lines, "Cancel") < index_of(&lines, "The picture at full size"));
+        assert!(index_of(&lines, "Close") > index_of(&lines, "The picture at full size"));
+        let closing = clicks(crate::ui::plan_side(&a), PAGE);
+        assert!(
+            closing
+                .iter()
+                .any(|m| matches!(m, Message::PlanPicture(p) if *p == look))
+        );
+        // Another picture replaces it; the same one again closes it.
+        let _ = a.update(Message::PlanPicture(PlanPicture::Overview));
+        assert_eq!(a.plan_enlarged, Some(PlanPicture::Overview));
+        let _ = a.update(Message::PlanPicture(PlanPicture::Overview));
+        assert_eq!(a.plan_enlarged, None);
+        assert!(!enlarged(&a));
+        // A picture the timeline no longer has shows nothing, and a new run
+        // starts with none open.
+        let _ = a.update(Message::PlanPicture(PlanPicture::Look { step: 9, look: 0 }));
+        assert!(!enlarged(&a));
+        let _ = a.update(Message::PlanPicture(look));
+        a.drop_plan();
+        assert_eq!(a.plan_enlarged, None);
+        a.planner = crate::Planner::Running(Progress::Analyzing);
+        assert!(!enlarged(&a));
+    }
+    #[test]
+    fn show_full_text_opens_a_clipped_note_reason_and_summary() {
+        use crate::ui::Expand;
+        use crate::ui::probe::{clicks, texts};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.page = Page::Ai;
+        let long = |tail: &str| format!("word{} {tail}", " word".repeat(120));
+        let preview = checked_preview_of(&a, false, |p| {
+            p.summary = long("SUMMARYEND");
+            p.setups[0].workholding = long("NOTEEND");
+            p.setups[0].operations[0].reason = long("REASONEND");
+            p.warnings = vec![long("WARNINGEND")];
+        });
+        a.planner = crate::Planner::Preview(preview);
+        let window = iced::Size::new(1000., 3000.);
+        let page = |a: &App| texts(crate::ui::plan_side(a), window);
+        let has = |lines: &[String], end: &str| lines.iter().any(|t| t.contains(end));
+        // Clipped: the ends are missing, and each text has its link.
+        let lines = page(&a);
+        for end in ["SUMMARYEND", "NOTEEND", "REASONEND", "WARNINGEND"] {
+            assert!(!has(&lines, end), "{end} is clipped");
+        }
+        assert_eq!(lines.iter().filter(|t| *t == "Show full text").count(), 4);
+        assert!(lines.iter().all(|t| t != "Show less"));
+        // The link is in the page and sends its text's toggle.
+        let sent = clicks(crate::ui::plan_side(&a), window);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(m, Message::PlanExpand(Expand::Reason(0, 0))))
+        );
+        // Each opens on its own, ends in its last word and offers Show less;
+        // the others stay clipped.
+        for (key, end) in [
+            (Expand::Summary, "SUMMARYEND"),
+            (Expand::Workholding(0), "NOTEEND"),
+            (Expand::Reason(0, 0), "REASONEND"),
+            (Expand::Warning(0), "WARNINGEND"),
+        ] {
+            let _ = a.update(Message::PlanExpand(key));
+            let lines = page(&a);
+            assert!(has(&lines, end), "{end} is shown in full");
+            assert_eq!(lines.iter().filter(|t| *t == "Show less").count(), 1);
+            assert_eq!(lines.iter().filter(|t| *t == "Show full text").count(), 3);
+            let _ = a.update(Message::PlanExpand(key));
+            assert!(!has(&page(&a), end), "{end} is clipped again");
+        }
+        // A short text has no link, and a discarded plan forgets what was open.
+        let preview = checked_preview(&a, false);
+        a.planner = crate::Planner::Preview(preview);
+        assert!(page(&a).iter().all(|t| t != "Show full text"));
+        let _ = a.update(Message::PlanExpand(Expand::Summary));
+        let _ = a.update(Message::DiscardPlan);
+        assert!(a.plan_expanded.is_empty());
+    }
     #[test]
     fn the_tool_lines_of_the_smoke_timeline_are_the_tools_own() {
         let dir = tempfile::tempdir().unwrap();

@@ -237,6 +237,11 @@ pub enum Message {
     PlanProgress(u64, planner::Event),
     PlanFinished(u64, Result<std::sync::Arc<PlanPreview>, planner::Failure>),
     PlanCancel,
+    /// A picture of the running page opens at full size, or closes if it is
+    /// the one open.
+    PlanPicture(ui::PlanPicture),
+    /// A clipped text of the plan preview opens in full, or closes again.
+    PlanExpand(ui::Expand),
     ApplyPlan,
     DiscardPlan,
     UndoPlan,
@@ -713,6 +718,10 @@ pub struct App {
     pub plan_stream: std::sync::Arc<std::sync::Mutex<String>>,
     /// The picture the current run's first request carries.
     pub plan_overview: Option<Shown>,
+    /// The picture of the running page shown at full size, if any.
+    pub plan_enlarged: Option<ui::PlanPicture>,
+    /// The clipped texts of the plan preview shown in full.
+    pub plan_expanded: std::collections::BTreeSet<ui::Expand>,
     /// Blocking stages still running, also those of cancelled runs.
     pub plan_busy: planner::Busy,
     /// Set by an edit that dropped a running plan or a preview, or by a
@@ -774,6 +783,8 @@ fn while_locked(m: &Message) -> bool {
             | PlanProgress(..)
             | PlanFinished(..)
             | PlanCancel
+            | PlanPicture(_)
+            | PlanExpand(_)
             | PostChecked(..)
             | LeftStock(_)
             | SaveProject
@@ -1072,6 +1083,8 @@ impl App {
             plan_timeline: vec![],
             plan_stream: Default::default(),
             plan_overview: None,
+            plan_enlarged: None,
+            plan_expanded: Default::default(),
             plan_camera: viewport::Camera::default(),
             plan_busy: planner::Busy::default(),
             plan_dropped: None,
@@ -2021,6 +2034,8 @@ impl App {
         self.planner = Planner::Idle;
         self.plan_timeline.clear();
         self.plan_overview = None;
+        self.plan_enlarged = None;
+        self.plan_expanded.clear();
         // The aborted run may still write to the old text.
         self.plan_stream = Default::default();
     }
@@ -3808,10 +3823,19 @@ impl App {
                     self.status = "Planning cancelled. The job is unchanged.".into();
                 }
             }
+            Message::PlanPicture(picture) => {
+                self.plan_enlarged = (self.plan_enlarged != Some(picture)).then_some(picture);
+            }
+            Message::PlanExpand(text) => {
+                if !self.plan_expanded.remove(&text) {
+                    self.plan_expanded.insert(text);
+                }
+            }
             Message::DiscardPlan => {
                 if matches!(self.planner, Planner::Preview(_) | Planner::Failed(_)) {
                     self.planner = Planner::Idle;
                     self.plan_timeline.clear();
+                    self.plan_expanded.clear();
                 }
             }
             Message::ApplyPlan => {
