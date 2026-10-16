@@ -1611,6 +1611,70 @@ impl Document {
 fn label(k: &str) -> String {
     k.replace('_', " ")
 }
+/// The operation editor's text fields, by key: the ones a check's message
+/// names by its `label`.
+const OPERATION_FIELDS: [&str; 33] = [
+    "name",
+    "hole_diameter",
+    "rpm",
+    "feed",
+    "clearance",
+    "retract",
+    "top",
+    "bottom",
+    "breakthrough",
+    "angle_a",
+    "angle_b",
+    "rotary_start",
+    "rotary_end",
+    "tilt_min",
+    "tilt_max",
+    "lead_angle",
+    "lean_angle",
+    "peck",
+    "dwell",
+    "direction",
+    "stepover",
+    "surface_stepover",
+    "slope_min",
+    "slope_max",
+    "stepdown",
+    "tolerance",
+    "allowance",
+    "axial_allowance",
+    "finish_passes",
+    "optimal_load",
+    "minimum_radius",
+    "ramp_angle",
+    "lead_in",
+];
+/// The operation editor's text field a check's message is about, by its key,
+/// so the editor can show the message at the field. The messages of
+/// `Operation::issues` start with the field's `label` (a Pocket's stepover
+/// message with the strategy before it, and the finishing passes under the
+/// name their field has); the speed and feed checks (`material::check`) name
+/// the surface speed, which the spindle speed sets, and the chip load, which
+/// the feed sets. None for a message about no text field.
+pub fn issue_field(issue: &str) -> Option<&'static str> {
+    let lower = issue.to_lowercase();
+    let m = lower.strip_prefix("pocket ").unwrap_or(&lower);
+    if m.starts_with("surface speed ") {
+        return Some("rpm");
+    }
+    if m.starts_with("chip load ") {
+        return Some("feed");
+    }
+    if m.starts_with("finishing passes ") {
+        return Some("finish_passes");
+    }
+    if m == "give this operation a name." {
+        return Some("name");
+    }
+    OPERATION_FIELDS.into_iter().find(|k| {
+        m.strip_prefix(label(k).as_str())
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
 fn finite(p: &Fields, k: &str, e: &mut Vec<String>) {
     if num(p, k).is_none() {
         e.push(format!("{} must be a finite number.", label(k)))
@@ -1783,6 +1847,57 @@ mod tests {
         assert!(issues(Strategy::Face, "60").is_empty());
         assert!(issues(Strategy::Face, "100").is_empty());
         assert!(!issues(Strategy::Face, "101").is_empty());
+    }
+    #[test]
+    fn each_check_message_names_the_field_it_is_about() {
+        let d = Document::sample();
+        let s = d.setup();
+        let mut o = Operation::new(Strategy::Pocket, d.tools[0].id.clone());
+        o.p.insert("stepover".into(), "60".into());
+        o.p.insert("axial_allowance".into(), "-1".into());
+        o.p.insert("rpm".into(), "0".into());
+        o.p.insert("name".into(), " ".into());
+        let issues = o.issues(&s.machine, &d.tools, &[]);
+        let field = |part: &str| {
+            let issue = issues
+                .iter()
+                .find(|x| x.contains(part))
+                .unwrap_or_else(|| panic!("no issue with {part:?} in {issues:?}"));
+            issue_field(issue)
+        };
+        assert_eq!(field("Pocket stepover"), Some("stepover"));
+        assert_eq!(field("axial allowance"), Some("axial_allowance"));
+        assert_eq!(field("rpm must"), Some("rpm"));
+        assert_eq!(field("a name"), Some("name"));
+        // The other forms the messages take, and the ones about no field.
+        for (issue, key) in [
+            (
+                "surface stepover must be greater than zero.",
+                Some("surface_stepover"),
+            ),
+            ("allowance cannot be negative or blank.", Some("allowance")),
+            ("slope max must not be below slope min.", Some("slope_max")),
+            ("Clearance must be above retract height.", Some("clearance")),
+            ("feed exceeds the saved machine limit.", Some("feed")),
+            (
+                "Finishing passes must be a whole number.",
+                Some("finish_passes"),
+            ),
+            (
+                "Surface speed 377 m/min is above Aluminium's 150–300 m/min.",
+                Some("rpm"),
+            ),
+            (
+                "Chip load 0.008 mm per tooth is below Aluminium's 0.020–0.060 mm for a Ø6 mm tool.",
+                Some("feed"),
+            ),
+            ("Choose a tool from the library.", None),
+            ("Select at least one machining feature or surface.", None),
+            ("Flutes must be a whole number.", None),
+            ("Rest machining needs an enabled preceding operation.", None),
+        ] {
+            assert_eq!(issue_field(issue), key, "{issue}");
+        }
     }
     #[test]
     fn drill_only_relevant_cycle_fields() {

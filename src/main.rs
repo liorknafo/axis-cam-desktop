@@ -187,8 +187,20 @@ pub enum Message {
     JogKeyUp,
     /// Space went down and no widget took it: Hold, or Resume.
     HoldKey,
-    /// Tab went down: the next text field, or the previous one with Shift.
+    /// Tab went down: the next text field, or the previous one with Shift;
+    /// with none focused, the form's first field.
     TabKey(bool),
+    /// F1 went down: the help of the focused text field, pinned.
+    HelpKey,
+    /// The focused text field F1 found, or none: pins its help, or puts the
+    /// pinned help away.
+    HelpFor(Option<help::FieldTag>),
+    /// Esc went down: the E-stop while a machine is connected; off the
+    /// Control page, it puts the pinned help away.
+    EscapeKey,
+    /// A row of the operation audit's report: opens its operation, at the
+    /// tab its line names.
+    AuditRow(usize),
     /// An action of the Run panel on the Control page.
     Run(run::Action),
     /// NC review's Run on the machine for a UC100 setup: the MACHINE
@@ -308,7 +320,8 @@ pub enum Message {
     WindowSized(iced::Size),
     HelpHover(bool),
     /// More… and Pause on a hover card: taken by the card's overlay
-    /// (`help::HoverHelp`), never by the app.
+    /// (`help::HoverHelp`); from the card F1 pinned (`help::pinned`), the
+    /// app's, for that card.
     HelpMore(bool),
     HelpPause(bool),
     Noop,
@@ -646,7 +659,12 @@ pub struct App {
     /// The setup editor's step shown (`ui::SETUP_STEPS`).
     pub setup_step: &'static str,
     pub status: String,
-    pub audit_report: Vec<(String, bool, String)>,
+    pub audit_report: Vec<AuditRow>,
+    /// The field whose help the F1 key pinned (`ui::view` draws it), and
+    /// whether its card is open to its More… text and its animation paused.
+    pub pinned_help: Option<help::FieldTag>,
+    pub pinned_expanded: bool,
+    pub pinned_paused: bool,
     pub post: Option<std::sync::Arc<post::JobPost>>,
     pub post_busy: bool,
     /// The stock the earlier setups left each later setup, once worked out.
@@ -794,6 +812,17 @@ pub struct App {
     #[cfg(test)]
     test_dir: Option<tempfile::TempDir>,
 }
+/// A line of the operation audit's report (`Message::GenerateAll`): the setup
+/// and operation it is about, by index, their names, whether the operation
+/// generated, and what happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditRow {
+    pub setup: usize,
+    pub operation: usize,
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
 pub const LOCKED: &str = "The machine is running: planning is locked until it stops.";
 /// What still works while planning is locked (`App::locked`): the Machine
 /// workspace (the Control page), looking around, saving, the account, and the
@@ -816,6 +845,9 @@ fn while_locked(m: &Message) -> bool {
             | JogKeyUp
             | HoldKey
             | TabKey(_)
+            | HelpKey
+            | HelpFor(_)
+            | EscapeKey
             | Run(_)
             | RunChecked(..)
             | ToggleStock
@@ -865,6 +897,8 @@ fn while_locked(m: &Message) -> bool {
             | Close(_)
             | Captured(_)
             | HelpHover(_)
+            | HelpMore(_)
+            | HelpPause(_)
             | Noop
     )
 }
@@ -1079,6 +1113,9 @@ impl App {
             setup_step: "Machine",
             status,
             audit_report: vec![],
+            pinned_help: None,
+            pinned_expanded: true,
+            pinned_paused: false,
             post: None,
             post_busy: false,
             left_stock: LeftStock::default(),
@@ -2435,6 +2472,7 @@ impl App {
             Message::Noop => {}
             Message::Page(p) => {
                 self.help_animating = false;
+                self.pinned_help = None;
                 if p == Page::Control && self.page != Page::Control {
                     self.cam_page = self.page;
                 }
@@ -2479,6 +2517,16 @@ impl App {
                         self.tab = "Tool".into();
                     }
                     self.picking = self.tab == "Geometry" && self.can_pick();
+                }
+            }
+            Message::AuditRow(i) => {
+                if let Some(row) = self.audit_report.get(i).cloned() {
+                    let setup = self.update(Message::SelectSetup(row.setup));
+                    let operation = self.update(Message::SelectOp(row.operation));
+                    if let Some(tab) = ui::issue_tab(&row.detail) {
+                        let _ = self.update(Message::Tab(tab.into()));
+                    }
+                    return Task::batch([setup, operation]);
                 }
             }
             Message::SetupEditor => {
@@ -2798,7 +2846,13 @@ impl App {
                                 ),
                                 Err(error) => (false, error),
                             };
-                            report.push((format!("{} / {}", setup.name(), op.name()), ok, detail));
+                            report.push(AuditRow {
+                                setup: si,
+                                operation: oi,
+                                name: format!("{} / {}", setup.name(), op.name()),
+                                ok,
+                                detail,
+                            });
                         });
                         self.audit_report = report;
                     } else {
@@ -2809,8 +2863,8 @@ impl App {
                     self.status = format!(
                         "Checked {} enabled operations: {} generated, {} need attention. Remaining stock is carried through operations and setups.",
                         self.audit_report.len(),
-                        self.audit_report.iter().filter(|r| r.1).count(),
-                        self.audit_report.iter().filter(|r| !r.1).count()
+                        self.audit_report.iter().filter(|r| r.ok).count(),
+                        self.audit_report.iter().filter(|r| !r.ok).count()
                     );
                     self.page = Page::Audit;
                     return Task::none();
@@ -3042,20 +3096,48 @@ impl App {
                 }
             }
             // Fields in layout order, such as the stock offsets, arriving with
-            // the value selected so typing replaces it. Only from a field: a
-            // Tab elsewhere must not give one the jog keys.
+            // the value selected so typing replaces it. With nothing focused,
+            // the form's first field, except while the keys jog the machine:
+            // a Tab there must not give a field the jog keys.
             Message::TabKey(back) => {
+                let jogging =
+                    self.page == Page::Control && !self.machine_setup && self.control.is_some();
                 return iced::advanced::widget::operate(control::typing()).then(move |typing| {
-                    if !typing {
-                        return Task::none();
-                    }
-                    let step = if back {
-                        iced::widget::operation::focus_previous()
-                    } else {
-                        iced::widget::operation::focus_next()
+                    let step = match tab_move(typing, back, jogging) {
+                        TabMove::Stay => return Task::none(),
+                        TabMove::Next => iced::widget::operation::focus_next(),
+                        TabMove::Previous => iced::widget::operation::focus_previous(),
+                        TabMove::First => {
+                            iced::advanced::widget::operate(control::focus_first()).discard()
+                        }
                     };
                     step.chain(iced::advanced::widget::operate(control::select_focused()).discard())
                 });
+            }
+            Message::HelpKey => {
+                return iced::advanced::widget::operate(help::focused_field())
+                    .map(Message::HelpFor);
+            }
+            // F1 on the pinned field puts its help away; on another, switches.
+            Message::HelpFor(tag) => {
+                self.pinned_help = match tag {
+                    Some(tag) if self.pinned_help.as_ref() != Some(&tag) => {
+                        self.pinned_expanded = true;
+                        self.pinned_paused = false;
+                        Some(tag)
+                    }
+                    _ => None,
+                }
+            }
+            // E-stop from any page, even while typing, while a machine is
+            // connected. Not connected, Esc is free off the Control page, which
+            // keeps it for the E-stop.
+            Message::EscapeKey => {
+                if let Some(c) = &self.control {
+                    c.send(uc100::controller::Command::EStop);
+                } else if self.page != Page::Control {
+                    self.pinned_help = None;
+                }
             }
             Message::JogKeyUp => {
                 if self.jog_key.take().is_some()
@@ -3736,7 +3818,8 @@ impl App {
                 }
             }
             Message::HelpHover(on) => self.help_animating = on,
-            Message::HelpMore(_) | Message::HelpPause(_) => {}
+            Message::HelpMore(expanded) => self.pinned_expanded = expanded,
+            Message::HelpPause(paused) => self.pinned_paused = paused,
             Message::Tick => {
                 if let Some(c) = &mut self.control {
                     c.refresh();
@@ -4447,11 +4530,16 @@ fn on_event(
             modifiers,
             ..
         }) if modifiers.command() && c.to_lowercase() == "n" => Some(Message::NewProject),
-        // E-stop from any page, even while typing; ignored when not connected.
+        // Esc from any page, even while typing: the E-stop while connected.
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
             ..
-        }) => Some(Message::MachineEStop),
+        }) => Some(Message::EscapeKey),
+        // F1 pins the focused field's help, even while typing.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F1),
+            ..
+        }) => Some(Message::HelpKey),
         // Tab and Shift+Tab move between text fields, even from inside one.
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
@@ -4482,6 +4570,30 @@ fn on_event(
             Some(Message::Machine(control::Action::JogRelease))
         }
         _ => None,
+    }
+}
+/// What the Tab key does (`Message::TabKey`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabMove {
+    /// The next text field.
+    Next,
+    /// The previous text field (Shift+Tab).
+    Previous,
+    /// The form's first text field (`control::focus_first`).
+    First,
+    /// Nothing.
+    Stay,
+}
+/// What Tab does when a text field is focused (`typing`), with Shift (`back`)
+/// and while the keys jog the machine (`jogging`): between the fields while
+/// one is focused; with none, into the form's first field, unless the keys
+/// jog, which a field would take from them.
+pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
+    match (typing, back, jogging) {
+        (true, true, _) => TabMove::Previous,
+        (true, false, _) => TabMove::Next,
+        (false, _, true) => TabMove::Stay,
+        (false, _, false) => TabMove::First,
     }
 }
 /// The axis and direction a jog key moves: the arrows jog X and Y (up is

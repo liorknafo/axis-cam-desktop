@@ -32,6 +32,21 @@ const HOVER_ROW: Color = Color::from_rgb8(239, 244, 249);
 const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
 /// The opacity of an icon whose command is unavailable.
 const DIMMED: f32 = 0.45;
+/// The amber of a warning: its box, its heading and its text.
+const WARNING: [Color; 3] = [
+    Color::from_rgb8(255, 247, 232),
+    Color::from_rgb8(166, 101, 32),
+    Color::from_rgb8(141, 90, 39),
+];
+/// The red of an error: its box, its heading and its text.
+const ERROR: [Color; 3] = [
+    Color::from_rgb8(253, 236, 236),
+    Color::from_rgb8(172, 44, 44),
+    Color::from_rgb8(146, 48, 48),
+];
+/// The inspector's scrollable, by id: a Tab with nothing focused enters its
+/// first field (`control::focus_first`).
+pub(crate) const INSPECTOR_ID: &str = "inspector";
 pub(crate) fn bold<'a>(s: impl Into<String>, size: u32) -> widget::Text<'a> {
     text(s.into()).size(size).font(Font {
         weight: iced::font::Weight::Semibold,
@@ -213,19 +228,52 @@ fn field<'a>(
     label: &'static str,
     target: Target,
 ) -> Element<'a, Message> {
-    help::field(
-        column![
-            muted(label),
-            text_input(label, get(p, key))
-                .on_input(move |v| Message::Edit(target, key, v))
-                .padding([7, 9])
-                .size(13)
-        ]
-        .spacing(5),
-        key,
-        label,
-        target,
-    )
+    checked_field(p, key, label, target, &[])
+}
+/// A text field with the checks about it: a red border for an error, amber
+/// for a warning, and each message under it with its label.
+fn checked_field<'a>(
+    p: &'a Fields,
+    key: &'static str,
+    label: &'static str,
+    target: Target,
+    checks: &[&Check],
+) -> Element<'a, Message> {
+    let mark = checks
+        .iter()
+        .find(|c| c.error)
+        .or(checks.first())
+        .map(|c| c.colors()[1]);
+    let mut c = column![
+        muted(label),
+        text_input(label, get(p, key))
+            .on_input(move |v| Message::Edit(target, key, v))
+            .padding([7, 9])
+            .size(13)
+            .style(move |theme, status| field_style(theme, status, mark))
+    ]
+    .spacing(5);
+    for check in checks {
+        c = c.push(check_line(check));
+    }
+    help::field(c, key, label, target)
+}
+/// Iced's look for a text field, with the border in a check's colour when one
+/// marks the field, and 2 px wide while the field has the keyboard focus, so
+/// the keyboard's place is seen.
+fn field_style(
+    theme: &Theme,
+    status: text_input::Status,
+    mark: Option<Color>,
+) -> text_input::Style {
+    let mut style = text_input::default(theme, status);
+    if let Some(color) = mark {
+        style.border.color = color;
+    }
+    if matches!(status, text_input::Status::Focused { .. }) {
+        style.border.width = 2.;
+    }
+    style
 }
 fn choice<'a>(
     p: &Fields,
@@ -317,6 +365,185 @@ pub(crate) fn caution<'a>(heading: impl Into<String>, lines: Vec<String>) -> Ele
         })
         .width(Fill)
         .into()
+}
+/// One line of the selected operation's checks: what it says; whether it is
+/// an error, which stops Generate and the export, or a warning, which only
+/// advises (a speed or feed outside the material's cutting data); and the
+/// text field its message names, when it names one (`model::issue_field`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Check {
+    pub text: String,
+    pub error: bool,
+    pub key: Option<&'static str>,
+}
+impl Check {
+    fn new(text: String, error: bool) -> Self {
+        Self {
+            key: issue_field(&text),
+            text,
+            error,
+        }
+    }
+    /// Its label: Error or Warning.
+    pub(crate) fn label(&self) -> &'static str {
+        if self.error { "Error" } else { "Warning" }
+    }
+    fn colors(&self) -> [Color; 3] {
+        if self.error { ERROR } else { WARNING }
+    }
+}
+/// The checks of the selected operation: its configuration issues as errors,
+/// then its speed and feed problems as warnings.
+pub(crate) fn op_checks(app: &App) -> Vec<Check> {
+    let mut checks: Vec<Check> = app
+        .op_issues()
+        .into_iter()
+        .map(|text| Check::new(text, true))
+        .collect();
+    if let Some(o) = app.operation()
+        && let Some(SpeedFeed::Out(problems)) = app.doc.speed_feed(app.doc.setup(), o)
+    {
+        checks.extend(problems.into_iter().map(|text| Check::new(text, false)));
+    }
+    checks
+}
+/// The operation editor's tab a check's message is about: the one with the
+/// field it names, Geometry for the selection it asks for, Tool for a tool;
+/// None for a message about no tab, such as the operation's name.
+pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
+    let tab = match issue_field(issue) {
+        Some("name") | None => {
+            return if issue.contains("feature or surface") {
+                Some("Geometry")
+            } else if issue.starts_with("Choose a tool") || issue.starts_with("Choose a drill") {
+                Some("Tool")
+            } else {
+                None
+            };
+        }
+        Some("rpm" | "feed") => "Tool",
+        Some("hole_diameter") => "Geometry",
+        Some("clearance" | "retract" | "top" | "bottom" | "breakthrough") => "Heights",
+        Some(
+            "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
+            | "lead_angle" | "lean_angle",
+        ) => "Orientation",
+        Some("peck" | "dwell") => "Cycle",
+        Some("ramp_angle" | "lead_in") => "Linking",
+        Some(_) => "Passes",
+    };
+    Some(tab)
+}
+/// The selected operation's checks as the editor draws them: each at its
+/// field when the open tab has it, the rest listed under the form.
+pub(crate) struct Checks {
+    pub(crate) list: Vec<Check>,
+    /// The keys of the fields drawn.
+    pub(crate) drawn: Vec<&'static str>,
+}
+impl Checks {
+    fn new(app: &App) -> Self {
+        Self {
+            list: op_checks(app),
+            drawn: vec![],
+        }
+    }
+    /// An operation field, with its checks.
+    fn field<'a>(
+        &mut self,
+        p: &'a Fields,
+        key: &'static str,
+        label: &'static str,
+    ) -> Element<'a, Message> {
+        self.drawn.push(key);
+        let at: Vec<&Check> = self.list.iter().filter(|c| c.key == Some(key)).collect();
+        checked_field(p, key, label, Target::Operation, &at)
+    }
+    /// The checks no field drawn shows.
+    pub(crate) fn rest(&self) -> Vec<&Check> {
+        self.list
+            .iter()
+            .filter(|c| !c.key.is_some_and(|k| self.drawn.contains(&k)))
+            .collect()
+    }
+}
+/// A check as one line: its label in its colour, then its text.
+fn check_line<'a>(check: &Check) -> Element<'a, Message> {
+    let [_, heading, body] = check.colors();
+    row![
+        bold(check.label(), 12).color(heading),
+        text(check.text.clone()).size(12).color(body).width(Fill)
+    ]
+    .spacing(6)
+    .into()
+}
+/// Under the form: that the checks passed, or the errors and the warnings no
+/// field on the open tab shows, in a box each, with how many the fields show.
+fn checks_summary<'a>(checks: &Checks) -> Element<'a, Message> {
+    if checks.list.is_empty() {
+        return container(
+            muted("Configuration checks passed").color(Color::from_rgb8(39, 130, 93)),
+        )
+        .padding([8, 0])
+        .into();
+    }
+    let rest = checks.rest();
+    let mut c = Column::new().spacing(8);
+    for error in [true, false] {
+        let total = checks.list.iter().filter(|x| x.error == error).count();
+        if total == 0 {
+            continue;
+        }
+        let lines: Vec<&Check> = rest.iter().copied().filter(|x| x.error == error).collect();
+        let [bg, heading, body] = if error { ERROR } else { WARNING };
+        let plural = if total == 1 { "" } else { "s" };
+        let title = if error {
+            let verb = if total == 1 { "stops" } else { "stop" };
+            format!("{total} error{plural} {verb} Generate and export")
+        } else {
+            format!("{total} warning{plural} · Generate and export still allowed")
+        };
+        let mut lines_column = column![bold(title, 12).color(heading)].spacing(5);
+        let at_fields = total - lines.len();
+        if at_fields > 0 {
+            let (whose, s) = if at_fields == 1 {
+                ("its", "")
+            } else {
+                ("their", "s")
+            };
+            lines_column = lines_column.push(
+                text(format!("{at_fields} shown at {whose} field{s} above"))
+                    .size(12)
+                    .color(body),
+            );
+        }
+        for line in lines {
+            lines_column = lines_column.push(check_line(line));
+        }
+        c = c.push(
+            container(lines_column)
+                .padding(12)
+                .width(Fill)
+                .style(move |_| container::Style {
+                    background: Some(bg.into()),
+                    border: Border {
+                        radius: 4.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+        );
+    }
+    c.into()
+}
+/// The selected operation's checks as the open tab places them (tests).
+#[cfg(test)]
+pub(crate) fn editor_checks(app: &App) -> Checks {
+    let mut checks = Checks::new(app);
+    if let Some(o) = app.operation() {
+        drop(operation_editor_with(app, o, &mut checks));
+    }
+    checks
 }
 fn section<'a>(title: impl Into<String>) -> Element<'a, Message> {
     column![space().height(3), bold(title, 13), rule::horizontal(1)]
@@ -507,15 +734,30 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if manufacture && app.page != Page::Home && !app.doc.setups.is_empty() {
         layout = layout.push(ribbon(app));
     }
-    container(layout.push(body).push(foot))
+    let page = container(layout.push(body).push(foot))
         .width(Fill)
         .height(Fill)
         .style(|_| container::Style {
             background: Some(BG.into()),
             text_color: Some(INK),
             ..Default::default()
-        })
-        .into()
+        });
+    // The help F1 pinned, in the lower right corner, over the page and
+    // above the status bar.
+    match &app.pinned_help {
+        None => page.into(),
+        Some(tag) => widget::Stack::with_children([
+            page.into(),
+            container(help::pinned(tag, app.pinned_expanded, app.pinned_paused))
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Bottom)
+                .padding([48, 18])
+                .into(),
+        ])
+        .into(),
+    }
 }
 fn start_screen(app: &App) -> Element<'_, Message> {
     let intro = column![
@@ -1653,7 +1895,7 @@ pub(crate) fn inspector(app: &App) -> Element<'_, Message> {
     let mut c = column![
         container(panel.head).width(inner),
         scrollable(container(panel.body).width(inner))
-            .id("inspector")
+            .id(INSPECTOR_ID)
             .width(Fill)
             .height(Fill)
     ]
@@ -1696,6 +1938,11 @@ fn about<'a>(label: String, open: bool) -> Element<'a, Message> {
     HelpButton::new(b, &msg, label).into()
 }
 fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
+    let mut checks = Checks::new(app);
+    operation_editor_with(app, o, &mut checks)
+}
+/// The editor, placing `checks` at their fields as it draws them.
+fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Panel<'a> {
     // Pinned: the operation's identity and its tabs, in rows of one width.
     let identity = row![
         icon(app, o.strategy, 30.),
@@ -1717,7 +1964,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
         tabs = tabs.push(r)
     }
     let head = column![identity, tabs, rule::horizontal(1)].spacing(13);
-    let mut c = column![field(&o.p, "name", "Operation name", Target::Operation)].spacing(13);
+    let mut c = column![checks.field(&o.p, "name", "Operation name")].spacing(13);
     // The strategy's explanation and availability, behind a disclosure that
     // stays as it was left.
     let open = app.settings.layout.strategy_help_open;
@@ -1747,7 +1994,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
             c = c
                 .push(btn("Open tool library", Message::Page(Page::Tools), false))
                 .push(section("Feeds & speeds"))
-                .push(field(p, "rpm", "Spindle speed · rpm", t));
+                .push(checks.field(p, "rpm", "Spindle speed · rpm"));
             if o.strategy.imported_preview() && !app.is_sample() {
                 c = c
                     .push(choice_value(
@@ -1766,7 +2013,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                     );
             }
             c = c
-                .push(field(p, "feed", "Cutting feed · mm/min", t))
+                .push(checks.field(p, "feed", "Cutting feed · mm/min"))
                 .push(choice(
                     p,
                     "coolant",
@@ -1774,15 +2021,10 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                     &["Flood", "Mist", "Air", "Off"],
                     t,
                 ));
-            match app.doc.speed_feed(app.doc.setup(), o) {
-                Some(SpeedFeed::Out(problems)) => {
-                    c = c.push(caution(
-                        "Speed or feed outside the material's cutting data",
-                        problems,
-                    ))
-                }
-                Some(SpeedFeed::Unchecked(why)) => c = c.push(muted(format!("Not checked. {why}"))),
-                _ => {}
+            // A speed or feed outside the material's cutting data is a
+            // warning at its field; why none is checked is said here.
+            if let Some(SpeedFeed::Unchecked(why)) = app.doc.speed_feed(app.doc.setup(), o) {
+                c = c.push(muted(format!("Not checked. {why}")));
             }
         }
         "Geometry" => {
@@ -1838,11 +2080,10 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                         ));
                     }
                     if o.strategy == Strategy::Drill {
-                        c = c.push(field(
+                        c = c.push(checks.field(
                             p,
                             "hole_diameter",
                             "Hole diameter filter · mm (0 = all)",
-                            t,
                         ));
                         if let Some(mesh) = &app.imported_mesh {
                             match crate::cam::holes(app.doc.setup(), o, mesh) {
@@ -1969,7 +2210,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                 ("top", "Top offset · mm"),
                 ("bottom", "Bottom offset · mm"),
             ] {
-                c = c.push(field(p, k, label, t));
+                c = c.push(checks.field(p, k, label));
             }
             if o.strategy == Strategy::Drill {
                 c = c.push(choice(
@@ -1980,15 +2221,15 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                     t,
                 ));
                 if get(p, "through") == "Yes" {
-                    c = c.push(field(p, "breakthrough", "Breakthrough · mm", t));
+                    c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
                 }
             }
         }
         "Orientation" => match o.strategy {
             Strategy::Indexed => {
-                c=c.push(note("Position the rotary axis before cutting. Angles are checked against the setup’s saved machine limits.")).push(field(p,"angle_a","Primary rotary angle · degrees",t));
+                c=c.push(note("Position the rotary axis before cutting. Angles are checked against the setup’s saved machine limits.")).push(checks.field(p, "angle_a", "Primary rotary angle · degrees"));
                 if app.doc.setup().machine.axes() == 5 {
-                    c = c.push(field(p, "angle_b", "Secondary rotary angle · degrees", t));
+                    c = c.push(checks.field(p, "angle_b", "Secondary rotary angle · degrees"));
                 }
             }
             Strategy::Rotary => {
@@ -2000,8 +2241,8 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                         &["A around X", "B around Y", "C around Z"],
                         t,
                     ))
-                    .push(field(p, "rotary_start", "Start angle · degrees", t))
-                    .push(field(p, "rotary_end", "End angle · degrees", t))
+                    .push(checks.field(p, "rotary_start", "Start angle · degrees"))
+                    .push(checks.field(p, "rotary_end", "End angle · degrees"))
                     .push(choice(
                         p,
                         "rotary_style",
@@ -2019,12 +2260,12 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                         &["Surface normal", "Lead and lean"],
                         t,
                     ))
-                    .push(field(p, "tilt_min", "Minimum tilt · degrees", t))
-                    .push(field(p, "tilt_max", "Maximum tilt · degrees", t));
+                    .push(checks.field(p, "tilt_min", "Minimum tilt · degrees"))
+                    .push(checks.field(p, "tilt_max", "Maximum tilt · degrees"));
                 if get(p, "axis_control") == "Lead and lean" {
                     c = c
-                        .push(field(p, "lead_angle", "Lead angle · degrees", t))
-                        .push(field(p, "lean_angle", "Lean angle · degrees", t));
+                        .push(checks.field(p, "lead_angle", "Lead angle · degrees"))
+                        .push(checks.field(p, "lean_angle", "Lean angle · degrees"));
                 }
                 c=c.push(choice(p,"collision","Collision avoidance preference",&["Retract and relink","Tilt within limits"],t)).push(note("This stores your intended strategy. Machine kinematics and collision solving are not connected yet."));
             }
@@ -2044,10 +2285,10 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                 t,
             ));
             if ["Chip breaking", "Deep drilling"].contains(&get(p, "cycle")) {
-                c = c.push(field(p, "peck", "Peck depth · mm", t));
+                c = c.push(checks.field(p, "peck", "Peck depth · mm"));
             }
             if get(p, "cycle") == "Counterboring" {
-                c = c.push(field(p, "dwell", "Dwell at bottom · seconds", t));
+                c = c.push(checks.field(p, "dwell", "Dwell at bottom · seconds"));
             }
             c = c
                 .push(choice(
@@ -2065,7 +2306,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                 }));
         }
         "Passes" => {
-            c = c.push(pass_fields(app, o));
+            c = c.push(pass_fields(app, o, checks));
         }
         "Linking"
             if !app.is_sample()
@@ -2081,7 +2322,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                 t,
             ));
             if pocket_setting(p, "pocket_entry") == "Profile ramp" {
-                c = c.push(field(p, "ramp_angle", "Ramp angle · degrees", t));
+                c = c.push(checks.field(p, "ramp_angle", "Ramp angle · degrees"));
             }
             c = c.push(note("Profile ramp descends around each closed contour at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. All transfers between contours retract to clearance; no sideways shortcut crosses an island."));
             c = c.push(note(fixture_note(app, Note::Pocket)));
@@ -2122,18 +2363,19 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                         t,
                     ));
                     if get(p, "ramp") != "Plunge" {
-                        c = c.push(field(p, "ramp_angle", "Ramp angle · degrees", t));
+                        c = c.push(checks.field(p, "ramp_angle", "Ramp angle · degrees"));
                     }
                 }
                 c = c
-                    .push(field(p, "lead_in", "Lead-in radius · mm", t))
+                    .push(checks.field(p, "lead_in", "Lead-in radius · mm"))
                     .push(choice(p, "keep_down", "Keep tool down", &["Yes", "No"], t));
             }
         }
         _ => {}
     }
-    // Pinned under the body: the checks, Generate and the operation's actions.
-    let mut foot = column![rule::horizontal(1), warnings(app.op_issues())].spacing(13);
+    // Pinned under the body: the checks no field on the open tab shows,
+    // Generate and the operation's actions.
+    let mut foot = column![rule::horizontal(1), checks_summary(checks)].spacing(13);
     if let Some((heading, lines)) = holding_warning(app) {
         foot = foot.push(caution(heading, lines));
     }
@@ -2176,7 +2418,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
         foot: Some(foot.into()),
     }
 }
-fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
+fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
     let p = &o.p;
     let t = Target::Operation;
     let s = o.strategy;
@@ -2188,12 +2430,12 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
         )
     {
         if s == Strategy::Parallel {
-            c=c.push(field(p,"direction","Pass direction · degrees",t))
-                .push(field(p,"surface_stepover","Surface stepover · mm",t))
-                .push(field(p,"slope_min","Minimum surface slope · degrees",t))
-                .push(field(p,"slope_max","Maximum surface slope · degrees",t))
-                .push(field(p,"tolerance","Sampling tolerance · mm",t))
-                .push(field(p,"allowance","Vertical stock to leave · mm",t))
+            c=c.push(checks.field(p, "direction", "Pass direction · degrees"))
+                .push(checks.field(p, "surface_stepover", "Surface stepover · mm"))
+                .push(checks.field(p, "slope_min", "Minimum surface slope · degrees"))
+                .push(checks.field(p, "slope_max", "Maximum surface slope · degrees"))
+                .push(checks.field(p, "tolerance", "Sampling tolerance · mm"))
+                .push(checks.field(p, "allowance", "Vertical stock to leave · mm"))
                 .push(note("Flat and ball cutter envelopes are evaluated against mesh triangles on a bounded grid. Zigzag passes follow the upper surface. Undercuts are unreachable; spacing/tolerance controls sampling, not certified machining accuracy."));
         } else {
             c = c
@@ -2205,12 +2447,12 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
                     &FACING_MILLING,
                     t,
                 ))
-                .push(field(p, "stepdown", "Maximum stepdown · mm", t))
-                .push(field(p, "allowance", "Radial stock to leave · mm", t));
+                .push(checks.field(p, "stepdown", "Maximum stepdown · mm"))
+                .push(checks.field(p, "allowance", "Radial stock to leave · mm"));
             if s == Strategy::Contour {
                 c=c.push(choice(p,"side","Contour side",&["Outside","Inside"],t))
                     .push(choice(p,"compensation","Cutter compensation",&["In computer"],t))
-                    .push(field(p,"finish_passes","Repeat finishing passes",t))
+                    .push(checks.field(p, "finish_passes", "Repeat finishing passes"))
                     .push(note("Outside follows the outer model silhouette at successive depths. Inside follows only the walls and islands of a selected recessed floor; select that floor in Geometry. Computer compensation includes the cutter radius and allowance. Repeat passes revisit the contour."));
             } else {
                 c=c.push(note("Constant-Z loops follow the projected geometry above each level, with cutter-radius compensation. This conservative vertical-access preview supports flat cutters. Overhung detail remains unmachined."));
@@ -2262,15 +2504,15 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
         );
     }
     if matches!(s, Strategy::Face | Strategy::Indexed | Strategy::Parallel) {
-        c = c.push(field(p, "direction", "Pass direction · degrees", t));
+        c = c.push(checks.field(p, "direction", "Pass direction · degrees"));
     }
     if matches!(s, Strategy::Face | Strategy::Indexed | Strategy::Pocket) {
-        c = c.push(field(p, "stepover", "Stepover · % tool diameter", t));
+        c = c.push(checks.field(p, "stepover", "Stepover · % tool diameter"));
     }
     if s == Strategy::Adaptive {
         c = c
-            .push(field(p, "optimal_load", "Optimal load · mm", t))
-            .push(field(p, "minimum_radius", "Minimum cutting radius · mm", t));
+            .push(checks.field(p, "optimal_load", "Optimal load · mm"))
+            .push(checks.field(p, "minimum_radius", "Minimum cutting radius · mm"));
     }
     if matches!(
         s,
@@ -2281,7 +2523,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
             | Strategy::Contour
             | Strategy::Waterline
     ) {
-        c = c.push(field(p, "stepdown", "Maximum stepdown · mm", t));
+        c = c.push(checks.field(p, "stepdown", "Maximum stepdown · mm"));
     }
     if s == Strategy::Contour {
         c = c
@@ -2301,7 +2543,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
             ));
     }
     if matches!(s, Strategy::Pocket | Strategy::Contour) {
-        c = c.push(field(p, "finish_passes", "Finishing passes", t));
+        c = c.push(checks.field(p, "finish_passes", "Finishing passes"));
     }
     if matches!(
         s,
@@ -2312,9 +2554,9 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
             | Strategy::FiveAxis
     ) {
         c = c
-            .push(field(p, "surface_stepover", "Surface stepover · mm", t))
-            .push(field(p, "slope_min", "Minimum surface slope · degrees", t))
-            .push(field(p, "slope_max", "Maximum surface slope · degrees", t));
+            .push(checks.field(p, "surface_stepover", "Surface stepover · mm"))
+            .push(checks.field(p, "slope_min", "Minimum surface slope · degrees"))
+            .push(checks.field(p, "slope_max", "Maximum surface slope · degrees"));
     }
     if s == Strategy::FiveAxis {
         c = c.push(choice(
@@ -2325,16 +2567,16 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
             t,
         ));
     }
-    c = c.push(field(p, "allowance", "Radial stock to leave · mm", t));
+    c = c.push(checks.field(p, "allowance", "Radial stock to leave · mm"));
     if matches!(s, Strategy::Adaptive | Strategy::Pocket) {
-        c = c.push(field(p, "axial_allowance", "Axial stock to leave · mm", t));
+        c = c.push(checks.field(p, "axial_allowance", "Axial stock to leave · mm"));
     }
     if !app.is_sample() && s == Strategy::Face {
         c = c.push(note("The preview supports flat end mills and face mills on the highest planar face. Continuous cutter sweeps preserve removed stock; fully cleared top layers are skipped automatically. This does not establish machining accuracy or collision clearance."));
     } else if !app.is_sample() && s == Strategy::Pocket {
         c = c.push(note(fixture_note(app, Note::Passes)));
     } else {
-        c = c.push(field(p, "tolerance", "Tolerance · mm", t));
+        c = c.push(checks.field(p, "tolerance", "Tolerance · mm"));
     }
     if matches!(s, Strategy::Adaptive | Strategy::Scallop) {
         c = c.push(choice(p, "rest", "Rest machining", &["No", "Yes"], t));
@@ -6851,21 +7093,48 @@ fn post(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+/// An audit report's row: a panel, shaded under the pointer.
+fn audit_row(status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(if hovered { HOVER_ROW } else { Color::WHITE }.into()),
+        text_color: INK,
+        border: Border {
+            color: LINE,
+            width: 1.,
+            radius: 5.into(),
+        },
+        ..Default::default()
+    }
+}
 fn operation_audit(app: &App) -> Element<'_, Message> {
     let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),btn("Back to machining",Message::Page(Page::Work),false)].spacing(12)].spacing(14).max_width(1020);
-    for (name, ok, detail) in &app.audit_report {
-        c = c.push(
-            container(
+    for (i, row) in app.audit_report.iter().enumerate() {
+        let where_ = match issue_tab(&row.detail) {
+            Some(tab) => format!(
+                "Opens {} in the editor, on its {tab} tab, where the setting its line names is.",
+                row.name
+            ),
+            None => format!("Opens {} in the editor.", row.name),
+        };
+        c = c.push(help::wrap(
+            button(
                 column![
-                    bold(format!("{}  {name}", if *ok { "✓" } else { "!" }), 14),
-                    text(detail).size(12)
+                    bold(
+                        format!("{}  {}", if row.ok { "✓" } else { "!" }, row.name),
+                        14
+                    ),
+                    text(&row.detail).size(12)
                 ]
                 .spacing(5),
             )
+            .on_press(Message::AuditRow(i))
             .padding(12)
             .width(Fill)
-            .style(panel_style),
-        );
+            .style(|_, status| audit_row(status)),
+            Help::text("Open the operation", where_),
+            widget::tooltip::Position::Bottom,
+        ));
     }
     for strategy in Strategy::ALL {
         c = c.push(
