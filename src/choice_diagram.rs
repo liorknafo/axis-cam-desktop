@@ -3,6 +3,9 @@ use crate::help::Diagram;
 use iced::{Color, Point, Size, widget::canvas};
 const CYAN: Color = Color::from_rgb(0.26, 0.83, 0.92);
 const GOLD: Color = Color::from_rgb(1., 0.75, 0.33);
+/// The spindle's turn in radians per second: about 2, but a whole number of
+/// turns (19) in the animations' period, so the wrapped clock does not jump.
+pub const SPIN: f32 = std::f32::consts::TAU * 19. / 60.;
 fn line(f: &mut canvas::Frame, a: Point, b: Point, color: Color, width: f32) {
     f.stroke(
         &canvas::Path::line(a, b),
@@ -105,7 +108,7 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
             // which is closer to the jaw than the narrower cutter. Only the
             // highlight and flute marks animate; the requested gap stays fixed.
             label(f, "GAP TO WORKHOLDING", 6., 2.);
-            let pulse = 0.12 + 0.06 * (time * 2.).sin();
+            let pulse = 0.12 + 0.06 * (time * SPIN).sin();
             f.fill_rectangle(
                 Point::new(137., 59.),
                 Size::new(54., 79.),
@@ -179,7 +182,7 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
                 canvas::Stroke::default().with_color(GOLD).with_width(2.),
             );
             for i in 0..6 {
-                let a = spin * time * 2. + i as f32 * std::f32::consts::TAU / 6.;
+                let a = spin * time * SPIN + i as f32 * std::f32::consts::TAU / 6.;
                 line(
                     f,
                     Point::new(c.x + 20. * a.cos(), c.y + 20. * a.sin()),

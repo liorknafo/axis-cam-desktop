@@ -1,5 +1,5 @@
 //! Contextual help shared by every command and form field.
-use crate::{Message, Target, model::Strategy};
+use crate::{Message, Target, choice_diagram::SPIN, model::Strategy};
 use iced::{
     Border, Color, Element, Event, Font, Length, Point, Rectangle, Renderer, Size, Theme, Vector,
     advanced::{
@@ -1259,6 +1259,20 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
     }
 }
 
+/// The animations repeat every 60 s: a whole number of the 5 s phase, of the
+/// spindle's turns (`SPIN`) and of the chips' 41 px travel (`CHIP_SPEED`).
+const ANIMATION_PERIOD: f64 = 60.;
+/// The chips' speed in px per second: about 10, 15 travels in the period.
+const CHIP_SPEED: f32 = 41. * 15. / 60.;
+/// Seconds since the first drawing, reduced in f64 to the animations' period
+/// so the f32 keeps its precision after days of uptime.
+fn animation_time() -> f32 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    wrapped(START.get_or_init(Instant::now).elapsed().as_secs_f64())
+}
+fn wrapped(seconds: f64) -> f32 {
+    (seconds % ANIMATION_PERIOD) as f32
+}
 struct Illustration(Diagram);
 impl canvas::Program<Message> for Illustration {
     type State = ();
@@ -1271,8 +1285,7 @@ impl canvas::Program<Message> for Illustration {
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut f = canvas::Frame::new(renderer, bounds.size());
-        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let time = START.get_or_init(Instant::now).elapsed().as_secs_f32();
+        let time = animation_time();
         let phase = (time / 5.).fract();
         let p = |a: [f32; 3]| {
             Point::new(
@@ -1355,7 +1368,7 @@ impl canvas::Program<Message> for Illustration {
                 );
                 // Screen Y points down, so increasing angle shows CW in top view.
                 for tooth in 0..6 {
-                    let a = time * if clockwise { 2. } else { -2. }
+                    let a = time * if clockwise { SPIN } else { -SPIN }
                         + tooth as f32 * std::f32::consts::TAU / 6.;
                     f.stroke(
                         &canvas::Path::line(
@@ -1494,7 +1507,7 @@ impl canvas::Program<Message> for Illustration {
             );
             f.fill_rectangle(Point::new(x - 7., 85.), iced::Size::new(14., 41.), gold);
             for i in 0..5 {
-                let y = 85. + ((i as f32 * 10. + time * 10.) % 41.);
+                let y = 85. + ((i as f32 * 10. + time * CHIP_SPEED) % 41.);
                 f.stroke(
                     &canvas::Path::line(Point::new(x - 7., y), Point::new(x + 7., y - 4.)),
                     canvas::Stroke::default()
@@ -2400,5 +2413,28 @@ mod tests {
             rest(&mut send, inside),
             "it opens again once the pointer comes back"
         );
+    }
+    #[test]
+    fn the_animations_repeat_every_period_so_the_wrapped_clock_never_jumps() {
+        use std::f64::consts::TAU;
+        // The clock a long-running session has: days, exact in f64.
+        let days = 6. * 86_400.;
+        for t in [0., 0.25, 3.5, 17.75, 59.5] {
+            let (now, later) = (wrapped(days + t), wrapped(days + t + ANIMATION_PERIOD));
+            assert_eq!(now, later, "the clock at t and t + 60 s is the same");
+            assert!(now < ANIMATION_PERIOD as f32);
+            // What the drawings take of it: the 5 s phase, the spindle's
+            // angle and the chips' offset.
+            let phase = |time: f32| (time / 5.).fract();
+            assert_eq!(phase(now), phase(later));
+        }
+        // Across the wrap the phase, the spindle and the chips continue.
+        assert_eq!((ANIMATION_PERIOD / 5.).fract(), 0.);
+        let turns = SPIN as f64 * ANIMATION_PERIOD / TAU;
+        assert!((turns - turns.round()).abs() < 1e-5, "{turns} turns");
+        let travel = CHIP_SPEED as f64 * ANIMATION_PERIOD / 41.;
+        assert!((travel - travel.round()).abs() < 1e-5, "{travel} travels");
+        // Both speeds stay what they were drawn at, within a percent.
+        assert!((SPIN - 2.).abs() < 0.02 && (CHIP_SPEED - 10.).abs() < 0.3);
     }
 }

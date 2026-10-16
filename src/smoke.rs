@@ -6107,6 +6107,27 @@ flood = { pin = 8 }
         assert_eq!(end(0, &sample), None);
     }
     #[test]
+    fn a_new_left_stock_result_does_not_reuse_the_picture_of_an_earlier_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = contoured_app(&dir, "35");
+        let _ = a.refresh_left_stock();
+        let first = crate::ui::stock_picture(&a, 0, true).unwrap();
+        let drawn = a.stock_pictures.borrow().len();
+        // The job is edited and its new result holds a stock at the address
+        // of the old one, as one allocated after the old is freed can.
+        let old = a.left_stock.clone();
+        a.doc.setups[0].p.insert("note".into(), "edited".into());
+        let key = a.left_key().unwrap();
+        assert_ne!(key, old.key);
+        a.left_stock = crate::LeftStock { key, ..old };
+        let second = crate::ui::stock_picture(&a, 0, true).unwrap();
+        assert_ne!(first.id(), second.id(), "the old picture was shown");
+        assert_eq!(a.stock_pictures.borrow().len(), drawn + 1);
+        // The same job asks for the same picture again.
+        let again = crate::ui::stock_picture(&a, 0, true).unwrap();
+        assert_eq!(second.id(), again.id());
+    }
+    #[test]
     fn the_job_says_what_it_leaves_under_stock_once_it_is_simulated() {
         let dir = tempfile::tempdir().unwrap();
         // The top faced on setup 1 and the underside on setup 2: the 2 mm of
