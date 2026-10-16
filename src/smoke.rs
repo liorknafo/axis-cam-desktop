@@ -1850,6 +1850,36 @@ mist = { pin = 9 }
     }
 
     #[test]
+    fn the_connected_machine_is_not_removed_and_disconnect_stays_on_the_control_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        a.page = Page::Control;
+        let id = a.doc.machines[0].id.clone();
+        let _ = a.update(Message::Connect);
+        assert!(a.control.is_some());
+        let _ = a.update(Message::DeleteMachine(id.clone()));
+        assert_eq!(a.doc.machines.len(), 1);
+        assert_eq!(
+            a.status,
+            "Disconnect before removing the connected machine."
+        );
+        assert!(page_texts(&a).iter().any(|t| t == "Disconnect"));
+        // A connection whose machine is gone from the library still ends
+        // from the Control page.
+        a.doc.machines.clear();
+        assert!(a.control_target().is_none());
+        assert!(page_texts(&a).iter().any(|t| t == "Disconnect"));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none());
+        assert!(!page_texts(&a).iter().any(|t| t == "Disconnect"));
+        // Disconnected, the machine can be removed again.
+        a.doc.machines.push(Machine::new(3));
+        let other = a.doc.machines[0].id.clone();
+        let _ = a.update(Message::DeleteMachine(other));
+        assert!(a.doc.machines.is_empty());
+    }
+
+    #[test]
     fn connects_to_the_simulated_uc100_resets_and_e_stops() {
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();

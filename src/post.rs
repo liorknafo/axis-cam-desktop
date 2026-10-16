@@ -1026,6 +1026,32 @@ pub struct SetupPost {
     /// machine (`run::plan_problems`), or what they refuse.
     pub run: Option<Result<(), Vec<String>>>,
 }
+impl SetupPost {
+    /// Whether the setup passes: a UC100 setup by the checks of a run, since
+    /// it takes no G-code file and its `result` is always refused; any other
+    /// by its programs.
+    pub fn passes(&self) -> bool {
+        match &self.run {
+            Some(run) => run.is_ok(),
+            None => self.result.is_ok(),
+        }
+    }
+    /// What stops the setup from passing, if anything.
+    fn problems(&self) -> Option<&[String]> {
+        match &self.run {
+            Some(run) => run.as_ref().err(),
+            None => self.result.as_ref().err(),
+        }
+        .map(Vec::as_slice)
+    }
+    /// The programs to write: none for a UC100 setup.
+    fn programs(&self) -> &[Program] {
+        match (&self.run, &self.result) {
+            (None, Ok(programs)) => programs,
+            _ => &[],
+        }
+    }
+}
 #[derive(Debug, Clone, Default)]
 pub struct JobPost {
     pub errors: Vec<String>,
@@ -1038,10 +1064,13 @@ impl JobPost {
             setups: vec![],
         }
     }
+    /// Every setup passes and some program is to be written: the LinuxCNC
+    /// programs of a job that also holds UC100 setups export, a job of UC100
+    /// setups alone has no file to export.
     pub fn ready(&self) -> bool {
         self.errors.is_empty()
-            && !self.setups.is_empty()
-            && self.setups.iter().all(|s| s.result.is_ok())
+            && self.setups.iter().all(SetupPost::passes)
+            && self.setups.iter().any(|s| !s.programs().is_empty())
     }
 }
 pub fn file_name(doc: &Document, index: usize, part: Option<(usize, usize, u32)>) -> String {
@@ -2079,9 +2108,7 @@ pub fn write_job(
             .cloned()
             .or_else(|| {
                 job.setups.iter().find_map(|s| {
-                    s.result
-                        .as_ref()
-                        .err()
+                    s.problems()
                         .and_then(|e| e.first().map(|x| format!("{}: {x}", s.name)))
                 })
             })
@@ -2089,7 +2116,7 @@ pub fn write_job(
         return Err(format!("Nothing was written. {reason}"));
     }
     let mut count = 0;
-    for program in job.setups.iter().flat_map(|s| s.result.as_ref().unwrap()) {
+    for program in job.setups.iter().flat_map(SetupPost::programs) {
         crate::storage::write_atomic(&folder.join(&program.file_name), program.text.as_bytes())?;
         count += 1;
     }
@@ -3828,6 +3855,49 @@ M2
                 .contains("Nothing was written")
         );
         assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn a_job_of_a_linuxcnc_and_a_uc100_setup_exports_the_linuxcnc_program() {
+        let (mut doc, mesh) = fixture::flipped_job();
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile = profile_dir.path().join("jy5800.toml");
+        std::fs::write(&profile, include_str!("../assets/jy5800.toml")).unwrap();
+        for (k, v) in [
+            ("controller", "UC100"),
+            ("uc100_profile", profile.to_str().unwrap()),
+        ] {
+            doc.setups[1].machine.p.insert(k.into(), v.into());
+        }
+        // The profile has no flood output, so Off is the coolant it can run.
+        for op in &mut doc.setups[1].operations {
+            op.p.insert("coolant".into(), "Off".into());
+        }
+        let job = post_job(&doc, &mesh);
+        // The UC100 setup's result is always refused: it takes no file. Its
+        // pass or refusal is its run check.
+        assert!(job.setups[1].result.is_err());
+        assert_eq!(job.setups[1].run, Some(Ok(())), "{:?}", job.setups[1].run);
+        assert!(job.setups[0].result.is_ok() && job.ready());
+        let dir = tempfile::tempdir().unwrap();
+        let (_, count) = write_job(&job, dir.path()).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // A UC100 setup that fails its run check holds the export back, and
+        // the reason is the run's.
+        let mut refused = job.clone();
+        refused.setups[1].run = Some(Err(vec!["Outside the travel.".into()]));
+        assert!(!refused.ready());
+        let empty = tempfile::tempdir().unwrap();
+        let reason = write_job(&refused, empty.path()).unwrap_err();
+        assert!(reason.contains("Outside the travel."), "{reason}");
+        assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
+        // Setups of UC100 machines alone have no file to export.
+        doc.setups[0]
+            .machine
+            .p
+            .insert("controller".into(), "UC100".into());
+        let all = post_job(&doc, &mesh);
+        assert!(!all.ready());
     }
     #[test]
     fn different_stock_boxes_are_refused_across_touch_off_programs() {

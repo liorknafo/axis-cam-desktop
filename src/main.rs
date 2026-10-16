@@ -3337,6 +3337,10 @@ impl App {
                 }
             }
             Message::DeleteMachine(id) => {
+                if self.control.as_ref().is_some_and(|c| c.machine_id == id) {
+                    self.status = "Disconnect before removing the connected machine.".into();
+                    return Task::none();
+                }
                 self.doc.machines.retain(|m| m.id != id);
                 self.touch();
                 self.status =
