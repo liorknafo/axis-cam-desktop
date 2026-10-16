@@ -1580,7 +1580,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
 /// the setup cuts. None without a part to show.
 fn scene(app: &App) -> Option<Element<'_, Message>> {
     let s = app.doc.active_setup();
-    let canvas: Element<viewport::Event> = canvas(Viewport {
+    let canvas: Element<viewport::Event> = Viewport {
         setup: s,
         mesh: app.part_mesh()?,
         operation: app.operation(),
@@ -1603,10 +1603,8 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
         show_uncut: app.show_uncut,
-    })
-    .width(Fill)
-    .height(Fill)
-    .into();
+    }
+    .view(Fill);
     Some(canvas.map(Message::Viewport))
 }
 fn workspace(app: &App) -> Element<'_, Message> {
@@ -6300,7 +6298,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
         let setup = job.setups.iter().find(|s| s.id == view.plan.setup);
         let operation =
             setup.and_then(|s| s.operations.iter().find(|o| o.id == view.plan.operation));
-        let scene: Element<viewport::Event> = canvas(Viewport {
+        let scene: Element<viewport::Event> = Viewport {
             setup,
             operation,
             mesh,
@@ -6316,10 +6314,8 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             live: None,
             uncut: &[],
             show_uncut: true,
-        })
-        .width(Fill)
-        .height(380)
-        .into();
+        }
+        .view(380);
         c = c
             .push(bold("Stock after the whole plan", 15))
             .push(muted("Drag to orbit, right-drag to pan, scroll to zoom."))

@@ -4,10 +4,10 @@ use crate::{
     stock::{self, Placement},
 };
 use iced::{
-    Color, Point, Rectangle, Renderer, Theme, mouse,
+    Color, Element, Fill, Length, Point, Rectangle, Renderer, Theme, mouse,
     widget::{
-        Action,
-        canvas::{self, Frame, Path, Stroke, Text},
+        Action, canvas,
+        canvas::{Frame, Path, Stroke, Text},
     },
 };
 use std::cell::RefCell;
@@ -124,6 +124,7 @@ impl RasterFrame {
         }
     }
 }
+#[derive(Clone)]
 pub struct Viewport<'a> {
     pub setup: Option<&'a Setup>,
     pub operation: Option<&'a Operation>,
@@ -997,6 +998,153 @@ impl Viewport<'_> {
         }
     }
 }
+/// The marks drawn over the 3D view: the stock's label, the machine's
+/// tool's label, the work zero and the axes. They are a layer of their own
+/// above the scene (`view`): within one layer the renderer paints lines
+/// before images, so the scene's raster would cover them.
+struct Marks<'a>(Viewport<'a>);
+impl canvas::Program<Event> for Marks<'_> {
+    type State = ();
+    fn draw(
+        &self,
+        _: &(),
+        renderer: &Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        _: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        vec![self.0.marks(renderer, bounds)]
+    }
+}
+impl<'a> Viewport<'a> {
+    /// The 3D view, `height` tall: the scene, with its marks above it.
+    pub(crate) fn view(self, height: impl Into<Length> + Copy) -> Element<'a, Event> {
+        let marks = Marks(self.clone());
+        iced::widget::stack![
+            canvas(self).width(Fill).height(height),
+            canvas(marks).width(Fill).height(height),
+        ]
+        .width(Fill)
+        .height(height)
+        .into()
+    }
+    fn marks(&self, renderer: &Renderer, bounds: Rectangle) -> canvas::Geometry {
+        let p = self.projector(bounds);
+        let mut frame = Frame::new(renderer, bounds.size());
+        if self.show_stock
+            && let Some(setup) = self.setup
+            && let Some(stock) = self.resolved_stock()
+        {
+            let d = self
+                .simulation
+                .map_or(stock.stock, |s| s.plan.stock)
+                .dimensions();
+            frame.fill_rectangle(
+                Point::new(10., 10.),
+                iced::Size::new(250., 28.),
+                Color::from_rgba8(255, 255, 255, 0.90),
+            );
+            frame.fill_rectangle(
+                Point::new(19., 19.),
+                iced::Size::new(9., 9.),
+                Color::from_rgb8(185, 128, 41),
+            );
+            frame.fill_text(Text {
+                content: if self.simulation.is_none() && !self.stock_is_known(setup) {
+                    "Remaining stock · generate preview".into()
+                } else {
+                    format!("Stock  {:.1} × {:.1} × {:.1} mm", d[0], d[1], d[2])
+                },
+                position: Point::new(35., 16.),
+                color: Color::from_rgb8(123, 84, 27),
+                size: 12.into(),
+                ..Text::default()
+            });
+        }
+        // The live tool is in the raster; text is drawn above it.
+        if let Some((tip, _, stickout)) = self.live {
+            let scale = self.mesh.display_scale();
+            let top = p.p([tip[0] * scale, tip[1] * scale, (tip[2] + stickout) * scale]);
+            frame.fill_text(Text {
+                content: "Machine".into(),
+                position: Point::new(top.x + 10., top.y - 14.),
+                color: Color::from_rgb8(214, 40, 40),
+                size: 12.into(),
+                ..Text::default()
+            });
+        }
+        // The work zero: an X/Y/Z cross where the program's X0 Y0 Z0 is, the
+        // same size on the screen at any zoom and outlined in white, so it
+        // stands out on the part, the stock and the background alike.
+        if let Some(zero) = self.zero() {
+            let scale = self.mesh.display_scale();
+            let at = |d: [f32; 3]| p.p(std::array::from_fn(|k| (zero[k] + d[k]) * scale));
+            let o = at([0.; 3]);
+            let halo = Color::from_rgba8(255, 255, 255, 0.92);
+            let arms = [
+                ([1., 0., 0.], Color::from_rgb8(205, 81, 85)),
+                ([0., 1., 0.], Color::from_rgb8(76, 154, 105)),
+                ([0., 0., 1.], Color::from_rgb8(67, 125, 196)),
+            ]
+            .map(|(d, c)| {
+                // A unit along the axis, drawn 22 px long when it lies flat
+                // on the screen and shorter as it turns towards the viewer.
+                let end = at(d.map(|v| v / scale));
+                let k = 22. / p.scale;
+                (Point::new(o.x + (end.x - o.x) * k, o.y + (end.y - o.y) * k), c)
+            });
+            for (end, _) in arms {
+                line(&mut frame, &[o, end], halo, 5.);
+            }
+            for (end, c) in arms {
+                line(&mut frame, &[o, end], c, 2.5);
+            }
+            frame.fill(&canvas::Path::circle(o, 5.5), halo);
+            frame.fill(&canvas::Path::circle(o, 3.5), Color::from_rgb8(30, 30, 30));
+            // The label goes on the side away from the arms, so it covers
+            // none of them.
+            let (mut ax, mut ay) = arms.iter().fold((0., 0.), |(x, y), (end, _)| {
+                (x + end.x - o.x, y + end.y - o.y)
+            });
+            let n = ax.hypot(ay);
+            (ax, ay) = if n < 1. { (0., -1.) } else { (ax / n, ay / n) };
+            let size = iced::Size::new(56., 16.);
+            let centre = Point::new(o.x - ax * 40., o.y - ay * 22.);
+            let corner = Point::new(centre.x - size.width / 2., centre.y - size.height / 2.);
+            frame.fill_rectangle(corner, size, halo);
+            let label = Point::new(corner.x + 3., corner.y + 1.);
+            frame.fill_text(Text {
+                content: "X0 Y0 Z0".into(),
+                position: label,
+                color: Color::from_rgb8(30, 30, 30),
+                size: 11.into(),
+                ..Text::default()
+            });
+        }
+        let origin = Point::new(45., bounds.height - 45.);
+        let o = p.p([0., 0., 0.]);
+        for (v, c, label) in [
+            ([24., 0., 0.], Color::from_rgb8(205, 81, 85), "X"),
+            ([0., 24., 0.], Color::from_rgb8(76, 154, 105), "Y"),
+            ([0., 0., 24.], Color::from_rgb8(67, 125, 196), "Z"),
+        ] {
+            let end = p.p(v);
+            let end = Point::new(
+                origin.x + (end.x - o.x) / p.scale * 1.1,
+                origin.y + (end.y - o.y) / p.scale * 1.1,
+            );
+            line(&mut frame, &[origin, end], c, 2.);
+            frame.fill_text(Text {
+                content: label.into(),
+                position: Point::new(end.x + 3., end.y - 7.),
+                color: c,
+                size: 11.into(),
+                ..Text::default()
+            });
+        }
+        frame.into_geometry()
+    }
+}
 impl canvas::Program<Event> for Viewport<'_> {
     type State = State;
     fn update(
@@ -1132,93 +1280,7 @@ impl canvas::Program<Event> for Viewport<'_> {
             .unwrap()
             .1
             .draw(&mut model_frame, bounds.size());
-        let model = model_frame.into_geometry();
-        let mut frame = Frame::new(renderer, bounds.size());
-        if self.show_stock
-            && let Some(setup) = self.setup
-            && let Some(stock) = self.resolved_stock()
-        {
-            let d = self
-                .simulation
-                .map_or(stock.stock, |s| s.plan.stock)
-                .dimensions();
-            frame.fill_rectangle(
-                Point::new(10., 10.),
-                iced::Size::new(250., 28.),
-                Color::from_rgba8(255, 255, 255, 0.90),
-            );
-            frame.fill_rectangle(
-                Point::new(19., 19.),
-                iced::Size::new(9., 9.),
-                Color::from_rgb8(185, 128, 41),
-            );
-            frame.fill_text(Text {
-                content: if self.simulation.is_none() && !self.stock_is_known(setup) {
-                    "Remaining stock · generate preview".into()
-                } else {
-                    format!("Stock  {:.1} × {:.1} × {:.1} mm", d[0], d[1], d[2])
-                },
-                position: Point::new(35., 16.),
-                color: Color::from_rgb8(123, 84, 27),
-                size: 12.into(),
-                ..Text::default()
-            });
-        }
-        // The live tool is in the raster; text is drawn above it.
-        if let Some((tip, _, stickout)) = self.live {
-            let scale = self.mesh.display_scale();
-            let top = p.p([tip[0] * scale, tip[1] * scale, (tip[2] + stickout) * scale]);
-            frame.fill_text(Text {
-                content: "Machine".into(),
-                position: Point::new(top.x + 10., top.y - 14.),
-                color: Color::from_rgb8(214, 40, 40),
-                size: 12.into(),
-                ..Text::default()
-            });
-        }
-        // The work zero: a small X/Y/Z cross where the program's X0 Y0 Z0 is.
-        if let Some(zero) = self.zero() {
-            let scale = self.mesh.display_scale();
-            let at = |d: [f32; 3]| p.p(std::array::from_fn(|k| (zero[k] + d[k]) * scale));
-            let o = at([0.; 3]);
-            for (d, c) in [
-                ([8., 0., 0.], Color::from_rgb8(205, 81, 85)),
-                ([0., 8., 0.], Color::from_rgb8(76, 154, 105)),
-                ([0., 0., 8.], Color::from_rgb8(67, 125, 196)),
-            ] {
-                line(&mut frame, &[o, at(d)], c, 2.);
-            }
-            frame.fill(&canvas::Path::circle(o, 3.5), Color::from_rgb8(30, 30, 30));
-            frame.fill_text(Text {
-                content: "X0 Y0 Z0".into(),
-                position: Point::new(o.x + 8., o.y + 4.),
-                color: Color::from_rgb8(30, 30, 30),
-                size: 11.into(),
-                ..Text::default()
-            });
-        }
-        let origin = Point::new(45., bounds.height - 45.);
-        let o = p.p([0., 0., 0.]);
-        for (v, c, label) in [
-            ([24., 0., 0.], Color::from_rgb8(205, 81, 85), "X"),
-            ([0., 24., 0.], Color::from_rgb8(76, 154, 105), "Y"),
-            ([0., 0., 24.], Color::from_rgb8(67, 125, 196), "Z"),
-        ] {
-            let end = p.p(v);
-            let end = Point::new(
-                origin.x + (end.x - o.x) / p.scale * 1.1,
-                origin.y + (end.y - o.y) / p.scale * 1.1,
-            );
-            line(&mut frame, &[origin, end], c, 2.);
-            frame.fill_text(Text {
-                content: label.into(),
-                position: Point::new(end.x + 3., end.y - 7.),
-                color: c,
-                size: 11.into(),
-                ..Text::default()
-            });
-        }
-        vec![background, model, frame.into_geometry()]
+        vec![background, model_frame.into_geometry()]
     }
     fn mouse_interaction(
         &self,
