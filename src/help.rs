@@ -441,7 +441,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Select geometry on the current part. Click a surface to toggle it, drag to orbit, and click Finish picking when done. Imported Facing/Pocket selections are connected planar mesh regions, not exact CAD faces."
         }
         Generate => {
-            "Generate the selected supported imported-part operation with sampled stock removal. The example project uses illustrative paths. G-code export is on the NC program page."
+            "Generate the selected supported imported-part operation with sampled stock removal. The example project uses illustrative paths. G-code export is on the NC review page."
         }
         GenerateAll => {
             "Generate and check every enabled operation in every setup. The report lists successful previews and specific failures; disabled operations are skipped. Remaining stock carries through earlier operations and setups. Failed upstream operations block downstream stock; playback remains one operation at a time."
@@ -882,7 +882,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "rpm") => (
-            "Spindle revolutions per minute. LinuxCNC export writes it as S, rounded to a whole number. Surface speed = π × tool diameter × rpm ÷ 1000. When the project material has cutting data, a surface speed outside its range is flagged on this tab and on the NC program page; export still goes ahead. The app does not calculate a speed for you.",
+            "Spindle revolutions per minute. LinuxCNC export writes it as S, rounded to a whole number. Surface speed = π × tool diameter × rpm ÷ 1000. When the project material has cutting data, a surface speed outside its range is flagged on this tab and on the NC review page; export still goes ahead. The app does not calculate a speed for you.",
             Some(Tool),
         ),
         (_, "spindle_rotation") => (
@@ -902,7 +902,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Ramp),
         ),
         (_, "feed") => (
-            "Cutter travel speed during cutting, in mm/min. Feed per tooth = feed ÷ (rpm × flute count). When the project material has cutting data, a feed per tooth outside the range for the tool's diameter is flagged on this tab and on the NC program page; export still goes ahead. Plunge and ramp feeds are not checked.",
+            "Cutter travel speed during cutting, in mm/min. Feed per tooth = feed ÷ (rpm × flute count). When the project material has cutting data, a feed per tooth outside the range for the tool's diameter is flagged on this tab and on the NC review page; export still goes ahead. Plunge and ramp feeds are not checked.",
             Some(Tool),
         ),
         (_, "coolant") => (
@@ -2282,7 +2282,7 @@ mod tests {
         for body in [&rpm, &feed] {
             assert!(
                 body.contains("project material has cutting data")
-                    && body.contains("flagged on this tab and on the NC program page")
+                    && body.contains("flagged on this tab and on the NC review page")
                     && body.contains("export still goes ahead"),
                 "{body}"
             );

@@ -3094,7 +3094,7 @@ flood = { pin = 8 }
         let mut a = run_app(dir.path());
         zeroed(&mut a);
         check_run(&mut a, 0);
-        // The Work page shows the facing operation's simulation.
+        // MANUFACTURE shows the facing operation's simulation.
         a.selected = Some(0);
         let sim = crate::simulation::prepare(&a.doc, a.part_mesh().unwrap(), 0, 0).unwrap();
         a.simulation = Some(sim);
@@ -4311,7 +4311,7 @@ flood = { pin = 8 }
         let _ = b.update(Message::Page(Page::Post));
         let page = nc_page(&b);
         assert_eq!(page.machine, NcMachine::LinuxCnc);
-        assert_eq!(page.title, "NC program");
+        assert_eq!(page.title, "NC review");
         assert_eq!(page.intro, "Check each setup, then export LinuxCNC G-code.");
         assert!(page.note.starts_with("LinuxCNC 3-axis output"));
         assert!(page.ready && page.run_buttons().is_empty() && page.problems().is_empty());
@@ -6484,7 +6484,7 @@ flood = { pin = 8 }
         let _ = a.refresh_left_stock();
         assert!(a.known_stock(1).1);
         // Worked out: the editor says what the export says, in its words,
-        // and the NC program page no longer counts setup 2 as checked.
+        // and the NC review page no longer counts setup 2 as checked.
         let lines = crate::ui::holding_lines(&a);
         assert!(
             lines[0].starts_with("Setup 2 cannot be held in the vise: setup 1, operation 3 removed the material the jaws grip on ±Y from 0 to 8 mm above the stock's bottom. Leave at least 8 mm of those sides uncut in setup 1, "),
@@ -7257,7 +7257,7 @@ flood = { pin = 8 }
         assert!(a.playback_ready(), "{}", a.status);
         assert!(
             a.status.contains(
-                "Sampled removal; this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); parallels, bolts, the table and the machine body are not. Export G-code from the NC program page."
+                "Sampled removal; this operation's own toolpath is checked against the vise jaws or clamps as boxes with a clearance gap (a warning shows if it comes too close); parallels, bolts, the table and the machine body are not. Export G-code from the NC review page."
             ),
             "{}",
             a.status
@@ -7294,7 +7294,7 @@ flood = { pin = 8 }
         old(&a);
         let _ = a.update(Message::Generate);
         assert!(
-            a.status.contains("Sampled removal; fixture and machine collisions are not checked. Export G-code from the NC program page."),
+            a.status.contains("Sampled removal; fixture and machine collisions are not checked. Export G-code from the NC review page."),
             "{}",
             a.status
         );
@@ -8529,6 +8529,120 @@ flood = { pin = 8 }
             result: Ok(mesh),
         });
         assert!(a.simulation.is_none());
+    }
+    /// The strip names the wait at normal size, with the time it has taken,
+    /// while the mesher runs, and keeps the cell size and triangle count in
+    /// a details line (#83).
+    #[test]
+    fn the_simulation_strip_says_the_stock_surface_is_updating_while_the_mesher_runs() {
+        let mut a = imported_app();
+        let top = a
+            .imported_mesh
+            .as_ref()
+            .unwrap()
+            .surfaces
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        // No surface and no job yet: nothing is updating, the details say it is awaited.
+        assert_eq!(crate::ui::stock_surface_notice(&a), None);
+        assert_eq!(
+            crate::ui::stock_surface_details(&a).as_deref(),
+            Some("Building stock surface…")
+        );
+        let mesh = std::sync::Arc::new(crate::stock_surface::SurfaceMesh {
+            vertices: vec![],
+            triangles: vec![],
+            cell_mm: 0.5,
+            milliseconds: 0,
+        });
+        let first = a.stock_mesh_key().unwrap();
+        let _ = a.update(Message::StockMeshed {
+            key: first,
+            seconds: 0.,
+            result: Ok(mesh.clone()),
+        });
+        assert_eq!(crate::ui::stock_surface_notice(&a), None);
+        assert_eq!(
+            crate::ui::stock_surface_details(&a).as_deref(),
+            Some("0.50 mm finest cell · 0 triangles")
+        );
+        // The timeline moves on and a newer surface is being meshed.
+        let _ = a.update(Message::Scrub(0.5));
+        let key = a.stock_mesh_key().unwrap();
+        a.stock_mesh_job = Some(key.clone());
+        a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        assert_eq!(
+            crate::ui::stock_surface_notice(&a).as_deref(),
+            Some("Updating the stock surface, showing the last finished one · 12 s")
+        );
+        // The cell size and triangle count are in the details line, not the notice.
+        assert_eq!(
+            crate::ui::stock_surface_details(&a).as_deref(),
+            Some("0.50 mm finest cell · 0 triangles")
+        );
+        let _ = a.view();
+        // The result is in: the line is gone, the surface is the new one.
+        let _ = a.update(Message::StockMeshed {
+            key,
+            seconds: 0.5,
+            result: Ok(mesh),
+        });
+        assert_eq!(crate::ui::stock_surface_notice(&a), None);
+        assert!(a.stock_mesh_elapsed().is_none());
+        let _ = a.view();
+    }
+    /// The footer's 02 and 03 steps only navigate: 02 keeps the operation
+    /// selected, and 03 shows the preview strip without generating (#86).
+    #[test]
+    fn the_footers_operations_and_preview_steps_navigate_without_selecting_or_generating() {
+        let mut a = imported_app();
+        let top = a
+            .imported_mesh
+            .as_ref()
+            .unwrap()
+            .surfaces
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::DuplicateOp);
+        assert_eq!(a.selected, Some(1));
+        // 02 Operations from another page keeps operation 1.
+        a.page = Page::Audit;
+        let _ = a.update(Message::OperationsStep);
+        assert_eq!((a.selected, a.page), (Some(1), Page::Work));
+        // 03 Preview shows the strip of the selected operation and does not generate.
+        let status = a.status.clone();
+        let _ = a.update(Message::PreviewStep);
+        assert_eq!((a.selected, a.page), (Some(1), Page::Work));
+        assert!(a.simulation.is_none() && !a.playback_ready());
+        assert_eq!(a.status, status);
+        // The strip offers it: Generate works from there.
+        let _ = a.update(Message::Generate);
+        assert!(a.playback_ready(), "{}", a.status);
+        // With the simulation up, 02 and 03 leave it alone.
+        let _ = a.update(Message::OperationsStep);
+        let _ = a.update(Message::PreviewStep);
+        assert!(a.playback_ready() && a.selected == Some(1));
+        // Nothing selected: 02 selects the first operation, 03 does not generate either.
+        let _ = a.update(Message::SetupEditor);
+        assert_eq!(a.selected, None);
+        let _ = a.update(Message::OperationsStep);
+        assert_eq!(a.selected, Some(0));
+        let _ = a.update(Message::SetupEditor);
+        let _ = a.update(Message::PreviewStep);
+        assert_eq!(a.selected, Some(0));
+        assert!(a.simulation.is_none());
+        let _ = a.view();
     }
     #[test]
     fn imported_pocket_selection_playback_direction_and_reopen_work_end_to_end() {
