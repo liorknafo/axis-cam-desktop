@@ -2554,3 +2554,202 @@ mod tests {
         );
     }
 }
+
+/// The job that machines the TOTEM keyboard's top case (TOTEM_case_ble_top_L,
+/// a 133 × 99 × 12.5 mm shell with a recessed plate of 18 switch cut-outs,
+/// countersunk screw bosses and a hollow underside) from both sides. The
+/// part is not ours to ship: point `AXIS_TOTEM_STEP` at the STEP and run
+/// `cargo test --release totem -- --ignored`.
+#[cfg(test)]
+mod totem {
+    use super::*;
+    use crate::{
+        model::{Document, ModelFile, Setup, Tool},
+        proposal::{
+            ProposedSetup,
+            tests::{aluminium, hold, op},
+        },
+    };
+    #[test]
+    #[ignore]
+    fn the_totem_case_machines_from_both_sides() {
+        let Ok(path) = std::env::var("AXIS_TOTEM_STEP") else {
+            eprintln!("skipped: set AXIS_TOTEM_STEP to the TOTEM top case STEP");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let mesh = crate::mesh::load(&path).unwrap();
+        let mut doc = Document::default();
+        for (n, (name, kind, diameter, angle)) in [
+            ("Flat 6", "Flat end mill", "6", ""),
+            ("Flat 3", "Flat end mill", "3", ""),
+            ("Flat 1.5", "Flat end mill", "1.5", ""),
+            ("Drill 2", "Drill", "2", ""),
+            ("Flat 1", "Flat end mill", "1", ""),
+            ("Flat 0.5", "Flat end mill", "0.5", ""),
+            ("Chamfer 82", "Chamfer mill", "6", "82"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut tool = Tool::new(name, kind, diameter);
+            for (k, v) in [("length", "20"), ("stickout", "30"), ("tip_angle", angle)] {
+                if !v.is_empty() {
+                    tool.p.insert(k.into(), v.into());
+                }
+            }
+            tool.p.insert("number".into(), (n + 1).to_string());
+            doc.tools.push(tool);
+        }
+        let mut setup = Setup::new(crate::model::Machine::new(3), "G54");
+        for (k, v) in [
+            ("stock_top", "1"),
+            ("stock_bottom", "3"),
+            ("stock_left", "10"),
+            ("stock_right", "10"),
+            ("stock_front", "10"),
+            ("stock_back", "10"),
+        ] {
+            setup.p.insert(k.into(), v.into());
+        }
+        doc.machines = vec![setup.machine.clone()];
+        doc.active = setup.id.clone();
+        doc.setups = vec![setup];
+        doc.file = Some(ModelFile {
+            name: "totem.step".into(),
+            path,
+            format: "step".into(),
+            bytes: 0,
+        });
+        doc.sync_stock_sources();
+        aluminium(&mut doc);
+        // The 100 mm starter vise grips the stock's frame across Y.
+        hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let planes = |up: &str| {
+            &report
+                .orientations
+                .iter()
+                .find(|o| o.up == up)
+                .unwrap()
+                .planes
+        };
+        let at = |up: &str, depth: f32| {
+            planes(up)
+                .iter()
+                .find(|p| (p.depth_below_top - depth).abs() < 0.01)
+                .unwrap()
+                .surfaces
+                .clone()
+        };
+        let underside: Vec<usize> = planes("-Z")
+            .iter()
+            .filter(|p| p.kind == "floor")
+            .flat_map(|p| p.surfaces.clone())
+            .collect();
+        let (top, well) = (at("+Z", 0.), at("+Z", 6.85));
+        let cut = |strategy: &str, tool: u32, surfaces: &[usize], feed: f32, edit: &dyn Fn(&mut crate::proposal::ProposedOp)| {
+            let mut o = op(strategy, tool, surfaces.to_vec());
+            (o.rpm, o.feed, o.coolant) = (12000., feed, "Mist".into());
+            edit(&mut o);
+            o
+        };
+        let through = |o: &mut crate::proposal::ProposedOp| {
+            o.through = Some(true);
+            o.breakthrough = Some(0.5);
+        };
+        let rest = |stepdown: f32| {
+            move |o: &mut crate::proposal::ProposedOp| {
+                o.stepdown = Some(stepdown);
+                o.finish_passes = Some(0);
+            }
+        };
+        let outline = |skin: f32| {
+            move |o: &mut crate::proposal::ProposedOp| {
+                o.contour_mode = Some("outside".into());
+                o.stepdown = Some(1.);
+                o.bottom_offset = Some(skin);
+            }
+        };
+        let proposal = Proposal {
+            summary: "Top, then the underside".into(),
+            setups: vec![
+                ProposedSetup {
+                    orientation: "+Z".into(),
+                    name: "Top".into(),
+                    origin: "Stock top center".into(),
+                    workholding: "Vise on the stock's frame".into(),
+                    holder: None,
+                    operations: vec![
+                        cut("Face", 1, &top, 1200., &|_| {}),
+                        cut("Pocket", 1, &well, 1200., &|o| {
+                            through(o);
+                            o.stepdown = Some(2.);
+                        }),
+                        cut("Pocket", 2, &well, 700., &|o| {
+                            through(o);
+                            rest(1.)(o);
+                        }),
+                        cut("Pocket", 3, &well, 500., &|o| {
+                            through(o);
+                            rest(0.5)(o);
+                        }),
+                        // R0.5 corners in the 13.8 mm switch cut-outs.
+                        cut("Pocket", 5, &well, 400., &|o| {
+                            through(o);
+                            rest(0.5)(o);
+                        }),
+                        cut("Drill", 4, &top, 500., &|o| {
+                            o.drill_cycle = Some("Deep drilling".into());
+                            o.peck = Some(1.);
+                        }),
+                        cut("Drill", 7, &top, 800., &|_| {}),
+                        cut("Pocket", 6, &at("+Z", 0.5), 400., &|o| o.stepdown = Some(0.1)),
+                        // Down to 2 mm over the part's bottom: the skin under
+                        // the outline holds the part in its frame for setup 2.
+                        cut("Contour", 1, &[], 1000., &|o| {
+                            outline(2.)(o);
+                            o.stepdown = Some(2.);
+                        }),
+                        cut("Contour", 2, &[], 700., &outline(2.)),
+                    ],
+                },
+                ProposedSetup {
+                    orientation: "-Z".into(),
+                    name: "Underside".into(),
+                    origin: "Stock top front-left".into(),
+                    workholding: "Vise on the frame".into(),
+                    holder: None,
+                    operations: vec![
+                        cut("Face", 1, &at("-Z", 0.), 1200., &|_| {}),
+                        cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),
+                        cut("Pocket", 2, &underside, 700., &rest(1.)),
+                        cut("Pocket", 3, &underside, 500., &rest(1.)),
+                        cut("Pocket", 5, &underside, 400., &rest(0.5)),
+                        // Last, it cuts the skin and frees the part.
+                        cut("Contour", 2, &[], 700., &outline(0.)),
+                    ],
+                },
+            ],
+            unmachined: vec![],
+            warnings: vec![],
+        };
+        let (out, job) = evaluate(&doc, &mesh, &report, &proposal);
+        let problems: Vec<String> = out.problems.iter().map(|p| p.line()).collect();
+        assert!(out.passed, "{problems:#?}");
+        let mut last = None;
+        crate::simulation::sequence_walk(
+            &job.unwrap(),
+            &mesh,
+            None,
+            |_, _, r| assert!(r.is_ok()),
+            |_, _, stock| last = Some(stock.clone()),
+            |_, _| {},
+        );
+        // What stays under stock: the tips of wedges under 1 mm wide between
+        // walls at an angle, a sloped relief and the logo's finest strokes.
+        let uncut = crate::uncut::uncut(&last.unwrap(), &doc.setups[0], &mesh);
+        assert!(uncut.share < 0.015, "{:.2}% uncut", uncut.share * 100.);
+        assert!(out.total_minutes < 400., "{} min", out.total_minutes);
+    }
+}

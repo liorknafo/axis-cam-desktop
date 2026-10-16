@@ -423,7 +423,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         }
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
-        Some("clearance" | "retract" | "top" | "bottom" | "breakthrough") => "Heights",
+        Some("clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings") => "Heights",
         Some(
             "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
             | "lead_angle" | "lean_angle",
@@ -2194,7 +2194,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             c = c.push(note(if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
             } else if !app.is_sample() && o.strategy == Strategy::Pocket {
-                "Cutting starts from the remaining stock after earlier operations, plus positive Top offset. A fully faced-off layer is skipped; uncut regions keep the higher start. Bottom offset and axial stock to leave are added to the selected floor. Clearance/retract stay referenced to the original stock top."
+                "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
             } else if !app.is_sample() && o.strategy==Strategy::Contour && get(p,"boundary")=="Selected geometry" {
                 "Inside contour skips fully cleared top layers and ends at the selected floor + bottom offset. Negative bottom offsets are rejected. Profile ramp/plunge are configured in Linking; the pocket interior is not cleared. Clearance/retract retain the original stock reference."
             } else if !app.is_sample() && matches!(o.strategy, Strategy::Contour | Strategy::Waterline) {
@@ -2202,7 +2202,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             } else if !app.is_sample() && o.strategy == Strategy::Parallel {
                 "Bottom offset is added to the cutter-compensated surface height; stock to leave is a vertical offset. Top offset raises approach heights. Finishing starts with the stock left by the earlier roughing operations."
             } else if !app.is_sample() && o.strategy == Strategy::Drill {
-                "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal is cylindrical without the drill-point cone."
+                "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. With a chamfer mill each opening is countersunk instead: the point goes down until its cone is as wide as the opening at the rim. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal follows the drill's 118° point or the chamfer mill's cone."
             } else { "All heights are in the current setup coordinate system. Clearance/retract are measured above stock top; offsets are relative to selected geometry." }));
             if let Some(z) = app.active_simulation().and_then(|s| s.plan.rest_top) {
                 c = c.push(note(format!("Automatic cutting start: Z {z:.2} mm. Earlier cuts cover the material above this height.")));
@@ -2214,6 +2214,19 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ("bottom", "Bottom offset · mm"),
             ] {
                 c = c.push(checks.field(p, k, label));
+            }
+            if !app.is_sample() && o.strategy == Strategy::Pocket {
+                c = c.push(choice_value(
+                    p,
+                    pocket_setting(p, "openings"),
+                    "openings",
+                    "Openings through the floor",
+                    &POCKET_OPENINGS,
+                    t,
+                ));
+                if pocket_setting(p, "openings") == POCKET_OPENINGS[1] {
+                    c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
+                }
             }
             if o.strategy == Strategy::Drill {
                 c = c.push(choice(
@@ -5238,6 +5251,9 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
         ("holder", "Holder diameter · mm"),
     ] {
         form = form.push(field(p, k, l, t));
+    }
+    if get(p, "type") == "Chamfer mill" {
+        form = form.push(field(p, "tip_angle", "Tip angle · °", t));
     }
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));

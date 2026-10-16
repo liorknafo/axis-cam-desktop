@@ -118,10 +118,18 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("cycle", "Counterboring") => {
             diagram = Some(Diagram::DrillCycle(3));
             (
-                "Feed to the target, pause for the selected Dwell time at the bottom, then retract. The preview uses cylindrical removal with the saved tool diameter; it does not model a drill-point cone.",
+                "Feed to the target, pause for the selected Dwell time at the bottom, then retract. The preview removes the drill's flutes and its 118° point, or a chamfer mill's cone.",
                 "",
             )
         }
+        ("openings", "Leave") => (
+            "Clear the selected floors only. Holes through a floor are cleared over at the floor's height and left for another operation.",
+            "",
+        ),
+        ("openings", "Cut through") => (
+            "Clear the selected floors, then cut each hole through them that nothing of the part covers or underlies down to where its walls end, plus Breakthrough. Openings narrower than the cutter are left for a smaller one.",
+            "Each opening's walls keep the cutter's radius in their corners, as a pocket's do. The extra depth goes into the stock under the part; modelled vise jaws and clamps are checked, parallels and the table are not.",
+        ),
         ("through", "Yes") => (
             "Extend the drill target below the bottom of each hole that goes through the part by Breakthrough. A selected hole that is blind is refused, since the part goes on under its bottom: set Through to No, or use the diameter filter to drill only the holes that go through.",
             "That extra travel is included in the preview, and modelled vise jaws and clamps are checked as boxes with a clearance gap; the material, parallels or the table underneath are not collision checked.",
@@ -376,11 +384,11 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("type", "Drill") => (
-            "A hole-making tool used by Drilling. The preview uses cylindrical removal at the saved diameter and does not model a conical point. The tool must fit the detected bore.",
+            "A hole-making tool used by Drilling. The preview removes its flutes' cylinder over a 118° point, with the programmed tip at the point. The tool must fit the detected bore.",
             "",
         ),
         ("type", "Chamfer mill") => (
-            "A tapered cutter intended for chamfers. Its library entry is saved; an imported chamfer toolpath/cutter kernel is not implemented.",
+            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. Chamfers along edges are not generated.",
             "",
         ),
         ("ramp", "Helix") => (

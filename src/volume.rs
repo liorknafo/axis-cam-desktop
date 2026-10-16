@@ -3,7 +3,7 @@
 use crate::{
     mesh::{Bounds, Mesh, rotation},
     model::{Setup, num},
-    simulation::{CutterShape, POINT_RISE},
+    simulation::CutterShape,
     stock::Placement,
 };
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -292,12 +292,13 @@ pub(crate) fn swept(
     if lo > hi {
         return false;
     }
-    let cone = POINT_RISE * POINT_RISE * l2;
+    let rise = shape.rise().unwrap_or(0.);
+    let cone = rise * rise * l2;
     let t = if shape == CutterShape::Ball && l2 > 1e-12 {
         (projection
             - v[2] * (r * r - perp).max(0.).sqrt() / (l2.sqrt() * (l2 + v[2] * v[2]).sqrt()))
         .clamp(lo, hi)
-    } else if shape == CutterShape::Drill && l2 > 1e-12 && cone > v[2] * v[2] {
+    } else if shape.rise().is_some() && l2 > 1e-12 && cone > v[2] * v[2] {
         // The point's cone is lowest over the interval where the tip's
         // descent balances the cone's rise; a move steeper than the cone is
         // lowest at an end of the interval, as a flat end is.
@@ -313,13 +314,14 @@ pub(crate) fn swept(
         + match shape {
             CutterShape::Ball => r - (r * r - radial).max(0.).sqrt(),
             CutterShape::Flat => 0.,
-            CutterShape::Drill => POINT_RISE * radial.sqrt(),
+            CutterShape::Drill | CutterShape::Chamfer(_) => rise * radial.sqrt(),
         };
     p[2] >= bottom - 0.00001
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::POINT_RISE;
     use crate::{mesh, model::Machine};
     fn frames() -> (Frame, Frame) {
         let mesh = mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();

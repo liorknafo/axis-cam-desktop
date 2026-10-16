@@ -342,7 +342,20 @@ impl Tool {
         if num(&self.p, "stickout") < num(&self.p, "length") {
             e.push("Stickout must be at least the flute length.".into())
         }
+        if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
+            e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
+        }
         e
+    }
+    /// A chamfer mill's included tip angle in degrees (90 when not saved),
+    /// None when it is outside 20–160°.
+    pub fn tip_angle(&self) -> Option<f32> {
+        let angle = if self.p.contains_key("tip_angle") {
+            num(&self.p, "tip_angle")?
+        } else {
+            90.
+        };
+        (20. ..=160.).contains(&angle).then_some(angle)
     }
     /// Controller tool number (T#), when it is a whole number 1–9999.
     pub fn number(&self) -> Option<u32> {
@@ -372,10 +385,15 @@ pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
 pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// What a Pocket does with the holes through its floor that nothing of the
+/// part covers or underlies: clears over them at the floor's height, or
+/// cuts them through, Breakthrough past the bottom of their walls.
+pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
 pub fn pocket_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
     p.get(key).map(String::as_str).unwrap_or(match key {
         "pocket_milling" => "Climb",
         "pocket_entry" => POCKET_ENTRIES[0],
+        "openings" => POCKET_OPENINGS[0],
         _ => "",
     })
 }
@@ -392,6 +410,7 @@ pub fn pocket_setting_issues(p: &Fields) -> Vec<String> {
             pocket_setting(p, "pocket_entry"),
             POCKET_ENTRIES,
         ),
+        ("openings", pocket_setting(p, "openings"), POCKET_OPENINGS),
         (
             "spindle_rotation",
             facing_setting(p, "spindle_rotation"),
@@ -640,8 +659,13 @@ impl Operation {
         }
         if let Some(t) = tools.iter().find(|t| t.id == self.tool) {
             e.extend(t.issues());
-            if self.strategy == Strategy::Drill && get(&t.p, "type") != "Drill" {
-                e.push("Choose a drill for a drilling cycle.".into())
+            if self.strategy == Strategy::Drill
+                && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
+            {
+                e.push(
+                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle."
+                        .into(),
+                )
             }
         } else {
             e.push("Choose a tool from the library.".into())

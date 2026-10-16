@@ -1,7 +1,7 @@
 //! Deterministic summary of the imported part for the AI planner: what can be
 //! reached from each of the six axis-aligned orientations. Lengths are mm.
 use crate::{
-    cam::{self, Geometry, Polygon},
+    cam::{self, Geometry},
     material::BANDS,
     mesh::{Bounds, Mesh, rotation},
     model::{Document, Operation, Setup, Strategy, get, num},
@@ -9,7 +9,7 @@ use crate::{
     surface::Selection,
     volume::{Frame, Volume},
 };
-use clipper2::{EndType, JoinType};
+
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -26,6 +26,11 @@ const MAX_PLANES: usize = 40;
 /// Faces whose heights differ by no more than this (mm) are one plane.
 const PLANE_TOLERANCE: f32 = 0.01;
 const MAX_HOLES: usize = 100;
+/// The openings listed for one floor at most; a floor with more lists none.
+const MAX_OPENINGS: usize = 60;
+/// The largest cutter a floor's report looks for, mm: a ledge open to a
+/// lower area takes any cutter its walls leave room for.
+const MAX_CUTTER: f32 = 50.;
 /// cos 0.5°: a face this close to horizontal counts as planar-horizontal.
 const FLAT: f32 = 0.99996;
 /// cos 89.5°: steeper faces count as vertical walls.
@@ -160,6 +165,9 @@ pub struct ToolReport {
     pub flutes: u32,
     pub flute_length: f32,
     pub stickout: f32,
+    /// A chamfer mill's included tip angle, degrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_angle: Option<f32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrientationReport {
@@ -188,6 +196,17 @@ pub struct PlaneReport {
     /// Largest flat cutter that fits inside the floor outline (floors only).
     pub max_cutter_diameter: Option<f32>,
     pub holes: Vec<HoleReport>,
+    /// Holes through this floor, of any shape, with nothing of the part over
+    /// or under them (floors only).
+    pub openings: Vec<OpeningReport>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OpeningReport {
+    /// x0, y0, x1, y1
+    pub bbox: [f32; 4],
+    /// From the floor down to where the opening's walls end.
+    pub depth: f32,
+    pub max_cutter_diameter: f32,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HoleReport {
@@ -844,31 +863,6 @@ struct Face {
     bbox: [f32; 4],
 }
 /// The largest cutter diameter that still fits inside the plane's outline.
-fn fitting_diameter(geometry: &Geometry, surfaces: &[usize], bbox: [f32; 4]) -> Option<f32> {
-    let outline: Vec<Polygon> = geometry
-        .triangles
-        .iter()
-        .filter(|t| t.feature.is_some_and(|id| surfaces.contains(&id)))
-        .map(|t| t.p.iter().map(|v| (v[0] as f64, v[1] as f64)).collect())
-        .collect();
-    let region = cam::region(outline).ok()?;
-    let (mut lo, mut hi) = (
-        0f32,
-        ((bbox[2] - bbox[0]).min(bbox[3] - bbox[1]) / 2.).max(0.),
-    );
-    for _ in 0..20 {
-        let mid = (lo + hi) / 2.;
-        let shrunk: Vec<Polygon> = region
-            .inflate(-(mid as f64), JoinType::Round, EndType::Polygon, 2.)
-            .into();
-        if shrunk.iter().any(|p| cam::area(p).abs() > 1e-6) {
-            lo = mid
-        } else {
-            hi = mid
-        }
-    }
-    Some(lo * 2.)
-}
 fn orientation(
     setup1: &Setup,
     stock: &Volume,
@@ -969,6 +963,7 @@ fn orientation(
                 bbox: face.bbox,
                 max_cutter_diameter: None,
                 holes: vec![],
+                openings: vec![],
             }
         });
         plane.surfaces.push(*id);
@@ -989,8 +984,30 @@ fn orientation(
         if plane.depth_below_top < 0.01 {
             plane.kind = "top";
         } else {
-            plane.max_cutter_diameter =
-                fitting_diameter(&geometry, &plane.surfaces, plane.bbox).map(r2);
+            let ids = plane.surfaces.iter().copied().collect();
+            if let Ok(floor) = crate::pocket::floor(&setup, &ids, mesh) {
+                plane.max_cutter_diameter = Some(r2(floor.largest(MAX_CUTTER)));
+                let sizes = floor.opening_sizes();
+                if sizes.len() > MAX_OPENINGS {
+                    truncated = true;
+                } else {
+                    plane.openings = floor
+                        .openings
+                        .iter()
+                        .zip(sizes)
+                        .map(|((_, bottom), (bbox, fit))| OpeningReport {
+                            bbox: [
+                                r2(bbox[0] - model.min[0]),
+                                r2(bbox[1] - model.min[1]),
+                                r2(bbox[2] - model.min[0]),
+                                r2(bbox[3] - model.min[1]),
+                            ],
+                            depth: r2(floor.plane - bottom),
+                            max_cutter_diameter: r2(fit),
+                        })
+                        .collect();
+                }
+            }
         }
         let mut probe = Operation::new(Strategy::Drill, String::new());
         probe.geometry.clear();
@@ -1276,6 +1293,9 @@ fn describe(
                     flutes: num(&t.p, "flutes").filter(|f| *f >= 1. && f.fract() == 0.)? as u32,
                     flute_length: num(&t.p, "length")?,
                     stickout: num(&t.p, "stickout")?,
+                    tip_angle: (get(&t.p, "type") == "Chamfer mill")
+                        .then(|| t.tip_angle())
+                        .flatten(),
                 })
             })
             .collect(),
@@ -1530,10 +1550,22 @@ pub(crate) mod tests {
         let pocket = plane(top, 12.);
         assert_eq!(pocket.kind, "floor");
         assert_eq!(pocket.bbox, [16., 20., 88., 60.]);
-        assert!((pocket.max_cutter_diameter.unwrap() - 37.05).abs() < 0.2);
+        // The largest the pocket generator accepts: 37.05 less its margin.
+        assert!((pocket.max_cutter_diameter.unwrap() - 36.68).abs() < 0.05);
+        assert!(pocket.openings.is_empty());
+        // A counterbore's floor is a ring round the bore, which goes on through
+        // the part: an end mill up to the counterbore's own Ø11 clears it.
         let counterbores = plane(top, 6.);
         assert_eq!(counterbores.surfaces.len(), 4);
-        assert!(counterbores.max_cutter_diameter.unwrap() < 2.3);
+        let fit = counterbores.max_cutter_diameter.unwrap();
+        assert!(fit > 10.8 && fit < 11., "{fit}");
+        assert_eq!(counterbores.openings.len(), 4);
+        assert!(
+            counterbores
+                .openings
+                .iter()
+                .all(|o| o.depth == 34. && o.max_cutter_diameter > 6.4)
+        );
         assert!(top.freeform_area > 100.);
         assert!(!top.truncated);
         assert!(!serde_json::to_string(&report).unwrap().contains("-0.0"));
