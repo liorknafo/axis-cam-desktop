@@ -16,6 +16,8 @@ Portions of this software are copyright © 2026 The FreeType Project (www.freety
 
 The CAD helper's source is `native/step_preview.cpp`. Rebuild it and the app with a C++17 compiler, Rust and an Open CASCADE installation: set OCCT_PREFIX and run the packaging script. The dynamically linked libraries can be replaced with compatible modified versions in `Contents/Frameworks`; re-sign the local bundle after replacing binaries. No license term of this application restricts modification or reverse engineering needed to debug changes to these libraries. No distribution signing credentials are required for local ad-hoc signing.
 
+`examples/totem-case-top-right.step` is the right BLE case top of the TOTEM keyboard by GEIST ([GEIGEIGEIST/TOTEM](https://github.com/GEIGEIGEIST/TOTEM)), copyright © 2022 GEIST, under the CERN Open Hardware Licence Version 2 – Permissive (CERN-OHL-P), unmodified. It is a test part only and is not distributed with the app; its licence is in `examples/totem-case-top-LICENSE.md`.
+
 Format implementation references: [3MF core specification](https://github.com/3MFConsortium/spec_core), [3MF Production extension](https://github.com/3MFConsortium/spec_production), and [Open CASCADE](https://dev.opencascade.org/).
 
 Stock surface meshing uses unmodified Fidget, fidget-core and fidget-mesh 0.4.3 under MPL-2.0. Their corresponding source is available at [Fidget v0.4.3](https://github.com/mkeeter/fidget/tree/v0.4.3), or the crates.io archives for those exact locked versions. Rebuild with Cargo to replace these libraries. The license and source notice are distributed in `licenses/fidget-MPL-2.0.txt` and `licenses/fidget-NOTICE.txt`, and copied to the app's `Contents/Resources/Licenses` directory.

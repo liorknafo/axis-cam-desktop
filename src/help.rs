@@ -1194,7 +1194,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         PickMaterial(_) => (
-            "Use this library material for the project. Its cutting data are used to check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner.",
+            "Use this library material for the project. Choosing it sets each operation's speed and feed (drilling aside) from its cutting data, for the operation's tool and machine. The data also check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner.",
             "",
         ),
         NewHolder("Clamp") => (
@@ -1780,7 +1780,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(MillingDirection),
         ),
         (_, "pocket_entry") => (
-            "Profile ramp descends along the closed pocket contour at the specified ramp angle, then cuts a complete loop at depth. Plunge feeds straight down and needs a plunge-capable end mill. Both use 25% cutting feed for entry. Transfers between loops retract to clearance to avoid crossing islands at depth.",
+            "Profile ramp descends along the pocket contour at the ramp angle, then cuts the loop at depth. Plunge feeds straight down and needs a plunge-capable end mill. Both enter at 25% feed. Between loops the tool stays down, stepping at most 1.5 stepovers clear of walls and islands; where it cannot, it retracts and enters again.",
             "",
             Some(Ramp),
         ),

@@ -262,9 +262,9 @@ THE PART REPORT
 
 STRATEGIES (the only six)
 - Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only the model's outline. Face makes levels × passes strokes, at most 2,000: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`. For example, 4 mm of stock above the face of an 84 mm wide stock and a Ø10 mill at `stepover_percent` 5 need a `stepdown` of 0.4 mm or more.
-- Pocket: clears from the stock top down to one floor. `surfaces` = all IDs of that floor plane. Tool: a flat end mill no wider than the floor's `max_cutter_diameter`. `stepover_percent` at most 50, `stepdown` at most the flute length. The floor's depth plus the stock above the top must be less than the tool's stickout. `radial_allowance` and `axial_allowance` leave stock. `pocket_entry` is `Profile ramp` or `Plunge`; `ramp_angle` null or 0.1-15 degrees, also with `Plunge`. `finish_passes` a whole number 0-20. Its moves are about levels × the points of all its offset rings, and three settings multiply them: a smaller `stepover_percent` adds rings, each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves on every ring and level (see the move limit under RULES).
+- Pocket: clears from the stock top down to one floor. `surfaces` = all IDs of that floor plane. Tool: a flat end mill no wider than the floor's `max_cutter_diameter`. `stepover_percent` at most 50, `stepdown` at most the flute length. The floor's depth plus the stock above the top must be less than the tool's stickout. `radial_allowance` and `axial_allowance` leave stock. `pocket_entry` is `Profile ramp` or `Plunge`; `ramp_angle` null or 0.1-15 degrees, also with `Plunge`. `finish_passes` a whole number 0-20. Its moves are about levels × the points of all its offset rings, and three settings multiply them: a smaller `stepover_percent` adds rings, each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot) (see the move limit under RULES).
 - Contour, `contour_mode` `outside`: one path around the whole model outline, from the stock top down to the model's bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length, `finish_passes` a whole number 0-20. The cut depth from the stock top must be less than the stickout; for a tall part use `bottom_offset` to stop higher and finish from the opposite side. It removes one tool width around the outline, not all surrounding stock. Its moves are about levels × the outline's points (see the move limit under RULES).
-- Contour, `contour_mode` `inside_floor`: the walls of one floor. `surfaces` = that floor's IDs. The tool and depth rules of Pocket apply: a flat end mill no wider than the floor's `max_cutter_diameter`, depth within the stickout, `stepdown` at most the flute length, `finish_passes` a whole number 0-20; `pocket_entry` and `ramp_angle` work as for Pocket, but its stepover is fixed at 40 %, so `stepover_percent` changes nothing. Its moves are about levels × the points of its rings, as for Pocket: each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves on every ring and level (see the move limit under RULES).
+- Contour, `contour_mode` `inside_floor`: the walls of one floor. `surfaces` = that floor's IDs. The tool and depth rules of Pocket apply: a flat end mill no wider than the floor's `max_cutter_diameter`, depth within the stickout, `stepdown` at most the flute length, `finish_passes` a whole number 0-20; `pocket_entry` and `ramp_angle` work as for Pocket, but its stepover is fixed at 40 %, so `stepover_percent` changes nothing. Its moves are about levels × the points of its rings, as for Pocket: each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot) (see the move limit under RULES).
 - Drill: drills the holes of one plane. `surfaces` = that plane's IDs. Tool: a drill no wider than the hole's `diameter` (one of exactly that diameter fits). `hole_diameter` limits it to holes whose `diameter` equals it (not `opening_diameter`); null drills every hole of the plane. The drill's depth is measured from the stock top: `stock_margin[0]` + the plane's `depth_below_top` + the hole's `depth` + `breakthrough` must be less than the drill's flute length. `drill_cycle` is `Drilling`, `Chip breaking`, `Deep drilling` (both need `peck`) or `Counterboring`. `peck` must be at least the drilling depth from the stock top ÷ 1,000: at most 1,000 pecks per hole.
 - Drill, through holes: `through` may be true only in setup 1, and only when every hole the operation selects is a through hole in the report; use `hole_diameter` to select only those. Setups after the first rest on the face where a drill would exit, so drill through holes in setup 1, or set `through` false and list the exit in `unmachined`. With `through` true, `breakthrough` extends the drill below the hole; null means 1 mm. It is at most half the drill diameter plus 1 mm and never more than the stock below the model (`stock_margin[1]`).
 - Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm. On a 120 × 80 mm part with a Ø6 ball end mill this means a `surface_stepover` of about 0.6 mm or more with `tolerance` 0.02.
@@ -280,7 +280,7 @@ WORKHOLDING
 
 {holding}SPEEDS AND FEEDS
 - `material` in the report holds the cutting data for carbide tools: `vc_min_m_per_min` and `vc_max_m_per_min` give the surface speed range in m/min, and `chip_load_mm` the chip load per tooth in mm in five bands by tool diameter. A band holds the diameters up to its `up_to_mm` (and above the previous band's), with its `min` and `max`; the last band, with `up_to_mm` null, holds every larger diameter.
-- The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter. Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
+- The program computes, for every operation, the surface speed Vc = π × D × rpm ÷ 1000 (m/min) and the chip load fz = feed ÷ (rpm × flutes) (mm per tooth), from the tool's diameter D and `flutes` in `tools` and the operation's `rpm` and `feed`. Vc must lie between `vc_min_m_per_min` and `vc_max_m_per_min`, and fz between the `min` and `max` of the band of the tool's diameter; under 3 mm the band's `min` and `max` shrink in proportion to the diameter (a Ø1 tool takes a third of them, a Ø0.5 a sixth). Choose a Vc in range and set rpm = Vc × 1000 ÷ (π × D), then choose an fz in the band and set feed = fz × rpm × flutes. For example, a 3-flute Ø10 mm tool at 8000 rpm and 1000 mm/min runs at Vc = 251 m/min with fz = 0.042 mm per tooth.
 - Drills are checked like end mills: a Drill's `feed` is divided by rpm × flutes in the same way and must give a chip load inside the band of the drill's diameter, so choose drill feeds inside those bands. A small drill needs a high rpm to reach the surface speed.
 - When even the machine's maximum rpm (`machine.max_rpm`) gives a tool less than the minimum surface speed, running at that maximum rpm counts as in range. When the minimum chip load needs more than the machine's maximum feed (`machine.max_feed`), running at that maximum feed counts as in range. A value above the material's maximum is never excused, and rounding gets 1% of slack on each limit.
 - Plunge and ramp feeds are not checked. Plans with a spindle speed or feed outside the material's cutting data are refused: each such operation comes back as a problem with the stage `cutting data`, together with the generation, export, tool-axis and gouge problems.
@@ -1806,7 +1806,7 @@ pub(crate) mod tests {
             })
         };
         for (strategy, passes, fails) in [
-            ("Pocket", 0.5, 0.45),
+            ("Pocket", 0.25, 0.2),
             ("Contour", 0.35, 0.3),
             ("Waterline", 0.45, 0.4),
         ] {
@@ -1837,7 +1837,7 @@ pub(crate) mod tests {
                 "{l}"
             );
             assert!(
-                l.contains("a smaller `ramp_angle` adds ramp moves on every ring and level"),
+                l.contains("a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot)"),
                 "{l}"
             );
         }
@@ -1866,7 +1866,10 @@ pub(crate) mod tests {
                 oi
             })
         };
-        for inside_floor in [false, true] {
+        // The finish passes, and the ramp angle, that go over the limit, with
+        // the tool staying down from ring to ring. No ramp angle allowed
+        // takes an inside-floor Contour over it.
+        for (inside_floor, finish, ramp) in [(false, 4, Some(0.1)), (true, 5, None)] {
             let name = if inside_floor {
                 "inside floor"
             } else {
@@ -1874,31 +1877,34 @@ pub(crate) mod tests {
             };
             assert_eq!(at_half(inside_floor, &|_| {}), Ok(()), "{name}");
             assert_eq!(
-                at_half(inside_floor, &|o| o.finish_passes = Some(1)),
+                at_half(inside_floor, &|o| o.finish_passes = Some(finish - 1)),
                 Ok(()),
-                "{name}, 1 finish pass"
+                "{name}, {} finish passes",
+                finish - 1
             );
             assert_eq!(
                 at_half(inside_floor, &|o| o.ramp_angle = Some(1.)),
                 Ok(()),
                 "{name}, ramp 1°"
             );
-            for (what, edit) in [
-                (
-                    "2 finish passes",
-                    &(|o: &mut proposal::ProposedOp| o.finish_passes = Some(2))
-                        as &dyn Fn(&mut proposal::ProposedOp),
+            let error = at_half(inside_floor, &|o| o.finish_passes = Some(finish)).unwrap_err();
+            assert!(
+                error.contains("30,000 moves"),
+                "{name}, {finish} finish passes: {error}"
+            );
+            let slowest = ramp.unwrap_or(0.1);
+            let ramped = at_half(inside_floor, &|o| o.ramp_angle = Some(slowest));
+            match ramp {
+                Some(_) => assert!(
+                    ramped.unwrap_err().contains("30,000 moves"),
+                    "{name}, ramp {slowest}°"
                 ),
-                ("ramp 0.3°", &|o| o.ramp_angle = Some(0.3)),
-            ] {
-                let Err(error) = at_half(inside_floor, edit) else {
-                    panic!("{name}, {what} passed");
-                };
-                assert!(error.contains("30,000 moves"), "{name}, {what}: {error}");
+                None => assert_eq!(ramped, Ok(()), "{name}, ramp {slowest}°"),
             }
         }
         // A smaller stepover adds Pocket rings; an inside-floor Contour keeps 40 %.
-        let error = at_half(false, &|o| o.stepover_percent = Some(30.)).unwrap_err();
+        assert_eq!(at_half(false, &|o| o.stepover_percent = Some(12.)), Ok(()));
+        let error = at_half(false, &|o| o.stepover_percent = Some(10.)).unwrap_err();
         assert!(error.contains("30,000 moves"), "{error}");
         assert_eq!(
             at_half(true, &|o| o.stepover_percent = Some(10.)),
