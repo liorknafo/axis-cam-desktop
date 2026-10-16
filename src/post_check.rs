@@ -12,6 +12,19 @@ use crate::{
 use std::collections::{HashMap, HashSet};
 
 const EPS: f32 = 0.0005;
+/// How many times the profile's path blending tolerance (G64 P) the tool
+/// keeps over the stock top where it moves sideways: the clearance plane,
+/// every sideways rapid and the link between two operations of one tool
+/// (issue #161). At the corner where a retract turns into a traverse the
+/// tangent blend leaves the vertical up to P/(√2 − 1) ≈ 2.41 P below the
+/// traverse height, so a traverse closer than that over the top can dip
+/// into the pocket rim the tool has just left.
+pub const BLEND_HEIGHT: f32 = 2.5;
+/// How far over the stock top sideways motion keeps, in mm: `BLEND_HEIGHT`
+/// times the blend tolerance of `settings`.
+pub fn blend_margin(settings: &PostSettings) -> f32 {
+    BLEND_HEIGHT * settings.blend
+}
 /// Machine-profile travel or feed in mm (or mm/min).
 pub fn machine_mm(m: &Machine, key: &str) -> f32 {
     let v = num(&m.p, key).unwrap_or(0.);
@@ -105,8 +118,22 @@ pub fn check_setup(
             problems.add(None, rule, format!("The program spans {size:.3} mm in {axis}, more than the machine's {axis} travel of {travel:.3} mm."));
         }
     }
-    if !settings.machine_home && clearance_plane(blocks) < top - EPS {
+    // Sideways motion keeps the blend margin over the top: at a corner the
+    // blend can dip below the programmed height (`BLEND_HEIGHT`).
+    let margin = blend_margin(settings);
+    let clear = top + margin;
+    let over = |z: f32| format!("{:.3} mm over the stock top", z - top);
+    let blend = || {
+        format!(
+            "less than {BLEND_HEIGHT} times the path blending tolerance (G64 P{:.3}, {margin:.3} mm)",
+            settings.blend
+        )
+    };
+    let plane = clearance_plane(blocks);
+    if !settings.machine_home && plane < top - EPS {
         problems.add(None, "retract", "The setup clearance plane is below the stock top, so tool changes would retract into material. Raise the operations' clearance heights.".into());
+    } else if !settings.machine_home && plane < clear - EPS {
+        problems.add(None, "retract", format!("The setup clearance plane is {}: {}, so the blend of a rapid there could dip into material. Raise the operations' clearance heights.", over(plane), blend()));
     }
     let rests: Vec<Option<RestStock>> = sims
         .iter()
@@ -156,8 +183,28 @@ pub fn check_setup(
         if low + o.stickout < top - EPS {
             problems.add(Some(op), "holder", format!("{}: the holder would drop below the stock top at {} (stickout {:.3} mm). Use a longer stickout or a shallower cut.", o.name, at([to[0], to[1], low]), o.stickout));
         }
-        if rapid && low < top - EPS {
-            let vertical = (from[0] - to[0]).abs() <= EPS && (from[1] - to[1]).abs() <= EPS;
+        let vertical = (from[0] - to[0]).abs() <= EPS && (from[1] - to[1]).abs() <= EPS;
+        if rapid && !vertical && low < clear - EPS {
+            problems.add(
+                Some(op),
+                "rapid",
+                if low < top - EPS {
+                    format!(
+                        "{}: a rapid moves sideways below the stock top at {}.",
+                        o.name,
+                        at(to)
+                    )
+                } else {
+                    format!(
+                        "{}: a rapid moves sideways at {}, {}: {}, so its blend could dip into material.",
+                        o.name,
+                        at(to),
+                        over(low),
+                        blend()
+                    )
+                },
+            );
+        } else if rapid && vertical && low < top - EPS {
             let revisited = visited
                 .get(&key(to[0], to[1]))
                 .is_some_and(|z| *z <= low + EPS);
@@ -173,17 +220,7 @@ pub fn check_setup(
                     r.beside(column) || r.top(column, low - 0.001, top) <= low + EPS
                 })
             };
-            if !vertical {
-                problems.add(
-                    Some(op),
-                    "rapid",
-                    format!(
-                        "{}: a rapid moves sideways below the stock top at {}.",
-                        o.name,
-                        at(to)
-                    ),
-                );
-            } else if !revisited && !proven() {
+            if !revisited && !proven() {
                 problems.add(
                     Some(op),
                     "rapid",
@@ -382,6 +419,79 @@ mod tests {
         assert!(
             problems.iter().any(|p| p.contains("sideways")),
             "{problems:?}"
+        );
+    }
+    #[test]
+    fn a_sideways_rapid_within_the_blend_margin_over_the_top_is_refused() {
+        // A Facing whose rapids cross `z`, 0.5 mm over the stock top (Z10).
+        // Under G64 P the blend at a corner can leave the vertical 2.41 P
+        // below the crossing height, so a crossing keeps 2.5 P over the
+        // top: clear with no blend and with the default 0.01 mm (0.025 mm),
+        // refused with 1 mm (2.5 mm) both at the clearance plane and as a
+        // sideways rapid, and clear again 2.5 mm over the top (#161).
+        let crossing = |z: f32| {
+            fixture::plan(
+                [-15., -15., z],
+                &[
+                    (Motion::Rapid, [-15., -15., 10.], 6000.),
+                    (Motion::Feed, [-15., -15., 9.], 250.),
+                    (Motion::Feed, [15., -15., 9.], 1000.),
+                    (Motion::Rapid, [15., -15., z], 6000.),
+                    (Motion::Rapid, [15., 15., z], 6000.),
+                ],
+            )
+        };
+        let problems = |machine: Machine, plan: Plan| -> Vec<String> {
+            let settings = PostSettings::from_machine(&machine).unwrap();
+            let op = fixture::facing_op();
+            let blocks = blocks(std::slice::from_ref(&op), &[&plan], &settings);
+            let setup = Setup::new(machine, "G54");
+            let sim = Simulation::new(plan);
+            check_setup(&setup, &[op], &[&sim], &blocks, &settings, [0., 0., 10.])
+        };
+        let plane = |blend: &str| {
+            let mut machine = blended(blend);
+            machine
+                .p
+                .insert("post_retract".into(), crate::model::POST_RETRACT[1].into());
+            machine
+        };
+        assert_eq!(problems(plane("0"), crossing(10.5)), Vec::<String>::new());
+        assert_eq!(
+            problems(plane("0.01"), crossing(10.5)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            problems(plane("1"), crossing(10.5)),
+            [
+                "The setup clearance plane is 0.500 mm over the stock top: less than 2.5 times the path blending tolerance (G64 P1.000, 2.500 mm), so the blend of a rapid there could dip into material. Raise the operations' clearance heights.",
+                "Face top: a rapid moves sideways at X15.000 Y15.000 Z0.500, 0.500 mm over the stock top: less than 2.5 times the path blending tolerance (G64 P1.000, 2.500 mm), so its blend could dip into material."
+            ]
+        );
+        assert_eq!(problems(plane("1"), crossing(12.5)), Vec::<String>::new());
+        // Retracting to machine home, only the crossing is named.
+        assert_eq!(
+            problems(blended("1"), crossing(10.5)),
+            [
+                "Face top: a rapid moves sideways at X15.000 Y15.000 Z0.500, 0.500 mm over the stock top: less than 2.5 times the path blending tolerance (G64 P1.000, 2.500 mm), so its blend could dip into material."
+            ]
+        );
+        // A crossing below the top keeps its own line (from a clearance
+        // point 15 mm over the top, so that nothing else is refused first).
+        let below = fixture::plan(
+            [-15., -15., 25.],
+            &[
+                (Motion::Rapid, [-15., -15., 10.], 6000.),
+                (Motion::Feed, [-15., -15., 9.], 250.),
+                (Motion::Feed, [15., -15., 9.], 1000.),
+                (Motion::Rapid, [15., -15., 9.5], 6000.),
+                (Motion::Rapid, [15., 15., 9.5], 6000.),
+                (Motion::Rapid, [15., 15., 25.], 6000.),
+            ],
+        );
+        assert_eq!(
+            problems(blended("1"), below),
+            ["Face top: a rapid moves sideways below the stock top at X15.000 Y15.000 Z-0.500."]
         );
     }
     #[test]
@@ -1015,7 +1125,9 @@ mod tests {
         // a rapid 6 mm deep, 2 mm below the facing, whose column touches the
         // stock box (X-62 from the work zero) at its -X side: wholly beside
         // it, where there never was stock. Nothing of the facing was that
-        // deep, so only the rest-stock proof can accept it.
+        // deep, so only the rest-stock proof can accept it. The crossing to
+        // it runs 3 mm over the top, above the blend margin (#161), so that
+        // only the column decides.
         let problems = |blend: &str| -> Vec<String> {
             let mut setup = doc.setups[0].clone();
             setup.machine.p.insert("post_blend".into(), blend.into());
@@ -1030,7 +1142,8 @@ mod tests {
             let plan = &mut sims[1].plan;
             assert_eq!(plan.radius, 5.);
             let p0 = plan.moves[0].to;
-            let hi = [-67. + zero[0], -35. + zero[1], p0[2]];
+            let up = [p0[0], p0[1], top + 3.];
+            let hi = [-67. + zero[0], -35. + zero[1], top + 3.];
             let lo = [hi[0], hi[1], top - 6.];
             let rapid = |from, to| Move {
                 from,
@@ -1043,7 +1156,14 @@ mod tests {
             };
             plan.moves.splice(
                 1..1,
-                [rapid(p0, hi), rapid(hi, lo), rapid(lo, hi), rapid(hi, p0)],
+                [
+                    rapid(p0, up),
+                    rapid(up, hi),
+                    rapid(hi, lo),
+                    rapid(lo, hi),
+                    rapid(hi, up),
+                    rapid(up, p0),
+                ],
             );
             let plans: Vec<&Plan> = sims.iter().map(|s| &s.plan).collect();
             let blocks = blocks(&ops, &plans, &settings);

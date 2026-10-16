@@ -530,6 +530,21 @@ pub fn verify(
                     ));
                 }
             }
+            Block::Standstill { seconds } => {
+                let s = take(steps, &mut i, "the standstill dwell")?;
+                if s.kind != StepKind::Dwell || (s.seconds - f64::from(*seconds)).abs() > TOL {
+                    return Err(format!(
+                        "line {}: expected a {seconds:.3} s standstill dwell",
+                        s.line
+                    ));
+                }
+                if s.state.spindle != Spindle::Off {
+                    return Err(format!(
+                        "line {}: the standstill dwell runs with the spindle on",
+                        s.line
+                    ));
+                }
+            }
             Block::Approach { op, xy } => {
                 let s = take(steps, &mut i, "the approach")?;
                 let w = work([xy[0], xy[1], 0.]);

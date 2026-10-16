@@ -1685,11 +1685,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "post_blend") => (
             "Path blending tolerance for LinuxCNC's trajectory planner. A positive value writes G64 P with this tolerance in mm, so corners may round by up to that much at speed. 0 writes G61 exact path.",
-            "The checks allow for it: it is added to the setup's clearance gap around the jaws and clamps and to the cutter's radius when a rapid descent is proven clear of the stock, also for a UC100 run.",
+            "The checks allow for it: it is added to the setup's clearance gap around the jaws and clamps and to the cutter's radius when a rapid descent is proven clear of the stock, also for a UC100 run. At a corner the blend can leave the vertical by 2.41 times the tolerance below the height a rapid crosses at, so the clearance plane and every sideways rapid keep 2.5 times the tolerance over the stock top (export and the Run checks refuse a rapid closer than that) and the link between two operations of one tool is raised to that height.",
             None,
         ),
         (_, "post_dwell") => (
-            "Seconds to wait after starting or changing the spindle before the first move. Use it when the spindle has no at-speed feedback. 0 writes no dwell.",
+            "Seconds to wait after starting or changing the spindle before the first move, and, between two operations of one tool that turn it opposite ways, after the M5 that stops it before it is started the other way. Use it when the spindle has no at-speed feedback. 0 writes no dwell. At a reversal nothing then waits for the spindle to stop.",
             "",
             None,
         ),
@@ -2849,6 +2849,21 @@ mod tests {
         assert!(
             blend.contains("added to the setup's clearance gap") && blend.contains("UC100 run"),
             "{blend}"
+        );
+        // The blend's dip at a corner and the margin it costs over the stock
+        // top (#161), and the dwell a reversal waits (#160).
+        assert!(
+            blend.contains("keep 2.5 times the tolerance over the stock top")
+                && blend.contains("2.41 times the tolerance"),
+            "{blend}"
+        );
+        let dwell = field_help("post_dwell", "x", Target::Machine).body;
+        assert!(
+            dwell.contains("after the M5 that stops it before it is started the other way")
+                && dwell.ends_with(
+                    "0 writes no dwell. At a reversal nothing then waits for the spindle to stop."
+                ),
+            "{dwell}"
         );
         // What the check is, and what it is not, in the field that chooses it.
         let holding = all(&field_help("holding", "x", Target::Setup));
