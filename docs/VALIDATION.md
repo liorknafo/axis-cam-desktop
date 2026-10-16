@@ -161,12 +161,20 @@ A hand on the hardware E-stop for every step; the mushroom's power cutoff is not
   - Workholding: a red vise.
   - AI planner: purple sparkles.
   - Operation support: a teal checklist.
-  - Control: a green start triangle.
+  - Control: a green start triangle (since #88 a control panel with a dial and a button).
   - Setup: a slate gear.
   - Manufacture (switcher): pink, a part with a toolpath.
 
   Re-inspected on Windows in MACHINE and in MANUFACTURE with the ribbon. Not a test.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 3 failed. Two are the STEP tests, as before. The third, `the_control_page_renders_in_every_state`, timed out under the full suite's load and passed alone.
+
+## Contrast of small text and toolbar tiles (#82, #88)
+
+- `muted_text_meets_contrast_on_every_surface` computes the WCAG contrast of the secondary-text colour `MUTED` against white panels, the application background and the selected, setup, hovered and active-button fills it is drawn on, and asserts at least 4.5:1 on each. Before (0.43, 0.50, 0.57): 4.09 on white, 3.74 on the application background, 3.36 on the selected operation row. After (0.30, 0.37, 0.44): 6.65, 6.07 and 5.45; the lowest of the seven surfaces is 5.45.
+- `toolbar_glyphs_meet_contrast_on_their_tiles` reads every `assets/tb-*.svg`, takes the first shape as the tile and checks each other fill and stroke colour against it for at least 4.5:1 (and that no glyph uses opacity). White on the tile before and after: Materials 2.27 to 4.95 (#e0a100 to #946800), Tools 3.58 to 5.18, Operation support 4.35 to 5.59, Control 3.45 to 5.31 (new tile #2b7a3d); the others were already above 4.5 (Workholding's and Manufacture's translucent shading is now solid white and separated by strokes in the tile colour).
+- `the_control_tile_is_a_panel_not_a_play_triangle` (the Control icon is a panel with a dial and a button) and `an_unavailable_strategy_says_why_on_hover` (the hover help of each unavailable strategy names the reason and Operation support).
+- Not tests: operational texts of 10 and 11 px (browser details, the playback lines, the status bar, the toolbar and ribbon labels) are now 12 px; ribbon captions 10 px; the inspector tab labels (11 px, one row of tabs), the "NATIVE PROTOTYPE" and "CAM STUDIO" brand text and the help card's concept-illustration note stay as they were. Unavailable strategies in the ribbon are drawn at 45 % opacity with the label in the muted colour. Toolbar tiles are drawn at 26 px instead of 28 so the solid tiles weigh less against the light operation icons. None of this was inspected in the window: this machine's renderer screenshots are unreliable, and the layout was not checked at the minimum window width (1120 px). No UI-scale preference was added.
+- Linux (16 October 2026): `cargo fmt`, `cargo clippy --all-targets --locked -- -D warnings` clean; `cargo test --locked -- --test-threads=6`: 939 passed, 0 failed after the rebase onto #76, #77 (the four new tests included).
 
 ## Stock pictures in the setup browser (LIO-132)
 

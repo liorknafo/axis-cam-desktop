@@ -18,10 +18,20 @@ use iced::{
     },
 };
 const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
-const MUTED: Color = Color::from_rgb(0.43, 0.50, 0.57);
+/// Secondary text. At least 4.5:1 on every surface below
+/// (`muted_text_meets_contrast_on_every_surface`).
+const MUTED: Color = Color::from_rgb(0.30, 0.37, 0.44);
 const BLUE: Color = Color::from_rgb(0.13, 0.42, 0.71);
 const LINE: Color = Color::from_rgb(0.85, 0.88, 0.91);
 const BG: Color = Color::from_rgb(0.95, 0.96, 0.975);
+// The fills that MUTED text is drawn on besides white panels and BG.
+const SELECTED_ROW: Color = Color::from_rgb8(218, 235, 249);
+const ACTIVE_TILE: Color = Color::from_rgb8(223, 237, 249);
+const SETUP_ROW: Color = Color::from_rgb8(230, 239, 248);
+const HOVER_ROW: Color = Color::from_rgb8(239, 244, 249);
+const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
+/// The opacity of an icon whose command is unavailable.
+const DIMMED: f32 = 0.45;
 pub(crate) fn bold<'a>(s: impl Into<String>, size: u32) -> widget::Text<'a> {
     text(s.into()).size(size).font(Font {
         weight: iced::font::Weight::Semibold,
@@ -58,9 +68,9 @@ fn flat(active: bool, status: button::Status) -> button::Style {
     button::Style {
         background: Some(
             if active {
-                Color::from_rgb8(223, 237, 249)
+                ACTIVE_TILE
             } else if hovered {
-                Color::from_rgb8(235, 240, 246)
+                HOVER_BUTTON
             } else {
                 Color::TRANSPARENT
             }
@@ -78,7 +88,7 @@ fn flat(active: bool, status: button::Status) -> button::Style {
 fn tool_btn<'a>(icon: &'static [u8], label: &str, msg: Message, active: bool) -> HelpButton<'a> {
     let action = msg.clone();
     let b = button(
-        column![tool_icon(icon), text(label.to_string()).size(11)]
+        column![tool_icon(icon), text(label.to_string()).size(12)]
             .spacing(2)
             .align_x(Alignment::Center),
     )
@@ -89,7 +99,7 @@ fn tool_btn<'a>(icon: &'static [u8], label: &str, msg: Message, active: bool) ->
 }
 fn tool_icon<'a>(icon: &'static [u8]) -> widget::Svg<'a> {
     // ponytail: hashes the few hundred bytes every frame; keep handles on App if that ever shows.
-    svg(svg::Handle::from_memory(icon)).width(28).height(28)
+    svg(svg::Handle::from_memory(icon)).width(26).height(26)
 }
 /// A button on the dark application bar.
 fn bar_btn<'a>(label: &str, msg: Message, active: bool) -> HelpButton<'a> {
@@ -390,7 +400,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .push(space().width(Fill))
         .push(
             text(workspace_note(app))
-                .size(11)
+                .size(12)
                 .color(Color::from_rgb8(183, 204, 222)),
         )
         .push(space().width(10))
@@ -483,9 +493,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
     let foot = container(
         row![
-            text(&app.status).size(11).width(Fill),
+            text(&app.status).size(12).width(Fill),
             text("mm  |  Bounded mesh previews · LinuxCNC 3-axis post")
-                .size(10)
+                .size(12)
                 .color(MUTED)
         ]
         .spacing(15)
@@ -632,7 +642,7 @@ fn ribbon(app: &App) -> Element<'_, Message> {
             Message::SetupEditor,
             app.page == Page::Work && app.selected.is_none()
         ),
-        muted("SETUP").size(9)
+        muted("SETUP").size(10)
     ]
     .spacing(2)
     .align_x(Alignment::Center);
@@ -645,34 +655,37 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         let mut buttons = Row::new().spacing(1);
         for s in &Strategy::ALL[range] {
             let s = *s;
-            buttons = buttons.push(HelpButton::new(
-                button(
-                    column![
-                        icon(app, s, 29.),
-                        text(if app.is_sample() || s.imported_preview() {
-                            s.short().to_string()
-                        } else {
-                            format!("{} · —", s.short())
-                        })
-                        .size(10)
-                    ]
+            let available = app.is_sample() || s.imported_preview();
+            // An unavailable strategy is dimmed: the icon at low opacity and
+            // the label in the muted colour, with its reason in the hover help.
+            let glyph = icon(app, s, 29.).opacity(if available { 1. } else { DIMMED });
+            let label = text(if available {
+                s.short().to_string()
+            } else {
+                format!("{} · —", s.short())
+            })
+            .size(12);
+            let tile = button(
+                column![glyph, if available { label } else { label.color(MUTED) }]
                     .spacing(4)
                     .align_x(Alignment::Center),
-                )
-                .padding([5, 7])
-                .on_press(if app.is_sample() || s.imported_preview() {
-                    Message::AddOp(s)
-                } else {
-                    Message::Page(Page::Audit)
-                })
-                .style(button::text),
-                &Message::AddOp(s),
-                s.name(),
-            ));
+            )
+            .padding([5, 5])
+            .on_press(if available {
+                Message::AddOp(s)
+            } else {
+                Message::Page(Page::Audit)
+            })
+            .style(button::text);
+            buttons = buttons.push(if available {
+                HelpButton::new(tile, &Message::AddOp(s), s.name())
+            } else {
+                HelpButton::unavailable(tile, s)
+            });
         }
         groups = groups
             .push(
-                column![buttons, muted(label).size(9)]
+                column![buttons, muted(label).size(10)]
                     .spacing(4)
                     .align_x(Alignment::Center),
             )
@@ -686,7 +699,7 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 Message::Page(Page::Post),
                 app.page == Page::Post
             ),
-            muted("ACTIONS").size(9)
+            muted("ACTIONS").size(10)
         ]
         .align_x(Alignment::Center)
         .spacing(2),
@@ -954,7 +967,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
     // covers them.
     let header = column![
         row![
-            bold("BROWSER", 11),
+            bold("BROWSER", 12),
             space().width(Fill),
             muted(format!("{} setups", app.doc.setups.len())),
             fold(app, Side::Browser)
@@ -994,7 +1007,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                         get(&s.p, "offset"),
                         s.machine.axes()
                     ))
-                    .size(10)
+                    .size(12)
                     .wrapping(Wrapping::None)
                 ]
                 .spacing(2)
@@ -1013,7 +1026,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 .style(move |t, st| {
                     let mut style = button::text(t, st);
                     if active {
-                        style.background = Some(Color::from_rgb8(230, 239, 248).into())
+                        style.background = Some(SETUP_ROW.into())
                     }
                     style.text_color = INK;
                     style
@@ -1023,7 +1036,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
         ));
         if active {
             tree = tree.push(
-                container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(10))
+                container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(12))
                     .padding([0, 16]),
             );
             let checks = app.current_ready();
@@ -1054,9 +1067,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                         .style(move |_, st| button::Style {
                             background: Some(
                                 if selected {
-                                    Color::from_rgb8(218, 235, 249)
+                                    SELECTED_ROW
                                 } else if matches!(st, button::Status::Hovered) {
-                                    Color::from_rgb8(239, 244, 249)
+                                    HOVER_ROW
                                 } else {
                                     Color::TRANSPARENT
                                 }
@@ -1077,7 +1090,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
             if let Some(picture) = stock_picture(app, si, true) {
                 tree = tree.push(help::wrap(
                     row![
-                        muted("Stock after this setup").size(11).width(Fill),
+                        muted("Stock after this setup").size(12).width(Fill),
                         widget::image(picture).width(64).height(48)
                     ]
                     .spacing(6)
@@ -1102,7 +1115,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
         rule::horizontal(1),
         muted("PROJECT UNITS"),
         text("Millimeters (mm)").size(12),
-        muted("Machine limits can use mm or inch. Tool and operation values use mm.").size(10)
+        muted("Machine limits can use mm or inch. Tool and operation values use mm.").size(12)
     ]
     .spacing(6);
     let tree = container(tree).width(Fill).padding(iced::Padding {
@@ -1156,7 +1169,7 @@ pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
         checkbox(app.show_uncut)
             .label("Show uncut faces")
             .on_toggle(|_| Message::ToggleUncut)
-            .text_size(11),
+            .text_size(12),
         crate::choice_help::selected(
             "uncut_visibility",
             "Show uncut faces",
@@ -1176,7 +1189,7 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
         return None;
     }
     let key = |colour: Color, name: &'static str| {
-        row![text("■").size(10).color(colour), muted(name).size(10)].spacing(3)
+        row![text("■").size(12).color(colour), muted(name).size(12)].spacing(3)
     };
     let mut legend = row![].spacing(10);
     if app.stock {
@@ -1192,7 +1205,7 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
 /// The browser's list of the regions of the part the whole job leaves under
 /// stock, or why that is not checked.
 fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
-    let mut block = column![muted("STILL UNCUT").size(10)].spacing(4);
+    let mut block = column![muted("STILL UNCUT").size(12)].spacing(4);
     match job_uncut(app) {
         Some(Ok(found)) if !found.regions.is_empty() => {
             block = block.push(
@@ -1202,18 +1215,18 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
                     if found.regions.len() == 1 { "" } else { "s" },
                     found.share * 100.
                 ))
-                .size(11)
+                .size(12)
                 .color(Color::from_rgb8(166, 46, 124)),
             );
             for region in found.regions.iter().take(5) {
-                block = block.push(muted(format!("• {}", region.line())).size(10));
+                block = block.push(muted(format!("• {}", region.line())).size(12));
             }
             if found.regions.len() > 5 {
                 block =
-                    block.push(muted(format!("• and {} more", found.regions.len() - 5)).size(10));
+                    block.push(muted(format!("• and {} more", found.regions.len() - 5)).size(12));
             }
         }
-        _ => block = block.push(muted(uncut_line(app)?).size(11)),
+        _ => block = block.push(muted(uncut_line(app)?).size(12)),
     }
     Some(help::wrap(
         container(block).padding([4, 10]),
@@ -1400,7 +1413,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             checkbox(app.stock)
                 .label("Stock")
                 .on_toggle(|_| Message::ToggleStock)
-                .text_size(11),
+                .text_size(12),
             crate::choice_help::selected(
                 "stock_visibility",
                 "Stock",
@@ -1419,7 +1432,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     "Toolpath"
                 })
                 .on_toggle(|_| Message::TogglePaths)
-                .text_size(11),
+                .text_size(12),
             crate::choice_help::selected(
                 "path_visibility",
                 "Toolpath",
@@ -1436,15 +1449,15 @@ fn workspace(app: &App) -> Element<'_, Message> {
     let toolbar = container(
         column![
             toggles,
-            muted(detail).size(10),
-            uncut_line(app).map(|line| muted(line).size(10)),
+            muted(detail).size(12),
+            uncut_line(app).map(|line| muted(line).size(12)),
             uncut_legend(app),
             muted(if app.picking {
                 "Click a highlighted feature to select it · drag to orbit"
             } else {
                 "Drag to orbit · right-drag to pan · scroll to zoom"
             })
-            .size(10)
+            .size(12)
         ]
         .spacing(7),
     )
@@ -1464,7 +1477,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                 } else {
                     "SIMULATION"
                 },
-                10
+                12
             ),
             space().width(Fill),
             muted(if app.is_sample() {
@@ -1472,7 +1485,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             } else {
                 fixture_note(app, Note::Panel)
             })
-            .size(10)
+            .size(12)
         ]
         .spacing(8)
     ]
@@ -1481,11 +1494,11 @@ fn workspace(app: &App) -> Element<'_, Message> {
         let said: Element<'_, Message> = if ok {
             let mut c = column![bold(heading, 12).color(GOOD)].spacing(3);
             for line in lines {
-                c = c.push(muted(line).size(10));
+                c = c.push(muted(line).size(12));
             }
             c.into()
         } else if lines.is_empty() {
-            muted(heading).size(11).into()
+            muted(heading).size(12).into()
         } else {
             caution(heading, lines)
         };
@@ -1497,7 +1510,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             btn("Restart", Message::Scrub(0.), false),
             help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
             muted(format!("{:03}%", (app.progress * 100.) as u32)),
-            help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(11).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
+            help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
         if let Some(sim) = app.active_simulation() {
@@ -1515,7 +1528,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                         .rest_top
                         .map_or(String::new(), |z| format!(" · Cutting start Z {z:.2} mm"))
                 ))
-                .size(10),
+                .size(12),
             );
             playback = playback.push(
                 muted(format!(
@@ -1525,10 +1538,10 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     (sim.removed_volume() - sim.inherited_volume()) / 1000.,
                     sim.removed_volume() / 1000.
                 ))
-                .size(10),
+                .size(12),
             );
             let surface_status = stock_surface_details(app).unwrap_or_default();
-            let mut detail = row![muted("Detail").size(10)]
+            let mut detail = row![muted("Detail").size(12)]
                 .spacing(5)
                 .align_y(Alignment::Center);
             for choice in crate::stock_surface::Detail::ALL {
@@ -1541,10 +1554,10 @@ fn workspace(app: &App) -> Element<'_, Message> {
             if let Some(notice) = stock_surface_notice(app) {
                 playback = playback.push(bold(notice, 12).color(WARN));
             }
-            playback = playback.push(detail.push(muted(surface_status).size(10)));
+            playback = playback.push(detail.push(muted(surface_status).size(12)));
         }
     } else {
-        let mut empty = row![muted(app.playback_reason()).size(11).width(Fill)]
+        let mut empty = row![muted(app.playback_reason()).size(12).width(Fill)]
             .spacing(10)
             .align_y(Alignment::Center);
         if imported_facing {
@@ -1746,7 +1759,7 @@ fn operation_editor<'a>(app: &'a App, o: &'a Operation) -> Panel<'a> {
                         muted(
                             "Viewed from spindle toward the part. Match the cutter's cutting hand.",
                         )
-                        .size(11),
+                        .size(12),
                     );
             }
             c = c
@@ -2204,7 +2217,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
     }
     if s == Strategy::Pocket && !app.is_sample() {
         c = c.push(choice_value(p, pocket_setting(p,"pocket_milling"), "pocket_milling", "Milling direction", &FACING_MILLING, t))
-            .push(muted(format!("Spindle: {} · set in Tool", facing_setting(p,"spindle_rotation"))).size(11))
+            .push(muted(format!("Spindle: {} · set in Tool", facing_setting(p,"spindle_rotation"))).size(12))
             .push(note("Climb / Conventional changes the direction around walls and islands. Offset contours clear from the interior outward, with a retract between loops."));
     }
     if s == Strategy::Face && !app.is_sample() {
@@ -2242,7 +2255,7 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
                 "Spindle: {} · set in Tool",
                 facing_setting(p, "spindle_rotation")
             ))
-            .size(11),
+            .size(12),
         );
     }
     if matches!(s, Strategy::Face | Strategy::Indexed | Strategy::Parallel) {
@@ -2876,7 +2889,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         if !margins.is_empty() {
             let mut m = column![muted("Against the cutting forces").size(12)].spacing(3);
             for line in margins {
-                m = m.push(muted(line).size(11));
+                m = m.push(muted(line).size(12));
             }
             c.push(m.into());
         }
@@ -3701,11 +3714,9 @@ pub(crate) fn act<'a>(
         .on_press_maybe(msg.clone())
         .style(move |_, status| {
             let (background, text_color) = match status {
-                _ if on => (Color::from_rgb8(223, 237, 249), BLUE),
+                _ if on => (ACTIVE_TILE, BLUE),
                 button::Status::Disabled => (BG, MUTED),
-                button::Status::Hovered | button::Status::Pressed => {
-                    (Color::from_rgb8(235, 240, 246), INK)
-                }
+                button::Status::Hovered | button::Status::Pressed => (HOVER_BUTTON, INK),
                 _ => (Color::WHITE, INK),
             };
             button::Style {
@@ -3850,7 +3861,7 @@ fn control(app: &App) -> Element<'_, Message> {
         .iter()
         .skip(s.log.len().saturating_sub(40))
         .fold(column![].spacing(2), |col, line| {
-            col.push(text(line.clone()).size(11).font(Font::MONOSPACE))
+            col.push(text(line.clone()).size(12).font(Font::MONOSPACE))
         });
     let left = container(
         column![
@@ -6979,6 +6990,7 @@ pub(crate) mod probe {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::Strategy;
     use std::path::Path;
 
     // Written as escapes so this file does not contain the text it hunts for.
@@ -7058,6 +7070,119 @@ mod tests {
             assert!(view_width(&l, min) >= VIEW_MIN, "{side:?}");
         }
     }
+
+    /// WCAG 2.x relative luminance of an sRGB colour given as 0-1 channels.
+    fn luminance([r, g, b]: [f64; 3]) -> f64 {
+        let linear = |c: f64| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+
+    fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    fn rgb(c: iced::Color) -> [f64; 3] {
+        [c.r, c.g, c.b].map(f64::from)
+    }
+
+    /// `#rrggbb` as 0-1 channels.
+    fn hex(h: &str) -> [f64; 3] {
+        let n = u32::from_str_radix(h.trim_start_matches('#'), 16).unwrap();
+        [n >> 16, (n >> 8) & 255, n & 255].map(|c| f64::from(c & 255) / 255.)
+    }
+
+    /// The `#rrggbb` value of a tag's `name="#..."` attribute.
+    fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+        let at = tag.find(&format!(" {name}=\"#"))? + name.len() + 3;
+        Some(&tag[at..at + 7])
+    }
+
+    #[test]
+    fn muted_text_meets_contrast_on_every_surface() {
+        use super::*;
+        let surfaces = [
+            ("white panel", Color::WHITE),
+            ("application background", BG),
+            ("selected operation row", SELECTED_ROW),
+            ("setup row", SETUP_ROW),
+            ("hovered row", HOVER_ROW),
+            ("active toolbar button", ACTIVE_TILE),
+            ("hovered button", HOVER_BUTTON),
+        ];
+        let low: Vec<_> = surfaces
+            .iter()
+            .map(|(name, surface)| (name, contrast(rgb(MUTED), rgb(*surface))))
+            .filter(|(_, ratio)| *ratio < 4.5)
+            .collect();
+        assert!(low.is_empty(), "muted text below 4.5:1 on {low:?}");
+        // It stays secondary: lighter than the body ink.
+        assert!(luminance(rgb(MUTED)) > luminance(rgb(INK)));
+    }
+
+    /// Every colour a toolbar tile's glyph is drawn in, against the tile.
+    #[test]
+    fn toolbar_glyphs_meet_contrast_on_their_tiles() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let file = path.file_name().unwrap().to_str().unwrap().to_string();
+            if !(file.starts_with("tb-") && file.ends_with(".svg")) {
+                continue;
+            }
+            let svg = std::fs::read_to_string(&path).unwrap();
+            let tags: Vec<_> = svg.split('<').skip(2).collect();
+            let tile = attribute(svg.split('<').nth(2).unwrap(), "fill")
+                .unwrap_or_else(|| panic!("{file}: the first shape is the tile"));
+            assert!(!svg.contains("opacity"), "{file}: glyphs are solid");
+            for tag in tags.iter().skip(1) {
+                for kind in ["fill", "stroke"] {
+                    let Some(colour) = attribute(tag, kind) else {
+                        continue;
+                    };
+                    if colour == tile {
+                        continue; // a cut-out or a gap in the tile's own colour
+                    }
+                    let ratio = contrast(hex(colour), hex(tile));
+                    assert!(
+                        ratio >= 4.5,
+                        "{file}: {kind} {colour} on tile {tile} is {ratio:.2}:1"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 9, "only {checked} glyph colours were read");
+    }
+
+    #[test]
+    fn the_control_tile_is_a_panel_not_a_play_triangle() {
+        let svg = include_str!("../assets/tb-control.svg");
+        assert!(svg.matches("<circle").count() >= 2, "a dial and a button");
+        assert!(!svg.contains("l13-8"), "the play triangle is gone");
+    }
+
+    #[test]
+    fn an_unavailable_strategy_says_why_on_hover() {
+        for s in Strategy::ALL.iter().filter(|s| !s.imported_preview()) {
+            let help = crate::help::unavailable_help(*s);
+            let reason = s
+                .availability()
+                .strip_prefix("Unavailable · ")
+                .expect("an unavailable strategy says so");
+            assert!(help.title.contains("unavailable"), "{}", help.title);
+            assert!(help.body.contains(reason), "{}", help.body);
+            assert!(help.body.contains("Operation support"), "{}", help.body);
+        }
+    }
+
     #[test]
     fn sources_and_docs_have_no_mojibake() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -343,7 +343,15 @@ left of the toolbar:
   **E-STOP** while connected.
 
 As in Fusion 360, each toolbar button has an icon above its label, and the
-switcher shows the open workspace's icon.
+switcher shows the open workspace's icon. Each icon is a solid tile with a
+white symbol that has at least 4.5:1 contrast against the tile (Materials is a
+dark gold, Control a control panel with a dial and a button, not a play
+triangle). Secondary grey text meets 4.5:1 on white panels, the application
+background and the selected rows, and the operational labels (dimensions,
+machining details, status lines) are 12 px or larger. In the ribbon, a
+strategy that is unavailable for an imported part is dimmed (icon and label,
+"· —" after its name); its hover help gives the reason, and a click opens
+Operation support.
 
 Picking MANUFACTURE goes back to the page left for MACHINE. While the
 machine moves (a tool run, held or paused, a probe, a jog or homing) the
@@ -797,7 +805,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-eight 
 - `src/fake_openai.rs`: test-only loopback stand-in for OpenAI.
 - `src/smoke.rs`: renderer smoke workflow and application action tests.
 - `assets/op-*.svg`: the eleven original operation icons from the web prototype.
-- `assets/tb-*.svg`: the nine toolbar icons.
+- `assets/tb-*.svg`: the nine toolbar icons (white glyphs on solid tiles, checked for contrast by `toolbar_glyphs_meet_contrast_on_their_tiles`).
 
 ## Next engineering stages
 

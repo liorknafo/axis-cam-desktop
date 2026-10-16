@@ -84,10 +84,33 @@ impl<'a> HelpButton<'a> {
             .animated(Diagram::Operation(strategy)),
         }
     }
+    /// A ribbon tile for a strategy the open job cannot run: the hover help
+    /// leads with the reason, then says where a click goes.
+    pub fn unavailable(button: widget::Button<'a, Message>, strategy: Strategy) -> Self {
+        Self {
+            button,
+            help: unavailable_help(strategy),
+        }
+    }
     pub fn width(mut self, width: impl Into<Length>) -> Self {
         self.button = self.button.width(width);
         self
     }
+}
+/// The hover help of a dimmed strategy tile: the reason first.
+pub fn unavailable_help(strategy: Strategy) -> Help {
+    let availability = strategy.availability();
+    let reason = availability
+        .strip_prefix("Unavailable · ")
+        .unwrap_or("this part of the job has no preview yet");
+    Help::text(
+        format!("{} (unavailable)", strategy.name()),
+        format!(
+            "Unavailable for imported parts: {reason}.\n\nClick to open Operation support, which lists what each strategy covers.\n\n{}",
+            strategy.help()
+        ),
+    )
+    .animated(Diagram::Operation(strategy))
 }
 impl<'a> From<HelpButton<'a>> for Element<'a, Message> {
     fn from(b: HelpButton<'a>) -> Self {
