@@ -218,6 +218,7 @@ pub enum Message {
     Saved(Option<PathBuf>),
     Export(&'static str),
     ToggleStock,
+    ToggleUncut,
     TogglePaths,
     Camera(&'static str),
     Viewport(viewport::Event),
@@ -667,6 +668,9 @@ pub struct App {
     pub last_archived: Option<PathBuf>,
     pub import_error: Option<String>,
     pub stock: bool,
+    /// "Show uncut faces": the part's faces the whole job leaves under stock
+    /// are drawn magenta (`uncut::Uncut::faces`), over the simulated stock too.
+    pub show_uncut: bool,
     pub paths: bool,
     pub picking: bool,
     pub playing: bool,
@@ -764,6 +768,7 @@ fn while_locked(m: &Message) -> bool {
             | Run(_)
             | RunChecked(..)
             | ToggleStock
+            | ToggleUncut
             | TogglePaths
             | Camera(_)
             | Viewport(_)
@@ -1047,6 +1052,7 @@ impl App {
             last_archived: None,
             import_error: None,
             stock: true,
+            show_uncut: true,
             paths: true,
             picking: false,
             playing: false,
@@ -3495,6 +3501,7 @@ impl App {
                 );
             }
             Message::ToggleStock => self.stock = !self.stock,
+            Message::ToggleUncut => self.show_uncut = !self.show_uncut,
             Message::TogglePaths => self.paths = !self.paths,
             Message::Camera(view) => {
                 self.camera = match view {

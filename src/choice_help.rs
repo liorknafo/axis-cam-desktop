@@ -336,6 +336,12 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("stock_visibility", "Hidden") => {
             "Stock is hidden and the reference part is visible. Material removal continues to be calculated; this does not reset stock or change the machining job."
         }
+        ("uncut_visibility", "Shown") => {
+            "The faces of the part that the stock still covers after every setup are magenta. With the simulated stock shown, they are drawn over it wherever its surface does not hide them. A selected one keeps its magenta and gets a blue outline."
+        }
+        ("uncut_visibility", "Hidden") => {
+            "The part is drawn without marking the faces the stock still covers. The Still uncut list and the share of the surface under the 3D view are unchanged."
+        }
         ("path_visibility", "Shown") => {
             "The current operation's preview path is visible. Hide it for an unobstructed view of the machined stock. This display choice does not disable the operation or change material removal."
         }
