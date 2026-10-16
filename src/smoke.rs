@@ -9307,6 +9307,57 @@ flood = { pin = 8 }
         let _ = a.update(Message::ClearSurfaces);
         assert!(a.operation().unwrap().surfaces.is_none());
     }
+    /// Issue #156: the Drill editor's hole list is worked out once for the
+    /// same part, placement and selected surfaces, not on every redraw.
+    #[test]
+    fn the_drill_editor_works_out_its_holes_once_per_part_placement_and_selection() {
+        let mut a = imported_app();
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        let faces: Vec<_> = a
+            .imported_mesh
+            .as_ref()
+            .unwrap()
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2] > 0.99999)
+            .map(|(id, _)| id)
+            .collect();
+        assert!(faces.len() >= 2, "{faces:?}");
+        let runs = || crate::DRILL_HOLE_RUNS.with(|n| n.get());
+        // Nothing selected is an answer too, kept like any other.
+        let none = runs();
+        for _ in 0..3 {
+            let _ = a.view();
+        }
+        assert_eq!(runs() - none, 1);
+        let _ = a.update(Message::Surface(faces[0]));
+        let before = runs();
+        // The planner page and the playback redraw many times a second.
+        for _ in 0..5 {
+            let _ = a.view();
+        }
+        assert_eq!(runs() - before, 1);
+        // Another selection is another list; the same list again is kept.
+        let _ = a.update(Message::Surface(faces[1]));
+        for _ in 0..3 {
+            let _ = a.view();
+        }
+        assert_eq!(runs() - before, 2);
+        // So is the setup's placement.
+        let _ = a.update(Message::Edit(Target::Setup, "tx", "1".into()));
+        for _ in 0..3 {
+            let _ = a.view();
+        }
+        assert_eq!(runs() - before, 3);
+        // An edit that does not move the part does not.
+        let _ = a.update(Message::Edit(Target::Operation, "feed", "851".into()));
+        let _ = a.view();
+        assert_eq!(runs() - before, 3);
+    }
     #[test]
     fn all_new_operations_complete_the_application_flow_and_job_audit_collects_failures() {
         let mut a = imported_app();

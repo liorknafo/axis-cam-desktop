@@ -922,35 +922,53 @@ fn orientation(
         }
     }
     // Coplanar visible faces at one height form one plane. Heights are sorted
-    // and merged while neighbours are within PLANE_TOLERANCE, so faces a few
-    // µm apart are never split by where a fixed bin edge happens to fall.
+    // and a cluster closes when a face is more than PLANE_TOLERANCE above its
+    // lowest, so faces a few µm apart are never split by where a fixed bin
+    // edge happens to fall and a chain of faces cannot drift across any height.
     let mut heights: Vec<(f32, usize)> = faces
         .iter()
         .filter(|(_, face)| face.flat && face.visible >= face.area * 0.5)
         .map(|(id, face)| (face.z, *id))
         .collect();
-    heights.sort_by(|a, b| a.0.total_cmp(&b.0));
+    heights.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     let mut cluster_of: std::collections::HashMap<usize, usize> = Default::default();
     let mut cluster = 0;
+    let mut start = f32::NEG_INFINITY;
     for (i, (z, id)) in heights.iter().enumerate() {
-        if i > 0 && z - heights[i - 1].0 > PLANE_TOLERANCE {
+        if i == 0 {
+            start = *z;
+        } else if z - start > PLANE_TOLERANCE {
             cluster += 1;
+            start = *z;
         }
         cluster_of.insert(*id, cluster);
+    }
+    // A plane's depth is the area-weighted height of its faces, so that it
+    // does not depend on the order of the surface ids.
+    let mut weighted: std::collections::HashMap<usize, (f64, f64)> = Default::default();
+    for (id, face) in &faces {
+        if let Some(&cluster) = cluster_of.get(id) {
+            let w = weighted.entry(cluster).or_default();
+            w.0 += f64::from(face.z) * f64::from(face.area);
+            w.1 += f64::from(face.area);
+        }
     }
     let mut planes: std::collections::BTreeMap<usize, PlaneReport> = Default::default();
     for (id, face) in &faces {
         let Some(&cluster) = cluster_of.get(id) else {
             continue;
         };
-        let plane = planes.entry(cluster).or_insert(PlaneReport {
-            surfaces: vec![],
-            kind: "floor",
-            depth_below_top: model.max[2] - face.z,
-            area: 0.,
-            bbox: face.bbox,
-            max_cutter_diameter: None,
-            holes: vec![],
+        let plane = planes.entry(cluster).or_insert_with(|| {
+            let (sum, area) = weighted[&cluster];
+            PlaneReport {
+                surfaces: vec![],
+                kind: "floor",
+                depth_below_top: model.max[2] - (sum / area.max(f64::MIN_POSITIVE)) as f32,
+                area: 0.,
+                bbox: face.bbox,
+                max_cutter_diameter: None,
+                holes: vec![],
+            }
         });
         plane.surfaces.push(*id);
         plane.area += face.area;
@@ -1614,6 +1632,37 @@ pub(crate) mod tests {
             assert_eq!(top.planes[0].surfaces.len(), 2);
             assert_eq!(top.planes[0].area, 2400.);
         }
+    }
+    /// Three 40 × 30 mm blocks, 10, 10.008 and 10.016 mm high, side by side in
+    /// the order `order` gives (an index into those three heights).
+    fn blocks_in_steps_of_8_microns(order: [usize; 3]) -> Mesh {
+        let mut t = vec![];
+        for (slot, n) in order.into_iter().enumerate() {
+            let x = slot as f32 * 50.;
+            t.extend(cuboid([x, 0., 0.], [x + 40., 30., 10. + n as f32 * 0.008]));
+        }
+        crate::mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn a_chain_of_faces_each_under_the_tolerance_apart_does_not_merge_across_the_tolerance() {
+        let (doc, _) = block();
+        let mut seen = vec![];
+        // The same three tops in every order of surface ids.
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [0, 2, 1]] {
+            let report = report(&doc, &blocks_in_steps_of_8_microns(order)).unwrap();
+            let top = &report.orientations[0];
+            assert_eq!(top.up, "+Z");
+            // 10 and 10.008 are within 0.01 mm of each other, 10.016 is not.
+            assert_eq!(top.planes.len(), 2, "{order:?}: {:?}", top.planes);
+            let high = top.planes.iter().find(|p| p.kind == "top").unwrap();
+            let low = top.planes.iter().find(|p| p.kind == "floor").unwrap();
+            assert_eq!(high.surfaces.len(), 1, "{order:?}");
+            assert_eq!(high.depth_below_top, 0.);
+            assert_eq!(low.surfaces.len(), 2, "{order:?}");
+            assert_eq!(low.depth_below_top, 0.01, "{order:?}");
+            seen.push((high.area, low.area));
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
     }
     #[test]
     fn setup_one_must_be_square_and_keeps_its_own_rotation() {

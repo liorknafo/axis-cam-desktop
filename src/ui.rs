@@ -2086,7 +2086,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                             "Hole diameter filter · mm (0 = all)",
                         ));
                         if let Some(mesh) = &app.imported_mesh {
-                            match crate::cam::holes(app.doc.setup(), o, mesh) {
+                            match &*app.drill_holes(o, mesh) {
                                 Ok(holes) => {
                                     for h in holes.iter().take(24) {
                                         c = c.push(muted(format!(
@@ -2099,7 +2099,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                         )));
                                     }
                                 }
-                                Err(error) => c = c.push(note(error)),
+                                Err(error) => c = c.push(note(error.clone())),
                             }
                         }
                     }

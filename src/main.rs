@@ -439,6 +439,13 @@ const HOLDING_KEYS: [&str; 7] = [
     "clamps",
     "holding_gap",
 ];
+/// What `cam::holes` answers for the Drill editor's list.
+pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has run `cam::holes` for the Drill editor.
+    pub(crate) static DRILL_HOLE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// A writer that feeds what is written to a hasher.
 struct HashWriter<'a>(&'a mut std::hash::DefaultHasher);
 impl std::io::Write for HashWriter<'_> {
@@ -683,6 +690,9 @@ pub struct App {
     /// The workholding warning of the preview shown (`ui::holding_warning`)
     /// and what it was worked out from.
     holding_note: std::cell::RefCell<Option<(String, HoldingNote)>>,
+    /// The Drill editor's hole list and what it was worked out from
+    /// (`App::drill_holes`).
+    drill_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<DrillHoles>)>>,
     /// The browser's pictures of stock, each drawn once for what it shows
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
@@ -1129,6 +1139,7 @@ impl App {
             ready: run::Ready::default(),
             ready_job: None,
             holding_note: std::cell::RefCell::new(None),
+            drill_holes: std::cell::RefCell::new(None),
             stock_pictures: Default::default(),
             post_epoch: 0,
             settings,
@@ -1910,6 +1921,39 @@ impl App {
             },
             move |job| Message::PostChecked(epoch, std::sync::Arc::new(job)),
         )
+    }
+    /// The holes the Drill operation `op` finds on `mesh` in the current
+    /// setup. `cam::holes` passes over every triangle per opening, and the
+    /// editor asks on every redraw, so the answer is kept until the part, the
+    /// setup's placement or the selected surfaces change.
+    pub(crate) fn drill_holes(
+        &self,
+        op: &Operation,
+        mesh: &mesh::Mesh,
+    ) -> std::sync::Arc<DrillHoles> {
+        use std::hash::{Hash, Hasher};
+        let setup = self.doc.setup();
+        let mut hasher = std::hash::DefaultHasher::new();
+        mesh.fingerprint.hash(&mut hasher);
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+            get(&setup.p, key).hash(&mut hasher);
+        }
+        op.surfaces
+            .as_ref()
+            .map(|s| (&s.mesh_fingerprint, &s.ids))
+            .hash(&mut hasher);
+        let key = hasher.finish();
+        let mut kept = self.drill_holes.borrow_mut();
+        if let Some((k, found)) = kept.as_ref()
+            && *k == key
+        {
+            return found.clone();
+        }
+        #[cfg(test)]
+        DRILL_HOLE_RUNS.with(|n| n.set(n.get() + 1));
+        let found = std::sync::Arc::new(cam::holes(setup, op, mesh));
+        *kept = Some((key, found.clone()));
+        found
     }
     /// The fingerprint of the job as the stock the earlier setups leave is
     /// concerned (`left_fingerprint`). None when there is nothing to work out:
