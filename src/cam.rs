@@ -381,6 +381,10 @@ pub struct Hole {
 /// Noncircular openings and boss outlines are rejected, never converted to drills.
 pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, String> {
     let g = Geometry::new(setup, mesh);
+    // The Drill geometry list and the part report ask without `simulation::generate`'s check.
+    if crate::simulation::exceeds_coordinate_limit(&g.bounds) {
+        return Err(crate::simulation::COORDINATE_LIMIT_MESSAGE.into());
+    }
     let selected = g.selected(op);
     let top = selected
         .first()
