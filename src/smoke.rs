@@ -2129,6 +2129,124 @@ flood = { pin = 8 }
         assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
     }
 
+    /// The driver refuses a job sent while it is not idle for it: for a few
+    /// milliseconds after a work or machine zero it re-anchors its position,
+    /// while the app's snapshot still says Idle. Such a Cycle Start ran
+    /// nothing, so it does not count as the setup's first tool run: the
+    /// work-zero steps stay and the X/Y work zero is not held yet (#168).
+    #[test]
+    fn a_cycle_start_the_driver_refuses_has_not_started() {
+        use crate::run::Action as R;
+        use crate::ui::work_zero_steps;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        assert!(!run_of(&a).started());
+        assert!(work_zero_steps(&a, conn(&a)).is_some());
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        // The machine starts a slow move; the app, with no tick since, still
+        // sees it Idle and sends the job, which the driver refuses.
+        conn(&a).send(Command::Mdi("G1 X5 F600".into()));
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_some());
+        run_until(&mut a, 5.0, "the refusal", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("not started, the machine is not idle"),
+            "{message}"
+        );
+        assert!(!run_of(&a).done[0] && run_of(&a).next == 0);
+        // Nothing ran: the setup has not started, and the steps stay.
+        assert!(!run_of(&a).started());
+        assert!(work_zero_steps(&a, conn(&a)).is_some());
+        let _ = a.view();
+        tick_until(&mut a, 5.0, "Idle after the move", |s| {
+            s.state == Some(State::Idle) && (s.work_pos[0] - 5.).abs() < 1e-3
+        });
+        // The X/Y work zero may still be moved: no tool run was cut from it.
+        conn(&a).send(Command::SetWork { axis: 0, value: 0. });
+        tick_until(&mut a, 2.0, "X zeroed here", |s| s.work_pos[0].abs() < 1e-6);
+        tick_for(&mut a, 100);
+        assert!(!has(&a, "X/Y work zero changed"), "{:?}", problems(&a));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // A Cycle Start the driver takes starts the setup: the steps go. A
+        // Stop ends the tool run not ok too, but it did cut, so the work
+        // zero stays held.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        assert!(run_of(&a).started());
+        assert!(work_zero_steps(&a, conn(&a)).is_none());
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok && !message.contains("not started"), "{message}");
+        assert!(run_of(&a).started());
+        assert!(work_zero_steps(&a, conn(&a)).is_none());
+    }
+
+    /// The Run panel's check simulates the whole job up to the setup, minutes
+    /// on a big part, and would starve the driver of the processor while it
+    /// feeds the machine (#167): it waits for the machine to stop.
+    #[test]
+    fn the_setup_check_waits_until_the_machine_stops() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        check_run(&mut a, 0);
+        assert!(run_of(&a).checked().is_some());
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        // A held jog: Check again marks the check wanted and starts none.
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        tick_until(&mut a, 2.0, "the jog", |s| s.state == Some(State::Jog));
+        assert!(a.locked());
+        let epoch = run_of(&a).epoch;
+        let task = a.update(Message::Run(R::Check));
+        assert!(
+            iced_runtime::task::into_stream(task).is_none(),
+            "a check started while jogging"
+        );
+        assert!(run_of(&a).stale && run_of(&a).checked().is_some());
+        assert_eq!(run_of(&a).epoch, epoch);
+        // Nor does the tick start one, however long the jog is held.
+        tick_for(&mut a, 300);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Jog));
+        assert!(run_of(&a).stale && run_of(&a).checked().is_some());
+        assert_eq!(run_of(&a).epoch, epoch);
+        // Picking the setup again while jogging: the panel says the check waits.
+        let task = a.update(Message::Run(R::Setup(0)));
+        assert!(
+            iced_runtime::task::into_stream(task).is_none(),
+            "a check started while jogging"
+        );
+        assert!(run_of(&a).stale && run_of(&a).programs.is_none());
+        assert_eq!(problems(&a), vec![crate::run::CHECK_WAITS.to_string()]);
+        let _ = a.view();
+        // Released, the tick that finds the machine Idle checks it.
+        let held = run_of(&a).epoch;
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle after the release", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert!(!a.locked());
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert_ne!(run_of(&a).epoch, held);
+        assert!(!run_of(&a).stale && run_of(&a).programs.is_none());
+        assert_eq!(problems(&a), vec!["Checking the setup…".to_string()]);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(2));
+    }
+
     /// The setup's work zero moved in the project between tool runs (its
     /// origin picked anew, or the stock moved under the same origin), but the
     /// machine's work offset was touched off for the old one: a later tool
@@ -3268,7 +3386,7 @@ flood = { pin = 8 }
         // own sentence (add them to the profile), at any position.
         let none = config(UNLIMITED);
         assert!(!none.soft_limits_configured());
-        let (heading, lines) = limits_off_warning(false, &[], false).unwrap();
+        let (heading, lines) = limits_off_warning(&[0, 1, 2], &[], false).unwrap();
         assert_eq!(heading, "Soft limits are OFF");
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
@@ -3279,21 +3397,79 @@ flood = { pin = 8 }
         // Configured but not referenced: the same heading, other sentences.
         let limited = config(LIMITED);
         assert!(limited.soft_limits_configured());
-        let (h, lines) = limits_off_warning(true, &[0, 1, 2], false).unwrap();
+        let (h, lines) = limits_off_warning(&[], &[0, 1, 2], false).unwrap();
         assert_eq!(h, heading);
         assert!(
             lines[0].starts_with("X, Y and Z have no machine position"),
             "{lines:?}"
         );
         assert_eq!(lines[1], "Set machine zero below to turn them on.");
-        let (_, lines) = limits_off_warning(true, &[2], true).unwrap();
+        let (_, lines) = limits_off_warning(&[], &[2], true).unwrap();
         assert!(
             lines[0].starts_with("Z has no machine position"),
             "{lines:?}"
         );
         assert_eq!(lines[1], "Home below to turn them on.");
         // Configured and referenced: no warning.
-        assert!(limits_off_warning(true, &[], true).is_none());
+        assert!(limits_off_warning(&[], &[], true).is_none());
+        // Soft limits on X and Y only (#164): the driver counts the profile
+        // as limited, the page does not, since Z runs into its ends, and the
+        // box names the axis without them and says to add them.
+        let partial = LIMITED.replace("soft_min = -55.0\nsoft_max = 0.0\n", "");
+        let some = config(&partial);
+        assert!(
+            some.soft_limits_configured(),
+            "the driver's any-axis meaning"
+        );
+        assert!(MachineView::envelope(&some).1, "the assumed travel");
+        let other = tempfile::tempdir().unwrap();
+        let mut a = profile_app(other.path(), &partial);
+        idle(&mut a);
+        assert!(!conn(&a).soft_limits_configured());
+        assert_eq!(conn(&a).unlimited_axes(), vec![2]);
+        let (h, lines) = limits_off_warning(&conn(&a).unlimited_axes(), &[], false).unwrap();
+        assert_eq!(h, heading);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "Z has no soft limits in this profile, so nothing stops it at the end of its travel."
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            "Add soft_min and soft_max for Z to the profile to turn them on."
+        );
+        // With X and Y waiting for a position too, both are said; Z is not
+        // waiting for one.
+        let (_, lines) = limits_off_warning(&[2], &[0, 1, 2], false).unwrap();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines[2].starts_with("X and Y have no machine position"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[3], "Set machine zero below to turn them on.");
+        let (_, lines) = limits_off_warning(&[1, 2], &[], false).unwrap();
+        assert!(
+            lines[0].starts_with(
+                "Y and Z have no soft limits in this profile, so nothing stops them at the end of their travel."
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            "Add soft_min and soft_max for Y and Z to the profile to turn them on."
+        );
+        // The page's green line needs all three: machine zero on X and Y
+        // alone leaves the amber box.
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "X and Y set", |s| {
+            s.referenced[0] && s.referenced[1]
+        });
+        assert!(conn(&a).unset_limited_axes().is_empty());
+        assert!(!conn(&a).soft_limits_configured());
+        a.page = Page::Control;
+        let _ = a.view();
         // The drawing: the profile without limits gets the assumed box, said
         // so whether or not the position is set; never "where the tool tip
         // can travel".

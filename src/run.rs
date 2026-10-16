@@ -46,7 +46,28 @@ pub struct Running {
     seq: u64,
     /// The work offset it was lowered with.
     pub offset: [f64; 6],
+    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
+    /// back when the driver refuses the job: nothing ran then (#168).
+    before: Before,
 }
+
+/// The run's record of its tool runs before a Cycle Start.
+#[derive(Clone)]
+struct Before {
+    xy: Option<(usize, [f64; 2])>,
+    zero: Option<(String, [f32; 3])>,
+    last: Option<(String, f64)>,
+    touched: bool,
+}
+
+/// The driver's outcome of a job it refused before anything moved: "<name>:
+/// not started, <why>" (the machine not idle, Override limits on, a move
+/// outside the soft limits).
+pub const NOT_STARTED: &str = "not started";
+
+/// What the Run panel says of a setup whose check waits (`stale` and not
+/// checked): for the machine to stop (#167), or for the edits to pause.
+pub const CHECK_WAITS: &str = "The setup is checked once the machine stops and the edits pause.";
 
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
@@ -145,7 +166,11 @@ impl Run {
         (self.running.is_none() && *tool != p.ops[0].tool_id).then_some(p)
     }
 
-    /// Notes how the running tool run ended, once the driver reports it.
+    /// Notes how the running tool run ended, once the driver reports it. A
+    /// job the driver refused ("not started": sent while it re-anchored its
+    /// position after a work zero, say) never ran, so the start is undone:
+    /// the work zero is not kept from it, and the first tool run's work-zero
+    /// steps stay (#168).
     pub fn refresh(&mut self, outcome: Option<&uc100::controller::ProgramOutcome>) {
         let (Some(r), Some(o)) = (&self.running, outcome) else {
             return;
@@ -156,6 +181,14 @@ impl Run {
         if o.ok {
             self.done[r.index] = true;
             self.next = r.index + 1;
+        } else if o.message.contains(NOT_STARTED) {
+            let Before {
+                xy,
+                zero,
+                last,
+                touched,
+            } = r.before.clone();
+            (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
         }
         self.outcome = Some((o.ok, o.message.clone()));
         self.running = None;
@@ -167,6 +200,7 @@ impl Run {
             return vec![REMOVED.into()];
         };
         let programs = match self.programs.as_deref() {
+            None if self.stale => return vec![CHECK_WAITS.into()],
             None => return vec!["Checking the setup…".into()],
             Some(Err(problems)) => return problems.clone(),
             Some(Ok(programs)) => programs,
@@ -357,6 +391,12 @@ impl Run {
             index: self.next,
             seq: s.program_outcome.as_ref().map_or(0, |o| o.seq),
             offset: s.work_offset,
+            before: Before {
+                xy: self.xy,
+                zero: self.zero.clone(),
+                last: self.last.clone(),
+                touched: self.touched,
+            },
         });
         self.xy
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
@@ -788,6 +828,12 @@ mod tests {
                 index: 0,
                 seq: 0,
                 offset: [0.; 6],
+                before: Before {
+                    xy: None,
+                    zero: None,
+                    last: None,
+                    touched: false,
+                },
             }),
             xy: None,
             zero: None,

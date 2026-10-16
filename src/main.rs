@@ -1534,7 +1534,8 @@ impl App {
     }
     /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
-    /// out in the background, so that none competes with the driver for the
+    /// out in the background, the Run panel's check of its setup included
+    /// (`check_waits`, #167), so that none competes with the driver for the
     /// processor while it feeds the machine its motion.
     pub fn locked(&self) -> bool {
         use uc100::controller::State;
@@ -1856,8 +1857,24 @@ impl App {
             move |programs| Message::RunChecked(epoch, std::sync::Arc::new(programs)),
         )
     }
+    /// While the machine moves (`locked`), the setup being run is only marked
+    /// to be checked: the Tick checks it once the machine stops, so that the
+    /// simulation of the job never competes with the driver feeding it
+    /// (#167). Whether the check waits.
+    fn check_waits(&mut self) -> bool {
+        if !self.locked() {
+            return false;
+        }
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            r.stale = true;
+        }
+        true
+    }
     /// Checks the setup being run again, keeping its progress.
     fn recheck_run(&mut self) -> Task<Message> {
+        if self.check_waits() {
+            return Task::none();
+        }
         self.run_epoch += 1;
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
             (r.epoch, r.programs, r.stale) = (self.run_epoch, None, false);
@@ -3190,6 +3207,9 @@ impl App {
                     self.dirty = true;
                     self.last_edit = Instant::now();
                 }
+                if self.check_waits() {
+                    return Task::none();
+                }
                 return self.check_run();
             }
             Message::RunOnMachine(si) => {
@@ -3907,10 +3927,12 @@ impl App {
                     Task::none()
                 };
                 // The Run panel's checks follow the project: a setup changed
-                // since it was checked is checked again once the edits pause.
+                // since it was checked is checked again once the edits pause,
+                // and the machine stands still (#167).
                 let stale = self.control.as_ref().and_then(|c| c.run.as_ref());
                 let recheck = if paused
                     && self.page == Page::Control
+                    && !self.locked()
                     && stale.is_some_and(|r| r.stale && r.running.is_none())
                 {
                     self.recheck_run()
