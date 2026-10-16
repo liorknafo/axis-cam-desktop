@@ -16,6 +16,14 @@ const OFFSET: f32 = 0.5;
 /// The longest side a sampled piece of a face has (mm): longer faces are
 /// sampled in pieces.
 const PIECE: f32 = 5.;
+/// The longest edge a triangle has when it is sampled (mm): `PIECE` times the
+/// 8 pieces a side is cut in at most. Longer edges are split first.
+const SPLIT: f32 = 8. * PIECE;
+/// How often a face is halved at most. That bounds a face to 2⁶ triangles of
+/// 64 samples, 4096 samples, and the background run to that many per face of
+/// the mesh; a triangle needing more splits (over about 300 mm across) is
+/// sampled in coarser pieces.
+const SPLITS: u32 = 6;
 /// The buckets of cuts along each axis of the stock.
 const BUCKETS: usize = 24;
 /// The sides of the part's box, in setup 1's axes, negative side first.
@@ -96,30 +104,35 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         let n = n.map(|x| x / twice);
         // ponytail: trusts the mesh's winding for which side is outside; a
         // face wound inwards samples the part and reads as under stock.
-        let longest = [u, v, sub(c, b)]
-            .map(|e| e.iter().map(|x| x * x).sum::<f32>().sqrt())
-            .into_iter()
-            .fold(0., f32::max);
-        let k = (longest / PIECE).ceil().clamp(1., 8.) as usize;
-        let (mut samples, mut under) = (0, 0);
-        // The centres of the k² pieces of the face: k(k+1)/2 with a corner
-        // at the face's first corner, and the k(k-1)/2 turned the other way.
-        for i in 0..k {
-            for j in 0..k - i {
-                for (shift, piece) in [(1. / 3., true), (2. / 3., i + j + 1 < k)] {
-                    if !piece {
-                        continue;
+        // The face in triangles with no edge over `SPLIT`, each sampled in
+        // pieces of at most `PIECE`; their shares weigh by area.
+        let mut parts = vec![];
+        split([a, b, c], 0, &mut parts);
+        let mut share = 0.;
+        for [a, b, c] in parts {
+            let (u, v) = (sub(b, a), sub(c, a));
+            let k = (longest(a, b, c) / PIECE).ceil().clamp(1., 8.) as usize;
+            let (mut samples, mut under) = (0, 0);
+            // The centres of the k² pieces of the part: k(k+1)/2 with a corner
+            // at its first corner, and the k(k-1)/2 turned the other way.
+            for i in 0..k {
+                for j in 0..k - i {
+                    for (shift, piece) in [(1. / 3., true), (2. / 3., i + j + 1 < k)] {
+                        if !piece {
+                            continue;
+                        }
+                        let (s, t) = ((i as f32 + shift) / k as f32, (j as f32 + shift) / k as f32);
+                        let p: [f32; 3] =
+                            std::array::from_fn(|q| a[q] + s * u[q] + t * v[q] + n[q] * OFFSET);
+                        samples += 1;
+                        under += usize::from(cuts.left(moved(p, first, stock.frame)));
                     }
-                    let (s, t) = ((i as f32 + shift) / k as f32, (j as f32 + shift) / k as f32);
-                    let p: [f32; 3] =
-                        std::array::from_fn(|q| a[q] + s * u[q] + t * v[q] + n[q] * OFFSET);
-                    samples += 1;
-                    under += usize::from(cuts.left(moved(p, first, stock.frame)));
                 }
             }
+            share += cross(u, v) / 2. * under as f32 / samples as f32;
         }
         let area = twice / 2.;
-        let share = under as f32 / samples as f32;
+        share /= area;
         total += area;
         covered += area * share;
         if share >= 0.5 {
@@ -219,6 +232,38 @@ fn moved(p: [f32; 3], from: Frame, to: Frame) -> [f32; 3] {
 }
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|k| a[k] - b[k])
+}
+/// The length of the cross product of `u` and `v`: twice the triangle's area.
+fn cross(u: [f32; 3], v: [f32; 3]) -> f32 {
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    n.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+fn longest(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    [sub(b, a), sub(c, b), sub(a, c)]
+        .map(|e| e.iter().map(|x| x * x).sum::<f32>().sqrt())
+        .into_iter()
+        .fold(0., f32::max)
+}
+/// `tri` as triangles with no edge over `SPLIT`, halved across the longest
+/// edge (the winding kept) up to `SPLITS` times.
+fn split(tri: [[f32; 3]; 3], depth: u32, out: &mut Vec<[[f32; 3]; 3]>) {
+    let edge = |e: usize| {
+        let d = sub(tri[(e + 1) % 3], tri[e]);
+        d.iter().map(|x| x * x).sum::<f32>()
+    };
+    let e = (0..3).fold(0, |best, e| if edge(e) > edge(best) { e } else { best });
+    if depth == SPLITS || edge(e) <= SPLIT * SPLIT {
+        out.push(tri);
+        return;
+    }
+    let (p, q, r) = (tri[e], tri[(e + 1) % 3], tri[(e + 2) % 3]);
+    let m = std::array::from_fn(|k| (p[k] + q[k]) / 2.);
+    split([p, m, r], depth + 1, out);
+    split([m, q, r], depth + 1, out);
 }
 /// The cuts that made a stock, bucketed by where they can have removed
 /// material, so a point is tested against the few that reach it.
@@ -358,6 +403,71 @@ mod tests {
             .iter()
             .filter(|r| r.from == ["the bottom", "the top"]);
         assert_eq!(through.count(), 4, "{:?}", both.regions);
+    }
+    #[test]
+    fn a_narrow_uncut_strip_in_a_large_flat_face_is_found() {
+        // One 120 × 120 mm face (two triangles with edges up to 170 mm), the
+        // size the mesher leaves a large planar face in, under a block cut
+        // everywhere but a 4 mm strip along X at Y -48…-44: sampled in 15 mm
+        // pieces its samples fall either side of the strip.
+        let mesh = crate::mesh::normalize(vec![
+            [[0., 0., 0.], [120., 0., 0.], [120., 120., 0.]],
+            [[0., 0., 0.], [120., 120., 0.], [0., 120., 0.]],
+        ])
+        .unwrap();
+        let setup = crate::model::Setup::new(crate::model::Machine::new(3), "G54");
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        let bounds = crate::mesh::Bounds {
+            min: [-60., -60., 0.],
+            max: [60., 60., 10.],
+        };
+        let mut stock = crate::volume::Volume::new(bounds, frame);
+        let cut = |y: f32, radius: f32| crate::stock_surface::Cut {
+            a: [-70., y, 0.],
+            b: [70., y, 0.],
+            radius,
+            flute: 10.,
+            shape: crate::simulation::CutterShape::Flat,
+            frame,
+            source: (0, 0),
+        };
+        // Y -68…-48 and -44…64.
+        std::sync::Arc::make_mut(&mut stock.cuts).extend([cut(-58., 10.), cut(10., 54.)]);
+        let uncut = super::uncut(&stock, &setup, &mesh);
+        // The strip is 4 of the face's 120 mm.
+        assert!(
+            uncut.share > 0.01 && uncut.share < 0.1,
+            "the strip is not found: {}",
+            uncut.share
+        );
+        // Without the cut over the strip's side the whole face is under stock.
+        std::sync::Arc::make_mut(&mut stock.cuts).truncate(1);
+        let uncut = super::uncut(&stock, &setup, &mesh);
+        assert!(uncut.share > 0.8, "{}", uncut.share);
+        assert!(uncut.faces.iter().all(|f| *f));
+    }
+    #[test]
+    fn a_face_is_split_into_at_most_the_samples_a_run_can_afford() {
+        let mut out = vec![];
+        super::split(
+            [[0., 0., 0.], [120., 0., 0.], [120., 120., 0.]],
+            0,
+            &mut out,
+        );
+        assert!(out.len() > 1 && out.len() <= 1 << super::SPLITS);
+        for [a, b, c] in &out {
+            assert!(super::longest(*a, *b, *c) <= super::SPLIT + 0.01);
+        }
+        let area = |t: &[[f32; 3]; 3]| super::cross(super::sub(t[1], t[0]), super::sub(t[2], t[0]));
+        assert!((out.iter().map(area).sum::<f32>() - 120. * 120.).abs() < 0.1);
+        // A face far larger than 40 mm × 2⁶ stops at the bound.
+        let mut huge = vec![];
+        super::split(
+            [[0., 0., 0.], [5000., 0., 0.], [0., 5000., 0.]],
+            0,
+            &mut huge,
+        );
+        assert_eq!(huge.len(), 1 << super::SPLITS);
     }
     #[test]
     fn completeness_is_not_checked_without_a_cut_or_after_a_failure() {

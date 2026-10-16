@@ -312,6 +312,10 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
     - The bottom is no longer under stock, and less of the surface is (72.1%).
     - The sides still are.
     - The four through holes are regions of their own, each reached from the bottom and the top.
+- `a_narrow_uncut_strip_in_a_large_flat_face_is_found` (issue #201): a 120 × 120 mm face (two triangles with edges up to 170 mm) over stock cut everywhere but a 4 mm strip.
+  - The share under stock is between 1% and 10% (the strip is 3.3%). Sampled in 15 mm pieces, as a triangle over 40 mm used to be, no sample fell in the strip and the share was 0.
+  - With the cut over the strip's side left out, every face is under stock.
+- `a_face_is_split_into_at_most_the_samples_a_run_can_afford` (issue #201): a 120 mm right triangle is halved into triangles with no edge over 40 mm that add up to its area, in at most 2⁶ of them; a triangle 5 m across stops at 2⁶, which bounds a face to 4096 samples.
 - `completeness_is_not_checked_without_a_cut_or_after_a_failure`:
   - A job without an operation says "No operation has cut the stock yet."
   - A job whose operation has lost its tool names that operation.
