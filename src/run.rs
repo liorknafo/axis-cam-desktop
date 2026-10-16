@@ -660,7 +660,7 @@ pub fn lower(p: &Checked, offset: [f64; 6], start: [f64; 6]) -> Vec<Located> {
                     coolant = o.coolant;
                 }
             }
-            Block::Wait { seconds } => actions.push(Do::Dwell {
+            Block::Wait { seconds } | Block::Standstill { seconds } => actions.push(Do::Dwell {
                 seconds: *seconds as f64,
             }),
             Block::Approach { xy, .. } => {
@@ -707,8 +707,8 @@ pub fn busy(state: Option<&State>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::post::{blocks, fixture};
-    use crate::simulation::Motion;
+    use crate::post::{OpState, blocks, fixture};
+    use crate::simulation::{Motion, Plan};
 
     fn settings() -> PostSettings {
         PostSettings {
@@ -717,6 +717,24 @@ mod tests {
             blend: 0.,
             dwell: 2.,
             air: None,
+        }
+    }
+
+    /// One tool run of `ops` and their `plans`, checked.
+    fn checked(ops: Vec<OpState>, plans: &[&Plan]) -> Checked {
+        let blocks = blocks(&ops, plans, &settings());
+        Checked {
+            blocks,
+            indexes: (0..ops.len()).collect(),
+            ops,
+            stock: plans[0].stock,
+            datum: [0., 0., 10.],
+            settings: settings(),
+            offset: "G54".into(),
+            origin: "Stock top center".into(),
+            part: Some((1, 1, 1)),
+            located: None,
+            probe: Ok([crate::post::At::Mid; 2]),
         }
     }
 
@@ -731,21 +749,70 @@ mod tests {
                 (Motion::Rapid, [10., 0., 15.], 6000.),
             ],
         );
-        let ops = vec![fixture::facing_op()];
-        let blocks = blocks(&ops, &[&plan], &settings());
-        Checked {
-            blocks,
-            ops,
-            indexes: vec![0],
-            stock: plan.stock,
-            datum: [0., 0., 10.],
-            settings: settings(),
-            offset: "G54".into(),
-            origin: "Stock top center".into(),
-            part: Some((1, 1, 1)),
-            located: None,
-            probe: Ok([crate::post::At::Mid; 2]),
-        }
+        checked(vec![fixture::facing_op()], &[&plan])
+    }
+
+    #[test]
+    fn a_spindle_reversal_lowers_to_off_a_dwell_and_the_reversed_start() {
+        // Two facing passes of one tool, the second turning the spindle the
+        // other way: between them the coolant and the spindle go off, the
+        // spindle gets the start dwell to stand still, then it starts the
+        // other way with the coolant and the start dwell follows (#160).
+        let pass = |from: [f32; 2], to: [f32; 2]| {
+            fixture::plan(
+                [from[0], from[1], 15.],
+                &[
+                    (Motion::Rapid, [from[0], from[1], 5.], 6000.),
+                    (Motion::Feed, [to[0], to[1], 5.], 600.),
+                    (Motion::Rapid, [to[0], to[1], 15.], 6000.),
+                ],
+            )
+        };
+        let (first, second) = (pass([0., 0.], [10., 0.]), pass([10., 10.], [0., 10.]));
+        let ops = vec![
+            fixture::facing_op(),
+            OpState {
+                name: "Face back".into(),
+                clockwise: false,
+                ..fixture::facing_op()
+            },
+        ];
+        let p = checked(ops, &[&first, &second]);
+        let located = lower(&p, [0.; 6], [0.; 6]);
+        let actions: Vec<Do> = located.iter().map(|l| l.action.clone()).collect();
+        let off = Do::Spindle {
+            state: Spindle::Off,
+            rpm: 0.,
+        };
+        let at = actions.iter().position(|a| *a == off).unwrap();
+        assert_eq!(
+            actions[at - 1..at + 5],
+            [
+                Do::Coolant {
+                    flood: false,
+                    mist: false,
+                },
+                off.clone(),
+                Do::Dwell { seconds: 2. },
+                Do::Spindle {
+                    state: Spindle::Ccw,
+                    rpm: 8000.,
+                },
+                Do::Coolant {
+                    flood: true,
+                    mist: false,
+                },
+                Do::Dwell { seconds: 2. },
+            ],
+            "{actions:?}"
+        );
+        // The run still ends with the spindle off, and the standstill dwell
+        // belongs to its block.
+        assert_eq!(actions.iter().filter(|a| **a == off).count(), 2);
+        assert!(matches!(
+            p.blocks[located[at + 1].line as usize - 1],
+            Block::Standstill { seconds } if seconds == 2.
+        ));
     }
 
     #[test]

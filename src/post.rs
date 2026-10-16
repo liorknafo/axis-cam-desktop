@@ -485,6 +485,12 @@ pub enum Block {
     Wait {
         seconds: f32,
     },
+    /// The same dwell after the M5 of a spindle reversal between two
+    /// operations of one tool: the spindle stands still before it is
+    /// started the other way (#160).
+    Standstill {
+        seconds: f32,
+    },
     /// Rapid in X/Y at the retract height after a tool change.
     Approach {
         op: usize,
@@ -521,7 +527,15 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         if change && !(k == 0 && settings.tool_table && !settings.machine_home) {
             out.extend([Block::Stop, Block::Retract]);
         } else if reverse {
+            // The start dwell is sized for a spin-up from rest, and without
+            // an at-speed pin the controller feeds after it regardless: the
+            // spindle gets the same time to stand still first.
             out.push(Block::Stop);
+            if settings.dwell > 0. {
+                out.push(Block::Standstill {
+                    seconds: settings.dwell,
+                });
+            }
         }
         out.push(Block::Start { op: k, change });
         if change {
@@ -549,9 +563,17 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 z: first[2],
             });
         } else {
-            // Same tool: climb, cross and descend between the two clearance points.
+            // Same tool: climb, cross and descend between the two clearance
+            // points. A crossing over the stock top keeps the blend margin
+            // (`post_check::blend_margin`) over it, since under G64 its
+            // corners can dip below its height; one below the top is left as
+            // it is, for the checks to refuse.
             let from = plans[k - 1].moves.last().unwrap().to;
-            let high = from[2].max(first[2]);
+            let top = plan.stock.max[2];
+            let mut high = from[2].max(first[2]);
+            if high >= top - 0.0005 {
+                high = high.max(top + crate::post_check::blend_margin(settings));
+            }
             let mut at = from;
             for to in [[from[0], from[1], high], [first[0], first[1], high], first] {
                 if to != at {
@@ -775,6 +797,27 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     for name in &h.disabled {
         w.wrapped("Suppressed: ", name);
     }
+    // A reversal between two operations of one tool (`blocks`): whether the
+    // program waits for the spindle to stop before starting it the other way.
+    for (k, op) in ops.iter().enumerate().skip(1) {
+        let before = &ops[k - 1];
+        if before.tool_id == op.tool_id && before.clockwise != op.clockwise {
+            let m = if op.clockwise { "M3" } else { "M4" };
+            w.note(&if settings.dwell > 0. {
+                format!(
+                    "Spindle reversal before operation {}: M5, then G4 P{:.3} for the spindle to stop, then S {m} and the {:.3} s start dwell.",
+                    k + 1,
+                    settings.dwell,
+                    settings.dwell
+                )
+            } else {
+                format!(
+                    "Spindle reversal before operation {}: M5, then S {m} at once; the machine profile's spindle start dwell is 0, so nothing waits for the spindle to stop.",
+                    k + 1
+                )
+            });
+        }
+    }
     let e = extents(blocks);
     w.line(format!(
         "(Extents: X{} to {} Y{} to {} Z{} to {} mm)",
@@ -906,7 +949,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                     coolant = s.coolant;
                 }
             }
-            Block::Wait { seconds } => w.line(format!("G4 P{seconds:.3}")),
+            Block::Wait { seconds } | Block::Standstill { seconds } => {
+                w.line(format!("G4 P{seconds:.3}"))
+            }
             Block::Approach { xy, .. } => {
                 let (x, y) = (work(xy[0], d[0]), work(xy[1], d[1]));
                 w.line(format!("G0 X{x} Y{y}"));
@@ -2663,11 +2708,15 @@ M2
             );
         }
     }
-    #[test]
-    fn a_spindle_reversal_between_operations_of_one_tool_stops_the_spindle_first() {
-        // Two Facing passes with one tool, the second along the back edge.
-        let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
-        let setup = Setup::new(Machine::new(3), "G54");
+    /// Two Facing passes with one tool, the golden one and one along the
+    /// back edge turning the spindle `clockwise`, posted on `machine`: the
+    /// text, its blocks, its operations and the settings.
+    fn back_edge_program(
+        machine: Machine,
+        clockwise: bool,
+    ) -> (String, Vec<Block>, Vec<OpState>, PostSettings) {
+        let settings = PostSettings::from_machine(&machine).unwrap();
+        let setup = Setup::new(machine, "G54");
         let first = golden_plan();
         let second = fixture::plan(
             [15., 15., 25.],
@@ -2678,28 +2727,33 @@ M2
                 (Motion::Rapid, [-15., 15., 25.], 6000.),
             ],
         );
+        let ops = vec![
+            fixture::facing_op(),
+            OpState {
+                name: "Face back".into(),
+                clockwise,
+                ..fixture::facing_op()
+            },
+        ];
+        let blocks = blocks(&ops, &[&first, &second], &settings);
+        let header = Header {
+            job: "Golden",
+            setup: &setup,
+            number: 1,
+            part: None,
+            stock: first.stock,
+            located: None,
+            datum: [0., 0., 10.],
+            holding: None,
+            disabled: vec![],
+        };
+        let text = emit(&header, &ops, &blocks, &settings);
+        (text, blocks, ops, settings)
+    }
+    #[test]
+    fn a_spindle_reversal_between_operations_of_one_tool_stops_the_spindle_first() {
         let program = |clockwise: bool| {
-            let ops = vec![
-                fixture::facing_op(),
-                OpState {
-                    name: "Face back".into(),
-                    clockwise,
-                    ..fixture::facing_op()
-                },
-            ];
-            let blocks = blocks(&ops, &[&first, &second], &settings);
-            let header = Header {
-                job: "Golden",
-                setup: &setup,
-                number: 1,
-                part: None,
-                stock: first.stock,
-                located: None,
-                datum: [0., 0., 10.],
-                holding: None,
-                disabled: vec![],
-            };
-            let text = emit(&header, &ops, &blocks, &settings);
+            let (text, blocks, ops, settings) = back_edge_program(Machine::new(3), clockwise);
             assert_eq!(
                 crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54"),
                 Ok(()),
@@ -2707,12 +2761,19 @@ M2
             );
             text
         };
-        // Turning the other way: the spindle (with the coolant) stops before
-        // it is started with M4, and the start dwell follows.
+        // Turning the other way: the spindle (with the coolant) stops, the
+        // dwell lets it stand still, then it is started with M4 and the
+        // start dwell follows (#62, #160); the header says so.
         let reversed = program(false);
         assert!(
             reversed.contains(
-                "G0 Z15.000\nM9\nM5\n(Operation 2/2: Face back - T1)\nS8000 M4\nM8\nG4 P2.000\nY15.000\n"
+                "G0 Z15.000\nM9\nM5\nG4 P2.000\n(Operation 2/2: Face back - T1)\nS8000 M4\nM8\nG4 P2.000\nY15.000\n"
+            ),
+            "{reversed}"
+        );
+        assert!(
+            reversed.contains(
+                "(Operation 2: Face back - Facing - T1 - S8000)\n(Spindle reversal before operation 2: M5, then G4 P2.000 for the spindle to stop, then S M4 and the 2.000 s start dwell.)\n(Extents: "
             ),
             "{reversed}"
         );
@@ -2723,6 +2784,165 @@ M2
             "{same}"
         );
         assert_eq!(same.matches("\nM5\n").count(), 1, "{same}");
+        assert_eq!(same.matches("\nG4 ").count(), 1, "{same}");
+        assert!(!same.contains("Spindle reversal"), "{same}");
+    }
+    #[test]
+    fn a_spindle_reversal_waits_for_the_spindle_to_stop_before_restarting_it() {
+        // Without a start dwell nothing waits: M5, then S M4 at once, and
+        // the header says so.
+        let mut machine = Machine::new(3);
+        machine.p.insert("post_dwell".into(), "0".into());
+        let (text, blocks, ops, settings) = back_edge_program(machine, false);
+        assert!(
+            text.contains(
+                "G0 Z15.000\nM9\nM5\n(Operation 2/2: Face back - T1)\nS8000 M4\nM8\nY15.000\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "(Spindle reversal before operation 2: M5, then S M4 at once; the machine profile's spindle start dwell is 0, so nothing waits for the spindle to stop.)\n(Extents: "
+            ),
+            "{text}"
+        );
+        assert!(!blocks.iter().any(|b| matches!(b, Block::Standstill { .. })));
+        assert_eq!(
+            crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54"),
+            Ok(())
+        );
+        // With one, the replay insists on the dwell after M5 with the
+        // spindle off: a program without the dwells, or with the standstill
+        // dwell moved after the restart, fails verification.
+        let (text, blocks, ops, settings) = back_edge_program(Machine::new(3), false);
+        assert!(blocks.contains(&Block::Standstill { seconds: 2. }));
+        let check = |t: &str| crate::ngc::verify(t, &blocks, &ops, [0., 0., 10.], &settings, "G54");
+        assert_eq!(check(&text), Ok(()));
+        let without = text
+            .replacen("M5\nG4 P2.000\n(Operation 2/2", "M5\n(Operation 2/2", 1)
+            .replacen("M8\nG4 P2.000\nY15.000", "M8\nY15.000", 1);
+        assert_eq!(without.matches("\nG4 ").count(), 1, "{without}");
+        assert!(
+            check(&without)
+                .unwrap_err()
+                .contains("expected a 2.000 s standstill dwell"),
+            "{without}"
+        );
+        let after = text
+            .replacen("M5\nG4 P2.000\n(Operation 2/2", "M5\n(Operation 2/2", 1)
+            .replacen(
+                "M8\nG4 P2.000\nY15.000",
+                "M8\nG4 P2.000\nG4 P2.000\nY15.000",
+                1,
+            );
+        assert_eq!(after.matches("\nG4 ").count(), 3, "{after}");
+        assert!(
+            check(&after)
+                .unwrap_err()
+                .contains("the standstill dwell runs with the spindle on"),
+            "{after}"
+        );
+    }
+    #[test]
+    fn a_link_between_operations_of_one_tool_keeps_the_blend_margin_over_the_stock_top() {
+        // Two Facing passes of one tool whose clearance points are 0.5 mm
+        // over the stock top (Z10): the link between them crosses there
+        // with no blend and with the default 0.01 mm (a 0.025 mm margin),
+        // and 2.5 mm over the top with G64 P1, where the blend at a corner
+        // can dip 2.41 mm below the crossing height (#161).
+        let plan = |start: [f32; 2], end: [f32; 2]| {
+            fixture::plan(
+                [start[0], start[1], 10.5],
+                &[
+                    (Motion::Feed, [start[0], start[1], 9.], 250.),
+                    (Motion::Feed, [end[0], end[1], 9.], 1000.),
+                    (Motion::Rapid, [end[0], end[1], 10.5], 6000.),
+                ],
+            )
+        };
+        let first = plan([-15., -15.], [15., -15.]);
+        let second = plan([15., 15.], [-15., 15.]);
+        let ops = vec![
+            fixture::facing_op(),
+            OpState {
+                name: "Face back".into(),
+                ..fixture::facing_op()
+            },
+        ];
+        let targets = |blend: &str| -> Vec<[f32; 3]> {
+            let mut machine = Machine::new(3);
+            machine.p.insert("post_blend".into(), blend.into());
+            let settings = PostSettings::from_machine(&machine).unwrap();
+            blocks(&ops, &[&first, &second], &settings)
+                .into_iter()
+                .filter_map(|b| match b {
+                    Block::Move { op: 1, to, .. } => Some(to),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(targets("0")[..2], [[15., 15., 10.5], [15., 15., 9.]]);
+        assert_eq!(targets("0.01")[..2], [[15., 15., 10.5], [15., 15., 9.]]);
+        assert_eq!(
+            targets("1")[..4],
+            [
+                [15., -15., 12.5],
+                [15., 15., 12.5],
+                [15., 15., 10.5],
+                [15., 15., 9.]
+            ]
+        );
+        // The golden pair, 15 mm over the top, links as before with G64 P1.
+        let mut machine = Machine::new(3);
+        machine.p.insert("post_blend".into(), "1".into());
+        let (_, blocks, _, _) = back_edge_program(machine, true);
+        assert_eq!(clearance_plane(&blocks), 25.);
+        assert!(blocks.contains(&Block::Move {
+            op: 1,
+            kind: Kind::Rapid,
+            from: [15., -15., 25.],
+            to: [15., 15., 25.],
+            feed: 0.,
+            seconds: 0.,
+        }));
+    }
+    #[test]
+    fn a_job_half_a_millimetre_over_the_stock_top_is_refused_with_g64_p1() {
+        // The fixture job's Facing, retracting between its rows, with its
+        // retract and clearance 0.5 mm over the stock top: with the default
+        // blend (G64 P0.010, a 0.025 mm margin) it posts; with G64 P1 its
+        // rapids cross 0.5 mm over the top, within the 2.5 mm the blend can
+        // dip, and it is refused naming the first and the margin (#161).
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0]
+            .operations
+            .retain(|o| o.strategy == Strategy::Face);
+        assert_eq!(doc.setups[0].operations.len(), 1);
+        let name = doc.setups[0].operations[0].name().to_string();
+        for (k, v) in [
+            ("retract", "0.5"),
+            ("clearance", "0.5"),
+            ("facing_link", "Retract each pass"),
+        ] {
+            doc.setups[0].operations[0].p.insert(k.into(), v.into());
+        }
+        let posted = post_job(&doc, &mesh);
+        assert!(posted.ready(), "{:?}", errors(&posted));
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_blend".into(), "1".into());
+        let posted = post_job(&doc, &mesh);
+        assert!(!posted.ready());
+        let refused = errors(&posted);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with(&format!("{name}: a rapid moves sideways at "))
+                && refused[0].contains(
+                    "0.500 mm over the stock top: less than 2.5 times the path blending tolerance (G64 P1.000, 2.500 mm)"
+                ),
+            "{refused:?}"
+        );
     }
     #[test]
     fn a_flipped_setup_gets_its_own_program_and_offset() {
@@ -4558,7 +4778,7 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 38] = [
+    const COMMENT_STARTS: [&str; 39] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
         "Job, continued: ",
@@ -4587,6 +4807,7 @@ M2
         "Operation #/#, continued: ",
         "Suppressed: ",
         "Suppressed, continued: ",
+        "Spindle reversal before operation #: ",
         "Extents: ",
         "Not checked: ",
         MACHINE_HOME,
@@ -4722,6 +4943,17 @@ M2
                     }
                 }
             }
+        }
+        // The reversal's note, in the one program that has it.
+        {
+            let (text, blocks, ops, settings) = back_edge_program(Machine::new(3), false);
+            let counts = assert_comments_begin_with_app_words(&text);
+            (0..COMMENT_STARTS.len()).for_each(|k| used[k] += counts[k]);
+            assert_eq!(
+                crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54"),
+                Ok(()),
+                "{text}"
+            );
         }
         // Each kind of comment was written and checked.
         for (k, start) in COMMENT_STARTS.iter().enumerate() {
