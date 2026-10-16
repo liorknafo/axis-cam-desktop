@@ -3454,6 +3454,10 @@ impl App {
             Message::PickMaterial(id) => {
                 // A pick_list repeats the chosen item; that is not a change.
                 if self.doc.material_id != id && self.doc.select_material(&id) {
+                    let said = self.doc.fit_speeds();
+                    if !said.is_empty() {
+                        self.status = said;
+                    }
                     self.touch()
                 }
             }

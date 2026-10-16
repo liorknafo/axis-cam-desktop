@@ -146,7 +146,7 @@ pub fn offered(pictures: bool) -> Vec<Tool> {
     });
     tools.push(Tool {
         name: CUTTING_DATA,
-        description: "The spindle speed and feed a tool can run at in the project's material: the rpm range from the material's surface speed and the machine's maximum, a recommended rpm (the middle of the range, rounded to 10), and at that rpm the feed range from the chip-load band of the tool's diameter and its flutes, clipped to the machine's maximum feed, with a recommended feed and the band used. Feeds are in mm/min.".into(),
+        description: "The spindle speed and feed a tool can run at in the project's material: the rpm range from the material's surface speed and the machine's maximum, a recommended rpm (the middle of the range, but no faster than lets the machine's maximum feed reach the least chip load, and no slower than a quarter of the machine's maximum unless the range is; rounded to 10), and at that rpm the feed range from the chip-load band of the tool's diameter (under 3 mm, scaled down in proportion to the diameter) and its flutes, clipped to the machine's maximum feed, with a recommended feed and the band used. Feeds are in mm/min.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -622,10 +622,6 @@ struct CuttingData {
     feed_mm_per_min: Feed,
     chip_load_band: Band,
 }
-/// `value` rounded to the nearest 10.
-fn tens(value: f64) -> f64 {
-    (value / 10.).round() * 10.
-}
 /// 7960 as "7 960".
 fn grouped(n: u32) -> String {
     let digits = n.to_string();
@@ -684,19 +680,29 @@ fn cutting_data(arguments: &str, report: &PartReport) -> Answer {
         ));
     }
     let bottom = rpm_at(material.vc_min_m_per_min).max(MIN_RPM).min(top);
-    // The middle, rounded to 10 while that stays in the range: a value above
-    // the machine's maximum, or below the least surface speed at a maximum
-    // that cannot reach it, would not pass the check.
-    let rpm = tens((bottom + top) / 2.)
-        .clamp(bottom, top)
+    // The chip load the tool takes: the band's, less under 3 mm, as the
+    // check reads it (`material::chip_load`).
+    let share = material::chip_share(tool.diameter);
+    let (fz_min, fz_max) = (band.min * share, band.max * share);
+    // The speed and feed a material change sets (`material::pick`), whole:
+    // a value above the machine's maximum, or below the least surface speed
+    // at a maximum that cannot reach it, would not pass the check.
+    let max_feed = f64::from(machine.max_feed);
+    let (rpm, feed) = material::pick(
+        (bottom as f32, top as f32),
+        (fz_min, fz_max),
+        tool.flutes as f32,
+        machine.max_rpm,
+        machine.max_feed,
+    );
+    let rpm = f64::from(rpm)
         .round()
-        .min(max_rpm.floor());
+        .clamp(bottom.ceil().min(top.floor()), top.floor());
     // The feed range at that rpm, up to what the machine gives; when even the
     // maximum feed is below the least chip load, it counts as in range.
-    let max_feed = f64::from(machine.max_feed);
-    let feed_top = (f64::from(band.max) * flutes * rpm).min(max_feed);
-    let feed_bottom = (f64::from(band.min) * flutes * rpm).min(feed_top);
-    let feed = tens((feed_bottom + feed_top) / 2.)
+    let feed_top = (f64::from(fz_max) * flutes * rpm).min(max_feed);
+    let feed_bottom = (f64::from(fz_min) * flutes * rpm).min(feed_top);
+    let feed = f64::from(feed)
         .clamp(feed_bottom, feed_top)
         .round()
         .min(max_feed.floor());
@@ -718,8 +724,8 @@ fn cutting_data(arguments: &str, report: &PartReport) -> Answer {
         },
         chip_load_band: Band {
             up_to_mm: band.up_to_mm,
-            min: band.min,
-            max: band.max,
+            min: fz_min,
+            max: fz_max,
         },
     };
     Answer {
@@ -1510,6 +1516,45 @@ mod tests {
         assert_eq!(out["feed_mm_per_min"]["recommended"], 500);
     }
 
+    #[test]
+    fn cutting_data_slows_the_spindle_when_the_feed_is_capped_as_a_material_change_does() {
+        // A router: 24000 rpm, 1000 mm/min. The middle of the surface speed
+        // range would make chips under the least chip load at that feed.
+        let mut s = state_with(|r| {
+            r.machine.max_rpm = 24000.;
+            r.machine.max_feed = 1000.;
+        });
+        let out = json_of(&call("cutting_data", json!({"tool": 3}), &mut s));
+        let (rpm, feed) = (
+            out["rpm"]["recommended"].as_f64().unwrap(),
+            out["feed_mm_per_min"]["recommended"].as_f64().unwrap(),
+        );
+        let middle =
+            (out["rpm"]["min"].as_f64().unwrap() + out["rpm"]["max"].as_f64().unwrap()) / 2.;
+        assert!(rpm < middle - 100., "{out}");
+        assert_eq!(feed, 1000.);
+        // The same speed and feed `material::pick` gives a material change.
+        let tool = s.scene.report.tools.iter().find(|t| t.number == 3).unwrap();
+        let band = &s.scene.report.material.chip_load_mm[crate::material::band(tool.diameter)];
+        let share = crate::material::chip_share(tool.diameter);
+        let rpm_at = |vc: f32| vc * 1000. / (std::f32::consts::PI * tool.diameter);
+        let m = &s.scene.report.material;
+        let top = rpm_at(m.vc_max_m_per_min).min(24000.);
+        let picked = crate::material::pick(
+            (rpm_at(m.vc_min_m_per_min).min(top), top),
+            (band.min * share, band.max * share),
+            tool.flutes as f32,
+            24000.,
+            1000.,
+        );
+        assert_eq!(
+            (rpm, feed),
+            (f64::from(picked.0.round()), f64::from(picked.1.round()))
+        );
+        // And at that speed the chip is the band's least, within the check's
+        // 1 % (the speed is rounded to 10 rpm).
+        assert!(feed / (rpm * f64::from(tool.flutes)) >= f64::from(band.min * share) * 0.99);
+    }
     #[test]
     fn cutting_data_runs_at_the_machines_maximum_when_the_material_wants_more() {
         // 150 m/min on a Ø4 tool needs 11 937 rpm; the machine gives 6 000.

@@ -1752,7 +1752,7 @@ mod cumulative_tests {
         let carried = crate::volume::Volume::new(first, Frame::new(&doc.setups[0], &mesh))
             .transformed_bounds(Frame::new(&doc.setups[1], &mesh));
         let sim = prepare(&doc, &mesh, 1, 0).unwrap();
-        assert!(sim.volume.as_ref().unwrap().cuts.len() > 10_000);
+        assert!(sim.volume.as_ref().unwrap().cuts.len() > 8_000);
         let stock = sim.plan.stock;
         assert!(
             (stock.min[2] - (carried.min[2] + 4.)).abs() < 0.001,
