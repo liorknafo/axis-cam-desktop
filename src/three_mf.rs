@@ -265,7 +265,13 @@ fn read(bytes: &[u8], limit: u64) -> Result<Vec<Tri>, String> {
         if f.is_dir() {
             continue;
         }
-        if entries.insert(package_path("", f.name())?, i).is_some() {
+        // A name that is no valid package path (a percent-encoded thumbnail,
+        // say) cannot be the target of a reference the reader accepts, so the
+        // entry is never read and does not refuse the file.
+        let Ok(name) = package_path("", f.name()) else {
+            continue;
+        };
+        if entries.insert(name, i).is_some() {
             return Err("Duplicate 3MF package entry".into());
         }
     }
@@ -430,6 +436,20 @@ mod tests {
         assert!((t[0][0][0] - 50.8).abs() < 1e-4);
         assert!((t[0][1][0] - 76.2).abs() < 1e-4);
         assert!(load(&archive(&doc(MESH, "", ""), None)).is_err());
+    }
+    // OPC part names are percent-encoded; the geometry reader never reads such a thumbnail.
+    #[test]
+    fn entries_with_names_that_are_no_package_path_are_skipped() {
+        let d = doc(MESH, "<item objectid='1'/>", "");
+        for name in [
+            "Metadata/my%20thumb.png",
+            "Metadata/a:b.png",
+            "Metadata/a?b.png",
+            "Metadata/a#b.png",
+        ] {
+            let t = load(&archive(&d, Some((name, "png")))).unwrap();
+            assert_eq!(t.len(), 1, "{name}");
+        }
     }
     #[test]
     fn nested_rotation_translation_and_mirror() {

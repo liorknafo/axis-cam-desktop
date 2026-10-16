@@ -876,7 +876,11 @@ impl Setup {
 }
 /// A path as JSON: text when it is valid Unicode (which is all an older
 /// project file holds), otherwise its raw bytes (Unix) or UTF-16 units
-/// (Windows), which serde's own `PathBuf` refuses to write.
+/// (Windows), which serde's own `PathBuf` refuses to write. Both array forms
+/// are read on every platform, so a project written on the other OS family
+/// still loads: the foreign form decodes lossily to a path that names no
+/// file, and the model then reports itself unreadable instead of the whole
+/// project being refused.
 mod path_json {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::path::{Path, PathBuf};
@@ -884,9 +888,7 @@ mod path_json {
     #[serde(untagged)]
     enum Repr {
         Text(String),
-        #[cfg(unix)]
         Bytes(Vec<u8>),
-        #[cfg(windows)]
         Wide(Vec<u16>),
     }
     pub fn serialize<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
@@ -912,11 +914,15 @@ mod path_json {
                 use std::os::unix::ffi::OsStringExt;
                 PathBuf::from(std::ffi::OsString::from_vec(bytes))
             }
+            #[cfg(not(unix))]
+            Repr::Bytes(bytes) => PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()),
             #[cfg(windows)]
             Repr::Wide(units) => {
                 use std::os::windows::ffi::OsStringExt;
                 PathBuf::from(std::ffi::OsString::from_wide(&units))
             }
+            #[cfg(not(windows))]
+            Repr::Wide(units) => PathBuf::from(String::from_utf16_lossy(&units)),
         })
     }
 }
