@@ -769,7 +769,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (Target::Setup, "clearance") => (
-            "Requested minimum gap between the fixture and the outside of the cutter or holder, in mm. The illustration shows a side gap measured from the wider holder. This value is only saved with the setup; it does not change operation heights or toolpaths. The check of modelled vise jaws or clamps uses the Clearance gap beside them instead.",
+            "A minimum gap between the fixture and the outside of the cutter or holder that you ask the operator to keep, in mm: the illustration shows a side gap measured from the wider holder. It is a note. It is printed on the setup sheet and in the program header, it changes no operation height or toolpath, and nothing checks it. The checks of a modelled vise or clamps use Checked gap to jaws and clamps under Workholding instead; parallels, bolts, the table and the machine body are never checked.",
             Some(FixtureClearance),
         ),
         (Target::Material, "name") => (
@@ -870,7 +870,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "holding_gap") => (
-            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. The machine profile's path blending tolerance (G64 P) is added to it, since the controller may leave the programmed path by that much at a corner. A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export (every program move, the links between operations, approaches and retracts included).",
+            "The clearance gap the checks keep round the modelled jaws or clamps, in mm: 0 or more; left empty it is 2 mm. The operation preview, the export and the Run checks all use it, with the machine profile's path blending tolerance (G64 P) added, since the controller may leave the programmed path by that much at a corner. A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export and by the Run checks (every program move, the links between operations, approaches and retracts included). It is not the Requested fixture clearance under Setup notes, which nothing checks.",
             None,
         ),
         (Target::Setup, "clamps") => (
@@ -1941,7 +1941,11 @@ pub fn gallery<'a>(kind: u8) -> Element<'a, Message> {
             .collect()
     } else if kind == 1 {
         [
-            ("clearance", "Fixture clearance · mm", Target::Setup),
+            (
+                "clearance",
+                crate::ui::FIXTURE_CLEARANCE_LABEL,
+                Target::Setup,
+            ),
             ("clearance", "Clearance above stock · mm", Target::Operation),
             ("stepover", "Stepover · % tool diameter", Target::Operation),
             ("stepdown", "Maximum stepdown · mm", Target::Operation),
@@ -2186,7 +2190,7 @@ mod tests {
         }
         assert_eq!(
             field_help("holding_gap", "x", Target::Setup).body,
-            "The clearance to keep around the jaws or clamps, in mm. 0 or more; left empty it is 2 mm. The machine profile's path blending tolerance (G64 P) is added to it, since the controller may leave the programmed path by that much at a corner. A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export (every program move, the links between operations, approaches and retracts included)."
+            "The clearance gap the checks keep round the modelled jaws or clamps, in mm: 0 or more; left empty it is 2 mm. The operation preview, the export and the Run checks all use it, with the machine profile's path blending tolerance (G64 P) added, since the controller may leave the programmed path by that much at a corner. A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export and by the Run checks (every program move, the links between operations, approaches and retracts included). It is not the Requested fixture clearance under Setup notes, which nothing checks."
         );
         let blend = field_help("post_blend", "x", Target::Machine).body;
         assert!(
@@ -2226,8 +2230,9 @@ mod tests {
         );
         let clearance = field_help("clearance", "x", Target::Setup).body;
         assert!(
-            clearance.contains("only saved with the setup")
-                && clearance.contains("uses the Clearance gap beside them instead")
+            clearance.contains("nothing checks it")
+                && clearance
+                    .contains("use Checked gap to jaws and clamps under Workholding instead")
                 && !clearance.contains("not connected yet"),
             "{clearance}"
         );
@@ -2444,5 +2449,53 @@ mod tests {
         assert!((travel - travel.round()).abs() < 1e-5, "{travel} travels");
         // Both speeds stay what they were drawn at, within a percent.
         assert!((SPIN - 2.).abs() < 0.02 && (CHIP_SPEED - 10.).abs() < 0.3);
+    }
+    #[test]
+    fn the_holding_steps_gap_fields_say_what_each_does() {
+        use crate::ui::{FIXTURE_CLEARANCE_LABEL, HOLDING_GAP_LABEL, SETUP_NOTES_SECTION};
+        // The checked gap is named for what it does, and its card names
+        // every check that uses it and the blend they add (issue #72).
+        assert_eq!(HOLDING_GAP_LABEL, "Checked gap to jaws and clamps · mm");
+        let gap = field_help("holding_gap", HOLDING_GAP_LABEL, Target::Setup);
+        assert_eq!(gap.title, HOLDING_GAP_LABEL);
+        for part in [
+            "The operation preview, the export and the Run checks all use it",
+            "path blending tolerance (G64 P) added",
+            "refused at export and by the Run checks",
+            "Requested fixture clearance under Setup notes, which nothing checks",
+        ] {
+            assert!(gap.body.contains(part), "{part}: {}", gap.body);
+        }
+        assert!(gap.diagram.is_none());
+        // The requested clearance says in its label that it is not checked,
+        // sits under a heading that says the same, and its card says where
+        // it is printed and which field the checks use instead.
+        assert_eq!(
+            FIXTURE_CLEARANCE_LABEL,
+            "Requested fixture clearance · mm · not checked"
+        );
+        assert_eq!(SETUP_NOTES_SECTION, "Setup notes · recorded, not checked");
+        let requested = field_help("clearance", FIXTURE_CLEARANCE_LABEL, Target::Setup);
+        assert_eq!(requested.title, FIXTURE_CLEARANCE_LABEL);
+        for part in [
+            "It is a note.",
+            "printed on the setup sheet and in the program header",
+            "nothing checks it",
+            "use Checked gap to jaws and clamps under Workholding instead",
+        ] {
+            assert!(requested.body.contains(part), "{part}: {}", requested.body);
+        }
+        assert!(matches!(requested.diagram, Some(Diagram::FixtureClearance)));
+        // Neither card calls a field by its old name.
+        for body in [&gap.body, &requested.body] {
+            assert!(
+                !body.contains("Clearance gap") && !body.contains("Fixture clearance ·"),
+                "{body}"
+            );
+        }
+        // The operation's own clearance keeps its name and its card.
+        let heights = field_help("clearance", "Clearance above stock · mm", Target::Operation);
+        assert_eq!(heights.title, "Clearance above stock · mm");
+        assert!(matches!(heights.diagram, Some(Diagram::Heights)));
     }
 }
