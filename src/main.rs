@@ -1432,10 +1432,11 @@ impl App {
         }
         // What is saved, to the hundredth, is what is checked and reported.
         let layout = holding::layout(&self.doc.setups[si]).unwrap_or(layout);
-        let (holder, gap) = (&request.holder, request.gap);
+        // Clear by the gap and the blend, as export checks and the suggestion kept.
+        let holder = &request.holder;
         let held = holding::gripped(&layout, holder, stock, bands.as_ref());
         let boxes = holding::boxes(&layout, holder, held).unwrap_or_default();
-        let clashing = holding::clashes(&refs, &boxes, gap);
+        let clashing = holding::clashes(&refs, &boxes, request.reach);
         let opening = holding::opening_issue(&layout, holder, held);
         let message = holding::summary(&layout, refs.len(), clashing, failed, opening.as_deref());
         if changed {
