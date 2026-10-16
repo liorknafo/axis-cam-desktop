@@ -2619,7 +2619,14 @@ impl App {
                     return self.update(Message::SelectOp(0));
                 }
             }
-            Message::SetupStep(step) => self.setup_step = step,
+            // A step tab, or the workspace heading's link to the work zero:
+            // the setup editor opens on that step.
+            Message::SetupStep(step) => {
+                if self.selected.is_some() || self.page != Page::Work {
+                    let _ = self.update(Message::SetupEditor);
+                }
+                self.setup_step = step;
+            }
             Message::Tab(t) => {
                 self.picking = t == "Geometry" && self.can_pick();
                 if self.picking {
@@ -3245,6 +3252,8 @@ impl App {
                 }
                 self.run_epoch += 1;
                 c.run = Some(run::Run::new(&self.doc, si, self.run_epoch));
+                // A spot picked to probe from was for the setup before.
+                c.probe_spot = None;
                 // The setup picked to run is the one the 3D views show.
                 if self.doc.setups[si].id != self.doc.active {
                     self.doc.active = self.doc.setups[si].id.clone();

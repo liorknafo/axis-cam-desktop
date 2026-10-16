@@ -1613,17 +1613,25 @@ fn workspace(app: &App) -> Element<'_, Message> {
         row![
             column![
                 bold(s.map(|s| s.name()).unwrap_or("Imported model"), 15),
-                muted(
-                    s.map(|s| format!(
-                        "{} / {} / {}",
-                        get(&s.p, "offset"),
-                        app.doc.holding_label(s),
-                        get(&s.p, "origin")
-                    ))
-                    .unwrap_or_else(|| {
-                        "Create your first machining setup when you are ready.".into()
-                    })
-                )
+                match s {
+                    // The work zero, one click from its step.
+                    Some(s) => Element::from(
+                        row![
+                            muted(format!(
+                                "{} / {} / Work zero:",
+                                get(&s.p, "offset"),
+                                app.doc.holding_label(s),
+                            )),
+                            button(text(format!("{} · Change", get(&s.p, "origin"))).size(12))
+                                .padding([2, 6])
+                                .on_press(Message::SetupStep("Work zero"))
+                                .style(|_, status| flat(false, status)),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center)
+                    ),
+                    None => muted("Create your first machining setup when you are ready.").into(),
+                }
             ]
             .spacing(3),
             space().width(Fill),
@@ -2607,14 +2615,15 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
     c.into()
 }
 /// The setup editor's steps, one tab each, in order.
-pub(crate) const SETUP_STEPS: [&str; 4] = ["Machine", "Stock", "Position", "Holding"];
+pub(crate) const SETUP_STEPS: [&str; 5] = ["Machine", "Stock", "Position", "Holding", "Work zero"];
 /// Whether the active setup's `step` needs nothing more: its tab's ✓, else ○.
 pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
     let s = app.doc.setup();
     match step {
-        "Machine" => {
-            s.machine.issues().is_empty()
-                && !get(&s.p, "offset").is_empty()
+        "Machine" => s.machine.issues().is_empty(),
+        "Work zero" => {
+            !get(&s.p, "offset").is_empty()
+                && crate::post::references(get(&s.p, "origin")).is_some()
                 && !app
                     .current_ready()
                     .and_then(|r| r.zero.as_ref())
@@ -2628,7 +2637,10 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
         "Position" => ["rx", "ry", "rz", "tx", "ty", "tz"]
             .iter()
             .all(|k| num(&s.p, k).is_some()),
-        _ => matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty(),
+        "Holding" => {
+            matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty()
+        }
+        _ => false,
     }
 }
 /// Whether the part reaches outside the setup's fixed stock box.
@@ -2679,6 +2691,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
         "Stock" => setup_stock(app, c),
         "Position" => setup_position(app, c),
         "Holding" => setup_holding(app, c),
+        "Work zero" => setup_zero(app, c),
         _ => setup_machine(app, c),
     };
     // Pinned under the body: the checks and the setup's actions.
@@ -2705,9 +2718,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
 }
 fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let s = app.doc.setup();
-    let p = &s.p;
-    let t = Target::Setup;
-    c.push(section("Machine & coordinate system"))
+    c.push(section("Machine"))
         .push(
             btn(
                 format!(
@@ -2721,18 +2732,97 @@ fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             )
             .width(Fill),
         )
+        .push(muted(
+            "The work zero and its offset (G54–G59) are in the Work zero step.",
+        ))
+}
+/// The setup editor's Work zero step: where the program's X0 Y0 Z0 is, on
+/// the stock's top or bottom at a corner, an edge's middle or the centre
+/// (picked on a grid of the stock seen from above), or Model origin; and the
+/// work offset it is kept in.
+fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    use crate::post::At::{Max, Mid, Min};
+    let s = app.doc.setup();
+    let p = &s.p;
+    let t = Target::Setup;
+    let origin = get(p, "origin");
+    let zero = crate::post::stock_zero(origin);
+    let model = origin == "Model origin";
+    // A spot keeps the face picked, the top for Model origin.
+    let top = zero.is_none_or(|(_, top)| top);
+    let set = |v: String| Some(Message::Edit(t, "origin", v));
+    let spot_name = |refs: [crate::post::At; 2]| {
+        crate::post::SPOTS
+            .iter()
+            .find(|(_, r)| *r == refs)
+            .map_or("center", |(name, _)| name)
+    };
+    let at = |refs, top: bool| {
+        format!(
+            "Stock {} {}",
+            if top { "top" } else { "bottom" },
+            spot_name(refs)
+        )
+    };
+    let xy = zero.map_or([Mid, Mid], |(xy, _)| xy);
+    let faces = row![
+        act_sized(
+            "Stock top",
+            set(at(xy, true)),
+            zero.is_some() && top,
+            Some(Length::FillPortion(1))
+        ),
+        act_sized(
+            "Stock bottom",
+            set(at(xy, false)),
+            zero.is_some() && !top,
+            Some(Length::FillPortion(1))
+        ),
+        act_sized(
+            "Model origin",
+            set("Model origin".into()),
+            model,
+            Some(Length::FillPortion(1))
+        ),
+    ]
+    .spacing(4);
+    let label = |refs: [crate::post::At; 2]| match refs {
+        [Mid, Mid] => "Centre".to_string(),
+        _ => {
+            let s = spot_name(refs);
+            s[..1].to_uppercase() + &s[1..]
+        }
+    };
+    let mut grid = column![].spacing(4);
+    for y in [Max, Mid, Min] {
+        let mut line = row![].spacing(4);
+        for x in [Min, Mid, Max] {
+            let refs = [x, y];
+            line = line.push(act_sized(
+                label(refs),
+                set(at(refs, top)),
+                zero.is_some_and(|(xy, _)| xy == refs),
+                Some(Length::FillPortion(1)),
+            ));
+        }
+        grid = grid.push(line);
+    }
+    c.push(section("Work zero"))
+        .push(muted(
+            "Where the program's X0 Y0 Z0 is: the point you touch off or probe on the machine. The 3D view marks it with a cross.",
+        ))
+        .push(faces)
+        .push(muted(if model {
+            "Model origin is the part file's own 0,0,0. Pick a spot below to put the zero on the stock instead."
+        } else {
+            "On the stock, seen from above (back at the top, front toward you):"
+        }))
+        .push(grid)
         .push(choice(
             p,
             "offset",
             "Work offset",
             &["G54", "G55", "G56", "G57", "G58", "G59"],
-            t,
-        ))
-        .push(choice(
-            p,
-            "origin",
-            "Work coordinate origin",
-            &crate::post::ORIGINS,
             t,
         ))
         .push(zero_note(app))
@@ -2773,7 +2863,7 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     }];
     if let Some(refs) = refs {
         lines.push(format!(
-            "On the Control page, {} sets exactly this work zero.",
+            "On the Control page, {} sets exactly this work zero, probed from its own spot or, under Probe from, from another corner, edge middle or the centre a probe can reach.",
             crate::control::probe_name(refs)
         ));
     }
@@ -3956,8 +4046,25 @@ pub(crate) fn act<'a>(
     msg: Option<Message>,
     on: bool,
 ) -> Element<'a, Message> {
+    act_sized(label, msg, on, None)
+}
+
+/// `act`, `width` px wide with its label centred, for a grid of buttons
+/// whose columns line up.
+pub(crate) fn act_sized<'a>(
+    label: impl Into<String>,
+    msg: Option<Message>,
+    on: bool,
+    width: Option<Length>,
+) -> Element<'a, Message> {
     let label = label.into();
-    let b = button(text(label.clone()).size(12))
+    let face = text(label.clone()).size(12);
+    let face = match width {
+        Some(_) => face.width(Fill).align_x(Alignment::Center),
+        None => face,
+    };
+    let b = button(face)
+        .width(width.unwrap_or(Length::Shrink))
         .padding([7, 12])
         .on_press_maybe(msg.clone())
         .style(move |_, status| {
@@ -4411,15 +4518,69 @@ fn control(app: &App) -> Element<'_, Message> {
         ],
     );
     let manual = |a: Action| c.manual().then_some(Message::Machine(a));
-    let mut zeros = row![].spacing(6);
+    // A milling machine's DRO: each axis's work position with Zero, ½ and
+    // a value to set it to.
+    let mut dro = column![].spacing(6);
     for &a in &enabled {
-        zeros = zeros.push(act(
-            format!("Zero {}", AXES[a]),
-            manual(Action::WorkZero(Some(a))),
+        dro = dro.push(
+            row![
+                bold(AXES[a], 18).width(24),
+                // Right-aligned so the decimal points line up, as on a DRO.
+                text(format!("{:.3}", s.work_pos[a]))
+                    .size(22)
+                    .font(Font {
+                        weight: iced::font::Weight::Bold,
+                        ..Font::MONOSPACE
+                    })
+                    .width(140)
+                    .align_x(Alignment::End),
+                space().width(12),
+                act(
+                    format!("Zero {}", AXES[a]),
+                    manual(Action::WorkZero(Some(a))),
+                    false
+                ),
+                act("1/2", manual(Action::WorkHalf(a)), false),
+                help::field(
+                    text_input("Value", &c.presets[a])
+                        .on_input(move |v| Message::Machine(Action::WorkText(a, v)))
+                        .on_submit_maybe(
+                            (c.manual() && c.preset(a).is_some())
+                                .then_some(Message::Machine(Action::WorkSet(a)))
+                        )
+                        .width(80)
+                        .padding([7, 9])
+                        .size(13),
+                    "work_set",
+                    &format!("Set {} · mm", AXES[a]),
+                    Target::Machine
+                ),
+                act(
+                    format!("Set {}", AXES[a]),
+                    manual(Action::WorkSet(a)).filter(|_| c.preset(a).is_some()),
+                    false
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    let mut zeros = row![act("Zero all", manual(Action::WorkZero(None)), false)]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    if c.axis(0) && c.axis(1) {
+        let to = c.to_work_xy();
+        // A move, apart from the buttons that only set offsets.
+        zeros = zeros.push(space().width(18)).push(act(
+            "Go to X0 Y0",
+            to.is_ok().then_some(Message::Machine(Action::ToWorkXY)),
             false,
         ));
+        zeros = zeros.push(muted(match (to, c.manual()) {
+            (Err(why), true) => why,
+            _ => "Rapid at the current Z: lift Z clear of the part first.".into(),
+        }));
     }
-    zeros = zeros.push(act("Zero all", manual(Action::WorkZero(None)), false));
     let mut systems = row![].spacing(4);
     for i in 0..6 {
         systems = systems.push(act(
@@ -4428,18 +4589,30 @@ fn control(app: &App) -> Element<'_, Message> {
             s.active_wcs == i,
         ));
     }
+    // What stops every probe, said once under the heading; each button
+    // below says only what stops it alone.
+    let global = c.probe_ready(&[2]).filter(|_| !c.probing());
+    let own_why = |why: Option<String>| why.filter(|w| Some(w) != global.as_ref());
     let blocked = c.probe_z_blocked();
     // The stock top's work Z the plate lies on.
     let top = c.stock_top().unwrap_or_default();
-    let mut probe = column![
+    let mut probe = column![bold("Probe", 13)].spacing(10);
+    if let Some(why) = &global {
+        probe = probe.push(
+            text(why.clone())
+                .size(12)
+                .color(Color::from_rgb8(166, 101, 32)),
+        );
+    }
+    let probe = probe.push(
         row![
             act(
                 "Probe Z",
                 blocked.is_none().then_some(Message::Machine(Action::ProbeZ)),
-                c.probing() && !c.edging()
+                c.probing() && !c.edging() && c.feature().is_none()
             ),
-            muted(match (&blocked, &c.probe) {
-                (Some(why), _) if !c.probing() => why.clone(),
+            muted(match (own_why(blocked.clone()), &c.probe) {
+                (Some(why), _) if !c.probing() => why,
                 (_, Ok(p)) => format!(
                     "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
                     p.feed,
@@ -4452,10 +4625,17 @@ fn control(app: &App) -> Element<'_, Message> {
             })
         ]
         .spacing(8)
-        .align_y(Alignment::Center)
-    ];
-    probe = probe.push(match c.edges_setup() {
-        Err(why) => Element::from(muted(why)),
+        .align_y(Alignment::Center),
+    );
+    let mut probe = probe;
+    // The setup's own work zero, from the spot picked.
+    let spots = c
+        .run_program()
+        .ok()
+        .map(|p| p.probe_from.as_slice())
+        .unwrap_or_default();
+    let setup_probe: Element<_> = match c.edges_setup() {
+        Err(why) => muted(why).into(),
         Ok((refs, p)) => {
             let blocked = c.edges_blocked();
             let name = crate::control::probe_name(refs);
@@ -4465,18 +4645,31 @@ fn control(app: &App) -> Element<'_, Message> {
                     blocked.is_none().then_some(Message::Machine(Action::ProbeEdges)),
                     c.edging()
                 ),
-                muted(match (&blocked, &c.probe) {
-                    (Some(why), _) if !c.edging() => why.clone(),
-                    (_, Ok(pr)) => format!(
-                        "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero there.",
-                        crate::control::probe_spot(refs),
-                        crate::post::touch_off_spots(&p.origin, p.stock).unwrap_or_else(|| format!(
-                            "{}, and puts X0 Y0 Z0 on Model origin from them",
-                            crate::post::probe_spots(refs, p.stock)
-                        )),
-                        pr.tip.unwrap_or_default(),
-                        pr.feed
-                    ),
+                muted(match (own_why(blocked.clone()), &c.probe) {
+                    (Some(why), _) if !c.edging() => why,
+                    (_, Ok(pr)) => {
+                        let own = crate::post::references(&p.origin) == Some(refs)
+                            && crate::post::stock_zero(&p.origin).is_some();
+                        format!(
+                            "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero on {}{}.",
+                            crate::control::probe_spot(refs),
+                            crate::post::probe_spots(refs, p.stock),
+                            pr.tip.unwrap_or_default(),
+                            pr.feed,
+                            p.origin,
+                            if own {
+                                String::new()
+                            } else {
+                                let size = p.stock.dimensions();
+                                format!(
+                                    ", placed from there by the setup's {} × {} × {} mm stock: measure the stock first",
+                                    crate::post::exact_mm(size[0]),
+                                    crate::post::exact_mm(size[1]),
+                                    crate::post::exact_mm(size[2])
+                                )
+                            }
+                        )
+                    }
                     _ => String::new(),
                 })
             ]
@@ -4484,7 +4677,52 @@ fn control(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center)
             .into()
         }
-    });
+    };
+    let mut setup_col = column![bold("Setup work zero, from its stock", 12)].spacing(8);
+    if !spots.is_empty() {
+        setup_col = setup_col.push(probe_from_grid(c, spots));
+    }
+    probe = probe.push(setup_col.push(setup_probe));
+    // Features found where the tip is, without a setup.
+    let feature = |f: crate::control::Feature| {
+        act(
+            f.label(),
+            c.feature_blocked(f)
+                .is_none()
+                .then_some(Message::Machine(Action::ProbeFeature(f))),
+            c.feature() == Some(f),
+        )
+    };
+    use crate::control::Feature;
+    let corners = column![
+        row![feature(Feature::CORNERS[0]), feature(Feature::CORNERS[1])].spacing(4),
+        row![feature(Feature::CORNERS[2]), feature(Feature::CORNERS[3])].spacing(4),
+    ]
+    .spacing(4);
+    let mut edges = row![].spacing(4);
+    for f in Feature::EDGES {
+        edges = edges.push(feature(f));
+    }
+    let features = row![
+        column![muted("Surface"), feature(Feature::Top)].spacing(4),
+        column![muted("Edge, probing toward"), edges].spacing(4),
+        column![muted("Outside corner, seen from above"), corners].spacing(4),
+        column![muted("Inside"), feature(Feature::Bore)].spacing(4),
+    ]
+    .spacing(18);
+    let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
+    probe = probe.push(
+        column![
+            bold("Feature at the tip, no setup needed", 12),
+            features,
+            muted(match (why, c.feature()) {
+                (_, Some(f)) => f.how(),
+                (Some(why), None) => why,
+                (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
+            }),
+        ]
+        .spacing(8),
+    );
     if let Some(note) = probe_note(c) {
         probe = probe.push(note);
     }
@@ -4506,11 +4744,13 @@ fn control(app: &App) -> Element<'_, Message> {
     let work_panel = machine_panel(
         &format!("Work zero (G{})", 54 + s.active_wcs),
         column![
+            dro,
             zeros,
             systems,
             muted(
-                "Zero makes the current position work zero in the active coordinate system. G54 to G59 each keep their own; they change only while Idle."
+                "Zero makes the current position work zero in the active coordinate system; 1/2 halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press 1/2 on X. G54 to G59 each keep their own; they change only while Idle."
             ),
+            rule::horizontal(1),
             probe
         ],
     );
@@ -4607,20 +4847,23 @@ fn control(app: &App) -> Element<'_, Message> {
         );
         overrides = overrides.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
-    // Jog beside the position, so both fit without scrolling; the model
-    // beside the work zero and the spindle.
-    main = main.push(row![position, jog_panel].spacing(12)).push(
-        row![
-            model,
-            column![
-                work_panel,
-                machine_panel("Spindle and coolant", spindle),
-                machine_panel("Overrides", overrides)
+    // Jog beside the position, so both fit without scrolling; the work zero
+    // under them across the page, as a DRO under the jog; the model beside
+    // the spindle.
+    main = main
+        .push(row![position, jog_panel].spacing(12))
+        .push(work_panel)
+        .push(
+            row![
+                model,
+                column![
+                    machine_panel("Spindle and coolant", spindle),
+                    machine_panel("Overrides", overrides)
+                ]
+                .spacing(12)
             ]
-            .spacing(12)
-        ]
-        .spacing(12),
-    );
+            .spacing(12),
+        );
     let send =
         (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
     main = main.push(machine_panel(
@@ -5076,6 +5319,74 @@ fn touch_label(work: [f64; 3]) -> String {
     } else {
         format!("Set {}", work_words(work))
     }
+}
+/// The stock-top spots Probe corner, Probe edge or Probe centre can find
+/// the setup's work zero from, laid out as the top is seen from above (back
+/// at the top): a spot with a jaw or clamp in its way, or cut by an earlier
+/// setup, is greyed out, and the reason shows under the grid.
+fn probe_from_grid<'a>(
+    c: &'a crate::control::Connection,
+    spots: &'a [([crate::post::At; 2], Result<(), String>)],
+) -> Element<'a, Message> {
+    use crate::control::Action;
+    use crate::post::At::{Max, Mid, Min};
+    let program = c.run_program().ok();
+    // The zero's own spot, reachable or not: the one a jaw may stand at.
+    let own = program.and_then(|p| crate::post::references(&p.origin));
+    let model = program.is_some_and(|p| crate::post::stock_zero(&p.origin).is_none());
+    let reachable = |refs| spots.iter().any(|(r, ok)| *r == refs && ok.is_ok());
+    // What Probe corner will probe from: none lit when no spot it may use.
+    let picked = c
+        .probe_spot
+        .filter(|&r| reachable(r))
+        .or(own.filter(|&r| reachable(r)));
+    let name = |refs: [crate::post::At; 2]| match refs {
+        [Mid, Mid] => "Centre".to_string(),
+        [Mid, _] | [_, Mid] => {
+            let k = usize::from(refs[0] == Mid);
+            let s = crate::post::ENDS[k][usize::from(refs[k] == Max)];
+            s[..1].to_uppercase() + &s[1..]
+        }
+        _ => {
+            let s = crate::post::corner_name(refs);
+            s[..1].to_uppercase() + &s[1..]
+        }
+    };
+    let mut grid = column![].spacing(4);
+    for y in [Max, Mid, Min] {
+        let mut line = row![].spacing(4);
+        for x in [Min, Mid, Max] {
+            let refs = [x, y];
+            let ok = reachable(refs);
+            // Model origin is set off from its spot, not on it.
+            let label = match (Some(refs) == own, model) {
+                (true, false) => format!("{} (zero)", name(refs)),
+                (true, true) => format!("{} (default)", name(refs)),
+                _ => name(refs),
+            };
+            let pick = if Some(refs) == own { None } else { Some(refs) };
+            line = line.push(act_sized(
+                label,
+                (ok && !c.probing()).then_some(Message::Machine(Action::ProbeFrom(pick))),
+                picked == Some(refs),
+                Some(Length::Fixed(150.)),
+            ));
+        }
+        grid = grid.push(line);
+    }
+    let mut out = column![
+        muted("Probe from (the stock top seen from above, back at the top)"),
+        grid
+    ]
+    .spacing(6);
+    let refused: Vec<String> = spots
+        .iter()
+        .filter_map(|(r, ok)| ok.as_ref().err().map(|why| format!("{}: {why}", name(*r))))
+        .collect();
+    if !refused.is_empty() {
+        out = out.push(muted(refused.join(" ")));
+    }
+    out.into()
 }
 /// How the last probe ended, or that one is under way.
 fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {

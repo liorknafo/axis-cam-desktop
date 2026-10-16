@@ -215,6 +215,7 @@ impl App {
                 120 => "96-machine-idle".into(),
                 121 => "97-machine-run-panel".into(),
                 122 => "98-machine-setup".into(),
+                123 => "99-machine-work-zero".into(),
                 _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
             })
     }
@@ -1260,6 +1261,19 @@ impl App {
             }
             // The Setup view: the profile of the connected machine.
             122 => vec![Message::ControlSetup(true)],
+            // Back on the Control page, the work zero under the jog: each
+            // axis's DRO line with Zero, ½ and Set, a value typed for X, and
+            // the probes. No setup picked: the one of screen 97 cannot run,
+            // and the fixed Run strip listing why leaves little of the page.
+            123 => {
+                if let Some(c) = &mut self.control {
+                    c.run = None;
+                }
+                vec![
+                    Message::ControlSetup(false),
+                    Message::Machine(crate::control::Action::WorkText(0, "-5".into())),
+                ]
+            }
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.disconnect_machine();
@@ -1274,11 +1288,18 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
-            // The machine drawn under the position table, in view.
+            // The machine drawn under the work zero, in view.
             120 => {
                 return iced::widget::operation::scroll_to(
                     "control",
-                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 430. },
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 970. },
+                );
+            }
+            // The work zero under the position table and the jog.
+            123 => {
+                return iced::widget::operation::scroll_to(
+                    "control",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 420. },
                 );
             }
             116 => {
@@ -3024,6 +3045,173 @@ flood = { pin = 8 }
         work_offset(&a, corner);
     }
 
+    /// A front-left zero probed from the back-right corner, as when a jaw
+    /// stands at the front-left: the probe touches the top and the +X and +Y
+    /// sides there and puts the zero on the front-left corner by the
+    /// setup's stock size, which the simulator's block has.
+    #[test]
+    fn the_setups_zero_is_probed_from_the_corner_picked() {
+        use crate::control::Action;
+        use crate::post::At::{Max, Min};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        let spots = run_of(&a).checked().unwrap()[0].probe_from.clone();
+        assert_eq!(spots.len(), 9);
+        assert!(spots.iter().all(|(_, ok)| ok.is_ok()), "{spots:?}");
+        // The zero's own spot is the default; picking it again is None.
+        assert_eq!(conn(&a).edges_setup().unwrap().0, [Min, Min]);
+        let _ = a.update(Message::Machine(Action::ProbeFrom(Some([Max, Max]))));
+        assert_eq!(conn(&a).edges_setup().unwrap().0, [Max, Max]);
+        let _ = a.view();
+        let (lo, hi) = conn(&a).block.unwrap();
+        // The simulator's probe is a point: allowing for the 4 mm tip puts
+        // each side it finds 2 mm inside the block's.
+        let corner = [lo[0] + 2., lo[1] + 2., -40.];
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-30", hi[0] - 4., hi[1] - 4.),
+        );
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        assert!(
+            message.contains("Work zero set on Stock top front-left")
+                && message.contains("placed from the back-right corner"),
+            "{message}"
+        );
+        tick_until(&mut a, 5.0, "work zero", |s| s.work_offset[2] < -39.);
+        // The back-right corner, also 2 mm inside, less the stock's size.
+        work_offset(&a, [corner[0] - 4., corner[1] - 4., -40.]);
+        // A new setup picked to run starts from its own spot again.
+        check_run(&mut a, 0);
+        assert_eq!(conn(&a).probe_spot, None);
+    }
+
+    /// The probing screen's features on the simulator's block, from where
+    /// the tip is put: the top, a side and an outside corner, each setting
+    /// work zero on what it found and leaving the other axes alone.
+    #[test]
+    fn a_feature_is_probed_where_the_tip_is_and_becomes_work_zero() {
+        use crate::control::{Action, Feature};
+        use crate::post::At::Min;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), None);
+        let (lo, hi) = conn(&a).block.unwrap();
+        let mid = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.];
+        let probe = |a: &mut App, f: Feature| {
+            assert_eq!(conn(a).feature_blocked(f), None);
+            let _ = a.update(Message::Machine(Action::ProbeFeature(f)));
+            assert!(a.locked() && conn(a).feature() == Some(f));
+            let _ = a.view();
+            let (ok, message) = probed(a);
+            assert!(ok, "{message}");
+            // The work offset is set, then the tip moves back.
+            tick_for(a, 100);
+            tick_until(a, 5.0, "back where it started", |s| {
+                s.state == Some(State::Idle)
+            });
+            message
+        };
+        // Z top: Z0 on the block's top, X and Y as they were.
+        let before = conn(&a).snapshot.work_offset;
+        mdi(&mut a, &format!("G53 G0 X{} Y{} Z-30", mid[0], mid[1]));
+        let message = probe(&mut a, Feature::Top);
+        assert!(message.contains("Z0 set on the surface"), "{message}");
+        work_offset(&a, [before[0], before[1], -40.]);
+        // X+ from left of the block, 5 mm below its top.
+        mdi(&mut a, &format!("G53 G0 X{} Y{}", lo[0] - 8., mid[1]));
+        mdi(&mut a, "G53 G0 Z-45");
+        let message = probe(&mut a, Feature::Edge(0, true));
+        assert!(message.contains("X0 set on the left side"), "{message}");
+        work_offset(&a, [lo[0] + 2., before[1], -40.]);
+        assert!((conn(&a).snapshot.machine_pos[0] - (lo[0] - 8.)).abs() < 0.01);
+        // X− from right of the block: X0 on its right side.
+        // Over the block, not through it.
+        let over = |a: &mut App, x: f64, y: f64| {
+            mdi(a, "G53 G0 Z-30");
+            mdi(a, &format!("G53 G0 X{x} Y{y}"));
+            mdi(a, "G53 G0 Z-45");
+        };
+        over(&mut a, hi[0] + 8., mid[1]);
+        let message = probe(&mut a, Feature::Edge(0, false));
+        assert!(message.contains("X0 set on the right side"), "{message}");
+        work_offset(&a, [hi[0] - 2., before[1], -40.]);
+        // Outside the front-left corner, 5 mm off both sides.
+        over(&mut a, lo[0] - 5., lo[1] - 5.);
+        let message = probe(&mut a, Feature::Corner([Min, Min]));
+        assert!(message.contains("on the front-left corner"), "{message}");
+        work_offset(&a, [lo[0] + 2., lo[1] + 2., -40.]);
+        let s = &conn(&a).snapshot;
+        assert!(
+            (s.machine_pos[0] - (lo[0] - 5.)).abs() < 0.01,
+            "{:?}",
+            s.machine_pos
+        );
+        assert!(
+            (s.machine_pos[1] - (lo[1] - 5.)).abs() < 0.01,
+            "{:?}",
+            s.machine_pos
+        );
+        // Started in front of the block but not left of it, the corner's
+        // step along Y runs into it: nothing is set.
+        over(&mut a, lo[0] + 5., lo[1] - 5.);
+        let before = conn(&a).snapshot.work_offset;
+        let _ = a.update(Message::Machine(Action::ProbeFeature(Feature::Corner([
+            Min, Min,
+        ]))));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.contains("stepping along the side"),
+            "{message}"
+        );
+        assert_eq!(conn(&a).snapshot.work_offset, before);
+    }
+
+    /// A milling machine DRO's ½, Set and Go to X0 Y0.
+    #[test]
+    fn half_set_and_go_to_x0_y0_work_as_on_a_dro() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        // Zeroed at machine X195: 40 mm to the right reads X40, ½ makes it X20.
+        mdi(&mut a, "G0 X40 Y-12");
+        let _ = a.update(Message::Machine(Action::WorkHalf(0)));
+        tick_until(&mut a, 2.0, "X halved", |s| {
+            (s.work_pos[0] - 20.).abs() < 1e-3
+        });
+        assert!((conn(&a).snapshot.work_pos[1] - -12.).abs() < 1e-3);
+        assert!((conn(&a).snapshot.machine_pos[0] - 235.).abs() < 1e-3);
+        // Set Y to −5 where the tool is; a field that is no number sets nothing.
+        let _ = a.update(Message::Machine(Action::WorkText(1, "abc".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(1)));
+        tick_for(&mut a, 20);
+        assert!((conn(&a).snapshot.work_pos[1] - -12.).abs() < 1e-3);
+        let _ = a.update(Message::Machine(Action::WorkText(1, " -5 ".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(1)));
+        tick_until(&mut a, 2.0, "Y set", |s| (s.work_pos[1] - -5.).abs() < 1e-3);
+        let _ = a.view();
+        // Go to X0 Y0: X and Y move, Z stays.
+        let z = conn(&a).snapshot.machine_pos[2];
+        assert_eq!(conn(&a).to_work_xy(), Ok(()));
+        let _ = a.update(Message::Machine(Action::ToWorkXY));
+        tick_until(&mut a, 5.0, "at X0 Y0", |s| {
+            s.state == Some(State::Idle) && s.work_pos[..2].iter().all(|v| v.abs() < 1e-3)
+        });
+        assert!((conn(&a).snapshot.machine_pos[2] - z).abs() < 1e-6);
+        // In E-stop none of them does anything.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::Machine(Action::WorkText(0, "7".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(0)));
+        let _ = a.update(Message::Machine(Action::WorkHalf(1)));
+        tick_for(&mut a, 50);
+        assert!(conn(&a).snapshot.work_pos[0].abs() < 1e-3);
+        assert!(conn(&a).to_work_xy().is_err());
+    }
+
     /// Picking another setup in the Run strip while a probe is under way
     /// is refused, in the handler and on the buttons (`setup_locked`): the
     /// probe sets the work zero of the setup it started with, on that
@@ -4120,6 +4308,7 @@ flood = { pin = 8 }
         for (key, command) in [
             ("control_rpm", Ctl::Rpm(String::new())),
             ("mdi_line", Ctl::MdiText(String::new())),
+            ("work_set", Ctl::WorkText(0, String::new())),
         ] {
             let tag = tags
                 .iter()
@@ -7042,6 +7231,57 @@ flood = { pin = 8 }
         // The tool editor, its Save under the scrolling fields, builds too.
         let _ = a.update(Message::NewTool);
         let _ = a.view();
+    }
+    /// The work zero has a step of its own: the heading's link opens it
+    /// from an operation, the faces and the grid of the stock seen from
+    /// above set the origin, and the work offset is chosen there too.
+    #[test]
+    fn the_work_zero_step_picks_the_zero_on_a_grid_of_the_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let origin = |a: &App| get(&a.doc.setup().p, "origin").to_string();
+        let _ = a.update(Message::SelectOp(0));
+        assert!(a.selected.is_some());
+        // The heading's "· Change" link.
+        let _ = a.update(Message::SetupStep("Work zero"));
+        assert_eq!((a.setup_step, a.selected), ("Work zero", None));
+        let _ = a.view();
+        assert!(
+            crate::ui::setup_step_done(&a, "Work zero"),
+            "{}",
+            origin(&a)
+        );
+        // What the grid's back-right button and the Stock bottom button send.
+        let _ = a.update(Message::Edit(
+            Target::Setup,
+            "origin",
+            "Stock top back-right".into(),
+        ));
+        let _ = a.view();
+        let _ = a.update(Message::Edit(
+            Target::Setup,
+            "origin",
+            "Stock bottom back-right".into(),
+        ));
+        assert_eq!(origin(&a), "Stock bottom back-right");
+        let _ = a.update(Message::Edit(
+            Target::Setup,
+            "origin",
+            "Model origin".into(),
+        ));
+        let _ = a.view();
+        // A zero that is no work zero leaves the step undone.
+        a.doc
+            .setup_mut()
+            .p
+            .insert("origin".into(), "Somewhere".into());
+        assert!(!crate::ui::setup_step_done(&a, "Work zero"));
+        // The buttons' cards say what each zero is.
+        let card = crate::help::command(
+            &Message::Edit(Target::Setup, "origin", "Stock top front-left".into()),
+            "Front-left".into(),
+        );
+        assert!(!card.body.is_empty());
     }
     #[test]
     fn the_workholding_page_and_the_setup_editor_build_in_each_state() {
