@@ -1,5 +1,12 @@
 //! Explicit renderer smoke test. It uses an isolated data directory and never
 //! sends native input events or changes the user's regular saved workspace.
+//!
+//! Each screen is captured from a frame the window drew after the step that
+//! set it up (`frames`, `App::smoke_frame`), and checked against the screen
+//! before it (`App::smoke_check`): Iced's screenshot renders what the window
+//! last drew, and a window that draws no frame (on Wayland, one that is
+//! covered) would otherwise give the previous screen again, with its labels
+//! gone (#90).
 use crate::{
     App, Message, Page, Target,
     model::Machine,
@@ -7,6 +14,8 @@ use crate::{
 };
 use iced::Task;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 /// Timeline steps for the renderer smoke test: the stage, when it began and
 /// ended in seconds before now (None while it runs), and its result.
 fn smoke_steps(steps: Vec<(Progress, u64, Option<u64>, Option<StepResult>)>) -> Vec<crate::Step> {
@@ -35,12 +44,70 @@ fn smoke_problems(more: usize) -> StepResult {
         more,
     }
 }
+/// Whether the smoke run is waiting for frames: the window's frames become
+/// messages only then, since each message has Iced draw the window again.
+static WAITING: AtomicBool = AtomicBool::new(false);
+/// The frames drawn after a step before its screen is captured. The first
+/// shows the step; pictures of 2 MiB and more are uploaded after it.
+const FRAMES: u32 = 2;
+/// How long a step's frame may take to come before the run fails.
+const FRAME_WAIT: Duration = Duration::from_secs(15);
+/// The sharp edges per 1,000 drawn pixels, at the window's scale, under
+/// which a screen has no text: labelled screens measure 18 (the Control page
+/// before Connect) to 120, the stale frames of #90 3.5 to 3.8, and one that
+/// kept some of its labels 8.7.
+const TEXT_EDGES: f64 = 12.;
+/// The window's frames and sizes, for the smoke run: a message for each
+/// frame drawn while the run waits for one, and for each size the window
+/// takes.
+pub fn frames() -> iced::Subscription<Message> {
+    use iced::window::Event;
+    iced::event::listen_raw(|event, _status, _window| match event {
+        iced::Event::Window(Event::RedrawRequested(at)) if WAITING.load(Ordering::Relaxed) => {
+            Some(Message::Frame(at))
+        }
+        iced::Event::Window(Event::Opened { size, .. } | Event::Resized(size)) => {
+            Some(Message::WindowSized(size))
+        }
+        _ => None,
+    })
+}
+/// The marks of a drawn screen in a capture: the sharp edges (a luminance
+/// step over 80 between neighbouring pixels), which text makes in numbers,
+/// per 1,000 drawn pixels, and the share of pixels that are drawn (not the
+/// window's background). Every other row is read. A glyph's edges grow with
+/// the window's scale factor and its pixels with the square of it, so the
+/// edge count is taken at the scale.
+fn smoke_marks(image: &iced::window::Screenshot) -> (f64, f64) {
+    let (w, h) = (image.size.width as usize, image.size.height as usize);
+    let (mut edges, mut drawn, mut seen) = (0usize, 0usize, 0usize);
+    for y in (0..h).step_by(2) {
+        let mut previous = None;
+        for x in 0..w {
+            let [r, g, b] = <[u8; 3]>::try_from(&image.rgba[(y * w + x) * 4..][..3]).unwrap();
+            let luminance = (i32::from(r) * 299 + i32::from(g) * 587 + i32::from(b) * 114) / 1000;
+            if previous.is_some_and(|p: i32| (luminance - p).abs() > 80) {
+                edges += 1;
+            }
+            previous = Some(luminance);
+            if (i32::from(r) - 242).abs() > 12
+                || (i32::from(g) - 245).abs() > 12
+                || (i32::from(b) - 249).abs() > 12
+            {
+                drawn += 1;
+            }
+            seen += 1;
+        }
+    }
+    let scale = f64::from(image.scale_factor);
+    (
+        edges as f64 * scale * 1000. / drawn.max(1) as f64,
+        drawn as f64 / seen.max(1) as f64,
+    )
+}
 impl App {
-    pub fn capture_smoke(&mut self, image: iced::window::Screenshot) -> Task<Message> {
-        let Some(dir) = self.smoke_dir.clone() else {
-            return Task::none();
-        };
-        fs::create_dir_all(&dir).expect("create smoke output");
+    /// The name of the screen captured at `smoke_step`.
+    fn smoke_name(&self) -> String {
         let names = [
             "01-workspace",
             "02-geometry",
@@ -69,7 +136,7 @@ impl App {
             "25-invalid-stock-offset",
             "26-stock-offset-help",
         ];
-        let name = names
+        names
             .get(self.smoke_step)
             .map(|s| s.to_string())
             .unwrap_or_else(|| match self.smoke_step {
@@ -143,8 +210,165 @@ impl App {
                 114 | 115 => "91-planner-pictures".into(),
                 116 => "92-flipped-setup-leftover-stock".into(),
                 117 => "93-planner-tool-lines".into(),
-                _ => format!("motion-{:02}", self.smoke_step - 26),
-            });
+                118 => "94-machine-disconnected".into(),
+                119 => "95-machine-estop".into(),
+                120 => "96-machine-idle".into(),
+                121 => "97-machine-run-panel".into(),
+                122 => "98-machine-setup".into(),
+                _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
+            })
+    }
+    /// Starts the wait for the frames that show the step just taken.
+    pub fn smoke_arm(&mut self) {
+        self.smoke_frames = 0;
+        self.smoke_changed = Instant::now();
+        WAITING.store(true, Ordering::Relaxed);
+    }
+    /// The window drew a frame at `at`. The `FRAMES`th one drawn after the
+    /// last step is captured. Frames drawn before the step, while the
+    /// window takes a new size or while the stock surface is still being
+    /// meshed count for nothing: the screen is not settled yet.
+    pub fn smoke_frame(&mut self, at: Instant) -> Task<Message> {
+        if self.smoke_dir.is_none() || self.smoke_pending || !WAITING.load(Ordering::Relaxed) {
+            return Task::none();
+        }
+        if at < self.smoke_changed {
+            return Task::none();
+        }
+        if self.smoke_resize || self.stock_mesh_key().is_some() {
+            self.smoke_frames = 0;
+            self.smoke_changed = Instant::now();
+            return Task::none();
+        }
+        self.smoke_frames += 1;
+        if self.smoke_frames < FRAMES {
+            return Task::none();
+        }
+        self.smoke_pending = true;
+        WAITING.store(false, Ordering::Relaxed);
+        iced::window::latest()
+            .and_then(iced::window::screenshot)
+            .map(Message::Captured)
+    }
+    /// The window took a logical size.
+    pub fn smoke_sized(&mut self, size: iced::Size) {
+        if self.smoke_dir.is_none() {
+            return;
+        }
+        eprintln!("Window {} × {}", size.width, size.height);
+        self.smoke_window = Some(size);
+        if self.smoke_resize {
+            self.smoke_resize = false;
+            self.smoke_frames = 0;
+            self.smoke_changed = Instant::now();
+        }
+    }
+    /// Fails the run when the frame a step waits for has not come in
+    /// `FRAME_WAIT`, naming the screen; the tick calls it, before it notes
+    /// its time.
+    pub fn smoke_overdue(&mut self) {
+        if self.smoke_pending || !WAITING.load(Ordering::Relaxed) {
+            return;
+        }
+        // A tick long after the one before it says the main thread was busy
+        // with work a tick does in line in the smoke run (the stock the
+        // setups leave, the setup's checks), during which no frame could be
+        // drawn: the wait starts again.
+        if self.last_tick.elapsed() > Duration::from_secs(2) {
+            self.smoke_changed = Instant::now();
+            return;
+        }
+        let waited = self.smoke_changed.elapsed();
+        if waited <= FRAME_WAIT {
+            return;
+        }
+        let what = if self.smoke_resize {
+            "the window has not taken its new size".to_string()
+        } else {
+            format!(
+                "the window drew {} frame{} after its step",
+                self.smoke_frames,
+                if self.smoke_frames == 1 { "" } else { "s" }
+            )
+        };
+        panic!(
+            "Screen {}: {what} in {:.0} s. The smoke run captures each screen from a frame drawn after its step, so its window must stay visible and unoccluded on screen (on Wayland a covered window draws no frames).",
+            self.smoke_name(),
+            waited.as_secs_f64()
+        );
+    }
+    /// Refreshes the connection until the machine's snapshot satisfies `ok`,
+    /// or `secs` have passed: whether it did.
+    fn smoke_machine(
+        &mut self,
+        secs: f64,
+        ok: impl Fn(&uc100::controller::Snapshot) -> bool,
+    ) -> bool {
+        let end = Instant::now() + Duration::from_secs_f64(secs);
+        loop {
+            let c = self.control.as_mut().expect("connected");
+            c.refresh();
+            if ok(&c.snapshot) {
+                return true;
+            }
+            if Instant::now() > end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    /// The machine's state and its last log lines, for a failure.
+    fn smoke_machine_state(&self) -> String {
+        let s = &self.control.as_ref().expect("connected").snapshot;
+        format!(
+            "{:?}, log: {:?}",
+            s.state,
+            s.log.iter().rev().take(5).collect::<Vec<_>>()
+        )
+    }
+    /// The checks on a captured screen: it is not the frame the screen before
+    /// it was captured from, it is drawn, and it has text. A capture made
+    /// before the window drew the step's frame renders the previous screen,
+    /// and most of its labels are gone from it: their paragraphs belong to
+    /// the widget tree, which each message rebuilds (#90).
+    fn smoke_check(&mut self, name: &str, image: &iced::window::Screenshot) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (image.size.width, image.size.height, &image.rgba).hash(&mut hasher);
+        let hash = hasher.finish();
+        // Screen 91 is captured twice by design, the second file replacing
+        // the first; the second capture may equal the first.
+        assert!(
+            self.smoke_step == 115 || self.smoke_last != Some(hash),
+            "Screen {name} is the same frame as the screen before it: a stale capture (the window drew no new frame)"
+        );
+        self.smoke_last = Some(hash);
+        let (edges, drawn) = smoke_marks(image);
+        assert!(
+            drawn > 0.02,
+            "Screen {name} is blank: {:.1} % of its pixels differ from the background",
+            drawn * 100.
+        );
+        assert!(
+            edges > TEXT_EDGES,
+            "Screen {name} has no text: {edges:.1} sharp edges per 1,000 drawn pixels, labelled screens have over {TEXT_EDGES}"
+        );
+        eprintln!(
+            "Screen {name}: {} × {} px, {edges:.1} sharp edges per 1,000 drawn pixels, {:.0} % drawn, {} frame{} after the step",
+            image.size.width,
+            image.size.height,
+            drawn * 100.,
+            self.smoke_frames,
+            if self.smoke_frames == 1 { "" } else { "s" }
+        );
+    }
+    pub fn capture_smoke(&mut self, image: iced::window::Screenshot) -> Task<Message> {
+        let Some(dir) = self.smoke_dir.clone() else {
+            return Task::none();
+        };
+        fs::create_dir_all(&dir).expect("create smoke output");
+        let name = self.smoke_name();
+        self.smoke_check(&name, &image);
         if (26..50).contains(&self.smoke_step) {
             // Inspect the model region, excluding sidebars, labels and controls.
             // A blank async-upload frame contains only the pale background/grid.
@@ -183,8 +407,15 @@ impl App {
         if std::env::args().any(|arg| arg == "--help-only") {
             return iced::window::latest().and_then(iced::window::close);
         }
-        self.smoke_step += 1;
         self.smoke_pending = false;
+        let task = self.smoke_advance(&dir);
+        self.smoke_arm();
+        task
+    }
+    /// Takes the next step: sets up the next screen, in `dir`, the smoke's
+    /// workspace. The screen is captured once the window has drawn it.
+    fn smoke_advance(&mut self, dir: &std::path::Path) -> Task<Message> {
+        self.smoke_step += 1;
         let actions = match self.smoke_step {
             1 => vec![Message::SelectOp(1), Message::Tab("Geometry".into())],
             2 => vec![
@@ -211,6 +442,7 @@ impl App {
                     "Deep drilling".into(),
                 ));
                 let _ = self.update(Message::Tab("Cycle".into()));
+                self.smoke_resize = true;
                 return iced::window::latest()
                     .and_then(|id| iced::window::resize(id, iced::Size::new(1120., 720.)));
             }
@@ -297,6 +529,7 @@ impl App {
                 // Exercise frequently replaced images above the former 2 MiB
                 // upload boundary, at the same update cadence as animated help.
                 self.help_animating = true;
+                self.smoke_resize = true;
                 return iced::window::latest()
                     .and_then(|id| iced::window::resize(id, iced::Size::new(1440., 930.)));
             }
@@ -722,7 +955,6 @@ impl App {
                 vec![]
             }
             105 => {
-                self.smoke_pending = false;
                 return iced::widget::operation::scroll_to(
                     "planner-result",
                     iced::widget::scrollable::AbsoluteOffset { x: 0., y: 5000. },
@@ -950,8 +1182,87 @@ impl App {
                 self.page = Page::Ai;
                 vec![]
             }
+            118 => {
+                // MACHINE: the Control page before Connect. The owner's
+                // machine, with the driver's JY5800 profile written to the
+                // smoke's workspace, is simulated and assigned to the setup.
+                self.planner = crate::Planner::Idle;
+                self.plan_timeline.clear();
+                let mut m = crate::control::owners_machine(dir).expect("the owner's machine");
+                m.p.insert("uc100_connection".into(), "Simulated".into());
+                self.doc.setups[0].machine = m.clone();
+                self.doc.machines.push(m);
+                vec![Message::Page(Page::Control)]
+            }
+            119 => {
+                // Connected: the simulated machine starts in E-stop. The tick
+                // puts the state in the status line.
+                use uc100::controller::State;
+                let _ = self.update(Message::Connect);
+                assert!(self.control.is_some(), "Connect: {}", self.status);
+                assert!(
+                    self.smoke_machine(10., |s| s.state == Some(State::EStop)),
+                    "E-stop after connecting: {}",
+                    self.smoke_machine_state()
+                );
+                vec![Message::Tick]
+            }
+            120 => {
+                // Reset to Idle, with machine zero set where the machine
+                // starts: the model is drawn with its travel and the
+                // simulator's block.
+                use uc100::controller::State;
+                let _ = self.update(Message::MachineReset);
+                assert!(
+                    self.smoke_machine(10., |s| s.state == Some(State::Idle)),
+                    "Idle after Reset: {}",
+                    self.smoke_machine_state()
+                );
+                // Pressed again while an axis stays unset: the driver can
+                // drop a declaration (LIO-163), as the tests allow for.
+                let set = |s: &uc100::controller::Snapshot| s.referenced[..3].iter().all(|r| *r);
+                for _ in 0..5 {
+                    let _ =
+                        self.update(Message::Machine(crate::control::Action::MachineZero(None)));
+                    if self.smoke_machine(1., set) {
+                        break;
+                    }
+                }
+                assert!(
+                    self.smoke_machine(1., set),
+                    "machine zero: {}",
+                    self.smoke_machine_state()
+                );
+                vec![Message::Tick]
+            }
+            121 => {
+                // The setup picked in the Run panel, checked here (the smoke
+                // run leaves the tasks its steps return alone), with the Run
+                // strip above it.
+                let _ = self.update(Message::Run(crate::run::Action::Setup(0)));
+                let epoch = self
+                    .control
+                    .as_ref()
+                    .and_then(|c| c.run.as_ref())
+                    .expect("the setup picked to run")
+                    .epoch;
+                let mesh = self.part_mesh().expect("the imported part");
+                let programs = crate::run::programs(&self.doc, mesh, 0);
+                eprintln!(
+                    "Screen 97: {}",
+                    match &programs {
+                        Ok(runs) => format!("{} tool runs", runs.len()),
+                        Err(problems) => problems.join(" | "),
+                    }
+                );
+                let _ = self.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+                vec![]
+            }
+            // The Setup view: the profile of the connected machine.
+            122 => vec![Message::ControlSetup(true)],
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
+                self.disconnect_machine();
                 self.persist();
                 return iced::window::latest().and_then(iced::window::close);
             }
@@ -963,6 +1274,13 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
+            // The machine drawn under the position table, in view.
+            120 => {
+                return iced::widget::operation::scroll_to(
+                    "control",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 430. },
+                );
+            }
             116 => {
                 // The stock setup 2 starts from is the one worked out, and the
                 // jaws are drawn round it.
@@ -1047,7 +1365,7 @@ impl App {
                     iced::widget::scrollable::AbsoluteOffset { x: 0., y: 0. },
                 )
             };
-            return Task::batch([top("inspector"), top("planner-result")]);
+            return Task::batch([top("inspector"), top("planner-result"), top("control")]);
         }
         Task::none()
     }
