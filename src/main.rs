@@ -280,10 +280,12 @@ pub enum Message {
     AccountRestored(Result<Option<session::Session>, String>),
     SignIn,
     SignInCancel,
-    /// The browser step of a sign-in; see `oauth::approve`.
-    Approved(Result<oauth::Approval, String>),
-    /// The exchange of an approved sign-in; see `oauth::complete`.
-    SignedIn(Result<(session::Session, String), String>),
+    /// The browser step of a sign-in; see `oauth::approve`. The first value is
+    /// the `sign_in_attempt` that started it.
+    Approved(u64, Result<oauth::Approval, String>),
+    /// The exchange of an approved sign-in; see `oauth::complete`. The first
+    /// value is the `sign_in_attempt` that started it.
+    SignedIn(u64, Result<(session::Session, String), String>),
     /// The result of saving a finished sign-in; see `oauth::save_session`.
     SessionSaved(Result<session::Session, String>),
     SignOut,
@@ -691,6 +693,9 @@ pub struct App {
     store: std::sync::Arc<dyn session::SessionStore>,
     client: Option<std::sync::Arc<openai::Client>>,
     sign_in: Option<iced::task::Handle>,
+    /// Counts the sign-ins started, so a result of an earlier one is not taken
+    /// for the current one's.
+    sign_in_attempt: u64,
     /// Sends the user to the sign-in page; tests replace it.
     open_browser: BrowserOpener,
     account_restored: bool,
@@ -849,8 +854,8 @@ fn while_locked(m: &Message) -> bool {
             | AccountRestored(_)
             | SignIn
             | SignInCancel
-            | Approved(_)
-            | SignedIn(_)
+            | Approved(..)
+            | SignedIn(..)
             | SessionSaved(_)
             | SignOut
             | SignedOut(_)
@@ -1104,6 +1109,7 @@ impl App {
             store,
             client: None,
             sign_in: None,
+            sign_in_attempt: 0,
             open_browser: std::sync::Arc::new(oauth::open_browser),
             account_restored: false,
             camera: viewport::Camera::default(),
@@ -4155,6 +4161,12 @@ impl App {
                 }
                 self.account = Account::SigningIn;
                 self.account_note.clear();
+                // A sign-in that was superseded stops waiting for its browser.
+                if let Some(old) = self.sign_in.take() {
+                    old.abort();
+                }
+                self.sign_in_attempt = self.sign_in_attempt.wrapping_add(1);
+                let attempt = self.sign_in_attempt;
                 let (endpoints, settings) = (self.endpoints.clone(), self.settings.clone());
                 let open = self.open_browser.clone();
                 // Only the wait for the browser is abortable: the exchange
@@ -4164,7 +4176,7 @@ impl App {
                         let limit = Duration::from_secs(300);
                         oauth::approve(&endpoints, &settings, None, limit, |url| open(url)).await
                     },
-                    Message::Approved,
+                    move |result| Message::Approved(attempt, result),
                 )
                 .abortable();
                 self.sign_in = Some(handle);
@@ -4175,8 +4187,10 @@ impl App {
             // dropped: a cancel or sign-out during it only means that its
             // result arrives with nobody waiting and is revoked, below. The
             // handle stays until then, so Cancel still works.
-            Message::Approved(Ok(approval))
-                if self.account == Account::SigningIn && self.sign_in.is_some() =>
+            Message::Approved(attempt, Ok(approval))
+                if attempt == self.sign_in_attempt
+                    && self.account == Account::SigningIn
+                    && self.sign_in.is_some() =>
             {
                 let endpoints = self.endpoints.clone();
                 return Task::perform(
@@ -4184,13 +4198,16 @@ impl App {
                         let http = oauth::http_client(Duration::from_secs(60));
                         oauth::complete(&http, &endpoints, approval).await
                     },
-                    Message::SignedIn,
+                    move |result| Message::SignedIn(attempt, result),
                 );
             }
             // An approval nobody is waiting for holds no token; it is dropped.
-            Message::Approved(Ok(_)) => {}
-            Message::Approved(Err(e)) => {
-                if self.account == Account::SigningIn && self.sign_in.is_some() {
+            Message::Approved(_, Ok(_)) => {}
+            Message::Approved(attempt, Err(e)) => {
+                if attempt == self.sign_in_attempt
+                    && self.account == Account::SigningIn
+                    && self.sign_in.is_some()
+                {
                     self.sign_in = None;
                     self.account = Account::SignedOut;
                     self.account_note = e;
@@ -4209,11 +4226,14 @@ impl App {
                     self.account_note = "Sign-in cancelled.".into();
                 }
             }
-            // A sign-in nobody is waiting for any more, or a second result
-            // while the first is being saved: its refresh token was never
-            // saved, so revoke it instead of leaving it valid.
-            Message::SignedIn(Ok((session, client_id)))
-                if self.account != Account::SigningIn || self.saving_sign_in() =>
+            // A sign-in nobody is waiting for any more (cancelled, signed out,
+            // or superseded by a newer attempt), or a second result while the
+            // first is being saved: its refresh token was never saved, so
+            // revoke it instead of leaving it valid.
+            Message::SignedIn(attempt, Ok((session, client_id)))
+                if attempt != self.sign_in_attempt
+                    || self.account != Account::SigningIn
+                    || self.saving_sign_in() =>
             {
                 let endpoints = self.endpoints.clone();
                 return Task::perform(
@@ -4223,12 +4243,14 @@ impl App {
                     |()| Message::Noop,
                 );
             }
-            Message::SignedIn(Err(_))
-                if self.account != Account::SigningIn || self.saving_sign_in() => {}
+            Message::SignedIn(attempt, Err(_))
+                if attempt != self.sign_in_attempt
+                    || self.account != Account::SigningIn
+                    || self.saving_sign_in() => {}
             // The browser step is done. Saving is a step of its own that
             // cannot be cancelled, so a cancel can never land in the middle
             // of it; the account shows nothing until it reports.
-            Message::SignedIn(Ok((session, client_id))) => {
+            Message::SignedIn(_, Ok((session, client_id))) => {
                 self.sign_in = None;
                 self.settings.client_id = client_id.clone();
                 self.settings_failure = self.write_settings().err();
@@ -4242,7 +4264,7 @@ impl App {
                     Message::SessionSaved,
                 );
             }
-            Message::SignedIn(Err(e)) => {
+            Message::SignedIn(_, Err(e)) => {
                 self.sign_in = None;
                 self.account = Account::SignedOut;
                 self.account_note = e;

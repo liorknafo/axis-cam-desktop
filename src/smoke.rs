@@ -7982,7 +7982,10 @@ flood = { pin = 8 }
             let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
             let id = iced::window::Id::unique();
             let _ = a.update(Message::SignIn);
-            let _ = a.update(Message::SignedIn(Ok((session.clone(), "oaiapp_1".into()))));
+            let _ = a.update(Message::SignedIn(
+                a.sign_in_attempt,
+                Ok((session.clone(), "oaiapp_1".into())),
+            ));
             assert!(a.saving_sign_in());
             let _ = a.update(Message::Close(id));
             assert!(a.closing.is_some());
@@ -8025,10 +8028,10 @@ flood = { pin = 8 }
         // A sign-in save still pending after 11 s: close.
         let mut a = fresh();
         let _ = a.update(Message::SignIn);
-        let _ = a.update(Message::SignedIn(Ok((
-            crate::session::sample(),
-            "oaiapp_1".into(),
-        ))));
+        let _ = a.update(Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((crate::session::sample(), "oaiapp_1".into())),
+        ));
         assert!(a.saving_sign_in());
         assert_eq!(a.close_decision(id, start), Wait);
         assert_eq!(a.close_decision(id, after(11.)), Close);
@@ -9294,7 +9297,10 @@ flood = { pin = 8 }
             .save(&session)
             .unwrap();
         let _ = a.update(Message::SignIn);
-        let _ = a.update(Message::SignedIn(Ok((session.clone(), "oaiapp_1".into()))));
+        let _ = a.update(Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((session.clone(), "oaiapp_1".into())),
+        ));
         let _ = a.update(Message::SessionSaved(Ok(session)));
     }
     /// What a message that must be ignored may not change.
@@ -12209,9 +12215,10 @@ flood = { pin = 8 }
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Sign-in cancelled.");
         let _ = a.update(Message::SignIn);
-        let _ = a.update(Message::SignedIn(Err(
-            "Sign-in timed out. Try again.".into()
-        )));
+        let _ = a.update(Message::SignedIn(
+            a.sign_in_attempt,
+            Err("Sign-in timed out. Try again.".into()),
+        ));
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Sign-in timed out. Try again.");
         let mut a = signed_in_app(&dir);
@@ -12500,13 +12507,19 @@ flood = { pin = 8 }
         let _ = a.update(Message::SignIn);
         let _ = a.update(Message::SignInCancel);
         // The result is not used, but its refresh token is revoked: one task.
-        let late = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        let late = Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((crate::session::sample(), "oaiapp_1".into())),
+        );
         assert_eq!(a.update(late).units(), 1);
         assert_eq!(a.account, crate::Account::SignedOut);
         assert_eq!(a.account_note, "Sign-in cancelled.");
         assert!(a.settings.client_id.is_empty() && a.models.is_empty());
         assert!(a.client.is_none());
-        let late = Message::SignedIn(Err("Sign-in timed out. Try again.".into()));
+        let late = Message::SignedIn(
+            a.sign_in_attempt,
+            Err("Sign-in timed out. Try again.".into()),
+        );
         assert_eq!(a.update(late).units(), 0);
         assert_eq!(a.account_note, "Sign-in cancelled.");
     }
@@ -12521,7 +12534,10 @@ flood = { pin = 8 }
         assert!(handle.is_aborted() && a.sign_in.is_none());
         assert_eq!(a.account, crate::Account::SignedOut);
         assert!(!a.sign_out_pending, "there was no client to sign out");
-        let late = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        let late = Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((crate::session::sample(), "oaiapp_1".into())),
+        );
         assert_eq!(a.update(late).units(), 1, "revoked, not adopted");
         assert_eq!(a.account, crate::Account::SignedOut);
         assert!(a.account_note.is_empty());
@@ -12819,7 +12835,7 @@ flood = { pin = 8 }
         let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
         let session = crate::session::sample();
-        let result = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let result = Message::SignedIn(a.sign_in_attempt, Ok((session.clone(), "oaiapp_1".into())));
         // The save step is the one returned task; the account waits for it.
         assert_eq!(a.update(result).units(), 1);
         assert_eq!(a.account, crate::Account::SigningIn);
@@ -12839,7 +12855,10 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
-        let result = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        let result = Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((crate::session::sample(), "oaiapp_1".into())),
+        );
         let _ = a.update(result);
         let failed = "Could not save the ChatGPT sign-in: Keychain: save denied".to_string();
         assert_eq!(
@@ -12859,7 +12878,7 @@ flood = { pin = 8 }
         let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
         let session = crate::session::sample();
-        let result = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let result = Message::SignedIn(a.sign_in_attempt, Ok((session.clone(), "oaiapp_1".into())));
         let _ = a.update(result);
         // The save cannot be aborted, so there is nothing to cancel.
         assert_eq!(a.update(Message::SignInCancel).units(), 0);
@@ -12987,6 +13006,164 @@ flood = { pin = 8 }
         }
     }
     #[test]
+    fn a_result_of_a_superseded_sign_in_changes_nothing_and_is_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        let _ = a.update(Message::SignIn);
+        let first = a.sign_in_attempt;
+        let _ = a.update(Message::SignInCancel);
+        let _ = a.update(Message::SignIn);
+        assert!(a.sign_in_attempt != first);
+        let handle = a.sign_in.clone().expect("the second sign-in is running");
+        let before = snapshot(&a);
+        // The first attempt's exchange ends: revoked, not adopted, and the
+        // second attempt is left running.
+        let late = Message::SignedIn(first, Ok((crate::session::sample(), "oaiapp_1".into())));
+        assert_eq!(a.update(late).units(), 1);
+        assert_eq!(snapshot(&a), before);
+        assert!(a.sign_in.is_some() && !handle.is_aborted() && !a.saving_sign_in());
+        assert!(a.settings.client_id.is_empty() && a.client.is_none());
+        // Neither its failure nor its browser step touches the second one.
+        let late = Message::SignedIn(first, Err("The ID token is not valid.".into()));
+        assert_eq!(a.update(late).units(), 0);
+        let late = Message::Approved(first, Err("Sign-in timed out. Try again.".into()));
+        assert_eq!(a.update(late).units(), 0);
+        assert_eq!(snapshot(&a), before);
+        assert!(a.sign_in.is_some() && a.account_note.is_empty());
+        // Starting over while a handle is left behind aborts it.
+        a.account = crate::Account::SignedOut;
+        let _ = a.update(Message::SignIn);
+        assert!(handle.is_aborted());
+        assert!(a.sign_in.is_some());
+    }
+    #[test]
+    fn cancelling_during_the_exchange_and_signing_in_again_adopts_the_second_account() {
+        use crate::fake_openai::{Fake, Resp, claims, id_token, jwks, tokens};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering::SeqCst};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = fresh_app(&dir);
+            // The claims of each code, filled in when its browser opens.
+            let id_claims = Arc::new(Mutex::new(HashMap::<String, serde_json::Value>::new()));
+            let served = id_claims.clone();
+            let keys = Arc::new(AtomicUsize::new(0));
+            let fake = Fake::start(move |r| match r.path.as_str() {
+                // The first attempt's keys stall, so its exchange is still
+                // running when the user cancels and starts over.
+                "/jwks" if keys.fetch_add(1, SeqCst) == 0 => Resp {
+                    delay_ms: 700,
+                    ..Resp::json(200, jwks())
+                },
+                "/jwks" => Resp::json(200, jwks()),
+                "/revoke" => Resp::json(200, serde_json::json!({})),
+                "/token" => {
+                    let code = r.field("code");
+                    let claims = served.lock().unwrap()[&code].clone();
+                    let refresh = format!("refresh-{code}");
+                    let scope = crate::session::sample().scope;
+                    Resp::json(200, tokens("access", &refresh, &id_token(claims), &scope))
+                }
+                _ => Resp::json(404, serde_json::json!({})),
+            })
+            .await;
+            a.endpoints = crate::oauth::Endpoints::local(&fake.base);
+            // The second browser waits for the test before it approves.
+            let callbacks = Arc::new(Mutex::new(Vec::<String>::new()));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let (stored, count) = (callbacks.clone(), opened.clone());
+            a.open_browser = Arc::new(move |url: &str| {
+                let url = reqwest::Url::parse(url).unwrap();
+                let get = |key: &str| {
+                    url.query_pairs()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default()
+                };
+                let n = count.fetch_add(1, SeqCst) + 1;
+                let mut c = claims("oaiapp_1", &get("nonce"));
+                c["sub"] = format!("user-{n}").into();
+                c["name"] = format!("Account {n}").into();
+                id_claims.lock().unwrap().insert(format!("code-{n}"), c);
+                let callback = format!(
+                    "{}?code=code-{n}&state={}&client_id=oaiapp_1",
+                    get("redirect_uri"),
+                    get("state")
+                );
+                if n == 1 {
+                    tokio::spawn(async move { reqwest::get(callback).await });
+                } else {
+                    stored.lock().unwrap().push(callback);
+                }
+                Ok(())
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let pending = Arc::new(AtomicUsize::new(0));
+            pump_task(a.update(Message::SignIn), tx.clone(), pending.clone());
+            let mut waited = 0;
+            while fake.seen("/jwks").is_empty() {
+                assert!(waited < 400, "the sign-in never reached the keys");
+                waited += 1;
+                while let Ok(message) = rx.try_recv() {
+                    pump_task(a.update(message), tx.clone(), pending.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            // Cancel during the exchange, then sign in as the other account.
+            pump_task(a.update(Message::SignInCancel), tx.clone(), pending.clone());
+            pump_task(a.update(Message::SignIn), tx.clone(), pending.clone());
+            assert_eq!(a.account, crate::Account::SigningIn);
+            // The first exchange ends while the second browser step still
+            // waits: its tokens must not be adopted.
+            let mut waited = 0;
+            let mut ended = false;
+            while !ended {
+                assert!(waited < 400, "the first exchange never ended");
+                waited += 1;
+                match rx.try_recv() {
+                    Ok(message) => {
+                        ended = matches!(message, Message::SignedIn(..));
+                        pump_task(a.update(message), tx.clone(), pending.clone());
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+                }
+            }
+            assert_eq!(a.account, crate::Account::SigningIn);
+            assert!(a.sign_in.is_some() && !a.saving_sign_in());
+            // Now the second browser approves.
+            let callback = callbacks.lock().unwrap().pop().expect("a second browser");
+            tokio::spawn(async move { reqwest::get(callback).await });
+            loop {
+                if let Ok(message) = rx.try_recv() {
+                    pump_task(a.update(message), tx.clone(), pending.clone());
+                } else if pending.load(SeqCst) == 0 {
+                    break;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            match &a.account {
+                crate::Account::SignedIn { name, .. } => assert_eq!(name, "Account 2"),
+                other => panic!("the second account was not adopted: {other:?}"),
+            }
+            assert_eq!(
+                a.store.load().unwrap().unwrap().refresh_token,
+                "refresh-code-2"
+            );
+            let revoked: Vec<String> = fake
+                .seen("/revoke")
+                .iter()
+                .map(|r| r.field("token"))
+                .collect();
+            assert_eq!(revoked, ["refresh-code-1"]);
+            assert!(a.sign_in.is_none());
+        });
+    }
+    #[test]
     fn the_sign_out_note_says_nothing_while_waiting_and_confirms_afterwards() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_app(&dir);
@@ -13036,7 +13213,10 @@ flood = { pin = 8 }
         let _ = a.view(); // signed out
         let _ = a.update(Message::SignIn);
         let _ = a.view(); // browser step
-        let result = Message::SignedIn(Ok((crate::session::sample(), "oaiapp_1".into())));
+        let result = Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((crate::session::sample(), "oaiapp_1".into())),
+        );
         let _ = a.update(result);
         assert!(a.saving_sign_in());
         let _ = a.view(); // save step
@@ -13088,7 +13268,7 @@ flood = { pin = 8 }
         let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
         let session = crate::session::sample();
-        let result = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let result = Message::SignedIn(a.sign_in_attempt, Ok((session.clone(), "oaiapp_1".into())));
         let _ = a.update(result);
         assert!(a.saving_sign_in());
         let before = snapshot(&a);
@@ -13111,7 +13291,7 @@ flood = { pin = 8 }
         let mut a = fresh_app(&dir);
         let _ = a.update(Message::SignIn);
         let session = crate::session::sample();
-        let first = Message::SignedIn(Ok((session.clone(), "oaiapp_1".into())));
+        let first = Message::SignedIn(a.sign_in_attempt, Ok((session.clone(), "oaiapp_1".into())));
         let _ = a.update(first);
         assert!(a.saving_sign_in());
         let before = snapshot(&a);
@@ -13121,7 +13301,7 @@ flood = { pin = 8 }
             ..crate::session::sample()
         };
         // The only task is the revoke of the unused session.
-        let late = Message::SignedIn(Ok((other, "oaiapp_other".into())));
+        let late = Message::SignedIn(a.sign_in_attempt, Ok((other, "oaiapp_other".into())));
         assert_eq!(a.update(late).units(), 1);
         assert_eq!(snapshot(&a), before);
         assert_eq!(a.settings.client_id, "oaiapp_1");
@@ -13129,7 +13309,7 @@ flood = { pin = 8 }
         assert_eq!(saved.client_id, "oaiapp_1");
         assert!(a.saving_sign_in());
         // A late failure neither ends the save step nor shows a message.
-        let late = Message::SignedIn(Err("The browser sign-in failed.".into()));
+        let late = Message::SignedIn(a.sign_in_attempt, Err("The browser sign-in failed.".into()));
         assert_eq!(a.update(late).units(), 0);
         assert_eq!(snapshot(&a), before);
         assert!(a.saving_sign_in());
@@ -13192,7 +13372,10 @@ flood = { pin = 8 }
             ..crate::session::sample()
         };
         // The only task is the revoke of the unused session.
-        let late = Message::SignedIn(Ok((other.clone(), "oaiapp_other".into())));
+        let late = Message::SignedIn(
+            a.sign_in_attempt,
+            Ok((other.clone(), "oaiapp_other".into())),
+        );
         assert_eq!(a.update(late).units(), 1);
         assert_eq!(snapshot(&a), before);
         assert_eq!(a.settings.client_id, "oaiapp_1");
