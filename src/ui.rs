@@ -13,7 +13,7 @@ use iced::{
     Theme,
     widget::{
         self, Column, Row, button, canvas, checkbox, column, container, mouse_area, pick_list, row,
-        rule, scrollable, slider, space, svg, text, text_input,
+        rule, scrollable, slider, space, svg, text, text::Wrapping, text_input,
     },
 };
 const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
@@ -695,15 +695,39 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         .style(panel_style)
         .into()
 }
-fn browser(app: &App) -> Element<'_, Message> {
+/// Room kept at the right of a scrolled column for its scrollbar, which
+/// Iced's `scrollable` draws over the content: the bar is 10 wide.
+const SCROLLBAR_GUTTER: f32 = 14.;
+/// The browser's mark column: wide enough for the widest mark, "✓·".
+const MARK_WIDTH: f32 = 22.;
+/// How many characters of an operation's or a setup's name the browser shows
+/// before an ellipsis; the clipped row is the net for wide letters. The full
+/// name is in the row's hover help.
+const OP_NAME_CHARS: usize = 20;
+const SETUP_NAME_CHARS: usize = 14;
+/// `name` cut to `max` characters, ending in "…" when it was longer. Iced
+/// 0.14 text has no ellipsis of its own.
+pub(crate) fn ellipsize(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    let kept: String = name.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
+}
+pub(crate) fn browser(app: &App) -> Element<'_, Message> {
+    // The count and the rule stay put above the scrolling tree, so the
+    // scrollbar, drawn over the content's right edge, never covers the count.
+    let header = column![
+        row![
+            bold("BROWSER", 11),
+            space().width(Fill),
+            muted(format!("{} setups", app.doc.setups.len()))
+        ],
+        rule::horizontal(1)
+    ]
+    .spacing(9);
     let mut tree =
         column![
-            row![
-                bold("BROWSER", 11),
-                space().width(Fill),
-                muted(format!("{} setups", app.doc.setups.len()))
-            ],
-            rule::horizontal(1),
             bold(&app.doc.title, 14),
             muted(app.doc.file.as_ref().map(|f| f.name.as_str()).unwrap_or(
                 if app.doc.sample_model {
@@ -724,17 +748,21 @@ fn browser(app: &App) -> Element<'_, Message> {
         let active = s.id == app.doc.active;
         let label = row![
             text(if active { "▾" } else { "▸" }).size(12),
-            column![
-                bold(s.name(), 12),
-                muted(format!(
-                    "{} · {}-axis",
-                    get(&s.p, "offset"),
-                    s.machine.axes()
-                ))
-                .size(10)
-            ]
-            .spacing(2)
-            .width(Fill),
+            container(
+                column![
+                    bold(ellipsize(s.name(), SETUP_NAME_CHARS), 12).wrapping(Wrapping::None),
+                    muted(format!(
+                        "{} · {}-axis",
+                        get(&s.p, "offset"),
+                        s.machine.axes()
+                    ))
+                    .size(10)
+                    .wrapping(Wrapping::None)
+                ]
+                .spacing(2)
+            )
+            .width(Fill)
+            .clip(true),
             stock_picture(app, si, false).map(|p| widget::image(p).width(64).height(48))
         ]
         .spacing(6)
@@ -767,8 +795,16 @@ fn browser(app: &App) -> Element<'_, Message> {
                 let (glyph, color) = (mark.glyph(), mark.color());
                 let content = row![
                     icon(app, o.strategy, 23.),
-                    text(o.name()).size(12).width(Fill),
-                    text(glyph).size(13).color(color)
+                    container(
+                        text(ellipsize(o.name(), OP_NAME_CHARS))
+                            .size(12)
+                            .wrapping(Wrapping::None)
+                    )
+                    .width(Fill)
+                    .clip(true),
+                    container(text(glyph).size(13).color(color))
+                        .width(MARK_WIDTH)
+                        .align_x(iced::alignment::Horizontal::Right)
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center);
@@ -831,7 +867,11 @@ fn browser(app: &App) -> Element<'_, Message> {
         muted("Machine limits can use mm or inch. Tool and operation values use mm.").size(10)
     ]
     .spacing(6);
-    container(column![scrollable(tree).height(Fill), footer].spacing(12))
+    let tree = container(tree).width(Fill).padding(iced::Padding {
+        right: SCROLLBAR_GUTTER,
+        ..Default::default()
+    });
+    container(column![header, scrollable(tree).height(Fill), footer].spacing(12))
         .padding(14)
         .width(230)
         .height(Fill)
@@ -4427,7 +4467,73 @@ fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
-fn tools(app: &App) -> Element<'_, Message> {
+/// The note under a library editor's fields when its draft is not what the
+/// library holds: `saved` is the entry with the draft's id, if there is one.
+fn unsaved_note(draft: &Fields, saved: Option<&Fields>, what: &str) -> Option<String> {
+    match saved {
+        None => Some(format!(
+            "This {what} is not in the library yet: Save adds it."
+        )),
+        Some(saved) if saved != draft => Some(format!(
+            "Unsaved changes to this {what}: Save keeps them, choosing another entry drops them."
+        )),
+        Some(_) => None,
+    }
+}
+pub(crate) fn tool_unsaved(app: &App) -> Option<String> {
+    let draft = &app.tool_draft;
+    let saved = app.doc.tools.iter().find(|t| t.id == draft.id);
+    unsaved_note(&draft.p, saved.map(|t| &t.p), "tool")
+}
+pub(crate) fn material_unsaved(app: &App) -> Option<String> {
+    let draft = &app.material_draft;
+    let saved = app.doc.materials.iter().find(|m| m.id == draft.id);
+    unsaved_note(&draft.p, saved.map(|m| &m.p), "material")
+}
+pub(crate) fn holder_unsaved(app: &App) -> Option<String> {
+    let draft = &app.holder_draft;
+    let saved = app.doc.workholding.iter().find(|h| h.id == draft.id);
+    unsaved_note(&draft.p, saved.map(|h| &h.p), holder_word(draft))
+}
+/// What a workholding entry is called on its buttons and notes.
+fn holder_word(h: &crate::holding::Holder) -> &'static str {
+    match h.kind() {
+        "Vise" => "vise",
+        "Clamp" => "clamp",
+        _ => "entry",
+    }
+}
+/// The labels of the Save and Delete buttons of the workholding editor.
+pub(crate) fn holder_labels(h: &crate::holding::Holder) -> (String, String) {
+    let word = holder_word(h);
+    (format!("Save {word}"), format!("Delete {word}"))
+}
+/// The one layout of the library editors (Tools, Materials, Workholding): the
+/// fields scroll, and under them, outside the scroll, the unsaved-draft note
+/// and the Save and Delete buttons stay in sight at any window height.
+fn library_editor<'a>(
+    form: Column<'a, Message>,
+    unsaved: Option<String>,
+    save: HelpButton<'a>,
+    delete: HelpButton<'a>,
+) -> Element<'a, Message> {
+    let mut actions = column![].spacing(8);
+    if let Some(unsaved) = unsaved {
+        actions = actions.push(text(unsaved).size(12).color(Color::from_rgb8(166, 101, 32)));
+    }
+    actions = actions.push(row![save, delete].spacing(10));
+    let form = container(form).width(Fill).padding(iced::Padding {
+        right: SCROLLBAR_GUTTER,
+        ..Default::default()
+    });
+    container(column![scrollable(form).height(Fill), actions].spacing(14))
+        .padding(24)
+        .width(Fill)
+        .height(Fill)
+        .style(panel_style)
+        .into()
+}
+pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     if app.doc.tools.is_empty() && app.tool_draft.name().is_empty() {
         return container(
             column![
@@ -4507,22 +4613,22 @@ fn tools(app: &App) -> Element<'_, Message> {
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues));
-    // Below the scrolling fields, so Save stays in sight.
-    let actions = row![
+    let editor = library_editor(
+        form,
+        tool_unsaved(app),
         primary(
             app.resume_label().unwrap_or("Save tool".into()),
-            Message::SaveTool
+            Message::SaveTool,
         ),
         btn(
             "Delete tool",
             Message::DeleteTool(app.tool_draft.id.clone()),
-            false
-        )
-    ]
-    .spacing(10);
-    container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),container(column![scrollable(form).height(Fill),actions].spacing(14)).padding(24).width(Fill).height(Fill).style(panel_style)].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
+            false,
+        ),
+    );
+    container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),editor].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
 }
-fn materials(app: &App) -> Element<'_, Message> {
+pub(crate) fn materials(app: &App) -> Element<'_, Message> {
     let mut list = column![
         bold("Material library", 17),
         primary("+ New material", Message::NewMaterial)
@@ -4578,16 +4684,16 @@ fn materials(app: &App) -> Element<'_, Message> {
     }
     let mut issues = app.material_draft.issues();
     issues.extend(app.doc.material_name_issues(&app.material_draft));
-    form = form.push(warnings(issues)).push(
-        row![
-            primary("Save material", Message::SaveMaterial),
-            btn(
-                "Delete material",
-                Message::DeleteMaterial(app.material_draft.id.clone()),
-                false
-            )
-        ]
-        .spacing(10),
+    form = form.push(warnings(issues));
+    let editor = library_editor(
+        form,
+        material_unsaved(app),
+        primary("Save material", Message::SaveMaterial),
+        btn(
+            "Delete material",
+            Message::DeleteMaterial(app.material_draft.id.clone()),
+            false,
+        ),
     );
     container(
         column![
@@ -4601,11 +4707,7 @@ fn materials(app: &App) -> Element<'_, Message> {
                     .width(320)
                     .height(Fill)
                     .style(panel_style),
-                container(scrollable(form))
-                    .padding(24)
-                    .width(Fill)
-                    .height(Fill)
-                    .style(panel_style)
+                editor
             ]
             .spacing(20)
             .height(Fill)
@@ -4650,7 +4752,7 @@ fn holder_summary(h: &crate::holding::Holder) -> String {
         other => other.to_string(),
     }
 }
-fn workholding(app: &App) -> Element<'_, Message> {
+pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let mut list = column![
         bold("Workholding library", 17),
         row![
@@ -4686,14 +4788,14 @@ fn workholding(app: &App) -> Element<'_, Message> {
     issues.extend(app.doc.holder_name_issues(draft));
     form = form
         .push(field(p, "notes", "Notes", t))
-        .push(warnings(issues))
-        .push(
-            row![
-                primary("Save", Message::SaveHolder),
-                btn("Delete", Message::DeleteHolder(draft.id.clone()), false)
-            ]
-            .spacing(10),
-        );
+        .push(warnings(issues));
+    let (save, delete) = holder_labels(draft);
+    let editor = library_editor(
+        form,
+        holder_unsaved(app),
+        primary(save, Message::SaveHolder),
+        btn(delete, Message::DeleteHolder(draft.id.clone()), false),
+    );
     container(
         column![
             page_header(
@@ -4706,11 +4808,7 @@ fn workholding(app: &App) -> Element<'_, Message> {
                     .width(320)
                     .height(Fill)
                     .style(panel_style),
-                container(scrollable(form))
-                    .padding(24)
-                    .width(Fill)
-                    .height(Fill)
-                    .style(panel_style)
+                editor
             ]
             .spacing(20)
             .height(Fill)

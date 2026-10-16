@@ -8618,6 +8618,166 @@ flood = { pin = 8 }
         let _ = a.update(Message::NewTool);
         assert_eq!(a.tool_draft.number(), Some(4));
     }
+    /// What a widget tree has outside its scrollables: buttons, and how many
+    /// scrollables there are.
+    fn outside_scrolls(e: iced::Element<'_, Message>) -> (usize, usize) {
+        use iced::advanced::widget::{Tree, tree::Tag};
+        fn walk(t: &Tree, button: Tag, scroll: Tag) -> (usize, usize) {
+            if t.tag == scroll {
+                return (0, 1);
+            }
+            t.children
+                .iter()
+                .fold((usize::from(t.tag == button), 0), |(b, s), c| {
+                    let (cb, cs) = walk(c, button, scroll);
+                    (b + cb, s + cs)
+                })
+        }
+        let button =
+            Tree::new(iced::Element::<Message>::from(iced::widget::button("x")).as_widget()).tag;
+        let scroll = Tree::new(
+            iced::Element::<Message>::from(iced::widget::scrollable(iced::widget::text("x")))
+                .as_widget(),
+        )
+        .tag;
+        walk(&Tree::new(e.as_widget()), button, scroll)
+    }
+
+    /// The three library pages share one editor layout (#87): the fields
+    /// scroll, and Save and Delete, named for the entry, sit under them.
+    #[test]
+    fn each_library_page_builds_with_save_and_delete_fixed_under_the_scrolling_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        // The list and the fields scroll; outside both are the page's Back
+        // button and the editor's Save and Delete (before, Materials and
+        // Workholding had only Back outside: their Save scrolled).
+        let pages: [fn(&App) -> iced::Element<'_, Message>; 3] = [
+            crate::ui::tools,
+            crate::ui::materials,
+            crate::ui::workholding,
+        ];
+        for page in pages {
+            assert_eq!(outside_scrolls(page(&a)), (3, 2));
+        }
+        // Still so for a draft that is new, and one with a clamp, a vise and
+        // another kind of entry.
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::NewMaterial);
+        for kind in ["Vise", "Clamp"] {
+            let _ = a.update(Message::NewHolder(kind));
+            for page in pages {
+                assert_eq!(outside_scrolls(page(&a)), (3, 2), "{kind}");
+            }
+        }
+        a.holder_draft = crate::holding::Holder::new("Fixture plate", "Plate");
+        assert_eq!(outside_scrolls(crate::ui::workholding(&a)), (3, 2));
+    }
+
+    #[test]
+    fn a_workholding_entry_saves_and_deletes_under_its_own_name() {
+        use crate::holding::Holder;
+        let labels = |kind| crate::ui::holder_labels(&Holder::new(kind, "x"));
+        assert_eq!(labels("Vise"), ("Save vise".into(), "Delete vise".into()));
+        assert_eq!(
+            labels("Clamp"),
+            ("Save clamp".into(), "Delete clamp".into())
+        );
+        assert_eq!(
+            labels("Plate"),
+            ("Save entry".into(), "Delete entry".into())
+        );
+    }
+
+    #[test]
+    fn a_library_editor_says_when_its_draft_is_not_what_the_library_holds() {
+        use crate::ui::{holder_unsaved, material_unsaved, tool_unsaved};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.doc.adopt_materials();
+        a.material_draft = a.doc.materials[0].clone();
+        a.holder_draft = a.doc.workholding[0].clone();
+        // Each draft is the library's first entry: nothing to say.
+        assert_eq!(tool_unsaved(&a), None);
+        assert_eq!(material_unsaved(&a), None);
+        assert_eq!(holder_unsaved(&a), None);
+        // An edit makes it unsaved, and saving it clears the note.
+        let _ = a.update(Message::Edit(Target::Tool, "flutes", "5".into()));
+        let _ = a.update(Message::Edit(Target::Material, "hardness", "63 HRC".into()));
+        let _ = a.update(Message::Edit(Target::Holder, "notes", "my vise".into()));
+        assert!(
+            tool_unsaved(&a)
+                .unwrap()
+                .starts_with("Unsaved changes to this tool")
+        );
+        assert!(
+            material_unsaved(&a)
+                .unwrap()
+                .starts_with("Unsaved changes to this material")
+        );
+        assert!(
+            holder_unsaved(&a)
+                .unwrap()
+                .starts_with("Unsaved changes to this vise")
+        );
+        let _ = a.update(Message::SaveTool);
+        let _ = a.update(Message::SaveMaterial);
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.tools[0].p["flutes"], "5", "{}", a.status);
+        assert_eq!(tool_unsaved(&a), None, "{}", a.status);
+        assert_eq!(material_unsaved(&a), None, "{}", a.status);
+        assert_eq!(holder_unsaved(&a), None, "{}", a.status);
+        // A new entry is not in the library until it is saved.
+        let _ = a.update(Message::NewMaterial);
+        let _ = a.update(Message::NewHolder("Clamp"));
+        assert!(
+            material_unsaved(&a)
+                .unwrap()
+                .contains("not in the library yet")
+        );
+        assert!(
+            holder_unsaved(&a)
+                .unwrap()
+                .starts_with("This clamp is not in the library")
+        );
+    }
+
+    /// The browser keeps its setup count and rule outside the scrolling tree,
+    /// puts every setup and operation in it, and cuts a long name (#78).
+    #[test]
+    fn the_browser_builds_with_a_long_operation_and_setup_name_and_keeps_its_count_fixed() {
+        use crate::ui::ellipsize;
+        let long =
+            "Rough the whole outer wall of the bearing housing down to the finishing allowance";
+        assert_eq!(ellipsize("Facing", 20), "Facing");
+        assert_eq!(
+            ellipsize("12345678901234567890", 20),
+            "12345678901234567890"
+        );
+        let cut = ellipsize(long, 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.ends_with('…') && long.starts_with(&cut[..cut.len() - '…'.len_utf8()]));
+        // A multi-byte name is cut on a character, and the space before the
+        // ellipsis goes.
+        assert_eq!(ellipsize("Ø6 flat   mill", 8), "Ø6 flat…");
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.page = Page::Work;
+        let before = crate::ui::browser(&a);
+        let (outside, scrolls) = outside_scrolls(before);
+        // The browser holds no button outside its scroll: the count and the
+        // footer are text.
+        assert_eq!((outside, scrolls), (0, 1));
+        let ops = a.doc.setups[0].operations.len();
+        assert!(ops > 0);
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("name".into(), long.into());
+        a.doc.setups[0].p.insert("name".into(), long.into());
+        let _ = a.view();
+        assert_eq!(outside_scrolls(crate::ui::browser(&a)), (0, 1));
+    }
+
     fn fresh_app(dir: &tempfile::TempDir) -> App {
         App::from_workspace(dir.path().join("workspace.json"), None)
     }
