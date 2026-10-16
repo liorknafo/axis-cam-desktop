@@ -5495,6 +5495,54 @@ pub(crate) fn fixtures(note: Note, modelled: bool) -> &'static str {
         (Note::Panel, true) => "Adaptive stock · jaws and clamps checked as boxes",
     }
 }
+/// A text of the plan preview that `clip` shortens and the user can open in
+/// full: the planner's summary, a setup's workholding note, an operation's
+/// reason, an unmachined feature, a warning (by setup, operation or list
+/// position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Expand {
+    Summary,
+    Workholding(usize),
+    Reason(usize, usize),
+    Unmachined(usize),
+    Warning(usize),
+}
+/// The most characters an opened text shows: the layout stays bounded for a
+/// reply that is all one huge sentence.
+const FULL_TEXT: usize = 4000;
+/// The "Show full text" / "Show less" link under a clipped text.
+fn full_text_button<'a>(open: bool, key: Expand) -> Element<'a, Message> {
+    button(text(if open { "Show less" } else { "Show full text" }).size(12))
+        .on_press(Message::PlanExpand(key))
+        .padding(0)
+        .style(|_, status| button::Style {
+            text_color: if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                Color::from_rgb8(32, 97, 155)
+            } else {
+                BLUE
+            },
+            ..Default::default()
+        })
+        .into()
+}
+/// The model's `parts` as the preview shows them, each cut at its limit, or
+/// at `FULL_TEXT` once `key` is open, and the link that opens or closes them
+/// when any of them was cut.
+fn disclosure<'a, const N: usize>(
+    app: &App,
+    key: Expand,
+    parts: [(&str, usize); N],
+) -> ([String; N], Option<Element<'a, Message>>) {
+    let open = app.plan_expanded.contains(&key);
+    let mut cut = false;
+    let shown = parts.map(|(full, limit)| {
+        let short = clip(full, limit);
+        // `clip` ends a cut text with "…", one character past the limit.
+        cut |= short.chars().count() > limit;
+        if open { clip(full, FULL_TEXT) } else { short }
+    });
+    (shown, cut.then(|| full_text_button(open, key)))
+}
 fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a, Message> {
     let outcome = &preview.outcome;
     let (job, check, proposal) = (&outcome.job, &outcome.check, &outcome.proposal);
@@ -5522,13 +5570,13 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
     c = c.push(checks).push(actions());
     // The model's words are labelled as the planner's; the app's are not.
     if !proposal.summary.is_empty() {
-        c = c.push(
-            column![
-                bold("The planner's summary", 15),
-                text(clip(&proposal.summary, 600)).size(13)
-            ]
-            .spacing(6),
-        );
+        let ([summary], more) = disclosure(app, Expand::Summary, [(&proposal.summary, 600)]);
+        let mut block =
+            column![bold("The planner's summary", 15), text(summary).size(13)].spacing(6);
+        if let Some(more) = more {
+            block = block.push(more);
+        }
+        c = c.push(block);
     }
     for (si, setup) in job.setups.iter().enumerate() {
         let proposed = proposal.setups.get(si);
@@ -5545,7 +5593,11 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             .map(|s| s.workholding.as_str())
             .filter(|n| !n.is_empty())
         {
-            card = card.push(muted(workholding_line(si, &clip(notes, 500))));
+            let ([notes], more) = disclosure(app, Expand::Workholding(si), [(notes, 500)]);
+            card = card.push(muted(workholding_line(si, &notes)));
+            if let Some(more) = more {
+                card = card.push(more);
+            }
         }
         if let Some(line) = plan_holding_line(job, si) {
             card = card.push(muted(line));
@@ -5562,17 +5614,22 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
                 .iter()
                 .find(|r| r.setup == si + 1 && r.operation == oi + 1)
                 .map_or(0., |r| r.minutes);
-            let reason = proposed
-                .and_then(|s| s.operations.get(oi))
-                .map_or(String::new(), |p| clip(&p.reason, 160));
-            let [head, values, why] = operation_lines(o, &tool, minutes, &reason);
-            card = card.push(
-                row![
-                    icon(app, o.strategy, 22.),
-                    column![text(head).size(13), muted(values), muted(why)].spacing(2)
-                ]
-                .spacing(8),
+            let ([reason], more) = disclosure(
+                app,
+                Expand::Reason(si, oi),
+                [(
+                    proposed
+                        .and_then(|s| s.operations.get(oi))
+                        .map_or("", |p| p.reason.as_str()),
+                    160,
+                )],
             );
+            let [head, values, why] = operation_lines(o, &tool, minutes, &reason);
+            let mut lines = column![text(head).size(13), muted(values), muted(why)].spacing(2);
+            if let Some(more) = more {
+                lines = lines.push(more);
+            }
+            card = card.push(row![icon(app, o.strategy, 22.), lines].spacing(8));
         }
         c = c.push(container(card).padding(16).width(Fill).style(panel_style));
     }
@@ -5594,15 +5651,16 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
     }
     if !outcome.proposal.unmachined.is_empty() {
         let mut block = column![bold("Not machined (as listed by the planner)", 15)].spacing(6);
-        for item in &outcome.proposal.unmachined {
-            block = block.push(
-                text(format!(
-                    "• {}: {}",
-                    clip(&item.feature, 80),
-                    clip(&item.reason, 240)
-                ))
-                .size(13),
+        for (i, item) in outcome.proposal.unmachined.iter().enumerate() {
+            let ([feature, reason], more) = disclosure(
+                app,
+                Expand::Unmachined(i),
+                [(&item.feature, 80), (&item.reason, 240)],
             );
+            block = block.push(text(format!("• {feature}: {reason}")).size(13));
+            if let Some(more) = more {
+                block = block.push(more);
+            }
         }
         if outcome.more_unmachined > 0 {
             block = block.push(muted(format!("• and {} more", outcome.more_unmachined)));
@@ -5611,8 +5669,12 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
     }
     if !outcome.proposal.warnings.is_empty() {
         let mut block = column![bold("Warnings from the planner", 15)].spacing(6);
-        for warning in &outcome.proposal.warnings {
-            block = block.push(text(format!("• {}", clip(warning, 240))).size(13));
+        for (i, warning) in outcome.proposal.warnings.iter().enumerate() {
+            let ([warning], more) = disclosure(app, Expand::Warning(i), [(warning, 240)]);
+            block = block.push(text(format!("• {warning}")).size(13));
+            if let Some(more) = more {
+                block = block.push(more);
+            }
         }
         if outcome.more_warnings > 0 {
             block = block.push(muted(format!("• and {} more", outcome.more_warnings)));
@@ -5924,7 +5986,7 @@ fn timeline_view<'a>(app: &App, finished: bool) -> Option<Column<'a, Message>> {
         return None;
     }
     let mut c = column![].spacing(6);
-    for row in rows {
+    for (step, row) in rows.into_iter().enumerate() {
         let mark = match row.mark {
             Mark::Open => text("•").size(13).color(MUTED),
             Mark::Done => text("✓").size(13).color(GOOD),
@@ -5934,7 +5996,7 @@ fn timeline_view<'a>(app: &App, finished: bool) -> Option<Column<'a, Message>> {
         for line in row.notes {
             item = item.push(muted(line));
         }
-        for look in row.looks {
+        for (index, look) in row.looks.into_iter().enumerate() {
             let line = if look.warn {
                 text(look.line).size(12).color(WARN)
             } else {
@@ -5942,9 +6004,12 @@ fn timeline_view<'a>(app: &App, finished: bool) -> Option<Column<'a, Message>> {
             };
             item = item.push(match look.thumb {
                 Some(handle) => Element::from(
-                    row![widget::image(handle).width(120), line]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
+                    row![
+                        thumbnail(handle, 120, PlanPicture::Look { step, look: index }),
+                        line
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
                 ),
                 None => line.into(),
             });
@@ -5953,16 +6018,145 @@ fn timeline_view<'a>(app: &App, finished: bool) -> Option<Column<'a, Message>> {
     }
     Some(c)
 }
-/// A finished run's timeline under `heading`, in a panel: one line a step.
+/// A picture of the running page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPicture {
+    /// The overview the first request carries.
+    Overview,
+    /// Picture `look` of the timeline's step `step`.
+    Look { step: usize, look: usize },
+}
+/// A picture shrunk to `width`: a click opens it at full size, or closes it.
+fn thumbnail<'a>(
+    handle: widget::image::Handle,
+    width: u32,
+    picture: PlanPicture,
+) -> Element<'a, Message> {
+    button(widget::image(handle).width(width))
+        .on_press(Message::PlanPicture(picture))
+        .padding(0)
+        .style(|_, _| button::Style::default())
+        .into()
+}
+/// The picture `picture` stands for, if the timeline still has it.
+fn shown_picture(app: &App, picture: PlanPicture) -> Option<&crate::Shown> {
+    match picture {
+        PlanPicture::Overview => app.plan_overview.as_ref(),
+        PlanPicture::Look { step, look } => app.plan_timeline.get(step)?.looks.get(look),
+    }
+}
+/// The picture the user opened, at its natural size (the planner's pictures
+/// are 768 px) in a panel that scrolls both ways, with a Close button.
+fn enlarged_view<'a>(app: &App) -> Option<Element<'a, Message>> {
+    let picture = app.plan_enlarged?;
+    let shown = shown_picture(app, picture)?;
+    let handle = shown.thumb.clone()?;
+    let both = scrollable::Direction::Both {
+        vertical: scrollable::Scrollbar::default(),
+        horizontal: scrollable::Scrollbar::default(),
+    };
+    Some(
+        container(
+            column![
+                row![
+                    bold("The picture at full size", 15),
+                    space().width(Fill),
+                    btn("Close", Message::PlanPicture(picture), false)
+                ]
+                .align_y(Alignment::Center),
+                muted(shown.line.clone()),
+                scrollable(widget::image(handle))
+                    .direction(both)
+                    .width(Fill)
+                    .height(Length::Fixed(420.))
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(panel_style)
+        .into(),
+    )
+}
+/// The id of the scrollable that holds the timeline.
+const TIMELINE: &str = "plan-timeline";
+/// A finished run's timeline under `heading`, in a panel: one line a step,
+/// in a list that scrolls when it is longer than the panel.
 fn finished_timeline<'a>(app: &App, heading: &'static str) -> Option<Element<'a, Message>> {
     let rows = timeline_view(app, true)?;
+    let height = (app.plan_timeline.len() as f32 * 26.).min(240.);
     Some(
-        container(column![bold(heading, 15), rows].spacing(8))
-            .padding(16)
-            .width(Fill)
-            .style(panel_style)
-            .into(),
+        container(
+            column![
+                bold(heading, 15),
+                scrollable(container(rows).padding(iced::Padding::default().right(14)))
+                    .id(TIMELINE)
+                    .width(Fill)
+                    .height(Length::Fixed(height))
+            ]
+            .spacing(8),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(panel_style)
+        .into(),
     )
+}
+/// The running page: the stage, the time since the run started and Cancel
+/// stay put above; the picture opened at full size, if any, follows; the
+/// overview picture and the timeline scroll below.
+fn running_view(app: &App, stage: crate::planner::Progress) -> Element<'_, Message> {
+    let elapsed = app.plan_timeline.first().map_or(0., |first| {
+        std::time::Instant::now()
+            .saturating_duration_since(first.started)
+            .as_secs_f32()
+    });
+    let mut pinned = column![
+        bold(running_text(app, stage), 20),
+        muted(format!("{elapsed:.0} s since the run started")),
+        muted("This can take a few minutes. Nothing changes until you apply a plan."),
+        btn("Cancel", Message::PlanCancel, false)
+    ]
+    .spacing(10);
+    let pictures = app
+        .plan_overview
+        .as_ref()
+        .is_some_and(|o| o.thumb.is_some())
+        || app
+            .plan_timeline
+            .iter()
+            .any(|step| step.looks.iter().any(|l| l.thumb.is_some()));
+    if pictures {
+        pinned = pinned.push(muted("Click a picture to see it at full size."));
+    }
+    let mut scrolled = column![].spacing(14);
+    if let Some(overview) = &app.plan_overview {
+        let mut picture = column![bold("The AI starts with this picture", 15)].spacing(6);
+        if let Some(handle) = &overview.thumb {
+            picture = picture.push(thumbnail(handle.clone(), 240, PlanPicture::Overview));
+        }
+        scrolled = scrolled.push(picture.push(muted(overview.line.clone())));
+    }
+    if let Some(rows) = timeline_view(app, false) {
+        scrolled = scrolled.push(rows);
+    }
+    let mut c = column![pinned].spacing(14);
+    if let Some(enlarged) = enlarged_view(app) {
+        c = c.push(enlarged);
+    }
+    container(
+        c.push(
+            scrollable(container(scrolled).padding(iced::Padding::default().right(14)))
+                .id(TIMELINE)
+                .width(Fill)
+                .height(Fill),
+        ),
+    )
+    .padding(35)
+    .width(Fill)
+    .height(Fill)
+    .style(panel_style)
+    .into()
 }
 fn plan_result(app: &App) -> Element<'_, Message> {
     use crate::Planner;
@@ -5991,54 +6185,52 @@ fn plan_result(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .style(panel_style)
         .into(),
-        Planner::Running(stage) => {
-            let mut c = column![bold(running_text(app, *stage), 20)].spacing(14);
-            if let Some(overview) = &app.plan_overview {
-                let mut picture = column![bold("The AI starts with this picture", 15)].spacing(6);
-                if let Some(handle) = &overview.thumb {
-                    picture = picture.push(widget::image(handle.clone()).width(240));
-                }
-                c = c.push(picture.push(muted(overview.line.clone())));
-            }
-            if let Some(rows) = timeline_view(app, false) {
-                c = c.push(rows);
-            }
-            container(
-                c.push(muted(
-                    "This can take a few minutes. Nothing changes until you apply a plan.",
-                ))
-                .push(btn("Cancel", Message::PlanCancel, false)),
-            )
-            .padding(35)
-            .width(Fill)
-            .style(panel_style)
-            .into()
-        }
+        Planner::Running(stage) => running_view(app, *stage),
+        // A finished run puts its outcome and the actions first and the
+        // timeline under them.
         Planner::Failed(failure) => {
-            let mut c = column![].spacing(12);
-            if let Some(tried) = finished_timeline(app, "What the planner tried") {
-                c = c.push(tried);
-            }
-            c = c
-                .push(bold("No plan this time", 21))
-                .push(text(failure.message.clone()).size(13));
+            let mut c = column![
+                bold("No plan this time", 21),
+                text(failure.message.clone()).size(13)
+            ]
+            .spacing(12);
             for line in problem_lines(&failure.problems) {
                 c = c.push(muted(line));
             }
-            c.push(
+            c = c.push(
                 row![
                     primary("Try again", Message::Plan),
                     btn("Dismiss", Message::DiscardPlan, false)
                 ]
                 .spacing(10),
-            )
-            .into()
+            );
+            if let Some(tried) = finished_timeline(app, "What the planner tried") {
+                c = c.push(tried);
+            }
+            c.into()
         }
         Planner::Preview(preview) => match finished_timeline(app, "How the plan was made") {
-            Some(made) => column![made, plan_preview(app, preview)].spacing(12).into(),
+            Some(made) => column![plan_preview(app, preview), made].spacing(12).into(),
             None => plan_preview(app, preview),
         },
     }
+}
+/// The page's right side. A running plan fills it and keeps its stage and
+/// Cancel in view, scrolling only the timeline (`running_view`); the rest
+/// scroll as a whole.
+pub(crate) fn plan_side(app: &App) -> Element<'_, Message> {
+    if matches!(app.planner, crate::Planner::Running(_)) {
+        return container(plan_result(app))
+            .padding(iced::Padding::default().right(14))
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
+    scrollable(container(plan_result(app)).padding(iced::Padding::default().right(14)))
+        .id("planner-result")
+        .height(Fill)
+        .width(Fill)
+        .into()
 }
 fn ai(app: &App) -> Element<'_, Message> {
     container(
@@ -6063,10 +6255,7 @@ fn ai(app: &App) -> Element<'_, Message> {
                 .width(370)
                 .height(Fill)
                 .style(panel_style),
-                scrollable(container(plan_result(app)).padding(iced::Padding::default().right(14)))
-                    .id("planner-result")
-                    .height(Fill)
-                    .width(Fill)
+                plan_side(app)
             ]
             .spacing(24)
             .height(Fill)
@@ -6379,6 +6568,106 @@ fn operation_audit(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .height(Fill)
         .into()
+}
+
+/// Reads a page as the widget tree lays it out, without a window: the texts
+/// and scrollables in the order they sit on the page, and what a click at
+/// each point of the page sends.
+#[cfg(test)]
+pub(crate) mod probe {
+    use crate::Message;
+    use iced::{
+        Element, Event, Font, Pixels, Point, Size, mouse,
+        widget::{self, Id},
+    };
+    use iced_runtime::{
+        core::{clipboard, widget::Operation, widget::operation::Scrollable},
+        user_interface::{Cache, UserInterface},
+    };
+
+    /// What the page holds, in tree order.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) enum Seen {
+        Text(String),
+        /// A scrollable: its id and the size of what it scrolls.
+        Scroll(Option<Id>, Size),
+    }
+    struct Reader(Vec<Seen>);
+    impl Operation for Reader {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn text(&mut self, _: Option<&Id>, _: iced::Rectangle, text: &str) {
+            self.0.push(Seen::Text(text.to_string()));
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            _: iced::Rectangle,
+            content: iced::Rectangle,
+            _: iced::Vector,
+            _: &mut dyn Scrollable,
+        ) {
+            self.0.push(Seen::Scroll(id.cloned(), content.size()));
+        }
+    }
+    fn renderer() -> iced::Renderer {
+        iced_renderer::fallback::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+            Font::DEFAULT,
+            Pixels(16.),
+        ))
+    }
+    /// The texts and scrollables of `page`, in tree order.
+    pub(crate) fn seen(page: Element<'_, Message>, window: Size) -> Vec<Seen> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let mut reader = Reader(vec![]);
+        ui.operate(&renderer, &mut reader);
+        reader.0
+    }
+    /// The texts of `page`, in tree order.
+    pub(crate) fn texts(page: Element<'_, Message>, window: Size) -> Vec<String> {
+        seen(page, window)
+            .into_iter()
+            .filter_map(|item| match item {
+                Seen::Text(text) => Some(text),
+                Seen::Scroll(..) => None,
+            })
+            .collect()
+    }
+    /// The messages that pressing and releasing the left button gives, at
+    /// every eighth point of `page`.
+    pub(crate) fn clicks(page: Element<'_, Message>, window: Size) -> Vec<Message> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let mut messages = vec![];
+        let mut x = 0.;
+        while x < window.width {
+            let mut y = 0.;
+            while y < window.height {
+                let at = Point::new(x, y);
+                let events = [
+                    Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ];
+                let _ = ui.update(
+                    &events,
+                    mouse::Cursor::Available(at),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                y += 8.;
+            }
+            x += 8.;
+        }
+        messages
+    }
+    /// The id a scrollable of the app is given by name.
+    pub(crate) fn id(name: &'static str) -> Option<Id> {
+        Some(widget::Id::new(name))
+    }
 }
 
 #[cfg(test)]
