@@ -1688,6 +1688,10 @@ impl Connection {
         }
         if self.snapshot.state == Some(State::EStop) {
             self.forced.clear();
+            // What the pins said is over: the panel says to reference again.
+            if self.pin_referenced {
+                self.pin_said = None;
+            }
             self.pin_referenced = false;
         }
         // A probe ends with its outcome, once the machine has stopped.

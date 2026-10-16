@@ -3142,7 +3142,7 @@ fn zero_note(app: &App) -> Element<'_, Message> {
         ));
     }
     if crate::post::sits_on_pins(setup) {
-        lines.push("On the pins, the pins locate X and Y and the touch-off or probe sets Z: Probe corner, Probe edge and Probe centre stay available to check the part's place.".into());
+        lines.insert(0, "On the pins, the pins locate X and Y and the touch-off or probe sets Z: Probe corner, Probe edge and Probe centre stay available to check the part's place.".into());
     }
     let mut c = column![muted(lines.join(" "))].spacing(8);
     if let Some(zero) = app.current_ready().and_then(|r| r.zero.as_ref()) {
