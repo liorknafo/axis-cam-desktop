@@ -3921,6 +3921,7 @@ flood = { pin = 8 }
                 setup: 0,
                 name: a.doc.setups[0].name().into(),
                 result: Err(refused.unwrap_err()),
+                run: Some(Ok(())),
             }],
         }));
         let _ = a.view();
@@ -3936,6 +3937,86 @@ flood = { pin = 8 }
         let _ = a.view();
     }
 
+    /// The NC page words itself for the controller: a UC100 setup is checked
+    /// for a run on the machine, with its prerequisites and the Run button
+    /// and no error for the export file it does not have; a LinuxCNC setup
+    /// keeps the export page (#79).
+    #[test]
+    fn the_nc_page_is_worded_for_the_machines_controller() {
+        use crate::ui::{NO_EXPORT_FILE, NcCard, NcMachine, RUN_PREREQUISITES, nc_page};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let mesh = a.part_mesh().cloned().unwrap();
+        a.post = Some(std::sync::Arc::new(crate::post::post_job(&a.doc, &mesh)));
+        let page = nc_page(&a);
+        assert_eq!(page.machine, NcMachine::Uc100);
+        assert_eq!(page.title, "Run on the machine");
+        assert!(page.intro.contains("run on the UC100") && page.intro.contains("no G-code file"));
+        assert!(page.note.contains("takes no G-code file"));
+        assert!(!page.ready, "a UC100 job has no export");
+        // The run checks pass: the Run button, no error text.
+        assert!(
+            page.problems().is_empty(),
+            "no error shown for a passing UC100 setup: {:?}",
+            page.problems()
+        );
+        assert_eq!(page.run_buttons(), vec![0]);
+        assert!(matches!(page.cards[0].1, NcCard::Run { .. }));
+        assert!(
+            RUN_PREREQUISITES.starts_with("To run:") && NO_EXPORT_FILE.contains("no G-code file")
+        );
+        // The export check still refuses it, as before; only the page words it.
+        assert!(
+            a.post.as_ref().unwrap().setups[0]
+                .result
+                .as_ref()
+                .is_err_and(|e| e[0].starts_with("G-code export is LinuxCNC only"))
+        );
+        let _ = a.view();
+        // A run check that fails is listed, and Run on the machine stays.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("rpm".into(), "99999999".into());
+        a.post = Some(std::sync::Arc::new(crate::post::post_job(&a.doc, &mesh)));
+        let failed = nc_page(&a);
+        assert!(!failed.problems().is_empty());
+        assert_eq!(failed.run_buttons(), vec![0]);
+        let _ = a.view();
+
+        // A LinuxCNC setup keeps the export page.
+        let other = tempfile::tempdir().unwrap();
+        let mut b = App::from_workspace(other.path().join("workspace.json"), None);
+        let (doc, mesh) = crate::post::fixture::job();
+        b.replace_document(doc, None);
+        b.imported_mesh = Some(mesh);
+        b.smoke_dir = Some(other.path().to_path_buf());
+        let _ = b.update(Message::Page(Page::Post));
+        let page = nc_page(&b);
+        assert_eq!(page.machine, NcMachine::LinuxCnc);
+        assert_eq!(page.title, "NC program");
+        assert_eq!(page.intro, "Check each setup, then export LinuxCNC G-code.");
+        assert!(page.note.starts_with("LinuxCNC 3-axis output"));
+        assert!(page.ready && page.run_buttons().is_empty() && page.problems().is_empty());
+        assert!(matches!(page.cards[0].1, NcCard::Programs(_)));
+        let _ = b.view();
+        // Failing its export checks, a LinuxCNC setup is an error as before.
+        b.doc.setups[0].p.insert("offset".into(), "G92".into());
+        b.post = Some(std::sync::Arc::new(crate::post::JobPost {
+            errors: vec![],
+            setups: vec![crate::post::SetupPost {
+                setup: 0,
+                name: "Setup".into(),
+                result: Err(vec![
+                    "Work offset \"G92\" is not a LinuxCNC register.".into(),
+                ]),
+                run: None,
+            }],
+        }));
+        let refused = nc_page(&b);
+        assert_eq!(refused.problems().len(), 1);
+        assert!(refused.run_buttons().is_empty());
+        let _ = b.view();
+    }
     #[test]
     fn first_launch_and_empty_project_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
