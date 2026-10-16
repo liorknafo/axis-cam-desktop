@@ -23,13 +23,17 @@ pub fn machine_mm(m: &Machine, key: &str) -> f32 {
 }
 #[derive(Default)]
 struct Problems {
-    seen: HashSet<(Option<usize>, &'static str)>,
+    seen: HashSet<(Option<usize>, &'static str, String)>,
     list: Vec<(Option<usize>, String)>,
 }
 impl Problems {
     /// Keep the first message for each operation and rule.
     fn add(&mut self, op: Option<usize>, rule: &'static str, message: String) {
-        if self.seen.insert((op, rule)) {
+        self.add_about(op, rule, "", message);
+    }
+    /// Keep the first message for each operation, rule and `subject` (the box a hit names).
+    fn add_about(&mut self, op: Option<usize>, rule: &'static str, subject: &str, message: String) {
+        if self.seen.insert((op, rule, subject.to_string())) {
             self.list.push((op, message));
         }
     }
@@ -309,7 +313,7 @@ pub fn holding_problems(
         );
         for hit in hits {
             let message = crate::holding::message(&ops[k].name, &hit, gap, datum);
-            problems.add(Some(k), hit.part, message);
+            problems.add_about(Some(k), hit.part, &hit.label, message);
         }
     }
     problems.list
@@ -866,9 +870,10 @@ mod tests {
         }
     }
     #[test]
-    fn one_problem_per_operation_and_part_whatever_the_boxes() {
-        // Two tall clamps; the holder (reach 18) comes within the gap of one
-        // before the tool (reach 7) does.
+    fn one_problem_per_operation_part_and_box() {
+        // Two tall clamps; the holder (reach 18) comes within the gap of the
+        // first before the tool (reach 7) does, and both come within the gap
+        // of the second: a problem for each box, not one for each part.
         let boxes = [
             clamp_box("clamp on +X (offset 0)", [30., -10., 10.], [50., 10., 100.]),
             clamp_box(
@@ -890,6 +895,8 @@ mod tests {
             [
                 "Face top: the tool hits the clamp on +X (offset 0) at X24.0 Y0.0 Z10.0 (within the 2 mm gap).",
                 "Face top: the holder hits the clamp on +X (offset 0) at X14.0 Y0.0 Z10.0 (within the 2 mm gap).",
+                "Face top: the tool hits the clamp on -X (offset 0) at X-24.0 Y0.0 Z10.0 (within the 2 mm gap).",
+                "Face top: the holder hits the clamp on -X (offset 0) at X-24.0 Y0.0 Z10.0 (within the 2 mm gap).",
             ]
         );
     }

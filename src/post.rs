@@ -363,6 +363,16 @@ pub(crate) fn model_zero(
     Some((part, (!cut).then_some(top)))
 }
 pub fn coord(v: f32) -> String {
+    coord_mm(f64::from(v))
+}
+/// `v` (plan mm) less the datum `d` as a coordinate word. The difference is
+/// taken in f64, as `ngc::verify` takes it: in f32 a work coordinate beyond
+/// about 2048 mm is off by up to 0.00012 mm, enough with the rounding to
+/// 0.001 mm to fail the replay's tolerance.
+fn work(v: f32, d: f32) -> String {
+    coord_mm(f64::from(v) - f64::from(d))
+}
+fn coord_mm(v: f64) -> String {
     let s = format!("{v:.3}");
     if s == "-0.000" { "0.000".into() } else { s }
 }
@@ -502,12 +512,16 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         let first = plan.moves[0].from;
         let previous = k.checked_sub(1);
         let change = previous.is_none_or(|p| ops[p].tool_id != op.tool_id);
-        let spindle = change
-            || previous.is_some_and(|p| ops[p].rpm != op.rpm || ops[p].clockwise != op.clockwise);
-        let coolant = change || previous.is_some_and(|p| ops[p].coolant != op.coolant);
+        // A spindle turning the other way is stopped first (with the coolant,
+        // as at a tool change), then started again with the coolant.
+        let reverse = previous.is_some_and(|p| ops[p].clockwise != op.clockwise);
+        let spindle = change || reverse || previous.is_some_and(|p| ops[p].rpm != op.rpm);
+        let coolant = change || reverse || previous.is_some_and(|p| ops[p].coolant != op.coolant);
         // With a tool table and clearance-plane retracts, the first G0 Z needs the new tool's G43 H.
         if change && !(k == 0 && settings.tool_table && !settings.machine_home) {
             out.extend([Block::Stop, Block::Retract]);
+        } else if reverse {
+            out.push(Block::Stop);
         }
         out.push(Block::Start { op: k, change });
         if change {
@@ -758,12 +772,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     let e = extents(blocks);
     w.line(format!(
         "(Extents: X{} to {} Y{} to {} Z{} to {} mm)",
-        coord(e.min[0] - d[0]),
-        coord(e.max[0] - d[0]),
-        coord(e.min[1] - d[1]),
-        coord(e.max[1] - d[1]),
-        coord(e.min[2] - d[2]),
-        coord(e.max[2] - d[2])
+        work(e.min[0], d[0]),
+        work(e.max[0], d[0]),
+        work(e.min[1], d[1]),
+        work(e.max[1], d[1]),
+        work(e.min[2], d[2]),
+        work(e.max[2], d[2])
     ));
     // The program is only written once its jaws or clamps have been checked.
     if h.holding.is_some() {
@@ -819,7 +833,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         "G61".into()
     });
     w.line(offset);
-    let clearance = coord(clearance_plane(blocks) - d[2]);
+    let clearance = work(clearance_plane(blocks), d[2]);
     let mut position: [Option<String>; 3] = [None, None, None];
     let mut motion: Option<Kind> = None;
     let mut feed: Option<String> = None;
@@ -888,14 +902,14 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             }
             Block::Wait { seconds } => w.line(format!("G4 P{seconds:.3}")),
             Block::Approach { xy, .. } => {
-                let (x, y) = (coord(xy[0] - d[0]), coord(xy[1] - d[1]));
+                let (x, y) = (work(xy[0], d[0]), work(xy[1], d[1]));
                 w.line(format!("G0 X{x} Y{y}"));
                 position[0] = Some(x);
                 position[1] = Some(y);
                 motion = Some(Kind::Rapid);
             }
             Block::Descend { z, .. } => {
-                let z = coord(*z - d[2]);
+                let z = work(*z, d[2]);
                 w.line(format!("G0 Z{z}"));
                 position[2] = Some(z);
                 motion = Some(Kind::Rapid);
@@ -913,7 +927,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             } => {
                 let mut words = String::new();
                 for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
-                    let v = coord(to[k] - d[k]);
+                    let v = work(to[k], d[k]);
                     if position[k].as_deref() != Some(v.as_str()) {
                         words += &format!(" {axis}{v}");
                         position[k] = Some(v);
@@ -2632,6 +2646,67 @@ M2
                 "{key}"
             );
         }
+    }
+    #[test]
+    fn a_spindle_reversal_between_operations_of_one_tool_stops_the_spindle_first() {
+        // Two Facing passes with one tool, the second along the back edge.
+        let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
+        let setup = Setup::new(Machine::new(3), "G54");
+        let first = golden_plan();
+        let second = fixture::plan(
+            [15., 15., 25.],
+            &[
+                (Motion::Rapid, [15., 15., 11.], 6000.),
+                (Motion::Feed, [15., 15., 9.], 250.),
+                (Motion::Feed, [-15., 15., 9.], 1000.),
+                (Motion::Rapid, [-15., 15., 25.], 6000.),
+            ],
+        );
+        let program = |clockwise: bool| {
+            let ops = vec![
+                fixture::facing_op(),
+                OpState {
+                    name: "Face back".into(),
+                    clockwise,
+                    ..fixture::facing_op()
+                },
+            ];
+            let blocks = blocks(&ops, &[&first, &second], &settings);
+            let header = Header {
+                job: "Golden",
+                setup: &setup,
+                number: 1,
+                part: None,
+                stock: first.stock,
+                located: None,
+                datum: [0., 0., 10.],
+                holding: None,
+                disabled: vec![],
+            };
+            let text = emit(&header, &ops, &blocks, &settings);
+            assert_eq!(
+                crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54"),
+                Ok(()),
+                "{text}"
+            );
+            text
+        };
+        // Turning the other way: the spindle (with the coolant) stops before
+        // it is started with M4, and the start dwell follows.
+        let reversed = program(false);
+        assert!(
+            reversed.contains(
+                "G0 Z15.000\nM9\nM5\n(Operation 2/2: Face back - T1)\nS8000 M4\nM8\nG4 P2.000\nY15.000\n"
+            ),
+            "{reversed}"
+        );
+        // The same way: the spindle keeps running from one to the next.
+        let same = program(true);
+        assert!(
+            same.contains("G0 Z15.000\n(Operation 2/2: Face back - T1)\nY15.000\n"),
+            "{same}"
+        );
+        assert_eq!(same.matches("\nM5\n").count(), 1, "{same}");
     }
     #[test]
     fn a_flipped_setup_gets_its_own_program_and_offset() {
@@ -4438,6 +4513,29 @@ M2
             "{text}"
         );
         assert!(!text.contains("set X0 Y0 Z0 at the work zero"), "{text}");
+    }
+    #[test]
+    fn a_model_origin_3000_mm_from_the_part_exports_and_verifies() {
+        // The datum is taken off in f64, as the replay takes it off: in f32
+        // a work coordinate near 3000 mm is off by up to 0.00012 mm, which
+        // with the 0.0005 mm of rounding to 0.001 mm can exceed the replay's
+        // 0.0006 mm tolerance. The setup is turned 30 degrees, so that the
+        // coordinates lie off a grid that would round alike either way.
+        let (mut doc, mut mesh) = fixture::job();
+        doc.setups[0]
+            .p
+            .insert("origin".into(), "Model origin".into());
+        doc.setups[0].p.insert("rz".into(), "30".into());
+        mesh.origin[0] -= 3000. * mesh.display_scale();
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let text = &job.setups[0].result.as_ref().unwrap()[0].text;
+        assert!(
+            text.contains(
+                "(Part in work coordinates: X2527.213 to 2668.940 Y1436.457 to 1563.543 Z0.000 to 40.000 mm. Stock top Z44.000.)"
+            ),
+            "{text}"
+        );
     }
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
