@@ -1,12 +1,31 @@
 //! Test-only stand-in for OpenAI's sign-in and API servers on a loopback port.
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Test-only RSA key. It signs ID tokens for the fake server and nothing else.
-const KEY: &str = include_str!("fake_openai_key.pem");
-const JWKS: &str = include_str!("fake_openai_jwks.json");
+/// Test-only RSA key, generated on first use and never written to disk. It
+/// signs ID tokens for the fake server and nothing else.
+static KEY: OnceLock<(jsonwebtoken::EncodingKey, Value)> = OnceLock::new();
+fn key() -> &'static (jsonwebtoken::EncodingKey, Value) {
+    KEY.get_or_init(|| {
+        use aws_lc_rs::{encoding::AsDer, rsa::KeyPair, rsa::KeySize};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let der = KeyPair::generate(KeySize::Rsa2048)
+            .unwrap()
+            .as_der()
+            .unwrap();
+        let body = STANDARD.encode(der.as_ref());
+        let pem = format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n");
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        let jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(&key, jsonwebtoken::Algorithm::RS256)
+            .unwrap();
+        let mut jwk = serde_json::to_value(jwk).unwrap();
+        jwk["kid"] = "test-key".into();
+        jwk["use"] = "sig".into();
+        (key, json!({ "keys": [jwk] }))
+    })
+}
 pub const ISSUER: &str = "https://auth.openai.com";
 
 #[derive(Debug, Clone)]
@@ -239,7 +258,7 @@ async fn read(socket: &mut tokio::net::TcpStream) -> Option<Req> {
     })
 }
 pub fn jwks() -> Value {
-    serde_json::from_str(JWKS).unwrap()
+    key().1.clone()
 }
 pub fn id_token(claims: Value) -> String {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
@@ -249,8 +268,7 @@ pub fn id_token(claims: Value) -> String {
 /// An ID token signed with the test key under any header (for example one
 /// without `kid`).
 pub fn id_token_with(header: jsonwebtoken::Header, claims: Value) -> String {
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(KEY.as_bytes()).unwrap();
-    jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    jsonwebtoken::encode(&header, &claims, &key().0).unwrap()
 }
 /// Standard ID token claims for `client_id` and `nonce`, valid for ten minutes.
 pub fn claims(client_id: &str, nonce: &str) -> Value {
