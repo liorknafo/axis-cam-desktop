@@ -128,6 +128,10 @@ pub enum Message {
     SelectSetup(usize),
     SelectOp(usize),
     SetupEditor,
+    /// The workflow footer's 02 step.
+    OperationsStep,
+    /// The workflow footer's 03 step.
+    PreviewStep,
     SetupStep(&'static str),
     Tab(String),
     Edit(Target, &'static str, String),
@@ -690,6 +694,8 @@ pub struct App {
     pub simulation: Option<simulation::Simulation>,
     pub stock_detail: stock_surface::Detail,
     stock_mesh_job: Option<StockMeshKey>,
+    /// When the running mesher job started, for the elapsed time the strip names.
+    stock_mesh_started: Option<Instant>,
     stock_mesh_failed: Option<StockMeshKey>,
     pub progress: f32,
     pub speed: f32,
@@ -1077,6 +1083,7 @@ impl App {
             simulation: None,
             stock_detail: Default::default(),
             stock_mesh_job: None,
+            stock_mesh_started: None,
             stock_mesh_failed: None,
             progress: 0.,
             speed: 1.,
@@ -1675,6 +1682,11 @@ impl App {
         }
         ui::fixture_note(self, ui::Note::Playback)
     }
+    /// How long the stock mesher has been running, while it is.
+    pub fn stock_mesh_elapsed(&self) -> Option<Duration> {
+        self.stock_mesh_job.as_ref()?;
+        self.stock_mesh_started.map(|t| t.elapsed())
+    }
     fn stock_mesh_key(&self) -> Option<StockMeshKey> {
         let sim = self.active_simulation()?;
         let volume = sim.volume.as_ref()?;
@@ -1711,6 +1723,7 @@ impl App {
         };
         let seconds = sim.seconds;
         self.stock_mesh_job = Some(key.clone());
+        self.stock_mesh_started = Some(Instant::now());
         Task::perform(
             async move {
                 let result =
@@ -1767,7 +1780,7 @@ impl App {
         self.post = None;
         self.post_epoch = self.post_epoch.wrapping_add(1);
     }
-    /// Check and emit the whole job while the NC program page is open.
+    /// Check and emit the whole job while the NC review page is open.
     fn refresh_post(&mut self) -> Task<Message> {
         if self.page != Page::Post || self.post.is_some() || self.post_busy || self.locked() {
             return Task::none();
@@ -2293,6 +2306,8 @@ impl App {
             && matches!(
                 &message,
                 Message::SelectOp(_)
+                    | Message::OperationsStep
+                    | Message::PreviewStep
                     | Message::Edit(Target::Setup, _, _)
                     | Message::AddOp(_)
                     | Message::DuplicateOp
@@ -2430,6 +2445,16 @@ impl App {
                 self.playing = false;
                 self.simulation = None;
                 self.progress = 0.;
+            }
+            // The footer's 02 and 03 steps are navigation only: the operation
+            // selected stays selected (the first when none is), and the
+            // preview strip under the 3D view offers Generate & play.
+            Message::OperationsStep | Message::PreviewStep => {
+                if self.selected.is_some() {
+                    self.page = Page::Work;
+                } else {
+                    return self.update(Message::SelectOp(0));
+                }
             }
             Message::SetupStep(step) => self.setup_step = step,
             Message::Tab(t) => {
@@ -2684,7 +2709,7 @@ impl App {
                         Ok(sim) => {
                             let plan = &sim.plan;
                             self.status = format!(
-                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} Export G-code from the NC program page.",
+                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} Export G-code from the NC review page.",
                                 plan.strategy.name(),
                                 plan.levels,
                                 plan.duration / 60.,
@@ -3106,7 +3131,7 @@ impl App {
                     }
                     self.page = Page::Machines;
                     self.touch();
-                    self.status="Machine profile saved. Use Assign to setup to update an existing setup snapshot.".into();
+                    self.status="Machine profile saved. Use Assign to current setup to update an existing setup snapshot.".into();
                     return self.resume();
                 } else {
                     self.status = errors.join(" ");
@@ -3612,6 +3637,7 @@ impl App {
             } => {
                 if self.stock_mesh_job.as_ref() == Some(&key) {
                     self.stock_mesh_job = None;
+                    self.stock_mesh_started = None;
                 }
                 if let Some(sim) = &mut self.simulation
                     && sim.id == key.0
@@ -3881,7 +3907,7 @@ impl App {
                 self.page = Page::Work;
                 self.touch();
                 self.status = format!(
-                    "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC program.{restored}"
+                    "Plan applied. The previous job is in History; Undo is in AI planner. Review each operation, then export from NC review.{restored}"
                 );
             }
             Message::UndoPlan => {
@@ -4645,7 +4671,7 @@ pub(crate) enum CloseAction {
 /// What a close request does once the workspace save was tried. `saved`:
 /// the workspace is saved. `pending`: how long a pending sign-out, sign-in
 /// save or refresh of the sign-in has been waited for, and whether a
-/// sign-out is pending. `blocking`: a plan stage, the NC program refresh or
+/// sign-out is pending. `blocking`: a plan stage, the NC review refresh or
 /// the stock mesher is still running. `finishing`: a G-code export is
 /// running. Neither pending work nor finishing work is cut short by ending
 /// the process: the window closes and the runtime lets their blocking parts

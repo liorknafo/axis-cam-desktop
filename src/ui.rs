@@ -157,7 +157,7 @@ fn switcher(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center),
         Help::text(
             "Workspace",
-            "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC program. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
+            "MANUFACTURE plans the job: the part, setups, operations, the libraries, the AI planner and the NC review. MACHINE drives the CNC through the UC100: connect, jog, zero, probe and run a setup, and set up its profile. While the machine moves (a tool run, held or paused, a probe, a jog or homing) only MACHINE is open.",
         ),
         // Beside it, not over the list it opens.
         widget::tooltip::Position::Right,
@@ -679,7 +679,7 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         column![
             btn("Generate all", Message::GenerateAll, false),
             btn(
-                "NC program",
+                "NC review",
                 Message::Page(Page::Post),
                 app.page == Page::Post
             ),
@@ -1074,7 +1074,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     drawn.push((key, picture.clone()));
     Some(picture)
 }
-/// The 3D view of the active setup, as the Work page shows it: the part,
+/// The 3D view of the active setup, as MANUFACTURE shows it: the part,
 /// stock, workholding, the preview and the machine's tool while a tool run of
 /// the setup cuts. None without a part to show.
 fn scene(app: &App) -> Option<Element<'_, Message>> {
@@ -1287,20 +1287,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                 ))
                 .size(10),
             );
-            let surface_status = if let Some(surface) = &sim.stock_surface {
-                format!(
-                    "{:.2} mm finest cell · {} triangles{}",
-                    surface.cell_mm,
-                    surface.triangles.len(),
-                    if app.stock_mesh_key().is_some() {
-                        " · Updating…"
-                    } else {
-                        ""
-                    }
-                )
-            } else {
-                "Building stock surface…".into()
-            };
+            let surface_status = stock_surface_details(app).unwrap_or_default();
             let mut detail = row![muted("Detail").size(10)]
                 .spacing(5)
                 .align_y(Alignment::Center);
@@ -1310,6 +1297,9 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     Message::StockDetail(choice),
                     choice == app.stock_detail,
                 ));
+            }
+            if let Some(notice) = stock_surface_notice(app) {
+                playback = playback.push(bold(notice, 12).color(WARN));
             }
             playback = playback.push(detail.push(muted(surface_status).size(10)));
         }
@@ -1333,10 +1323,10 @@ fn workspace(app: &App) -> Element<'_, Message> {
             btn("01  Setup", Message::SetupEditor, app.selected.is_none()),
             btn(
                 "02  Operations",
-                Message::SelectOp(0),
+                Message::OperationsStep,
                 app.selected.is_some()
             ),
-            btn("03  Preview", Message::Generate, false),
+            btn("03  Preview", Message::PreviewStep, false),
             btn(
                 if uc100 {
                     "04  Review & run"
@@ -1355,6 +1345,32 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .width(Fill)
         .into()
+}
+/// The simulation strip's line while the stock mesher runs: what is drawn
+/// meanwhile, and for how long it has been working.
+pub(crate) fn stock_surface_notice(app: &App) -> Option<String> {
+    let seconds = app.stock_mesh_elapsed()?.as_secs();
+    let sim = app.active_simulation()?;
+    app.stock_mesh_key()?;
+    Some(if sim.stock_surface.is_some() {
+        format!("Updating the stock surface, showing the last finished one · {seconds} s")
+    } else {
+        format!("Building the stock surface · {seconds} s")
+    })
+}
+/// The finished stock surface's cell size and triangle count, the details
+/// line under the timeline; "Building stock surface…" before there is one.
+pub(crate) fn stock_surface_details(app: &App) -> Option<String> {
+    let sim = app.active_simulation()?;
+    match &sim.stock_surface {
+        Some(surface) => Some(format!(
+            "{:.2} mm finest cell · {} triangles",
+            surface.cell_mm,
+            surface.triangles.len()
+        )),
+        None if stock_surface_notice(app).is_some() => None,
+        None => Some("Building stock surface…".into()),
+    }
 }
 fn inspector(app: &App) -> Element<'_, Message> {
     let content = if app.doc.active_setup().is_none() {
@@ -3248,7 +3264,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(field(p, "post_dwell", "Spindle start dwell · s", t))
                     .push(choice_value(p, post_setting(p, "post_air"), "post_air", "Air blast output", &POST_AIR, t))
                     .push(warnings(post_setting_issues(p)))
-                    .push(note("Setups keep a snapshot of the machine. After saving, use Assign to setup so existing setups use these settings."));
+                    .push(note("Setups keep a snapshot of the machine. After saving, use Assign to current setup so existing setups use these settings."));
             }
             if get(p, "controller") == "UC100" {
                 form = form.push(bold("UC100", 15));
@@ -3610,7 +3626,7 @@ fn control(app: &App) -> Element<'_, Message> {
     };
     main = main.push(limits);
     // The setup picked to run, beside its tool runs, with the machine's tool
-    // while a tool run cuts: the Work page is out of reach while it moves.
+    // while a tool run cuts: MANUFACTURE is out of reach while it moves.
     let job = c
         .run
         .as_ref()
@@ -4097,7 +4113,7 @@ pub(crate) fn run_strip<'a>(
         .filter(|(_, x)| x.machine.id == c.machine_id)
         .collect();
     if setups.is_empty() {
-        body = body.push(muted("No setup uses this machine. On the Work page, choose it as a setup's machine (Assign to setup) to run that setup here."));
+        body = body.push(muted("No setup uses this machine. In MANUFACTURE, choose it as a setup's machine (Assign to current setup) to run that setup here."));
     } else {
         let mut pick = row![muted("Setup")].spacing(6).align_y(Alignment::Center);
         for (si, x) in setups {
@@ -5358,7 +5374,7 @@ pub(crate) fn plan_work_zero_line(outcome: &crate::planner::Outcome, si: usize) 
         outcome.check.zeros.get(si).copied().flatten(),
     )
 }
-/// The NC program page's note on what export checks, for a job whose setups
+/// The NC review page's note on what export checks, for a job whose setups
 /// model their vise or clamps as `held` says.
 pub(crate) fn program_note(held: Held) -> &'static str {
     match held {
@@ -6112,7 +6128,7 @@ pub(crate) enum NcCard<'a> {
         setup: usize,
     },
 }
-/// The NC program page, before it is drawn: its words and its setups' cards.
+/// The NC review page, before it is drawn: its words and its setups' cards.
 pub(crate) struct NcPage<'a> {
     pub title: &'static str,
     pub intro: &'static str,
@@ -6152,21 +6168,21 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
     let machine = nc_machine(app);
     let (title, intro, heading, note) = match machine {
         NcMachine::LinuxCnc => (
-            "NC program",
+            "NC review",
             "Check each setup, then export LinuxCNC G-code.",
-            "Program review",
+            "Setup checks",
             program_note(held(app)),
         ),
         NcMachine::Uc100 => (
             "Run on the machine",
             "Check each setup for a run on the UC100, then run it from MACHINE. A UC100 machine takes no G-code file.",
-            "Run review",
+            "Run checks",
             run_note(held(app)),
         ),
         NcMachine::Mixed => (
-            "NC program",
+            "NC review",
             "Check each setup: a LinuxCNC setup exports G-code, a UC100 setup runs on the machine.",
-            "Program review",
+            "Setup checks",
             program_note(held(app)),
         ),
     };
