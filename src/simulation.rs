@@ -40,7 +40,13 @@ impl Move {
 pub enum CutterShape {
     Flat,
     Ball,
+    /// A drill: flat flutes over a 118° point, the cone `POINT_RISE` gives,
+    /// with the programmed tip at its apex.
+    Drill,
 }
+/// The rise of a 118° drill point's cone per mm from the drill's axis, tan
+/// 31°: what `cam::holes` takes a blind hole's floor to be.
+pub const POINT_RISE: f32 = 0.600_860_6;
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub shape: CutterShape,
@@ -492,6 +498,36 @@ impl StockGrid {
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
                         a[2] + contact * dz + radius - (radius * radius - d).max(0.).sqrt()
+                    } else if shape == CutterShape::Drill {
+                        // The cone's lowest point over the covered interval:
+                        // where the tip's descent balances the cone's rise,
+                        // or an end of the interval when the move is steeper
+                        // than the cone, as a flat end is lowest there.
+                        let perp = if length < 1e-10 {
+                            (point[0] - a[0]).powi(2) + (point[1] - a[1]).powi(2)
+                        } else {
+                            (point[0] - a[0] - projection * (b[0] - a[0])).powi(2)
+                                + (point[1] - a[1] - projection * (b[1] - a[1])).powi(2)
+                        };
+                        let dz = b[2] - a[2];
+                        let contact = if length < 1e-10 {
+                            if dz < 0. { 1. } else { 0. }
+                        } else {
+                            let half = ((radius * radius - perp).max(0.) / length).sqrt();
+                            let cone = POINT_RISE * POINT_RISE * length;
+                            let t = if cone > dz * dz {
+                                projection
+                                    - dz * perp.sqrt() / (length.sqrt() * (cone - dz * dz).sqrt())
+                            } else if dz < 0. {
+                                1.
+                            } else {
+                                0.
+                            };
+                            t.clamp((projection - half).max(0.), (projection + half).min(1.))
+                        };
+                        let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
+                            + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
+                        a[2] + contact * dz + POINT_RISE * d.sqrt()
                     } else if length < 1e-10 {
                         a[2].min(b[2])
                     } else {
@@ -811,6 +847,77 @@ mod tests {
             for (x, y) in direct.heights.iter().zip(split.heights) {
                 assert!((x - y).abs() < 0.0001, "{x} != {y}");
             }
+        }
+    }
+    #[test]
+    fn a_drills_sweep_leaves_its_point_cone_in_the_stock_grid() {
+        let bounds = Bounds {
+            min: [0., 0., 0.],
+            max: [10., 10., 10.],
+        };
+        let cell = |grid: &StockGrid, x: usize, y: usize| {
+            [(x as f32 + 0.5) * grid.dx, (y as f32 + 0.5) * grid.dy]
+        };
+        // A Ø4 drill plunged to 3 mm leaves the cone its point makes over
+        // its tip, a 118° cone 1.2 mm tall at its rim, under flat stock.
+        let mut grid = StockGrid::new(bounds);
+        grid.cut_shape([5., 5., 9.], [5., 5., 3.], 2., CutterShape::Drill);
+        let mut cone = 0;
+        for y in 0..grid.ny {
+            for x in 0..grid.nx {
+                let p = cell(&grid, x, y);
+                let distance = ((p[0] - 5.).powi(2) + (p[1] - 5.).powi(2)).sqrt();
+                let height = grid.heights[y * grid.nx + x];
+                if distance <= 2. {
+                    assert!(
+                        (height - (3. + POINT_RISE * distance)).abs() < 0.0001,
+                        "{p:?}"
+                    );
+                    cone += 1;
+                } else {
+                    assert_eq!(height, 10., "{p:?}");
+                }
+            }
+        }
+        assert!(cone > 50);
+        // Along a ramp the cone is lowest where the tip's descent balances
+        // its rise: the sampled lowest cutter over the move, whatever the
+        // playback's chunking.
+        for (a, b) in [([1., 5., 8.], [9., 5., 2.]), ([9., 5., 2.], [1., 5., 8.])] {
+            let mut direct = StockGrid::new(bounds);
+            let mut split = direct.clone();
+            direct.cut_shape(a, b, 1., CutterShape::Drill);
+            for i in 0..100 {
+                let p = std::array::from_fn(|k| a[k] + (b[k] - a[k]) * i as f32 / 100.);
+                let q = std::array::from_fn(|k| a[k] + (b[k] - a[k]) * (i + 1) as f32 / 100.);
+                split.cut_shape(p, q, 1., CutterShape::Drill);
+            }
+            let mut checked = 0;
+            for y in 0..direct.ny {
+                for x in 0..direct.nx {
+                    let i = y * direct.nx + x;
+                    assert!((direct.heights[i] - split.heights[i]).abs() < 0.0001);
+                    let p = cell(&direct, x, y);
+                    let lowest = (0..=4000)
+                        .map(|j| {
+                            let t = j as f32 / 4000.;
+                            let d = ((p[0] - a[0] - t * (b[0] - a[0])).powi(2)
+                                + (p[1] - a[1] - t * (b[1] - a[1])).powi(2))
+                            .sqrt();
+                            if d <= 1. {
+                                a[2] + t * (b[2] - a[2]) + POINT_RISE * d
+                            } else {
+                                10.
+                            }
+                        })
+                        .fold(10., f32::min);
+                    assert!((direct.heights[i] - lowest).abs() < 0.01, "{p:?}");
+                    if lowest < 10. {
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 100);
         }
     }
     fn fixture() -> (Setup, Operation, Tool, Mesh) {

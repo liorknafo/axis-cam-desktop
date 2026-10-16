@@ -2,7 +2,11 @@
 //! contouring. Coordinates remain attached to the first setup, across flips.
 //! The small occupancy grid in Volume is only a removal-volume estimate; it is
 //! never used to construct this surface. No dense fine-resolution grid exists.
-use crate::{mesh::Bounds, simulation::CutterShape, volume::Frame};
+use crate::{
+    mesh::Bounds,
+    simulation::{CutterShape, POINT_RISE},
+    volume::Frame,
+};
 use fidget::{
     context::Tree,
     mesh::{Octree, Settings},
@@ -94,14 +98,19 @@ impl Cut {
         let r = self.radius;
         if l < 1e-6 {
             let radial = (p[0].square() + p[1].square()).sqrt() - r;
-            let bottom = if self.shape == CutterShape::Flat {
-                Tree::from(d[2].min(0.))
-            } else {
+            let bottom = match self.shape {
+                CutterShape::Flat => Tree::from(d[2].min(0.)),
                 // Sphere lower hemisphere, with a cylindrical wall above it.
-                Tree::from(d[2].min(0.) + r)
-                    - (Tree::from(r * r) - p[0].square() - p[1].square())
-                        .max(0.)
-                        .sqrt()
+                CutterShape::Ball => {
+                    Tree::from(d[2].min(0.) + r)
+                        - (Tree::from(r * r) - p[0].square() - p[1].square())
+                            .max(0.)
+                            .sqrt()
+                }
+                // The point's cone, rising from the tip, under the wall.
+                CutterShape::Drill => {
+                    Tree::from(d[2].min(0.)) + (p[0].square() + p[1].square()).sqrt() * POINT_RISE
+                }
             };
             return radial
                 .max(bottom - p[2].clone())
@@ -118,26 +127,50 @@ impl Cut {
         let mut lo = ((u.clone() - half.clone()) / l).max(0.).min(1.);
         let mut hi = ((u.clone() + half.clone()) / l).max(0.).min(1.);
 
-        let lower = if self.shape == CutterShape::Ball {
-            // Constrain the minimizer to instants where the point is below the
-            // finite flute top, then solve the spherical lower envelope.
-            if d[2] > 1e-7 {
-                lo = lo.max(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
-            } else if d[2] < -1e-7 {
-                hi = hi.min(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
+        let lower = match self.shape {
+            CutterShape::Ball => {
+                // Constrain the minimizer to instants where the point is below the
+                // finite flute top, then solve the spherical lower envelope.
+                if d[2] > 1e-7 {
+                    lo = lo.max(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
+                } else if d[2] < -1e-7 {
+                    hi = hi.min(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
+                }
+                let t = (u.clone() / l - half * (d[2] / (l * (l * l + d[2] * d[2]).sqrt())))
+                    .max(lo.clone())
+                    .min(hi.clone());
+                t.clone() * d[2] + r
+                    - (Tree::from(r * r) - (u - t * l).square() - v.square())
+                        .max(0.)
+                        .sqrt()
             }
-            let t = (u.clone() / l - half * (d[2] / (l * (l * l + d[2] * d[2]).sqrt())))
-                .max(lo.clone())
-                .min(hi.clone());
-            t.clone() * d[2] + r
-                - (Tree::from(r * r) - (u - t * l).square() - v.square())
-                    .max(0.)
-                    .sqrt()
-        } else {
-            if d[2] < 0. {
-                hi.clone() * d[2]
-            } else {
-                lo.clone() * d[2]
+            CutterShape::Drill => {
+                // As the ball, with the point's cone as the lower envelope:
+                // lowest where the tip's descent balances the cone's rise,
+                // or at an end of the interval under a move steeper than
+                // the cone (`volume::swept`).
+                if d[2] > 1e-7 {
+                    lo = lo.max(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
+                } else if d[2] < -1e-7 {
+                    hi = hi.min(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
+                }
+                let cone = POINT_RISE * POINT_RISE * l * l;
+                let t = if cone > d[2] * d[2] {
+                    u.clone() / l - v.abs() * (d[2] / (l * (cone - d[2] * d[2]).sqrt()))
+                } else if d[2] < 0. {
+                    hi.clone()
+                } else {
+                    lo.clone()
+                };
+                let t = t.max(lo.clone()).min(hi.clone());
+                t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * POINT_RISE
+            }
+            CutterShape::Flat => {
+                if d[2] < 0. {
+                    hi.clone() * d[2]
+                } else {
+                    lo.clone() * d[2]
+                }
             }
         };
         let upper = if d[2] < 0. {
@@ -268,8 +301,8 @@ mod tests {
         }
     }
     #[test]
-    fn continuous_flat_and_ball_fields_match_analytic_swept_solids() {
-        for shape in [CutterShape::Flat, CutterShape::Ball] {
+    fn continuous_cutter_fields_match_analytic_swept_solids() {
+        for shape in [CutterShape::Flat, CutterShape::Ball, CutterShape::Drill] {
             for (a, b) in [
                 ([-4., 0., 2.], [4., 0., 2.]),
                 ([-4., 0., 1.], [4., 0., 6.]),
@@ -376,7 +409,7 @@ mod tests {
         }
         let current = Frame::new(&setup, &mesh);
         let reference = frame();
-        for shape in [CutterShape::Flat, CutterShape::Ball] {
+        for shape in [CutterShape::Flat, CutterShape::Ball, CutterShape::Drill] {
             let mut c = cut([-4., 0., 2.], [4., 0., 6.], shape);
             c.frame = current;
             let vm = VmShape::from(c.field(reference));
@@ -421,6 +454,36 @@ mod tests {
             }
         }
         assert!(count > 30);
+    }
+    #[test]
+    fn a_drills_mesh_keeps_its_point_cone_and_closed_surface() {
+        let mesh = snapshot(
+            vec![cut([0., 0., 12.], [0., 0., 3.], CutterShape::Drill)],
+            Detail::Standard,
+        )
+        .build()
+        .unwrap();
+        watertight(&mesh);
+        // Under the wall the floor is the 118° cone from the tip at Z3 to
+        // the rim 1.8 mm higher, and the wall keeps the radius above it.
+        let (mut cone, mut wall) = (0, 0);
+        for p in &mesh.vertices {
+            let distance = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            if distance > 0.3 && distance < 2.8 && p[2] > 2.5 && p[2] < 5. {
+                assert!(
+                    (p[2] - (3. + POINT_RISE * distance)).abs() < 0.03,
+                    "cone surface {p:?}"
+                );
+                cone += 1;
+            } else if p[2] > 5.2 && p[2] < 9.8 && p[0].abs() < 4. && p[1].abs() < 4. {
+                assert!((distance - 3.).abs() < 0.01, "wall {p:?}");
+                wall += 1;
+            }
+        }
+        assert!(
+            cone > 30 && wall > 30,
+            "{cone} cone and {wall} wall vertices"
+        );
     }
     #[test]
     fn cut_history_is_shared_and_playback_fragments_coalesce() {

@@ -599,6 +599,9 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         return Err("Breakthrough cannot be negative.".into());
     }
     b.plan.milling_direction = "Drilling · axial feed";
+    // The sweep is the drill's shape: its 118° point under its flutes, so
+    // that a blind hole's drill-point floor is left as it is (#155).
+    b.plan.shape = CutterShape::Drill;
     if !["Optimize travel", "By X then Y"].contains(&get(&op.p, "hole_order")) {
         return Err("Choose a valid hole order.".into());
     }
@@ -1088,7 +1091,7 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         mesh,
@@ -1367,7 +1370,7 @@ mod tests {
     /// `section` turned about Z, 64 sides: (radius, height) points along the
     /// part's section, each pair a ring of quads, a point on the axis at
     /// either end a fan to it.
-    fn revolved(section: &[(f32, f32)]) -> Vec<[[f32; 3]; 3]> {
+    pub(crate) fn revolved(section: &[(f32, f32)]) -> Vec<[[f32; 3]; 3]> {
         let mut t = vec![];
         for i in 0..64 {
             let a = i as f32 * std::f32::consts::TAU / 64.;
