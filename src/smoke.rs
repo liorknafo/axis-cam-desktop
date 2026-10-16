@@ -1354,6 +1354,30 @@ spindle_pwm = { pin = 16 }
 flood = { pin = 8 }
 "#;
 
+    /// X, Y and Z without soft limits (and without switches).
+    const UNLIMITED: &str = r#"
+[controller]
+step_rate = "100kHz"
+[axes.x]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 2 }
+dir = { pin = 3 }
+[axes.y]
+steps_per_unit = 200.0
+max_velocity = 2000.0
+acceleration = 300.0
+step = { pin = 4 }
+dir = { pin = 5 }
+[axes.z]
+steps_per_unit = 400.0
+max_velocity = 1000.0
+acceleration = 200.0
+step = { pin = 6 }
+dir = { pin = 7 }
+"#;
+
     /// Home switches on every axis, a limit switch on X, a reversible
     /// spindle and mist.
     const SWITCHED: &str = r#"
@@ -2895,11 +2919,96 @@ flood = { pin = 8 }
     #[test]
     fn the_test_profiles_are_valid() {
         let dir = tempfile::tempdir().unwrap();
-        for text in [LIMITED, SWITCHED, FAST] {
+        for text in [LIMITED, SWITCHED, FAST, UNLIMITED] {
             let a = profile_app(dir.path(), text);
             let checked = crate::control::profile(&a.doc.machines[0]);
             assert!(checked.is_ok(), "{checked:?}");
         }
+    }
+
+    #[test]
+    fn a_profile_with_no_soft_limits_gets_the_same_amber_warning_and_an_assumed_box() {
+        use crate::machine_view::{Caption, MachineView};
+        use crate::ui::limits_off_warning;
+        let dir = tempfile::tempdir().unwrap();
+        let config = |text: &str| {
+            let a = profile_app(dir.path(), text);
+            crate::control::profile(&a.doc.machines[0]).unwrap()
+        };
+        let view = |c: &uc100::config::MachineConfig, known: bool| {
+            let (envelope, assumed) = MachineView::envelope(c);
+            MachineView {
+                pos: [0.; 3],
+                known,
+                envelope,
+                assumed,
+                block: None,
+                zero: [0.; 3],
+            }
+        };
+        // No soft limits: the warning of the unreferenced machine, with its
+        // own sentence (add them to the profile), at any position.
+        let none = config(UNLIMITED);
+        assert!(!none.soft_limits_configured());
+        let (heading, lines) = limits_off_warning(false, &[], false).unwrap();
+        assert_eq!(heading, "Soft limits are OFF");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("This profile sets no soft limits"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("soft_min and soft_max"), "{lines:?}");
+        // Configured but not referenced: the same heading, other sentences.
+        let limited = config(LIMITED);
+        assert!(limited.soft_limits_configured());
+        let (h, lines) = limits_off_warning(true, &[0, 1, 2], false).unwrap();
+        assert_eq!(h, heading);
+        assert!(
+            lines[0].starts_with("X, Y and Z have no machine position"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "Set machine zero below to turn them on.");
+        let (_, lines) = limits_off_warning(true, &[2], true).unwrap();
+        assert!(
+            lines[0].starts_with("Z has no machine position"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "Home below to turn them on.");
+        // Configured and referenced: no warning.
+        assert!(limits_off_warning(true, &[], true).is_none());
+        // The drawing: the profile without limits gets the assumed box, said
+        // so whether or not the position is set; never "where the tool tip
+        // can travel".
+        for known in [false, true] {
+            let v = view(&none, known);
+            assert!(v.assumed);
+            let lines = v.captions();
+            assert!(
+                lines.contains(&(
+                    Caption::Assumed,
+                    "Dashed box: assumed travel, travel not configured in the profile"
+                )),
+                "{lines:?}"
+            );
+            assert!(
+                lines.iter().all(|(_, t)| !t.contains("can travel")),
+                "{lines:?}"
+            );
+        }
+        // The real soft-limit box keeps its caption once the position is set.
+        let real = view(&limited, true);
+        assert!(!real.assumed);
+        assert_eq!(real.envelope, [[0., 0., -55.], [390., 280., 0.]]);
+        assert!(
+            real.captions()
+                .contains(&(Caption::Travel, "Box: where the tool tip can travel"))
+        );
+        assert!(
+            view(&limited, false)
+                .captions()
+                .iter()
+                .all(|(k, _)| *k != Caption::Assumed)
+        );
     }
 
     #[test]

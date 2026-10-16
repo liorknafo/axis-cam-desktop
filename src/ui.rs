@@ -3215,6 +3215,48 @@ fn axis_names(axes: &[usize]) -> String {
     }
 }
 
+/// The amber warning above the Control page when nothing stops an axis at the
+/// end of its travel: the profile sets no soft limits, or an axis with one has
+/// no machine position yet. Both are the same prominent box with their own
+/// sentence on what to do (#73). None while the soft limits are on.
+pub(crate) fn limits_off_warning(
+    configured: bool,
+    unset: &[usize],
+    home_switches: bool,
+) -> Option<(&'static str, Vec<String>)> {
+    if !configured {
+        return Some((
+            "Soft limits are OFF",
+            vec![
+                "This profile sets no soft limits, so nothing stops an axis at the end of its travel. Jog slowly and watch the machine.".into(),
+                "Add soft_min and soft_max for X, Y and Z to the profile to turn them on.".into(),
+            ],
+        ));
+    }
+    if unset.is_empty() {
+        return None;
+    }
+    let one = unset.len() == 1;
+    Some((
+        "Soft limits are OFF",
+        vec![
+            format!(
+                "{} {} no machine position (every E-stop clears it), so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
+                axis_names(unset),
+                if one { "has" } else { "have" },
+                if one { "it" } else { "them" },
+                if one { "its" } else { "their" },
+            ),
+            if home_switches {
+                "Home below to turn them on."
+            } else {
+                "Set machine zero below to turn them on."
+            }
+            .into(),
+        ],
+    ))
+}
+
 /// The Control page: the UC100 machine, its connection and its live state.
 fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
@@ -3344,29 +3386,10 @@ fn control(app: &App) -> Element<'_, Message> {
         )));
     }
     let unset = c.unset_limited_axes();
-    let limits: Element<_> = if !c.soft_limits_configured() {
-        muted("This profile sets no soft limits: nothing stops an axis at the end of its travel.")
-            .into()
-    } else if !unset.is_empty() {
-        let one = unset.len() == 1;
-        caution(
-            "Soft limits are OFF",
-            vec![
-                format!(
-                    "{} {} no machine position (every E-stop clears it), so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
-                    axis_names(&unset),
-                    if one { "has" } else { "have" },
-                    if one { "it" } else { "them" },
-                    if one { "its" } else { "their" },
-                ),
-                if c.home_switches() {
-                    "Home below to turn them on."
-                } else {
-                    "Set machine zero below to turn them on."
-                }
-                .into(),
-            ],
-        )
+    let limits: Element<_> = if let Some((heading, lines)) =
+        limits_off_warning(c.soft_limits_configured(), &unset, c.home_switches())
+    {
+        caution(heading, lines)
     } else {
         let ranges: Vec<String> = (0..6)
             .filter_map(|a| {
@@ -3453,6 +3476,7 @@ fn control(app: &App) -> Element<'_, Message> {
     if c.home_switches() {
         zero = zero.push(act("Home", idle(Action::Home), false));
     }
+    let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config);
     let model = crate::machine_view::MachineView {
         pos: [
             s.machine_pos[0] as f32,
@@ -3460,7 +3484,8 @@ fn control(app: &App) -> Element<'_, Message> {
             s.machine_pos[2] as f32,
         ],
         known: (0..3).all(|a| !c.axis(a) || s.referenced[a]),
-        envelope: crate::machine_view::MachineView::envelope(&c.config),
+        envelope,
+        assumed,
         block: c
             .block
             .map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
