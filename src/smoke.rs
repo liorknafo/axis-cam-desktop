@@ -5528,7 +5528,7 @@ flood = { pin = 8 }
         crate::storage::save(&project, &legacy).unwrap();
         let (doc, notes) = crate::storage::load_reporting(&project).unwrap();
         assert_eq!(notes, [linked]);
-        assert_eq!(doc.materials.len(), 15);
+        assert_eq!(doc.materials.len(), 22);
         assert_eq!(doc.selected_material().unwrap().name(), "Brass C360");
         // Open: the status carries the note.
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
@@ -5591,7 +5591,7 @@ flood = { pin = 8 }
             b.status,
             "Choose New project, Open, or Continue your previous project."
         );
-        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 16));
+        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 23));
         assert!(!b.dirty);
         // A workspace that needed no migration starts clean, and so does a blank one.
         let c = App::from_workspace(path, None);
@@ -5665,13 +5665,13 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         // A blank workspace starts with the starter materials.
-        assert_eq!(a.doc.materials.len(), 15);
+        assert_eq!(a.doc.materials.len(), 22);
         let user = crate::material::Material::new("Titanium Gr5");
         assert!(user.issues().is_empty());
         let titanium = user.id.clone();
         a.doc.materials.push(user);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 16);
+        assert_eq!(a.doc.materials.len(), 23);
         assert!(a.doc.material_id.is_empty() && a.doc.material.is_empty());
         // The user's own copy of a starter, renamed in another case and
         // edited, is kept; no starter is added next to it.
@@ -5693,8 +5693,8 @@ flood = { pin = 8 }
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(names.len(), 16);
-        assert_eq!(unique.len(), 16, "{names:?}");
+        assert_eq!(names.len(), 23);
+        assert_eq!(unique.len(), 23, "{names:?}");
         assert!(a.doc.materials.iter().any(|m| m.id == titanium));
         assert_eq!(a.doc.material_id, mine);
         assert_eq!(
@@ -5712,15 +5712,15 @@ flood = { pin = 8 }
         );
         // Opening it again, and a new project, add nothing more.
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 16);
+        assert_eq!(a.doc.materials.len(), 23);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 16);
+        assert_eq!(a.doc.materials.len(), 23);
         assert!(a.doc.material_id.is_empty());
         // An example opened from a library without the user's edits links
         // its material to the starter.
         let mut fresh = App::from_workspace(dir.path().join("other").join("workspace.json"), None);
         let _ = fresh.update(Message::OpenSample);
-        assert_eq!(fresh.doc.materials.len(), 15);
+        assert_eq!(fresh.doc.materials.len(), 22);
         assert_eq!(
             fresh.doc.selected_material().unwrap().name(),
             "Aluminium 6061-T6"
@@ -5742,7 +5742,7 @@ flood = { pin = 8 }
                 Material::new(" édelstahl 304 "),
                 Material::new(" aluminium 6061-t6 "),
             ],
-            starter_materials: 2,
+            starter_materials: crate::material::STARTER_SET,
             ..Document::default()
         };
         let (doc, status) = crate::merge_sample(&user);
@@ -5761,11 +5761,11 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 6061-T6");
-        assert_eq!(a.doc.materials.len(), 14);
+        assert_eq!(a.doc.materials.len(), 21);
         let _ = a.update(Message::OpenSample);
         // The deleted starter is not brought back with its data: the example's
         // material is added to the library without cutting data, and says so.
-        assert_eq!(a.doc.materials.len(), 15);
+        assert_eq!(a.doc.materials.len(), 22);
         let selected = a.doc.selected_material().unwrap();
         assert_eq!(selected.name(), "Aluminium 6061-T6");
         assert!(selected.cutting_data().is_none());
@@ -5777,7 +5777,7 @@ flood = { pin = 8 }
         // New project and a second Explore example keep that entry once.
         let _ = a.update(Message::NewProject);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 15);
+        assert_eq!(a.doc.materials.len(), 22);
         assert!(a.status.contains("linked to the library"), "{}", a.status);
     }
     #[test]
@@ -5786,9 +5786,9 @@ flood = { pin = 8 }
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 5052-H32");
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 14);
+        assert_eq!(a.doc.materials.len(), 21);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 14);
+        assert_eq!(a.doc.materials.len(), 21);
         assert!(
             !a.doc
                 .materials
@@ -6003,7 +6003,15 @@ flood = { pin = 8 }
         assert_eq!(a.doc.material_id, other);
         assert!(matches!(a.planner, crate::Planner::Idle));
         assert!(a.project_dirty);
-        assert_eq!(a.status, "Planning stopped because the job changed.");
+        // What the new material did to the speeds and feeds comes first.
+        assert!(
+            a.status
+                .starts_with("Speeds and feeds set for Aluminium 7075-T6: ")
+                && a.status
+                    .ends_with(" Planning stopped because the job changed."),
+            "{}",
+            a.status
+        );
     }
     #[test]
     fn the_material_note_has_three_outcomes() {
@@ -6026,6 +6034,71 @@ flood = { pin = 8 }
             material_note(&doc).as_deref(),
             Some("No material is chosen: speeds and feeds are not checked.")
         );
+    }
+    #[test]
+    fn picking_a_material_sets_every_operations_speed_and_feed_and_says_so() {
+        use crate::material::SpeedFeed;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        let pine = a
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Pine")
+            .unwrap()
+            .id
+            .clone();
+        let before: Vec<_> = a.doc.setups[0]
+            .operations
+            .iter()
+            .map(|o| get(&o.p, "rpm").to_string())
+            .collect();
+        let _ = a.update(Message::PickMaterial(pine.clone()));
+        assert_eq!(a.doc.material, "Pine");
+        assert!(a.dirty);
+        assert!(
+            a.status
+                .starts_with("Speeds and feeds set for Pine: Top / "),
+            "{}",
+            a.status
+        );
+        // Every operation but the drilling now suits pine, and the line names
+        // each one changed. The drilling keeps its own, and the line says so.
+        assert!(
+            a.status.ends_with(" A drilling operation keeps its speed and feed outside the data: set a drill's by hand, the library has no drill data."),
+            "{}",
+            a.status
+        );
+        for setup in &a.doc.setups {
+            for (o, old) in setup.operations.iter().zip(&before) {
+                if o.strategy == crate::model::Strategy::Drill {
+                    assert_eq!(get(&o.p, "rpm"), old);
+                    continue;
+                }
+                assert!(
+                    matches!(a.doc.speed_feed(setup, o), Some(SpeedFeed::InRange { .. })),
+                    "{}: {:?}",
+                    o.name(),
+                    a.doc.speed_feed(setup, o)
+                );
+                let rpm = get(&o.p, "rpm");
+                if rpm != old {
+                    assert!(
+                        a.status.contains(&format!(
+                            "{} / {} {old} → {rpm} rpm",
+                            setup.name(),
+                            o.name()
+                        )),
+                        "{}",
+                        a.status
+                    );
+                }
+            }
+        }
+        // Picking it again is no change and says nothing new.
+        a.status = "unchanged".into();
+        let _ = a.update(Message::PickMaterial(pine));
+        assert_eq!(a.status, "unchanged");
     }
     #[test]
     fn speeds_and_feeds_outside_the_materials_data_warn_and_never_block_export() {
@@ -11691,6 +11764,12 @@ flood = { pin = 8 }
     fn held_in_a_vise(proposal: &mut crate::proposal::Proposal) {
         let contour = proposal.setups[0].operations.remove(2);
         assert_eq!(contour.strategy, "Contour");
+        // The pocket's first loop past the boss slots the narrow corridor
+        // beside it at the full feed: 2 mm deep, that could tip the stock
+        // out of the vise's shallow grip (×1.8 against ×2).
+        let pocket = &mut proposal.setups[0].operations[1];
+        assert_eq!(pocket.strategy, "Pocket");
+        pocket.stepdown = Some(1.);
     }
     /// `apply_checked_plan` of the good plan as `edit` changes it.
     fn apply_checked_plan_of(a: &mut App, edit: impl FnOnce(&mut crate::proposal::Proposal)) {

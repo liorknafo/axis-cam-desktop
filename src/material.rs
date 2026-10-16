@@ -29,8 +29,9 @@ pub const NAME_LIMIT: usize = 60;
 pub const STARTER_NOTE: &str =
     "Starting point for carbide tools: adjust to your machine and your tool maker's data.";
 /// The starter set a library has been given: 1 is the first nine, 2 adds
-/// six common aluminium alloys. A library is brought up to it once.
-pub const STARTER_SET: u32 = 2;
+/// six common aluminium alloys, 3 adds seven woods. A library is brought up
+/// to it once.
+pub const STARTER_SET: u32 = 3;
 /// The starters set 2 added, by name.
 pub const ADDED_IN_SET_2: [&str; 6] = [
     "Aluminium 6082-T6",
@@ -40,6 +41,25 @@ pub const ADDED_IN_SET_2: [&str; 6] = [
     "Aluminium 1050A-H14",
     "Cast aluminium plate (MIC-6)",
 ];
+/// The starters set 3 added, by name.
+pub const ADDED_IN_SET_3: [&str; 7] = [
+    "Pine",
+    "Oak",
+    "Hard maple",
+    "Beech",
+    "Walnut",
+    "Cherry",
+    "Birch plywood",
+];
+/// The starters added after set `set`, by name: what a library given that
+/// set is still missing.
+pub fn added_since(set: u32) -> Vec<&'static str> {
+    [(2, &ADDED_IN_SET_2[..]), (3, &ADDED_IN_SET_3[..])]
+        .into_iter()
+        .filter(|(added, _)| set < *added)
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect()
+}
 /// Every cutting-data key prefix: the surface speed, then each chip-load band.
 fn bases() -> impl Iterator<Item = &'static str> {
     std::iter::once("vc").chain(BANDS.iter().map(|(k, _)| *k))
@@ -174,10 +194,125 @@ pub enum SpeedFeed {
     /// Why the operation could not be checked.
     Unchecked(String),
 }
+/// `machine`'s maximum spindle speed (rpm) and feed (mm/min), infinite
+/// when it gives none: the same maximum the model is told
+/// (`analysis::machine_report`), the UC100 profile's spindle maximum when it
+/// is lower; a profile that cannot be read leaves the saved rpm.
+fn limits(machine: &Machine) -> (f32, f32) {
+    let inch = if get(&machine.p, "units") == "inch" {
+        25.4
+    } else {
+        1.
+    };
+    let max_rpm = num(&machine.p, "rpm").unwrap_or(f32::INFINITY).min(
+        crate::control::spindle_cap(machine)
+            .ok()
+            .flatten()
+            .unwrap_or(f32::INFINITY),
+    );
+    let max_feed = num(&machine.p, "feed").map_or(f32::INFINITY, |v| v * inch);
+    (max_rpm, max_feed)
+}
+/// `value` rounded to 10 when that stays within `low`–`high`, else to a
+/// whole number within them.
+fn tens(value: f32, low: f32, high: f32) -> f32 {
+    let ten = (value / 10.).round() * 10.;
+    if (low..=high).contains(&ten) {
+        ten
+    } else if low.ceil() <= high.floor() {
+        value.round().clamp(low.ceil(), high.floor())
+    } else {
+        value
+    }
+}
+/// How much of its band's chip load a Ø`diameter` tool takes: all of it from
+/// the smallest band's 3 mm up, and under that in proportion to the
+/// diameter, since a small cutter takes a thinner chip (a Ø0.5 a sixth of a
+/// Ø3's) and snaps at a big one.
+pub fn chip_share(diameter: f32) -> f32 {
+    (diameter / BANDS[0].1).clamp(0., 1.)
+}
+/// The chip-load range (mm per tooth) a Ø`diameter` tool takes in `data`:
+/// its band's, scaled by `chip_share`.
+pub fn chip_load(data: &CuttingData, diameter: f32) -> (f32, f32) {
+    let (min, max) = data.fz[band(diameter)];
+    let share = chip_share(diameter);
+    (min * share, max * share)
+}
+/// The spindle speed (rpm) and feed (mm/min) to run at within `bottom`–`top`
+/// rpm and a chip load of `fz` (mm per tooth) with `flutes`, on a machine
+/// whose maximums are `max_rpm` and `max_feed`. The speed is the middle of
+/// the range, but no faster than lets the maximum feed reach the least chip
+/// load (a capped feed at a fast spindle makes thin chips that rub), and no
+/// slower than a quarter of the maximum rpm, where a router's spindle loses
+/// its torque, unless the range is. The feed is the middle of the chip-load
+/// range at that speed, up to the maximum feed. Both are rounded to 10 where
+/// that stays in range.
+pub fn pick(
+    (bottom, top): (f32, f32),
+    (fz_min, fz_max): (f32, f32),
+    flutes: f32,
+    max_rpm: f32,
+    max_feed: f32,
+) -> (f32, f32) {
+    let slowest = (max_rpm / 4.).max(bottom).min(top);
+    let fastest = (max_feed / (fz_min * flutes)).max(slowest);
+    let rpm = tens(((bottom + top) / 2.).clamp(slowest, fastest), bottom, top);
+    let high = (fz_max * flutes * rpm).min(max_feed);
+    let low = (fz_min * flutes * rpm).min(high);
+    (rpm, tens((low + high) / 2., low, high))
+}
+/// The spindle speed (rpm) and feed (mm/min) for `tool` in `material` on
+/// `machine`, which `check` finds in range: `pick` within the material's
+/// surface speed range up to the machine's maximum rpm, at the chip load the
+/// tool takes (`chip_load`). None without the material's cutting data, the
+/// tool's diameter and flutes, or the machine's maximum rpm and feed: without
+/// those a recommendation could be any speed.
+pub fn recommend(
+    material: &Material,
+    tool: &Tool,
+    machine: &Machine,
+) -> Result<(f32, f32), String> {
+    let name = crate::proposal::clip(material.name(), NAME_LIMIT);
+    let Some(data) = material.cutting_data() else {
+        return Err(format!("{name} has no cutting data."));
+    };
+    let (Some(d), Some(z)) = (
+        num(&tool.p, "diameter").filter(|d| *d > 0.),
+        num(&tool.p, "flutes").filter(|z| *z >= 1.),
+    ) else {
+        return Err("The tool has no diameter or flutes.".into());
+    };
+    let (max_rpm, max_feed) = limits(machine);
+    if !(max_rpm.is_finite() && max_rpm > 0. && max_feed.is_finite() && max_feed > 0.) {
+        return Err("The machine has no maximum spindle speed or feed.".into());
+    }
+    let rpm_at = |vc: f32| vc * 1000. / (std::f32::consts::PI * d);
+    let top = rpm_at(data.vc.1).min(max_rpm);
+    let bottom = rpm_at(data.vc.0).min(top);
+    Ok(pick(
+        (bottom, top),
+        chip_load(&data, d),
+        z,
+        max_rpm,
+        max_feed,
+    ))
+}
+/// A chip load in mm as a check says it: 3 decimals, and a fourth under
+/// 0.01 mm, where a small cutter's lie, unless it is 0.
+fn chip(mm: f32) -> String {
+    if mm < 0.01 {
+        let four = format!("{mm:.4}");
+        four.strip_suffix('0').map_or(four.clone(), str::to_string)
+    } else {
+        format!("{mm:.3}")
+    }
+}
 /// Checks an operation's spindle speed and feed against `material`, for
 /// `tool` on `machine` (whose maximum rpm and feed count as in range when the
 /// material asks for more; on a UC100 machine the profile's spindle maximum
-/// counts when it is lower). 1 % slack on every limit absorbs rounding.
+/// counts when it is lower), at the chip load the tool takes (`chip_load`).
+/// 1 % slack on every limit absorbs rounding.
 pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine) -> SpeedFeed {
     let name = crate::proposal::clip(material.name(), NAME_LIMIT);
     let Some(data) = material.cutting_data() else {
@@ -194,24 +329,11 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
             "The tool or the operation has no positive speed data.".into(),
         );
     }
-    let inch = if get(&machine.p, "units") == "inch" {
-        25.4
-    } else {
-        1.
-    };
-    // The same maximum the model is told (`analysis::machine_report`); a
-    // profile that cannot be read leaves the saved rpm.
-    let max_rpm = num(&machine.p, "rpm").unwrap_or(f32::INFINITY).min(
-        crate::control::spindle_cap(machine)
-            .ok()
-            .flatten()
-            .unwrap_or(f32::INFINITY),
-    );
-    let max_feed = num(&machine.p, "feed").map_or(f32::INFINITY, |v| v * inch);
+    let (max_rpm, max_feed) = limits(machine);
     let vc = std::f32::consts::PI * d * n / 1000.;
     let fz = f / (n * z);
     let (vc_min, vc_max) = data.vc;
-    let (fz_min, fz_max) = data.fz[band(d)];
+    let (fz_min, fz_max) = chip_load(&data, d);
     let mut out = vec![];
     if vc > vc_max * 1.01 {
         out.push(format!(
@@ -222,10 +344,15 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
             "Surface speed {vc:.0} m/min is below {name}'s {vc_min:.0}–{vc_max:.0} m/min."
         ));
     }
+    let (shown, low, high) = (chip(fz), chip(fz_min), chip(fz_max));
     if fz > fz_max * 1.01 {
-        out.push(format!("Chip load {fz:.3} mm per tooth is above {name}'s {fz_min:.3}–{fz_max:.3} mm for a Ø{d} mm tool."));
+        out.push(format!(
+            "Chip load {shown} mm per tooth is above {name}'s {low}–{high} mm for a Ø{d} mm tool."
+        ));
     } else if fz < fz_min * 0.99 && f < max_feed - 0.5 {
-        out.push(format!("Chip load {fz:.3} mm per tooth is below {name}'s {fz_min:.3}–{fz_max:.3} mm for a Ø{d} mm tool."));
+        out.push(format!(
+            "Chip load {shown} mm per tooth is below {name}'s {low}–{high} mm for a Ø{d} mm tool."
+        ));
     }
     if out.is_empty() {
         SpeedFeed::InRange { vc, fz }
@@ -243,7 +370,7 @@ pub fn starters() -> Vec<Material> {
         [(f32, f32); 5],
         &'static str,
     );
-    let rows: [Row; 15] = [
+    let rows: [Row; 22] = [
         (
             "Aluminium 6061-T6",
             "Aluminium",
@@ -454,6 +581,104 @@ pub fn starters() -> Vec<Material> {
             ],
             "Mist or air; stable cast tooling plate that stays flat.",
         ),
+        (
+            "Pine",
+            "Wood and composite",
+            "Janka 1.7–3.1 kN",
+            (100., 1200.),
+            [
+                (0.040, 0.100),
+                (0.060, 0.180),
+                (0.100, 0.250),
+                (0.120, 0.300),
+                (0.150, 0.350),
+            ],
+            "Dust extraction; no coolant. Soft and fibrous, as are spruce and fir: sharp tools and a light finishing pass, it fuzzes and tears across the grain. Resin gums up tools.",
+        ),
+        (
+            "Oak",
+            "Wood and composite",
+            "Janka 5.7–6.0 kN",
+            (100., 1000.),
+            [
+                (0.030, 0.080),
+                (0.050, 0.130),
+                (0.080, 0.180),
+                (0.100, 0.220),
+                (0.120, 0.280),
+            ],
+            "Dust extraction; no coolant. Open grain that chips out at edges: sharp tools and a light finishing pass.",
+        ),
+        (
+            "Hard maple",
+            "Wood and composite",
+            "Janka 6.4 kN",
+            (100., 1000.),
+            [
+                (0.030, 0.080),
+                (0.050, 0.130),
+                (0.080, 0.180),
+                (0.100, 0.220),
+                (0.120, 0.280),
+            ],
+            "Dust extraction; no coolant. Dense and burns: keep the chip load up and do not dwell.",
+        ),
+        (
+            "Beech",
+            "Wood and composite",
+            "Janka 5.8 kN",
+            (100., 1000.),
+            [
+                (0.030, 0.080),
+                (0.050, 0.130),
+                (0.080, 0.180),
+                (0.100, 0.220),
+                (0.120, 0.280),
+            ],
+            "Dust extraction; no coolant. Close grain that takes fine detail; burns if the tool rubs.",
+        ),
+        (
+            "Walnut",
+            "Wood and composite",
+            "Janka 4.5 kN",
+            (100., 1000.),
+            [
+                (0.030, 0.090),
+                (0.050, 0.150),
+                (0.080, 0.200),
+                (0.100, 0.250),
+                (0.120, 0.300),
+            ],
+            "Dust extraction; no coolant. Machines cleanly and takes fine detail.",
+        ),
+        (
+            "Cherry",
+            "Wood and composite",
+            "Janka 4.2 kN",
+            (100., 1000.),
+            [
+                (0.030, 0.090),
+                (0.050, 0.150),
+                (0.080, 0.200),
+                (0.100, 0.250),
+                (0.120, 0.300),
+            ],
+            "Dust extraction; no coolant. Burns easily: keep the chip load up and do not dwell.",
+        ),
+        (
+            "Birch plywood",
+            "Wood and composite",
+            "",
+            (100., 1000.),
+            [
+                (0.030, 0.080),
+                (0.050, 0.150),
+                (0.080, 0.200),
+                (0.100, 0.250),
+                (0.120, 0.300),
+            ],
+            "Dust extraction; no coolant. The glue lines dull tools; compression or down-cut tools keep the faces from splintering.",
+        ),
     ];
     rows.into_iter()
         .map(|(name, group, hardness, vc, fz, note)| {
@@ -490,7 +715,7 @@ mod tests {
     #[test]
     fn starters_are_valid_and_complete() {
         let all = starters();
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 22);
         for m in &all {
             assert!(m.issues().is_empty(), "{}: {:?}", m.name(), m.issues());
             assert!(m.cutting_data().is_some(), "{}", m.name());
@@ -500,7 +725,7 @@ mod tests {
         let mut names: Vec<_> = all.iter().map(|m| m.name().to_lowercase()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 22);
         let data = alu().cutting_data().unwrap();
         assert_eq!(data.vc, (150., 300.));
         assert_eq!(data.fz[1], (0.02, 0.05));
@@ -525,6 +750,31 @@ mod tests {
         // The first nine come first, in their old order.
         assert_eq!(all[0].name(), "Aluminium 6061-T6");
         assert_eq!(all[8].name(), "MDF");
+    }
+    #[test]
+    fn the_third_starter_set_is_seven_woods() {
+        let all = starters();
+        for name in ADDED_IN_SET_3 {
+            let m = all.iter().find(|m| m.name() == name).expect(name);
+            assert_eq!(get(&m.p, "group"), "Wood and composite", "{name}");
+        }
+        let wood = |name: &str| {
+            all.iter()
+                .find(|m| m.name() == name)
+                .unwrap()
+                .cutting_data()
+                .unwrap()
+        };
+        assert_eq!(wood("Pine").vc, (100., 1200.));
+        assert_eq!(wood("Oak").vc, (100., 1000.));
+        assert_eq!(wood("Hard maple").fz[1], (0.05, 0.13));
+        // The first fifteen come first, in their old order.
+        assert_eq!(all[14].name(), "Cast aluminium plate (MIC-6)");
+        assert_eq!(all[15].name(), "Pine");
+        // What a library given each set is still missing.
+        assert_eq!(added_since(1).len(), 13);
+        assert_eq!(added_since(2), ADDED_IN_SET_3);
+        assert!(added_since(STARTER_SET).is_empty());
     }
     #[test]
     fn cutting_data_must_be_complete_positive_and_ordered() {
@@ -663,17 +913,19 @@ mod tests {
             panic!()
         };
         assert!(
-            problems[0].contains("Chip load 0.008 mm per tooth is below"),
+            problems[0].contains("Chip load 0.0083 mm per tooth is below"),
             "{problems:?}"
         );
-        // A 1 mm tool cannot reach 150 m/min under 12000 rpm: the machine's maximum counts.
+        // A 1 mm tool cannot reach 150 m/min under 12000 rpm: the machine's
+        // maximum counts. (300 mm/min is 0.0083 mm a tooth, inside the
+        // 0.003–0.010 mm a Ø1 takes.)
         let small = Tool::new("Flat 1", "Flat end mill", "1");
         assert!(matches!(
-            check(&alu(), &small, &op("12000", "500"), &machine),
+            check(&alu(), &small, &op("12000", "300"), &machine),
             SpeedFeed::InRange { .. }
         ));
         assert!(matches!(
-            check(&alu(), &small, &op("11000", "500"), &machine),
+            check(&alu(), &small, &op("11000", "300"), &machine),
             SpeedFeed::Out(_)
         ));
         // 1 % slack for rounding.
@@ -698,11 +950,137 @@ mod tests {
             SpeedFeed::Unchecked(_)
         ));
     }
+    #[test]
+    fn common_router_cuts_in_wood_are_in_range() {
+        // A hobby router: 24000 rpm, 1000 mm/min.
+        let mut router = Machine::new(3);
+        router.p.insert("rpm".into(), "24000".into());
+        router.p.insert("feed".into(), "1000".into());
+        let wood = |name: &str| starters().into_iter().find(|m| m.name() == name).unwrap();
+        let bit = |d: &str| {
+            let mut t = Tool::new("Bit", "Flat end mill", d);
+            t.p.insert("flutes".into(), "2".into());
+            t
+        };
+        for (name, d, rpm, feed) in [
+            // 1/8" at 18000 rpm: 180 m/min, the feed at the machine's maximum.
+            ("Oak", "3.175", "18000", "1000"),
+            // Ø6 slowed to 10000 rpm for a 0.05 mm chip: 188 m/min.
+            ("Hard maple", "6", "10000", "1000"),
+            // 1/2" at 18000 rpm: 718 m/min.
+            ("Walnut", "12.7", "18000", "1000"),
+            // Ø25 surfacing bit at 12000 rpm: 942 m/min.
+            ("Birch plywood", "25", "12000", "1000"),
+            ("Pine", "25", "15000", "1000"),
+        ] {
+            assert!(
+                matches!(
+                    check(&wood(name), &bit(d), &op(rpm, feed), &router),
+                    SpeedFeed::InRange { .. }
+                ),
+                "{name} Ø{d} {rpm} rpm: {:?}",
+                check(&wood(name), &bit(d), &op(rpm, feed), &router)
+            );
+        }
+        // Rubbing still counts where the machine could feed faster.
+        let SpeedFeed::Out(problems) = check(
+            &wood("Cherry"),
+            &bit("6"),
+            &op("12000", "1000"),
+            &Machine::new(3),
+        ) else {
+            panic!()
+        };
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("Chip load 0.042 mm per tooth is below"),
+            "{problems:?}"
+        );
+    }
     fn machine(feed: &str, units: &str) -> Machine {
         let mut m = Machine::new(3);
         m.p.insert("feed".into(), feed.into());
         m.p.insert("units".into(), units.into());
         m
+    }
+    #[test]
+    fn a_recommended_speed_and_feed_pass_the_check_for_every_starter_tool_and_machine() {
+        let mut router = Machine::new(3);
+        router.p.insert("rpm".into(), "24000".into());
+        router.p.insert("feed".into(), "1000".into());
+        let mut open = Machine::new(3);
+        open.p.remove("rpm");
+        open.p.remove("feed");
+        // Without a maximum rpm and feed there is nothing to recommend from.
+        assert_eq!(
+            recommend(&alu(), &flat_6(), &open),
+            Err("The machine has no maximum spindle speed or feed.".into())
+        );
+        let machines = [Machine::new(3), router.clone(), machine("40", "inch")];
+        let mut checked = 0;
+        for m in starters() {
+            for machine in &machines {
+                for d in ["1", "3", "6", "10", "20"] {
+                    for z in ["1", "2", "3", "4"] {
+                        let mut tool = Tool::new("Cutter", "Flat end mill", d);
+                        tool.p.insert("flutes".into(), z.into());
+                        let (rpm, feed) = recommend(&m, &tool, machine).unwrap();
+                        let o = op(&rpm.to_string(), &feed.to_string());
+                        assert!(
+                            matches!(check(&m, &tool, &o, machine), SpeedFeed::InRange { .. }),
+                            "{} Ø{d} z{z} {rpm} rpm {feed} mm/min: {:?}",
+                            m.name(),
+                            check(&m, &tool, &o, machine)
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 22 * 3 * 5 * 4);
+        // Aluminium, Ø6 three-flute, 12000 rpm and 5000 mm/min: the middle of
+        // 7958–12000 rpm, and of the 0.02–0.05 mm band's 599–1497 mm/min there.
+        assert_eq!(
+            recommend(&alu(), &flat_6(), &Machine::new(3)),
+            Ok((9980., 1050.))
+        );
+        // Pine with a Ø3 three-flute on a 24000 rpm, 1000 mm/min router: the
+        // feed cannot reach 0.04 mm a tooth even at the least surface speed,
+        // so the spindle runs at that, for the thickest chip (0.031 mm).
+        let pine = starters().into_iter().find(|m| m.name() == "Pine").unwrap();
+        let three = Tool::new("Flat 3", "Flat end mill", "3");
+        assert_eq!(recommend(&pine, &three, &router), Ok((10611., 1000.)));
+        // A Ø10 would want 3333 rpm for the least chip load at 1000 mm/min:
+        // it stops at a quarter of the router's 24000, where its spindle
+        // still has torque.
+        let ten = Tool::new("Flat 10", "Flat end mill", "10");
+        assert_eq!(recommend(&pine, &ten, &router), Ok((6000., 1000.)));
+        // A Ø50 surfacing cutter's middle, 4138 rpm, is under that too.
+        let fifty = Tool::new("Surfacing 50", "Flat end mill", "50");
+        assert_eq!(recommend(&pine, &fifty, &router).unwrap().0, 6000.);
+        // A Ø0.5 two-flute takes a sixth of a Ø3's chip load: 0.0017–0.005 mm
+        // in aluminium, not the 0.010–0.030 mm that snaps it.
+        let mut tiny = Tool::new("Flat 0.5", "Flat end mill", "0.5");
+        tiny.p.insert("flutes".into(), "2".into());
+        let (rpm, feed) = recommend(&alu(), &tiny, &router).unwrap();
+        let fz = feed / (rpm * 2.);
+        assert!(
+            (0.0016..=0.0051).contains(&fz),
+            "{rpm} rpm {feed} mm/min: {fz}"
+        );
+        let too_much = op(&rpm.to_string(), &(0.015 * rpm * 2.).round().to_string());
+        let SpeedFeed::Out(problems) = check(&alu(), &tiny, &too_much, &router) else {
+            panic!()
+        };
+        assert!(
+            problems[0].contains("is above Aluminium 6061-T6's 0.0017–0.005 mm for a Ø0.5 mm tool"),
+            "{problems:?}"
+        );
+        // Nothing to recommend from.
+        assert!(recommend(&Material::new("Unknown"), &three, &router).is_err());
+        let mut fluteless = three.clone();
+        fluteless.p.insert("flutes".into(), "0".into());
+        assert!(recommend(&pine, &fluteless, &router).is_err());
     }
     #[test]
     fn the_machine_feed_limit_counts_in_its_own_units() {

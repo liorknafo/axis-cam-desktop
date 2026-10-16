@@ -2461,7 +2461,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if pocket_setting(p, "pocket_entry") == "Profile ramp" {
                 c = c.push(checks.field(p, "ramp_angle", "Ramp angle · degrees"));
             }
-            c = c.push(note("Profile ramp descends around each closed contour at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. All transfers between contours retract to clearance; no sideways shortcut crosses an island."));
+            c = c.push(note("Profile ramp descends around the contour it enters at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. Between contours the tool stays down: it follows the contour just cut, then steps across at most 1.5 stepovers along a line clear of every wall and island; otherwise it retracts to clearance and enters again."));
             c = c.push(note(fixture_note(app, Note::Pocket)));
         }
         "Linking" if !app.is_sample() && o.strategy == Strategy::Face => {
@@ -3204,7 +3204,7 @@ fn material_picker(app: &App) -> Element<'_, Message> {
                 .text_size(13).style(choice_style),
             Help::text(
                 "Project material",
-                "Material from the library. Its cutting data are used to check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
+                "Material from the library. Choosing it sets each operation's speed and feed (drilling aside) from its cutting data, for the operation's tool and machine. The data also check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
             ),
             widget::tooltip::Position::Left
         ),
