@@ -489,13 +489,13 @@ fn tolerance(largest: f64) -> f64 {
 fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
     let mut largest = largest;
     for v in triangles.iter().flatten().flatten() {
-        if !(v.abs() <= FAR) {
+        if v.is_nan() || v.abs() > FAR {
             largest = f64::INFINITY;
             break;
         }
         largest = largest.max(v.abs());
     }
-    if !(largest <= FAR) {
+    if largest.is_nan() || largest > FAR {
         return Closure {
             open_edges: 3 * triangles.len(),
             encloses_volume: false,
@@ -729,13 +729,14 @@ struct Tree<'a> {
     points: &'a [[f64; 3]],
     ids: Vec<u32>,
     /// Each node's box, its points (a range of `ids`) and its children.
-    nodes: Vec<(
-        [f64; 3],
-        [f64; 3],
-        std::ops::Range<usize>,
-        Option<[usize; 2]>,
-    )>,
+    nodes: Vec<Node>,
 }
+type Node = (
+    [f64; 3],
+    [f64; 3],
+    std::ops::Range<usize>,
+    Option<[usize; 2]>,
+);
 impl<'a> Tree<'a> {
     fn new(points: &'a [[f64; 3]], ids: Vec<u32>) -> Self {
         let mut tree = Self {
@@ -1277,7 +1278,7 @@ pub(crate) mod tests {
         crate::proposal::tests::aluminium(&mut doc);
         (doc, mesh)
     }
-    fn plane<'a>(o: &'a OrientationReport, depth: f32) -> &'a PlaneReport {
+    fn plane(o: &OrientationReport, depth: f32) -> &PlaneReport {
         o.planes
             .iter()
             .find(|p| (p.depth_below_top - depth).abs() < 0.01)

@@ -329,7 +329,7 @@ mod tests {
     fn check(machine: Machine, op: OpState, moves: &[(Motion, [f32; 3], f32)]) -> Vec<String> {
         let plan = fixture::plan([-15., -15., 25.], moves);
         let settings = PostSettings::from_machine(&machine).unwrap();
-        let blocks = blocks(&[op.clone()], &[&plan], &settings);
+        let blocks = blocks(std::slice::from_ref(&op), &[&plan], &settings);
         let setup = Setup::new(machine, "G54");
         let sim = Simulation::new(plan);
         check_setup(&setup, &[op], &[&sim], &blocks, &settings, [0., 0., 10.])
@@ -440,7 +440,7 @@ mod tests {
             plan.moves[2].feed = bad;
             let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
             let op = fixture::facing_op();
-            let blocks = blocks(&[op.clone()], &[&plan], &settings);
+            let blocks = blocks(std::slice::from_ref(&op), &[&plan], &settings);
             let setup = Setup::new(Machine::new(3), "G54");
             let sim = Simulation::new(plan);
             let problems = check_setup(&setup, &[op], &[&sim], &blocks, &settings, [0., 0., 10.]);
@@ -575,7 +575,7 @@ mod tests {
         );
         let settings = PostSettings::from_machine(&Machine::new(3)).unwrap();
         let op = fixture::facing_op();
-        let blocks = blocks(&[op.clone()], &[&plan], &settings);
+        let blocks = blocks(std::slice::from_ref(&op), &[&plan], &settings);
         assert!(blocks.contains(&Block::Descend {
             op: 0,
             xy: [-15., -15.],

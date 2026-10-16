@@ -731,6 +731,7 @@ The `examples` directory includes a sample AXIS project, an OBJ cube, matching f
 ```sh
 cargo test --locked
 cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
 cargo run --locked -- --smoke-test ./smoke-output
 # Fast, isolated rendering of field help only:
 cargo run --release --locked -- --smoke-test ./help-output --help-only

@@ -140,7 +140,7 @@ pub(crate) fn stl(b: &[u8]) -> Result<Vec<[[f32; 3]; 3]>, String> {
         let n = u32::from_le_bytes(b[80..84].try_into().unwrap()) as usize;
         if 84usize.checked_add(n.checked_mul(50).ok_or("Invalid STL size")?) == Some(b.len()) {
             let mut out = Vec::with_capacity(n);
-            for chunk in b[84..].chunks_exact(50) {
+            for chunk in b[84..].as_chunks::<50>().0 {
                 let mut tri = [[0.; 3]; 3];
                 for (v, p) in tri.iter_mut().enumerate() {
                     for (c, x) in p.iter_mut().enumerate() {
@@ -173,7 +173,9 @@ pub(crate) fn stl(b: &[u8]) -> Result<Vec<[[f32; 3]; 3]>, String> {
         return Err("STL must contain complete triangles.".into());
     }
     Ok(vertices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|v| [v[0], v[1], v[2]])
         .collect())
 }
@@ -590,12 +592,8 @@ mod tests {
         let mesh = normalize(vec![[[10., 20., 30.], [20., 20., 30.], [10., 40., 35.]]]).unwrap();
         let s = mesh.display_scale();
         let expected = [-15. * s, -30. * s, -30. * s + 4.];
-        for k in 0..3 {
-            assert!(
-                (mesh.origin[k] - expected[k]).abs() < 1e-3,
-                "{:?}",
-                mesh.origin
-            );
+        for (k, e) in expected.iter().enumerate() {
+            assert!((mesh.origin[k] - e).abs() < 1e-3, "{:?}", mesh.origin);
         }
         let sources = [[10., 20., 30.], [20., 20., 30.], [10., 40., 35.]];
         for p in &mesh.faces[0].points {

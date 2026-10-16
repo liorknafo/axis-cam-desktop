@@ -200,9 +200,9 @@ pub fn generate(
             {
                 for point in &face.points {
                     let p = placement.transform(*point).map(|v| v / scale);
-                    for k in 0..3 {
-                        b.min[k] = b.min[k].min(p[k]);
-                        b.max[k] = b.max[k].max(p[k]);
+                    for (k, &v) in p.iter().enumerate() {
+                        b.min[k] = b.min[k].min(v);
+                        b.max[k] = b.max[k].max(v);
                     }
                 }
             }
@@ -747,7 +747,7 @@ pub fn sequence_walk(
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
                 sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.preceding=preceding;sim.source=(index(si),index(oi));
-                if let Some((previous,stock))=&grid {if *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}}
+                if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
                 Ok(sim)
             });
             match &result {

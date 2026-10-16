@@ -235,7 +235,15 @@ pub fn check(material: &Material, tool: &Tool, op: &Operation, machine: &Machine
 }
 /// The starter library (spec table "Starter materials").
 pub fn starters() -> Vec<Material> {
-    let rows: [(&str, &str, &str, (f32, f32), [(f32, f32); 5], &str); 15] = [
+    type Row = (
+        &'static str,
+        &'static str,
+        &'static str,
+        (f32, f32),
+        [(f32, f32); 5],
+        &'static str,
+    );
+    let rows: [Row; 15] = [
         (
             "Aluminium 6061-T6",
             "Aluminium",

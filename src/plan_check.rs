@@ -1579,7 +1579,7 @@ mod tests {
             assert_eq!(crate::exit_code(&result.map(|r| r.2)), 2, "{args:?}");
         }
         assert!(
-            crate::check_plan(&[project.clone()])
+            crate::check_plan(std::slice::from_ref(&project))
                 .unwrap_err()
                 .starts_with("Usage")
         );

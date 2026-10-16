@@ -863,11 +863,10 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
                 ];
                 let i = y * nx + x;
                 if let Some(height) = drop_triangle(&t.p, xy, r, b.plan.shape == CutterShape::Ball)
+                    && z[i].is_none_or(|v| height > v)
                 {
-                    if z[i].is_none_or(|v| height > v) {
-                        z[i] = Some(height);
-                        selected[i] = slope >= low - 0.001 && slope <= high + 0.001;
-                    }
+                    z[i] = Some(height);
+                    selected[i] = slope >= low - 0.001 && slope <= high + 0.001;
                 }
             }
         }

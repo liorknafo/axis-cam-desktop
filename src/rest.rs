@@ -53,9 +53,9 @@ fn transformed(b: Bounds, from: Frame, to: Frame) -> Bounds {
         max: [f32::NEG_INFINITY; 3],
     };
     for p in corners(b).map(|p| transfer(p, from, to)) {
-        for k in 0..3 {
-            out.min[k] = out.min[k].min(p[k]);
-            out.max[k] = out.max[k].max(p[k]);
+        for (k, &v) in p.iter().enumerate() {
+            out.min[k] = out.min[k].min(v);
+            out.max[k] = out.max[k].max(v);
         }
     }
     out

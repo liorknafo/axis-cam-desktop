@@ -323,24 +323,20 @@ impl Viewport<'_> {
                 max: [f32::NEG_INFINITY; 3],
             };
             for point in sim.plan.moves.iter().flat_map(|m| [m.from, m.to]) {
-                for k in 0..3 {
+                for (k, &pk) in point.iter().enumerate() {
                     reach.min[k] = reach.min[k].min(
-                        (point[k]
-                            - if k == 2 {
-                                0.
-                            } else {
-                                sim.plan.radius.max(sim.plan.holder_radius)
-                            })
-                            * sim.plan.display_scale,
+                        (pk - if k == 2 {
+                            0.
+                        } else {
+                            sim.plan.radius.max(sim.plan.holder_radius)
+                        }) * sim.plan.display_scale,
                     );
                     reach.max[k] = reach.max[k].max(
-                        (point[k]
-                            + if k == 2 {
-                                sim.plan.tool_length + 8.
-                            } else {
-                                sim.plan.radius.max(sim.plan.holder_radius)
-                            })
-                            * sim.plan.display_scale,
+                        (pk + if k == 2 {
+                            sim.plan.tool_length + 8.
+                        } else {
+                            sim.plan.radius.max(sim.plan.holder_radius)
+                        }) * sim.plan.display_scale,
                     );
                 }
             }
@@ -378,11 +374,10 @@ impl Viewport<'_> {
             let vertices: Vec<_> = face.points.iter().map(|v| (p.p(*v), p.depth(*v))).collect();
             for i in 1..vertices.len() - 1 {
                 if let Some(z) = triangle_depth([vertices[0], vertices[i], vertices[i + 1]], point)
+                    && z > nearest
                 {
-                    if z > nearest {
-                        nearest = z;
-                        feature = face.feature;
-                    }
+                    nearest = z;
+                    feature = face.feature;
                 }
             }
         }
@@ -674,34 +669,35 @@ impl Viewport<'_> {
                 }
                 all.extend(path.iter().copied());
             }
-            if let Some(progress) = self.progress {
-                if !all.is_empty() {
-                    let point = all[((all.len() - 1) as f32 * progress.clamp(0., 1.)) as usize];
-                    let top = [point[0], point[1], point[2] + 30.];
-                    let cap = [point[0], point[1], point[2] + 45.];
-                    raster_line(
-                        &mut rgba,
-                        w,
-                        h,
-                        scaled(point),
-                        scaled(top),
-                        [209, 158, 57, 255],
-                        9. * ratio,
-                    );
-                    raster_line(
-                        &mut rgba,
-                        w,
-                        h,
-                        scaled(top),
-                        scaled(cap),
-                        [80, 98, 115, 255],
-                        16. * ratio,
-                    );
-                }
+            if let Some(progress) = self.progress
+                && !all.is_empty()
+            {
+                let point = all[((all.len() - 1) as f32 * progress.clamp(0., 1.)) as usize];
+                let top = [point[0], point[1], point[2] + 30.];
+                let cap = [point[0], point[1], point[2] + 45.];
+                raster_line(
+                    &mut rgba,
+                    w,
+                    h,
+                    scaled(point),
+                    scaled(top),
+                    [209, 158, 57, 255],
+                    9. * ratio,
+                );
+                raster_line(
+                    &mut rgba,
+                    w,
+                    h,
+                    scaled(top),
+                    scaled(cap),
+                    [80, 98, 115, 255],
+                    16. * ratio,
+                );
             }
         }
         (rgba, depths)
     }
+    #[allow(clippy::too_many_arguments)]
     fn raster_simulation(
         &self,
         sim: &crate::simulation::Simulation,
@@ -731,13 +727,12 @@ impl Viewport<'_> {
                 );
             }
         };
-        if self.show_stock {
-            if let (Some(volume), Some(current)) = (&sim.volume, sim.frame) {
-                if let Some(surface) = &sim.stock_surface {
-                    for (points, color) in stock_triangles(volume, surface, current) {
-                        face(&points, color);
-                    }
-                }
+        if self.show_stock
+            && let (Some(volume), Some(current)) = (&sim.volume, sim.frame)
+            && let Some(surface) = &sim.stock_surface
+        {
+            for (points, color) in stock_triangles(volume, surface, current) {
+                face(&points, color);
             }
         }
         if self.show_stock && sim.volume.is_none() {
@@ -1008,19 +1003,19 @@ impl canvas::Program<Event> for Viewport<'_> {
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(_)) => {
                 if let Some((_, _, button)) = state.drag.take() {
-                    if !state.moved && button == mouse::Button::Left {
-                        if let Some(p) = cursor.position_in(bounds) {
-                            if let Some(f) = self.picked(bounds, p) {
-                                return Some(
-                                    Action::publish(if self.sample {
-                                        Event::Pick(f)
-                                    } else {
-                                        Event::PickSurface(f)
-                                    })
-                                    .and_capture(),
-                                );
-                            }
-                        }
+                    if !state.moved
+                        && button == mouse::Button::Left
+                        && let Some(p) = cursor.position_in(bounds)
+                        && let Some(f) = self.picked(bounds, p)
+                    {
+                        return Some(
+                            Action::publish(if self.sample {
+                                Event::Pick(f)
+                            } else {
+                                Event::PickSurface(f)
+                            })
+                            .and_capture(),
+                        );
                     }
                     return Some(Action::capture());
                 }
@@ -1596,6 +1591,7 @@ fn raster_triangle(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn raster_depth_line(
     pixels: &mut [u8],
     depths: &[f32],
@@ -2049,7 +2045,7 @@ mod tests {
                 &mut SolidBuffers::default(),
             );
             assert_eq!(
-                &pixels[index..index + 4] == [128, 128, 128, 255],
+                pixels[index..index + 4] == [128, 128, 128, 255],
                 expected_unchanged
             );
             assert_eq!(pixels[index + 3], 255);

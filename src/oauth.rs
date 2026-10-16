@@ -1078,7 +1078,8 @@ mod tests {
     }
     #[tokio::test]
     async fn id_tokens_must_match_key_audience_nonce_issuer_and_time() {
-        let cases: Vec<(&str, Box<dyn Fn(Value) -> Value + Send + Sync>)> = vec![
+        type Case = (&'static str, Box<dyn Fn(Value) -> Value + Send + Sync>);
+        let cases: Vec<Case> = vec![
             (
                 "audience",
                 Box::new(|mut c| {
@@ -1445,8 +1446,10 @@ mod tests {
         impl<T: std::fmt::Debug> Probe<T> {
             const DEBUG: bool = true;
         }
-        assert!(Probe::<Callback>::DEBUG, "the probe detects Debug");
-        assert!(!Probe::<Attempt>::DEBUG, "Attempt must not implement Debug");
+        const {
+            assert!(Probe::<Callback>::DEBUG, "the probe detects Debug");
+            assert!(!Probe::<Attempt>::DEBUG, "Attempt must not implement Debug");
+        }
     }
     #[tokio::test]
     async fn id_tokens_need_rs256_and_may_omit_kid_with_a_single_key() {

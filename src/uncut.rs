@@ -175,9 +175,9 @@ pub fn uncut(stock: &Volume, setup1: &Setup, mesh: &Mesh) -> Uncut {
         group.faces.push(i);
         group.area += area;
         for v in p {
-            for k in 0..3 {
-                group.bounds.min[k] = group.bounds.min[k].min(v[k] - part.min[k]);
-                group.bounds.max[k] = group.bounds.max[k].max(v[k] - part.min[k]);
+            for (k, &x) in v.iter().enumerate().take(3) {
+                group.bounds.min[k] = group.bounds.min[k].min(x - part.min[k]);
+                group.bounds.max[k] = group.bounds.max[k].max(x - part.min[k]);
             }
         }
         for side in 0..6 {
