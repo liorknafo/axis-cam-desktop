@@ -69,6 +69,18 @@ fn number(operation: &Operation, key: &str) -> Result<f32, String> {
         )
     })
 }
+/// The refusal for stock, part or tool coordinates the preview polygon
+/// kernel's integer range cannot hold.
+pub const COORDINATE_LIMIT_MESSAGE: &str =
+    "Geometry/tool extent exceeds the ±1,000,000 mm preview coordinate limit.";
+/// Whether a corner of `bounds` lies beyond ±1,000,000 mm.
+pub fn exceeds_coordinate_limit(bounds: &Bounds) -> bool {
+    bounds
+        .min
+        .iter()
+        .chain(&bounds.max)
+        .any(|v| v.abs() > 1_000_000.)
+}
 pub fn generate(
     setup: &Setup,
     operation: &Operation,
@@ -77,13 +89,14 @@ pub fn generate(
 ) -> Result<Plan, String> {
     // Keep coordinates within the preview polygon kernel's integer range.
     // This applies to every strategy before its geometry-specific calculations.
+    // A fixed-size box stays at the origin while the part follows the setup's
+    // translation, so the placed part is checked as well as the stock.
     if operation.strategy.imported_preview() {
-        let bounds = stock::resolve(setup, Some(mesh))?.stock;
-        if bounds
-            .min
-            .iter()
-            .chain(&bounds.max)
-            .any(|v| v.abs() > 1_000_000.)
+        let stock = stock::resolve(setup, Some(mesh))?;
+        if exceeds_coordinate_limit(&stock.stock)
+            || stock
+                .part
+                .is_some_and(|part| exceeds_coordinate_limit(&part))
             || ["diameter", "length", "stickout", "holder"]
                 .iter()
                 .any(|k| num(&tool.p, k).is_some_and(|v| v > 1_000_000.))
@@ -91,9 +104,7 @@ pub fn generate(
                 .iter()
                 .any(|k| num(&operation.p, k).is_some_and(|v| v.abs() > 1_000_000.))
         {
-            return Err(
-                "Geometry/tool extent exceeds the ±1,000,000 mm preview coordinate limit.".into(),
-            );
+            return Err(COORDINATE_LIMIT_MESSAGE.into());
         }
     }
     if operation.strategy == Strategy::Pocket {
@@ -229,6 +240,9 @@ pub fn generate(
             "Set a positive retract height and clearance at or above retract before simulation."
                 .into(),
         );
+    }
+    if top - target >= tool_length {
+        return Err("Facing depth from the cutting start to the target must be less than tool stickout. Choose a tool with adequate reach or reduce the stock above the target.".into());
     }
     let mut envelope = area;
     for k in 0..2 {
@@ -941,6 +955,55 @@ mod tests {
             generate(&setup, &op, &tool, &mesh)
                 .unwrap_err()
                 .contains("changed")
+        );
+    }
+    #[test]
+    fn a_facing_deeper_than_the_tool_stickout_is_refused() {
+        let (mut setup, op, tool, mesh) = fixture();
+        // The 2 mm cutter's stickout is 35 mm. With 40 mm of stock above the
+        // target, the holder would be in the stock, as the other kernels refuse.
+        setup.p.insert("stock_top".into(), "40".into());
+        let error = generate(&setup, &op, &tool, &mesh).unwrap_err();
+        assert!(error.contains("stickout"), "{error}");
+        setup.p.insert("stock_top".into(), "34".into());
+        assert!(generate(&setup, &op, &tool, &mesh).is_ok());
+    }
+    #[test]
+    fn a_part_translated_beyond_the_coordinate_limit_is_refused_in_a_fixed_box() {
+        let (mut setup, face, tool, mesh) = fixture();
+        setup.p.insert("stock_type".into(), "Fixed size box".into());
+        setup.p.insert("tx".into(), "1e20".into());
+        // The box itself is within range; only the placed part is not.
+        let stock = stock::resolve(&setup, Some(&mesh)).unwrap();
+        assert!(!exceeds_coordinate_limit(&stock.stock));
+        for strategy in [
+            Strategy::Face,
+            Strategy::Pocket,
+            Strategy::Contour,
+            Strategy::Drill,
+            Strategy::Parallel,
+            Strategy::Waterline,
+        ] {
+            let mut op = Operation::new(strategy, tool.id.clone());
+            op.geometry.clear();
+            op.surfaces = face.surfaces.clone();
+            assert_eq!(
+                generate(&setup, &op, &tool, &mesh).unwrap_err(),
+                COORDINATE_LIMIT_MESSAGE,
+                "{strategy:?}"
+            );
+        }
+        // The hole list is also asked for outside `generate`.
+        let mut drill = Operation::new(Strategy::Drill, tool.id.clone());
+        drill.surfaces = face.surfaces.clone();
+        assert_eq!(
+            crate::cam::holes(&setup, &drill, &mesh).unwrap_err(),
+            COORDINATE_LIMIT_MESSAGE
+        );
+        setup.p.insert("tx".into(), "0".into());
+        assert_ne!(
+            crate::cam::holes(&setup, &drill, &mesh).err().as_deref(),
+            Some(COORDINATE_LIMIT_MESSAGE)
         );
     }
     #[test]
