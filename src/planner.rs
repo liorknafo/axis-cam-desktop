@@ -299,7 +299,7 @@ WORKHOLDING
 - Set the fields a strategy does not use to null. A null field takes the program's default: `stepdown` 2, `stepover_percent` 40, `surface_stepover` 1, `tolerance` 0.01, `peck` 3, `finish_passes` 1, `ramp_angle` 2, `breakthrough` 1, `clearance` 15, allowances and `bottom_offset` 0.
 - For later setups choose the work zero: `Model origin` is accepted; the program tells the operator where it lies relative to the part, and to the stock top while no earlier setup has cut it. Prefer a stock-based zero when the stock it is touched off on is untouched. A stock-based zero `Stock top <spot>` or `Stock bottom <spot>` is a point of the box the setup starts from (what the earlier setups leave), <spot> being `center`, a corner (`front-left`, `front-right`, `back-left`, `back-right`) or the middle of an edge (`front`, `back`, `left`, `right`); front is -Y, left -X. It is touched off on the stock top over the point (a zero on the bottom as the stock's height above it), and X0 Y0 from the sides it names (both sides of an axis for a point midway along it) between 1 mm and 10 mm below the top, near the end of each side nearer the zero (5% to 15% of its length from it) or near its middle. Corners are touched within 10 mm of the corner, at least 1 mm in from both edges. On stock under 40 mm tall the sides are touched within a quarter of its height below the top, and under 40 mm across the corner area is a quarter of the shorter top side. A stock-based zero is refused when earlier setups have cut the stock at one of those spots, or under a zero on the bottom.
 - Give each setup a short `workholding` note. The jaws or clamps in the report are modelled; say what else must be kept clear.
-- `clearance` is the height above the stock top, in mm, at which the tool travels between cuts: 15 when null. It can only be raised, never below 15. Raise it only for the reason given under WORKHOLDING.
+- `clearance` is the height above the stock top, in mm, at which the tool travels between cuts: 15 when null. It can only be raised, never below 15 and never above the machine's Z travel (`machine.travel`, its third value; 300 when that is 0). Raise it only for the reason given under WORKHOLDING.
 - List every feature you cannot machine with these tools and strategies in `unmachined`, with the reason. Do not leave it out silently, and do not add an operation that cannot work.
 - Put risks the operator should know about in `warnings`.
 - In the check report, `covered_other` lists the remaining surface by `facing` (+X, -X, +Y, -Y, top, bottom), named in setup 1's frame, which can differ from the orientation names when setup 1 is rotated.
@@ -753,10 +753,38 @@ fn refuses_tools_or_pictures(message: &str) -> bool {
         .iter()
         .any(|word| message.contains(word))
 }
+/// What a refused send should be made again without. A 400 that names only
+/// pictures drops the pictures first, as it would fail again with the same
+/// ones; any other refusal, and `Unsupported` with no text to go by, drops the
+/// tools first. What is already off is skipped.
+fn dropped_for(error: &ApiError, sight: &Sight) -> Option<Dropped> {
+    let pictures_first = match error {
+        ApiError::Unsupported(_) => false,
+        ApiError::BadRequest(m) => {
+            if !refuses_tools_or_pictures(m) {
+                return None;
+            }
+            let m = m.to_lowercase();
+            let names = |words: [&str; 2]| words.iter().any(|word| m.contains(word));
+            names(["image", "picture"]) && !names(["tool", "function"])
+        }
+        _ => return None,
+    };
+    let order = if pictures_first {
+        [Dropped::Pictures, Dropped::Tool]
+    } else {
+        [Dropped::Tool, Dropped::Pictures]
+    };
+    order.into_iter().find(|dropped| match dropped {
+        Dropped::Tool => sight.tool,
+        Dropped::Pictures => sight.pictures,
+    })
+}
 /// One planner request: sends the conversation, answers the model's tool
 /// calls, and returns the text of the first reply without calls. A send
-/// OpenAI refuses for its tools or pictures is made again without the
-/// tools, then without pictures.
+/// OpenAI refuses for its tools or pictures is made again without what it
+/// names: the tools, or the pictures when only they are named, and then the
+/// other.
 async fn ask(
     backend: &(impl Backend + Sync),
     sight: &mut Sight,
@@ -788,25 +816,17 @@ async fn ask(
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
         let reply = match backend.reply(&messages, &tools, choice).await {
             Ok(reply) => reply,
-            Err(error)
-                if (sight.tool || sight.pictures)
-                    && match &error {
-                        ApiError::Unsupported(_) => true,
-                        ApiError::BadRequest(m) => refuses_tools_or_pictures(m),
-                        _ => false,
-                    } =>
-            {
-                let dropped = if sight.tool {
-                    sight.tool = false;
-                    Dropped::Tool
-                } else {
-                    sight.pictures = false;
-                    Dropped::Pictures
+            Err(error) => {
+                let Some(dropped) = dropped_for(&error, sight) else {
+                    return Err(error);
                 };
+                match dropped {
+                    Dropped::Tool => sight.tool = false,
+                    Dropped::Pictures => sight.pictures = false,
+                }
                 progress(Event::Dropped(request, dropped));
                 continue;
             }
-            Err(error) => return Err(error),
         };
         if reply.calls.is_empty() {
             return Ok(reply.text);
@@ -1534,7 +1554,7 @@ pub(crate) mod tests {
             "already covers a height below 15",
             "When the height is 15 or more",
             "work coordinates (X, Y and Z measured from the setup's work zero",
-            "It can only be raised, never below 15.",
+            "It can only be raised, never below 15 and never above the machine's Z travel (`machine.travel`, its third value; 300 when that is 0).",
             "above the jaws' top",
             "stage `workholding`",
             "are not checked",
@@ -4446,6 +4466,56 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(drops, vec![(1, Dropped::Tool), (1, Dropped::Pictures)]);
+    }
+    #[tokio::test]
+    async fn a_refusal_naming_only_the_images_drops_the_pictures_and_keeps_the_tools() {
+        let (doc, mesh, report) = block();
+        let script = Script::calls(vec![
+            Err(ApiError::BadRequest(
+                "Invalid value: 'image_url'. (parameter: input[3].content[1].image_url)".into(),
+            )),
+            text(&good(&report)),
+            text(&good(&report)),
+        ]);
+        let mut events = vec![];
+        plan(&script, doc, mesh, &Busy::default(), |e| events.push(e))
+            .await
+            .unwrap();
+        let drops: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Dropped(n, d) => Some((*n, *d)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drops, vec![(1, Dropped::Pictures)]);
+        let offered = script.offered.lock().unwrap();
+        assert_eq!(offered[0][0], look::NAME);
+        assert_eq!(offered[0][1..], PART_TOOLS);
+        assert!(
+            offered[1..].iter().all(|names| names[..] == PART_TOOLS),
+            "{offered:?}"
+        );
+        // A refusal that names both, or `Unsupported`, still drops the tools first.
+        let sight = Sight {
+            pictures: true,
+            tool: true,
+            overview: true,
+        };
+        for error in [
+            ApiError::BadRequest("tools and images".into()),
+            ApiError::Unsupported("images".into()),
+        ] {
+            assert_eq!(
+                dropped_for(&error, &sight),
+                Some(Dropped::Tool),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            dropped_for(&ApiError::BadRequest("image_url".into()), &sight),
+            Some(Dropped::Pictures)
+        );
     }
     #[tokio::test]
     async fn a_bad_request_that_names_neither_tools_nor_pictures_ends_the_run_at_once() {

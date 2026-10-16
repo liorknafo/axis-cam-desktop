@@ -63,6 +63,8 @@ pub struct Resp {
     /// Promise more body than is sent, keep the connection open this long
     /// and then drop it: a reply that stalls or, with 0, is cut off.
     pub cut_after_ms: Option<u64>,
+    /// A `retry-after` header, in seconds.
+    pub retry_after: Option<u64>,
 }
 impl Resp {
     pub fn json(status: u16, value: Value) -> Self {
@@ -74,6 +76,7 @@ impl Resp {
             hangup: false,
             location: None,
             cut_after_ms: None,
+            retry_after: None,
         }
     }
     /// Reads the request, then hangs up without sending a response.
@@ -97,6 +100,7 @@ impl Resp {
             hangup: false,
             location: None,
             cut_after_ms: None,
+            retry_after: None,
             body: events
                 .iter()
                 .map(|e| {
@@ -174,8 +178,12 @@ impl Fake {
                         .as_ref()
                         .map(|l| format!("location: {l}\r\n"))
                         .unwrap_or_default();
+                    let retry = response
+                        .retry_after
+                        .map(|s| format!("retry-after: {s}\r\n"))
+                        .unwrap_or_default();
                     let head = format!(
-                        "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n{location}connection: close\r\n\r\n",
+                        "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\n{location}{retry}connection: close\r\n\r\n",
                         response.status,
                         response.content_type,
                         response.body.len() + usize::from(response.cut_after_ms.is_some())

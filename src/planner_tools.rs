@@ -675,6 +675,14 @@ fn cutting_data(arguments: &str, report: &PartReport) -> Answer {
     let rpm_at = |vc: f32| f64::from(vc) * 1000. / (std::f64::consts::PI * diameter);
     let max_rpm = f64::from(machine.max_rpm);
     let top = rpm_at(material.vc_max_m_per_min).min(max_rpm);
+    // A plan's spindle speed is at least MIN_RPM: a range under it holds no
+    // speed the checks accept.
+    if top < MIN_RPM {
+        return Answer::sentence(format!(
+            "Tool {} cannot be used in this material: its surface speed range gives at most {:.0} rpm, under the plan's minimum of {MIN_RPM} rpm. Choose a smaller tool.",
+            tool.number, top
+        ));
+    }
     let bottom = rpm_at(material.vc_min_m_per_min).max(MIN_RPM).min(top);
     // The middle, rounded to 10 while that stays in the range: a value above
     // the machine's maximum, or below the least surface speed at a maximum
@@ -1558,6 +1566,43 @@ mod tests {
         let mut no_machine = state_with(|r| r.machine.max_rpm = 0.);
         let a = call("cutting_data", json!({"tool": 3}), &mut no_machine);
         assert_eq!(a.output, "The machine has no maximum rpm or feed.");
+    }
+
+    #[test]
+    fn cutting_data_never_recommends_an_rpm_under_the_plans_minimum() {
+        // A Ø100 face mill at 30 m/min at most is 95 rpm: no speed the
+        // checks accept, so the answer is a sentence.
+        let mut slow = state_with(|r| {
+            r.tools[0].diameter = 100.;
+            r.material.vc_min_m_per_min = 20.;
+            r.material.vc_max_m_per_min = 30.;
+        });
+        let a = call("cutting_data", json!({"tool": 1}), &mut slow);
+        assert!(
+            a.output
+                .starts_with("Tool 1 cannot be used in this material")
+                && a.output.contains("95 rpm"),
+            "{}",
+            a.output
+        );
+        assert!(a.output.contains(&format!("{MIN_RPM} rpm")) && a.picture.is_none());
+        assert_eq!(a.line, a.output);
+        // Just enough: 100 rpm is a range of one value, accepted.
+        let vc = (100. * std::f64::consts::PI * 100. / 1000.) as f32 + 0.01;
+        let mut edge = state_with(move |r| {
+            r.tools[0].diameter = 100.;
+            r.material.vc_min_m_per_min = 20.;
+            r.material.vc_max_m_per_min = vc;
+        });
+        let out = json_of(&call("cutting_data", json!({"tool": 1}), &mut edge));
+        assert_eq!(
+            (
+                &out["rpm"]["min"],
+                &out["rpm"]["max"],
+                &out["rpm"]["recommended"]
+            ),
+            (&json!(100), &json!(100), &json!(100))
+        );
     }
 
     /// The area (mm²) of the mesh faces of surface `id`, from the mesh itself.

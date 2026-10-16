@@ -52,6 +52,20 @@ impl ApiError {
         }
     }
 }
+/// The longest pause a `Retry-After` may ask for.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The pause a response's `Retry-After` (whole seconds) asks for, at most
+/// [`MAX_RETRY_AFTER`]; None when it has none or another form of it.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
 /// `status` is 0 for an `error` or `response.failed` event in a stream.
 fn api_error(status: u16, body: &Value) -> ApiError {
     let error = &body["error"];
@@ -296,12 +310,15 @@ impl SseParser {
         Ok(sse_event(&std::mem::take(&mut self.buffer)))
     }
 }
-/// The most reply text (output, refusal and call arguments) one request may
-/// stream.
+/// The most reply text (output, refusal and the calls' ids, names and
+/// arguments) one request may stream.
 const MAX_REPLY: usize = 4 * 1024 * 1024;
 /// The most function calls of one reply that are run; the later ones are
 /// kept so that each gets an answer, as the API requires.
 pub const MAX_CALLS: usize = 16;
+/// The most function calls one reply may hold: a reply with more fails
+/// instead of being answered call by call.
+const MAX_REPLY_CALLS: usize = 64;
 /// A function call item as the API sends it; its item `id` is not kept.
 fn call(item: &Value) -> Option<ToolCall> {
     Some(ToolCall {
@@ -378,8 +395,19 @@ impl Accumulator {
             }
             _ => {}
         }
-        let arguments: usize = self.calls.iter().map(|c| c.arguments.len()).sum();
-        if self.text.len() + self.refusal.len() + arguments > MAX_REPLY {
+        let calls: usize = self
+            .calls
+            .iter()
+            .map(|c| c.arguments.len() + c.call_id.len() + c.name.len())
+            .sum();
+        if self.calls.len() > MAX_REPLY_CALLS {
+            self.text = String::new();
+            self.refusal = String::new();
+            self.calls = Vec::new();
+            self.error.get_or_insert(ApiError::Other(format!(
+                "The reply made more than {MAX_REPLY_CALLS} function calls."
+            )));
+        } else if self.text.len() + self.refusal.len() + calls > MAX_REPLY {
             self.text = String::new();
             self.refusal = String::new();
             self.calls = Vec::new();
@@ -663,9 +691,11 @@ impl Client {
         })
     }
     /// Sends with the bearer token: one forced refresh after a 401, and up to
-    /// three tries when OpenAI could not be reached or answered with a server
-    /// error. A request that may have reached OpenAI without an answer is not
-    /// repeated, so it is never billed twice.
+    /// three tries when OpenAI could not be reached, answered with a server
+    /// error or said to slow down (an HTTP 429 without one of its usage-limit
+    /// codes; its `Retry-After`, at most 30 s, replaces the pause). A request
+    /// that may have reached OpenAI without an answer is not repeated, so it
+    /// is never billed twice.
     async fn send(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -674,6 +704,7 @@ impl Client {
         let mut refreshed = false;
         let mut tries = 0;
         loop {
+            let mut pause = None;
             let unavailable = match build(&token).send().await {
                 Ok(r) if r.status().as_u16() == 401 && !refreshed => {
                     refreshed = true;
@@ -681,6 +712,15 @@ impl Client {
                     continue;
                 }
                 Ok(r) if r.status().is_server_error() => "OpenAI is unavailable; try again.",
+                Ok(r) if r.status().as_u16() == 429 => {
+                    pause = retry_after(r.headers());
+                    let body = r.json::<Value>().await.unwrap_or(Value::Null);
+                    // A usage limit or an eligibility answer is for the caller.
+                    match api_error(429, &body) {
+                        ApiError::Other(_) => "OpenAI is busy; try again in a moment.",
+                        error => return Err(error),
+                    }
+                }
                 Ok(r) => return Ok(r),
                 Err(e) if e.is_connect() => "Could not reach OpenAI.",
                 Err(e) if e.is_timeout() => return Err(ApiError::Unavailable(TIMED_OUT.into())),
@@ -694,7 +734,7 @@ impl Client {
             if tries == 3 {
                 return Err(ApiError::Unavailable(unavailable.into()));
             }
-            tokio::time::sleep(self.backoff * tries).await;
+            tokio::time::sleep(pause.unwrap_or(self.backoff * tries)).await;
         }
     }
     /// Forgets a session OpenAI no longer accepts. The lock is taken first,
@@ -1349,6 +1389,86 @@ mod tests {
             Err(ApiError::Unavailable(_))
         ));
         assert!(r.store.load().unwrap().is_some());
+    }
+    #[tokio::test]
+    async fn a_plain_rate_limit_is_retried_but_a_usage_limit_is_not() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let r = rig(sample(), move |_| {
+            if seen.fetch_add(1, Ordering::SeqCst) < 2 {
+                Resp {
+                    retry_after: Some(0),
+                    ..Resp::error(429, "rate_limit_exceeded")
+                }
+            } else {
+                Resp::answer("{}")
+            }
+        })
+        .await;
+        assert!(r.client.respond(&request()).await.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Bounded: the third answer is reported.
+        let r = rig(sample(), |_| Resp::error(429, "rate_limit_exceeded")).await;
+        assert!(matches!(
+            r.client.respond(&request()).await,
+            Err(ApiError::Unavailable(_))
+        ));
+        assert_eq!(r.fake.seen("/v1/responses").len(), 3);
+        let r = rig(sample(), |_| {
+            Resp::error(429, "subscription_sharing_usage_limit_exceeded")
+        })
+        .await;
+        assert_eq!(
+            r.client.respond(&request()).await.unwrap_err(),
+            ApiError::UsageLimit
+        );
+        assert_eq!(r.fake.seen("/v1/responses").len(), 1);
+    }
+    #[test]
+    fn a_retry_after_is_whole_seconds_capped_at_thirty() {
+        let wait = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            retry_after(&headers)
+        };
+        assert_eq!(wait("2"), Some(Duration::from_secs(2)));
+        assert_eq!(wait(" 0 "), Some(Duration::ZERO));
+        assert_eq!(wait("3600"), Some(Duration::from_secs(30)));
+        assert_eq!(wait("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+    #[tokio::test]
+    async fn a_reply_with_too_many_calls_fails_instead_of_being_answered() {
+        let call = |i: usize| json!({"type": "function_call", "call_id": format!("c{i}"), "name": "view_model", "arguments": "{}"});
+        for (count, fails) in [(MAX_REPLY_CALLS, false), (MAX_REPLY_CALLS + 1, true)] {
+            let items: Vec<Value> = (0..count).map(call).collect();
+            let events: Vec<Value> = items
+                .iter()
+                .map(|item| json!({"type": "response.output_item.done", "item": item}))
+                .chain([json!({"type": "response.completed", "response": {"output": items}})])
+                .collect();
+            let r = rig(sample(), move |_| Resp::sse(&events)).await;
+            let reply = r.client.respond(&request()).await;
+            match reply {
+                Ok(reply) => assert!(!fails && reply.calls.len() == count),
+                Err(ApiError::Other(m)) => {
+                    assert!(fails && m.contains("64 function calls"), "{m}");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn the_ids_and_names_of_calls_count_toward_the_reply_limit() {
+        let mut reply = Accumulator::default();
+        // Each call is 1 MiB of name and no arguments: the fourth, with the
+        // ids, passes 4 MiB.
+        for i in 0..4 {
+            let item = json!({"type": "function_call", "call_id": format!("c{i}"), "name": "n".repeat(1 << 20), "arguments": ""});
+            reply.apply(&json!({"type": "response.output_item.done", "item": item}));
+        }
+        assert!(matches!(&reply.error, Some(ApiError::Other(m)) if m.contains("too large")));
+        assert!(reply.calls.is_empty());
     }
     #[tokio::test]
     async fn api_errors_map_to_user_facing_states() {
