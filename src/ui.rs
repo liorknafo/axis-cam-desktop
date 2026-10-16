@@ -4120,6 +4120,22 @@ fn wizard(app: &App) -> Element<'_, Message> {
                         field(p, "probe_retract", "Retract after the probe · mm", t),
                     ].spacing(8))
                     .push(warnings(crate::control::probe_settings(p).err().unwrap_or_default()))
+                    .push(bold("Fixture pins", 15))
+                    .push(field(p, "pins", "Pins on the plate · X Y; X Y; … mm, pin 1 first", t))
+                    .push(row![
+                        field(p, "pin_diameter", "Pin diameter · mm", t),
+                        field(p, "pin_height", "Pin height above the plate · mm", t),
+                    ].spacing(8))
+                    .push(match crate::control::pins_settings(p) {
+                        Ok(Some(crate::control::Pins { reference: Some(at), .. })) => muted(format!(
+                            "Pin 1's machine place: X {:.3} Y {:.3}, recorded on the Control page.",
+                            at[0], at[1]
+                        )).into(),
+                        Ok(Some(_)) => muted("Pin 1's machine place is not recorded yet: on the Control page, set machine zero, then Record the pins' place.").into(),
+                        Ok(None) => muted("No fixture pins.").into(),
+                        Err(e) => warnings(e),
+                    })
+                    .push(note("Dowel pins pressed into a plate on the table, square to X and Y, typed in the plate's own coordinates as drilled. A part drops over them by holes in it, so it sits in the same place and turn every time, also after a flip: a setup that sits on the pins (its Work zero step) gets its X and Y work offset from them without probing; Z is still touched off. Pin 1 is the reference pin: its machine place is recorded once on the Control page, and after every E-stop or power cycle Reference X Y from pin 1 makes machine X and Y, every saved work offset and the soft limits hold again."))
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
@@ -4539,6 +4555,9 @@ fn control(app: &App) -> Element<'_, Message> {
     if c.home_switches() {
         zero = zero.push(act("Home", idle(Action::Home), false));
     }
+    if let Some(pins) = pin_block(c) {
+        zero = zero.push(pins);
+    }
     let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config);
     let model = crate::machine_view::MachineView {
         pos: [
@@ -4856,6 +4875,7 @@ fn control(app: &App) -> Element<'_, Message> {
         column![muted("Edge, probing toward"), edges].spacing(4),
         column![muted("Outside corner, seen from above"), corners].spacing(4),
         column![muted("Inside"), feature(Feature::Bore)].spacing(4),
+        column![muted("Outside"), feature(Feature::Boss)].spacing(4),
     ]
     .spacing(18);
     let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
@@ -5552,6 +5572,64 @@ fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
             })
             .into(),
     )
+}
+/// The fixture pins under Machine zero: Record the pins' place and
+/// Reference X Y from pin 1, why either cannot start, and how the last one
+/// ended. None for a machine without pins.
+fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
+    use crate::control::Action;
+    let pins = match &c.pins {
+        Ok(None) => return None,
+        Ok(Some(pins)) => Some(pins),
+        Err(_) => None,
+    };
+    let (record, reference) = (c.record_blocked(), c.reference_blocked());
+    let mut col = column![
+        bold("Fixture pins", 12),
+        row![
+            act(
+                "Record the pins' place",
+                record.is_none().then_some(Message::Machine(Action::RecordPins)),
+                c.pinning() == Some(true)
+            ),
+            act(
+                "Reference X Y from pin 1",
+                reference.is_none().then_some(Message::Machine(Action::ReferencePins)),
+                c.pinning() == Some(false)
+            ),
+        ]
+        .spacing(6),
+    ]
+    .spacing(6);
+    let green = Color::from_rgb8(39, 130, 93);
+    let state = match pins.and_then(|p| p.reference) {
+        _ if c.pinning().is_some() => text("Probing pin 1: E-stop stops it.").size(12),
+        Some(at) if c.pin_referenced => text(format!(
+            "X and Y are referenced from pin 1, recorded at machine X {:.3} Y {:.3}.",
+            at[0], at[1]
+        ))
+        .size(12)
+        .color(green),
+        Some(at) => muted(format!(
+            "Pin 1 is recorded at machine X {:.3} Y {:.3}. After every E-stop or power cycle, take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1: X and Y need no machine position first, Z does.{}",
+            at[0],
+            at[1],
+            reference.map_or(String::new(), |why| format!(" {why}"))
+        )),
+        None => muted(format!(
+            "Not recorded yet. Once, after setting machine zero: take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Record the pins' place. It finds pin 1, then pin 2, and says how square the plate is.{}",
+            record.map_or(String::new(), |why| format!(" {why}"))
+        )),
+    };
+    col = col.push(state);
+    if let Some((ok, said)) = &c.pin_said {
+        col = col.push(text(said.clone()).size(12).color(if *ok {
+            green
+        } else {
+            Color::from_rgb8(166, 101, 32)
+        }));
+    }
+    Some(col.into())
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";

@@ -657,13 +657,130 @@ pub(crate) fn hole_candidates(setup: &Setup, op: &Operation, mesh: &Mesh) -> usi
             .count()
     })
 }
+/// A hole for a fixture pin of a later setup that sits on the pins, in the
+/// frame of the setup that drills it (mm): its centre, the face it opens
+/// on (that later setup's bottom) and the pin's diameter and height.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinHole {
+    pub center: [f32; 2],
+    pub top: f32,
+    pub diameter: f32,
+    pub height: f32,
+}
+/// How much deeper than its pin's height a pin hole is drilled at full
+/// diameter (mm): the pin never bottoms out in it.
+pub const PIN_HOLE_EXTRA: f32 = 1.;
+/// The holes a later setup `target` (its id) needs for the pins it sits on,
+/// drilled in `setup` (index `si` of `doc`): its pins where they stand when
+/// it starts from the box the cuts in `volume` leave it
+/// (`simulation::leftover_box`), carried into this setup's frame. Refused
+/// when that setup is gone, not later or not on the pins, or the pins are
+/// not vertical here or go into this setup's bottom.
+pub fn pin_holes(
+    doc: &crate::model::Document,
+    mesh: &Mesh,
+    si: usize,
+    volume: Option<&crate::volume::Volume>,
+    target: &str,
+) -> Result<Vec<PinHole>, String> {
+    use crate::volume::{Frame, Volume};
+    let setup = &doc.setups[si];
+    let Some((ti, on)) = (doc.setups.iter().enumerate()).find(|(_, s)| s.id == target) else {
+        return Err("The setup these pin holes were for is gone: choose another under Holes.".into());
+    };
+    let name = on.name();
+    if ti <= si || !crate::post::sits_on_pins(on) {
+        return Err(format!(
+            "Pin holes are drilled for a later setup that sits on the pins: {name} is not one. Choose another under Holes."
+        ));
+    }
+    if let Some(issue) = crate::post::pins_issue(on) {
+        return Err(format!("{name}: {issue}"));
+    }
+    let own = Frame::new(setup, mesh);
+    let start = match volume {
+        Some(v) => crate::simulation::leftover_box(v, on, mesh),
+        None => {
+            let stock = crate::stock::resolve(setup, Some(mesh))?.stock;
+            crate::simulation::leftover_box(&Volume::new(stock, own), on, mesh)
+        }
+    };
+    let datum = crate::post::datum(on, start, mesh)?;
+    let Some(pins) = crate::post::on_pins(on, datum) else {
+        return Err(format!("{name} cannot be placed on the pins."));
+    };
+    let theirs = Frame::new(on, mesh);
+    pins.places
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let [low, high] = [start.min[2], start.min[2] + pins.height]
+                .map(|z| theirs.transfer([c[0], c[1], z], own));
+            if (0..2).any(|k| (low[k] - high[k]).abs() > 0.01) {
+                return Err(format!(
+                    "The pins of {name} are not vertical in this setup, which is a side setup to it: drill their holes in a setup whose Z is along them."
+                ));
+            }
+            if high[2] < low[2] - 0.001 {
+                Ok(PinHole {
+                    center: [low[0], low[1]],
+                    top: low[2],
+                    diameter: pins.diameter,
+                    height: pins.height,
+                })
+            } else {
+                Err(format!(
+                    "Pin {} of {name} goes into this setup's bottom: drill the pin holes in a setup that has the face {name} sits on at its top.",
+                    i + 1
+                ))
+            }
+        })
+        .collect()
+}
 fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;
     if get(&tool.p, "type") != "Drill" {
         return Err("Choose a drill for a drilling cycle.".into());
     }
-    let mut holes = holes(setup, op, mesh)?;
-    let filter = if op.p.contains_key("hole_diameter") {
+    let mut holes = if op.drills_pin_holes() {
+        let pins = setup
+            .preview_pin_holes
+            .clone()
+            .unwrap_or_else(|| Err("Pin holes are worked out as the job is simulated.".into()))?;
+        let diameter = b.plan.radius * 2.;
+        if let Some(p) = pins.first()
+            && diameter < p.diameter - 0.001
+        {
+            return Err(format!(
+                "The Ø{:.2} drill is smaller than the Ø{:.2} pins: the part would not drop over them. Choose a drill of at least Ø{:.2}.",
+                diameter, p.diameter, p.diameter
+            ));
+        }
+        let through = get(&op.p, "through") == "Yes";
+        // Full diameter for the pin's height and 1 mm, the drill's point
+        // under that; or through the stock.
+        pins.iter()
+            .map(|p| Hole {
+                center: p.center,
+                diameter,
+                opening: diameter,
+                sagitta: 0.,
+                top: p.top,
+                bottom: if through {
+                    b.plan.stock.min[2]
+                } else {
+                    p.top
+                        - p.height
+                        - PIN_HOLE_EXTRA
+                        - b.plan.radius * crate::simulation::POINT_RISE
+                },
+                through,
+            })
+            .collect()
+    } else {
+        holes(setup, op, mesh)?
+    };
+    let filter = if op.p.contains_key("hole_diameter") && !op.drills_pin_holes() {
         number(op, "hole_diameter")?
     } else {
         0.

@@ -1523,6 +1523,139 @@ fn in_the_way(stock: Bounds, refs: [At; 2], boxes: &[crate::holding::HoldBox]) -
     }
     None
 }
+/// A setup that sits on its machine's fixture pins (`on_pins`): where pin
+/// 1 stands in its work coordinates, and each pin's centre in its plan
+/// frame, pin 1 first (mm).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnPins {
+    pub pin1: [f32; 2],
+    pub places: Vec<[f32; 2]>,
+    pub diameter: f32,
+    pub height: f32,
+}
+/// Whether `setup` sits on its machine's fixture pins (the Work zero step).
+pub fn sits_on_pins(setup: &Setup) -> bool {
+    get(&setup.p, "on_pins") == "Yes"
+}
+/// Where pin 1 stands in `setup`'s work coordinates (Pin 1 X and Y), when
+/// both are numbers.
+pub fn pin1_work(setup: &Setup) -> Option<[f32; 2]> {
+    let [x, y] = ["pin1_x", "pin1_y"].map(|k| num(&setup.p, k).filter(|v| v.is_finite()));
+    Some([x?, y?])
+}
+/// Why `setup`, which sits on the pins, cannot be placed on them from its
+/// own settings: its machine has no pins or they do not read, or pin 1's
+/// spot is not typed. None when it can, or does not sit on them.
+pub fn pins_issue(setup: &Setup) -> Option<String> {
+    if !sits_on_pins(setup) {
+        return None;
+    }
+    match crate::control::pins_settings(&setup.machine.p) {
+        Ok(None) => Some(format!(
+            "This setup sits on the pins, but its machine {} has no fixture pins: add them under Fixture pins in the Machine library and use Assign to current setup, or turn off Sits on the pins.",
+            setup.machine.name()
+        )),
+        Err(e) => Some(format!(
+            "This setup sits on the pins, but its machine's fixture pins do not read: {}",
+            e.join(" ")
+        )),
+        Ok(Some(_)) if pin1_work(setup).is_none() => Some(
+            "This setup sits on the pins: type where pin 1 stands in its work coordinates (Pin 1 X and Pin 1 Y)."
+                .into(),
+        ),
+        Ok(Some(_)) => None,
+    }
+}
+/// `setup`'s pins with its work zero at `datum` (plan mm): each pin at the
+/// datum, plus pin 1's spot in work coordinates, plus where the pin stands
+/// from pin 1 on the plate (the plate is square to X and Y). None when it
+/// does not sit on them, or they cannot be placed (`pins_issue`).
+pub fn on_pins(setup: &Setup, datum: [f32; 3]) -> Option<OnPins> {
+    if !sits_on_pins(setup) {
+        return None;
+    }
+    let pins = crate::control::pins_settings(&setup.machine.p).ok()??;
+    let pin1 = pin1_work(setup)?;
+    let places = (0..pins.at.len())
+        .map(|i| {
+            let d = pins.from_first(i);
+            [0, 1].map(|a| datum[a] + pin1[a] + d[a] as f32)
+        })
+        .collect();
+    Some(OnPins {
+        pin1,
+        places,
+        diameter: pins.diameter as f32,
+        height: pins.height as f32,
+    })
+}
+/// The pins of `on` that no earlier cut of `volume` has drilled a hole
+/// for, in the frame `frame` of the setup on them whose stock bottom is at
+/// `bottom` (plan mm), each with why. A hole counts when a straight cut
+/// along Z in that frame covers the pin with its full diameter (above a
+/// drill's point) from the bottom up to the pin's height: drilled from the
+/// other side and flipped, or through from this side.
+pub fn undrilled_pins(
+    on: &OnPins,
+    volume: &crate::volume::Volume,
+    frame: crate::volume::Frame,
+    bottom: f32,
+) -> Vec<(usize, String)> {
+    let r = on.diameter / 2.;
+    on.places
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            // The heights each cut over the pin has its full width at.
+            let mut spans: Vec<(f32, f32)> = volume
+                .cuts
+                .iter()
+                .filter_map(|cut| {
+                    let [a, b] = [cut.a, cut.b].map(|p| cut.frame.transfer(p, frame));
+                    let vertical = (0..2).all(|k| (a[k] - b[k]).abs() < 0.01);
+                    let off = (a[0] - c[0]).hypot(a[1] - c[1]);
+                    if !vertical || off + r > cut.radius + 0.005 {
+                        return None;
+                    }
+                    let point = match cut.shape {
+                        crate::simulation::CutterShape::Drill => {
+                            cut.radius * crate::simulation::POINT_RISE
+                        }
+                        _ => 0.,
+                    };
+                    // The tip is at `b` once a plunge ends; its point leaves
+                    // less than the full width for that far from it.
+                    Some(if b[2] >= a[2] {
+                        (a[2].min(b[2]), b[2] - point)
+                    } else {
+                        (b[2] + point, a[2].max(b[2]))
+                    })
+                })
+                .filter(|(lo, hi)| hi > lo)
+                .collect();
+            spans.sort_by(|x, y| x.0.total_cmp(&y.0));
+            let need = (bottom + 0.01, bottom + on.height);
+            let mut reach = need.0;
+            for (lo, hi) in spans {
+                if lo <= reach + 0.2 {
+                    reach = reach.max(hi);
+                }
+            }
+            (reach < need.1).then(|| {
+                (
+                    i,
+                    format!(
+                        "pin {} (Ø{} at X{} Y{})",
+                        i + 1,
+                        exact_mm(on.diameter),
+                        exact_mm(c[0]),
+                        exact_mm(c[1])
+                    ),
+                )
+            })
+        })
+        .collect()
+}
 /// What finds a setup's work zero on the stock it starts from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZeroCheck {
@@ -1532,6 +1665,12 @@ pub struct ZeroCheck {
     /// The faces a probe touches to find it (`references`), or why no
     /// probe does: the operator touches it off by hand then.
     pub probe: Result<[At; 2], String>,
+    /// The pins the setup sits on (`on_pins`), which locate its X and Y.
+    pub pins: Option<OnPins>,
+    /// What the operator should know and the check cannot prove: pins no
+    /// earlier setup drills holes for (they may have been drilled off the
+    /// machine).
+    pub warnings: Vec<String>,
 }
 /// Whether the work zero of `setup` is on `stock`, the box its first
 /// simulation `first` starts from (its `datum`'s box), and how a probe finds
@@ -1544,7 +1683,64 @@ pub struct ZeroCheck {
 /// front-left corner of the stock top; when that is not on the stock, only
 /// the probe is refused: it is touched off by hand from the part. A jaw or
 /// clamp in the probe's way (`in_the_way`) refuses only the probe.
+///
+/// A setup that sits on the pins (`on_pins`) is refused when it cannot be
+/// placed on them or a pin is not under its stock, and warned of pins no
+/// earlier cut drilled a hole for (`undrilled_pins`); the rest is checked
+/// as for any setup: Z is still touched off on the stock.
 pub(crate) fn zero_check(
+    setup: &Setup,
+    stock: Bounds,
+    datum: [f32; 3],
+    first: &Simulation,
+    boxes: &[crate::holding::HoldBox],
+) -> ZeroCheck {
+    let mut found = stock_zero_check(setup, stock, first, boxes);
+    if !sits_on_pins(setup) {
+        return found;
+    }
+    let name = setup.name();
+    if let Some(issue) = pins_issue(setup) {
+        found.refused.push(format!("{name}: {issue}"));
+        return found;
+    }
+    let Some(on) = on_pins(setup, datum) else {
+        return found;
+    };
+    let r = on.diameter / 2.;
+    for (i, c) in on.places.iter().enumerate() {
+        if (0..2).any(|a| c[a] - r < stock.min[a] - 0.001 || c[a] + r > stock.max[a] + 0.001) {
+            found.refused.push(format!(
+                "{name}: pin {} is at X{} Y{} in work coordinates, not under the stock this setup starts from (X{} to X{}, Y{} to Y{}): the part cannot sit on it. Check Pin 1 X and Y in the Work zero step and the pins in the Machine library.",
+                i + 1,
+                exact_mm(c[0] - datum[0]),
+                exact_mm(c[1] - datum[1]),
+                exact_mm(stock.min[0] - datum[0]),
+                exact_mm(stock.max[0] - datum[0]),
+                exact_mm(stock.min[1] - datum[1]),
+                exact_mm(stock.max[1] - datum[1]),
+            ));
+        }
+    }
+    let missing = match (&first.initial_volume, first.frame) {
+        (Some(volume), Some(frame)) => undrilled_pins(&on, volume, frame, stock.min[2]),
+        _ => (0..on.places.len()).map(|i| (i, format!("pin {}", i + 1))).collect(),
+    };
+    if !missing.is_empty() {
+        let pins: Vec<String> = missing.into_iter().map(|(_, said)| said).collect();
+        found.warnings.push(format!(
+            "No earlier setup drills holes for {}, Ø{} or more, opening on this setup's bottom and at least {} mm deep. Drill them in an earlier setup (a Drill operation whose holes are Pin holes for {name}), or check that the part's holes fit the pins if they were made off this machine.",
+            listed(&pins.iter().map(String::as_str).collect::<Vec<_>>()),
+            exact_mm(on.diameter),
+            exact_mm(on.height)
+        ));
+    }
+    found.pins = Some(on);
+    found
+}
+/// `zero_check` for the stock alone: where the work zero is on it and how
+/// a probe finds it.
+fn stock_zero_check(
     setup: &Setup,
     stock: Bounds,
     first: &Simulation,
@@ -1557,6 +1753,8 @@ pub(crate) fn zero_check(
             probe: Err(format!(
                 "This setup's work zero is {origin}, which no probe finds: touch it off by hand."
             )),
+            pins: None,
+            warnings: vec![],
         };
     };
     let model = stock_zero(origin).is_none();
@@ -1598,6 +1796,8 @@ pub(crate) fn zero_check(
                 probe: Err(format!(
                     "{said}, where a probe finds Model origin from: touch it off by hand from the part."
                 )),
+                pins: None,
+                warnings: vec![],
             };
         }
         let choose = if usable.is_empty() {
@@ -1614,6 +1814,8 @@ pub(crate) fn zero_check(
                 setup.name()
             )],
             probe: Err(format!("{said}.")),
+            pins: None,
+            warnings: vec![],
         };
     }
     ZeroCheck {
@@ -1624,6 +1826,8 @@ pub(crate) fn zero_check(
             )),
             None => Ok(refs),
         },
+        pins: None,
+        warnings: vec![],
     }
 }
 /// The stock-top spots a probe can find a setup's work zero from
@@ -1676,10 +1880,12 @@ pub(crate) fn zero_checked(
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Option<ZeroCheck> {
     let walk = walk(doc, mesh, si, sims, PostSettings::for_machine).ok()?;
-    let boxes = holding_boxes(doc, si, gripped(doc, mesh, si, &walk)).unwrap_or_default();
+    let boxes =
+        holding_boxes(doc, si, gripped(doc, mesh, si, &walk), walk.zero).unwrap_or_default();
     Some(zero_check(
         &doc.setups[si],
         walk.stock,
+        walk.zero,
         walk.simulations[0],
         &boxes,
     ))
@@ -1834,10 +2040,17 @@ fn holding_boxes(
     doc: &Document,
     si: usize,
     held: crate::holding::Gripped,
+    datum: [f32; 3],
 ) -> Result<Vec<crate::holding::HoldBox>, String> {
     let setup = &doc.setups[si];
-    doc.holding_boxes(setup, held)
-        .map_err(|e| format!("{}: {e}", setup.name()))
+    let mut boxes = doc
+        .holding_boxes(setup, held)
+        .map_err(|e| format!("{}: {e}", setup.name()))?;
+    boxes.extend(crate::holding::pin_boxes(
+        on_pins(setup, datum).as_ref(),
+        held.stock,
+    ));
+    Ok(boxes)
 }
 /// Why the vise or clamps of setup `si` cannot hold `held` (`gripped`, the
 /// stock `walk` found), with what earlier setups cut away from it and
@@ -1959,7 +2172,7 @@ pub(crate) fn held_walked(
 ) -> Option<Vec<Held>> {
     let walk = walk(doc, mesh, si, sims, PostSettings::for_machine).ok()?;
     let held = gripped(doc, mesh, si, &walk);
-    let boxes = match holding_boxes(doc, si, held) {
+    let boxes = match holding_boxes(doc, si, held, walk.zero) {
         Ok(boxes) => boxes,
         Err(message) => {
             return Some(vec![Held {
@@ -2023,6 +2236,9 @@ pub struct Checked {
     /// (`holding_boxes`, plan mm): the probe travels over the tallest
     /// (`probe_height`, `control::Edges`).
     pub holds: Vec<crate::holding::HoldBox>,
+    /// The pins the setup sits on, which give its X and Y work offset
+    /// (`control::Connection::pin_offset`).
+    pub pins: Option<OnPins>,
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
@@ -2081,7 +2297,7 @@ pub(crate) fn checked(
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
     let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
     let held = gripped(doc, mesh, si, &walk);
-    let boxes = holding_boxes(doc, si, held).map_err(|e| vec![e])?;
+    let boxes = holding_boxes(doc, si, held, zero).map_err(|e| vec![e])?;
     let unholdable = unholdable(doc, mesh, si, &walk, held);
     if !unholdable.is_empty() {
         return Err(unholdable);
@@ -2094,7 +2310,7 @@ pub(crate) fn checked(
         return Err(pushed);
     }
     let origin = get(&setup.p, "origin");
-    let found = zero_check(setup, stock, simulations[0], &boxes);
+    let found = zero_check(setup, stock, zero, simulations[0], &boxes);
     if !found.refused.is_empty() {
         return Err(found.refused);
     }
@@ -2131,6 +2347,7 @@ pub(crate) fn checked(
             probe: found.probe.clone(),
             probe_from: probe_from.clone(),
             holds: boxes.clone(),
+            pins: found.pins.clone(),
         });
     }
     Ok(out)

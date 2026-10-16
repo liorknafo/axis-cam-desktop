@@ -768,6 +768,9 @@ pub fn sequence_walk(
                 .as_ref()
                 .filter(|v| !v.cuts.is_empty())
                 .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, frame)));
+            setup.preview_pin_holes = op.drills_pin_holes().then(|| {
+                crate::cam::pin_holes(doc, mesh, si, volume.as_ref(), get(&op.p, "hole_source"))
+            });
             let mut issues = setup.issues();
             issues.extend(op.issues(&setup.machine, &doc.tools, &setup.operations[..oi]));
             let plan = if let Some(issue) = issues.first() {

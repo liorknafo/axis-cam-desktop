@@ -1456,6 +1456,22 @@ impl App {
         self.status = message;
         changed
     }
+    /// Keeps pin 1's machine X Y just recorded on the Control page in the
+    /// profile of machine `id`, and in its draft if it is being edited. It
+    /// is a measurement, not a setting: no setup's check depends on it.
+    fn record_pins(&mut self, id: &str, at: [f64; 2]) {
+        let keep = |m: &mut Machine| {
+            if m.id == id {
+                m.p.insert("pin_ref_x".into(), format!("{:.3}", at[0]));
+                m.p.insert("pin_ref_y".into(), format!("{:.3}", at[1]));
+            }
+        };
+        self.doc.machines.iter_mut().for_each(keep);
+        keep(&mut self.machine_draft);
+        self.dirty = true;
+        self.project_dirty = true;
+        self.last_edit = Instant::now();
+    }
     fn touch(&mut self) {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -3360,6 +3376,7 @@ impl App {
                     let mut m = self.machine_draft.clone();
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
+                        c.pins = control::pins_settings(&m.p);
                     }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
@@ -3967,6 +3984,11 @@ impl App {
                             s => format!("Connected to {name}: {}", s.label()),
                         };
                     }
+                }
+                if let Some((id, at)) = (self.control.as_mut())
+                    .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
+                {
+                    self.record_pins(&id, at);
                 }
                 if self.status == LOCKED && !self.locked() {
                     self.status.clear();

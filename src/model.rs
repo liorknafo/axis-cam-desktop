@@ -293,6 +293,7 @@ impl Machine {
         {
             e.push("Choose the machine's UC100 profile file.".into())
         }
+        e.extend(crate::control::pins_settings(&self.p).err().unwrap_or_default());
         e
     }
     pub fn fill_post_defaults(&mut self) {
@@ -598,9 +599,14 @@ impl Operation {
         get(&self.p, "name")
     }
     pub fn needs_surfaces(&self) -> bool {
-        self.strategy.needs_surfaces()
+        (self.strategy.needs_surfaces() && !self.drills_pin_holes())
             || (self.strategy == Strategy::Contour
                 && get(&self.p, "boundary") == "Selected geometry")
+    }
+    /// A drilling operation whose holes are those for the pins of a later
+    /// setup (`hole_source`: its id), not holes found in the part.
+    pub fn drills_pin_holes(&self) -> bool {
+        self.strategy == Strategy::Drill && !get(&self.p, "hole_source").is_empty()
     }
     pub fn toggle_feature(&mut self, n: usize) {
         if !self.strategy.features().contains(&n) {
@@ -794,6 +800,10 @@ pub struct Setup {
     pub preview_stock: Option<crate::mesh::Bounds>,
     #[serde(skip)]
     pub preview_remaining: Option<std::sync::Arc<crate::rest::RestStock>>,
+    /// The holes the operation being generated drills for the pins of a
+    /// later setup (`cam::pin_holes`), set as the job is simulated.
+    #[serde(skip)]
+    pub preview_pin_holes: Option<Result<Vec<crate::cam::PinHole>, String>>,
     pub id: String,
     pub machine: Machine,
     pub p: Fields,
@@ -804,6 +814,7 @@ impl Setup {
         Self {
             preview_stock: None,
             preview_remaining: None,
+            preview_pin_holes: None,
             id: id(),
             machine,
             p: fields(&[
@@ -871,6 +882,10 @@ impl Setup {
             finite(&self.p, k, &mut e)
         }
         nonnegative(&self.p, "clearance", &mut e);
+        // The machine's own issues say what is wrong with the pins.
+        if crate::control::pins_settings(&self.machine.p).is_ok() {
+            e.extend(crate::post::pins_issue(self));
+        }
         e
     }
 }
