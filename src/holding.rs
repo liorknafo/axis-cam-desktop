@@ -1014,13 +1014,20 @@ pub fn suggest_clamps(
     chosen.iter().map(|c| (c.0, c.1)).collect()
 }
 /// What suggesting a layout for a setup starts from: the kind of workholding
-/// it has, the library entry it points at and its clearance gap.
+/// it has, the library entry it points at, its clearance gap and how far
+/// the moves are kept from the jaws or clamps.
 pub struct Request {
     pub vise: bool,
     /// The setup's `holder` key: the entry's id.
     pub id: String,
     pub holder: Holder,
+    /// The setup's clearance gap, which the layout stores.
     pub gap: f32,
+    /// How far the suggestion keeps the moves from the jaws or clamps: the
+    /// gap and the machine profile's path blending tolerance, as the export
+    /// checks them (`post_check::holding_problems`), so that what it says is
+    /// clear is not refused there.
+    pub reach: f32,
 }
 /// The `Request` for `setup`, whose library entry is `holder` (the one its
 /// `holder` key names, when the library has it), or why no layout can be
@@ -1063,6 +1070,7 @@ pub fn request(setup: &Setup, holder: Option<&Holder>) -> Result<Request, String
         id,
         holder: holder.clone(),
         gap,
+        reach: gap + crate::post::blend(&setup.machine),
     })
 }
 impl Request {
@@ -1083,6 +1091,8 @@ impl Request {
     }
     /// `suggest`, the stock being the first plan's, else the one `otherwise`
     /// tells (the box the setup starts from as far as the caller knows it).
+    /// The jaws or clamps are placed clear of the moves by `reach`, and the
+    /// layout stores the setup's `gap`.
     pub fn suggest_on(
         &self,
         plans: &[&Plan],
@@ -1090,9 +1100,9 @@ impl Request {
         bands: Option<&Bands>,
     ) -> Option<(Bounds, Layout)> {
         let stock = plans.first().map(|plan| plan.stock).or_else(otherwise)?;
-        let (holder, gap) = (self.id.clone(), self.gap);
+        let (holder, gap, reach) = (self.id.clone(), self.gap, self.reach);
         let layout = if self.vise {
-            let (axis_y, grip) = suggest_vise(stock, bands, &self.holder, plans, gap);
+            let (axis_y, grip) = suggest_vise(stock, bands, &self.holder, plans, reach);
             Layout::Vise {
                 holder,
                 axis_y,
@@ -1103,7 +1113,7 @@ impl Request {
         } else {
             Layout::Clamps {
                 holder,
-                clamps: suggest_clamps(stock, &self.holder, plans, gap),
+                clamps: suggest_clamps(stock, &self.holder, plans, reach),
                 gap,
             }
         };
@@ -1467,12 +1477,16 @@ const JOIN: &str = "Leave material joining them (for example a `bottom_offset` a
 ///
 /// Material is looked for 0.05 mm inside the faces, at points spread evenly
 /// with the ends inset by 1 % of the span: on each jaw's contact face, the
-/// band's face, across the jaw's width (on the band) from the stock's
-/// bottom up to the grip, 12 × 4, at least 60 % of them; on the stock's
-/// bottom under the band, 8 × 8, at least 50 %; under each clamp's bite on
-/// the stock's top, 6 along its width × 3 across the bite, at least 60 %. A
-/// point has material when it is inside the band (the stock for clamps) and
-/// no earlier cut removed it. A jaw or clamp with material enough is cut
+/// band's face, across the jaw's width (on the band) from where the stock
+/// stands (`Gripped::bottom`, the box's bottom raised past the layer the
+/// earlier cuts can have taken off it) up to the grip above that, at most
+/// the stock's top, 12 × 4, at least 60 % of them; on the bottom the stock
+/// stands on, under the band, 8 × 8, at least 50 %; under each clamp's
+/// bite on the stock's top, 6 along its width × 3 across the bite, at least
+/// 60 %. A point has material when it is inside the band above where the
+/// stock stands (the stock for clamps) and no earlier cut removed it: what
+/// lies below where it stands is no material, not something an earlier
+/// operation is blamed for. A jaw or clamp with material enough is cut
 /// free when none of its points' voxels is joined to the part (`freed`).
 pub fn holdable(
     setup: usize,
@@ -1498,9 +1512,17 @@ pub fn holdable(
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let axis = if *axis_y { "Y" } else { "X" };
-            // The jaws close on the band, from far below the stock up to the grip.
-            let band = held.band;
-            let height = (stock.min[2], (stock.min[2] + grip).min(stock.max[2]));
+            // The jaws close on the band, from far below the stock up to the
+            // grip above where it stands: nothing below that is material.
+            let mut band = held.band;
+            band.min[2] = held.bottom;
+            let height = (held.bottom, (held.bottom + grip).min(stock.max[2]));
+            if height.1 <= height.0 {
+                found.push(format!(
+                    "Setup {n} cannot be held in the vise: earlier setups cut away the material between the jaws up to the stock's top, so nothing stands on the table for them to grip. Choose another holder."
+                ));
+                return found;
+            }
             let (mut bare, mut failed) = (vec![], vec![]);
             let (mut loose, mut between) = (vec![], vec![]);
             for jaw in &placed {
@@ -1554,12 +1576,13 @@ pub fn holdable(
                     sides(&loose),
                 ));
             }
-            // What rests on the table: the bottom of the material between the jaws.
+            // What rests on the table: the bottom of the material between
+            // the jaws, where the stock stands.
             let bottom = grid(
                 [0, 1, 2],
                 (band.min[0], band.max[0]),
                 (band.min[1], band.max[1]),
-                stock.min[2] + INSIDE,
+                held.bottom + INSIDE,
                 (8, 8),
             );
             let lost = missing(&bottom.unwrap_or_default(), band, removed, 50);
@@ -2898,6 +2921,66 @@ mod tests {
         // Neither: this document has no second setup.
         assert!(request.suggest(&doc, None, 1, &[], None).is_none());
     }
+    #[test]
+    fn the_suggestion_keeps_the_moves_clear_by_the_blend_the_export_adds_to_the_gap() {
+        // A Ø6 cutter 10.5 mm up along all four sides: 2.5 mm above jaws
+        // gripping 8 mm, clear of the 2 mm gap, within it and a 1 mm blend.
+        let mut skim = plan(3., &rectangle(47., 26., 10.5));
+        skim.stock = stock();
+        assert_eq!(
+            suggest_vise(stock(), None, &vise(), &[&skim], 2.),
+            (true, 8.)
+        );
+        assert_eq!(
+            suggest_vise(stock(), None, &vise(), &[&skim], 3.),
+            (true, 7.)
+        );
+        // A setup on a machine profile with G64 P1: the request keeps the
+        // moves clear by the gap and the blend, 3 mm, and the layout stores
+        // the gap.
+        let mut blended = setup(&[("holding", "Vise"), ("holder", "v")]);
+        blended.machine.p.insert("post_blend".into(), "1".into());
+        let asked = request(&blended, Some(&vise())).unwrap();
+        assert_eq!((asked.gap, asked.reach), (2., 3.));
+        let (_, layout) = asked.suggest_on(&[&skim], || None, None).unwrap();
+        assert_eq!(
+            layout,
+            Layout::Vise {
+                holder: "v".into(),
+                axis_y: true,
+                offset: 0.,
+                grip: 7.,
+                gap: 2.,
+            }
+        );
+        // What the status says is clear, the export (the gap and the blend)
+        // finds clear too.
+        let jaws = boxes(&layout, &vise(), stock()).unwrap();
+        assert_eq!(clashes(&[&skim], &jaws, asked.reach), 0);
+        assert!(hits(&skim, &jaws, asked.reach).is_empty());
+        assert_eq!(
+            summary(&layout, 1, clashes(&[&skim], &jaws, asked.reach), 0, None),
+            "Suggested: vise jaws on ±Y, grip 7 mm. Every operation is clear of them."
+        );
+        // Gripping 8 mm, as the gap alone suggested, the export refuses the pass.
+        let eight = boxes(&vise_gripping(8.), &vise(), stock()).unwrap();
+        assert_eq!(clashes(&[&skim], &eight, asked.gap), 0);
+        assert_eq!(clashes(&[&skim], &eight, asked.reach), 1);
+        // Clamps are placed by the same reach, and store the gap too.
+        let mut blended = setup(&[("holding", "Clamps"), ("holder", "c")]);
+        blended.machine.p.insert("post_blend".into(), "1".into());
+        let asked = request(&blended, Some(&clamp())).unwrap();
+        assert_eq!((asked.gap, asked.reach), (2., 3.));
+        let (_, layout) = asked.suggest_on(&[], || Some(stock()), None).unwrap();
+        assert!(matches!(layout, Layout::Clamps { gap, .. } if gap == 2.));
+        // The default profile's blend, 0.01 mm, counts too.
+        let asked = request(
+            &setup(&[("holding", "Vise"), ("holder", "v")]),
+            Some(&vise()),
+        )
+        .unwrap();
+        assert!((asked.reach - 2.01).abs() < 0.0001);
+    }
     /// `stock()` uncut, in the frame of a setup 1 in which it sits as given,
     /// and that frame turned upside down (rx 180).
     fn untouched() -> (Volume, Frame, Frame) {
@@ -3097,6 +3180,28 @@ mod tests {
             jaws.iter()
                 .all(|j| (j.bounds.max[2] - (left.min[2] + 10.)).abs() < 0.001),
             "{jaws:?}"
+        );
+        // The jaws have material from the faced surface up, and the stock
+        // rests on it: the setup is holdable, and nothing blames the facing.
+        let removed = Removed::new(&v, flipped).with_part(&PartGrid::boxed(&v, PART));
+        assert_eq!(
+            holdable(1, &layout, &vise(), held, Some(&removed), &names),
+            Vec::<String>::new()
+        );
+        // Gripping 3 mm, the least suggested, the same.
+        let least = vise_gripping(3.);
+        let on_least = gripped(&least, &vise(), left, Some(&bands));
+        assert!(holdable(1, &least, &vise(), on_least, Some(&removed), &names).is_empty());
+        // Cut through everywhere between the jaws, nothing stands on the table.
+        let gone = Gripped {
+            bottom: left.max[2],
+            ..held
+        };
+        assert_eq!(
+            holdable(1, &layout, &vise(), gone, Some(&removed), &names),
+            [
+                "Setup 2 cannot be held in the vise: earlier setups cut away the material between the jaws up to the stock's top, so nothing stands on the table for them to grip. Choose another holder."
+            ]
         );
         // A Ø10 cutter along the +Y jaw's face, over the stock's edge, 11 mm
         // above the box's bottom: within the 2 mm gap of the real jaws.
