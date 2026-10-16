@@ -6954,7 +6954,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Generate);
         assert!(a.playback_ready(), "{}", a.status);
         // Generated and not yet checked: grey, not the green of ready.
-        assert_eq!(marks(&a), [OpMark::Generated, OpMark::Pending]);
+        assert_eq!(marks(&a), [OpMark::Checking, OpMark::Pending]);
         assert_eq!(run_check(&a).unwrap().0, "Checking Top as run will…");
         let _ = a.refresh_ready();
         let refused = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).unwrap_err();
@@ -6995,6 +6995,84 @@ flood = { pin = 8 }
             lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"),
             "{lines:?}"
         );
+    }
+    /// #74: a grey and a green ✓ differed by colour only, and the hover help
+    /// did not explain the mark.
+    #[test]
+    fn each_browser_mark_has_its_own_glyph_and_hover_help_that_names_the_state() {
+        use crate::ui::{OpMark, mark_help, op_mark};
+        let mut glyphs: Vec<&str> = OpMark::ALL.iter().map(|m| m.glyph()).collect();
+        glyphs.sort();
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), OpMark::ALL.len(), "{glyphs:?}");
+        let mut states: Vec<&str> = OpMark::ALL.iter().map(|m| m.state()).collect();
+        states.sort();
+        states.dedup();
+        assert_eq!(states.len(), OpMark::ALL.len(), "{states:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), LIMITED);
+        a.doc.adopt_holders();
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        a.page = Page::Work;
+        let help = |a: &App, i: usize| {
+            let mark = op_mark(a, a.current_ready(), i);
+            (mark, mark_help(a, a.current_ready(), i, mark))
+        };
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Clamps".into()));
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Generate);
+        // Generated, checks not in yet.
+        let (mark, text) = help(&a, 0);
+        assert_eq!(mark, OpMark::Checking);
+        assert!(
+            text.contains("…") && text.contains("Generated, being checked"),
+            "{text}"
+        );
+        let (mark, text) = help(&a, 1);
+        assert_eq!(mark, OpMark::Pending);
+        assert!(
+            text.contains("○") && text.contains("Not generated"),
+            "{text}"
+        );
+        // Clamps in the way: the Run panel's own lines.
+        let _ = a.refresh_ready();
+        let refused = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).unwrap_err();
+        let (mark, text) = help(&a, 0);
+        assert_eq!(mark, OpMark::Collides);
+        assert!(
+            text.contains("!") && text.contains("Workholding refused"),
+            "{text}"
+        );
+        assert!(text.contains("Run will refuse Top"), "{text}");
+        assert!(
+            text.contains(&refused[0]) || text.contains("tool hits the clamp"),
+            "{text}"
+        );
+        // Vise: ready.
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let _ = a.refresh_ready();
+        let (mark, text) = help(&a, 0);
+        assert_eq!(mark, OpMark::Ready);
+        assert!(
+            text.contains("✓") && text.contains("Ready to run"),
+            "{text}"
+        );
+        // Mist coolant: generated, but Run refuses, with the reason.
+        let _ = a.update(Message::Edit(Target::Operation, "coolant", "Mist".into()));
+        let _ = a.refresh_ready();
+        let (mark, text) = help(&a, 0);
+        assert_eq!(mark, OpMark::Generated);
+        assert!(text.contains("Generated, will not run"), "{text}");
+        assert!(
+            text.contains("uses mist coolant, but the UC100 profile has no mist output"),
+            "{text}"
+        );
+        // Suppressed.
+        a.doc.active_setup_mut().unwrap().operations[1].enabled = false;
+        let (mark, text) = help(&a, 1);
+        assert_eq!(mark, OpMark::Suppressed);
+        assert!(text.contains("—") && text.contains("Suppressed"), "{text}");
+        let _ = a.view();
     }
     #[test]
     fn the_setup_editor_and_the_run_checks_say_whether_the_vise_holds_against_the_cut() {

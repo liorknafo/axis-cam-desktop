@@ -353,13 +353,15 @@ The fixture block (120 × 80 × 40 mm) has 4 mm of stock on top, 3 mm below and 
 `the_browser_marks_an_operation_ready_only_when_the_run_checks_pass` replays the blind review's case on a simulated UC100 machine like the JY5800: the fixture block's Top setup with Facing and Drilling.
 
 - **Suggested toe clamps**
-  - Generated and not yet checked, Facing has the grey ✓ and Drilling ○. The simulation panel says "Checking Top as run will…".
+  - Generated and not yet checked, Facing has the grey … and Drilling ○. The simulation panel says "Checking Top as run will…".
   - Once checked, the lines the app keeps are exactly `run::programs`' refusal, the list the Run panel shows. Both operations get the amber !, because the clearance plane is below the clamps.
   - The panel's heading is "Workholding problem: Run will refuse Top" ("Workholding in the way" until LIO-167 added the cutting forces). Its first line is Facing's own clamp hit, and every line Run lists is there.
 - **The suggested vise instead**
   - The check is out of date as soon as the holding changes.
   - Checked again, `run::programs` passes and both operations get the green ✓. The panel says "Ready to run: Run's checks of Top pass.".
-- **Facing on mist coolant**, which the profile has no output for: both operations go back to the grey ✓. The panel says "Run will refuse Top" and lists the coolant line first.
+- **Facing on mist coolant**, which the profile has no output for: both operations go back to the grey ✓·. The panel says "Run will refuse Top" and lists the coolant line first.
+
+- **Glyphs and hover help (#74)**: a grey and a green ✓ differed by colour only. `each_browser_mark_has_its_own_glyph_and_hover_help_that_names_the_state` checks that the six marks (— ○ … ✓· ! ✓) have six different glyphs and six different state names, and walks the same job: generated and unchecked reads "…" with "Generated, being checked", Drilling "○" with "Not generated", the toe clamps "!" with "Workholding refused" and the Run panel's "Run will refuse Top" lines, the vise "✓" with "Ready to run", mist coolant "✓·" with "Generated, will not run" and the coolant line, and a switched-off operation "—" with "Suppressed".
 
 Other checks:
 
@@ -389,7 +391,7 @@ The estimate is a model, not a measurement: every number it assumes is named at 
   - With a second clamp on +X, friction is the least: "Pocket: holds ×5.2 against sliding."
 - **The setup editor and Run.** `smoke::tests::the_setup_editor_and_the_run_checks_say_whether_the_vise_holds_against_the_cut`, on a simulated UC100 machine:
   - With the suggested vise the editor lists, under "Against the cutting forces", "Facing: holds ×5.5 against tipping." and "Drilling: no cutting force sideways or up to hold against.", and no issue. Facing gets the green ✓.
-  - At grip 1 the editor lists the Facing's issue (×0.5) and its margin reads "Facing: only ×0.5 against tipping; ×2 is wanted.". Facing gets the amber ! and Drilling the grey ✓, since Run will refuse the setup.
+  - At grip 1 the editor lists the Facing's issue (×0.5) and its margin reads "Facing: only ×0.5 against tipping; ×2 is wanted.". Facing gets the amber ! and Drilling the grey ✓·, since Run will refuse the setup.
 - **A later setup on the walls an earlier one finished.** `smoke::tests::the_setup_editor_shows_what_the_earlier_setups_left_the_vise_to_grip`:
   - Turned over, setup 2 grips 3 mm of the walls setup 1's Contour finished. The jaws have material there, but with the vise's typical 5000 N they do not hold the stock against setup 2's facing 39 mm higher (a contact 2.9 mm high, ×1.9).
   - With the vise's clamping force set to 10 kN in the library, the line goes, without simulating the earlier setups again.
