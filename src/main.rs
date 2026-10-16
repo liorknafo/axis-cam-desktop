@@ -3237,9 +3237,9 @@ impl App {
                 let Some(c) = &mut self.control else {
                     return Task::none();
                 };
-                if si >= self.doc.setups.len()
-                    || c.run.as_ref().is_some_and(|r| r.running.is_some())
-                {
+                // Not while a tool run or a probe is under way: the probe
+                // sets the work zero of the setup it started with (#165).
+                if si >= self.doc.setups.len() || c.setup_locked() {
                     return Task::none();
                 }
                 self.run_epoch += 1;

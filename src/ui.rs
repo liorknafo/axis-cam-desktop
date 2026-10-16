@@ -4727,7 +4727,7 @@ pub(crate) fn run_strip<'a>(
             let picked = c.run.as_ref().is_some_and(|r| r.setup == si);
             pick = pick.push(act(
                 format!("{}. {}", si + 1, x.name()),
-                msg(!running, R::Setup(si)),
+                msg(!c.setup_locked(), R::Setup(si)),
                 picked,
             ));
         }

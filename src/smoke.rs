@@ -3024,6 +3024,59 @@ flood = { pin = 8 }
         work_offset(&a, corner);
     }
 
+    /// Picking another setup in the Run strip while a probe is under way
+    /// is refused, in the handler and on the buttons (`setup_locked`): the
+    /// probe sets the work zero of the setup it started with, on that
+    /// setup's panel (#165).
+    #[test]
+    fn picking_another_setup_in_the_run_strip_waits_for_the_probe() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &probe_profile());
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert("probe_tip".into(), "4".into());
+        m.p.insert("probe_feed".into(), "1000".into());
+        for s in &mut a.doc.setups {
+            s.machine = m.clone();
+        }
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        // A second setup on the same machine: a copy of the first.
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        a.page = Page::Control;
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        assert!(!conn(&a).setup_locked());
+        let (lo, _) = conn(&a).block.unwrap();
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-30", lo[0] + 6., lo[1] + 6.),
+        );
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        assert!(conn(&a).edging() && conn(&a).setup_locked());
+        let _ = a.view();
+        // The second setup, picked while it probes: nothing happens.
+        let _ = a.update(Message::Run(R::Setup(1)));
+        assert_eq!(run_of(&a).setup, 0);
+        assert!(conn(&a).edging());
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        // The work zero set is the first setup's, on its panel.
+        assert_eq!(run_of(&a).setup, 0);
+        assert!(run_of(&a).touched);
+        tick_until(&mut a, 5.0, "work zero", |s| s.work_offset[2] < -39.);
+        work_offset(&a, [lo[0] + 2., lo[1] + 2., -40.]);
+        // Ended, the second setup can be picked, and starts untouched.
+        assert!(!conn(&a).setup_locked());
+        let _ = a.update(Message::Run(R::Setup(1)));
+        assert_eq!(run_of(&a).setup, 1);
+        assert!(!run_of(&a).touched);
+        let _ = a.view();
+    }
+
     /// Stock bottom back on the simulated UC100: the Control page offers
     /// Probe edge, which sets the work zero the program has, the stock's
     /// height below the block's top under the middle of its back edge (Y a
