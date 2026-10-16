@@ -277,6 +277,10 @@ pub enum Message {
     ConfirmDeleteSetup(bool),
     Close(iced::window::Id),
     Captured(iced::window::Screenshot),
+    /// The renderer smoke run: the window drew a frame (at the instant) while
+    /// the run waited for one, and the window took a logical size.
+    Frame(Instant),
+    WindowSized(iced::Size),
     HelpHover(bool),
     Noop,
 }
@@ -594,6 +598,15 @@ pub struct App {
     pub smoke_step: usize,
     pub help_animating: bool,
     pub smoke_pending: bool,
+    /// The renderer smoke run's wait for the frame that shows its last step
+    /// (`smoke::frames`): the frames drawn since, when the wait began,
+    /// whether the window is to take a new size first, the window's logical
+    /// size, and the last capture's hash.
+    pub smoke_frames: u32,
+    pub smoke_changed: Instant,
+    pub smoke_resize: bool,
+    pub smoke_window: Option<iced::Size>,
+    pub smoke_last: Option<u64>,
     pub doc: Document,
     pub page: Page,
     /// The Manufacture page the workspace switcher goes back to from the
@@ -996,6 +1009,11 @@ impl App {
             jog_key: None,
             run_epoch: 0,
             smoke_pending: false,
+            smoke_frames: 0,
+            smoke_changed: Instant::now(),
+            smoke_resize: false,
+            smoke_window: None,
+            smoke_last: None,
             machine_draft: doc
                 .machines
                 .first()
@@ -1103,6 +1121,7 @@ impl App {
             if std::env::args().any(|arg| arg == "--help-only") {
                 app.smoke_step = 14;
             }
+            app.smoke_arm();
         }
         (app, Task::none())
     }
@@ -2353,6 +2372,8 @@ impl App {
             Message::Captured(image) => {
                 return self.capture_smoke(image);
             }
+            Message::Frame(at) => return self.smoke_frame(at),
+            Message::WindowSized(size) => self.smoke_sized(size),
             Message::Noop => {}
             Message::Page(p) => {
                 self.help_animating = false;
@@ -3664,11 +3685,11 @@ impl App {
                     );
                     return self.refresh_stock_surface();
                 }
-                if self.smoke_dir.is_some() && !self.smoke_pending {
-                    self.smoke_pending = true;
-                    return iced::window::latest()
-                        .and_then(iced::window::screenshot)
-                        .map(Message::Captured);
+                // The smoke run captures each screen from a frame drawn after
+                // its step (`smoke_frame`); a step whose frame does not come
+                // fails the run here.
+                if self.smoke_dir.is_some() {
+                    self.smoke_overdue();
                 }
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.2);
@@ -4276,7 +4297,7 @@ impl App {
         Task::none()
     }
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             iced::time::every(
                 if self.playing || self.help_animating || self.control.is_some() {
                     Duration::from_millis(33)
@@ -4286,7 +4307,11 @@ impl App {
             )
             .map(|_| Message::Tick),
             iced::event::listen_with(on_event),
-        ])
+        ];
+        if self.smoke_dir.is_some() {
+            subscriptions.push(smoke::frames());
+        }
+        Subscription::batch(subscriptions)
     }
     fn view(&self) -> Element<'_, Message> {
         ui::view(self)

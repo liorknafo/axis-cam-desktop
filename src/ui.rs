@@ -4027,7 +4027,10 @@ fn control(app: &App) -> Element<'_, Message> {
         left,
         column![
             fixed.padding(4),
-            scrollable(main.padding(4)).height(Fill).width(Fill)
+            scrollable(main.padding(4))
+                .id("control")
+                .height(Fill)
+                .width(Fill)
         ]
         .spacing(4)
         .height(Fill)
