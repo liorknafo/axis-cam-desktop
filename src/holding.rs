@@ -194,6 +194,12 @@ pub fn fixture_note(setup: &Setup) -> Option<&str> {
     Some(get(p, "fixture"))
         .filter(|note| matches!(get(p, "holding"), "" | "None") && !matches!(*note, "" | "None"))
 }
+/// The setup's requested fixture clearance in mm, a note for the operator
+/// that nothing checks; the setup sheet and the program header print it,
+/// "not set" when the field is blank or not a number.
+pub fn requested_clearance(setup: &Setup) -> Option<f32> {
+    number(get(&setup.p, "clearance"))
+}
 /// A number typed into a field: surrounding spaces are ignored.
 fn number(text: &str) -> Option<f32> {
     text.trim().parse::<f32>().ok().filter(|v| v.is_finite())

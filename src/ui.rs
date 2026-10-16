@@ -187,6 +187,15 @@ fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
         });
     HelpButton::new(b, &action, label)
 }
+/// The Holding step's field for the gap the checks keep round the modelled
+/// jaws and clamps, saved as `holding_gap`: its label says what it does.
+pub(crate) const HOLDING_GAP_LABEL: &str = "Checked gap to jaws and clamps · mm";
+/// The setup's requested fixture clearance, saved as `clearance`: a note for
+/// the operator that nothing checks, and its label says so.
+pub(crate) const FIXTURE_CLEARANCE_LABEL: &str = "Requested fixture clearance · mm · not checked";
+/// The Holding step's section of fields that are recorded on the setup sheet
+/// and in the program header and checked by nothing.
+pub(crate) const SETUP_NOTES_SECTION: &str = "Setup notes · recorded, not checked";
 fn field<'a>(
     p: &'a Fields,
     key: &'static str,
@@ -2235,8 +2244,11 @@ fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
     for control in holding_controls(app) {
         c = c.push(control);
     }
+    // What follows is recorded for the operator and checked by nothing, so
+    // it sits under its own heading, apart from the checked workholding.
     c = c
-        .push(field(p, "clearance", "Fixture clearance · mm", t))
+        .push(section(SETUP_NOTES_SECTION))
+        .push(field(p, "clearance", FIXTURE_CLEARANCE_LABEL, t))
         .push(choice(
             p,
             "reposition",
@@ -2431,7 +2443,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         }
     }
     if holding != "None" {
-        c.push(field(p, "holding_gap", "Clearance gap · mm", t));
+        c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
         c.push(
             btn("Suggest layout", Message::SuggestLayout, false)
                 .width(Fill)

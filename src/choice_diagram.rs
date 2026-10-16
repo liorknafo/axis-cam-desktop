@@ -106,8 +106,10 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
         Diagram::FixtureClearance => {
             // Side elevation: the gap starts at the holder's outside edge,
             // which is closer to the jaw than the narrower cutter. Only the
-            // highlight and flute marks animate; the requested gap stays fixed.
-            label(f, "GAP TO WORKHOLDING", 6., 2.);
+            // highlight and flute marks animate; the requested gap stays
+            // fixed. It is the setup's note, which nothing checks, and the
+            // heading and the dimension say so.
+            label(f, "REQUESTED GAP · NOT CHECKED", 6., 2.);
             let pulse = 0.12 + 0.06 * (time * SPIN).sin();
             f.fill_rectangle(
                 Point::new(137., 59.),
@@ -151,7 +153,7 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
             label(f, "Holder", 35., 75.);
             line(f, Point::new(73., 82.), Point::new(102., 82.), CYAN, 1.);
             label(f, "Cutter", 66., 107.);
-            label(f, "Clearance", 141., 26.);
+            label(f, "Requested", 141., 26.);
             // Dimension extension lines terminate at the actual nearest faces.
             for (x, bottom) in [(137., 101.), (191., 64.)] {
                 line(f, Point::new(x, 43.), Point::new(x, bottom), GOLD, 1.);

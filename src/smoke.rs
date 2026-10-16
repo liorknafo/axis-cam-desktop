@@ -12242,4 +12242,41 @@ flood = { pin = 8 }
     fn tests_cannot_open_the_real_workspace() {
         let _ = App::from_workspace(crate::storage::state_path(), None);
     }
+    #[test]
+    fn the_holding_step_builds_with_the_gap_fields_named_for_what_they_do() {
+        use crate::ui::{FIXTURE_CLEARANCE_LABEL, HOLDING_GAP_LABEL};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.page = Page::Work;
+        a.selected = None;
+        a.setup_step = "Holding";
+        // The step builds with None, a vise and clamps: the checked gap only
+        // with a vise or clamps, the requested clearance always (issue #72).
+        for holding in ["None", "Vise", "Clamps"] {
+            edit_setup(&mut a, &[("holding", holding)]);
+            let _ = a.view();
+        }
+        assert!(
+            HOLDING_GAP_LABEL.starts_with("Checked gap")
+                && FIXTURE_CLEARANCE_LABEL.ends_with("not checked")
+                && HOLDING_GAP_LABEL != FIXTURE_CLEARANCE_LABEL
+        );
+        // The requested clearance is printed on the setup sheet after the
+        // reposition, as a note that is not checked, "not set" when blank.
+        edit_setup(&mut a, &[("clearance", "15")]);
+        let reposition = get(&a.doc.setup().p, "reposition").to_string();
+        let sheet = a.doc.setup_sheet(None);
+        assert!(
+            sheet.contains(&format!(
+                "Reposition: {reposition}\n\nRequested fixture clearance (not checked): 15 mm\n\n"
+            )),
+            "{sheet}"
+        );
+        edit_setup(&mut a, &[("clearance", " ")]);
+        assert!(
+            a.doc
+                .setup_sheet(None)
+                .contains("Requested fixture clearance (not checked): not set\n\n")
+        );
+    }
 }

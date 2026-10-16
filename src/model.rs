@@ -1569,8 +1569,13 @@ impl Document {
             .into_iter()
             .flatten()
             .collect();
+            // The operator's requested fixture clearance: a note, checked by nothing.
+            let requested = match crate::holding::requested_clearance(setup) {
+                Some(mm) => format!("{mm} mm"),
+                None => "not set".into(),
+            };
             s += &format!(
-                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\n{}\n\n",
+                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
                 setup.name(),
                 get(&setup.p, "offset"),
                 setup.machine.name(),
@@ -1588,6 +1593,7 @@ impl Document {
                 get(&setup.p, "ty"),
                 get(&setup.p, "tz"),
                 get(&setup.p, "reposition"),
+                requested,
                 get(&setup.p, "notes")
             );
             for o in &setup.operations {

@@ -736,6 +736,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     if let Some(holding) = &h.holding {
         w.wrapped("Workholding: ", holding);
     }
+    // The operator's requested fixture clearance, a note checked by nothing,
+    // as a fixed sentence with the app's number, before the notes' free text.
+    w.note(&match crate::holding::requested_clearance(setup) {
+        Some(mm) => format!("Requested fixture clearance, not checked: {} mm", coord(mm)),
+        None => "Requested fixture clearance, not checked: not set".into(),
+    });
     if !clean(get(&setup.p, "notes")).is_empty() {
         w.wrapped("Setup notes: ", get(&setup.p, "notes"));
     }
@@ -2285,6 +2291,7 @@ mod tests {
 (Machine: Workshop Mill v1)
 (Work zero: Stock top center in G54. Touch off Z0 on the stock top at its centre and X0 Y0 from the four sides near their middles, between 1 mm and 2.5 mm below the top.)
 (Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
+(Requested fixture clearance, not checked: 15.000 mm)
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
 (Operation 1: Face top - Facing - T1 - S8000)
 (Extents: X-15.000 to 15.000 Y-15.000 to -15.000 Z-1.000 to 15.000 mm)
@@ -3787,7 +3794,7 @@ M2
         let text = &setup_texts(&posted, 1)[0];
         assert!(
             text.contains(
-                "(Fixture: Vise)\n(Setup notes: Flip about X; clamp on the machined walls.)\n"
+                "(Fixture: Vise)\n(Requested fixture clearance, not checked: 15.000 mm)\n(Setup notes: Flip about X; clamp on the machined walls.)\n"
             ),
             "{text}"
         );
@@ -4401,7 +4408,9 @@ M2
         doc.setups[0]
             .p
             .insert("fixture".into(), "Low profile clamps".into());
-        assert!(header(&doc).contains("deg.)\n(Fixture: Low profile clamps)\n(T1: "));
+        assert!(header(&doc).contains(
+            "deg.)\n(Fixture: Low profile clamps)\n(Requested fixture clearance, not checked: 15.000 mm)\n(T1: "
+        ));
         assert!(
             doc.setup_sheet(Some(&mesh))
                 .contains("\n\nFixture: Low profile clamps\n\nRotation:")
@@ -4410,7 +4419,7 @@ M2
         hold(&mut doc, "Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
         let text = header(&doc);
         assert!(
-            text.contains("deg.)\n(Workholding: 100 mm machine vise on +-Y, grip 8 mm, offset 0 mm, gap 2 mm.)\n(T1: "),
+            text.contains("deg.)\n(Workholding: 100 mm machine vise on +-Y, grip 8 mm, offset 0 mm, gap 2 mm.)\n(Requested fixture clearance, not checked: 15.000 mm)\n(T1: "),
             "{text}"
         );
         let sheet = doc.setup_sheet(Some(&mesh));
@@ -4435,7 +4444,7 @@ M2
             .insert("name".into(), "Toe (MSG,hello) clamp Ø60".into());
         let text = header(&doc);
         assert!(
-            text.contains("deg.)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Setup notes: Soft jaws)\n(T1: "),
+            text.contains("deg.)\n(Workholding: 4 x Toe MSG,hello clamp D60 at -X 0, +X 0, -Y 0, +Y 0, gap 2 mm.)\n(Requested fixture clearance, not checked: 15.000 mm)\n(Setup notes: Soft jaws)\n(T1: "),
             "{text}"
         );
         assert_comments_begin_with_app_words(&text);
@@ -4542,7 +4551,7 @@ M2
     /// How every comment the post writes begins; `#` stands for a number the
     /// app writes. A comment that carries text from the user or the model
     /// begins with a fixed word and a colon; the others are fixed sentences.
-    const COMMENT_STARTS: [&str; 37] = [
+    const COMMENT_STARTS: [&str; 38] = [
         "AXIS CAM Studio - LinuxCNC 3-axis program",
         "Job: ",
         "Job, continued: ",
@@ -4562,6 +4571,7 @@ M2
         "Workholding, continued: ",
         "Setup notes: ",
         "Setup notes, continued: ",
+        "Requested fixture clearance, not checked: ",
         "T#: ",
         "T#, continued: ",
         "Operation #: ",
