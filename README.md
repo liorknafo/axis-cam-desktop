@@ -108,6 +108,8 @@ Generation limits: 30,000 moves for the new kernels; up to 300 waterline layers;
 
 Hover a choice field to see **the selected option in the title** and its specific behavior. For example, Profile ramp explains a descending contour entry; Plunge explains a straight vertical entry. Changing the choice updates the text and illustration. Milling-method help also reads the saved spindle rotation; Facing explains when Both ways overrides the one-way method preference. Legacy values use the same resolved defaults as the visible control.
 
+A card's hover text is short: what the selected value or the button does and one caveat, in about three sentences and under 350 characters (issue #89). The procedure, the limits and the conventions are under **More…** on the card. The card stays open while the pointer is on it, so More… can be clicked; it expands the card, and **Pause** on an animated card holds the animation on a still frame. Both are forgotten when the card closes. The work-zero card, for example, says where program zero is and that export and a run are refused once an earlier setup has cut the stock there; where each side is touched off, and which probe finds the point, are under More….
+
 Selected-state animations cover spindle rotation, Climb/Conventional, one-way/zigzag facing, keep-down/retract links, ramp/plunge entry, four drilling cycles and cutter containment. Setup, machine, tool-type, coolant, stock mode, playback-speed and display choices also have option-specific text. Saved preferences are distinguished from implemented behavior. These are explanatory animations, not previews of the current job.
 
 The contextual approach references Autodesk's [Fusion Face parameter reference](https://help.autodesk.com/view/fusion360/ENU/?contextId=MFG-REF-2D-FACE-CMD). The native illustrations and descriptions are original and reflect this app's supported behavior. Stock-detail selection uses visible Draft / Standard / Fine buttons so its tooltip cannot obscure a drop-down menu.
@@ -281,9 +283,9 @@ Limits: 50 MB source file, 100 MB expanded 3MF XML (counted as the parts the roo
 
 ### Tooltips and animated help
 
-Hold the pointer over a button, field label/input, dropdown or toggle for about **0.6 seconds**. Command cards explain the action; field cards explain meaning, units and practical consequences. Relevant cards show a five-second looping native canvas illustration: facing, pocket clearing, drilling, finishing, rotary/indexed motion, tool tilt, clearance planes, pass spacing, layer depth or cutter dimensions. No GIF download or network connection is needed. Illustrations explain concepts; they are not computed toolpaths and do not depend on the current parameter value. Animation updates run at approximately 30 fps while an animated help target is hovered.
+Hold the pointer over a button, field label/input, dropdown or toggle for about **0.6 seconds**. Command cards explain the action; field cards explain meaning, units and practical consequences. The hover text is under 350 characters; the rest is under **More…** on the card (see **Contextual help for choices**). Relevant cards show a five-second looping native canvas illustration: facing, pocket clearing, drilling, finishing, rotary/indexed motion, tool tilt, clearance planes, pass spacing, layer depth or cutter dimensions; **Pause** on the card holds it on a still frame. No GIF download or network connection is needed. Illustrations explain concepts; they are not computed toolpaths and do not depend on the current parameter value. Animation updates run at approximately 30 fps while an animated card is open and not paused.
 
-A click puts the help away (LIO-148). Pressing a button, tab, field or other control shuts its card, and the card stays shut until the pointer leaves that control and comes back, so it never covers the page or result the click opened. A control that a click brings up under the resting pointer shows no help until the pointer moves off it and back.
+A click puts the help away (LIO-148). Pressing a button, tab, field or other control shuts its card, and the card stays shut until the pointer leaves that control and comes back, so it never covers the page or result the click opened. A control that a click brings up under the resting pointer shows no help until the pointer moves off it and back. An open card stays while the pointer is on the control or on the card, and for a quarter of a second on the way between them.
 
 ## Materials
 
@@ -772,7 +774,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-eight 
 - `src/mesh.rs`: sample model, STL/OBJ readers and preview normalization.
 - `src/three_mf.rs`: bounded 3MF package and mesh/component reader.
 - `src/step.rs`, `native/step_preview.cpp`, `build.rs`: isolated Open CASCADE STEP converter.
-- `src/help.rs`: shared hover cards and operation illustrations.
+- `src/help.rs`: shared hover cards (a short hover text, the rest under More…), the hover widget that keeps a card open under the pointer, and operation illustrations; `src/help_before_89.tsv` holds the texts from before the split for the test that no sentence was lost.
 - `src/choice_help.rs`, `src/choice_diagram.rs`: selected-value descriptions, related-setting context and matching native animations.
 - `src/storage.rs`: project loading and atomic persistence.
 - `src/rest.rs`: conservative continuous-sweep coverage for automatic cutting start heights, also used by export to prove a rapid's descent clear and to find the stock faces earlier setups cut, and (`RestStock::left`) the box a later setup starts from, and (`Removed`) where earlier cuts removed material, which operation did and whether the part is still joined to the material a holder grips.

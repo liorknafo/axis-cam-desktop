@@ -1232,7 +1232,10 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
         container(block).padding([4, 10]),
         Help::text(
             "Still uncut",
-            "The faces of the part that the stock left after every setup still covers: what the job has not machined yet. Each face is sampled 0.5 mm outside itself against the simulated cuts, so a thinner finishing allowance counts as cut. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm. Until every enabled operation generates, completeness is not checked.",
+            "The faces of the part that the stock left after every setup still covers: what the job has not machined yet. Until every enabled operation generates, completeness is not checked.",
+        )
+        .more(
+            "Each face is sampled 0.5 mm outside itself against the simulated cuts, so a thinner finishing allowance counts as cut. Positions are in setup 1's axes from the part's -X/-Y/bottom corner, in mm.",
         ),
         widget::tooltip::Position::Right,
     ))
@@ -5308,7 +5311,10 @@ pub(crate) fn refusal(what: Dropped) -> (&'static str, &'static str) {
     }
 }
 /// The pictures checkbox's hover help.
-pub(crate) const PICTURES_HELP: &str = "Ticked, the planner also sends OpenAI pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels: an overview with the first request, and the views the model asks for, its own toolpaths among them. Unticked, it sends text only. The CAD file is never sent. A run keeps the choice it started with: the box cannot be changed until the run is over.";
+pub(crate) const PICTURES_HELP: &str = "Ticked, the planner also sends OpenAI pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels: an overview with the first request, and the views the model asks for, its own toolpaths among them. Unticked, it sends text only. The CAD file is never sent.";
+/// What More… adds to the pictures box's help.
+pub(crate) const PICTURES_HELP_MORE: &str =
+    "A run keeps the choice it started with: the box cannot be changed until the run is over.";
 /// What the page beside the Plan button says is sent to OpenAI.
 pub(crate) fn sent_to_openai(pictures: bool) -> String {
     let mut text = SENT_TO_OPENAI.to_string();
@@ -5342,7 +5348,7 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
             .label("Let the AI see pictures of the part")
             .on_toggle_maybe((!running).then_some(Message::PlanPictures))
             .text_size(13),
-        Help::text("Pictures for the AI planner", PICTURES_HELP),
+        Help::text("Pictures for the AI planner", PICTURES_HELP).more(PICTURES_HELP_MORE),
         widget::tooltip::Position::Top,
     ));
     if !ready {
