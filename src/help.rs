@@ -920,6 +920,16 @@ pub fn command(m: &Message, label: String) -> Help {
             .more("Configure Tool → Geometry → Heights → Passes/Cycle → Linking. Unavailable strategies open Operation support for imported jobs; their animations are educational.")
             .animated(Diagram::Operation(*s));
     }
+    // The work zero step's buttons say what the zero they pick is.
+    if let Edit(Target::Setup, "origin", origin) = m {
+        return crate::choice_help::selected(
+            "origin",
+            "Work zero",
+            origin,
+            Target::Setup,
+            &crate::model::Fields::new(),
+        );
+    }
     if let StockDetail(detail) = m {
         return crate::choice_help::selected(
             "stock_detail",
@@ -1015,8 +1025,12 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         SetupStep("Machine") => (
-            "The machine this setup runs on, its work offset and where the work zero sits on the stock. ✓ once the machine profile has no issues and a work offset is chosen.",
+            "The machine this setup runs on. ✓ once the machine profile has no issues.",
             "",
+        ),
+        SetupStep("Work zero") => (
+            "Where the program's X0 Y0 Z0 is: on the stock top or bottom at a corner, the middle of an edge or the centre, picked on a grid of the stock seen from above, or Model origin; and the work offset (G54–G59) it is kept in. ✓ once the zero is on the stock this setup starts from.",
+            "On the Control page, Probe corner, Probe edge or Probe centre sets this zero; Probe from probes it from another spot when a jaw is in the way.",
         ),
         SetupStep("Stock") => (
             "The project material and the block the part is cut from. ✓ once a material is chosen and the stock box holds the part.",
@@ -1422,6 +1436,30 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Make the current position work zero on this axis, in the active coordinate system.",
             "",
         ),
+        WorkHalf(_) => (
+            "Halve this axis's work position where the tool is, as a milling machine's DRO does. Zero the axis on one side of a part, move to the other side and press 1/2: the middle is now 0. With an edge finder or probe the tip's radius cancels out.",
+            "",
+        ),
+        WorkText(..) => (
+            "The work position to give this axis where the tool is, in mm: for example −5 with the edge of a 10 mm edge finder against a side.",
+            "",
+        ),
+        WorkSet(_) => (
+            "Make the current position the value beside it on this axis, in the active coordinate system.",
+            "",
+        ),
+        ToWorkXY => (
+            "Rapid X and Y to work X0 Y0, Z staying where it is: lift Z clear first. Soft limits apply.",
+            "",
+        ),
+        ProbeFrom(_) => (
+            "Where on the stock top the probe finds this setup's work zero from: its own spot, or another corner, edge middle or the centre when a jaw or clamp is in the way. The zero stays where the program has it, placed from the touches by the setup's stock size.",
+            "",
+        ),
+        ProbeFeature(_) => (
+            "Probe a feature from where the tip is and set work zero on it in the active coordinate system, without a setup: a surface (Z top), a side (X+, X−, Y+, Y−), an outside corner, or the centre of a bore. The tip's radius is allowed for. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
+            "",
+        ),
         Wcs(_) => (
             "Use this work coordinate system. Each of G54–G59 keeps its own work zero; they change only while Idle.",
             "",
@@ -1541,6 +1579,10 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         }
         (Target::Machine, "mdi_line") => {
             let (body, more) = machine_help(&crate::control::Action::MdiText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "work_set") => {
+            let (body, more) = machine_help(&crate::control::Action::WorkText(0, String::new()));
             (body, more, None)
         }
         (Target::Machine, "cal_distance") => {
@@ -3656,6 +3698,7 @@ mod tests {
             SetupStep("Stock"),
             SetupStep("Position"),
             SetupStep("Holding"),
+            SetupStep("Work zero"),
             SelectSetup(0),
             SelectOp(0),
             DuplicateOp,
@@ -3747,6 +3790,10 @@ mod tests {
             Ctl::JogSpeed(50.),
             Ctl::WorkZero(None),
             Ctl::WorkZero(Some(0)),
+            Ctl::WorkHalf(0),
+            Ctl::WorkText(0, String::new()),
+            Ctl::WorkSet(0),
+            Ctl::ToWorkXY,
             Ctl::Wcs(0),
             Ctl::Rpm(String::new()),
             Ctl::Spindle(uc100::gcode::Spindle::Off),
@@ -3765,6 +3812,8 @@ mod tests {
             Ctl::CalMove,
             Ctl::ProbeZ,
             Ctl::ProbeEdges,
+            Ctl::ProbeFrom(None),
+            Ctl::ProbeFeature(crate::control::Feature::Bore),
             Ctl::TouchOff,
             Ctl::ToSimZero,
         ] {

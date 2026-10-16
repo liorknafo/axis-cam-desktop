@@ -276,6 +276,11 @@ struct Edges {
     bottom: bool,
     /// The work zero is Model origin, found from the front-left corner.
     model: bool,
+    /// The setup's work zero (`post::ORIGINS`), for a message.
+    origin: String,
+    /// `refs` are not the zero's own spot: the zero is placed from the
+    /// faces touched by the setup's stock size.
+    moved: bool,
     faces: Vec<Face>,
     /// The setup's stock (mm).
     size: [f64; 3],
@@ -349,6 +354,8 @@ impl Edges {
             refs,
             bottom: crate::post::stock_zero(origin).is_some_and(|(_, top)| !top),
             model: crate::post::stock_zero(origin).is_none(),
+            origin: origin.into(),
+            moved: crate::post::stock_zero(origin).is_some_and(|(own, _)| own != refs),
             touches: vec![vec![]; faces.len()],
             faces,
             size: stock.dimensions().map(f64::from),
@@ -532,6 +539,11 @@ impl Edges {
             format!(
                 "Work zero set on Model origin {at}, set off from {spot} of the stock top, from {count} touches."
             )
+        } else if self.moved {
+            format!(
+                "Work zero set on {} {at}, placed from {spot} of the stock top by the setup's {:.3} × {:.3} × {:.3} mm stock, from {count} touches: a stock of another size moves it by the difference.",
+                self.origin, self.size[0], self.size[1], self.size[2]
+            )
         } else if self.bottom {
             format!(
                 "Work zero set on the stock bottom under {spot} of the stock top, {:.3} mm below it, {at}, from {count} touches.",
@@ -601,6 +613,266 @@ pub fn probe_spot(refs: [crate::post::At; 2]) -> String {
     }
 }
 
+/// How far a corner probe steps along each side from where it starts
+/// before it probes the other side (mm): it starts outside the corner, less
+/// than this off both sides.
+pub const CORNER_REACH: f64 = 15.;
+
+/// A feature the probe finds without a setup, from where the operator put
+/// it, setting work zero there in the active work system, as a milling
+/// machine's probing screen does. The tip's radius is allowed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    /// Straight down onto a surface: Z0 there.
+    Top,
+    /// Along axis `.0` (X or Y), toward + when `.1`, onto a side: that
+    /// axis's zero on it. The tip starts beside the side, below its top.
+    Edge(usize, bool),
+    /// An outside corner (`post::At::Min` or `Max` along X and Y): X0 Y0
+    /// on it. The tip starts outside it, below the top, less than
+    /// `CORNER_REACH` off both sides.
+    Corner([crate::post::At; 2]),
+    /// The centre of a bore or pocket: X0 Y0 there. The tip starts inside
+    /// it, below its top.
+    Bore,
+}
+
+impl Feature {
+    pub const EDGES: [Feature; 4] = [
+        Feature::Edge(0, true),
+        Feature::Edge(0, false),
+        Feature::Edge(1, true),
+        Feature::Edge(1, false),
+    ];
+    pub const CORNERS: [Feature; 4] = {
+        use crate::post::At::{Max, Min};
+        [
+            Feature::Corner([Min, Max]),
+            Feature::Corner([Max, Max]),
+            Feature::Corner([Min, Min]),
+            Feature::Corner([Max, Min]),
+        ]
+    };
+
+    /// The button's words: "Z top", "X+", "Front-left", "Bore centre".
+    pub fn label(self) -> String {
+        match self {
+            Feature::Top => "Z top".into(),
+            Feature::Edge(k, plus) => format!("{}{}", ["X", "Y"][k], if plus { "+" } else { "−" }),
+            Feature::Corner(c) => {
+                let s = crate::post::corner_name(c);
+                s[..1].to_uppercase() + &s[1..]
+            }
+            Feature::Bore => "Bore centre".into(),
+        }
+    }
+
+    /// The axes it moves and sets.
+    fn axes(self) -> &'static [usize] {
+        match self {
+            Feature::Top => &[2],
+            Feature::Edge(0, _) => &[0],
+            Feature::Edge(..) => &[1],
+            Feature::Corner(_) | Feature::Bore => &[0, 1],
+        }
+    }
+
+    /// Where to put the tip before pressing it, and what it does.
+    pub fn how(self) -> String {
+        match self {
+            Feature::Top => "Jog the tip over the surface and press Z top: it probes straight down and sets Z0 where the tip's bottom touches. A 3D probe is not as long as the cutter: touch the cutter off on Z0 after it, with Probe Z or Set Z.".into(),
+            Feature::Edge(k, plus) => {
+                let side = crate::post::ENDS[k][usize::from(!plus)];
+                format!(
+                    "Jog the tip beside the {side} side of the part, below its top, and press {}: it probes toward {} and sets {}0 on the side.",
+                    self.label(),
+                    if plus { "+" } else { "−" },
+                    ["X", "Y"][k]
+                )
+            }
+            Feature::Corner(c) => format!(
+                "Jog the tip outside the {} corner, below the top, less than {CORNER_REACH:.0} mm off both sides, and press {}: it steps along each side, probes the other and sets X0 Y0 on the corner.",
+                crate::post::corner_name(c),
+                self.label()
+            ),
+            Feature::Bore => "Jog the tip into the bore or pocket, below its top, and press Bore centre: it probes −X, +X at the middle found, −Y and +Y, sets X0 Y0 at the centre and stays there.".into(),
+        }
+    }
+}
+
+/// One driver command of a `Routine`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Leg {
+    /// A rapid move.
+    Rapid(Vec6),
+    /// A probe move that must touch nothing.
+    Guard(Vec6),
+    /// A probe move that must touch.
+    Touch(Vec6),
+}
+
+/// A `Feature` probed from where the tip was put (machine mm).
+struct Routine {
+    feature: Feature,
+    start: Vec6,
+    radius: f64,
+    feed: f64,
+    /// How far each touch goes at most.
+    distance: f64,
+    /// Where each touch was made, as the driver reports it.
+    touches: Vec<Vec6>,
+    legs: VecDeque<Leg>,
+    /// The command under way and the counts before it (`Connection::seq`).
+    sent: Option<(Leg, (u64, u64))>,
+}
+
+impl Routine {
+    fn new(feature: Feature, probe: &Probe, start: Vec6) -> Self {
+        Self {
+            feature,
+            start,
+            radius: probe.tip.unwrap_or_default() / 2.,
+            feed: probe.feed,
+            distance: probe.distance,
+            touches: vec![],
+            legs: VecDeque::new(),
+            sent: None,
+        }
+    }
+
+    /// `p` moved `d` along axis `k`.
+    fn by(p: Vec6, k: usize, d: f64) -> Vec6 {
+        let mut q = p;
+        q[k] += d;
+        q
+    }
+
+    /// Which way the corner probe moves along X and Y to reach the part.
+    fn ways(c: [crate::post::At; 2]) -> [f64; 2] {
+        c.map(|a| if a == crate::post::At::Min { 1. } else { -1. })
+    }
+
+    /// The bore's centre along X, from its first two touches.
+    fn mid_x(&self) -> f64 {
+        (self.touches[0][0] + self.touches[1][0]) / 2.
+    }
+
+    /// The legs to the next touch, from the last one; None once every
+    /// touch is made.
+    fn plan(&self) -> Option<Vec<Leg>> {
+        use Leg::{Guard, Rapid, Touch};
+        let (s, d, n) = (self.start, self.distance, self.touches.len());
+        Some(match (self.feature, n) {
+            (Feature::Top, 0) => vec![Touch(Self::by(s, 2, -d))],
+            (Feature::Edge(k, plus), 0) => vec![Touch(Self::by(s, k, if plus { d } else { -d }))],
+            (Feature::Corner(c), 0) => {
+                let w = Self::ways(c);
+                let along = Self::by(s, 1, w[1] * CORNER_REACH);
+                vec![Guard(along), Touch(Self::by(along, 0, w[0] * d))]
+            }
+            (Feature::Corner(c), 1) => {
+                let w = Self::ways(c);
+                let along = Self::by(s, 0, w[0] * CORNER_REACH);
+                vec![
+                    Rapid(Self::by(s, 1, w[1] * CORNER_REACH)),
+                    Rapid(s),
+                    Guard(along),
+                    Touch(Self::by(along, 1, w[1] * d)),
+                ]
+            }
+            (Feature::Bore, 0) => vec![Touch(Self::by(s, 0, -d))],
+            (Feature::Bore, 1) => vec![Rapid(s), Touch(Self::by(s, 0, d))],
+            (Feature::Bore, 2 | 3) => {
+                let mut mid = s;
+                mid[0] = self.mid_x();
+                vec![
+                    Rapid(mid),
+                    Touch(Self::by(mid, 1, if n == 2 { -d } else { d })),
+                ]
+            }
+            _ => return None,
+        })
+    }
+
+    /// Where the routine leaves the tip once every touch is made: back where
+    /// it started, or on the bore's centre.
+    fn last(&self) -> Vec<Vec6> {
+        match self.feature {
+            Feature::Corner(c) => {
+                let w = Self::ways(c);
+                vec![Self::by(self.start, 0, w[0] * CORNER_REACH), self.start]
+            }
+            Feature::Bore => {
+                let z = self.zero();
+                let mut at = self.start;
+                (at[0], at[1]) = (z[0], z[1]);
+                vec![at]
+            }
+            Feature::Top => vec![self.start],
+            Feature::Edge(..) => vec![self.start],
+        }
+    }
+
+    /// The feature's machine position on the axes it sets (`Feature::axes`),
+    /// once every touch is made: a side is a tip radius ahead of the tip's
+    /// centre, a surface at the tip's bottom, a bore's centre midway between
+    /// opposite touches.
+    fn zero(&self) -> [f64; 3] {
+        let (t, r) = (&self.touches, self.radius);
+        let mut w = [self.start[0], self.start[1], self.start[2]];
+        match self.feature {
+            Feature::Top => w[2] = t[0][2],
+            Feature::Edge(k, plus) => w[k] = t[0][k] + if plus { r } else { -r },
+            Feature::Corner(c) => {
+                let way = Self::ways(c);
+                w[0] = t[0][0] + way[0] * r;
+                w[1] = t[1][1] + way[1] * r;
+            }
+            Feature::Bore => {
+                w[0] = self.mid_x();
+                w[1] = (t[2][1] + t[3][1]) / 2.;
+            }
+        }
+        w
+    }
+
+    /// What was found and set, once every touch is made.
+    fn found(&self) -> String {
+        let w = self.zero();
+        let at = |axes: &[usize]| {
+            axes.iter()
+                .map(|&a| format!("{} {:.3}", ["X", "Y", "Z"][a], w[a]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        match self.feature {
+            Feature::Top => format!("Z0 set on the surface at machine {}.", at(&[2])),
+            Feature::Edge(k, plus) => format!(
+                "{}0 set on the {} side at machine {}.",
+                ["X", "Y"][k],
+                crate::post::ENDS[k][usize::from(!plus)],
+                at(&[k])
+            ),
+            Feature::Corner(c) => format!(
+                "X0 Y0 set on the {} corner at machine {}.",
+                crate::post::corner_name(c),
+                at(&[0, 1])
+            ),
+            Feature::Bore => {
+                let t = &self.touches;
+                let across =
+                    |a: usize, b: usize, k: usize| (t[b][k] - t[a][k]).abs() + 2. * self.radius;
+                format!(
+                    "X0 Y0 set on the bore's centre at machine {}: {:.3} mm across Y through it, {:.3} mm across X where the tip started.",
+                    at(&[0, 1]),
+                    across(2, 3, 1),
+                    across(0, 1, 0)
+                )
+            }
+        }
+    }
+}
+
 /// Rapid moves through `points` from `at`, leaving out any that go nowhere.
 fn moves_from(mut at: Vec6, points: &[Vec6]) -> Vec<Do> {
     let mut out = vec![];
@@ -661,6 +933,17 @@ pub enum Action {
     /// Make the current position work zero of the active coordinate
     /// system: one axis, or every axis.
     WorkZero(Option<usize>),
+    /// Halve an axis's work position where the tool is, as a milling
+    /// machine's DRO does: zeroed on one side of a part and moved to the
+    /// other, X0 is then midway.
+    WorkHalf(usize),
+    /// An axis's Set field (`Connection::presets`).
+    WorkText(usize, String),
+    /// Make the current position the axis's Set field value in the active
+    /// coordinate system.
+    WorkSet(usize),
+    /// Rapid X and Y to work X0 Y0 at the height the tool is at.
+    ToWorkXY,
     /// Select G54 (0) … G59 (5).
     Wcs(usize),
     /// The RPM field.
@@ -690,6 +973,13 @@ pub enum Action {
     /// Probe corner, Probe edge or Probe centre: the X, Y and Z work zero
     /// of the setup picked in the Run panel, from its stock.
     ProbeEdges,
+    /// The stock-top spot Probe corner, Probe edge or Probe centre finds the
+    /// setup's work zero from (`post::Checked::probe_from`): None for the
+    /// zero's own.
+    ProbeFrom(Option<[crate::post::At; 2]>),
+    /// Probe a feature where the tip is and set work zero on it, without a
+    /// setup (`Feature`).
+    ProbeFeature(Feature),
     /// Sets the work position where the tool tip is to that of the setup
     /// picked in the Run panel's touch-off point (`Connection::touch_off`):
     /// the tip is on the stock top there. Like Probe Z, it waits while the
@@ -784,6 +1074,12 @@ pub struct Connection {
     pub probe: Result<Probe, Vec<String>>,
     probing: Option<Probing>,
     edges: Option<Edges>,
+    /// The stock-top spot picked to probe the setup's work zero from
+    /// (`Action::ProbeFrom`).
+    pub probe_spot: Option<[crate::post::At; 2]>,
+    routine: Option<Routine>,
+    /// Each axis's Set field (`Action::WorkSet`).
+    pub presets: [String; 6],
     /// How the last probe ended (ok, what it did).
     pub probed: Option<(bool, String)>,
     /// The simulator's block (min and max corners, machine mm).
@@ -854,6 +1150,9 @@ impl Connection {
             probe: probe_settings(&m.p),
             probing: None,
             edges: None,
+            probe_spot: None,
+            routine: None,
+            presets: Default::default(),
             probed: None,
             block,
         })
@@ -976,6 +1275,7 @@ impl Connection {
             }
         }
         self.edges_step();
+        self.routine_step();
         // Any state but Idle (E-stop, a move) drops what is left, so nothing
         // is declared later by surprise.
         if self.idle() {
@@ -1072,6 +1372,32 @@ impl Connection {
                     self.send(Command::SetWork { axis: a, value: 0. });
                 }
             }
+            Action::WorkHalf(a) if self.manual() && self.axis(a) => {
+                if let (Some(run), 2) = (&mut self.run, a) {
+                    run.touched = true;
+                }
+                self.send(Command::SetWork {
+                    axis: a,
+                    value: self.snapshot.work_pos[a] / 2.,
+                });
+            }
+            Action::WorkText(a, text) if a < 6 => self.presets[a] = text,
+            Action::WorkSet(a) if self.manual() && self.axis(a) => {
+                if let Some(value) = self.preset(a) {
+                    if let (Some(run), 2) = (&mut self.run, a) {
+                        run.touched = true;
+                    }
+                    self.send(Command::SetWork { axis: a, value });
+                }
+            }
+            Action::ToWorkXY if self.to_work_xy().is_ok() => {
+                let now = self.snapshot.machine_pos;
+                let mut to = now;
+                for (v, work) in to.iter_mut().zip(self.snapshot.work_pos).take(2) {
+                    *v -= work;
+                }
+                self.send(job("To X0 Y0", moves_from(now, &[to])));
+            }
             Action::Wcs(i) if self.idle() && i < 6 => {
                 self.send(Command::Mdi(format!("G{}", 54 + i)))
             }
@@ -1139,6 +1465,8 @@ impl Connection {
                 }
             }
             Action::ProbeEdges => self.start_edges(),
+            Action::ProbeFrom(spot) if !self.probing() => self.probe_spot = spot,
+            Action::ProbeFeature(f) => self.start_routine(f),
             // Both act on the checked setup, which an edit may have changed:
             // like the probes, they wait while its check is out of date (#39).
             Action::TouchOff if self.manual() && self.run_program().is_ok() => {
@@ -1204,7 +1532,7 @@ impl Connection {
     }
 
     /// Why a probe moving `axes` cannot start now; None when it can.
-    fn probe_ready(&self, axes: &[usize]) -> Option<String> {
+    pub fn probe_ready(&self, axes: &[usize]) -> Option<String> {
         let s = &self.snapshot;
         let Some(pin) = self.config.inputs.probe else {
             return Some(
@@ -1270,7 +1598,12 @@ impl Connection {
     /// A probe move or probing routine is under way: planning is locked
     /// (`App::locked`).
     pub fn probing(&self) -> bool {
-        self.probing.is_some() || self.edges.is_some()
+        self.probing.is_some() || self.edges.is_some() || self.routine.is_some()
+    }
+
+    /// The feature being probed (`Feature`), if one is.
+    pub fn feature(&self) -> Option<Feature> {
+        self.routine.as_ref().map(|r| r.feature)
     }
 
     /// Probe corner or Probe centre is under way.
@@ -1393,10 +1726,190 @@ impl Connection {
             return Err("Probe corner, Probe edge and Probe centre set the work zero of the setup picked in the Run panel, from its stock.".into());
         }
         let p = self.run_program()?;
+        // A spot picked that a new check of the setup finds blocked is
+        // left for the zero's own, as the grid shows it.
+        if let Some(refs) = self.probe_spot
+            && p.probe_from.iter().any(|(r, ok)| *r == refs && ok.is_ok())
+        {
+            return Ok((refs, p));
+        }
         match &p.probe {
             Ok(refs) => Ok((*refs, p)),
+            Err(why) if p.probe_from.iter().any(|(_, ok)| ok.is_ok()) => Err(format!(
+                "{why} Pick a spot under Probe from that a probe can reach."
+            )),
             Err(why) => Err(why.clone()),
         }
+    }
+
+    /// An axis's Set field, when it is a number.
+    pub fn preset(&self, a: usize) -> Option<f64> {
+        let v: f64 = self.presets.get(a)?.trim().parse().ok()?;
+        v.is_finite().then_some(v)
+    }
+
+    /// Why Go to X0 Y0 cannot move now.
+    pub fn to_work_xy(&self) -> Result<(), String> {
+        if !self.idle() {
+            return Err("The machine is not Idle.".into());
+        }
+        if !self.unset_limited_axes().is_empty() || !(0..2).all(|a| self.snapshot.referenced[a]) {
+            return Err(format!(
+                "X and Y need a machine position first: {}.",
+                if self.home_switches() {
+                    "home"
+                } else {
+                    "set machine zero"
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    /// Why probing feature `f` cannot start now; None when it can.
+    pub fn feature_blocked(&self, f: Feature) -> Option<String> {
+        self.probe_ready(f.axes())
+            .or_else(|| match (&self.probe, f) {
+                (
+                    Ok(Probe { tip: None, .. }),
+                    Feature::Edge(..) | Feature::Corner(_) | Feature::Bore,
+                ) => Some("Probe tip diameter is not set: set it in the Machine library.".into()),
+                _ => None,
+            })
+    }
+
+    /// `p` held inside the soft limits of X, Y and Z, which the driver
+    /// refuses a move past.
+    fn inside(&self, mut p: Vec6) -> Vec6 {
+        for (a, v) in p.iter_mut().enumerate().take(3) {
+            if let Some(x) = self.config.axes.get(a) {
+                if let Some(lo) = x.soft_min {
+                    *v = v.max(lo);
+                }
+                if let Some(hi) = x.soft_max {
+                    *v = v.min(hi);
+                }
+            }
+        }
+        p
+    }
+
+    /// Starts probing feature `f` from where the tip is.
+    fn start_routine(&mut self, f: Feature) {
+        let (None, Ok(probe)) = (self.feature_blocked(f), self.probe.clone()) else {
+            return;
+        };
+        self.routine = Some(Routine::new(f, &probe, self.snapshot.machine_pos));
+        self.probed = None;
+        self.routine_step();
+    }
+
+    /// Follows a feature probe: once a command has ended, checks how and
+    /// sends the next, until every touch is made.
+    fn routine_step(&mut self) {
+        let Some(mut r) = self.routine.take() else {
+            return;
+        };
+        if let Some((leg, seq)) = r.sent {
+            let Some((ok, message, result)) = self.ended(seq) else {
+                self.routine = Some(r);
+                return;
+            };
+            let tripped = result.filter(|r| r.tripped).map(|r| r.position);
+            let failed = match (leg, tripped) {
+                _ if !ok => Some(message),
+                (Leg::Guard(_), Some(p)) => Some(format!(
+                    "The probe touched something at machine X {:.3} Y {:.3} Z {:.3} stepping along the side before it probes the other. {}",
+                    p[0],
+                    p[1],
+                    p[2],
+                    r.feature.how()
+                )),
+                (Leg::Touch(_), Some(p)) => {
+                    r.touches.push(p);
+                    None
+                }
+                (Leg::Touch(to), None) => Some(format!(
+                    "No contact up to machine X {:.3} Y {:.3} Z {:.3}. {}",
+                    to[0],
+                    to[1],
+                    to[2],
+                    r.feature.how()
+                )),
+                _ => None,
+            };
+            if let Some(why) = failed {
+                self.probed = Some((false, why));
+                return;
+            }
+            r.sent = None;
+        }
+        loop {
+            if r.legs.is_empty() {
+                match r.plan() {
+                    Some(legs) => r.legs = legs.into(),
+                    None => return self.routine_done(r),
+                }
+            }
+            let now = self.snapshot.machine_pos;
+            let leg = match r.legs.pop_front().unwrap() {
+                Leg::Rapid(to) => Leg::Rapid(self.inside(to)),
+                Leg::Guard(to) => Leg::Guard(self.inside(to)),
+                Leg::Touch(to) => Leg::Touch(self.inside(to)),
+            };
+            let name = format!("Probe {}", r.feature.label());
+            let seq = self.seq();
+            match leg {
+                // A rapid that goes nowhere is no command: the driver would
+                // report no outcome for it.
+                Leg::Rapid(to) if (0..6).all(|a| (to[a] - now[a]).abs() < 1e-9) => continue,
+                Leg::Rapid(to) => self.send(job(&name, moves_from(now, &[to]))),
+                Leg::Guard(to) => self.send(job(
+                    &name,
+                    vec![Do::Probe {
+                        target: to,
+                        feed: r.feed / 60.,
+                        must_trip: false,
+                    }],
+                )),
+                // G38.3: a miss is not an error; it is reported as one here.
+                Leg::Touch(to) => self.send(Command::Probe {
+                    target: to,
+                    feed: r.feed,
+                    must_trip: false,
+                }),
+            }
+            r.sent = Some((leg, seq));
+            self.routine = Some(r);
+            return;
+        }
+    }
+
+    /// Every touch of a feature probe is made, Idle: sets work zero on the
+    /// feature and moves the tip back (`Routine::last`).
+    fn routine_done(&mut self, r: Routine) {
+        // The driver takes SetWork only Idle or paused (#166).
+        if !self.manual() {
+            self.probed = Some((false, stopped_after(&self.snapshot.state)));
+            return;
+        }
+        let w = r.zero();
+        let now = self.snapshot.machine_pos;
+        for &a in r.feature.axes() {
+            self.send(Command::SetWork {
+                axis: a,
+                value: now[a] - w[a],
+            });
+        }
+        if let (Some(run), Feature::Top) = (&mut self.run, r.feature) {
+            run.touched = true;
+        }
+        let back: Vec<Vec6> = r.last().into_iter().map(|p| self.inside(p)).collect();
+        let moves = moves_from(now, &back);
+        if !moves.is_empty() {
+            self.send(job(&format!("Probe {}", r.feature.label()), moves));
+        }
+        self.probed = Some((true, r.found()));
     }
 
     /// Where the operator touches off the setup to run, in plan mm, and the
@@ -1676,12 +2189,14 @@ impl Connection {
 
     /// Idle, and no probing routine is between two of its moves.
     pub fn idle(&self) -> bool {
-        self.snapshot.state == Some(State::Idle) && self.edges.is_none()
+        self.snapshot.state == Some(State::Idle) && self.edges.is_none() && self.routine.is_none()
     }
 
     /// Jog, work zero, MDI and the spindle are allowed: Idle, or paused in a program.
     pub fn manual(&self) -> bool {
-        matches!(self.snapshot.state, Some(State::Idle | State::Paused(_))) && self.edges.is_none()
+        matches!(self.snapshot.state, Some(State::Idle | State::Paused(_)))
+            && self.edges.is_none()
+            && self.routine.is_none()
     }
 
     /// Every enabled axis has a home switch, so Home can run.
@@ -2427,6 +2942,212 @@ soft_max = 0.0
         let e = touch_box(e, lo, hi);
         assert_eq!(e.touches[0].len(), 2);
         check(&e, [100., 50., -30.]);
+    }
+
+    /// Every stock-based work zero, probed from each of the nine spots of
+    /// the stock top, is set where the program has it: from its own spot as
+    /// before, from another by the stock's size.
+    #[test]
+    fn every_zero_is_found_from_every_spot() {
+        use crate::post::{At, ORIGINS, probe_faces, stock_zero};
+        let stock = crate::mesh::Bounds {
+            min: [0.; 3],
+            max: [124., 84., 40.],
+        };
+        let probe = Probe {
+            plate: None,
+            tip: Some(4.),
+            feed: 100.,
+            distance: 20.,
+            retract: 5.,
+        };
+        // Machine = plan + this: the stock at machine X 100…224, Y 50…134,
+        // Z -70…-30.
+        let shift = [100., 50., -70.];
+        let (lo, hi) = ([100., 50., -70.], [224., 134., -30.]);
+        let along = |k: usize, at: At| match at {
+            At::Min => stock.min[k],
+            At::Mid => (stock.min[k] + stock.max[k]) / 2.,
+            At::Max => stock.max[k],
+        };
+        let spots = [At::Min, At::Mid, At::Max];
+        for origin in ORIGINS.iter().filter(|o| stock_zero(o).is_some()) {
+            let (xy, top) = stock_zero(origin).unwrap();
+            let datum = [
+                along(0, xy[0]),
+                along(1, xy[1]),
+                if top { stock.max[2] } else { stock.min[2] },
+            ];
+            let zero: [f64; 3] = std::array::from_fn(|a| datum[a] as f64 + shift[a]);
+            for refs in spots
+                .iter()
+                .flat_map(|&x| spots.iter().map(move |&y| [x, y]))
+            {
+                let spot = probe_faces(stock, refs)[0].3;
+                let start = [
+                    (spot.min[0] + spot.max[0]) as f64 / 2. + shift[0],
+                    (spot.min[1] + spot.max[1]) as f64 / 2. + shift[1],
+                    -25.,
+                    0.,
+                    0.,
+                    0.,
+                ];
+                let e = Edges::new(
+                    origin,
+                    refs,
+                    stock,
+                    datum,
+                    &[],
+                    &probe,
+                    4.,
+                    start,
+                    (-80., 0.),
+                );
+                let e = touch_box(e, lo, hi);
+                let (w, fixed) = e.zero();
+                assert_eq!(fixed, [true; 3], "{origin} from {refs:?}");
+                assert!(
+                    (0..3).all(|a| (w[a] - zero[a]).abs() < 1e-9),
+                    "{origin} from {refs:?}: {w:?}, expected {zero:?}"
+                );
+                let own = refs == xy;
+                assert_eq!(e.found().contains("placed from"), !own, "{}", e.found());
+            }
+        }
+    }
+
+    /// Runs a feature probe against the material `solid` says is there
+    /// (machine mm): a guarded move must meet nothing, a touch stops where
+    /// the tip, `r.radius` round, first meets material (its bottom going
+    /// down, its equator going sideways), to 1e-5 mm. Returns where the
+    /// routine leaves the tip.
+    fn walk_routine(r: &mut Routine, solid: &dyn Fn([f64; 3]) -> bool) -> Vec6 {
+        let first = |from: Vec6, to: Vec6, lead: &dyn Fn(Vec6) -> [f64; 3]| {
+            let at = |t: f64| -> Vec6 { std::array::from_fn(|a| from[a] + (to[a] - from[a]) * t) };
+            let steps = 4000;
+            let k = (1..=steps).find(|&k| solid(lead(at(k as f64 / steps as f64))))?;
+            let (mut lo, mut hi) = ((k - 1) as f64 / steps as f64, k as f64 / steps as f64);
+            while (hi - lo) * 400. > 1e-5 {
+                let mid = (lo + hi) / 2.;
+                if solid(lead(at(mid))) {
+                    hi = mid
+                } else {
+                    lo = mid
+                }
+            }
+            Some(at(hi))
+        };
+        let rad = r.radius;
+        let lead = move |from: Vec6, to: Vec6| {
+            let k = (0..3)
+                .find(|&k| (to[k] - from[k]).abs() > 1e-12)
+                .unwrap_or(2);
+            let dir = (to[k] - from[k]).signum();
+            move |p: Vec6| {
+                let mut q = [p[0], p[1], p[2]];
+                if k < 2 {
+                    (q[k], q[2]) = (q[k] + dir * rad, q[2] + rad);
+                }
+                q
+            }
+        };
+        let mut at = r.start;
+        while let Some(legs) = r.plan() {
+            for leg in legs {
+                match leg {
+                    Leg::Rapid(to) => {
+                        assert!(
+                            first(at, to, &lead(at, to)).is_none(),
+                            "a rapid from {at:?} to {to:?} hits"
+                        );
+                        at = to;
+                    }
+                    Leg::Guard(to) => {
+                        let hit = first(at, to, &lead(at, to));
+                        assert!(
+                            hit.is_none(),
+                            "the guarded move to {to:?} touched at {hit:?}"
+                        );
+                        at = to;
+                    }
+                    Leg::Touch(to) => {
+                        at = first(at, to, &lead(at, to))
+                            .unwrap_or_else(|| panic!("no contact up to {to:?}"));
+                        r.touches.push(at);
+                    }
+                }
+            }
+        }
+        for to in r.last() {
+            assert!(
+                first(at, to, &lead(at, to)).is_none(),
+                "backing off to {to:?} hits"
+            );
+            at = to;
+        }
+        at
+    }
+
+    #[test]
+    fn each_feature_is_found_from_where_the_tip_is() {
+        use crate::post::At::{Max, Min};
+        let probe = Probe {
+            plate: None,
+            tip: Some(4.),
+            feed: 100.,
+            distance: 30.,
+            retract: 5.,
+        };
+        // A block at machine X 100…224, Y 50…134, Z -70…-30.
+        let (lo, hi) = ([100., 50., -70.], [224., 134., -30.]);
+        let block = |p: [f64; 3]| (0..3).all(|a| p[a] >= lo[a] && p[a] <= hi[a]);
+        let found = |f: Feature, start: [f64; 3], solid: &dyn Fn([f64; 3]) -> bool| {
+            let mut r = Routine::new(f, &probe, [start[0], start[1], start[2], 0., 0., 0.]);
+            let end = walk_routine(&mut r, solid);
+            (r.zero(), end, r.found())
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        let (w, end, _) = found(Feature::Top, [150., 90., -20.], &block);
+        assert!(near(w[2], -30.) && near(end[2], -20.), "{w:?} {end:?}");
+        for (f, start, k, at) in [
+            (Feature::Edge(0, true), [90., 90., -35.], 0, 100.),
+            (Feature::Edge(0, false), [234., 90., -35.], 0, 224.),
+            (Feature::Edge(1, true), [150., 40., -35.], 1, 50.),
+            (Feature::Edge(1, false), [150., 144., -35.], 1, 134.),
+        ] {
+            let (w, end, s) = found(f, start, &block);
+            assert!(near(w[k], at), "{f:?}: {w:?}");
+            assert!(
+                (0..3).all(|a| near(end[a], start[a])),
+                "{f:?} ends at {end:?}"
+            );
+            assert!(s.contains(&format!("{}0 set on the", ["X", "Y"][k])), "{s}");
+        }
+        for (c, start, at) in [
+            ([Min, Min], [95., 45., -35.], [100., 50.]),
+            ([Max, Min], [229., 45., -35.], [224., 50.]),
+            ([Min, Max], [95., 139., -35.], [100., 134.]),
+            ([Max, Max], [229., 139., -35.], [224., 134.]),
+        ] {
+            let (w, end, s) = found(Feature::Corner(c), start, &block);
+            assert!(near(w[0], at[0]) && near(w[1], at[1]), "{c:?}: {w:?}");
+            assert!(
+                (0..3).all(|a| near(end[a], start[a])),
+                "{c:?} ends at {end:?}"
+            );
+            assert!(s.contains(&crate::post::corner_name(c)), "{s}");
+        }
+        // A 30 mm bore at X160 Y92, the tip started 5 mm left of its centre
+        // and 3 mm behind it: it ends on the centre.
+        let bored =
+            |p: [f64; 3]| block(p) && ((p[0] - 160.).powi(2) + (p[1] - 92.).powi(2)).sqrt() >= 15.;
+        let (w, end, s) = found(Feature::Bore, [155., 95., -40.], &bored);
+        assert!(near(w[0], 160.) && near(w[1], 92.), "{w:?}");
+        assert!(
+            near(end[0], 160.) && near(end[1], 92.) && near(end[2], -40.),
+            "{end:?}"
+        );
+        assert!(s.contains("30.000 mm across Y"), "{s}");
     }
 
     /// Runs a probing routine against the material `solid` says is there
