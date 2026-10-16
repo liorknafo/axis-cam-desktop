@@ -468,6 +468,8 @@ impl Viewport<'_> {
         // The pixels where a marked surface is nearest; empty without any.
         let cells = if marked.is_empty() { 0 } else { w * h };
         let mut plain = vec![false; cells as usize];
+        // The nearest-surface buffers of the boxes, shared by all of them.
+        let mut solid = SolidBuffers::default();
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
         for (fi, face) in if self.simulation.is_some() && self.show_stock {
@@ -572,7 +574,9 @@ impl Viewport<'_> {
                 let q = p.p(v);
                 (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
             });
-            raster_stock(&mut rgba, &depths, w, h, projected, ratio, p.scale);
+            raster_stock(
+                &mut rgba, &depths, w, h, projected, ratio, p.scale, &mut solid,
+            );
             // Only the planner's pictures mark surfaces (the app passes
             // none, so its view is unchanged): the model asked to see them,
             // so the translucent box must not dim them.
@@ -595,6 +599,7 @@ impl Viewport<'_> {
                     projected,
                     ratio,
                     p.scale,
+                    &mut solid,
                 );
             }
         }
@@ -1376,7 +1381,23 @@ const HOLDING: Look = Look {
     open: 0.5,
     behind: 0.3,
 };
+/// What `raster_solid` finds nearest at each pixel: the depth and the face's
+/// tone. One is kept for all the boxes of a frame and reset for each.
+#[derive(Default)]
+struct SolidBuffers {
+    near: Vec<f32>,
+    tones: Vec<u8>,
+}
+impl SolidBuffers {
+    fn reset(&mut self, cells: usize) {
+        self.near.clear();
+        self.near.resize(cells, f32::NEG_INFINITY);
+        self.tones.clear();
+        self.tones.resize(cells, 0);
+    }
+}
 /// The stock's box: `raster_solid` in the stock's colors.
+#[allow(clippy::too_many_arguments)]
 fn raster_stock(
     pixels: &mut [u8],
     part_depth: &[f32],
@@ -1385,11 +1406,22 @@ fn raster_stock(
     vertices: [(Point, f32); 8],
     ratio: f32,
     scale: f32,
+    buffers: &mut SolidBuffers,
 ) {
-    raster_solid(&STOCK, pixels, part_depth, (w, h), vertices, ratio, scale);
+    raster_solid(
+        &STOCK,
+        pixels,
+        part_depth,
+        (w, h),
+        vertices,
+        ratio,
+        scale,
+        buffers,
+    );
 }
 /// Composite only the nearest surface of a box; use both surfaces and part
 /// depth to distinguish visible edges from dashed hidden edges.
+#[allow(clippy::too_many_arguments)]
 fn raster_solid(
     look: &Look,
     pixels: &mut [u8],
@@ -1398,9 +1430,10 @@ fn raster_solid(
     vertices: [(Point, f32); 8],
     ratio: f32,
     scale: f32,
+    buffers: &mut SolidBuffers,
 ) {
-    let mut near = vec![f32::NEG_INFINITY; (w * h) as usize];
-    let mut tones = vec![0usize; (w * h) as usize];
+    buffers.reset((w * h) as usize);
+    let SolidBuffers { near, tones } = buffers;
     for (tone, face) in [
         [0, 1, 2, 3],
         [4, 5, 6, 7],
@@ -1445,7 +1478,7 @@ fn raster_solid(
                         && z > near[index]
                     {
                         near[index] = z;
-                        tones[index] = tone;
+                        tones[index] = tone as u8;
                     }
                 }
             }
@@ -2005,7 +2038,16 @@ mod tests {
         let index = (5 * 12 + 5) * 4;
         for (depth, expected_unchanged) in [(3., true), (1., false)] {
             let mut pixels = [128u8, 128, 128, 255].repeat(144);
-            raster_stock(&mut pixels, &vec![depth; 144], 12, 12, vertices, 1., 1.);
+            raster_stock(
+                &mut pixels,
+                &vec![depth; 144],
+                12,
+                12,
+                vertices,
+                1.,
+                1.,
+                &mut SolidBuffers::default(),
+            );
             assert_eq!(
                 &pixels[index..index + 4] == [128, 128, 128, 255],
                 expected_unchanged
@@ -2021,6 +2063,7 @@ mod tests {
             vertices,
             1.,
             1.,
+            &mut SolidBuffers::default(),
         );
         assert!(transparent[index + 3] > 0 && transparent[index + 3] < 128);
     }

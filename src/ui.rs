@@ -932,9 +932,11 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
         vec![]
     };
     // What the picture shows: the stock meshed, else its box, and the jaws.
+    // A meshed stock is named by the job it was worked out for, not by its
+    // address, which a later stock can take once this one is freed.
     let mut hasher = std::hash::DefaultHasher::new();
     match &cut {
-        Some((v, _)) => std::sync::Arc::as_ptr(v).hash(&mut hasher),
+        Some(_) => left.key.hash(&mut hasher),
         None => stock
             .min
             .iter()
