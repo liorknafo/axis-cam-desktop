@@ -142,7 +142,7 @@ Choose **Draft**, **Standard** or **Fine** beside the simulation timeline. These
 
 Meshing runs in a background worker. While it runs, the simulation strip says "Updating the stock surface, showing the last finished one" at normal size, with the seconds it has taken; the last completed stock surface is displayed meanwhile. The finest cell size and the triangle count are in the details line beside the Detail buttons (#83). Orbit/pan/zoom reuse that mesh. Rewinding discards surfaces from the future; changing detail, selecting a different operation or editing the job rejects stale worker results. Long jobs and Fine detail can take seconds to update; cutter motion is independent of that update. Untouched outer faces stay amber and cut faces are green. Hide Toolpath for an unobstructed view of the stock.
 
-![Adaptive stock with cutter-radius pocket walls](docs/adaptive-stock.png)
+![Adaptive stock at Fine detail with the cutter-radius pocket walls](docs/adaptive-stock.png)
 
 ## Start a project from nothing
 
@@ -247,7 +247,7 @@ Bottom offset plus axial allowance is measured from the selected floor and canno
 
 **Pocket starts from the stock left by preceding enabled operations and setups.** The continuous 3D stock retains cavities when the part is flipped. Each operation has its own timeline; Restart restores its inherited starting stock. The vertical-access check is not a tool/holder/fixture collision solver. This is an imported-part preview, not production NC output.
 
-![Pocket stock after clearing around an island](docs/pocket-finished.png)
+![Pocket stock after clearing around an island, with the faces still under stock in magenta](docs/pocket-finished.png)
 
 ![Pocket direction and partial simulation](docs/pocket-partial.png)
 
@@ -267,7 +267,7 @@ Each offset is independent, in mm; zero is flush with the part. For a 120 × 80 
 
 Stock is rendered as a lightly shaded transparent amber box. Solid visible edges and faint dashed hidden edges distinguish the stock from the blue-gray part. Each offset field includes a looping illustration of extra material on that side.
 
-![Relative stock with top and right offsets](docs/relative-stock.png)
+![Setup page with a relative size box as the stock](docs/relative-stock.png)
 
 Older saved projects whose relative mode contained only overall dimensions reopen as **Fixed size box**, preserving those dimensions. Select Relative size box to use the new per-side offsets. Later setups start from the material left by earlier enabled operations and setups, including after flips.
 
@@ -357,6 +357,8 @@ It is the one program for daily use: the driver's own egui app
 (`uc100-gui`, built only with the driver's `gui` feature) is a developer and
 bench tool. What only that app does: open and run a G-code file made
 elsewhere (LIO-111) and edit the profile as raw TOML.
+
+![MACHINE workspace: the Control page, Idle, with the simulated Jingyan CNC4030, the Run panel and the machine drawn](docs/machine-idle.png)
 
 A workspace whose Machine library is empty starts with the owner's machine,
 the **Jingyan CNC4030** (CNC4030-800W, JY5800) on the UC100, ready to
