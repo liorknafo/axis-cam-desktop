@@ -210,6 +210,15 @@ Other checks:
   - The NC program page renders with that setup refused and its **Run on the machine** button.
   - Run on the machine from the NC program page, with another setup active and the machine disconnected, opens the Control page (MANUFACTURE goes back to the NC program page) and does not connect.
   - Connect then picks that setup in the Run panel and makes it the active setup.
+
+## The NC page is worded for the controller (#79)
+
+- `the_nc_page_is_worded_for_the_machines_controller`, on the page's description (`ui::nc_page`) that `post` draws, so no screenshot:
+  - A UC100 job's page is titled "Run on the machine", its intro and note say the setups are checked for a run and take no G-code file, and a setup whose run checks pass has the Run button and no error text. The export check still refuses it as before (`result` is unchanged; `SetupPost::run` carries the run checks).
+  - A UC100 setup whose run checks fail (a spindle speed above the profile's) lists the problems and keeps the button.
+  - A LinuxCNC job's page keeps "NC program", "Check each setup, then export LinuxCNC G-code.", the export note and no Run button; a LinuxCNC setup that fails its export checks is still an error.
+  - The page builds in each state.
+- Not covered: the mixed-controller wording, and how the page looks in the window.
 - The step strip's "04 Review & run" label for a UC100 setup and the connected path (Run on the machine picks the setup at once, as clicking it in the Run panel does) are not covered by a test.
 - Not inspected in the real window: the window is shared with other work on this PC.
 - `cargo test` on Windows (`AXIS_SKIP_STEP=1`): 813 passed, 6 failed: the two STEP tests, as before, and four simulated-UC100 smoke tests that timed out under the load of parallel builds (`the_control_page_renders_in_every_state`, `a_jog_into_a_soft_limit_ends_at_the_limit`, `e_stop_stops_a_probe`, `keep_the_last_position_declares_where_the_machine_was_left`); each passes alone.

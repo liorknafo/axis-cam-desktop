@@ -511,8 +511,12 @@ change between them and the work zero on the stock before the first.
 
 From MANUFACTURE, the last step under the Work page's 3D view reads
 **04 Review & run** when the active setup's machine is a UC100 one (**04 NC
-review** otherwise). Its NC program page says "G-code export is LinuxCNC
-only" for each such setup and offers **Run on the machine**: it opens
+review** otherwise). When every setup is a UC100 one, the NC program page
+is titled **Run on the machine** and says the setups are checked for a run,
+not exported (#79). Each setup has a **Run on UC100** card with the run's
+checks, the prerequisites (connect, machine zero, work zero, a tool run
+inside the soft limits) and **Run on the machine**; that there is no G-code
+file is explained in plain text, not shown as an error. The button opens
 MACHINE with the setup's machine chosen and picks the setup in the Run
 panel, at once when that machine is connected, or when you press
 **Connect** (it never connects by itself).
@@ -600,7 +604,7 @@ wizard.
 
 ## LinuxCNC G-code export
 
-Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis; a UC100 setup is refused with **Run on the machine** beside it, see **Running a setup**), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps, one problem for each operation, jaw or clamp and part of the tool (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
+Open **NC program**. Checks run in the background for every setup: generation, controller (LinuxCNC, 3-axis; a UC100 setup takes no G-code file and gets the checks of a run on the machine instead, with **Run on the machine** on its own card, see **Running a setup**), work offset (G54–G59.3), tool numbers, spindle and feed limits, machine travel span, rapids into material and holder clearance, and for a setup that models a vise or clamps the clearance to their jaws and clamps, one problem for each operation, jaw or clamp and part of the tool (see **Workholding**). Each program is then read back by a strict G-code reader and compared move by move with the simulation. **Export LinuxCNC G-code…** writes `<job> - <n> <setup> (<offset>).ngc` for every setup (touch-off mode: `… - <i> of <k> T<t>.ngc` per tool run), or nothing if any setup fails.
 
 - Output: G21, G90, G17, G94, G0/G1/G4 only. Drilling pecks are expanded, with no canned cycles or arcs. Coordinates are relative to the setup's work zero (see **The work zero**).
 - Each operation begins with its comment, then its spindle (`S` with `M3` or `M4`) and coolant when they differ from the operation before, and the profile's start dwell after every spindle start. A tool change switches the coolant and the spindle off (`M9`, `M5`) and retracts first. A change of spindle rotation between two operations of the same tool switches them off too, so the spindle stops before it is started the other way; the coolant and the dwell follow the new `S` word.

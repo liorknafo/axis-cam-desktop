@@ -968,8 +968,12 @@ pub struct Program {
 pub struct SetupPost {
     pub setup: usize,
     pub name: String,
-    /// One program per setup, or one per tool run in touch-off mode.
+    /// One program per setup, or one per tool run in touch-off mode. A UC100
+    /// setup is refused here: it takes no G-code file.
     pub result: Result<Vec<Program>, Vec<String>>,
+    /// For a UC100 setup only: whether it passes the checks of a run on the
+    /// machine (`run::plan_problems`), or what they refuse.
+    pub run: Option<Result<(), Vec<String>>>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct JobPost {
@@ -1997,10 +2001,13 @@ pub(crate) fn post_simulated(
                     })
                     .collect::<Result<Vec<_>, _>>()
             });
+            let run = (get(&doc.setups[si].machine.p, "controller") == "UC100")
+                .then(|| crate::run::plan_problems(doc, mesh, si, sims));
             SetupPost {
                 setup: si,
                 name: doc.setups[si].name().to_string(),
                 result,
+                run,
             }
         })
         .collect();

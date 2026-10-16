@@ -5895,9 +5895,153 @@ fn ai(app: &App) -> Element<'_, Message> {
     .height(Fill)
     .into()
 }
+/// Which controllers the job's setups use, as far as the NC page words
+/// itself: LinuxCNC export, a run on a UC100 machine, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NcMachine {
+    LinuxCnc,
+    Uc100,
+    Mixed,
+}
+pub(crate) fn nc_machine(app: &App) -> NcMachine {
+    let uc100 = |s: &crate::model::Setup| get(&s.machine.p, "controller") == "UC100";
+    let count = app.doc.setups.iter().filter(|s| uc100(s)).count();
+    match count {
+        0 => NcMachine::LinuxCnc,
+        n if n == app.doc.setups.len() => NcMachine::Uc100,
+        _ => NcMachine::Mixed,
+    }
+}
+/// The NC page's note on what a UC100 run checks, for setups that model their
+/// vise or clamps as `held` says.
+pub(crate) fn run_note(held: Held) -> &'static str {
+    match held {
+        Held::No => {
+            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: air-cut first."
+        }
+        Held::Every => {
+            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move, the links between operations, approaches and retracts included, is checked against each setup's vise jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked: air-cut first."
+        }
+        Held::Mixed => {
+            "A UC100 machine takes no G-code file: each setup is checked as a run checks it before Cycle Start — limits, travel, rapids into material, holder clearance, the profile's spindle and coolant outputs — and runs from MACHINE. The checks that need the connected machine, its work zero and position, are made there. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Every program move of a setup that models a vise or clamps, the links between operations, approaches and retracts included, is checked against its jaws or clamps as boxes with a clearance gap; parallels, bolts, the table, the machine body and tool-change motion are not checked, and neither are fixtures and clamps in the setups whose workholding is not modelled or cannot be checked: air-cut first."
+        }
+    }
+}
+/// What a UC100 setup's card lists as needed before Cycle Start, beside the
+/// checks it has passed.
+pub(crate) const RUN_PREREQUISITES: &str = "To run: connect the machine, set machine zero and the work zero, and have the tool run inside the soft limits at that zero; Cycle Start stays grey with the reasons listed until it can start.";
+/// Why a UC100 setup has no export file, as plain explanation.
+pub(crate) const NO_EXPORT_FILE: &str =
+    "A UC100 machine takes no G-code file: this setup runs from MACHINE.";
+/// One setup's card on the NC page.
+pub(crate) enum NcCard<'a> {
+    /// A LinuxCNC setup whose programs were produced.
+    Programs(&'a [crate::post::Program]),
+    /// A LinuxCNC setup that failed its export checks.
+    Refused(&'a [String]),
+    /// A UC100 setup: the run checks' problems (none when it passes) and the
+    /// setup Run on the machine opens.
+    Run {
+        problems: &'a [String],
+        setup: usize,
+    },
+}
+/// The NC program page, before it is drawn: its words and its setups' cards.
+pub(crate) struct NcPage<'a> {
+    pub title: &'static str,
+    pub intro: &'static str,
+    pub heading: &'static str,
+    pub note: &'static str,
+    pub errors: &'a [String],
+    /// Each setup's name with its card; empty before the checks are in.
+    pub cards: Vec<(&'a str, NcCard<'a>)>,
+    pub machine: NcMachine,
+    pub ready: bool,
+}
+#[cfg(test)]
+impl NcPage<'_> {
+    /// Every problem the page shows as an error.
+    pub(crate) fn problems(&self) -> Vec<&str> {
+        let cards = self.cards.iter().flat_map(|(_, card)| match card {
+            NcCard::Refused(p) | NcCard::Run { problems: p, .. } => p.iter(),
+            NcCard::Programs(_) => [].iter(),
+        });
+        self.errors
+            .iter()
+            .chain(cards)
+            .map(String::as_str)
+            .collect()
+    }
+    /// The setups whose card offers Run on the machine.
+    pub(crate) fn run_buttons(&self) -> Vec<usize> {
+        (self.cards.iter())
+            .filter_map(|(_, card)| match card {
+                NcCard::Run { setup, .. } => Some(*setup),
+                _ => None,
+            })
+            .collect()
+    }
+}
+pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
+    let machine = nc_machine(app);
+    let (title, intro, heading, note) = match machine {
+        NcMachine::LinuxCnc => (
+            "NC program",
+            "Check each setup, then export LinuxCNC G-code.",
+            "Program review",
+            program_note(held(app)),
+        ),
+        NcMachine::Uc100 => (
+            "Run on the machine",
+            "Check each setup for a run on the UC100, then run it from MACHINE. A UC100 machine takes no G-code file.",
+            "Run review",
+            run_note(held(app)),
+        ),
+        NcMachine::Mixed => (
+            "NC program",
+            "Check each setup: a LinuxCNC setup exports G-code, a UC100 setup runs on the machine.",
+            "Program review",
+            program_note(held(app)),
+        ),
+    };
+    let mut page = NcPage {
+        title,
+        intro,
+        heading,
+        note,
+        errors: &[],
+        cards: vec![],
+        machine,
+        ready: false,
+    };
+    if let Some(job) = &app.post {
+        page.errors = &job.errors;
+        page.ready = job.ready();
+        for s in &job.setups {
+            let uc100 = (app.doc.setups.get(s.setup))
+                .is_some_and(|x| get(&x.machine.p, "controller") == "UC100");
+            let card = if uc100 {
+                NcCard::Run {
+                    problems: match &s.run {
+                        Some(Err(problems)) => problems,
+                        _ => &[],
+                    },
+                    setup: s.setup,
+                }
+            } else {
+                match &s.result {
+                    Ok(programs) => NcCard::Programs(programs),
+                    Err(problems) => NcCard::Refused(problems),
+                }
+            };
+            page.cards.push((s.name.as_str(), card));
+        }
+    }
+    page
+}
 fn post(app: &App) -> Element<'_, Message> {
-    let mut summary =
-        column![bold("Program review", 20), note(program_note(held(app))),].spacing(14);
+    let page = nc_page(app);
+    let mut summary = column![bold(page.heading, 20), note(page.note),].spacing(14);
     let lines = speed_feed_lines(app);
     if !lines.is_empty() {
         summary = summary.push(caution(
@@ -5914,14 +6058,14 @@ fn post(app: &App) -> Element<'_, Message> {
                 "Checks run when this page opens."
             }))
         }
-        Some(job) => {
-            if !job.errors.is_empty() {
-                summary = summary.push(warnings(job.errors.clone()));
+        Some(_) => {
+            if !page.errors.is_empty() {
+                summary = summary.push(warnings(page.errors.to_vec()));
             }
-            for s in &job.setups {
-                match &s.result {
-                    Ok(programs) => {
-                        for program in programs {
+            for (name, card) in &page.cards {
+                match card {
+                    NcCard::Programs(programs) => {
+                        for program in programs.iter() {
                             summary = summary.push(
                                 column![
                                     bold(format!("✓  {}", program.file_name), 13),
@@ -5942,27 +6086,39 @@ fn post(app: &App) -> Element<'_, Message> {
                             );
                         }
                     }
-                    Err(problems) => {
+                    NcCard::Refused(problems) => {
                         summary = summary
-                            .push(bold(format!("!  {}", s.name), 13))
-                            .push(warnings(problems.clone()));
-                        if (app.doc.setups.get(s.setup))
-                            .is_some_and(|x| get(&x.machine.p, "controller") == "UC100")
-                        {
-                            summary = summary.push(
-                                primary("Run on the machine", Message::RunOnMachine(s.setup))
+                            .push(bold(format!("!  {name}"), 13))
+                            .push(warnings(problems.to_vec()));
+                    }
+                    NcCard::Run { problems, setup } => {
+                        let mark = if problems.is_empty() { "✓" } else { "!" };
+                        summary = summary.push(bold(format!("{mark}  Run on UC100: {name}"), 13));
+                        if !problems.is_empty() {
+                            summary = summary.push(warnings(problems.to_vec()));
+                        }
+                        summary = summary
+                            .push(muted(RUN_PREREQUISITES))
+                            .push(muted(NO_EXPORT_FILE))
+                            .push(
+                                primary("Run on the machine", Message::RunOnMachine(*setup))
                                     .width(Fill),
                             );
-                        }
                     }
                 }
             }
         }
     }
-    summary = if app.post.as_ref().is_some_and(|job| job.ready()) {
+    summary = if page.ready {
         summary.push(primary("Export LinuxCNC G-code…", Message::ExportGcode).width(Fill))
     } else {
-        summary.push(muted("Export becomes available when every setup passes."))
+        summary.push(muted(match page.machine {
+            NcMachine::LinuxCnc => "Export becomes available when every setup passes.",
+            NcMachine::Uc100 => "A UC100 machine takes no G-code file: run each setup on the machine.",
+            NcMachine::Mixed => {
+                "Export becomes available when every setup passes; a UC100 setup takes no G-code file and runs on the machine."
+            }
+        }))
     };
     summary = summary
         .push(btn("Export setup sheet (.md)", Message::Export("sheet"), false).width(Fill))
@@ -5981,10 +6137,7 @@ fn post(app: &App) -> Element<'_, Message> {
         });
     container(
         column![
-            page_header(
-                "NC program",
-                "Check each setup, then export LinuxCNC G-code."
-            ),
+            page_header(page.title, page.intro),
             row![
                 container(scrollable(summary))
                     .padding(22)
