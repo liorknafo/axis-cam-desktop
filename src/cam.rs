@@ -102,6 +102,63 @@ pub(crate) fn plane_height(p: &[[f32; 3]; 3], xy: [f32; 2]) -> Option<f32> {
     (u >= -0.00001 && w >= -0.00001 && u + w <= 1.00001)
         .then_some(p[0][2] + u * (p[1][2] - p[0][2]) + w * (p[2][2] - p[0][2]))
 }
+/// The centre of the circle through the loop's vertices: least squares on
+/// x² + y² + Dx + Ey + F = 0, exact for vertices on a circle whatever their
+/// spacing or phase (their box's centre and their mean are not); none for a
+/// loop that fits no circle.
+fn circle_centre(path: &Polygon) -> Option<(f64, f64)> {
+    // About the box's centre, so that the sums stay small.
+    let (low, high) = path.iter().fold(
+        (
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ),
+        |((x0, y0), (x1, y1)), p| ((x0.min(p.0), y0.min(p.1)), (x1.max(p.0), y1.max(p.1))),
+    );
+    let mid = ((low.0 + high.0) / 2., (low.1 + high.1) / 2.);
+    // The normal equations, with their right-hand side as a fourth column.
+    let mut m = [[0f64; 4]; 3];
+    for p in path {
+        let (x, y) = (p.0 - mid.0, p.1 - mid.1);
+        let row = [x, y, 1., -(x * x + y * y)];
+        for (sums, w) in m.iter_mut().zip([x, y, 1.]) {
+            for (sum, v) in sums.iter_mut().zip(row) {
+                *sum += w * v;
+            }
+        }
+    }
+    let det = |c: [[f64; 3]; 3]| {
+        c[0][0] * (c[1][1] * c[2][2] - c[1][2] * c[2][1])
+            - c[0][1] * (c[1][0] * c[2][2] - c[1][2] * c[2][0])
+            + c[0][2] * (c[1][0] * c[2][1] - c[1][1] * c[2][0])
+    };
+    let a = m.map(|r| [r[0], r[1], r[2]]);
+    let d = det(a);
+    if d.abs() <= 1e-9 * (a[0][0] * a[1][1] * a[2][2]).abs() {
+        return None;
+    }
+    let solve = |k: usize| {
+        let mut c = a;
+        for (row, sums) in c.iter_mut().zip(m) {
+            row[k] = sums[3];
+        }
+        det(c) / d
+    };
+    Some((mid.0 - solve(0) / 2., mid.1 - solve(1) / 2.))
+}
+/// The gradient of the triangle's plane, rise per horizontal distance up its
+/// steepest line; none for a vertical triangle.
+fn plane_slope(p: &[[f32; 3]; 3]) -> Option<f32> {
+    let a = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+    let b = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+    let det = a[0] * b[1] - a[1] * b[0];
+    if det.abs() < 1e-8 {
+        return None;
+    }
+    let gx = (a[2] * b[1] - b[2] * a[1]) / det;
+    let gy = (a[0] * b[2] - b[0] * a[2]) / det;
+    Some((gx * gx + gy * gy).sqrt())
+}
 struct Builder {
     plan: Plan,
     pos: [f32; 3],
@@ -370,8 +427,15 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
 #[derive(Debug, Clone)]
 pub struct Hole {
     pub center: [f32; 2],
+    /// Narrowest diameter down to the bottom: the largest drill that fits. A
+    /// bore whose corridor is a ring of its own chords is read at their ends,
+    /// its nominal size, not at the chords' midpoints a sagitta inside it.
     pub diameter: f32,
     pub opening: f32,
+    /// How far the opening's chords lie inside its circle, R(1 − cos(π/n))
+    /// for its n vertices at radius R. A drill fits up to `diameter` plus
+    /// twice this.
+    pub sagitta: f32,
     pub top: f32,
     pub bottom: f32,
     /// The bottom is the model's bottom: nothing of the part is under it.
@@ -401,21 +465,25 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
             path.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max),
             path.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
         ];
-        let center = [
-            ((low[0] + high[0]) / 2.) as f32,
-            ((low[1] + high[1]) / 2.) as f32,
-        ];
-        let radius = ((high[0] - low[0] + high[1] - low[1]) / 4.) as f32;
+        // The circle through the loop's vertices: its box's centre is off by
+        // up to half a chord's sagitta, with the polygon's phase.
+        let center =
+            circle_centre(path).unwrap_or(((low[0] + high[0]) / 2., (low[1] + high[1]) / 2.));
+        let center = [center.0 as f32, center.1 as f32];
+        let distance = |p: &(f64, f64)| {
+            ((p.0 as f32 - center[0]).powi(2) + (p.1 as f32 - center[1]).powi(2)).sqrt()
+        };
+        // The vertex radius: a regular polygon's vertices are all on its circle.
+        let radius = path.iter().map(distance).sum::<f32>() / path.len() as f32;
         if radius <= 0.
-            || path.iter().any(|p| {
-                (((p.0 as f32 - center[0]).powi(2) + (p.1 as f32 - center[1]).powi(2)).sqrt()
-                    - radius)
-                    .abs()
-                    > 0.03f32.max(radius * 0.02)
-            })
+            || path
+                .iter()
+                .any(|p| (distance(p) - radius).abs() > 0.03f32.max(radius * 0.02))
         {
             continue;
         }
+        // Its chords' midpoints lie this far inside the circle.
+        let sagitta = radius * (1. - (std::f32::consts::PI / path.len() as f32).cos());
         let bottom = g.height(center).unwrap_or(g.bounds.min[2]);
         if bottom >= top - 0.01 {
             continue;
@@ -431,12 +499,37 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
         let point = if through {
             0.
         } else {
-            31f32.to_radians().tan()
+            // A floor sharper than a 118° point (a 90° one rises 1 per mm)
+            // would cross that cone a fraction of a millimetre from the
+            // centre, so the clip takes the floor's own cone where that is
+            // steeper: the gradient of the floor triangles that hold the
+            // centre, taken only where one has a vertex there, the cone's
+            // apex, so that a tilted floor keeps the 118° clip. A fan
+            // triangle's plane is the cone's slope over cos(π/n), exactly
+            // the slope that puts the whole fan and the rings beyond it
+            // under the clip.
+            let near = 0.05f32.max(radius * 0.01);
+            let cone = g
+                .triangles
+                .iter()
+                .filter(|t| {
+                    plane_height(&t.p, center).is_some_and(|z| (z - bottom).abs() < 0.01)
+                        && t.p.iter().any(|p| {
+                            ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt() <= near
+                        })
+                })
+                .filter_map(|t| plane_slope(&t.p))
+                .fold(0., f32::max);
+            31f32.to_radians().tan().max(cone)
         };
         let above = |p: &[f32; 3]| {
             p[2] - point * ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt()
         };
         let mut corridor = radius;
+        // The nearest vertex of the triangle that sets the corridor: on a
+        // bore's wall an end of the chord whose midpoint set it, a sagitta
+        // past it; on a ledge or a boss much farther than its nearest point.
+        let mut ring = None;
         for triangle in &g.triangles {
             // Each edge is split at its point nearest the centre, where the
             // cone is lowest under it, so that a ledge whose edge passes the
@@ -487,6 +580,7 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
                 corridor = 0.;
                 break;
             }
+            let mut nearest = f32::INFINITY;
             for (a, b) in polygon
                 .iter()
                 .zip(polygon.iter().cycle().skip(1))
@@ -500,20 +594,39 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
                     (((center[0] - a.0 as f32) * v[0] + (center[1] - a.1 as f32) * v[1]) / l2)
                         .clamp(0., 1.)
                 };
-                corridor = corridor.min(
+                nearest = nearest.min(
                     ((center[0] - a.0 as f32 - t * v[0]).powi(2)
                         + (center[1] - a.1 as f32 - t * v[1]).powi(2))
                     .sqrt(),
+                );
+            }
+            if nearest < corridor {
+                corridor = nearest;
+                ring = Some(
+                    triangle
+                        .p
+                        .iter()
+                        .map(|p| ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt())
+                        .fold(f32::INFINITY, f32::min),
                 );
             }
         }
         if corridor < 0.1 {
             continue;
         }
+        // A corridor set by a chord whose ends lie a sagitta past it (of the
+        // opening's tessellation or a finer one) is the chord's ring, a circle
+        // through those ends: the bore is read there, its nominal size, where
+        // the chord's midpoint is the inscribed polygon's.
+        let diameter = match ring {
+            Some(v) if v >= corridor && v - corridor <= sagitta * 1.1 + 0.001 => v * 2.,
+            _ => corridor * 2.,
+        };
         holes.push(Hole {
             center,
-            diameter: corridor * 2.,
+            diameter,
             opening: radius * 2.,
+            sagitta,
             top,
             bottom,
             through,
@@ -622,7 +735,10 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             0
         };
         let h = holes.remove(index);
-        if b.plan.radius * 2. > h.diameter + 0.01 {
+        // The drill may be as wide as the bore at its tessellation's vertices,
+        // which its chords lie a sagitta inside, and 0.01 over that: the part
+        // report rounds the bore to 0.01 and the planner's drill is that size.
+        if b.plan.radius * 2. > h.diameter + 2. * h.sagitta + 0.01 {
             return Err(format!(
                 "The Ø{:.2} drill exceeds an opening Ø{:.2}. Choose a smaller drill or a diameter filter.",
                 b.plan.radius * 2.,
@@ -1536,6 +1652,27 @@ pub(crate) mod tests {
                 8.,
                 8. + point(4.),
             ),
+            // Sharper points than the 118° the clip assumes: a 90° point's
+            // floor rises at 1.0 per mm, a 100° one's at 0.84.
+            (
+                "a 90° drill-point floor",
+                blind(&[(12., 10.), (4., 10.), (4., 2.), (0., 2. - 4.)]),
+                8.,
+                8.,
+                12.,
+            ),
+            (
+                "a 100° drill-point floor",
+                blind(&[
+                    (12., 10.),
+                    (4., 10.),
+                    (4., 2.),
+                    (0., 2. - 4. * 40f32.to_radians().tan()),
+                ]),
+                8.,
+                8.,
+                8. + 4. * 40f32.to_radians().tan(),
+            ),
             ("a 0.5 mm bottom fillet", blind(&fillet), 8., 8., 8.),
             (
                 "a Ø5 bore 3 mm deep under the Ø8 bore",
@@ -1595,6 +1732,91 @@ pub(crate) mod tests {
                 "{name}"
             );
         }
+    }
+    /// The model's lowest horizontal face: the top once the setup is turned over.
+    fn select_bottom(op: &mut Operation, mesh: &Mesh) {
+        let bottom = mesh
+            .surfaces
+            .iter()
+            .filter(|s| s.normal[2] < -0.999999)
+            .map(|s| s.center[2])
+            .fold(f32::INFINITY, f32::min);
+        let ids = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2] < -0.999999 && (s.center[2] - bottom).abs() < 0.001)
+            .map(|(id, _)| id)
+            .collect();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids,
+        });
+    }
+    #[test]
+    fn a_step_bores_nominal_drill_is_accepted_and_the_bore_reads_its_nominal_size() {
+        // The STEP helper tessellates the example's circles in 42 segments, so
+        // the chords of a Ø6.6 bore are Ø6.582 across: the bore is read at its
+        // vertices, and the drill of its nominal size goes.
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/four-setup-block.step"),
+        )
+        .unwrap();
+        let r2 = |v: f32| (v * 100.).round() / 100.;
+        // Turned over, the bottom plane is up and its four Ø6.6 bores open straight.
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        let setup = crate::analysis::oriented(&setup, "-Z").unwrap();
+        select_bottom(&mut op, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        eprintln!("step, bottom plane: {found:#?}");
+        let bores: Vec<_> = found
+            .iter()
+            .filter(|h| (h.opening - 6.6).abs() < 0.05)
+            .collect();
+        assert_eq!(bores.len(), 4, "{found:?}");
+        for h in &bores {
+            assert!(h.through, "{h:?}");
+            assert_eq!(r2(h.diameter), 6.6, "{h:?}");
+            assert_eq!(r2(h.opening), 6.6, "{h:?}");
+            assert!((h.top - h.bottom - 40.).abs() < 0.01, "{h:?}");
+        }
+        tool.p.insert("diameter".into(), "6.6".into());
+        op.p.insert("hole_diameter".into(), "6.6".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 4);
+        assert_plan(plan);
+        // A drill 0.5 mm over the bore is still refused.
+        tool.p.insert("diameter".into(), "7.1".into());
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap_err()
+                .contains("exceeds an opening")
+        );
+        // From the top the same bores lie under Ø11 counterbores: the corridor
+        // is their chords, read at their vertices just the same.
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        eprintln!("step, top plane: {found:#?}");
+        let counterbored: Vec<_> = found
+            .iter()
+            .filter(|h| (h.opening - 11.).abs() < 0.05)
+            .collect();
+        assert_eq!(counterbored.len(), 4, "{found:?}");
+        for h in &counterbored {
+            assert!(h.through, "{h:?}");
+            assert_eq!(r2(h.diameter), 6.6, "{h:?}");
+            assert_eq!(r2(h.opening), 11., "{h:?}");
+        }
+        tool.p.insert("diameter".into(), "6.6".into());
+        op.p.insert("hole_diameter".into(), "6.6".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 4);
+        assert_plan(plan);
     }
     #[test]
     fn new_milling_parameters_change_motion_and_setup_placement_is_respected() {

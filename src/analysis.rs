@@ -192,7 +192,8 @@ pub struct PlaneReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HoleReport {
     pub center: [f32; 2],
-    /// Narrowest diameter down to the bottom: the largest drill that fits.
+    /// Narrowest diameter down to the bottom, a bore read at its
+    /// tessellation's vertices (its nominal size): the largest drill that fits.
     pub diameter: f32,
     pub opening_diameter: f32,
     pub depth: f32,
@@ -1536,6 +1537,68 @@ pub(crate) mod tests {
         assert!(top.freeform_area > 100.);
         assert!(!top.truncated);
         assert!(!serde_json::to_string(&report).unwrap().contains("-0.0"));
+    }
+    #[test]
+    fn the_step_example_reports_its_bores_at_their_nominal_size() {
+        // The STEP helper's 42-segment circles are Ø6.582 across their chords
+        // for a Ø6.6 bore: the report gives the size at the vertices, which is
+        // the drill the planner is told to use.
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let (doc, _) = block();
+        let mesh = crate::mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/four-setup-block.step"),
+        )
+        .unwrap();
+        let report = report(&doc, &mesh).unwrap();
+        let by_up = |up: &str| report.orientations.iter().find(|o| o.up == up).unwrap();
+        let top = plane(by_up("+Z"), 0.);
+        eprintln!("step, top: {:#?}", top.holes);
+        let through: Vec<_> = top.holes.iter().filter(|h| h.through).collect();
+        assert_eq!(through.len(), 4);
+        assert!(
+            through
+                .iter()
+                .all(|h| h.diameter == 6.6 && h.opening_diameter == 11. && h.depth == 40.),
+            "{through:?}"
+        );
+        let blind = top.holes.iter().find(|h| !h.through).unwrap();
+        assert_eq!(
+            (blind.diameter, blind.opening_diameter),
+            (6., 6.),
+            "{blind:?}"
+        );
+        let bottom = plane(by_up("-Z"), 0.);
+        eprintln!("step, bottom: {:#?}", bottom.holes);
+        let bores: Vec<_> = bottom
+            .holes
+            .iter()
+            .filter(|h| h.opening_diameter == 6.6)
+            .collect();
+        assert_eq!(bores.len(), 4, "{:?}", bottom.holes);
+        assert!(
+            bores.iter().all(|h| h.diameter == 6.6 && h.through),
+            "{bores:?}"
+        );
+        // Every bore of the example reads a round nominal size.
+        for o in &report.orientations {
+            for h in o.planes.iter().flat_map(|p| &p.holes) {
+                assert_eq!(
+                    h.diameter,
+                    (h.diameter * 10.).round() / 10.,
+                    "{} {h:?}",
+                    o.up
+                );
+                assert_eq!(
+                    h.opening_diameter,
+                    (h.opening_diameter * 10.).round() / 10.,
+                    "{} {h:?}",
+                    o.up
+                );
+            }
+        }
     }
     #[test]
     fn each_orientation_lists_only_what_is_visible_from_above() {
