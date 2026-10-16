@@ -496,6 +496,29 @@ pub async fn exchange(
             error_name(&body)
         ));
     }
+    // The token endpoint has answered, so a grant exists at OpenAI that the
+    // app can neither list nor revoke later. Whatever fails from here on, the
+    // refresh token it issued is revoked before the error is returned.
+    let issued = body["refresh_token"].as_str().map(str::to_string);
+    match identify(http, e, client_id, attempt, body).await {
+        Ok(session) => Ok(session),
+        Err(error) => {
+            if let Some(refresh_token) = issued {
+                let _ = revoke(http, e, client_id, &refresh_token).await;
+            }
+            Err(error)
+        }
+    }
+}
+/// The part of `exchange` after the token endpoint answered 200: reads the
+/// tokens and validates the ID token.
+async fn identify(
+    http: &reqwest::Client,
+    e: &Endpoints,
+    client_id: &str,
+    attempt: &Attempt,
+    body: Value,
+) -> Result<Session, String> {
     let tokens: TokenResponse = serde_json::from_value(body)
         .map_err(|_| "OpenAI returned an unreadable sign-in response.".to_string())?;
     let id_token = tokens
@@ -685,7 +708,8 @@ pub async fn approve(
 }
 /// The second step, which must not be cancelled half way: exchanges the code
 /// and validates the ID token. Once the token endpoint has answered, the
-/// refresh token it issued is the caller's to save or revoke. Returns the
+/// refresh token it issued is revoked if the exchange then fails; if it
+/// succeeds, the refresh token is the caller's to save or revoke. Returns the
 /// session and the client ID to remember.
 pub async fn complete(
     http: &reqwest::Client,
@@ -1158,6 +1182,90 @@ mod tests {
         )
         .await;
         assert!(forged.unwrap_err().contains("not valid"));
+    }
+    #[tokio::test]
+    async fn an_exchange_that_fails_after_the_token_endpoint_answered_revokes_the_refresh_token() {
+        let attempt = Attempt {
+            state: "s".into(),
+            nonce: "n".into(),
+            verifier: "v".into(),
+            redirect_uri: "http://127.0.0.1:1/auth/callback".into(),
+        };
+        // Keys that cannot be fetched, an expired ID token (a wrong clock) and
+        // a response without an ID token: each leaves a grant at OpenAI.
+        for name in ["keys 500", "expired", "no id token"] {
+            let fake = Fake::start(move |r: &Req| match (r.path.as_str(), name) {
+                ("/jwks", "keys 500") => Resp::error(500, "server_error"),
+                ("/jwks", _) => Resp::json(200, jwks()),
+                ("/revoke", _) => Resp::json(200, json!({})),
+                ("/token", "no id token") => Resp::json(
+                    200,
+                    json!({"access_token": "access-1", "refresh_token": "refresh-1"}),
+                ),
+                ("/token", _) => {
+                    let mut c = claims("oaiapp_1", "n");
+                    if name == "expired" {
+                        c["exp"] = json!(crate::session::now() - 3600);
+                    }
+                    Resp::json(200, tokens("access-1", "refresh-1", &id_token(c), SCOPE))
+                }
+                _ => Resp::json(404, json!({})),
+            })
+            .await;
+            let error = exchange(
+                &reqwest::Client::new(),
+                &Endpoints::local(&fake.base),
+                "oaiapp_1",
+                "c",
+                &attempt,
+            )
+            .await
+            .unwrap_err();
+            // The error shown is the validation error, not the revoke's.
+            let expected = match name {
+                "keys 500" => "OpenAI's signing keys could not be read.",
+                "no id token" => "OpenAI returned no ID token.",
+                _ => "The ID token is not valid",
+            };
+            assert!(error.contains(expected), "{name}: {error}");
+            let revoked = fake.seen("/revoke");
+            assert_eq!(revoked.len(), 1, "{name}");
+            assert_eq!(revoked[0].field("token"), "refresh-1", "{name}");
+            assert_eq!(revoked[0].field("client_id"), "oaiapp_1", "{name}");
+        }
+        // A revoke that fails does not change the error, and a rejected code
+        // (no grant) revokes nothing.
+        let fake = Fake::start(|r: &Req| match r.path.as_str() {
+            "/jwks" => Resp::error(500, "server_error"),
+            "/revoke" => Resp::hangup(),
+            "/token" => Resp::json(
+                200,
+                tokens("a", "refresh-1", &id_token(claims("oaiapp_1", "n")), SCOPE),
+            ),
+            _ => Resp::json(404, json!({})),
+        })
+        .await;
+        let error = exchange(
+            &reqwest::Client::new(),
+            &Endpoints::local(&fake.base),
+            "oaiapp_1",
+            "c",
+            &attempt,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "OpenAI's signing keys could not be read.");
+        let fake = Fake::start(|_| Resp::error(400, "invalid_grant")).await;
+        let rejected = exchange(
+            &reqwest::Client::new(),
+            &Endpoints::local(&fake.base),
+            "oaiapp_1",
+            "c",
+            &attempt,
+        )
+        .await;
+        assert!(rejected.is_err());
+        assert!(fake.seen("/revoke").is_empty());
     }
     #[tokio::test]
     async fn an_invalid_returned_client_id_fails_before_any_token_request() {
