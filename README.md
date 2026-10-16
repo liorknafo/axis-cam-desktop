@@ -417,7 +417,11 @@ Once the machine is Idle, the Control page has everything needed before a job:
   position, an amber box says the soft limits are **OFF**: nothing stops an
   axis at the end of its travel. The same amber box shows for good when the
   profile sets no soft limits at all, and then says to add `soft_min` and
-  `soft_max` to the profile. Every E-stop clears the machine position, so
+  `soft_max` to the profile. A profile with soft limits on only some of X, Y
+  and Z does not count as limited either (#164): the box names the axes
+  without them ("Z has no soft limits in this profile…") and says to add
+  them, with the axes still waiting for a machine position under that; the
+  green "Soft limits on" line needs all three. Every E-stop clears the machine position, so
   set it again after one. **Home** appears when every axis has a home switch;
   an axis with a switch gets its position only by homing.
 - **Jog.** Hold **X−/X+/Y−/Y+/Z+/Z−**, or on this page the arrow keys (X, Y;
@@ -544,7 +548,12 @@ panel, at once when that machine is connected, or when you press
    per run of the same tool, as with touch-off G-code programs. The checks follow the
    project: after an edit, such as another workholding, the Control page
    checks the setup again on its own once the edits pause, keeping its
-   progress, as **Check again** does (LIO-150). The run keeps to the setup
+   progress, as **Check again** does (LIO-150). While the machine moves (a
+   jog, a probe, homing, a tool run) no check starts: picking a setup or
+   **Check again** then only marks it to be checked, the panel says "The
+   setup is checked once the machine stops and the edits pause.", and the
+   check runs once it stops (#167), so that the simulation of the job
+   never competes with the driver feeding the machine. The run keeps to the setup
    picked when setups are moved in MANUFACTURE; once that setup is deleted,
    the panel says "This setup was removed from the project." in place of its
    tool runs, and nothing is touched off or probed from it, until another
@@ -582,7 +591,12 @@ panel, at once when that machine is connected, or when you press
 3. **Cycle Start** turns the tool run into the driver's actions at the
    current work zero (plan point − work zero + work offset, feeds in mm/s)
    and sends them as one job; the driver checks the soft limits again before
-   anything moves. **Hold**, **Resume** and **Stop** (decelerate, then spindle
+   anything moves. A job the driver refuses before anything moves ("not
+   started": the machine not idle for it, as for a few milliseconds after a
+   work or machine zero while it re-anchors its position) ends with that
+   message in the Run strip and does not count as started: the work-zero
+   steps and their buttons stay, the X/Y work zero is not held yet, and
+   Cycle Start can be pressed again (#168). **Hold**, **Resume** and **Stop** (decelerate, then spindle
    and coolant off). **Space** holds from any page while no text field is
    being edited, and resumes from that hold only on the Control page with
    the run panel on screen, not in the Controller configuration view. The

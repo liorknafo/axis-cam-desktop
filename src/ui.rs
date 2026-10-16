@@ -4002,45 +4002,60 @@ fn axis_names(axes: &[usize]) -> String {
 }
 
 /// The amber warning above the Control page when nothing stops an axis at the
-/// end of its travel: the profile sets no soft limits, or an axis with one has
-/// no machine position yet. Both are the same prominent box with their own
+/// end of its travel: the profile sets no soft limits on X, Y and Z, or on
+/// some of them (`unlimited`, #164), or an axis with them has no machine
+/// position yet (`unset`). All are the same prominent box with their own
 /// sentence on what to do (#73). None while the soft limits are on.
 pub(crate) fn limits_off_warning(
-    configured: bool,
+    unlimited: &[usize],
     unset: &[usize],
     home_switches: bool,
 ) -> Option<(&'static str, Vec<String>)> {
-    if !configured {
-        return Some((
-            "Soft limits are OFF",
-            vec![
-                "This profile sets no soft limits, so nothing stops an axis at the end of its travel. Jog slowly and watch the machine.".into(),
-                "Add soft_min and soft_max for X, Y and Z to the profile to turn them on.".into(),
-            ],
+    let mut lines = vec![];
+    if unlimited.len() >= 3 {
+        lines.push("This profile sets no soft limits, so nothing stops an axis at the end of its travel. Jog slowly and watch the machine.".into());
+        lines.push(
+            "Add soft_min and soft_max for X, Y and Z to the profile to turn them on.".into(),
+        );
+    } else if !unlimited.is_empty() {
+        let one = unlimited.len() == 1;
+        lines.push(format!(
+            "{} {} no soft limits in this profile, so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
+            axis_names(unlimited),
+            if one { "has" } else { "have" },
+            if one { "it" } else { "them" },
+            if one { "its" } else { "their" },
+        ));
+        lines.push(format!(
+            "Add soft_min and soft_max for {} to the profile to turn them on.",
+            axis_names(unlimited)
         ));
     }
-    if unset.is_empty() {
-        return None;
-    }
-    let one = unset.len() == 1;
-    Some((
-        "Soft limits are OFF",
-        vec![
-            format!(
-                "{} {} no machine position (every E-stop clears it), so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
-                axis_names(unset),
-                if one { "has" } else { "have" },
-                if one { "it" } else { "them" },
-                if one { "its" } else { "their" },
-            ),
+    // An axis without limits is not waiting for its position.
+    let unset: Vec<usize> = unset
+        .iter()
+        .copied()
+        .filter(|a| !unlimited.contains(a))
+        .collect();
+    if !unset.is_empty() {
+        let one = unset.len() == 1;
+        lines.push(format!(
+            "{} {} no machine position (every E-stop clears it), so nothing stops {} at the end of {} travel. Jog slowly and watch the machine.",
+            axis_names(&unset),
+            if one { "has" } else { "have" },
+            if one { "it" } else { "them" },
+            if one { "its" } else { "their" },
+        ));
+        lines.push(
             if home_switches {
                 "Home below to turn them on."
             } else {
                 "Set machine zero below to turn them on."
             }
             .into(),
-        ],
-    ))
+        );
+    }
+    (!lines.is_empty()).then_some(("Soft limits are OFF", lines))
 }
 
 /// The Control page: the UC100 machine, its connection and its live state.
@@ -4171,22 +4186,21 @@ fn control(app: &App) -> Element<'_, Message> {
             v(&id.bootloader)
         )));
     }
-    let unset = c.unset_limited_axes();
-    let limits: Element<_> = if let Some((heading, lines)) =
-        limits_off_warning(c.soft_limits_configured(), &unset, c.home_switches())
-    {
-        caution(heading, lines)
-    } else {
-        let ranges: Vec<String> = (0..6)
-            .filter_map(|a| {
-                let x = c.config.axes.get(a)?;
-                Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
-            })
-            .collect();
-        muted(format!("Soft limits on: {} mm.", ranges.join(", ")))
-            .color(Color::from_rgb8(39, 130, 93))
-            .into()
-    };
+    let (unlimited, unset) = (c.unlimited_axes(), c.unset_limited_axes());
+    let limits: Element<_> =
+        if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, c.home_switches()) {
+            caution(heading, lines)
+        } else {
+            let ranges: Vec<String> = (0..6)
+                .filter_map(|a| {
+                    let x = c.config.axes.get(a)?;
+                    Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
+                })
+                .collect();
+            muted(format!("Soft limits on: {} mm.", ranges.join(", ")))
+                .color(Color::from_rgb8(39, 130, 93))
+                .into()
+        };
     main = main.push(limits);
     // The setup picked to run, beside its tool runs, with the machine's tool
     // while a tool run cuts: MANUFACTURE is out of reach while it moves.
@@ -4696,6 +4710,11 @@ pub(crate) fn run_strip<'a>(
         );
     };
     let programs = match run.programs.as_deref() {
+        // Out of date and not checked yet: the check waits for the machine to
+        // stop, so that nothing competes with the driver feeding it (#167).
+        None if run.stale => {
+            return machine_panel("Run", body.push(muted(crate::run::CHECK_WAITS)));
+        }
         None => {
             return machine_panel(
                 "Run",
@@ -4833,7 +4852,7 @@ pub(crate) fn run_panel<'a>(
             .align_y(Alignment::Center),
         );
     }
-    if run.stale {
+    if run.stale && run.programs.is_some() {
         body = body
             .push(caution(
                 "The project changed since this setup was checked",

@@ -1554,8 +1554,24 @@ impl Connection {
             .all(|a| a.home.is_some())
     }
 
+    /// X, Y and Z all have both soft limits, as `MachineView::envelope`
+    /// wants: the driver's `soft_limits_configured` is true with one axis
+    /// limited, while the others run into their ends (#164).
     pub fn soft_limits_configured(&self) -> bool {
-        self.config.soft_limits_configured()
+        self.unlimited_axes().is_empty()
+    }
+
+    /// X, Y and Z axes without both soft limits in the profile: nothing
+    /// stops them at the end of their travel, position or not.
+    pub fn unlimited_axes(&self) -> Vec<usize> {
+        (0..3)
+            .filter(|&a| {
+                self.config
+                    .axes
+                    .get(a)
+                    .is_none_or(|x| x.soft_min.is_none() || x.soft_max.is_none())
+            })
+            .collect()
     }
 
     /// Axes with a soft limit and no machine position yet. The driver applies
