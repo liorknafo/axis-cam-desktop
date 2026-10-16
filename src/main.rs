@@ -1182,7 +1182,7 @@ impl App {
         let Some(file) = &self.doc.file else {
             return Task::none();
         };
-        let path = PathBuf::from(&file.path);
+        let path = file.path.clone();
         self.import_busy = true;
         self.status = format!("Loading {}…", file.name);
         Task::perform(
@@ -1348,9 +1348,11 @@ impl App {
         }
     }
     /// Blocking work that keeps the process alive after its window closes:
-    /// iced's runtime waits for it on exit.
+    /// iced's runtime waits for it on exit. A model import is one (a STEP
+    /// conversion may take two minutes).
     fn blocking_work(&self) -> bool {
-        self.plan_busy.running() > 0
+        self.import_busy
+            || self.plan_busy.running() > 0
             || self.post_busy
             || self.left_job.is_some()
             || self.ready_job.is_some()
@@ -3325,12 +3327,6 @@ impl App {
                 );
             }
             Message::Import => {
-                if self.page == Page::Home && !self.import_busy && !self.save_busy {
-                    let _ = self.update(Message::NewProject);
-                    if self.page == Page::Home {
-                        return Task::none();
-                    }
-                }
                 if self.import_busy || self.save_busy {
                     return Task::none();
                 }
@@ -3355,7 +3351,7 @@ impl App {
                             .to_lowercase();
                         let info = ModelFile {
                             name: file.file_name(),
-                            path: p.to_string_lossy().into_owned(),
+                            path: p.to_path_buf(),
                             format: ext.clone(),
                             bytes: meta.len(),
                         };
@@ -3372,12 +3368,20 @@ impl App {
                 );
             }
             Message::FileImported(Some(Ok((f, m)))) => {
+                self.import_busy = false;
+                // From the Start screen the import starts a new project, once
+                // a file is chosen: until then the resumable one stays.
+                if self.page == Page::Home {
+                    let _ = self.update(Message::NewProject);
+                    if self.page == Page::Home {
+                        return Task::none();
+                    }
+                }
                 self.doc.title = std::path::Path::new(&f.name)
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                self.import_busy = false;
                 self.import_error = None;
                 self.status = format!(
                     "{} geometry loaded. Facing and Pocket can select planar surfaces and generate bounded previews.",

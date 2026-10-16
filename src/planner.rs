@@ -1415,7 +1415,7 @@ pub(crate) mod tests {
             .flatten()
             .map(|(_, text)| text.as_str())
             .collect();
-        let path = doc.file.as_ref().unwrap().path.clone();
+        let path = doc.file.as_ref().unwrap().path.to_str().unwrap().to_owned();
         for private in [
             "Secret customer bracket",
             path.as_str(),
@@ -1466,7 +1466,7 @@ pub(crate) mod tests {
             "Secret customer bracket",
             "ZZ-SECRET-FIXTURE",
             file.name.as_str(),
-            file.path.as_str(),
+            file.path.to_str().unwrap(),
             ".ngc",
             &mesh.fingerprint,
         ] {

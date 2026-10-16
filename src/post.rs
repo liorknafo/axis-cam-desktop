@@ -2200,7 +2200,7 @@ pub(crate) mod fixture {
         doc.setups = vec![setup];
         doc.file = Some(ModelFile {
             name: "four-setup-block.3mf".into(),
-            path: path.to_string_lossy().into_owned(),
+            path: path.clone(),
             format: "3mf".into(),
             bytes: 0,
         });
@@ -3216,7 +3216,7 @@ M2
         doc.setups.push(underside);
         doc.file = Some(ModelFile {
             name: "preview-cube.obj".into(),
-            path: path.to_string_lossy().into_owned(),
+            path: path.clone(),
             format: "obj".into(),
             bytes: 0,
         });

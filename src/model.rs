@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 
 pub type Fields = BTreeMap<String, String>;
 pub fn fields(values: &[(&str, &str)]) -> Fields {
@@ -875,10 +876,57 @@ impl Setup {
         e
     }
 }
+/// A path as JSON: text when it is valid Unicode (which is all an older
+/// project file holds), otherwise its raw bytes (Unix) or UTF-16 units
+/// (Windows), which serde's own `PathBuf` refuses to write.
+mod path_json {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::path::PathBuf;
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        #[cfg(unix)]
+        Bytes(Vec<u8>),
+        #[cfg(windows)]
+        Wide(Vec<u16>),
+    }
+    pub fn serialize<S: Serializer>(path: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
+        if let Some(text) = path.to_str() {
+            return Repr::Text(text.to_owned()).serialize(s);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            Repr::Bytes(path.as_os_str().as_bytes().to_vec()).serialize(s)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            Repr::Wide(path.as_os_str().encode_wide().collect()).serialize(s)
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        Ok(match Repr::deserialize(d)? {
+            Repr::Text(text) => PathBuf::from(text),
+            #[cfg(unix)]
+            Repr::Bytes(bytes) => {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(bytes))
+            }
+            #[cfg(windows)]
+            Repr::Wide(units) => {
+                use std::os::windows::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_wide(&units))
+            }
+        })
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelFile {
     pub name: String,
-    pub path: String,
+    #[serde(with = "path_json")]
+    pub path: PathBuf,
     pub format: String,
     pub bytes: u64,
 }
@@ -1591,6 +1639,32 @@ fn range_equal(p: &Fields, a: &str, b: &str, e: &mut Vec<String>) {
 }
 
 #[cfg(test)]
+#[test]
+fn the_model_path_is_read_from_a_string_and_written_as_one_when_it_is_text() {
+    let file: ModelFile =
+        serde_json::from_str(r#"{"name":"a.stl","path":"/parts/a.stl","format":"stl","bytes":3}"#)
+            .unwrap();
+    assert_eq!(file.path, PathBuf::from("/parts/a.stl"));
+    let text = serde_json::to_value(&file).unwrap();
+    assert_eq!(text["path"], "/parts/a.stl");
+}
+#[cfg(unix)]
+#[test]
+fn a_model_path_that_is_not_utf8_survives_a_save_and_load() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let path = PathBuf::from(OsStr::from_bytes(b"/parts/caf\xe9/\xff.stl"));
+    assert!(path.to_str().is_none());
+    let file = ModelFile {
+        name: "part.stl".into(),
+        path: path.clone(),
+        format: "stl".into(),
+        bytes: 3,
+    };
+    let json = serde_json::to_string(&file).unwrap();
+    let back: ModelFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.path, path);
+}
 mod tests {
     use super::*;
     #[test]
