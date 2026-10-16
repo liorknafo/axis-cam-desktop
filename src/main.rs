@@ -307,6 +307,10 @@ pub enum Message {
     Frame(Instant),
     WindowSized(iced::Size),
     HelpHover(bool),
+    /// More… and Pause on a hover card: taken by the card's overlay
+    /// (`help::HoverHelp`), never by the app.
+    HelpMore(bool),
+    HelpPause(bool),
     Noop,
 }
 /// A plan that passed every check, with the stock it leaves for the 3D view.
@@ -3732,6 +3736,7 @@ impl App {
                 }
             }
             Message::HelpHover(on) => self.help_animating = on,
+            Message::HelpMore(_) | Message::HelpPause(_) => {}
             Message::Tick => {
                 if let Some(c) = &mut self.control {
                     c.refresh();

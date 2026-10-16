@@ -12111,9 +12111,10 @@ flood = { pin = 8 }
             "{help}"
         );
         assert!(help.contains("The CAD file is never sent."), "{help}");
+        let more = crate::ui::PICTURES_HELP_MORE;
         assert!(
-            help.contains("A run keeps the choice it started with"),
-            "{help}"
+            more.contains("A run keeps the choice it started with"),
+            "{more}"
         );
     }
     #[tokio::test]
