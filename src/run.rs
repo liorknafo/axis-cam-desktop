@@ -737,6 +737,7 @@ mod tests {
             part: Some((1, 1, 1)),
             located: None,
             probe: Ok([crate::post::At::Mid; 2]),
+            holds: vec![],
         }
     }
 

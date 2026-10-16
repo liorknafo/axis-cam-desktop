@@ -1416,37 +1416,109 @@ fn listed(items: &[impl AsRef<str>]) -> String {
         ),
     }
 }
+/// How high above the stock a probe travels between the faces of a
+/// stock-based work zero (plan mm): `corner_area` above the stock top, or
+/// above the top of the tallest of `boxes`, the setup's jaws or clamps,
+/// when one stands higher, so that a clamp bar on the stock top is flown
+/// over, not crossed at its height (#163).
+pub(crate) fn probe_height(stock: Bounds, boxes: &[crate::holding::HoldBox]) -> f32 {
+    let tallest = (boxes.iter().map(|b| b.bounds.max[2])).fold(stock.max[2], f32::max);
+    tallest + corner_area(stock)
+}
+/// Whether the segment from `a` to `b` passes through the rectangle from
+/// `lo` to `hi` (its edges included), in the plane.
+pub(crate) fn segment_crosses(a: [f64; 2], b: [f64; 2], lo: [f64; 2], hi: [f64; 2]) -> bool {
+    let (mut t0, mut t1) = (0f64, 1f64);
+    for k in 0..2 {
+        let d = b[k] - a[k];
+        if d.abs() < 1e-9 {
+            if a[k] < lo[k] || a[k] > hi[k] {
+                return false;
+            }
+            continue;
+        }
+        let (mut u, mut v) = ((lo[k] - a[k]) / d, (hi[k] - a[k]) / d);
+        if u > v {
+            std::mem::swap(&mut u, &mut v);
+        }
+        (t0, t1) = (t0.max(u), t1.min(v));
+        if t0 > t1 {
+            return false;
+        }
+    }
+    true
+}
 /// The jaw or clamp of `boxes` in the way of a probe touching the faces of
 /// `refs` on `stock` (`probe_faces`), with the face and its spot: one in
-/// the column a probe goes down beside a side, from `corner_area` above
-/// the top to the bottom of the side's spot and out to `corner_area` from
-/// it, or over the top's spot up to that height. None when they are all
+/// the column a probe goes down beside a side, from the height it travels
+/// at (`probe_height`) to the bottom of the side's spot and out to
+/// `corner_area` from it, or over the top's spot up to that height; or one
+/// reaching that height under the line the probe crosses at it from one
+/// face's approach point to another's (#163). None when they are all
 /// clear.
 ///
 /// ponytail: the column is `corner_area` wide, not the probe's clearance
 /// plus its tip; take the tip from the machine if a wide tip clips a jaw.
 fn in_the_way(stock: Bounds, refs: [At; 2], boxes: &[crate::holding::HoldBox]) -> Option<String> {
     let clear = corner_area(stock);
-    let spots = probe_faces(stock, refs)
-        .into_iter()
-        .zip(touch_spots(stock, refs));
-    for ((face, k, far, spot), (words, _)) in spots {
-        let mut room = spot;
-        room.max[2] = stock.max[2] + clear;
-        if k < 2 {
-            (room.min[k], room.max[k]) = if far {
-                (stock.max[k], stock.max[k] + clear)
+    let high = probe_height(stock, boxes);
+    let faces = probe_faces(stock, refs);
+    let overlaps = |b: &Bounds, room: &Bounds| {
+        (0..3).all(|a| b.min[a] < room.max[a] && b.max[a] > room.min[a])
+    };
+    for ((face, k, far, spot), (words, _)) in faces.iter().zip(touch_spots(stock, refs)) {
+        let mut room = *spot;
+        room.max[2] = high;
+        if *k < 2 {
+            (room.min[*k], room.max[*k]) = if *far {
+                (stock.max[*k], stock.max[*k] + clear)
             } else {
-                (stock.min[k] - clear, stock.min[k])
+                (stock.min[*k] - clear, stock.min[*k])
             };
         }
-        let overlaps =
-            |b: &Bounds| (0..3).all(|a| b.min[a] < room.max[a] && b.max[a] > room.min[a]);
-        if let Some(hold) = boxes.iter().find(|h| overlaps(&h.bounds)) {
+        if let Some(hold) = boxes.iter().find(|h| overlaps(&h.bounds, &room)) {
             return Some(format!(
                 "the {} is in the way of the {face} {words}",
                 hold.label
             ));
+        }
+    }
+    // Between faces the probe rises to `high` over where it came down and
+    // crosses straight to above the next face's approach point, `clear`
+    // outside a side at its spot's middle, or the top's spot. Any two faces
+    // can follow each other: one touched off its spot is touched again.
+    let approach = |(_, k, far, spot): &(&str, usize, bool, Bounds)| -> [f32; 2] {
+        let mut p = [
+            (spot.min[0] + spot.max[0]) / 2.,
+            (spot.min[1] + spot.max[1]) / 2.,
+        ];
+        if *k < 2 {
+            p[*k] = if *far {
+                stock.max[*k] + clear
+            } else {
+                stock.min[*k] - clear
+            };
+        }
+        p
+    };
+    for (i, from) in faces.iter().enumerate() {
+        for to in &faces[i + 1..] {
+            let (a, b) = (approach(from), approach(to));
+            let under = |h: &&crate::holding::HoldBox| {
+                let x = &h.bounds;
+                let xy = |p: [f32; 3]| [f64::from(p[0]), f64::from(p[1])];
+                x.max[2] >= high
+                    && segment_crosses(a.map(f64::from), b.map(f64::from), xy(x.min), xy(x.max))
+            };
+            if let Some(hold) = boxes.iter().find(under) {
+                return Some(format!(
+                    "the {} reaches {} mm above the stock top, under the probe's way between the {} and the {}",
+                    hold.label,
+                    exact_mm(hold.bounds.max[2] - stock.max[2]),
+                    from.0,
+                    to.0
+                ));
+            }
         }
     }
     None
@@ -1904,6 +1976,10 @@ pub struct Checked {
     /// The faces a probe touches to find the work zero, or why no probe
     /// does (`ZeroCheck::probe`).
     pub probe: Result<[At; 2], String>,
+    /// The setup's jaws or clamps as that was checked with them
+    /// (`holding_boxes`, plan mm): the probe travels over the tallest
+    /// (`probe_height`, `control::Edges`).
+    pub holds: Vec<crate::holding::HoldBox>,
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
@@ -2009,6 +2085,7 @@ pub(crate) fn checked(
             part: (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool)),
             located,
             probe: found.probe.clone(),
+            holds: boxes.clone(),
         });
     }
     Ok(out)
@@ -3563,6 +3640,61 @@ M2
             "the clamp on -X (offset 0) is in the way of the top face near the middle of its left edge"
         );
         assert_eq!(in_the_way(stock, [At::Max, At::Mid], &[clamp]), None);
+        // The probe travels 10 mm above the top, or above the tallest jaw or
+        // clamp (#163). A bar overhanging the +X side from 50 to 55 mm,
+        // above the 50 mm the column used to reach: the probe comes down
+        // beside the side from 65 mm, through it.
+        let bar = HoldBox {
+            label: "clamp on +X (offset 0)".into(),
+            bounds: Bounds {
+                min: [90., 25., 50.],
+                max: [120., 35., 55.],
+            },
+        };
+        assert_eq!(probe_height(stock, &[]), 50.);
+        assert_eq!(probe_height(stock, std::slice::from_ref(&bar)), 65.);
+        assert_eq!(
+            in_the_way(stock, [At::Mid; 2], std::slice::from_ref(&bar)).unwrap(),
+            "the clamp on +X (offset 0) is in the way of the +X side near its centre"
+        );
+        // A toe clamp on the +X −Y corner of the top, 20 mm proud: clear of
+        // every column, and under the probe's way from the +X side (110, 30)
+        // to the −Y side (50, −10) only at its own height, 10 mm below the
+        // 70 mm the probe travels at. The routine flies over it
+        // (`control::tests::a_clamp_bar_on_the_stock_top_is_flown_over_or_refused`).
+        let toe = HoldBox {
+            label: "clamp on +X (offset 0)".into(),
+            bounds: Bounds {
+                min: [80., 0., 40.],
+                max: [100., 20., 60.],
+            },
+        };
+        assert_eq!(probe_height(stock, std::slice::from_ref(&toe)), 70.);
+        assert_eq!(in_the_way(stock, [At::Mid; 2], &[toe]), None);
+        assert!(segment_crosses(
+            [110., 30.],
+            [50., -10.],
+            [80., 0.],
+            [100., 20.]
+        ));
+        assert!(!segment_crosses(
+            [110., 30.],
+            [50., 30.],
+            [80., 0.],
+            [100., 20.]
+        ));
+        assert!(segment_crosses(
+            [90., 30.],
+            [90., -10.],
+            [80., 0.],
+            [100., 20.]
+        ));
+        assert!(!segment_crosses(
+            [70., 30.],
+            [70., -10.],
+            [80., 0.],
+            [100., 20.]
+        ));
     }
     #[test]
     fn touch_off_spots_follow_the_work_zero() {

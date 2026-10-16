@@ -279,10 +279,18 @@ struct Edges {
     faces: Vec<Face>,
     /// The setup's stock (mm).
     size: [f64; 3],
-    /// How far a face may be from where it is expected (mm): how high above
-    /// the top the probe travels, how far outside a side it goes down, and
-    /// how far past where the side should be it probes.
+    /// How far a face may be from where it is expected (mm): how far outside
+    /// a side the probe goes down, how far past where the side should be it
+    /// probes, and how high above the top, or the tallest jaw or clamp, it
+    /// travels.
     clear: f64,
+    /// The setup's jaws or clamps from the work zero (mm): their names,
+    /// min and max corners.
+    holds: Vec<(String, [f64; 3], [f64; 3])>,
+    /// How far above the stock top the probe travels between faces (mm):
+    /// `clear`, or more when one of `holds` stands higher than the top
+    /// (`post::probe_height`, #163).
+    rise: f64,
     radius: f64,
     feed: f64,
     /// How far the first touch of the top goes down at most.
@@ -303,14 +311,15 @@ struct Edges {
 
 impl Edges {
     /// For a setup's work zero `origin` found from the faces of `refs`
-    /// on its `stock` at `datum` (plan mm), the probe with a tip of `tip`
-    /// mm starting at `start`.
+    /// on its `stock` at `datum` (plan mm), held by `holds`, the probe with
+    /// a tip of `tip` mm starting at `start`.
     #[allow(clippy::too_many_arguments)]
     fn new(
         origin: &str,
         refs: [crate::post::At; 2],
         stock: crate::mesh::Bounds,
         datum: [f32; 3],
+        holds: &[crate::holding::HoldBox],
         probe: &Probe,
         tip: f64,
         start: Vec6,
@@ -335,6 +344,7 @@ impl Edges {
                 hi: std::array::from_fn(|a| rel(spot.max[a], a)),
             })
             .collect();
+        let corner = |b: [f32; 3]| std::array::from_fn(|a| rel(b[a], a));
         Self {
             refs,
             bottom: crate::post::stock_zero(origin).is_some_and(|(_, top)| !top),
@@ -344,6 +354,11 @@ impl Edges {
             size: stock.dimensions().map(f64::from),
             // 10 mm, a quarter of the shorter top side when less.
             clear: crate::post::corner_area(stock) as f64,
+            rise: (crate::post::probe_height(stock, holds) - stock.max[2]) as f64,
+            holds: holds
+                .iter()
+                .map(|h| (h.label.clone(), corner(h.bounds.min), corner(h.bounds.max)))
+                .collect(),
             radius: tip / 2.,
             feed: probe.feed,
             distance: probe.distance,
@@ -415,7 +430,7 @@ impl Edges {
         let f = &self.faces[i];
         let mid = |a: usize| (f.lo[a] + f.hi[a]) / 2.;
         let top = self.top(w);
-        let high = (top + self.clear).min(self.z.1);
+        let high = self.high(w);
         let mut up = self.from;
         up[2] = high;
         let mut over = up;
@@ -453,6 +468,44 @@ impl Edges {
     /// The machine Z of the stock top, given the work zero `w` (machine).
     fn top(&self, w: [f64; 3]) -> f64 {
         w[2] + self.faces[0].at
+    }
+
+    /// The machine Z the probe travels at between faces, given the work
+    /// zero `w` (machine): `rise` above the stock top, or the top of Z.
+    fn high(&self, w: [f64; 3]) -> f64 {
+        (self.top(w) + self.rise).min(self.z.1)
+    }
+
+    /// Why the traverse `moves` to face `i` (`plan`) must not be made: the
+    /// top of Z holds it so low that its level moves would pass within a
+    /// millimetre over one of `holds`, the tip's radius allowed for
+    /// sideways. At `rise` above the top the traverse clears every one by
+    /// `clear`; only the top of Z can bound it lower (#163).
+    fn blocked(&self, i: usize, moves: &[Vec6]) -> Option<String> {
+        let (w, _) = self.zero();
+        let r = self.radius;
+        for pair in moves.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if (a[2] - b[2]).abs() > 1e-9 {
+                continue;
+            }
+            for (label, lo, hi) in &self.holds {
+                let top = w[2] + hi[2];
+                let (lo, hi) = (
+                    [w[0] + lo[0] - r, w[1] + lo[1] - r],
+                    [w[0] + hi[0] + r, w[1] + hi[1] + r],
+                );
+                if top + 1. > a[2]
+                    && crate::post::segment_crosses([a[0], a[1]], [b[0], b[1]], lo, hi)
+                {
+                    return Some(format!(
+                        "The probe cannot pass over the {label}, whose top is at machine Z {top:.3}, on its way to the {}: Z ends at {:.3}. Touch the work zero off by hand.",
+                        self.faces[i].name, self.z.1
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Where the tip should be found, for a message: "its centre", "the
@@ -740,6 +793,24 @@ pub struct Connection {
     _nap: uc100::macos::ActivityToken,
 }
 
+/// Why a probe whose program ended with the machine in `state`, not Idle
+/// or paused, set nothing: the driver takes SetWork in those two only.
+fn stopped_after(state: &Option<State>) -> String {
+    match state {
+        Some(State::EStop) => {
+            "The machine was E-stopped as the probe ended, so nothing is set: probe again.".into()
+        }
+        Some(s) => format!(
+            "The machine is {} after the probe ended, so nothing is set: probe again.",
+            s.label()
+        ),
+        None => {
+            "The machine is not connected after the probe ended, so nothing is set: probe again."
+                .into()
+        }
+    }
+}
+
 impl Connection {
     /// Starts the controller for `m`. The driver connects and leaves the
     /// machine in E-stop. `state_dir` holds its saved offsets and last
@@ -863,8 +934,14 @@ impl Connection {
     fn ended(&self, seq: (u64, u64)) -> Option<(bool, String, Option<ProbeResult>)> {
         let s = &self.snapshot;
         let o = s.program_outcome.as_ref().filter(|o| o.seq > seq.0)?;
-        if matches!(s.state, Some(State::Run | State::Hold | State::Stopping)) {
-            return None;
+        match &s.state {
+            Some(State::Run | State::Hold | State::Stopping) => return None,
+            Some(State::Idle | State::Paused(_)) => {}
+            // An E-stop (or a disconnect, a jog) just after the outcome: the
+            // driver leaves an ok outcome in place, having no program to
+            // abort, and drops SetWork and the retract. Nothing is set (#166).
+            other if o.ok => return Some((false, stopped_after(other), None)),
+            _ => {}
         }
         let r = s.probe_result.as_ref().filter(|r| o.ok && r.seq > seq.1);
         Some((o.ok, o.message.clone(), r.cloned()))
@@ -1201,6 +1278,12 @@ impl Connection {
         self.edges.is_some()
     }
 
+    /// The setup picked in the Run panel cannot be changed now: a tool run
+    /// is under way, or a probe is setting that setup's work zero (#165).
+    pub fn setup_locked(&self) -> bool {
+        self.run.as_ref().is_some_and(|r| r.running.is_some()) || self.probing()
+    }
+
     /// Probes straight down, up to the maximum distance or the bottom of Z.
     fn start_probe(&mut self, touch: Touch) {
         let (None, Ok(probe)) = (self.probe_blocked(), self.probe.clone()) else {
@@ -1229,6 +1312,11 @@ impl Connection {
     /// A probe ended, Idle: on contact at machine Z `trip`, sets what it is
     /// for and lifts the tool.
     fn probe_done(&mut self, p: Probing, trip: Option<f64>) {
+        // The driver takes SetWork only Idle or paused (#166).
+        if !self.manual() {
+            self.probed = Some((false, stopped_after(&self.snapshot.state)));
+            return;
+        }
         let Some(trip) = trip else {
             self.probed = Some((
                 false,
@@ -1361,7 +1449,7 @@ impl Connection {
         let start = self.snapshot.machine_pos;
         let tip = probe.tip.unwrap_or_default();
         self.edges = Some(Edges::new(
-            &p.origin, refs, p.stock, p.datum, &probe, tip, start, z,
+            &p.origin, refs, p.stock, p.datum, &p.holds, &probe, tip, start, z,
         ));
         self.probed = None;
         self.edges_step();
@@ -1425,9 +1513,17 @@ impl Connection {
             e.sent = None;
         }
         if e.steps.is_empty() {
-            match e.next() {
-                Some(i) => e.steps = e.plan(i),
-                None => return self.edges_done(e),
+            let Some(i) = e.next() else {
+                return self.edges_done(e);
+            };
+            e.steps = e.plan(i);
+            // The top of Z would hold the traverse down onto a jaw or clamp
+            // under its way (#163).
+            if let Some(Step::Go(moves, _)) = e.steps.front()
+                && let Some(why) = e.blocked(i, moves)
+            {
+                self.probed = Some((false, why));
+                return;
             }
         }
         let step = e.steps.pop_front().unwrap();
@@ -1461,6 +1557,11 @@ impl Connection {
     /// Every face is touched at its spot, Idle: sets the X, Y and Z work zero
     /// and backs the probe off and up.
     fn edges_done(&mut self, e: Edges) {
+        // The driver takes SetWork only Idle or paused (#166).
+        if !self.manual() {
+            self.probed = Some((false, stopped_after(&self.snapshot.state)));
+            return;
+        }
         let (w, _) = e.zero();
         let now = self.snapshot.machine_pos;
         for a in 0..3 {
@@ -1473,7 +1574,7 @@ impl Connection {
             run.touched = true;
         }
         let mut up = e.from;
-        up[2] = (e.top(w) + e.clear).min(e.z.1);
+        up[2] = e.high(w);
         self.send(job(e.name(), moves_from(now, &[e.from, up])));
         self.probed = Some((true, e.found()));
     }
@@ -2158,12 +2259,52 @@ soft_max = 0.0
 
     /// Runs a probing routine against a box at machine `lo`…`hi`: each touch
     /// stops where the tip, `e.radius` round, meets a face.
-    fn touch_box(mut e: Edges, lo: [f64; 3], hi: [f64; 3]) -> Edges {
+    fn touch_box(e: Edges, lo: [f64; 3], hi: [f64; 3]) -> Edges {
+        touch_box_round(e, lo, hi, &[]).unwrap()
+    }
+
+    /// `touch_box` with `clamps` (machine min and max corners) about the
+    /// box: a level traverse whose tip, `e.radius` round, would run into
+    /// one at or below its height fails, and the routine's own refusal of
+    /// a traverse (`Edges::blocked`) is returned.
+    fn touch_box_round(
+        mut e: Edges,
+        lo: [f64; 3],
+        hi: [f64; 3],
+        clamps: &[([f64; 3], [f64; 3])],
+    ) -> Result<Edges, String> {
         let mut at = e.start;
         while let Some(i) = e.next() {
-            for step in e.plan(i) {
+            let steps = e.plan(i);
+            if let Some(Step::Go(moves, _)) = steps.front()
+                && let Some(why) = e.blocked(i, moves)
+            {
+                return Err(why);
+            }
+            for step in steps {
                 match step {
                     Step::Go(moves, guard) => {
+                        for pair in moves.windows(2) {
+                            let (a, b) = (pair[0], pair[1]);
+                            if (a[2] - b[2]).abs() > 1e-9 {
+                                continue;
+                            }
+                            for (lo, hi) in clamps {
+                                let r = e.radius;
+                                let hit = hi[2] >= a[2]
+                                    && crate::post::segment_crosses(
+                                        [a[0], a[1]],
+                                        [b[0], b[1]],
+                                        [lo[0] - r, lo[1] - r],
+                                        [hi[0] + r, hi[1] + r],
+                                    );
+                                assert!(
+                                    !hit,
+                                    "the traverse at Z {} from {a:?} to {b:?} runs into the clamp at {lo:?}…{hi:?}",
+                                    a[2]
+                                );
+                            }
+                        }
                         if let Some(down) = guard {
                             let clear = (0..2).any(|a| down[a] < lo[a] || down[a] > hi[a]);
                             assert!(clear, "going down onto the box at {down:?}");
@@ -2188,7 +2329,7 @@ soft_max = 0.0
                 }
             }
         }
-        e
+        Ok(e)
     }
 
     #[test]
@@ -2235,6 +2376,7 @@ soft_max = 0.0
             [At::Min; 2],
             stock,
             [0., 0., 40.],
+            &[],
             &probe,
             4.,
             start,
@@ -2254,6 +2396,7 @@ soft_max = 0.0
             [At::Mid; 2],
             stock,
             [62., 42., 40.],
+            &[],
             &probe,
             4.,
             start,
@@ -2275,6 +2418,7 @@ soft_max = 0.0
             [At::Min; 2],
             stock,
             [0., 0., 40.],
+            &[],
             &probe,
             4.,
             start,
@@ -2405,7 +2549,7 @@ soft_max = 0.0
                 ];
                 let zero = datum(setup, stock, &mesh).unwrap();
                 let z = (stock.min[2] as f64 - 100., stock.max[2] as f64 + 100.);
-                let e = Edges::new(origin, refs, stock, zero, &probe, 4., start, z);
+                let e = Edges::new(origin, refs, stock, zero, &[], &probe, 4., start, z);
                 let (w, fixed) = touch_material(e, &solid).zero();
                 assert_eq!(fixed, [true; 3], "{state} {origin}");
                 assert!(
@@ -2425,6 +2569,284 @@ soft_max = 0.0
                 "flipped Stock bottom center"
             ]
         );
+    }
+
+    /// A toe clamp on the +X −Y corner of the stock top, 20 mm proud, lies
+    /// under the diagonal Probe centre crosses from the +X side to the −Y
+    /// side, away from every column the check looks down. Given the
+    /// setup's clamps, the routine travels 10 mm above the clamp, which is
+    /// the top of Z; one 35 mm proud, whose top is above the top of Z,
+    /// stops it before that traverse (#163).
+    #[test]
+    fn a_clamp_bar_on_the_stock_top_is_flown_over_or_refused() {
+        use crate::{holding::HoldBox, mesh::Bounds, post::At};
+        let stock = Bounds {
+            min: [0.; 3],
+            max: [124., 84., 40.],
+        };
+        let probe = Probe {
+            plate: None,
+            tip: Some(4.),
+            feed: 100.,
+            distance: 20.,
+            retract: 5.,
+        };
+        let z = (-80., 0.);
+        // The stock at machine X 100…224, Y 50…134, Z -70…-30, the probe
+        // started 3 mm right of its centre and 2 mm in front, 15 mm above.
+        let (lo, hi) = ([100., 50., -70.], [224., 134., -30.]);
+        let start = [165., 90., -15., 0., 0., 0.];
+        let clamp = |proud: f32| HoldBox {
+            label: "clamp on +X (offset 0)".into(),
+            bounds: Bounds {
+                min: [94., 0., 40.],
+                max: [124., 24., 40. + proud],
+            },
+        };
+        // The same clamp in machine coordinates, for the harness.
+        let at = |c: &HoldBox| {
+            (
+                [194., 50., -30.],
+                [224., 74., -30. + f64::from(c.bounds.max[2] - 40.)],
+            )
+        };
+        let edges = |holds: &[HoldBox]| {
+            Edges::new(
+                "Stock top center",
+                [At::Mid; 2],
+                stock,
+                [62., 42., 40.],
+                holds,
+                &probe,
+                4.,
+                start,
+                z,
+            )
+        };
+        let c = clamp(20.);
+        assert_eq!(
+            crate::post::probe_height(stock, std::slice::from_ref(&c)),
+            70.
+        );
+        let e = edges(std::slice::from_ref(&c));
+        assert_eq!((e.clear, e.rise), (10., 30.));
+        let e = touch_box_round(e, lo, hi, &[at(&c)]).unwrap();
+        let (w, fixed) = e.zero();
+        assert_eq!(fixed, [true; 3]);
+        assert!(
+            (0..3).all(|a| (w[a] - [162., 92., -30.][a]).abs() < 1e-9),
+            "{w:?}"
+        );
+        // 10 mm over the clamp's top at machine Z -10: the top of Z.
+        assert_eq!(e.high(w), 0.);
+        assert_eq!(e.touches.iter().map(Vec::len).collect::<Vec<_>>(), [1; 5]);
+        // 35 mm proud, its top at machine Z 5, above the top of Z: refused
+        // before the traverse from the +X side to the -Y side.
+        let c = clamp(35.);
+        let why = match touch_box_round(edges(std::slice::from_ref(&c)), lo, hi, &[at(&c)]) {
+            Err(why) => why,
+            Ok(_) => panic!("the traverse over the clamp was not refused"),
+        };
+        assert!(
+            why.contains(
+                "cannot pass over the clamp on +X (offset 0), whose top is at machine Z 5.000, on its way to the -Y side"
+            ) && why.contains("Z ends at 0.000"),
+            "{why}"
+        );
+        // Without the clamps the routine travels 10 mm above the stock top,
+        // through the 20 mm clamp: the harness fails on that traverse.
+        let c = clamp(20.);
+        let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            touch_box_round(edges(&[]), lo, hi, &[at(&c)])
+        }));
+        assert!(hit.is_err());
+    }
+
+    /// `ended` (#166): the outcome of the command after `seq` once the
+    /// machine has stopped. An ok outcome counts only Idle or paused, when
+    /// the driver takes the SetWork that follows; E-stopped or disconnected
+    /// as the probe ended, it is not ok and says so. A failed outcome keeps
+    /// the driver's words.
+    #[test]
+    fn ended_takes_an_ok_outcome_only_idle_or_paused() {
+        use uc100::controller::ProgramOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("limited.toml");
+        std::fs::write(&profile, LIMITED).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let mut c = Connection::open(&m, dir.path()).unwrap();
+        c.snapshot.program_outcome = Some(ProgramOutcome {
+            seq: 1,
+            ok: true,
+            message: "Probe done".into(),
+        });
+        c.snapshot.probe_result = Some(ProbeResult {
+            seq: 1,
+            tripped: true,
+            position: [0.; 6],
+        });
+        let ended = |c: &mut Connection, state: Option<State>| {
+            c.snapshot.state = state;
+            c.ended((0, 0))
+        };
+        let (ok, message, result) = ended(&mut c, Some(State::Idle)).unwrap();
+        assert!(ok && message == "Probe done" && result.is_some_and(|r| r.tripped));
+        assert!(ended(&mut c, Some(State::Paused("M0".into()))).unwrap().0);
+        assert_eq!(ended(&mut c, Some(State::Run)), None);
+        assert_eq!(ended(&mut c, Some(State::Hold)), None);
+        assert_eq!(ended(&mut c, Some(State::Stopping)), None);
+        let (ok, message, result) = ended(&mut c, Some(State::EStop)).unwrap();
+        assert!(!ok && result.is_none(), "{message}");
+        assert_eq!(
+            message,
+            "The machine was E-stopped as the probe ended, so nothing is set: probe again."
+        );
+        let (ok, message, _) = ended(&mut c, Some(State::Jog)).unwrap();
+        assert!(
+            !ok && message.starts_with("The machine is Jog after"),
+            "{message}"
+        );
+        let (ok, message, _) = ended(&mut c, None).unwrap();
+        assert!(!ok && message.contains("not connected"), "{message}");
+        // The driver's own words when the probe failed.
+        c.snapshot.program_outcome = Some(ProgramOutcome {
+            seq: 1,
+            ok: false,
+            message: "Program aborted by E-stop: E-stop pressed".into(),
+        });
+        let (ok, message, result) = ended(&mut c, Some(State::EStop)).unwrap();
+        assert!(!ok && result.is_none());
+        assert_eq!(message, "Program aborted by E-stop: E-stop pressed");
+        // An outcome from before the command is not its.
+        assert_eq!(ended(&mut c, Some(State::Idle)).map(|e| e.0), Some(false));
+        assert_eq!(c.ended((1, 1)), None);
+    }
+
+    /// LIMITED's travel on fast axes, with a probe input: the simulator's
+    /// block is X 145…245, Y 90…190, its top at machine Z -40.
+    const PROBED: &str = r#"
+[controller]
+step_rate = "100kHz"
+[motion]
+junction_deviation = 0.02
+arc_tolerance = 0.002
+buffer_ms = 400
+default_feed = 500
+[axes.x]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 390.0
+[axes.y]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 280.0
+[axes.z]
+steps_per_unit = 20.0
+max_velocity = 30000.0
+acceleration = 20000.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -80.0
+soft_max = 0.0
+[inputs]
+probe = { pin = 13, active_low = true }
+"#;
+
+    /// Probe Z onto the simulator's block, then an E-stop in the window
+    /// between the probe's end and the tick that reads it (#166): the
+    /// driver, with no program left to abort, keeps the probe's ok outcome
+    /// and would drop the SetWork; the tick reports the E-stop, sets
+    /// nothing and marks nothing touched off.
+    #[test]
+    fn a_probe_that_ended_into_an_e_stop_sets_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("probed.toml");
+        std::fs::write(&profile, PROBED).unwrap();
+        let mut m = Machine::new(3);
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        m.p.insert("probe_plate".into(), "10".into());
+        m.p.insert("probe_feed".into(), "1000".into());
+        let mut c = Connection::open(&m, dir.path()).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        let (_, top) = c.block.expect("the simulator's block");
+        assert_eq!(top[2], -40.);
+        // 10 mm above the block's top.
+        c.send(Command::Mdi("G53 G0 X195 Y140 Z-30".into()));
+        until(&mut c, 5.0, "over the block", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[2] - -30.).abs() < 1e-3
+        });
+        assert_eq!(c.probe_blocked(), None);
+        c.act(Action::ProbeZ);
+        let seq = c.probing.as_ref().expect("probing").seq;
+        // The driver's own snapshot, not read by a tick.
+        let raw = |c: &Connection, what: &str, ok: &dyn Fn(&Snapshot) -> bool| {
+            let cap = Instant::now() + Duration::from_secs(60);
+            loop {
+                let s = c.controller.snapshot();
+                if ok(&s) {
+                    return s;
+                }
+                assert!(
+                    Instant::now() < cap,
+                    "timed out waiting for {what}: {:?} {:?}",
+                    s.state,
+                    s.log
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let s = raw(&c, "the probe to end", &|s| {
+            s.state == Some(State::Idle)
+                && (s.program_outcome.as_ref()).is_some_and(|o| o.seq > seq.0 && o.ok)
+                && (s.probe_result.as_ref()).is_some_and(|r| r.seq > seq.1 && r.tripped)
+        });
+        let touched = s.probe_result.unwrap().position[2];
+        assert!((touched - top[2]).abs() < 0.1, "{touched}");
+        // E-stop before the tick.
+        c.send(Command::EStop);
+        raw(&c, "E-stop", &|s| s.state == Some(State::EStop));
+        c.refresh();
+        assert!(!c.probing());
+        let (ok, message) = c.probed.clone().expect("the probe ended");
+        assert!(!ok, "{message}");
+        assert_eq!(
+            message,
+            "The machine was E-stopped as the probe ended, so nothing is set: probe again."
+        );
+        // Nothing was set: Reset, and the work offset is as it was.
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert!(
+            c.snapshot.work_offset[2].abs() < 1e-9,
+            "{:?}",
+            c.snapshot.work_offset
+        );
+        assert_eq!(c.probed.map(|p| p.0), Some(false));
     }
 
     #[test]

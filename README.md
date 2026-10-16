@@ -170,7 +170,7 @@ Every zero is found from the stock top and the sides it names: a corner from the
 The zero must be on material that is there. Once the background check of the active setup is back, the editor lists under the choice, in the words Run and export refuse it with:
 
 - **The work zero is not on the stock** when earlier setups have cut a spot it is touched off on, or the stock under a zero on the bottom, or when the stock is not square to the setup. The message names the spot and the work zeros still on the stock ("Later: earlier setups have cut the stock's top face at its centre, so the Stock top center work zero is no longer on the stock. Choose one that is, Stock top front-left, …, or Model origin for this setup."). Export and Run refuse the setup, and the Machine step keeps its ○.
-- **No probe finds this work zero** when a vise jaw or clamp stands where the probe would go down beside a side or onto the top's spot (the column out to 10 mm from the side, up to 10 mm above the top), or when the stock-top corner Model origin is found from was cut. The setup can still run: touch the zero off by hand.
+- **No probe finds this work zero** when a vise jaw or clamp stands where the probe would go down beside a side or onto the top's spot (the column out to 10 mm from the side, up to the height the probe travels at: 10 mm above the top, or above the tallest jaw or clamp when one stands higher), or reaches that height under the probe's way between two faces, or when the stock-top corner Model origin is found from was cut. The setup can still run: touch the zero off by hand.
 
 The same point is used everywhere: the program's coordinates (plan point − work zero), the simulation and a run's moves (plan point − work zero + the machine's work offset), the 3D view's **X0 Y0 Z0** marker (drawn on the stock the simulation starts from, or the box the editor knows for the setup), the header's touch-off words, the Run panel's steps and the probe.
 
@@ -447,7 +447,8 @@ Once the machine is Idle, the Control page has everything needed before a job:
   that is what counts. Without contact nothing is set, and a refusal says
   why. Probe Z is offered while Idle with Z referenced, a probe input in the
   profile and that input not already active; otherwise the panel says what
-  is missing. E-stop stops a probe.
+  is missing. E-stop stops a probe; one that has just ended when the E-stop
+  comes sets nothing either, and the panel says so (#166).
 - **Probe corner, Probe edge and Probe centre.** The X, Y and Z work zero of
   the setup picked in the Run panel, from its stock, exactly where its program
   has it (LIO-166): **Probe corner** for a corner of the top or bottom and for
@@ -463,16 +464,24 @@ Once the machine is Idle, the Control page has everything needed before a job:
   is corrected by the tip's radius. A face first touched off its spot,
   because only the other touches tell where that is (a side when the probe
   starts close to a corner, or the top when it starts off the top's spot), is
-  touched once more on it. The probe travels 10 mm above the top (a quarter
-  of the stock's shorter top side when that is less), goes down that far
-  outside where it expects each side, from the stock's size, and probes up to
-  that far past it: start within that distance of the spot. Then it sets the
+  touched once more on it. Between faces the probe travels 10 mm (a quarter
+  of the stock's shorter top side when that is less) above the top, or above
+  the tallest of the setup's jaws and clamps when one stands higher, so a
+  clamp bar on the stock top is flown over, never crossed at its height
+  (#163); when the top of Z travel would hold it within 1 mm of one under
+  its way, it stops before that move, names the clamp, and nothing is set:
+  touch off by hand. It goes down that same clearance outside where it
+  expects each side, from the stock's size, and probes up to that far past
+  it: start within that distance of the spot. Then it sets the
   work position there to the program's (the stock's height in Z for a zero on
   the bottom, the corner's coordinates for Model origin) and backs off; with
   both sides of an axis touched it also gives the stock's measured size.
   Anything touched on the way down, a miss, Stop or E-stop ends it with
-  nothing set. Every move in toward the stock is a probe move at the probe
-  feed. It needs X, Y and Z referenced, and the setup checked since the last
+  nothing set, also an E-stop as it ends, before the work zero is set: the
+  panel says the machine was E-stopped and to probe again (#166). While it
+  runs, the Run strip's setup buttons wait, so the work zero it sets is the
+  picked setup's (#165). Every move in toward the stock is a probe move at
+  the probe feed. It needs X, Y and Z referenced, and the setup checked since the last
   edit. When no probe can find the zero (a jaw or clamp in the way, or the
   stock-top corner of a Model origin cut), the panel says why.
 - **Spindle and coolant.** CW at an RPM, Stop; CCW only when the profile has a
@@ -540,8 +549,9 @@ MACHINE with the setup's machine chosen and picks the setup in the Run
 panel, at once when that machine is connected, or when you press
 **Connect** (it never connects by itself).
 
-1. Pick one of the setups that use the connected machine. AXIS CAM simulates
-   the job up to it and checks it as export would (stock, work zero, rapids,
+1. Pick one of the setups that use the connected machine; while a probe
+   runs, the buttons wait, so the work zero it sets is the picked setup's
+   (#165). AXIS CAM simulates the job up to it and checks it as export would (stock, work zero, rapids,
    holder, jaws and clamps), makes it the active setup and shows it in the
    **Job** view beside the **Tool runs** panel, which lists its **tool runs**: one
    per run of the same tool, as with touch-off G-code programs. The checks follow the
