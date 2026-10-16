@@ -748,13 +748,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
         None => page.into(),
         Some(tag) => widget::Stack::with_children([
             page.into(),
-            container(help::pinned(tag, app.pinned_expanded, app.pinned_paused))
-                .width(Fill)
-                .height(Fill)
-                .align_x(iced::alignment::Horizontal::Right)
-                .align_y(iced::alignment::Vertical::Bottom)
-                .padding([48, 18])
-                .into(),
+            container(help::pinned(
+                tag,
+                app.pinned_expanded,
+                app.pinned_paused,
+                app.esc_closes_pinned_help(),
+            ))
+            .width(Fill)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding([48, 18])
+            .into(),
         ])
         .into(),
     }

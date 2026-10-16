@@ -504,22 +504,8 @@ impl overlay::Overlay<Message, Theme, Renderer> for CardOverlay<'_, '_> {
             renderer,
             &layout::Limits::new(Size::ZERO, bounds),
         );
-        let size = node.size();
-        let control = self.control;
-        let centred_x = control.x + (control.width - size.width) / 2.;
-        let centred_y = control.y + (control.height - size.height) / 2.;
-        let at = match self.position {
-            tooltip::Position::Top => Point::new(centred_x, control.y - size.height - GAP),
-            tooltip::Position::Bottom => Point::new(centred_x, control.y + control.height + GAP),
-            tooltip::Position::Left => Point::new(control.x - size.width - GAP, centred_y),
-            tooltip::Position::Right | tooltip::Position::FollowCursor => {
-                Point::new(control.x + control.width + GAP, centred_y)
-            }
-        };
-        node.move_to(Point::new(
-            at.x.min(bounds.width - size.width).max(0.),
-            at.y.min(bounds.height - size.height).max(0.),
-        ))
+        let at = place(self.control, node.size(), self.position, bounds);
+        node.move_to(at)
     }
     fn draw(
         &self,
@@ -611,13 +597,61 @@ impl overlay::Overlay<Message, Theme, Renderer> for CardOverlay<'_, '_> {
             &layout.bounds(),
             renderer,
         );
-        // Anything but None keeps the pointer from the controls under the card.
-        if interaction == mouse::Interaction::None && cursor.is_over(layout.bounds()) {
+        // Anything but None keeps the pointer from the controls under the
+        // card. A card that had to be clamped over its own control (issue
+        // #184) leaves the pointer to the control instead, except over its
+        // More… and Pause links, so the control can still be clicked, which
+        // closes the card.
+        if interaction == mouse::Interaction::None
+            && cursor.is_over(layout.bounds())
+            && !layout.bounds().intersects(&self.control)
+        {
             mouse::Interaction::Idle
         } else {
             interaction
         }
     }
+}
+/// Where a card of `size` goes beside `control` in a window of `bounds`:
+/// `GAP` away on `position`'s side, centred along it, or on the opposite
+/// side when that side lacks the room (issue #184), then kept inside the
+/// window. A card too tall or wide for either side is clamped over its
+/// control, and `CardOverlay::mouse_interaction` keeps the control live.
+fn place(control: Rectangle, size: Size, position: tooltip::Position, bounds: Size) -> Point {
+    use tooltip::Position::*;
+    let fits = |position: tooltip::Position| match position {
+        Top => control.y - size.height - GAP >= 0.,
+        Bottom => control.y + control.height + GAP + size.height <= bounds.height,
+        Left => control.x - size.width - GAP >= 0.,
+        Right | FollowCursor => control.x + control.width + GAP + size.width <= bounds.width,
+    };
+    let position = match position {
+        FollowCursor => Right,
+        p => p,
+    };
+    let opposite = match position {
+        Top => Bottom,
+        Bottom => Top,
+        Left => Right,
+        Right | FollowCursor => Left,
+    };
+    let position = if !fits(position) && fits(opposite) {
+        opposite
+    } else {
+        position
+    };
+    let centred_x = control.x + (control.width - size.width) / 2.;
+    let centred_y = control.y + (control.height - size.height) / 2.;
+    let at = match position {
+        Top => Point::new(centred_x, control.y - size.height - GAP),
+        Bottom => Point::new(centred_x, control.y + control.height + GAP),
+        Left => Point::new(control.x - size.width - GAP, centred_y),
+        Right | FollowCursor => Point::new(control.x + control.width + GAP, centred_y),
+    };
+    Point::new(
+        at.x.min(bounds.width - size.width).max(0.),
+        at.y.min(bounds.height - size.height).max(0.),
+    )
 }
 pub fn field<'a>(
     content: impl Into<Element<'a, Message>>,
@@ -817,8 +851,21 @@ pub fn focused_field() -> impl Operation<Option<FieldTag>> {
 /// The help the F1 key pinned for a field, for a corner of the window: its
 /// card, open to its More… text unless Less was clicked (no hover overlay
 /// takes the card's toggles here: `Message::HelpMore` and `HelpPause` reach
-/// the app), and how it goes away.
-pub fn pinned<'a>(tag: &FieldTag, expanded: bool, paused: bool) -> Element<'a, Message> {
+/// the app), and how it goes away: Esc, where `esc_closes` (no machine
+/// connected and off the Control page, `Message::EscapeKey`); elsewhere Esc
+/// is kept for the E-stop and the hint says so (issue #185).
+/// The pinned card's hint where Esc puts it away.
+pub const PINNED_HINT_ESC_CLOSES: &str = "F1 pins the focused field's help · Esc closes it";
+/// The pinned card's hint where Esc is kept for the E-stop: while a machine
+/// is connected, and on the Control page.
+pub const PINNED_HINT_ESC_IS_ESTOP: &str =
+    "F1 pins the focused field's help · Esc is kept for the E-stop · Close puts it away";
+pub fn pinned<'a>(
+    tag: &FieldTag,
+    expanded: bool,
+    paused: bool,
+    esc_closes: bool,
+) -> Element<'a, Message> {
     let close = widget::button(text("Close").size(12))
         .on_press(Message::HelpFor(None))
         .padding([4, 9])
@@ -841,10 +888,14 @@ pub fn pinned<'a>(tag: &FieldTag, expanded: bool, paused: bool) -> Element<'a, M
     column![
         card(tag.help(), expanded, paused),
         row![
-            text("F1 pins the focused field's help · Esc closes it")
-                .size(12)
-                .color(Color::from_rgb(0.30, 0.37, 0.44))
-                .width(Length::Fill),
+            text(if esc_closes {
+                PINNED_HINT_ESC_CLOSES
+            } else {
+                PINNED_HINT_ESC_IS_ESTOP
+            })
+            .size(12)
+            .color(Color::from_rgb(0.30, 0.37, 0.44))
+            .width(Length::Fill),
             close
         ]
         .spacing(9)
@@ -3942,6 +3993,154 @@ mod tests {
             again.expect("it opens again").bounds().size(),
             bounds.size(),
             "opened again, the card is the hover text alone"
+        );
+    }
+    #[test]
+    fn the_card_takes_the_side_with_room_and_stays_in_the_window() {
+        use tooltip::Position;
+        let window = Size::new(1120., 720.);
+        let card = Size::new(330., 300.);
+        // A browser row low in the window: no room below, so the card goes
+        // above it, centred on it.
+        let low = Rectangle::new(Point::new(400., 650.), Size::new(120., 24.));
+        let at = place(low, card, Position::Bottom, window);
+        assert_eq!(at, Point::new(295., 650. - 300. - GAP));
+        // The same row with room below keeps the preferred side.
+        let mid = Rectangle::new(Point::new(400., 300.), Size::new(120., 24.));
+        assert_eq!(
+            place(mid, card, Position::Bottom, window),
+            Point::new(295., 324. + GAP)
+        );
+        // A wizard field near the left edge: no room to its left, so the
+        // card goes to its right.
+        let edge = Rectangle::new(Point::new(60., 300.), Size::new(200., 24.));
+        let at = place(edge, card, Position::Left, window);
+        assert_eq!(at, Point::new(260. + GAP, 300. + (24. - 300.) / 2.));
+        // Top and Right flip the same way.
+        let high = Rectangle::new(Point::new(400., 20.), Size::new(120., 24.));
+        assert_eq!(place(high, card, Position::Top, window).y, 44. + GAP);
+        let right = Rectangle::new(Point::new(900., 300.), Size::new(200., 24.));
+        assert_eq!(
+            place(right, card, Position::Right, window).x,
+            900. - 330. - GAP
+        );
+        // No room on either side: the card is kept in the window, over
+        // the control, and the control stays live (the test below).
+        let short = Size::new(1120., 400.);
+        let at = place(mid, card, Position::Bottom, short);
+        assert_eq!(at, Point::new(295., 100.));
+        assert!(Rectangle::new(at, card).intersects(&mid));
+    }
+    #[test]
+    fn a_control_under_a_clamped_card_can_still_be_clicked_to_close_it() {
+        use futures_util::FutureExt;
+        use iced::{Pixels, window};
+        let renderer =
+            <Renderer as renderer::Headless>::new(Font::DEFAULT, Pixels(16.), Some("tiny-skia"))
+                .now_or_never()
+                .flatten()
+                .expect("tiny-skia renderer");
+        // An animated card, about 300 px tall, under a control in the middle
+        // of a window too short for it on either side.
+        let help = field_help("clearance", "x", Target::Setup);
+        assert!(help.diagram.is_some());
+        let mut field = wrap(
+            widget::button("Gap").on_press(Message::Noop),
+            help,
+            tooltip::Position::Bottom,
+        );
+        let mut tree = Tree::new(&field);
+        let window = Size::new(800., 420.);
+        let node = field
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, window),
+            )
+            .move_to(Point::new(0., 200.));
+        let control = node.bounds();
+        let viewport = Rectangle::with_size(window);
+        // Sends an event with the pointer at `at`, to the open card first and
+        // then to the control with the cursor the runtime gives it: the card's
+        // layout if it is open afterwards, the messages, and whether the
+        // control had the pointer.
+        let mut send = |event: Event, at: Point| {
+            let mut messages = vec![];
+            let cursor = mouse::Cursor::Available(at);
+            let mut base_cursor = cursor;
+            if let Some(mut overlay) = field.as_widget_mut().overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &viewport,
+                Vector::ZERO,
+            ) {
+                let card = overlay.as_overlay_mut().layout(&renderer, window);
+                overlay.as_overlay_mut().update(
+                    &event,
+                    Layout::new(&card),
+                    cursor,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                );
+                if overlay
+                    .as_overlay()
+                    .mouse_interaction(Layout::new(&card), cursor, &renderer)
+                    != mouse::Interaction::None
+                {
+                    base_cursor = mouse::Cursor::Unavailable;
+                }
+            }
+            field.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                base_cursor,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let card = field
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .map(|mut o| o.as_overlay_mut().layout(&renderer, window));
+            (card, messages, base_cursor != mouse::Cursor::Unavailable)
+        };
+        let moved = |at| Event::Mouse(mouse::Event::CursorMoved { position: at });
+        let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
+        let inside = Point::new(control.x + 5., control.y + 5.);
+        let outside = Point::new(700., 400.);
+        send(moved(outside), outside);
+        send(moved(inside), inside);
+        std::thread::sleep(HELP_DELAY + Duration::from_millis(100));
+        let (card, _, live) = send(redraw(), inside);
+        let card = card.expect("hovering the control shows its help").bounds();
+        assert!(
+            card.intersects(&control) && card.y >= 0. && card.y + card.height <= window.height,
+            "the card fits on neither side, so it is kept in the window over the control: {card:?} over {control:?}"
+        );
+        assert!(
+            live,
+            "the pointer on the control under the card stays the control's"
+        );
+        // Pressing the control shuts the card, and the release still clicks.
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let (shut, ..) = send(press, inside);
+        assert!(shut.is_none(), "the press shuts the card");
+        let (_, messages, _) = send(release, inside);
+        assert!(
+            matches!(messages[..], [Message::Noop]),
+            "the click reaches the control: {messages:?}"
         );
     }
 }

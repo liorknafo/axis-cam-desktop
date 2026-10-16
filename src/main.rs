@@ -3145,7 +3145,7 @@ impl App {
             Message::EscapeKey => {
                 if let Some(c) = &self.control {
                     c.send(uc100::controller::Command::EStop);
-                } else if self.page != Page::Control {
+                } else if self.esc_closes_pinned_help() {
                     self.pinned_help = None;
                 }
             }
@@ -4508,15 +4508,32 @@ impl App {
         }
         Task::none()
     }
+    /// Whether Esc puts the F1-pinned help away: with no machine connected
+    /// and off the Control page. Otherwise Esc is kept for the E-stop, and
+    /// the pinned card's hint says so (issue #185).
+    pub fn esc_closes_pinned_help(&self) -> bool {
+        self.control.is_none() && self.page != Page::Control
+    }
+    /// Whether the app ticks every 33 ms rather than every 500 ms: while a
+    /// simulation plays, a hover card animates, a machine is connected, or
+    /// the F1-pinned card shows an animation that is not paused (issue #186).
+    pub fn ticks_fast(&self) -> bool {
+        self.playing
+            || self.help_animating
+            || self.control.is_some()
+            || (self
+                .pinned_help
+                .as_ref()
+                .is_some_and(|t| t.help().diagram.is_some())
+                && !self.pinned_paused)
+    }
     fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
-            iced::time::every(
-                if self.playing || self.help_animating || self.control.is_some() {
-                    Duration::from_millis(33)
-                } else {
-                    Duration::from_millis(500)
-                },
-            )
+            iced::time::every(if self.ticks_fast() {
+                Duration::from_millis(33)
+            } else {
+                Duration::from_millis(500)
+            })
             .map(|_| Message::Tick),
             iced::event::listen_with(on_event),
         ];

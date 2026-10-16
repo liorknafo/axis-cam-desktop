@@ -3731,8 +3731,27 @@ flood = { pin = 8 }
         let _ = a.update(Message::EscapeKey);
         tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
         assert_eq!(a.pinned_help, Some(tag));
+        // The pinned card's hint says so while the machine is connected,
+        // and says Esc closes it once it is not (issue #185).
+        assert!(!a.esc_closes_pinned_help());
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == crate::help::PINNED_HINT_ESC_IS_ESTOP)
+                && !texts
+                    .iter()
+                    .any(|t| t == crate::help::PINNED_HINT_ESC_CLOSES),
+            "{texts:?}"
+        );
         let _ = a.update(Message::Disconnect);
         assert!(a.control.is_none());
+        assert!(a.esc_closes_pinned_help());
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t == crate::help::PINNED_HINT_ESC_CLOSES)
+        );
     }
 
     /// A view laid out without a window, as `ui::probe` lays one out, for
@@ -4004,18 +4023,71 @@ flood = { pin = 8 }
         assert_eq!(a.pinned_help.as_ref(), Some(&other));
         let _ = a.update(Message::HelpFor(None));
         assert!(a.pinned_help.is_none());
-        // Esc puts it away on the Work page, where nothing is connected; on
-        // the Control page Esc is kept for the E-stop and leaves it.
+        // Esc puts it away on the Work page, where nothing is connected, and
+        // the card's hint says so; on the Control page Esc is kept for the
+        // E-stop and leaves it, and the hint says that instead (issue #185).
         let _ = a.update(Message::HelpFor(Some(tag.clone())));
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t == crate::help::PINNED_HINT_ESC_CLOSES)
+        );
         let _ = a.update(Message::EscapeKey);
         assert!(a.pinned_help.is_none());
         let _ = a.update(Message::HelpFor(Some(tag.clone())));
         a.page = Page::Control;
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == crate::help::PINNED_HINT_ESC_IS_ESTOP)
+                && !texts
+                    .iter()
+                    .any(|t| t == crate::help::PINNED_HINT_ESC_CLOSES),
+            "{texts:?}"
+        );
         let _ = a.update(Message::EscapeKey);
         assert_eq!(a.pinned_help.as_ref(), Some(&tag));
         // Leaving for another page puts it away.
         let _ = a.update(Message::Page(Page::Work));
         assert!(a.pinned_help.is_none());
+    }
+
+    #[test]
+    fn a_pinned_card_with_an_animation_ticks_fast_until_paused() {
+        let mut a = app();
+        assert!(!a.ticks_fast(), "idle, the app ticks every 500 ms");
+        // A text-only card: no animation to drive.
+        let rpm = crate::help::FieldTag {
+            target: Target::Machine,
+            key: "rpm".into(),
+            label: "Maximum spindle speed · rpm".into(),
+        };
+        assert!(rpm.help().diagram.is_none());
+        let _ = a.update(Message::HelpFor(Some(rpm)));
+        assert!(!a.ticks_fast());
+        // The requested fixture clearance's animated card (issue #186):
+        // fast while it plays, slow while it is paused, fast again on Play.
+        let clearance = crate::help::FieldTag {
+            target: Target::Setup,
+            key: "clearance".into(),
+            label: "Requested fixture clearance · mm".into(),
+        };
+        assert!(clearance.help().diagram.is_some());
+        let _ = a.update(Message::HelpFor(Some(clearance.clone())));
+        assert!(a.ticks_fast());
+        let _ = a.update(Message::HelpPause(true));
+        assert!(!a.ticks_fast());
+        let _ = a.update(Message::HelpPause(false));
+        assert!(a.ticks_fast());
+        // Pinned again after Pause, it plays; put away, the ticks slow.
+        let _ = a.update(Message::HelpPause(true));
+        let _ = a.update(Message::HelpFor(None));
+        assert!(!a.ticks_fast());
+        let _ = a.update(Message::HelpFor(Some(clearance)));
+        assert!(a.ticks_fast(), "a card pinned anew is not paused");
+        let _ = a.update(Message::HelpFor(None));
+        assert!(!a.ticks_fast());
     }
 
     #[test]
