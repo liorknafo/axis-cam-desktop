@@ -3,7 +3,7 @@
 use crate::{
     mesh::{Bounds, Mesh, rotation},
     model::{Setup, num},
-    simulation::CutterShape,
+    simulation::{CutterShape, POINT_RISE},
     stock::Placement,
 };
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -292,10 +292,16 @@ pub(crate) fn swept(
     if lo > hi {
         return false;
     }
+    let cone = POINT_RISE * POINT_RISE * l2;
     let t = if shape == CutterShape::Ball && l2 > 1e-12 {
         (projection
             - v[2] * (r * r - perp).max(0.).sqrt() / (l2.sqrt() * (l2 + v[2] * v[2]).sqrt()))
         .clamp(lo, hi)
+    } else if shape == CutterShape::Drill && l2 > 1e-12 && cone > v[2] * v[2] {
+        // The point's cone is lowest over the interval where the tip's
+        // descent balances the cone's rise; a move steeper than the cone is
+        // lowest at an end of the interval, as a flat end is.
+        (projection - v[2] * perp.sqrt() / (l2.sqrt() * (cone - v[2] * v[2]).sqrt())).clamp(lo, hi)
     } else if v[2] < 0. {
         hi
     } else {
@@ -304,10 +310,10 @@ pub(crate) fn swept(
     let radial = (p[0] - a[0] - t * v[0]).powi(2) + (p[1] - a[1] - t * v[1]).powi(2);
     let bottom = a[2]
         + t * v[2]
-        + if shape == CutterShape::Ball {
-            r - (r * r - radial).max(0.).sqrt()
-        } else {
-            0.
+        + match shape {
+            CutterShape::Ball => r - (r * r - radial).max(0.).sqrt(),
+            CutterShape::Flat => 0.,
+            CutterShape::Drill => POINT_RISE * radial.sqrt(),
         };
     p[2] >= bottom - 0.00001
 }
@@ -398,8 +404,8 @@ mod tests {
         }
     }
     #[test]
-    fn swept_flat_and_ball_are_invariant_to_playback_subdivision() {
-        for shape in [CutterShape::Flat, CutterShape::Ball] {
+    fn swept_shapes_are_invariant_to_playback_subdivision() {
+        for shape in [CutterShape::Flat, CutterShape::Ball, CutterShape::Drill] {
             let (a, _) = frames();
             let mut direct = Volume::new(
                 Bounds {
@@ -454,6 +460,77 @@ mod tests {
         assert_eq!(v.cuts[0].b, [-4., 0., 6.]);
         assert_eq!(v.cuts[1].b, [0., 0., 6.]);
         assert_eq!(v.cuts[2].b, [2., 0., 6.]);
+    }
+    #[test]
+    fn a_drills_point_is_a_cone_under_its_flat_end() {
+        // The cone rises tan 31° per mm from the axis, as `cam::holes` takes
+        // a blind hole's floor to.
+        assert_eq!(POINT_RISE, 31f32.to_radians().tan());
+        let drill = CutterShape::Drill;
+        // A Ø8 drill plunged to Z2: the axis is cut to the tip, the cone
+        // rises 2.4 mm to the rim, and the flutes go on 10 mm up.
+        let plunge = |p: [f32; 3]| swept(p, [0., 0., 8.], [0., 0., 2.], 4., 10., drill);
+        assert!(plunge([0., 0., 2.]));
+        assert!(!plunge([0., 0., 1.99]));
+        for (distance, direction) in [(3.9, [1., 0.]), (2., [0., -1.]), (1., [0.6, 0.8])] {
+            let at = |z: f32| [distance * direction[0], distance * direction[1], z];
+            assert!(!plunge(at(2.)), "{distance}");
+            assert!(!plunge(at(2. + POINT_RISE * distance - 0.01)), "{distance}");
+            assert!(plunge(at(2. + POINT_RISE * distance + 0.01)), "{distance}");
+            assert!(plunge(at(12.)), "{distance}");
+            assert!(!plunge(at(18.01)), "{distance}");
+        }
+        assert!(!plunge([4.1, 0., 8.]));
+        // A flat end of the same size takes the cone as well.
+        assert!(swept(
+            [3.9, 0., 2.],
+            [0., 0., 8.],
+            [0., 0., 2.],
+            4.,
+            10.,
+            CutterShape::Flat
+        ));
+        // Along a ramp the cone is lowest where the tip's descent balances
+        // its rise, and an end of the move is lowest when the move is
+        // steeper than the cone: the lowest cutter sampled over the move.
+        for (a, b) in [
+            ([-4., 0., 1.], [4., 0., 6.]),
+            ([-4., 0., 6.], [4., 0., 1.]),
+            ([-4., 0., 3.], [4., 0., 3.]),
+            ([-2., 0., 8.], [2., 0., 1.]),
+        ] {
+            let mut checked = 0;
+            for x in -14..15 {
+                for y in -7..8 {
+                    let xy = [x as f32 * 0.53, y as f32 * 0.47];
+                    let lowest = (0..=4000)
+                        .map(|j| {
+                            let t = j as f32 / 4000.;
+                            let d = ((xy[0] - a[0] - t * (b[0] - a[0])).powi(2)
+                                + (xy[1] - a[1] - t * (b[1] - a[1])).powi(2))
+                            .sqrt();
+                            if d <= 3. {
+                                a[2] + t * (b[2] - a[2]) + POINT_RISE * d
+                            } else {
+                                f32::INFINITY
+                            }
+                        })
+                        .fold(f32::INFINITY, f32::min);
+                    for z in 0..20 {
+                        let p = [xy[0], xy[1], z as f32 * 0.51];
+                        if (p[2] - lowest).abs() > 0.02 && p[2] < 9. {
+                            assert_eq!(
+                                swept(p, a, b, 3., 30., drill),
+                                p[2] > lowest,
+                                "{a:?}->{b:?} at {p:?}, lowest {lowest}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(checked > 500);
+        }
     }
     #[test]
     fn finite_cutter_does_not_erase_stock_above_its_flutes() {

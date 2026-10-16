@@ -1536,6 +1536,110 @@ mod tests {
         assert!(cells >= 20, "{cells}");
         assert!(bounds[0][0] > b.max[0] - 25. && bounds[1][2] <= b.max[2]);
     }
+    /// The cam tests' Ø24 cup on a base (`cam::tests::cup`) whose Ø8 bore,
+    /// 8 mm deep to its rim, ends in the cone a 118° drill point leaves (#6),
+    /// as triangles: the apex is 2.4 mm under the rim, 1.6 mm over the base.
+    fn cup_with_a_drill_point() -> Vec<[[f32; 3]; 3]> {
+        let point = 4. * 31f32.to_radians().tan();
+        crate::cam::tests::revolved(&[
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - point),
+        ])
+    }
+    #[test]
+    fn a_drills_point_cone_under_a_blind_hole_is_not_a_gouge() {
+        use crate::{model::Machine, simulation::CutterShape};
+        // #155: a Ø8 blind hole whose floor is a 118° drill-point cone, in a
+        // part the size of the example block, on the simulation's 1.3 mm
+        // cells. A flat cylinder swept to the cone's apex removes the ring
+        // of part between the cone and the cylinder, up to 2.4 mm tall: cells
+        // well inside the part, over the threshold. The drill's own shape
+        // removes the cone and no more.
+        let point = 4. * 31f32.to_radians().tan();
+        let apex = 20. - point;
+        let disc = crate::cam::tests::revolved(&[
+            (0., 0.),
+            (60., 0.),
+            (60., 40.),
+            (4., 40.),
+            (4., 20.),
+            (0., apex),
+        ]);
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = Frame::new(&crate::model::Setup::new(Machine::new(3), "G54"), &mesh);
+        let stock = Volume::new(
+            Bounds {
+                min: [-62., -62., -3.],
+                max: [62., 62., 44.],
+            },
+            frame,
+        );
+        assert!((stock.cell[0] - 1.29).abs() < 0.01, "{:?}", stock.cell);
+        let part = PartGrid::of(&stock, disc);
+        assert_eq!(part.gouged(&stock).0, 0);
+        let drilled = |shape: CutterShape| {
+            let mut stock = stock.clone();
+            stock.cut([0., 0., 45.], [0., 0., apex], 4., 30., shape, frame, (0, 0));
+            part.gouged(&stock).0
+        };
+        let flat = drilled(CutterShape::Flat);
+        assert!((GOUGE_CELLS..=30).contains(&flat), "{flat} cells");
+        assert_eq!(drilled(CutterShape::Drill), 0);
+    }
+    #[test]
+    fn a_plan_that_drills_a_blind_hole_with_a_drill_point_floor_passes_the_gouge_stage() {
+        // #155: the planner drills a CAD hole whose floor is the cone a 118°
+        // drill point leaves, with a drill of the bore's size, to the cone's
+        // apex (#6). The simulation removes the cone and no more, so the
+        // coarse gouge check finds nothing well inside the part removed.
+        let (mut doc, _, _) = block();
+        let mesh = crate::mesh::normalize(cup_with_a_drill_point()).unwrap();
+        // T4, a Ø8 drill, at 8000 rpm and 1000 mm/min: 201 m/min and 0.042 mm
+        // per tooth, inside Aluminium 6061-T6's cutting data.
+        let mut tool = Tool::new("Drill 8", "Drill", "8");
+        for (k, v) in [("length", "60"), ("stickout", "65"), ("number", "4")] {
+            tool.p.insert(k.into(), v.into());
+        }
+        doc.tools.push(tool);
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let holes = &report
+            .orientations
+            .iter()
+            .find(|o| o.up == "+Z")
+            .unwrap()
+            .planes
+            .iter()
+            .find(|p| p.kind == "top")
+            .unwrap()
+            .holes;
+        assert_eq!(holes.len(), 1, "{holes:?}");
+        assert!(
+            !holes[0].through && (holes[0].diameter - 8.).abs() < 0.02,
+            "{holes:?}"
+        );
+        let mut drill = op("Drill", 4, plane(&report, "+Z", "top"));
+        drill.rpm = 8000.;
+        drill.feed = 1000.;
+        let (check, job) = check(&doc, &mesh, &report, &plan_of(vec![("+Z", vec![drill])]));
+        assert!(check.passed, "{:?}", stages(&check));
+        assert_eq!(check.operations.len(), 1);
+        let job = job.unwrap();
+        let setup = &job.setups[0];
+        let plan =
+            crate::simulation::generate(setup, &setup.operations[0], &job.tools[3], &mesh).unwrap();
+        // To the apex, 10.4 mm under the part's top and 14.4 under the stock's.
+        assert!(
+            (plan.stock.max[2] - plan.target - 14.4).abs() < 0.01,
+            "{}",
+            plan.target
+        );
+        assert_eq!(plan.shape, crate::simulation::CutterShape::Drill);
+    }
     #[test]
     fn the_command_line_check_matches_the_library() {
         let (mut doc, _, report) = block();
