@@ -519,6 +519,7 @@ impl Run {
                 ));
             }
         }
+        e.extend(a_problems(&setup.machine, &c.config));
         match OFFSETS.iter().position(|o| *o == p.offset) {
             Some(i) if i < 6 => {
                 if i != s.active_wcs {
@@ -807,6 +808,42 @@ impl Run {
             stickout: p.ops[op].stickout,
         })
     }
+}
+
+/// Why a machine with an A axis cannot run on this UC100 profile: the
+/// profile has no `[axes.a]` or no soft limits on it, or its A range is not
+/// the machine's rotary range in AXIS CAM (degrees), as the XYZ travel must
+/// be. Empty for a machine without an A axis (LIO-184).
+fn a_problems(
+    machine: &crate::model::Machine,
+    config: &uc100::config::MachineConfig,
+) -> Vec<String> {
+    if !machine.has_a() {
+        return vec![];
+    }
+    let Some(a) = config.axes.get(3) else {
+        return vec![format!(
+            "{} has an A axis in AXIS CAM, but the UC100 profile has no [axes.a]. Add the A axis to the profile.",
+            machine.name()
+        )];
+    };
+    let Some((lo, hi)) = a.soft_min.zip(a.soft_max) else {
+        return vec!["The UC100 profile sets no soft limits on A, so AXIS CAM cannot check that the job fits the machine.".into()];
+    };
+    let (min, max) = (
+        crate::model::num(&machine.p, "rotary_min"),
+        crate::model::num(&machine.p, "rotary_max"),
+    );
+    let Some((min, max)) = min.zip(max) else {
+        return vec!["The machine's rotary range in AXIS CAM is not a number.".into()];
+    };
+    // Both ends: an angle, unlike a travel, has a place as well as a length.
+    if (min as f64 - lo).abs() > 0.01 || (max as f64 - hi).abs() > 0.01 {
+        return vec![format!(
+            "The machine's A range in AXIS CAM is {min:.3} to {max:.3} degrees, but the UC100 profile's soft limits are {lo:.3} to {hi:.3} degrees. Make them agree."
+        )];
+    }
+    vec![]
 }
 
 /// The operation a block belongs to, if it names one.
@@ -1257,6 +1294,7 @@ mod tests {
     use super::*;
     use crate::post::{OpState, blocks, fixture};
     use crate::simulation::{Motion, Plan};
+    use uc100::config::MachineConfig;
 
     fn settings() -> PostSettings {
         PostSettings {
@@ -1527,5 +1565,62 @@ mod tests {
             run.programs.as_deref().and_then(|p| p.as_ref().err()),
             Some(&vec![REMOVED.to_string()])
         );
+    }
+
+    fn rotary(range: Option<(&str, &str)>) -> crate::model::Machine {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = crate::control::rotary_machine(dir.path()).unwrap();
+        if let Some((min, max)) = range {
+            m.p.insert("rotary_min".into(), min.into());
+            m.p.insert("rotary_max".into(), max.into());
+        }
+        m
+    }
+
+    #[test]
+    fn a_range_that_matches_the_profiles_a_soft_limits_is_accepted() {
+        let config = MachineConfig::from_toml(&crate::control::rotary_profile()).unwrap();
+        assert_eq!(a_problems(&rotary(None), &config), Vec::<String>::new());
+        // The same width somewhere else does not agree.
+        let shifted = rotary(Some(("0", "360")));
+        assert_eq!(a_problems(&shifted, &config).len(), 1);
+    }
+
+    #[test]
+    fn a_range_that_differs_from_the_profiles_a_soft_limits_is_refused() {
+        let config = MachineConfig::from_toml(&crate::control::rotary_profile()).unwrap();
+        let problems = a_problems(&rotary(Some(("-90", "90"))), &config);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("A range in AXIS CAM is -90.000 to 90.000 degrees"));
+        assert!(problems[0].contains("soft limits are -180.000 to 180.000 degrees"));
+        // Soft limits on A are required, as on XYZ.
+        let mut open = config.clone();
+        open.axes.a.as_mut().unwrap().soft_max = None;
+        let problems = a_problems(&rotary(None), &open);
+        assert!(
+            problems[0].contains("sets no soft limits on A"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_an_a_axis_on_a_profile_without_one_is_refused() {
+        let config = MachineConfig::from_toml(include_str!("../assets/jy5800.toml")).unwrap();
+        let problems = a_problems(&rotary(None), &config);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("has no [axes.a]"));
+    }
+
+    #[test]
+    fn a_machine_without_an_a_axis_is_not_asked_about_a() {
+        let dir = tempfile::tempdir().unwrap();
+        let owners = crate::control::owners_machine(dir.path()).unwrap();
+        for toml in [
+            include_str!("../assets/jy5800.toml").to_string(),
+            crate::control::rotary_profile(),
+        ] {
+            let config = MachineConfig::from_toml(&toml).unwrap();
+            assert!(a_problems(&owners, &config).is_empty());
+        }
     }
 }

@@ -173,6 +173,8 @@ pub enum Message {
     Flip(&'static str),
     AssignMachine(String),
     NewMachine,
+    /// Adds the Jingyan CNC4030 with its rotary unit to the Machine library.
+    AddRotaryMachine,
     EditMachine(String),
     WizardStep(usize),
     SaveMachine,
@@ -3108,6 +3110,9 @@ impl App {
                             .into(),
                         );
                     }
+                    if matches!(k, "axes" | "arrangement") {
+                        self.machine_draft.fill_rotary_defaults();
+                    }
                 }
                 Target::Tool => {
                     self.tool_draft.p.insert(k.into(), v);
@@ -3531,10 +3536,30 @@ impl App {
                 self.wizard_step = 0;
                 self.page = Page::Wizard;
             }
+            Message::AddRotaryMachine => {
+                let dir = self
+                    .state_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                match control::rotary_machine(dir) {
+                    Ok(m) => {
+                        self.status = format!(
+                            "{} is in the Machine library, with an assumed rotary unit still to be measured.",
+                            m.name()
+                        );
+                        self.doc.machines.push(m);
+                        self.touch();
+                    }
+                    Err(e) => {
+                        self.status = format!("Could not write the rotary UC100 profile: {e}.")
+                    }
+                }
+            }
             Message::EditMachine(id) => {
                 if let Some(m) = self.doc.machines.iter().find(|m| m.id == id) {
                     self.machine_draft = m.clone();
                     self.machine_draft.fill_post_defaults();
+                    self.machine_draft.fill_rotary_defaults();
                     self.wizard_step = 0;
                     self.page = Page::Wizard;
                 }
