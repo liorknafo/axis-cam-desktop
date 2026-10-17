@@ -2,6 +2,7 @@ use crate::{
     App, Message, Page, Target,
     help::{self, Help, HelpButton},
     holding::Held,
+    manual,
     material::SpeedFeed,
     model::*,
     planner::Dropped,
@@ -1016,6 +1017,10 @@ fn ribbon(app: &App) -> Element<'_, Message> {
     .spacing(2)
     .align_x(Alignment::Center);
     groups = groups.push(setup).push(rule::vertical(1));
+    let manual_setup = app
+        .doc
+        .active_setup()
+        .is_some_and(|s| manual::is_manual(&s.machine));
     for (label, range) in [
         ("2D MILLING", 0..5),
         ("3D FINISHING", 5..8),
@@ -1024,7 +1029,8 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         let mut buttons = Row::new().spacing(1);
         for s in &Strategy::ALL[range] {
             let s = *s;
-            let available = app.is_sample() || s.imported_preview();
+            let reason = (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS);
+            let available = reason.is_none() && (app.is_sample() || s.imported_preview());
             // An unavailable strategy is dimmed: the icon at low opacity and
             // the label in a light grey, with its reason in the hover help.
             let glyph = icon(app, s, 29.).opacity(if available { 1. } else { DIMMED });
@@ -1044,16 +1050,16 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 .align_x(Alignment::Center),
             )
             .padding([5, 5])
-            .on_press(if available {
-                Message::AddOp(s)
-            } else {
-                Message::Page(Page::Audit)
+            .on_press(match (available, reason) {
+                (true, _) => Message::AddOp(s),
+                (false, Some(_)) => Message::Noop,
+                (false, None) => Message::Page(Page::Audit),
             })
             .style(button::text);
-            buttons = buttons.push(if available {
-                HelpButton::new(tile, &Message::AddOp(s), s.name())
-            } else {
-                HelpButton::unavailable(tile, s)
+            buttons = buttons.push(match (available, reason) {
+                (true, _) => HelpButton::new(tile, &Message::AddOp(s), s.name()),
+                (false, Some(reason)) => HelpButton::dimmed(tile, s, reason),
+                (false, None) => HelpButton::unavailable(tile, s),
             });
         }
         groups = groups
@@ -1484,6 +1490,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
     tree = tree
         .push(space().height(6))
         .push(secondary("+ Add setup", Message::AddSetup).width(Fill));
+    if app.doc.machines.iter().any(manual::is_manual) {
+        tree = tree.push(secondary("+ Add manual setup", Message::AddManualSetup).width(Fill));
+    }
     let footer = column![
         rule::horizontal(1),
         muted("PROJECT UNITS"),
@@ -3439,13 +3448,42 @@ fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
     }
     c.into()
 }
-/// The picker of the library's vises or clamps (`kind`) for the active setup.
-fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
-    let choices: Vec<Named> = app
-        .doc
+/// A check box per library machine for the `machines` of a tool or holder
+/// (`p`): none checked fits every CNC machine.
+fn machine_boxes<'a>(
+    app: &'a App,
+    p: &Fields,
+    toggle: fn(String, bool) -> Message,
+) -> Element<'a, Message> {
+    let listed: Vec<&str> = get(p, "machines").split(',').map(str::trim).collect();
+    let mut c = column![muted("Machines")].spacing(5);
+    for m in &app.doc.machines {
+        let id = m.id.clone();
+        c = c.push(help::wrap(
+            checkbox(listed.contains(&m.id.as_str()))
+                .label(m.name().to_string())
+                .on_toggle(move |on| toggle(id.clone(), on))
+                .text_size(12),
+            help::command(&toggle(m.id.clone(), true), m.name().to_string()),
+            widget::tooltip::Position::Right,
+        ));
+    }
+    c.push(muted("None checked: every CNC machine.").size(12))
+        .into()
+}
+/// The library's vises or clamps (`kind`) that fit the active setup's machine.
+pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::holding::Holder> {
+    let machine = &app.doc.setup().machine;
+    app.doc
         .workholding
         .iter()
-        .filter(|h| h.kind() == kind)
+        .filter(|h| h.kind() == kind && manual::fits(get(&h.p, "machines"), machine))
+        .collect()
+}
+/// The picker of the library's vises or clamps (`kind`) for the active setup.
+fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
+    let choices: Vec<Named> = fitting_holders(app, kind)
+        .into_iter()
         .map(|h| Named {
             id: h.id.clone(),
             name: h.name().to_string(),
@@ -3907,7 +3945,11 @@ fn machines(app: &App) -> Element<'_, Message> {
                 space().width(35),
                 muted(format!("Spindle  {} rpm", get(&m.p, "rpm"))),
                 space().width(35),
-                muted(format!("Controller  {}", get(&m.p, "controller"))),
+                muted(if manual::is_manual(m) {
+                    "Manual mill  ·  no G-code".to_string()
+                } else {
+                    format!("Controller  {}", get(&m.p, "controller"))
+                }),
                 space().width(35),
                 muted(get(&m.p, "arrangement"))
             ]
@@ -3942,43 +3984,102 @@ fn machines(app: &App) -> Element<'_, Message> {
     .height(Fill)
     .into()
 }
+/// The wizard's steps for `m`: a manual mill has no kinematics or controller
+/// to describe, and one step of its own in their place.
+pub(crate) fn wizard_steps(m: &Machine) -> Vec<&'static str> {
+    if manual::is_manual(m) {
+        vec!["Identity", "Travel & spindle", "Manual mill", "Review"]
+    } else {
+        vec![
+            "Identity",
+            "Travel & spindle",
+            "Kinematics",
+            "Controller",
+            "Review",
+        ]
+    }
+}
 fn wizard(app: &App) -> Element<'_, Message> {
     let m = &app.machine_draft;
     let p = &m.p;
     let t = Target::Machine;
-    let steps = [
-        "Identity",
-        "Travel & spindle",
-        "Kinematics",
-        "Controller",
-        "Review",
-    ];
+    let steps = wizard_steps(m);
+    let step = app.wizard_step.min(steps.len() - 1);
     let mut nav = Row::new().spacing(8);
     for (i, label) in steps.iter().enumerate() {
         nav = nav.push(btn(
             format!("{}  {label}", i + 1),
             Message::WizardStep(i),
-            i == app.wizard_step,
+            i == step,
         ));
     }
-    let mut form = column![bold(steps[app.wizard_step], 22)].spacing(16);
-    match app.wizard_step {
-        0 => {
-            form=form.push(field(p,"name","Machine name",t)).push(choice(p,"axes","Number of axes",&["3","4","5"],t)).push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
+    let mut form = column![bold(steps[step], 22)].spacing(16);
+    match steps[step] {
+        "Identity" => {
+            form = form
+                .push(field(p, "name", "Machine name", t))
+                .push(choice_value(
+                    p,
+                    if manual::is_manual(m) {
+                        "Manual"
+                    } else {
+                        "CNC"
+                    },
+                    "kind",
+                    "Machine kind",
+                    &["CNC", "Manual"],
+                    t,
+                ));
+            if !manual::is_manual(m) {
+                form = form.push(choice(p, "axes", "Number of axes", &["3", "4", "5"], t));
+            }
+            form=form.push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
         }
-        1 => {
-            for (k, l) in [
-                ("x", "X travel"),
-                ("y", "Y travel"),
-                ("z", "Z travel"),
-                ("rpm", "Maximum spindle speed · rpm"),
-                ("power", "Spindle power · W"),
-                ("feed", "Maximum feed · machine units/min"),
-            ] {
+        "Travel & spindle" => {
+            let spindle = if manual::is_manual(m) {
+                vec![
+                    ("power", "Spindle power · W"),
+                    ("speeds", "Spindle speeds · rpm, or a range"),
+                    ("hand_feed", "Hand feed · mm/min"),
+                    ("hand_rapid", "Hand rapid · mm/min"),
+                    ("turn_x", "X per handwheel turn · mm"),
+                    ("turn_y", "Y per handwheel turn · mm"),
+                    ("turn_z", "Z per handwheel turn · mm"),
+                ]
+            } else {
+                vec![
+                    ("rpm", "Maximum spindle speed · rpm"),
+                    ("power", "Spindle power · W"),
+                    ("feed", "Maximum feed · machine units/min"),
+                ]
+            };
+            for (k, l) in [("x", "X travel"), ("y", "Y travel"), ("z", "Z travel")]
+                .into_iter()
+                .chain(spindle)
+            {
                 form = form.push(field(p, k, l, t));
             }
         }
-        2 => {
+        "Manual mill" => {
+            form = form
+                .push(choice(
+                    p,
+                    "dro_comp",
+                    "DRO tool radius compensation",
+                    &["Yes", "No"],
+                    t,
+                ))
+                .push(field(p, "pass_time", "Time per pass · s", t))
+                .push(field(p, "tool_time", "Time per tool change · min", t))
+                .push(field(
+                    p,
+                    "move_time",
+                    "Time to move the stock to another machine · min",
+                    t,
+                ))
+                .push(note("Manual mill — no G-code; MACHINE shows the steps."));
+        }
+        "Kinematics" => {
             let modes = match m.axes() {
                 4 => vec!["Indexed (3+1)", "Continuous 4-axis"],
                 5 => vec!["Indexed (3+2)", "Simultaneous 5-axis"],
@@ -4060,7 +4161,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 ));
             }
         }
-        3 => {
+        "Controller" => {
             form=form.push(choice(p,"controller","Controller / intended postprocessor",&["LinuxCNC","UC100","GRBL","Mach3 / Mach4","Fanuc","Haas","Siemens","Heidenhain","Custom"],t)).push(choice(p,"tool_change","Tool change",&["Manual","Automatic"],t)).push(choice(p,"tcp","Tool center point control",&["No","Yes"],t)).push(note("LinuxCNC has a 3-axis postprocessor. AXIS CAM drives a UC100 machine itself. Other controllers are saved for planning; exporting G-code for them is refused."));
             if get(p, "controller") == "LinuxCNC" {
                 form = form
@@ -4123,6 +4224,15 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
+        _ if manual::is_manual(m) => {
+            form = form
+                .push(bold(m.name(), 18))
+                .push(muted(format!("Manual mill · speeds {} rpm", get(p, "speeds"))))
+                .push(muted(format!("Travel: {} × {} × {} {}", get(p, "x"), get(p, "y"), get(p, "z"), get(p, "units"))))
+                .push(muted(format!("Hand feed {} · hand rapid {} mm/min", get(p, "hand_feed"), get(p, "hand_rapid"))))
+                .push(warnings(m.issues()))
+                .push(note("Save this profile to your local library. Assign it to a setup, or add a manual setup, to cut on it."));
+        }
         _ => {
             form=form.push(bold(m.name(),18)).push(muted(format!("{}-axis · {} · {}",m.axes(),get(p,"mode"),get(p,"controller")))).push(muted(format!("Travel: {} × {} × {} {}",get(p,"x"),get(p,"y"),get(p,"z"),get(p,"units")))).push(muted(format!("Spindle: {} rpm · Feed: {} {}/min",get(p,"rpm"),get(p,"feed"),get(p,"units")))).push(muted(format!("Post: {} · {} · G64 P{} · dwell {} s", post_setting(p, "post_tool_length"), post_setting(p, "post_retract"), post_setting(p, "post_blend"), post_setting(p, "post_dwell")))).push(warnings(m.issues())).push(note("Save this profile to your local library. Assign it to a setup to capture this version of its settings."));
         }
@@ -4132,14 +4242,11 @@ fn wizard(app: &App) -> Element<'_, Message> {
         space().width(Fill)
     ]
     .spacing(8);
-    if app.wizard_step > 0 {
-        actions = actions.push(secondary(
-            "Previous",
-            Message::WizardStep(app.wizard_step - 1),
-        ));
+    if step > 0 {
+        actions = actions.push(secondary("Previous", Message::WizardStep(step - 1)));
     }
-    actions = actions.push(if app.wizard_step < 4 {
-        primary("Continue", Message::WizardStep(app.wizard_step + 1))
+    actions = actions.push(if step + 1 < steps.len() {
+        primary("Continue", Message::WizardStep(step + 1))
     } else {
         primary(
             app.resume_label().unwrap_or("Save machine profile".into()),
@@ -5697,6 +5804,7 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     ] {
         form = form.push(field(p, k, l, t));
     }
+    form = form.push(machine_boxes(app, p, Message::ToolMachine));
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues));
@@ -5873,6 +5981,7 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let mut issues = draft.issues();
     issues.extend(app.doc.holder_name_issues(draft));
     form = form
+        .push(machine_boxes(app, p, Message::HolderMachine))
         .push(field(p, "notes", "Notes", t))
         .push(warnings(issues));
     let (save, delete) = holder_labels(draft);

@@ -158,6 +158,8 @@ pub enum Message {
     Generate,
     GenerateAll,
     AddSetup,
+    /// Inserts a setup on the first manual machine, before the CNC setups.
+    AddManualSetup,
     DuplicateSetup,
     RemoveSetup,
     MoveSetup(isize),
@@ -168,6 +170,10 @@ pub enum Message {
     WizardStep(usize),
     SaveMachine,
     DeleteMachine(String),
+    /// A machine's check box in the tool editor (machine id, checked).
+    ToolMachine(String, bool),
+    /// A machine's check box in the workholding editor (machine id, checked).
+    HolderMachine(String, bool),
     /// Opens a file dialog for the machine draft's UC100 profile.
     BrowseUc100Profile,
     /// The chosen UC100 profile; None when the dialog was cancelled.
@@ -2695,7 +2701,11 @@ impl App {
                     }
                 }
                 Target::Machine => {
-                    self.machine_draft.p.insert(k.into(), v.clone());
+                    if k == "kind" {
+                        manual::set_kind(&mut self.machine_draft, &v);
+                    } else {
+                        self.machine_draft.p.insert(k.into(), v.clone());
+                    }
                     if k == "axes" {
                         let axes = self.machine_draft.axes();
                         self.machine_draft.p.insert(
@@ -3008,6 +3018,14 @@ impl App {
                     self.status = "Choose the machine for the first setup.".into();
                 }
             }
+            Message::AddManualSetup => match self.doc.add_manual_setup() {
+                Ok(()) => {
+                    self.stop_selection();
+                    self.touch();
+                    self.status = "Manual setup added before the CNC setups.".into();
+                }
+                Err(e) => self.status = e,
+            },
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());
                 self.doc.active = s.id.clone();
@@ -3080,7 +3098,9 @@ impl App {
                     self.page = Page::Wizard;
                 }
             }
-            Message::WizardStep(s) => self.wizard_step = s.min(4),
+            Message::WizardStep(s) => {
+                self.wizard_step = s.min(ui::wizard_steps(&self.machine_draft).len() - 1)
+            }
             Message::BrowseUc100Profile => {
                 return Task::perform(
                     async {
@@ -3356,6 +3376,9 @@ impl App {
                 }
             }
             Message::SaveMachine => {
+                if manual::is_manual(&self.machine_draft) {
+                    manual::settle(&mut self.machine_draft);
+                }
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
                     let mut m = self.machine_draft.clone();
@@ -3375,6 +3398,16 @@ impl App {
                 } else {
                     self.status = errors.join(" ");
                 }
+            }
+            Message::ToolMachine(id, on) => {
+                let p = &mut self.tool_draft.p;
+                let list = manual::toggle(get(p, "machines"), &id, on);
+                p.insert("machines".into(), list);
+            }
+            Message::HolderMachine(id, on) => {
+                let p = &mut self.holder_draft.p;
+                let list = manual::toggle(get(p, "machines"), &id, on);
+                p.insert("machines".into(), list);
             }
             Message::DeleteMachine(id) => {
                 if self.control.as_ref().is_some_and(|c| c.machine_id == id) {

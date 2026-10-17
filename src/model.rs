@@ -176,6 +176,28 @@ pub const FEATURES: [&str; 9] = [
     "Hole 4 · Ø8",
 ];
 
+/// The setup keys a manual setup put first takes from the old first setup,
+/// besides its stock: orientation, zero, offset and holding.
+const HANDED_OVER: [&str; 17] = [
+    "rx",
+    "ry",
+    "rz",
+    "tx",
+    "ty",
+    "tz",
+    "origin",
+    "offset",
+    "holding",
+    "holder",
+    "holding_gap",
+    "vise_axis",
+    "vise_offset",
+    "vise_grip",
+    "clamps",
+    "fixture",
+    "clearance",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Machine {
     pub id: String,
@@ -1659,7 +1681,7 @@ impl Document {
         let mut offsets = HashSet::new();
         for s in &self.setups {
             e.extend(s.issues().into_iter().map(|x| format!("{}: {x}", s.name())));
-            if !offsets.insert(get(&s.p, "offset")) {
+            if !crate::manual::is_manual(&s.machine) && !offsets.insert(get(&s.p, "offset")) {
                 e.push(format!(
                     "{}: work offset is also used by another setup.",
                     s.name()
@@ -1677,6 +1699,40 @@ impl Document {
             e.push(x)
         }
         e
+    }
+    /// Inserts a setup named "Big mill" on the first manual machine of the
+    /// library, before the first CNC setup. Put first, it takes the stock,
+    /// orientation, zero and holding of the old first setup, which then starts
+    /// from the stock it leaves. `active` is a setup id, so it keeps its setup.
+    pub fn add_manual_setup(&mut self) -> Result<(), String> {
+        let Some(machine) = self.machines.iter().find(|m| crate::manual::is_manual(m)) else {
+            return Err("Add a manual machine to the library first.".into());
+        };
+        let at = self
+            .setups
+            .iter()
+            .position(|s| !crate::manual::is_manual(&s.machine))
+            .unwrap_or(self.setups.len());
+        let mut setup = Setup::new(machine.clone(), &self.next_offset());
+        setup.p.insert("name".into(), "Big mill".into());
+        match (at, self.setups.first()) {
+            (0, Some(old)) => {
+                for (k, v) in &old.p {
+                    if HANDED_OVER.contains(&k.as_str()) || k.starts_with("stock_") {
+                        setup.p.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            _ if !self.sample_model => {
+                for key in ["stock_x", "stock_y", "stock_z"] {
+                    setup.p.insert(key.into(), String::new());
+                }
+            }
+            _ => {}
+        }
+        self.setups.insert(at, setup);
+        self.sync_stock_sources();
+        Ok(())
     }
     pub fn setup_sheet(&self, mesh: Option<&crate::mesh::Mesh>) -> String {
         let mut s = format!(
@@ -1701,11 +1757,17 @@ impl Document {
                 None => "not set".into(),
             };
             s += &format!(
-                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
+                "\n## {} · {}\n\nMachine: {}\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
                 setup.name(),
                 get(&setup.p, "offset"),
-                setup.machine.name(),
-                setup.machine.version,
+                if crate::manual::is_manual(&setup.machine) {
+                    format!(
+                        "{} (manual mill)\n\nManual mill: steps on the MACHINE page",
+                        setup.machine.name()
+                    )
+                } else {
+                    format!("{} (v{})", setup.machine.name(), setup.machine.version)
+                },
                 crate::stock::sheet_description(setup, mesh),
                 get(&setup.p, "origin"),
                 crate::holding::fixture_note(setup)
@@ -3290,5 +3352,97 @@ mod tests {
             none.holding_issues(0, None),
             ["\"Glue\" is not a workholding choice."]
         );
+    }
+}
+#[cfg(test)]
+mod manual_setups {
+    use super::*;
+    fn with_manual() -> Document {
+        let mut d = Document::sample();
+        d.machines.push(crate::manual::defaults());
+        d
+    }
+    fn stock(s: &Setup) -> Vec<(&String, &String)> {
+        s.p.iter()
+            .filter(|(k, _)| k.starts_with("stock_") && *k != "stock_source")
+            .collect()
+    }
+    #[test]
+    fn a_manual_setup_put_first_takes_what_the_old_first_setup_had() {
+        let mut d = with_manual();
+        d.setup_mut().p.insert("stock_left".into(), "7".into());
+        d.setup_mut().p.insert("rz".into(), "90".into());
+        d.setup_mut().p.insert("tx".into(), "3".into());
+        d.setup_mut()
+            .p
+            .insert("origin".into(), "Stock top corner".into());
+        d.setup_mut().p.insert("holding".into(), "Vise".into());
+        d.setup_mut().p.insert("vise_axis".into(), "Y".into());
+        let (old, was) = (d.setups[0].id.clone(), d.setups[0].clone());
+        d.add_manual_setup().unwrap();
+        assert_eq!(d.setups.len(), 2);
+        let (new, kept) = (&d.setups[0], &d.setups[1]);
+        assert_eq!(new.name(), "Big mill");
+        assert!(crate::manual::is_manual(&new.machine));
+        assert_eq!(stock(new), stock(&was));
+        for k in [
+            "rx",
+            "ry",
+            "rz",
+            "tx",
+            "ty",
+            "tz",
+            "origin",
+            "offset",
+            "holding",
+            "vise_axis",
+        ] {
+            assert_eq!(get(&new.p, k), get(&was.p, k), "{k}");
+        }
+        assert!(new.operations.is_empty());
+        assert_eq!(kept.id, old);
+        assert_eq!(get(&new.p, "stock_source"), "fresh");
+        assert_eq!(get(&kept.p, "stock_source"), new.id);
+        assert_eq!(d.active, old);
+        assert_eq!(d.index(), 1);
+        assert_eq!(d.issues(), Vec::<String>::new());
+    }
+    #[test]
+    fn a_second_manual_setup_goes_before_the_first_cnc_setup() {
+        let mut d = with_manual();
+        d.add_manual_setup().unwrap();
+        let first = d.setups[0].id.clone();
+        d.add_manual_setup().unwrap();
+        assert_eq!(d.setups.len(), 3);
+        assert_eq!(d.setups[0].id, first);
+        assert!(crate::manual::is_manual(&d.setups[1].machine));
+        assert!(!crate::manual::is_manual(&d.setups[2].machine));
+        assert_eq!(get(&d.setups[1].p, "stock_source"), first);
+        assert_eq!(get(&d.setups[2].p, "stock_source"), d.setups[1].id);
+        assert_eq!(d.active, d.setups[2].id);
+        assert_eq!(d.issues(), Vec::<String>::new());
+    }
+    #[test]
+    fn a_manual_setup_needs_a_manual_machine_in_the_library() {
+        let mut d = Document::sample();
+        assert!(d.add_manual_setup().is_err());
+        assert_eq!(d.setups.len(), 1);
+    }
+    #[test]
+    fn the_setup_sheet_names_the_manual_mill_and_points_to_the_steps() {
+        let mut d = with_manual();
+        let cnc = d.setup_sheet(None);
+        assert!(cnc.contains("Machine: Workshop Mill (v1)"), "{cnc}");
+        assert!(!cnc.contains("Manual mill"));
+        d.add_manual_setup().unwrap();
+        let sheet = d.setup_sheet(None);
+        assert!(
+            sheet.contains(
+                "Machine: Manual Mill (manual mill)\n\nManual mill: steps on the MACHINE page"
+            ),
+            "{sheet}"
+        );
+        assert!(sheet.contains("Machine: Workshop Mill (v1)"));
+        assert_eq!(sheet.matches("steps on the MACHINE page").count(), 1);
     }
 }

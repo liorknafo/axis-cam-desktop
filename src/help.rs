@@ -99,6 +99,18 @@ impl<'a> HelpButton<'a> {
             help: unavailable_help(strategy),
         }
     }
+    /// A ribbon tile for a strategy the active setup's machine cannot run:
+    /// the hover help is the machine's `reason`.
+    pub fn dimmed(
+        button: widget::Button<'a, Message>,
+        strategy: Strategy,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            button,
+            help: dimmed_help(strategy, reason),
+        }
+    }
     pub fn width(mut self, width: impl Into<Length>) -> Self {
         self.button = self.button.width(width);
         self
@@ -119,6 +131,13 @@ pub fn unavailable_help(strategy: Strategy) -> Help {
     )
     .more(strategy.help())
     .animated(Diagram::Operation(strategy))
+}
+/// The hover help of a strategy dimmed by the machine: its reason, and under
+/// More… what the strategy does.
+pub fn dimmed_help(strategy: Strategy, reason: &'static str) -> Help {
+    Help::text(format!("{} (unavailable)", strategy.name()), reason)
+        .more(strategy.help())
+        .animated(Diagram::Operation(strategy))
 }
 impl<'a> From<HelpButton<'a>> for Element<'a, Message> {
     fn from(b: HelpButton<'a>) -> Self {
@@ -1020,6 +1039,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Add another machining position with its own machine, stock, work offset and operations. Use a new setup when you reclamp, flip or reorient the part. Without a setup, choose or configure your machine first.",
             "",
         ),
+        AddManualSetup => (
+            "Add a setup on the manual mill before the CNC setups, for the cuts the big mill makes first. Put first, it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock it leaves.",
+            "",
+        ),
         SetupEditor => (
             "Set the machine, work coordinate system, stock, part orientation and workholding for the current setup.",
             "",
@@ -1141,8 +1164,20 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this profile from the reusable library. Existing setup snapshots remain available.",
             "",
         ),
+        WizardStep(2) if label.ends_with("Manual mill") => (
+            "Say if the DRO compensates the tool radius, and the minutes a pass, a tool change and moving the stock cost on this mill.",
+            "",
+        ),
+        WizardStep(3) if label.ends_with("Review") => (
+            "Review the profile and resolve configuration issues before saving it to your local machine library.",
+            "",
+        ),
+        ToolMachine(..) | HolderMachine(..) => (
+            "Check the machines that hold this entry. With none checked it fits every CNC machine and no manual machine.",
+            "",
+        ),
         WizardStep(0) => (
-            "Name the machine and choose 3, 4 or 5 axes and the units used by its specification.",
+            "Name the machine, choose a CNC or a manual mill, then 3, 4 or 5 axes for a CNC, and the units used by its specification.",
             "",
         ),
         WizardStep(1) => (
@@ -3744,6 +3779,9 @@ mod tests {
             RunOnMachine(0),
             NewMachine,
             AddSetup,
+            AddManualSetup,
+            ToolMachine("m".into(), true),
+            HolderMachine("m".into(), true),
             StockDetail(Detail::Draft),
             StockDetail(Detail::Standard),
             StockDetail(Detail::Fine),
@@ -3899,6 +3937,10 @@ mod tests {
             .collect();
         for s in Strategy::ALL {
             cards.push((format!("unavailable:{s:?}"), unavailable_help(s)));
+            cards.push((
+                format!("dimmed:{s:?}"),
+                dimmed_help(s, crate::manual::ONE_AXIS),
+            ));
             let b = HelpButton::operation(
                 widget::button("x"),
                 s,

@@ -94,6 +94,36 @@ pub fn fits(machines: &str, m: &Machine) -> bool {
     machines.split(',').any(|id| id.trim() == m.id)
 }
 
+/// Makes the wizard's draft `kind` ("Manual" or "CNC"). Choosing Manual fills
+/// the manual defaults and keeps the name, units, travel and power entered.
+pub fn set_kind(m: &mut Machine, kind: &str) {
+    if kind != "Manual" {
+        m.p.insert("kind".into(), "CNC".into());
+    } else if !is_manual(m) {
+        for (k, v) in defaults().p {
+            if !matches!(k.as_str(), "name" | "units" | "x" | "y" | "z" | "power") {
+                m.p.insert(k, v);
+            }
+        }
+    }
+}
+
+/// `machines` with `id` added or taken off, as the check boxes edit it.
+pub fn toggle(machines: &str, id: &str, on: bool) -> String {
+    let mut ids: Vec<&str> = machines
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != id)
+        .collect();
+    if on {
+        ids.push(id);
+    }
+    ids.join(",")
+}
+
+/// Why a strategy is dimmed on a setup of the manual mill.
+pub const ONE_AXIS: &str = "The big mill cuts one axis at a time.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +213,40 @@ mod tests {
         assert!(fits(&list, &cnc));
         assert!(fits(&list, &manual));
         assert!(!fits(&list, &other));
+    }
+    #[test]
+    fn choosing_manual_fills_the_defaults_and_keeps_what_was_entered() {
+        let mut m = Machine::new(3);
+        for (k, v) in [
+            ("name", "Old"),
+            ("x", "900"),
+            ("power", "1500"),
+            ("units", "inch"),
+        ] {
+            with(&mut m, k, v);
+        }
+        set_kind(&mut m, "Manual");
+        assert!(is_manual(&m));
+        assert_eq!(get(&m.p, "name"), "Old");
+        assert_eq!(get(&m.p, "x"), "900");
+        assert_eq!(get(&m.p, "power"), "1500");
+        assert_eq!(get(&m.p, "units"), "inch");
+        assert_eq!(get(&m.p, "speeds"), "90,150,250,400,640,1000,1600");
+        assert_eq!(get(&m.p, "rpm"), "1600");
+        with(&mut m, "hand_feed", "100");
+        set_kind(&mut m, "Manual");
+        assert_eq!(get(&m.p, "hand_feed"), "100");
+        set_kind(&mut m, "CNC");
+        assert!(!is_manual(&m));
+    }
+    #[test]
+    fn the_check_boxes_add_and_take_off_one_id() {
+        assert_eq!(toggle("", "a", true), "a");
+        assert_eq!(toggle("a", "b", true), "a,b");
+        assert_eq!(toggle("a, b", "a", true), "b,a");
+        assert_eq!(toggle("a,b", "a", false), "b");
+        assert_eq!(toggle("a", "a", false), "");
+        assert_eq!(toggle("a", "b", false), "a");
     }
     #[test]
     fn a_manual_machine_needs_its_gears_hand_speeds_and_times() {
