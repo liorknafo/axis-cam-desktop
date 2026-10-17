@@ -1050,6 +1050,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Add a setup on the manual mill before the CNC setups, for the cuts the big mill makes first. Put first, it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock it leaves.",
             "",
         ),
+        AddLatheSetup => (
+            "Add a setup on the lathe before the CNC setups, with a round bar in the 3-jaw chuck. Put first, it takes the orientation of the old first setup, which then starts from the bar it leaves.",
+            "",
+        ),
         SetupEditor => (
             "Set the machine, work coordinate system, stock, part orientation and workholding for the current setup.",
             "",
@@ -1389,6 +1393,10 @@ pub fn command(m: &Message, label: String) -> Help {
                     "Passes" => {
                         "Control cutting depth, spacing, finishing allowance and tolerance."
                     }
+                    "Turn" => {
+                        "Choose what to turn and set its sizes: Z 0 is the free end, diameters are diameters."
+                    }
+                    "Centre" => "Set how deep the drill goes on the lathe's centre line.",
                     "Linking" => {
                         "Control how the tool enters a cut and moves between cutting passes."
                     }
@@ -1876,6 +1884,76 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Tool, "pitches") => (
             "The finest and coarsest pitch the threading tool cuts, in mm, written like 0.5-3.",
+            "",
+            None,
+        ),
+        (Target::Operation, "turn_kind") => (
+            "What this Turn does: face the end, turn an outside diameter, bore, chamfer an edge, cut a groove, part off or cut a thread. Changing the kind brings that kind's sizes and a fitting tool.",
+            "Each kind uses a tool of its own type: a turning tool for Face, Outside and Chamfer, a boring bar, a grooving tool, a parting blade, a threading tool.",
+            None,
+        ),
+        (Target::Operation, "face_off") => (
+            "How much comes off the end of the bar, in mm: the face ends up this far in from the free end.",
+            "",
+            None,
+        ),
+        (Target::Operation, "to_diameter") => (
+            "The diameter the facing cut reaches, in mm; 0 faces right to the centre.",
+            "",
+            None,
+        ),
+        (Target::Operation, "diameter") => (
+            "The finished diameter in mm: what the turned or bored section measures, a groove's bottom, or a thread's major diameter. Diameters are diameters, not radii.",
+            "",
+            None,
+        ),
+        (Target::Operation, "z_end") => (
+            "Where the cut stops along the bar, in mm. Z 0 is the free end and negative is toward the chuck, so -30 turns 30 mm of the bar.",
+            "",
+            None,
+        ),
+        (Target::Operation, "z") => (
+            "Where the cut is along the bar, in mm: the groove's side toward the chuck, or the side of a parting cut that stays with the part. Z 0 is the free end and negative is toward the chuck.",
+            "",
+            None,
+        ),
+        (Target::Operation, "depth") => (
+            "How much one pass takes off the diameter, in mm; a lathe drill's depth in from the free end. Passes are equal and no larger than this.",
+            "",
+            None,
+        ),
+        (Target::Operation, "finish") => (
+            "What the last pass takes off the diameter, in mm, to leave a clean surface at the finished size.",
+            "",
+            None,
+        ),
+        (Target::Operation, "edge") => (
+            "Which edge to break: the outside corner of the end, the inside corner of a bore, or a shoulder.",
+            "",
+            None,
+        ),
+        (Target::Operation, "size") => (
+            "The length of the 45 degree chamfer's leg, in mm.",
+            "",
+            None,
+        ),
+        (Target::Operation, "width") => (
+            "How wide the groove is, in mm. It is at least as wide as the grooving tool.",
+            "",
+            None,
+        ),
+        (Target::Operation, "thread_side") => (
+            "Cut the thread on the outside of the bar or inside a bore.",
+            "",
+            None,
+        ),
+        (Target::Operation, "pitch") => (
+            "The distance between thread crests, in mm. It must be one the gearbox cuts and one the threading tool's range covers.",
+            "",
+            None,
+        ),
+        (Target::Operation, "passes") => (
+            "How many passes cut the thread. Empty takes the usual number for the pitch; the first pass is the deepest and they get lighter.",
             "",
             None,
         ),
@@ -3069,6 +3147,13 @@ impl canvas::Program<Message> for Illustration {
                     };
                     [-30. + 30. * x, -18. + row * 10., 25.]
                 }
+                Strategy::Turn => {
+                    // A pass along the bar, back, and one nearer the axis.
+                    let pass = (t * 2.).floor().min(1.);
+                    let k = (t * 2.).fract();
+                    let x = if k < 0.5 { 2. * k } else { 2. - 2. * k };
+                    [-34. + 68. * x, 10. - 6. * pass, 25.]
+                }
                 Strategy::Contour => [44. * a.cos(), 27. * a.sin(), 21.],
                 Strategy::Drill => {
                     let hole = (t * 4.).floor().min(3.) as usize;
@@ -4006,6 +4091,8 @@ mod tests {
             "Cycle",
             "Passes",
             "Linking",
+            "Turn",
+            "Centre",
             "Other",
         ] {
             commands.push((tab.into(), Tab(tab.into())));
@@ -4034,6 +4121,7 @@ mod tests {
             NewMachine,
             AddSetup,
             AddManualSetup,
+            AddLatheSetup,
             ToolMachine("m".into(), true),
             HolderMachine("m".into(), true),
             StockDetail(Detail::Draft),
@@ -4204,10 +4292,13 @@ mod tests {
             .collect();
         for s in Strategy::ALL {
             cards.push((format!("unavailable:{s:?}"), unavailable_help(s)));
-            cards.push((
-                format!("dimmed:{s:?}"),
-                dimmed_help(s, crate::manual::ONE_AXIS),
-            ));
+            for reason in [
+                crate::manual::ONE_AXIS,
+                crate::lathe::ONLY_TURN,
+                crate::lathe::TURN_ON_MILL,
+            ] {
+                cards.push((format!("dimmed:{s:?}:{reason}"), dimmed_help(s, reason)));
+            }
             let b = HelpButton::operation(
                 widget::button("x"),
                 s,

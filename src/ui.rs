@@ -503,10 +503,13 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             } else if issue.starts_with("Choose a tool")
                 || issue.starts_with("Choose a drill")
                 || issue.contains(" is not on ")
+                || (issue.starts_with("Choose a ") && issue.ends_with(" turn."))
             {
                 Some("Tool")
             } else if issue.starts_with("The box must be") {
                 Some("Box")
+            } else if issue == lathe::DRILL_ON_CENTRE {
+                Some("Centre")
             } else {
                 None
             };
@@ -514,6 +517,10 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
         Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
+        Some(
+            "turn_kind" | "face_off" | "to_diameter" | "diameter" | "z_end" | "z" | "edge" | "size"
+            | "width" | "thread_side" | "pitch",
+        ) => "Turn",
         Some(
             "clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings" | "tab_count"
             | "tab_width" | "tab_height",
@@ -1065,16 +1072,26 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         .doc
         .active_setup()
         .is_some_and(|s| manual::is_manual(&s.machine));
+    let lathe_setup = app
+        .doc
+        .active_setup()
+        .is_some_and(|s| lathe::is_lathe(&s.machine));
     for (label, range) in [
         ("2D MILLING", 0..5),
         ("3D FINISHING", 5..8),
         ("MULTI-AXIS", 8..11),
         ("MANUAL", 11..12),
+        ("LATHE", 12..13),
     ] {
         let mut buttons = Row::new().spacing(1);
         for s in &Strategy::ALL[range] {
             let s = *s;
-            let reason = if s == Strategy::Box {
+            // Why the strategy is dimmed on the active setup's machine.
+            let reason = if lathe_setup {
+                (!matches!(s, Strategy::Turn | Strategy::Drill)).then_some(lathe::ONLY_TURN)
+            } else if s == Strategy::Turn {
+                Some(lathe::TURN_ON_MILL)
+            } else if s == Strategy::Box {
                 (!manual_setup).then_some(manual::BOX_ON_CNC)
             } else {
                 (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
@@ -1550,6 +1567,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
         .push(secondary("+ Add setup", Message::AddSetup).width(Fill));
     if app.doc.machines.iter().any(manual::is_manual) {
         tree = tree.push(secondary("+ Add manual setup", Message::AddManualSetup).width(Fill));
+    }
+    if app.doc.machines.iter().any(lathe::is_lathe) {
+        tree = tree.push(secondary("+ Add lathe setup", Message::AddLatheSetup).width(Fill));
     }
     let footer = column![
         rule::horizontal(1),
@@ -2204,7 +2224,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     ]
     .spacing(9)
     .align_y(Alignment::Center);
-    let all = o.strategy.tabs();
+    let all = o.tabs(&app.doc.setup().machine);
     let mut tabs = Column::new().spacing(2);
     // Five tabs fit one row; the sixth, Orientation, takes two rows of three.
     for chunk in all.chunks(if all.len() > 5 { 3 } else { all.len().max(1) }) {
@@ -2229,10 +2249,18 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     }
     let p = &o.p;
     let t = Target::Operation;
+    let machine = &app.doc.setup().machine;
+    let lathe = lathe::is_lathe(machine);
     match app.tab.as_str() {
         "Tool" => {
             c = c.push(section("Cutter"));
-            for tool in &app.doc.tools {
+            // A lathe's operation offers the tools that fit the lathe.
+            for tool in app
+                .doc
+                .tools
+                .iter()
+                .filter(|tool| !lathe || tool.fits(machine) || o.tool == tool.id)
+            {
                 c = c.push(
                     btn(
                         tool_label(tool),
@@ -2246,7 +2274,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 .push(secondary("Open tool library", Message::Page(Page::Tools)))
                 .push(section("Feeds & speeds"))
                 .push(checks.field(p, "rpm", "Spindle speed · rpm"));
-            if o.strategy.imported_preview() && o.strategy != Strategy::Box && !app.is_sample() {
+            if o.strategy.imported_preview()
+                && !matches!(o.strategy, Strategy::Box | Strategy::Turn)
+                && !lathe
+                && !app.is_sample()
+            {
                 c = c
                     .push(choice_value(
                         p,
@@ -2263,15 +2295,18 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         .size(12),
                     );
             }
-            c = c
-                .push(checks.field(p, "feed", "Cutting feed · mm/min"))
-                .push(choice(
-                    p,
-                    "coolant",
-                    "Coolant",
-                    &["Flood", "Mist", "Air", "Off"],
-                    t,
-                ));
+            if o.strategy == Strategy::Turn {
+                c = c.push(muted("Feed: the carriage power feed, or by hand.").size(12));
+            } else {
+                c = c.push(checks.field(p, "feed", "Cutting feed · mm/min"));
+            }
+            c = c.push(choice(
+                p,
+                "coolant",
+                "Coolant",
+                &["Flood", "Mist", "Air", "Off"],
+                t,
+            ));
             // A speed or feed outside the material's cutting data is a
             // warning at its field; why none is checked is said here.
             if let Some(SpeedFeed::Unchecked(why)) = app.doc.speed_feed(app.doc.setup(), o) {
@@ -2467,6 +2502,16 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .push(secondary("From selected face", Message::BoxFromFace).width(Fill));
             }
         }
+        "Turn" => {
+            c = c.push(turn_fields(o, checks));
+        }
+        "Centre" => {
+            c = c
+                .push(note(
+                    "Drills on the centre line from the tailstock, in from the free end.",
+                ))
+                .push(checks.field(p, "depth", "Depth · mm"));
+        }
         "Heights" => {
             c = c.push(note(if o.strategy == Strategy::Box {
                 "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
@@ -2606,20 +2651,21 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if get(p, "cycle") == "Counterboring" {
                 c = c.push(checks.field(p, "dwell", "Dwell at bottom · seconds"));
             }
-            c = c
-                .push(choice(
+            if !lathe {
+                c = c.push(choice(
                     p,
                     "hole_order",
                     "Hole order",
                     &["Optimize travel", "By X then Y"],
                     t,
-                ))
-                .push(note(match get(p, "cycle") {
-                    "Chip breaking" => "Retract slightly after each peck to break the chip.",
-                    "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
-                    "Counterboring" => "Feed to depth and dwell before retracting.",
-                    _ => "Feed to the bottom in one move, then retract.",
-                }));
+                ));
+            }
+            c = c.push(note(match get(p, "cycle") {
+                "Chip breaking" => "Retract slightly after each peck to break the chip.",
+                "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
+                "Counterboring" => "Feed to depth and dwell before retracting.",
+                _ => "Feed to the bottom in one move, then retract.",
+            }));
         }
         "Passes" => {
             c = c.push(pass_fields(app, o, checks));
@@ -2750,11 +2796,98 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         foot: Some(foot.into()),
     }
 }
+/// A Turn's kind and the sizes of that kind, in lathe work coordinates.
+fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
+    let p = &o.p;
+    let t = Target::Operation;
+    let mut c =
+        Column::new()
+            .spacing(12)
+            .push(choice(p, "turn_kind", "Kind", &lathe::TURN_KINDS, t));
+    c = c.push(note(
+        "Z 0 is the free end of the bar, negative toward the chuck. Sizes are diameters.",
+    ));
+    match get(p, "turn_kind") {
+        "Face" => {
+            c = c
+                .push(checks.field(p, "face_off", "Take off the end · mm"))
+                .push(checks.field(p, "to_diameter", "Face to diameter · mm (0 = centre)"));
+        }
+        "Outside" | "Bore" => {
+            c = c.push(
+                row![
+                    checks.field(p, "diameter", "Diameter · mm"),
+                    checks.field(p, "z_end", "Z end · mm")
+                ]
+                .spacing(9),
+            );
+        }
+        "Chamfer" => {
+            c = c
+                .push(choice(p, "edge", "Edge", &lathe::EDGES, t))
+                .push(checks.field(p, "size", "Size · mm"));
+        }
+        "Groove" => {
+            c = c
+                .push(
+                    row![
+                        checks.field(p, "z", "Z, left side · mm"),
+                        checks.field(p, "width", "Width · mm")
+                    ]
+                    .spacing(9),
+                )
+                .push(checks.field(p, "diameter", "Bottom diameter · mm"));
+        }
+        "Part off" => {
+            c = c.push(checks.field(p, "z", "Z · mm"));
+        }
+        "Thread" => {
+            c = c
+                .push(choice(
+                    p,
+                    "thread_side",
+                    "Thread on",
+                    &lathe::THREAD_SIDES,
+                    t,
+                ))
+                .push(
+                    row![
+                        checks.field(p, "diameter", "Major diameter · mm"),
+                        checks.field(p, "pitch", "Pitch · mm")
+                    ]
+                    .spacing(9),
+                )
+                .push(checks.field(p, "z_end", "Z end · mm"));
+        }
+        _ => {}
+    }
+    c.into()
+}
 fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
     let p = &o.p;
     let t = Target::Operation;
     let s = o.strategy;
     let mut c = Column::new().spacing(12);
+    if s == Strategy::Turn {
+        return match get(p, "turn_kind") {
+            "Outside" | "Bore" => c
+                .push(
+                    row![
+                        checks.field(p, "depth", "Depth per pass · mm"),
+                        checks.field(p, "finish", "Finish pass · mm")
+                    ]
+                    .spacing(9),
+                )
+                .push(checks.field(p, "allowance", "Stock to leave · mm"))
+                .push(note("Equal passes down to the diameter plus the stock to leave, then the finish pass."))
+                .into(),
+            "Thread" => c
+                .push(checks.hinted(p, "passes", "Passes", "Auto"))
+                .push(note("Leave Passes empty for the usual number for the pitch."))
+                .into(),
+            _ => c.into(),
+        };
+    }
     if s == Strategy::Box {
         return c
             .push(checks.field(p, "allowance", "Stock to leave · mm"))

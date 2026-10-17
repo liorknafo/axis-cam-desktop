@@ -386,6 +386,10 @@ impl Builder {
     }
 }
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    // Turning, and drilling on a lathe's centre, are not planned yet.
+    if op.strategy == Strategy::Turn || op.on_centre(&setup.machine) {
+        return Err(crate::lathe::NOT_GENERATED.into());
+    }
     match op.strategy {
         Strategy::Contour => contour(setup, op, tool, mesh),
         Strategy::Drill => drill(setup, op, tool, mesh),
@@ -2690,7 +2694,32 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn all_twelve_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn turning_and_a_lathes_centre_drilling_are_not_generated_yet() {
+        let mesh = block();
+        let mut setup = Setup::new(crate::lathe::defaults(), "G54");
+        let mut tool = Tool::lathe("Turn", "Turning tool");
+        tool.p.insert("machines".into(), setup.machine.id.clone());
+        let turn = Operation::new(Strategy::Turn, tool.id.clone());
+        let mut drill = Operation::for_machine(Strategy::Drill, tool.id.clone(), &setup.machine);
+        drill.p.insert("depth".into(), "10".into());
+        for op in [&turn, &drill] {
+            for plan in [
+                generate(&setup, op, &tool, &mesh),
+                simulation::generate(&setup, op, &tool, &mesh),
+            ] {
+                assert_eq!(plan.unwrap_err(), "Turning passes are not generated yet.");
+            }
+        }
+        // A Drill on a mill still selects holes.
+        setup.machine = Machine::new(3);
+        let plain = Operation::new(Strategy::Drill, tool.id.clone());
+        assert_ne!(
+            generate(&setup, &plain, &tool, &mesh).unwrap_err(),
+            "Turning passes are not generated yet."
+        );
+    }
+    #[test]
+    fn all_thirteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -2707,7 +2736,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            7
+            8
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.

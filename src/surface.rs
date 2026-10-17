@@ -146,8 +146,13 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     if !operation.strategy.imported_preview() {
         return vec![operation.strategy.availability().into()];
     }
-    // A Box is a block of numbers: it selects no surfaces.
-    if operation.strategy == crate::model::Strategy::Box {
+    // A Box and a Turn are numbers, and a lathe Drill is on the centre: they
+    // select no surfaces.
+    if matches!(
+        operation.strategy,
+        crate::model::Strategy::Box | crate::model::Strategy::Turn
+    ) || operation.on_centre(&setup.machine)
+    {
         return vec![];
     }
     let Some(mesh) = mesh else {

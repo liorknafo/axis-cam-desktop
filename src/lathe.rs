@@ -41,6 +41,98 @@ pub const TOOLS: [&str; 5] = [
     "Threading tool",
 ];
 
+/// Why a strategy other than Turn and Drill is dimmed on a lathe setup.
+pub const ONLY_TURN: &str = "The lathe turns and drills on the centre.";
+/// Why Turn is dimmed, and refused, on a setup of a mill.
+pub const TURN_ON_MILL: &str = "Turn runs on a lathe.";
+/// What a lathe Drill without a hole selection says when it is given one.
+pub const DRILL_ON_CENTRE: &str =
+    "A lathe drills on the centre line: remove the hole selection and set the depth.";
+
+/// What generating a Turn, or a Drill on the centre, says until its passes
+/// are planned.
+pub const NOT_GENERATED: &str = "Turning passes are not generated yet.";
+
+/// The kinds of Turn (`turn_kind`).
+pub const TURN_KINDS: [&str; 7] = [
+    "Face", "Outside", "Bore", "Chamfer", "Groove", "Part off", "Thread",
+];
+/// The edges a Chamfer breaks (`edge`).
+pub const EDGES: [&str; 3] = ["End outside", "End inside", "Shoulder"];
+/// The sides a Thread is cut on (`thread_side`).
+pub const THREAD_SIDES: [&str; 2] = ["Outside", "Inside"];
+/// Every field a Turn kind has besides the spindle speed and the allowance:
+/// the keys that change meaning with the kind.
+pub const TURN_KEYS: [&str; 13] = [
+    "face_off",
+    "to_diameter",
+    "diameter",
+    "z_end",
+    "depth",
+    "finish",
+    "edge",
+    "size",
+    "z",
+    "width",
+    "thread_side",
+    "pitch",
+    "passes",
+];
+
+/// The tool type a Turn of `kind` cuts with; None for an unknown kind.
+pub fn tool_for(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "Face" | "Outside" | "Chamfer" => "Turning tool",
+        "Bore" => "Boring bar",
+        "Groove" => "Grooving tool",
+        "Part off" => "Parting blade",
+        "Thread" => "Threading tool",
+        _ => return None,
+    })
+}
+
+/// The settings a Turn of `kind` starts with (lathe work coordinates: Z 0 at
+/// the free end, negative toward the chuck; diameters as diameters), the
+/// spindle speed included. Empty for an unknown kind.
+pub fn turn_defaults(kind: &str) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        "Face" => &[("rpm", "450"), ("face_off", "1"), ("to_diameter", "0")],
+        "Outside" => &[
+            ("rpm", "710"),
+            ("diameter", "40"),
+            ("z_end", "-30"),
+            ("depth", "2"),
+            ("finish", "0.2"),
+            ("allowance", "0"),
+        ],
+        "Bore" => &[
+            ("rpm", "710"),
+            ("diameter", "20"),
+            ("z_end", "-20"),
+            ("depth", "1"),
+            ("finish", "0.1"),
+            ("allowance", "0"),
+        ],
+        "Chamfer" => &[("rpm", "450"), ("edge", "End outside"), ("size", "1")],
+        "Groove" => &[
+            ("rpm", "280"),
+            ("z", "-20"),
+            ("width", "3"),
+            ("diameter", "35"),
+        ],
+        "Part off" => &[("rpm", "180"), ("z", "-60")],
+        "Thread" => &[
+            ("rpm", "110"),
+            ("thread_side", "Outside"),
+            ("diameter", "40"),
+            ("pitch", "1.5"),
+            ("z_end", "-20"),
+            ("passes", ""),
+        ],
+        _ => &[],
+    }
+}
+
 /// The hands a turning tool has.
 pub const HANDS: [&str; 3] = ["Right", "Left", "Neutral"];
 
@@ -167,6 +259,35 @@ mod tests {
         (a - b).abs() < 1e-4
     }
 
+    #[test]
+    fn each_turn_kind_has_a_tool_type_and_defaults_that_are_its_own() {
+        assert_eq!(TURN_KINDS.len(), 7);
+        for kind in TURN_KINDS {
+            let tool = tool_for(kind).expect(kind);
+            assert!(is_tool(tool), "{kind}");
+            let starts = turn_defaults(kind);
+            // The spindle speed is one of the default lathe's gears.
+            let rpm = starts.iter().find(|(k, _)| *k == "rpm").expect(kind).1;
+            assert!(manual::on_gear(&defaults(), rpm.parse().unwrap()), "{kind}");
+            for (k, _) in starts {
+                assert!(
+                    *k == "rpm" || *k == "allowance" || TURN_KEYS.contains(k),
+                    "{kind} {k}"
+                );
+            }
+        }
+        assert_eq!(tool_for("Part off"), Some("Parting blade"));
+        assert_eq!(tool_for("Knurl"), None);
+        assert!(turn_defaults("Knurl").is_empty());
+        // Every key of a kind is in the list the kind change clears.
+        let all: std::collections::BTreeSet<_> = TURN_KINDS
+            .iter()
+            .flat_map(|k| turn_defaults(k))
+            .map(|(k, _)| *k)
+            .filter(|k| !matches!(*k, "rpm" | "allowance"))
+            .collect();
+        assert_eq!(all, TURN_KEYS.into_iter().collect());
+    }
     #[test]
     fn only_the_mill_is_manual_only_the_lathe_is_a_lathe_and_both_are_hand() {
         let (mill, lathe, cnc) = (manual::defaults(), defaults(), Machine::new(3));

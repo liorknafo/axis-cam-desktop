@@ -16490,13 +16490,323 @@ flood = { pin = 8 }
         assert!(!adds(&a, Strategy::FiveAxis));
         assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
         // The ten dimmed tiles each say why; Box and Drill are not dimmed.
-        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 2);
+        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 3);
         assert_eq!(reasons(&a, box_on_cnc), 0);
         // Back on the CNC setup only Box is dimmed.
         a.doc.active = a.doc.setups[1].id.clone();
         assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Box));
         assert_eq!(reasons(&a, one_axis), 0);
         assert_eq!(reasons(&a, box_on_cnc), 1);
+    }
+    /// The sample app with a lathe in the library and a lathe tool of each type.
+    fn with_lathe(a: &mut App) {
+        a.doc.machines.push(crate::lathe::defaults());
+        for kind in crate::lathe::TOOLS {
+            a.doc.tools.push(crate::model::Tool::lathe(kind, kind));
+        }
+        a.doc.number_tools();
+    }
+    /// `with_lathe`, a lathe setup first and selected.
+    fn on_the_lathe(a: &mut App) {
+        with_lathe(a);
+        let _ = a.update(Message::AddLatheSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        a.selected = None;
+    }
+    #[test]
+    fn add_lathe_setup_shows_with_a_lathe_and_inserts_the_setup() {
+        let mut a = app();
+        lacks(&a, &["+ Add lathe setup"]);
+        a.doc.machines.push(crate::manual::defaults());
+        lacks(&a, &["+ Add lathe setup"]);
+        with_lathe(&mut a);
+        shows(&a, &["+ Add lathe setup"]);
+        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::AddLatheSetup)));
+        let old = a.doc.active.clone();
+        let _ = a.update(Message::AddLatheSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        assert_eq!(a.doc.setups[0].name(), "Lathe");
+        assert_eq!(a.doc.setups[1].id, old);
+        assert_eq!(a.doc.active, old);
+        assert_eq!(a.page, Page::Work);
+        assert_eq!(a.selected, None);
+        assert!(a.status.contains("Lathe setup added"), "{}", a.status);
+        assert!(a.doc.workholding.iter().any(|h| h.kind() == "Chuck"));
+        // Without a lathe the press says so and changes nothing.
+        let mut b = app();
+        let _ = b.update(Message::AddLatheSetup);
+        assert_eq!(b.doc.setups.len(), 1);
+        assert!(b.status.contains("lathe"), "{}", b.status);
+    }
+    #[test]
+    fn the_ribbon_has_a_lathe_group_and_enables_only_turn_and_drill_on_a_lathe_setup() {
+        let mut a = app();
+        with_lathe(&mut a);
+        let sent = |a: &App| crate::ui::probe::clicks(a.view(), WINDOW);
+        let adds = |a: &App, s: Strategy| {
+            sent(a)
+                .iter()
+                .any(|m| matches!(m, Message::AddOp(x) if *x == s))
+        };
+        let reasons = |a: &App, reason: &str| {
+            let (_, cards) = laid(a).run(Helps::default()).expect("the view");
+            cards.iter().filter(|c| c.body == reason).count()
+        };
+        let (only_turn, turn_on_mill) = (crate::lathe::ONLY_TURN, crate::lathe::TURN_ON_MILL);
+        shows(&a, &["LATHE", "MANUAL"]);
+        // On a CNC setup Turn is dimmed and says so; everything else as before.
+        assert!(!adds(&a, Strategy::Turn) && adds(&a, Strategy::Face));
+        assert_eq!(reasons(&a, turn_on_mill), 1);
+        assert_eq!(reasons(&a, only_turn), 0);
+        let _ = a.update(Message::AddLatheSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        for s in Strategy::ALL {
+            assert_eq!(
+                adds(&a, s),
+                matches!(s, Strategy::Turn | Strategy::Drill),
+                "{s:?}"
+            );
+        }
+        // The eleven others each say why.
+        assert_eq!(reasons(&a, only_turn), Strategy::ALL.len() - 2);
+        assert_eq!(reasons(&a, turn_on_mill), 0);
+        // Back on the CNC setup.
+        a.doc.active = a.doc.setups[1].id.clone();
+        assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Turn));
+        assert_eq!(reasons(&a, only_turn), 0);
+        assert_eq!(reasons(&a, turn_on_mill), 1);
+        // And on the manual mill.
+        a.doc.machines.push(crate::manual::defaults());
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a
+            .doc
+            .setups
+            .iter()
+            .find(|s| crate::manual::is_manual(&s.machine))
+            .unwrap()
+            .id
+            .clone();
+        assert!(!adds(&a, Strategy::Turn) && adds(&a, Strategy::Box));
+        assert_eq!(reasons(&a, turn_on_mill), 1);
+    }
+    #[test]
+    fn adding_a_turn_on_the_lathe_takes_a_turning_tool_and_a_gear_and_the_kind_changes_both() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        let tool = |a: &App, kind: &str| {
+            a.doc
+                .tools
+                .iter()
+                .find(|t| get(&t.p, "type") == kind)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let _ = a.update(Message::AddOp(Strategy::Turn));
+        let op = a.operation().unwrap().clone();
+        assert_eq!(op.strategy, Strategy::Turn);
+        assert_eq!(op.tool, tool(&a, "Turning tool"));
+        assert_eq!(get(&op.p, "turn_kind"), "Outside");
+        assert!(
+            num(&op.p, "rpm")
+                .is_some_and(|rpm| crate::manual::on_gear(&a.doc.setup().machine, rpm))
+        );
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        assert_eq!(a.tab, "Tool");
+        // Each kind: its fields, the tool of its type, no issue.
+        for kind in crate::lathe::TURN_KINDS {
+            let _ = a.update(Message::Edit(Target::Operation, "turn_kind", kind.into()));
+            let op = a.operation().unwrap().clone();
+            assert_eq!(get(&op.p, "turn_kind"), kind);
+            assert_eq!(
+                op.tool,
+                tool(&a, crate::lathe::tool_for(kind).unwrap()),
+                "{kind}"
+            );
+            assert_eq!(a.op_issues(), Vec::<String>::new(), "{kind}");
+            assert!(!op.preview);
+        }
+        // A tool of the kind's type already chosen stays.
+        let other = crate::model::Tool::lathe("Second parting blade", "Parting blade");
+        let other_id = other.id.clone();
+        a.doc.tools.push(other);
+        let _ = a.update(Message::Edit(Target::Operation, "tool", other_id.clone()));
+        if let Some(o) = a.operation_mut() {
+            o.tool = other_id.clone();
+        }
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "turn_kind",
+            "Part off".into(),
+        ));
+        assert_eq!(a.operation().unwrap().tool, other_id);
+        // A drill on the lathe is on the centre: no selection, a depth.
+        let mut drill = crate::model::Tool::new("Drill 8", "Drill", "8");
+        drill
+            .p
+            .insert("machines".into(), a.doc.setup().machine.id.clone());
+        a.doc.tools.push(drill);
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let op = a.operation().unwrap();
+        assert!(op.geometry.is_empty() && get(&op.p, "depth") == "20");
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        // A Turn with no turning tool in the library goes to the tools page.
+        let mut b = app();
+        b.doc.machines.push(crate::lathe::defaults());
+        let _ = b.update(Message::AddLatheSetup);
+        b.doc.active = b.doc.setups[0].id.clone();
+        let _ = b.update(Message::AddOp(Strategy::Turn));
+        assert_eq!(b.page, Page::Tools);
+        assert!(b.doc.setups[0].operations.is_empty());
+        assert!(b.status.contains("needs a cutter"), "{}", b.status);
+    }
+    #[test]
+    fn the_turn_editor_has_a_kind_chooser_and_the_fields_of_each_kind() {
+        let mut a = imported_app();
+        on_the_lathe(&mut a);
+        let _ = a.update(Message::AddOp(Strategy::Turn));
+        let _ = a.update(Message::Tab("Turn".into()));
+        shows(&a, &["Kind", "Diameter · mm", "Z end · mm"]);
+        lacks(&a, &["Take off the end · mm", "Pitch · mm"]);
+        let _ = a.update(Message::Tab("Passes".into()));
+        shows(
+            &a,
+            &[
+                "Depth per pass · mm",
+                "Finish pass · mm",
+                "Stock to leave · mm",
+            ],
+        );
+        lacks(
+            &a,
+            &[
+                "Pass direction · degrees",
+                "Tolerance · mm",
+                "Stepover · % tool diameter",
+            ],
+        );
+        // The tool tab: the lathe's tools, a speed, no feed in mm/min and no rotation choice.
+        let _ = a.update(Message::Tab("Tool".into()));
+        shows(&a, &["Spindle speed · rpm"]);
+        lacks(&a, &["Cutting feed · mm/min", "Spindle rotation"]);
+        assert!(page_texts(&a).iter().any(|t| t.contains("Turning tool")));
+        // The mill's tools are not offered to the lathe.
+        assert!(!page_texts(&a).iter().any(|t| t.contains("Flat end mill")));
+        for (kind, tab, shown, hidden) in [
+            (
+                "Face",
+                "Turn",
+                vec![
+                    "Take off the end · mm",
+                    "Face to diameter · mm (0 = centre)",
+                ],
+                vec!["Diameter · mm"],
+            ),
+            (
+                "Bore",
+                "Turn",
+                vec!["Diameter · mm", "Z end · mm"],
+                vec!["Pitch · mm"],
+            ),
+            ("Bore", "Passes", vec!["Depth per pass · mm"], vec![]),
+            (
+                "Chamfer",
+                "Turn",
+                vec!["Edge", "Size · mm"],
+                vec!["Diameter · mm"],
+            ),
+            (
+                "Groove",
+                "Turn",
+                vec!["Z, left side · mm", "Width · mm", "Bottom diameter · mm"],
+                vec!["Z end · mm"],
+            ),
+            (
+                "Part off",
+                "Turn",
+                vec!["Z · mm"],
+                vec!["Width · mm", "Diameter · mm"],
+            ),
+            (
+                "Thread",
+                "Turn",
+                vec![
+                    "Thread on",
+                    "Major diameter · mm",
+                    "Pitch · mm",
+                    "Z end · mm",
+                ],
+                vec!["Depth per pass · mm"],
+            ),
+            ("Thread", "Passes", vec!["Passes"], vec!["Finish pass · mm"]),
+        ] {
+            let _ = a.update(Message::Edit(Target::Operation, "turn_kind", kind.into()));
+            let _ = a.update(Message::Tab(tab.into()));
+            shows(&a, &shown);
+            lacks(&a, &hidden);
+        }
+        // Kinds that cut in one go have no Passes tab: it is not in the row.
+        let _ = a.update(Message::Edit(Target::Operation, "turn_kind", "Face".into()));
+        assert!(
+            !a.operation()
+                .unwrap()
+                .tabs(&a.doc.setup().machine)
+                .contains(&"Passes")
+        );
+        for tab in ["Tool", "Turn", "Passes", "Centre"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            let _view = a.view();
+        }
+        // A wrong number shows at its field and opens its tab from the audit.
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "turn_kind",
+            "Outside".into(),
+        ));
+        let _ = a.update(Message::Edit(Target::Operation, "diameter", "0".into()));
+        let _ = a.update(Message::Tab("Turn".into()));
+        let checks = crate::ui::op_checks(&a);
+        assert_eq!(
+            checks.len(),
+            1,
+            "{:?}",
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(checks[0].key, Some("diameter"));
+        // Generating says the passes are not planned yet.
+        let _ = a.update(Message::Edit(Target::Operation, "diameter", "40".into()));
+        let _ = a.update(Message::Generate);
+        assert_eq!(a.status, crate::lathe::NOT_GENERATED, "{}", a.status);
+    }
+    #[test]
+    fn a_lathe_drill_has_a_centre_tab_and_no_hole_selection() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        let mut drill = crate::model::Tool::new("Drill 8", "Drill", "8");
+        drill
+            .p
+            .insert("machines".into(), a.doc.setup().machine.id.clone());
+        a.doc.tools.push(drill);
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let tabs = a.operation().unwrap().tabs(&a.doc.setup().machine);
+        assert_eq!(tabs, vec!["Tool", "Centre", "Cycle"]);
+        let _ = a.update(Message::Tab("Centre".into()));
+        shows(&a, &["Depth · mm"]);
+        let _ = a.update(Message::Tab("Cycle".into()));
+        shows(&a, &["Drilling cycle"]);
+        lacks(&a, &["Hole order"]);
+        // No pick mode on the lathe, whatever the tab.
+        let _ = a.update(Message::Tab("Geometry".into()));
+        assert!(!a.picking && !a.can_pick());
+        // The same operation on a CNC setup keeps its tabs and its hole order.
+        a.doc.active = a.doc.setups[1].id.clone();
+        a.selected = Some(0);
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let tabs = a.operation().unwrap().tabs(&a.doc.setup().machine);
+        assert_eq!(tabs, Strategy::Drill.tabs());
+        let _ = a.update(Message::Tab("Cycle".into()));
+        shows(&a, &["Hole order"]);
     }
     #[test]
     fn adding_a_box_on_the_big_mill_takes_a_fitting_tool_and_a_gear() {

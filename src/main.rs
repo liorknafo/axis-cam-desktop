@@ -168,6 +168,9 @@ pub enum Message {
     AddSetup,
     /// Inserts a setup on the first manual machine, before the CNC setups.
     AddManualSetup,
+    /// Inserts a setup on the first lathe, with a round bar in a chuck,
+    /// before the CNC setups.
+    AddLatheSetup,
     DuplicateSetup,
     RemoveSetup,
     MoveSetup(isize),
@@ -1165,6 +1168,7 @@ impl App {
             include_bytes!("../assets/op-9.svg"),
             include_bytes!("../assets/op-10.svg"),
             include_bytes!("../assets/op-11.svg"),
+            include_bytes!("../assets/op-12.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -1457,11 +1461,14 @@ impl App {
     }
     pub fn can_pick(&self) -> bool {
         self.operation().is_some_and(|o| {
-            self.is_sample()
-                || (self.doc.file.is_some()
-                    && (o.needs_surfaces() || o.strategy == Strategy::Box)
-                    && o.strategy.imported_preview()
-                    && self.imported_mesh.is_some())
+            // A lathe drills on its centre and turns by numbers: nothing to pick.
+            !o.on_centre(&self.doc.setup().machine)
+                && o.strategy != Strategy::Turn
+                && (self.is_sample()
+                    || (self.doc.file.is_some()
+                        && (o.needs_surfaces() || o.strategy == Strategy::Box)
+                        && o.strategy.imported_preview()
+                        && self.imported_mesh.is_some()))
         })
     }
     fn operation_mut(&mut self) -> Option<&mut Operation> {
@@ -1832,11 +1839,7 @@ impl App {
         self.selected
             .and_then(|i| {
                 self.doc.setup().operations.get(i).map(|o| {
-                    let mut issues = o.issues(
-                        &self.doc.setup().machine,
-                        &self.doc.tools,
-                        &self.doc.setup().operations[..i],
-                    );
+                    let mut issues = self.doc.setup().operation_issues(i, &self.doc.tools);
                     if self.doc.file.is_some() {
                         issues.extend(surface::issues(
                             o,
@@ -2940,8 +2943,7 @@ impl App {
                     if !self
                         .operation()
                         .unwrap()
-                        .strategy
-                        .tabs()
+                        .tabs(&self.doc.setup().machine)
                         .contains(&self.tab.as_str())
                     {
                         self.tab = "Tool".into();
@@ -2954,6 +2956,15 @@ impl App {
                     let setup = self.update(Message::SelectSetup(row.setup));
                     let operation = self.update(Message::SelectOp(row.operation));
                     if let Some(tab) = ui::issue_tab(&row.detail) {
+                        // A tab the operation does not have (a lathe Drill has
+                        // no Passes) gives its place to the one with its sizes.
+                        let tabs = (self.operation()).map(|o| o.tabs(&self.doc.setup().machine));
+                        let tab = match tabs {
+                            Some(tabs) if !tabs.contains(&tab) => {
+                                tabs.get(1).copied().unwrap_or(tab)
+                            }
+                            _ => tab,
+                        };
                         let _ = self.update(Message::Tab(tab.into()));
                     }
                     return Task::batch([setup, operation]);
@@ -2996,6 +3007,35 @@ impl App {
             }
             Message::Edit(target, k, v) => match target {
                 Target::Operation => {
+                    // A Turn's kind brings its own fields, speed and tool.
+                    if k == "turn_kind"
+                        && lathe::tool_for(&v).is_some()
+                        && self
+                            .operation()
+                            .is_some_and(|o| o.strategy == Strategy::Turn)
+                    {
+                        let machine = self.doc.setup().machine.clone();
+                        let needed = lathe::tool_for(&v);
+                        let has = |tool: &model::Tool| Some(get(&tool.p, "type")) == needed;
+                        let fitting = (self.doc.tools.iter())
+                            .find(|t| t.fits(&machine) && has(t))
+                            .map(|t| t.id.clone());
+                        let current = self.operation().map(|o| o.tool.clone());
+                        let right = self
+                            .doc
+                            .tools
+                            .iter()
+                            .any(|t| Some(&t.id) == current.as_ref() && has(t));
+                        if let Some(o) = self.operation_mut() {
+                            o.set_turn_kind(&v);
+                            manual::snap(&machine, &mut o.p);
+                            if let (false, Some(id)) = (right, fitting) {
+                                o.tool = id;
+                            }
+                        }
+                        self.touch();
+                        return Task::none();
+                    }
                     if let Some(o) = self.operation_mut() {
                         // A project saved before tabs has no sizes for them.
                         if k == "tabs" {
@@ -3101,6 +3141,9 @@ impl App {
                         t.fits(machine)
                             && if strategy == Strategy::Drill {
                                 get(&t.p, "type") == "Drill"
+                            } else if strategy == Strategy::Turn {
+                                // The default kind, Outside, turns with a turning tool.
+                                Some(get(&t.p, "type")) == lathe::tool_for("Outside")
                             } else if strategy == Strategy::Parallel {
                                 get(&t.p, "type") == "Ball end mill"
                             } else {
@@ -3109,7 +3152,11 @@ impl App {
                                         && get(&t.p, "type") == "Face mill")
                             }
                     })
-                    .or(self.doc.tools.first())
+                    .or(self
+                        .doc
+                        .tools
+                        .first()
+                        .filter(|_| strategy != Strategy::Turn))
                 else {
                     self.page = Page::Tools;
                     self.pending = Some((Page::Tools, Message::AddOp(strategy)));
@@ -3120,13 +3167,10 @@ impl App {
                     );
                     return Task::none();
                 };
-                let mut operation = Operation::new(strategy, tool.id.clone());
+                let mut operation = Operation::for_machine(strategy, tool.id.clone(), machine);
                 operation
                     .p
                     .insert("coolant".into(), control::default_coolant(machine).into());
-                if manual::is_manual(machine) {
-                    manual::snap(machine, &mut operation.p);
-                }
                 if !self.is_sample() {
                     operation.geometry.clear();
                 }
@@ -3197,9 +3241,11 @@ impl App {
             }
             Message::Surface(n) => {
                 if self.doc.file.is_none()
-                    || !self
-                        .operation()
-                        .is_some_and(|o| o.strategy.imported_preview())
+                    || !self.operation().is_some_and(|o| {
+                        o.strategy.imported_preview()
+                            && o.strategy != Strategy::Turn
+                            && !o.on_centre(&self.doc.setup().machine)
+                    })
                 {
                     return Task::none();
                 }
@@ -3426,6 +3472,14 @@ impl App {
                     self.stop_selection();
                     self.touch();
                     self.status = "Manual setup added before the CNC setups.".into();
+                }
+                Err(e) => self.status = e,
+            },
+            Message::AddLatheSetup => match self.doc.add_lathe_setup() {
+                Ok(()) => {
+                    self.stop_selection();
+                    self.touch();
+                    self.status = "Lathe setup added before the CNC setups.".into();
                 }
                 Err(e) => self.status = e,
             },

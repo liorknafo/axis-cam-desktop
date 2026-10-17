@@ -111,6 +111,10 @@ pub fn generate(
     tool: &Tool,
     mesh: &Mesh,
 ) -> Result<Plan, String> {
+    // Turning and a lathe's centre drilling are planned in their own frame.
+    if operation.strategy == Strategy::Turn || operation.on_centre(&setup.machine) {
+        return crate::cam::generate(setup, operation, tool, mesh);
+    }
     // Keep coordinates within the preview polygon kernel's integer range.
     // This applies to every strategy before its geometry-specific calculations.
     // A fixed-size box stays at the origin while the part follows the setup's
@@ -787,7 +791,7 @@ pub fn sequence_walk(
                 .filter(|v| !v.cuts.is_empty())
                 .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, frame)));
             let mut issues = setup.issues();
-            issues.extend(op.issues(&setup.machine, &doc.tools, &setup.operations[..oi]));
+            issues.extend(setup.operation_issues(oi, &doc.tools));
             let plan = if let Some(issue) = issues.first() {
                 Err(issue.clone())
             } else {
