@@ -862,6 +862,15 @@ pub(crate) mod tests {
         }
         assert_eq!(n, 4);
         assert!(moves.all(|m| !m.cutting_pass));
+        // Conventional with M3: the rows step toward the wall on +Y, so they
+        // feed along +X with the uncut material on their left.
+        let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
+        assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
+        let sides = simulation::uncut_sides(&rows);
+        assert!(
+            !sides.is_empty() && sides.iter().all(|s| *s > 0.),
+            "{sides:?}"
+        );
     }
     #[test]
     fn x_and_y_read_the_tool_edge_on_the_comp_side_with_the_dros_compensation() {

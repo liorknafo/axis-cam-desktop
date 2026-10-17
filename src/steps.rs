@@ -2195,6 +2195,9 @@ pub(crate) mod tests {
         assert!(shown.windows(2).all(|w| w[0] < w[1]), "{shown:?}");
         assert!(t.iter().any(|s| s == "Pass done ▶"));
         assert!(t.iter().any(|s| s.starts_with("1 turn every")), "{t:?}");
+        // The feed runs toward +X (conventional: the step's wall on the left).
+        let feed = dro(targets.last().unwrap().shown);
+        assert!(t.contains(&format!("▶ {feed}")), "{t:?}");
         // The edge readouts carry their centre.
         let edge = targets.iter().find(|g| g.edge).unwrap();
         assert!(

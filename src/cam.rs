@@ -547,7 +547,7 @@ fn meets(t: &[[f32; 3]; 3], b: &Bounds) -> bool {
 /// along its longer side, every move along one axis. Its sides on or beyond
 /// the stock's faces are open; the others, and a floor above the stock's
 /// bottom, keep `allowance`. Rows start at the open side and step toward the
-/// uncut material, which stays on the right of the feed (conventional, M3).
+/// uncut material, which stays on the left of the feed (conventional, M3).
 fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     if !crate::manual::is_manual(&setup.machine) {
         return Err("Box runs on a manual mill.".into());
@@ -621,8 +621,9 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     } else {
         vec![last]
     };
-    // The uncut material (toward) on the right of the feed: right of +X is −Y, right of +Y is +X.
-    let forward = if p == 0 { -toward } else { toward };
+    // Conventional with M3: the uncut material (toward) on the left of the
+    // feed. Left of +X is +Y, left of +Y is −X.
+    let forward = if p == 0 { toward } else { -toward };
     let ends = open[p];
     let near = [
         if ends[0] {
@@ -2258,6 +2259,21 @@ pub(crate) mod tests {
         }
         (setup, op, tool)
     }
+    /// Every row of a Box `plan` is conventional with M3, by the rule the
+    /// CNC's one-way facing is checked with (`simulation::uncut_sides`): the
+    /// uncut material on the left of the feed. The rows' sides, for checks
+    /// that there are some.
+    fn assert_conventional(plan: &Plan) -> Vec<f32> {
+        let along = |m: &Move| usize::from(m.from[1] != m.to[1]);
+        let cuts = cuts(plan);
+        let rows: Vec<&Move> = (cuts.iter().copied())
+            .filter(|m| cuts.first().is_some_and(|f| along(f) == along(m)))
+            .collect();
+        let sides = crate::simulation::uncut_sides(&rows);
+        assert!(plan.spindle_clockwise && plan.milling_direction == "Conventional");
+        assert!(sides.iter().all(|s| *s > 0.001), "climb: {sides:?}");
+        sides
+    }
     fn boxed_plan(b: [f32; 6], fields: &[(&str, &str)]) -> Result<Plan, String> {
         let (setup, mut op, tool) = big_mill(b);
         for (k, v) in fields {
@@ -2266,6 +2282,7 @@ pub(crate) mod tests {
         let plan = generate(&setup, &op, &tool, &block());
         if let Ok(plan) = &plan {
             assert_single_axis(plan);
+            assert_conventional(plan);
         }
         plan
     }
@@ -2341,12 +2358,14 @@ pub(crate) mod tests {
                 .iter()
                 .all(|m| (m.to[2] - (s.max[2] - 2.)).abs() < 1e-4)
         );
-        // Passes along Y, with the material (+X) on the right: feeds toward +Y.
+        // Passes along Y, with the material (+X) on the left: feeds toward −Y.
         assert!(
             cuts(&plan)
                 .iter()
-                .all(|m| m.to[1] > m.from[1] && m.to[0] == m.from[0])
+                .all(|m| m.to[1] < m.from[1] && m.to[0] == m.from[0])
         );
+        // One row: its direction is the rule's, checked on wider boxes in
+        // `a_step_stops_at_the_allowance_and_cuts_conventionally`.
     }
     #[test]
     fn meets_finds_only_triangles_that_reach_into_the_box() {
@@ -2398,8 +2417,8 @@ pub(crate) mod tests {
         for m in cuts(&plan) {
             assert!((-52.5..=52.5).contains(&m.to[1]));
             assert_eq!(m.to[2], 38.);
-            // Off the stock at both ends, toward −X (the material on +Y, on the right).
-            assert_eq!((m.from[0], m.to[0]), (74.5, -74.5));
+            // Off the stock at both ends, toward +X (the material on +Y, on the left).
+            assert_eq!((m.from[0], m.to[0]), (-74.5, 74.5));
         }
         // Down outside the stock: no feed into it from above.
         assert!(
@@ -2423,15 +2442,34 @@ pub(crate) mod tests {
         {
             assert!((row - want).abs() < 1e-4, "{rows:?}");
         }
-        // Rows step toward +Y (the uncut material), so they feed along −X.
+        // Rows step toward +Y (the uncut material), so they feed along +X
+        // with it on their left.
         assert!(
             cuts.windows(2)
                 .all(|w| w[1].to[1] > w[0].to[1] || w[1].to[2] < w[0].to[2])
         );
         assert!(
             cuts.iter()
+                .all(|m| m.to[0] > m.from[0] && m.from[1] == m.to[1])
+        );
+        assert_eq!(assert_conventional(&plan).len(), 3);
+        // The mirror step, open on +Y: rows step toward −Y and feed along −X.
+        let back = boxed_plan([-100., 100., -15.5, 100., 0., -5.], &[]).unwrap();
+        assert!(
+            (back.moves.iter())
+                .filter(|m| m.cutting_pass)
                 .all(|m| m.to[0] < m.from[0] && m.from[1] == m.to[1])
         );
+        assert_eq!(assert_conventional(&back).len(), 3);
+        // Longer in Y, open on +X: rows step toward −X and feed along +Y.
+        let side = boxed_plan([15.5, 100., -100., 100., 0., -5.], &[]).unwrap();
+        let rows: Vec<&Move> = (side.moves.iter()).filter(|m| m.cutting_pass).collect();
+        assert!(
+            rows.iter()
+                .all(|m| m.to[1] > m.from[1] && m.from[0] == m.to[0])
+        );
+        assert!(rows.windows(2).all(|w| w[1].to[0] < w[0].to[0]));
+        assert!(assert_conventional(&side).len() >= 2);
         // The floor is closed: 5 mm down less the allowance.
         assert!(cuts.iter().all(|m| (m.to[2] - 35.5).abs() < 1e-4));
         assert_eq!(plan.target, 35.5);
@@ -2588,10 +2626,10 @@ pub(crate) mod tests {
         assert_eq!(cuts(&plan).len(), 1);
         let clearance = 40. + num(&op.p, "clearance").unwrap();
         let retract = 45.;
-        // From the corner at clearance: down to retract, along X to −28,
+        // From the corner at clearance: down to retract, along X to −42,
         // across Y to 25, plunge at 30 mm/min to 35.5, pause 20 s, feed
         // 14 mm at 120 mm/min, up to retract and clearance.
-        let rapids = (clearance - retract) * 2. + 32. + 65. + (retract - 35.5);
+        let rapids = (clearance - retract) * 2. + 18. + 65. + (retract - 35.5);
         let expected = rapids / 1500. * 60. + (retract - 35.5) / 30. * 60. + 20. + 14. / 120. * 60.;
         assert!(
             (plan.duration - expected).abs() < 0.1,

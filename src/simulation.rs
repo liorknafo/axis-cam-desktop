@@ -826,6 +826,26 @@ pub fn prepare(
     selected.unwrap_or_else(|| Err("Select an enabled operation.".into()))
 }
 
+/// The side of each cutting row the uncut material is on, for successive
+/// rows `cuts` at the same Z: the feed crossed with the step to the next
+/// row's midpoint. Positive: the material is on the left of the feed (with
+/// CW, M3, conventional); negative: on the right (CW climb).
+#[cfg(test)]
+pub(crate) fn uncut_sides(cuts: &[&Move]) -> Vec<f32> {
+    let mid = |m: &Move| [(m.from[0] + m.to[0]) / 2., (m.from[1] + m.to[1]) / 2.];
+    cuts.windows(2)
+        .filter(|p| p[0].to[2] == p[1].to[2])
+        .map(|pair| {
+            let (a, b) = (mid(pair[0]), mid(pair[1]));
+            let feed = [
+                pair[0].to[0] - pair[0].from[0],
+                pair[0].to[1] - pair[0].from[1],
+            ];
+            feed[0] * (b[1] - a[1]) - feed[1] * (b[0] - a[0])
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,15 +1324,9 @@ mod tests {
                     let cuts: Vec<_> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
                     // Use successive row midpoints to measure the nominal uncut
                     // side, independent of generator's direction/across vectors.
-                    let mid = |m: &Move| [(m.from[0] + m.to[0]) / 2., (m.from[1] + m.to[1]) / 2.];
-                    for pair in cuts.windows(2).filter(|p| p[0].to[2] == p[1].to[2]) {
-                        let a = mid(pair[0]);
-                        let b = mid(pair[1]);
-                        let feed = [
-                            pair[0].to[0] - pair[0].from[0],
-                            pair[0].to[1] - pair[0].from[1],
-                        ];
-                        let side = feed[0] * (b[1] - a[1]) - feed[1] * (b[0] - a[0]);
+                    let sides = uncut_sides(&cuts);
+                    assert!(!sides.is_empty());
+                    for side in sides {
                         // CW climb: material on right of moving cutter. CCW:
                         // material on left. Conventional has the opposite side.
                         let right = (rotation == "Clockwise (CW)") == (method == "Climb");

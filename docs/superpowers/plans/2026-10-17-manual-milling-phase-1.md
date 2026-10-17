@@ -28,7 +28,7 @@
   - a new `Document` field is `#[serde(default)]`.
 - The CNC's G-code, the post, the UC100 Run and their checks do not change for CNC setups. Manual setups are skipped by every post, export and Run path, and never produce `.ngc`.
 - On a manual machine, every move of every plan changes exactly one of X, Y and Z (a Dwell changes none). Tests assert this on every manual plan they build.
-- Box passes are conventional milling with M3: the uncut material is on the right of the feed direction.
+- Box passes are conventional milling with M3: the uncut material is on the left of the feed direction (on the right is climb, as `simulation.rs` tests for the CNC).
 - Follow the codebase's style: `Fields` maps with `get`/`num`, compact functions, few comments, no `#[allow]`.
 - Every new field key needs a `help::field_help` arm. Every new `Message` needs a `help::command` arm, and an entry in `while_locked` when it must work while the CNC runs (all Steps page messages must).
 - UI text is short labels. Never claim checks that are not made: the guide does not read the DRO, and the vise is checked as boxes, as today.
@@ -210,7 +210,7 @@
   1. **Open and closed sides.** The box is clipped to the leftover stock (`plan.stock`). A side lying on or beyond the stock's face is open; every other side and the floor (unless it is at or below the stock's bottom) is closed. Closed sides and the floor move in by `allowance`.
   2. **Pass axis** = the box's longer side in X/Y; the cross axis steps.
   3. **Levels** from `z_top` down to the floor by `stepdown` (or `power_stepdown` at the full stepover width, capped at the flute length and the diameter), with equal steps, the last exactly on the floor.
-  4. **Rows across.** The first row is on the open side when the cross axis has one (else on the − side); rows step toward the closed side by `stepover`, the last row exactly at the closed side − radius. Rows are not climb: the feed direction is chosen so the uncut material (the side the rows step toward) is on the right of the feed with M3.
+  4. **Rows across.** The first row is on the open side when the cross axis has one (else on the − side); rows step toward the closed side by `stepover`, the last row exactly at the closed side − radius. Rows are not climb: the feed direction is chosen so the uncut material (the side the rows step toward) is on the left of the feed with M3.
   5. **Each row:**
      1. Rapid Z to retract;
      2. rapid along the pass axis to the start: off the stock by radius + 2 mm when that end is open, else at the closed end − radius;
@@ -227,7 +227,7 @@
 - [ ] Write tests in `cam.rs` (all with a manual machine, a 120 × 80 × 40 block, a Ø25 end mill):
   - **single axis:** every move of a Box plan and of a Drill plan with three holes changes at most one axis; the same Drill on a CNC machine still makes its usual multi-axis rapids (no change);
   - **a face:** a box covering the whole top 2 mm deep, all sides open, gives one level and rows covering the full width, with every feed move inside the stock's Y range ± radius;
-  - **a step on −Y:** −Y open, +Y closed at 15.5, allowance 0.5. The last row's tool edge is at 15.0. No feed move puts the tool edge past 15.0. Rows step toward +Y with the feed along −X (conventional, uncut material on the right).
+  - **a step on −Y:** −Y open, +Y closed at 15.5, allowance 0.5. The last row's tool edge is at 15.0. No feed move puts the tool edge past 15.0. Rows step toward +Y with the feed along +X (conventional, uncut material on the left).
   - **a closed pocket:** plunges as Feed at a quarter of the feed, and the floor is `z_bottom` + allowance;
   - **levels:** a 9.5 mm deep box with `stepdown` 2.5 gives levels at −2.5, −5, −7.5, −9.5 (minus allowance on a closed floor); an empty `stepdown` gives a positive automatic depth ≤ the flute length and ≤ the diameter;
   - **part check:** a box overlapping the part is refused with the message; a box 0.5 mm off a part face passes;
