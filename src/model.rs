@@ -189,8 +189,6 @@ pub const FEATURES: [&str; 9] = [
     "Hole 4 · Ø8",
 ];
 
-/// The setup keys a manual setup put first takes from the old first setup,
-/// besides its stock: orientation, zero, offset and holding.
 /// The keys of a setup's vise or clamps.
 const HOLDING: [&str; 7] = [
     "holding",
@@ -201,6 +199,8 @@ const HOLDING: [&str; 7] = [
     "vise_grip",
     "clamps",
 ];
+/// The setup keys a manual setup put first takes from the old first setup,
+/// besides its stock: orientation, zero, offset and holding.
 const HANDED_OVER: [&str; 17] = [
     "rx",
     "ry",

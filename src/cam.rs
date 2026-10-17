@@ -578,7 +578,10 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // The stepdown: given, or what the spindle takes at a full stepover,
     // at the operation's rpm with the tool's flutes. The project's material
     // does not reach `generate`: it is counted as steel, the hardest common
-    // group but stainless.
+    // group but stainless. Rows cut one stepover wide, except the first row
+    // of a box closed on both cross-axis sides: it starts inside the stock
+    // and cuts a full slot, the tool's whole diameter, so the depth is
+    // sized for that width.
     let width = stepover / 100. * 2. * r;
     let down = if get(&op.p, "stepdown").trim().is_empty() {
         let rpm = number(op, "rpm").ok().filter(|n| *n > 0.);
@@ -586,7 +589,9 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         let (Some(rpm), Some(flutes)) = (rpm, flutes) else {
             return Err("An automatic stepdown needs a positive rpm and the tool's flutes.".into());
         };
-        crate::forces::power_stepdown(&setup.machine, None, 2. * r, width, b.feed, rpm, flutes)
+        let slot = open[c] == [false, false];
+        let cut_width = if slot { 2. * r } else { width };
+        crate::forces::power_stepdown(&setup.machine, None, 2. * r, cut_width, b.feed, rpm, flutes)
             .min(b.plan.flute_length)
     } else {
         number(op, "stepdown")?
@@ -2596,7 +2601,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_closed_pocket_plunges_at_a_quarter_feed_onto_its_floor_and_allowance() {
-        let plan = boxed_plan([-55., -15., 12., 38., 0., -5.], &[]).unwrap();
+        // One level: the slot is 4.5 mm deep, the stepdown given.
+        let plan = boxed_plan([-55., -15., 12., 38., 0., -5.], &[("stepdown", "5")]).unwrap();
         let downs: Vec<&Move> = plan
             .moves
             .iter()
@@ -2668,6 +2674,34 @@ pub(crate) mod tests {
         );
         op.p.insert("stepdown".into(), "5".into());
         assert!(generate(&setup, &op, &tool, &block()).is_err());
+    }
+    /// A box closed on both cross sides cuts a full slot with its first row:
+    /// its automatic stepdown is sized at the tool's diameter, not the
+    /// stepover. An open face only ever engages the stepover.
+    #[test]
+    fn a_closed_pockets_automatic_stepdown_is_sized_for_the_full_slot() {
+        let (setup, ..) = big_mill([0.; 6]);
+        // Ø25 at 120 mm/min, 640 rpm, 3 flutes; stepover 70 % is 17.5 mm.
+        let power = |width: f32| {
+            crate::forces::power_stepdown(&setup.machine, None, 25., width, 120., 640., 3.)
+        };
+        let (narrow, full) = (power(17.5), power(25.));
+        assert!(full < narrow && narrow < 12., "{full} {narrow}");
+        // Equal levels of at most `down` down a 12 mm block.
+        let levels = |plan: &Plan| {
+            let mut z: Vec<f32> = cuts(plan).iter().map(|m| m.to[2] - 40.).collect();
+            z.dedup();
+            z
+        };
+        let steps = |down: f32| (12. / down - 0.0001).ceil() as usize;
+        assert_ne!(steps(full), steps(narrow));
+        let closed = boxed_plan([-50., 50., -30., 30., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(closed.levels, steps(full), "{:?}", levels(&closed));
+        let open = boxed_plan([-100., 100., -100., 100., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(open.levels, steps(narrow), "{:?}", levels(&open));
+        // Closed on one cross side only, the first row hangs off the open one.
+        let step = boxed_plan([-50., 50., -100., 30., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(step.levels, steps(narrow));
     }
     /// Steps between levels (from the top) and between rows: none under half
     /// of the stepdown or the stepover, and none over it, unless it is the
@@ -2757,7 +2791,9 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_single_row_box_takes_its_feeds_rapids_and_pause() {
-        let (setup, op, tool) = big_mill([-55., -15., 12., 38., 0., -5.]);
+        let (setup, mut op, tool) = big_mill([-55., -15., 12., 38., 0., -5.]);
+        // One level: the stepdown given (automatic, the full slot takes two).
+        op.p.insert("stepdown".into(), "5".into());
         let plan = generate(&setup, &op, &tool, &block()).unwrap();
         assert_eq!(cuts(&plan).len(), 1);
         let clearance = 40. + num(&op.p, "clearance").unwrap();
