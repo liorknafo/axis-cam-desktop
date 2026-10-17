@@ -3506,14 +3506,8 @@ impl App {
                 }
             }
             Message::DeleteTool(id) => {
-                if self
-                    .doc
-                    .setups
-                    .iter()
-                    .flat_map(|s| &s.operations)
-                    .any(|o| o.tool == id)
-                {
-                    self.status="This tool is assigned to an operation. Reassign those operations before deleting it.".into()
+                if let Some(note) = self.doc.tool_in_use_note(&id) {
+                    self.status = format!("This tool is not deleted. {note}")
                 } else {
                     self.doc.tools.retain(|t| t.id != id);
                     self.tool_draft = self

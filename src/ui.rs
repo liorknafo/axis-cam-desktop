@@ -5974,17 +5974,18 @@ pub(crate) fn holder_labels(h: &crate::holding::Holder) -> (String, String) {
     (format!("Save {word}"), format!("Delete {word}"))
 }
 /// The one layout of the library editors (Tools, Materials, Workholding): the
-/// fields scroll, and under them, outside the scroll, the unsaved-draft note
-/// and the Save and Delete buttons stay in sight at any window height.
+/// fields scroll, and under them, outside the scroll, the notes (an unsaved
+/// draft, an entry that cannot be deleted) and the Save and Delete buttons
+/// stay in sight at any window height.
 fn library_editor<'a>(
     form: Column<'a, Message>,
-    unsaved: Option<String>,
+    notes: impl IntoIterator<Item = String>,
     save: HelpButton<'a>,
     delete: HelpButton<'a>,
 ) -> Element<'a, Message> {
     let mut actions = column![].spacing(8);
-    if let Some(unsaved) = unsaved {
-        actions = actions.push(text(unsaved).size(12).color(Color::from_rgb8(166, 101, 32)));
+    for note in notes {
+        actions = actions.push(text(note).size(12).color(Color::from_rgb8(166, 101, 32)));
     }
     actions = actions.push(row![save, delete].spacing(10));
     let form = container(form).width(Fill).padding(iced::Padding {
@@ -6082,7 +6083,9 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     form = form.push(warnings(tool_issues));
     let editor = library_editor(
         form,
-        tool_unsaved(app),
+        tool_unsaved(app)
+            .into_iter()
+            .chain(app.doc.tool_in_use_note(&app.tool_draft.id)),
         primary(
             app.resume_label().unwrap_or("Save tool".into()),
             Message::SaveTool,
