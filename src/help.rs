@@ -1769,7 +1769,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "pocket_entry") => (
             "Profile ramp descends along the pocket contour at the ramp angle, then cuts the loop at depth. Plunge feeds straight down and needs a plunge-capable end mill. Both enter at 25% feed. Between loops the tool stays down, stepping at most 1.5 stepovers clear of walls and islands; where it cannot, it retracts and enters again.",
-            "",
+            "A loop too short for its ramp, one the ramp would have to go round more than ten times (twice in a rest pass's corners, where little of the cutter meets material), plunges instead. Below the first level a loop the tool enters again rapids down to 0.5 mm over the level before, where the cutter has already been.",
             Some(Ramp),
         ),
         (_, "feed") => (
@@ -1823,9 +1823,14 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "breakthrough") => (
-            "Additional drill travel past the exit of a hole that goes through, in mm; it is never added under a blind hole. The real required distance also depends on drill-point geometry.",
+            "Additional travel past the exit, in mm: of a hole that goes through, for a drill (never under a blind hole), or of a Pocket's openings cut through, below where their walls end. The real required distance also depends on drill-point geometry.",
             "",
             Some(Operation(Strategy::Drill)),
+        ),
+        (_, "openings") => (
+            "Holes in the selected floors with nothing of the part over or under them, such as switch cut-outs in a plate: Leave clears over them at the floor's height, Cut through also cuts each down to where its walls end, plus Breakthrough.",
+            "An opening is a hole in a selected floor whose column holds no part at all. Its walls are followed at the cutter's radius, as a pocket's are, so corners keep that radius; run a smaller cutter after it to sharpen them. Openings narrower than the cutter are left, for a smaller one. Round holes are openings too, but Drilling makes them faster.",
+            Some(Operation(Strategy::Pocket)),
         ),
         (_, "angle_a" | "angle_b") => (
             "Indexed position of the primary or secondary rotary axis, in degrees. The axis is positioned before cutting and held fixed during the cut.",
@@ -2210,6 +2215,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "holder") => (
             "Maximum holder diameter in mm. The holder is wider than the cutter and needs its own clearance around walls and fixtures.",
             "",
+            Some(Tool),
+        ),
+        (_, "tip_angle") => (
+            "A chamfer mill's included point angle in degrees, 90 when left empty. Match a countersink's angle: an 82° countersink needs an 82° cutter.",
+            "Drilling with a chamfer mill plunges its point into each detected opening until the cone is as wide as the opening at its rim, so a countersink comes out at the CAD's size. Bottom offset raises the plunge (a narrower chamfer); a negative one lowers it (a wider one).",
             Some(Tool),
         ),
         _ => (

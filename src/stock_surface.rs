@@ -2,11 +2,7 @@
 //! contouring. Coordinates remain attached to the first setup, across flips.
 //! The small occupancy grid in Volume is only a removal-volume estimate; it is
 //! never used to construct this surface. No dense fine-resolution grid exists.
-use crate::{
-    mesh::Bounds,
-    simulation::{CutterShape, POINT_RISE},
-    volume::Frame,
-};
+use crate::{mesh::Bounds, simulation::CutterShape, volume::Frame};
 use fidget::{
     context::Tree,
     mesh::{Octree, Settings},
@@ -108,8 +104,9 @@ impl Cut {
                             .sqrt()
                 }
                 // The point's cone, rising from the tip, under the wall.
-                CutterShape::Drill => {
-                    Tree::from(d[2].min(0.)) + (p[0].square() + p[1].square()).sqrt() * POINT_RISE
+                CutterShape::Drill | CutterShape::Chamfer(_) => {
+                    Tree::from(d[2].min(0.))
+                        + (p[0].square() + p[1].square()).sqrt() * self.shape.rise().unwrap()
                 }
             };
             return radial
@@ -144,7 +141,8 @@ impl Cut {
                         .max(0.)
                         .sqrt()
             }
-            CutterShape::Drill => {
+            CutterShape::Drill | CutterShape::Chamfer(_) => {
+                let rise = self.shape.rise().unwrap();
                 // As the ball, with the point's cone as the lower envelope:
                 // lowest where the tip's descent balances the cone's rise,
                 // or at an end of the interval under a move steeper than
@@ -154,7 +152,7 @@ impl Cut {
                 } else if d[2] < -1e-7 {
                     hi = hi.min(((p[2].clone() - self.flute) / d[2]).max(0.).min(1.));
                 }
-                let cone = POINT_RISE * POINT_RISE * l * l;
+                let cone = rise * rise * l * l;
                 let t = if cone > d[2] * d[2] {
                     u.clone() / l - v.abs() * (d[2] / (l * (cone - d[2] * d[2]).sqrt()))
                 } else if d[2] < 0. {
@@ -163,7 +161,7 @@ impl Cut {
                     lo.clone()
                 };
                 let t = t.max(lo.clone()).min(hi.clone());
-                t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * POINT_RISE
+                t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * rise
             }
             CutterShape::Flat => {
                 if d[2] < 0. {
@@ -255,6 +253,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulation::POINT_RISE;
     use fidget::shape::EzShape;
     fn frame() -> Frame {
         let mesh =
