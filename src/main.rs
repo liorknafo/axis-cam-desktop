@@ -185,8 +185,17 @@ pub enum Message {
     BrowseUc100Profile,
     /// The chosen UC100 profile; None when the dialog was cancelled.
     Uc100ProfilePicked(Option<PathBuf>),
-    /// Chooses the UC100 machine for the Control page (machine id).
+    /// Chooses the UC100 machine for the Control page (machine id). While
+    /// another machine is connected it asks first (`SwitchMachine`).
     ControlMachine(String),
+    /// The answer to "disconnect and switch?": true disconnects, chooses the
+    /// machine asked about and connects to it.
+    SwitchMachine(bool),
+    /// Back to the manual mill's steps from the CNC's Control page.
+    ShowGuide,
+    /// The Control page's Real | Simulated switch for its machine (true:
+    /// simulated). Connected the other way, it reconnects.
+    MachineConnection(bool),
     Connect,
     Disconnect,
     MachineReset,
@@ -852,6 +861,13 @@ pub struct App {
     pub profile_draft: Option<(String, Result<setup::Draft, String>)>,
     /// The UC100 machine chosen on the Control page (machine id).
     pub control_machine: Option<String>,
+    /// The machine (id) picked on the Control page while another is
+    /// connected: the page asks whether to disconnect and switch to it.
+    pub switch_machine: Option<String>,
+    /// The manual-mill setup (id) whose Control page shows the CNC instead of
+    /// its steps, after a CNC machine was picked there. Making another setup
+    /// active shows the steps again.
+    pub cnc_over_guide: Option<String>,
     /// The setup (id) Run on the machine picked while disconnected: Connect
     /// picks it in the Run panel.
     run_on_connect: Option<String>,
@@ -1182,6 +1198,8 @@ impl App {
             machine_setup: false,
             profile_draft: None,
             control_machine: None,
+            switch_machine: None,
+            cnc_over_guide: None,
             run_on_connect: None,
             jog_key: None,
             run_epoch: 0,
@@ -1748,6 +1766,7 @@ impl App {
     }
     /// Disables the machine and stops its controller, if connected.
     pub fn disconnect_machine(&mut self) {
+        self.switch_machine = None;
         if let Some(c) = self.control.take() {
             c.close();
             self.status = "Disconnected from the machine.".into();
@@ -2339,7 +2358,9 @@ impl App {
     pub(crate) fn steps_page(&self) -> bool {
         self.page == Page::Control
             && !self.machine_setup
-            && (self.doc.active_setup()).is_some_and(|s| manual::is_manual(&s.machine))
+            && (self.doc.active_setup()).is_some_and(|s| {
+                manual::is_manual(&s.machine) && self.cnc_over_guide.as_ref() != Some(&s.id)
+            })
     }
     /// The guide as built, when that was for the job as it is now.
     pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
@@ -2420,6 +2441,7 @@ impl App {
                 let Some(s) = self.doc.setups.get(si) else {
                     return Task::none();
                 };
+                self.cnc_over_guide = None;
                 if s.id != self.doc.active {
                     self.doc.active = s.id.clone();
                     self.stop_selection();
@@ -3529,11 +3551,55 @@ impl App {
                 }
             }
             Message::ControlMachine(id) => {
-                if self.control.is_none() {
-                    self.control_machine = Some(id);
+                if let Some(s) = (self.doc.active_setup()).filter(|s| manual::is_manual(&s.machine))
+                {
+                    self.cnc_over_guide = Some(s.id.clone());
+                }
+                match &self.control {
+                    None => self.control_machine = Some(id),
+                    Some(c) => {
+                        self.switch_machine = (c.machine_id != id).then_some(id);
+                    }
                 }
                 if self.machine_setup {
                     self.open_profile(false);
+                }
+            }
+            Message::SwitchMachine(yes) => {
+                let Some(id) = self.switch_machine.take() else {
+                    return Task::none();
+                };
+                if !yes {
+                    self.run_on_connect = None;
+                } else if self.doc.machines.iter().any(|m| m.id == id) {
+                    self.disconnect_machine();
+                    self.control_machine = Some(id);
+                    return self.update(Message::Connect);
+                }
+            }
+            Message::ShowGuide => self.cnc_over_guide = None,
+            Message::MachineConnection(sim) => {
+                let Some(id) = self.control_target().map(|m| m.id.clone()) else {
+                    return Task::none();
+                };
+                let value = if sim { "Simulated" } else { "USB" };
+                // Not a planning setting: the setups' snapshots keep their
+                // version. A machine being edited takes the choice too.
+                for m in (self.doc.machines.iter_mut())
+                    .chain(std::iter::once(&mut self.machine_draft))
+                    .filter(|m| m.id == id)
+                {
+                    m.p.insert("uc100_connection".into(), value.into());
+                }
+                self.dirty = true;
+                self.project_dirty = true;
+                self.last_edit = Instant::now();
+                if let Some(c) = &self.control
+                    && c.machine_id == id
+                    && c.simulated != sim
+                {
+                    self.disconnect_machine();
+                    return self.update(Message::Connect);
                 }
             }
             Message::ControlSetup(on) => {
@@ -3739,8 +3805,13 @@ impl App {
                     Some(c) if c.machine_id == machine => {
                         Task::batch([page, self.update(Message::Run(run::Action::Setup(si)))])
                     }
-                    // Connected to another machine: its Run panel lists its own setups.
-                    Some(_) => page,
+                    // Connected to another machine: the page asks whether to
+                    // switch, and the setup is picked after connecting.
+                    Some(_) => {
+                        self.switch_machine = Some(machine);
+                        self.run_on_connect = Some(setup);
+                        page
+                    }
                 };
             }
             Message::Run(run::Action::Check) => return self.recheck_run(),

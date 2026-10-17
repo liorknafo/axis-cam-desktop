@@ -6315,6 +6315,69 @@ flood = { pin = 8 }
     }
 
     #[test]
+    fn picking_another_machine_while_connected_asks_then_switches() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        let mut other = a.doc.machines[0].clone();
+        other.id = "other".into();
+        other.p.insert("name".into(), "Second router".into());
+        a.doc.machines.push(other);
+        let first = a.doc.machines[0].id.clone();
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        // The connected machine itself asks nothing.
+        let _ = a.update(Message::ControlMachine(first.clone()));
+        assert!(a.switch_machine.is_none());
+        let _ = a.update(Message::ControlMachine("other".into()));
+        assert_eq!(conn(&a).machine_id, first);
+        shows(&a, &["Switch to Second router?", "Disconnect and switch"]);
+        let _ = a.update(Message::SwitchMachine(false));
+        assert!(a.switch_machine.is_none() && conn(&a).machine_id == first);
+        lacks(&a, &["Switch to Second router?"]);
+        let _ = a.update(Message::ControlMachine("other".into()));
+        let _ = a.update(Message::SwitchMachine(true));
+        assert_eq!(conn(&a).machine_id, "other");
+        assert_eq!(a.control_target().unwrap().id, "other");
+        tick_until(&mut a, 3.0, "E-stop after switching", |s| {
+            s.state == Some(State::EStop)
+        });
+        // A Disconnect drops a question still open.
+        let _ = a.update(Message::ControlMachine(first));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.switch_machine.is_none() && a.control.is_none());
+    }
+
+    #[test]
+    fn the_real_or_simulated_switch_saves_the_machines_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        a.page = Page::Control;
+        a.machine_draft = a.doc.machines[0].clone();
+        shows(&a, &["Real (USB)", "Simulated"]);
+        let _ = a.update(Message::MachineConnection(false));
+        assert!(!crate::control::simulated(&a.doc.machines[0]));
+        assert!(!crate::control::simulated(&a.machine_draft));
+        assert_eq!(a.doc.machines[0].version, 1, "not a planning change");
+        assert!(a.control.is_none(), "choosing does not connect");
+        let _ = a.update(Message::MachineConnection(true));
+        assert!(crate::control::simulated(&a.doc.machines[0]));
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).simulated);
+        // The way it is connected already keeps the connection.
+        a.control.as_mut().unwrap().mdi = "G0 X1".into();
+        let _ = a.update(Message::MachineConnection(true));
+        assert_eq!(conn(&a).mdi, "G0 X1");
+        shows(
+            &a,
+            &["Real (USB) disconnects the simulator and connects to the machine itself."],
+        );
+    }
+
+    #[test]
     fn connect_reports_a_missing_profile_and_needs_a_uc100_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut empty = App::from_workspace(dir.path().join("empty.json"), None);
