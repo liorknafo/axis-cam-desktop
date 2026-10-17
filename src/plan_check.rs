@@ -943,7 +943,19 @@ fn run(
                         name: op.name().to_string(),
                         minutes: (sim.plan.duration / 6.).round() / 10.,
                     });
-                    for message in axis_problems(&sim.plan, &geometries[si], &indexes[si], si) {
+                    // A lathe plan's moves are a side view (X the tool's
+                    // distance from the spindle axis, Z along it), not a
+                    // tool hanging down the setup's Z: the part above its
+                    // tip and the floor under it do not apply. Its rings
+                    // were checked against the part when it was generated
+                    // (`turn::generate`), and the stock check below sees
+                    // them in the volume.
+                    let lathe = sim.plan.is_lathe();
+                    for message in (!lathe)
+                        .then(|| axis_problems(&sim.plan, &geometries[si], &indexes[si], si))
+                        .into_iter()
+                        .flatten()
+                    {
                         axis.push(Problem {
                             setup: si + 1,
                             operation: Some(oi + 1),
@@ -2202,6 +2214,36 @@ mod tests {
         let report = analysis::report(&doc, &closed).unwrap();
         let (check, _) = super::check(&doc, &closed, &report, &face_and_waterline(&report));
         assert!(check.passed, "{:?}", stages(&check));
+    }
+    #[test]
+    fn a_lathe_plan_is_not_read_as_a_tool_hanging_down_the_setup_z() {
+        use crate::turn::tests::{add, job, tube};
+        // A groove beyond the end of a Ø30 shaft: the tool's tip, at Ø20,
+        // has the shaft above it along the setup's Z, which is the spindle
+        // axis, not the tool's.
+        let (mut doc, mesh) = job(50., 100., tube(0., 15., 0., 50.), -60.);
+        add(
+            &mut doc,
+            "Groove",
+            &[("z", "-70"), ("width", "3"), ("diameter", "20")],
+        );
+        doc.adopt_materials();
+        doc.material_id = doc.materials[0].id.clone();
+        let sim = crate::simulation::prepare(&doc, &mesh, 0, 0).unwrap();
+        let geometry = Geometry::new(&doc.setups[0], &mesh);
+        let index = Index::new(&geometry);
+        assert!(!axis_problems(&sim.plan, &geometry, &index, 0).is_empty());
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let check = check_built(&doc, &mesh, &report);
+        assert!(
+            !check
+                .problems
+                .iter()
+                .any(|p| p.stage == "gouge" || p.stage == "generation"),
+            "{:?}",
+            check.problems
+        );
+        assert_eq!(check.operations.len(), 1);
     }
     #[test]
     fn a_plunge_where_the_underside_is_open_is_refused() {

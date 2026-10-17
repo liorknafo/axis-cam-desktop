@@ -36,6 +36,8 @@ pub struct RestStock {
     /// Where every earlier cut, of any cutter shape, can have removed
     /// material (`removal_boxes`, in `current`): what `bottom` reads.
     removal: Vec<Bounds>,
+    /// The earlier lathe cuts about `current`'s Z axis (`coaxial`).
+    coaxial: Coaxial,
 }
 fn corners(b: Bounds) -> [[f32; 3]; 8] {
     std::array::from_fn(|mask| {
@@ -153,6 +155,52 @@ fn turned(volume: &Volume, current: Frame) -> Option<Bounds> {
         }
     }
     Some(out)
+}
+/// The lathe's view of the stock in `volume` about `current`'s Z axis
+/// (X = Y = 0), what a Turn plans its passes from.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Coaxial {
+    /// How far from the axis the round bar reaches, when the stock started
+    /// as a round bar whose axis is parallel to it: its radius, plus the
+    /// offset of its axis when that is not on it.
+    pub bar: Option<f32>,
+    /// Every lathe cut (`Revolve`) made about this same axis, in any setup
+    /// whose Z axis lies on it either way round, as `[z0, z1, r0, r1]` in
+    /// `current` (mm, `z0 <= z1`, `r0 <= r1`). Lathe cuts about another
+    /// axis, and every other cut, are left out: the passes may start in air
+    /// after them, but never deeper than the material.
+    pub rings: Vec<[f32; 4]>,
+}
+/// `Coaxial` of `volume` about `current`'s Z axis.
+pub fn coaxial(volume: &Volume, current: Frame) -> Coaxial {
+    const TOLERANCE: f32 = 1e-3;
+    let on_axis = |frame: Frame, p: [f32; 3]| {
+        let axis = frame.transfer_vector([0., 0., 1.], current);
+        let at = frame.transfer(p, current);
+        (axis[0].abs() < 1e-4 && axis[1].abs() < 1e-4).then_some(at)
+    };
+    let bar = volume
+        .round
+        .then(|| crate::stock::bar(volume.bounds))
+        .and_then(|(centre, radius)| {
+            on_axis(volume.frame, [centre[0], centre[1], 0.]).map(|c| c[0].hypot(c[1]) + radius)
+        });
+    let rings = volume
+        .cuts
+        .iter()
+        .filter(|c| c.shape == CutterShape::Revolve)
+        .filter_map(|c| {
+            let low = on_axis(c.frame, [0., 0., c.a[0]])?;
+            let high = on_axis(c.frame, [0., 0., c.b[0]])?;
+            (low[0].hypot(low[1]) < TOLERANCE).then_some([
+                low[2].min(high[2]),
+                low[2].max(high[2]),
+                c.a[1],
+                c.b[1],
+            ])
+        })
+        .collect();
+    Coaxial { bar, rings }
 }
 /// Box, in `current`, around each earlier cut of any cutter shape: material can
 /// only have been removed inside these boxes.
@@ -438,7 +486,12 @@ impl RestStock {
             whole,
             cuts,
             removal: removal_boxes(volume, current),
+            coaxial: coaxial(volume, current),
         }
+    }
+    /// What earlier lathe cuts left about the current frame's Z axis.
+    pub fn coaxial(&self) -> &Coaxial {
+        &self.coaxial
     }
     /// The box the stock left lies in, in the current frame, mm: outside it
     /// no stock is left (the stock's box, less what lathe cuts turned away).

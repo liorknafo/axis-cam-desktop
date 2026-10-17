@@ -49,10 +49,6 @@ pub const TURN_ON_MILL: &str = "Turn runs on a lathe.";
 pub const DRILL_ON_CENTRE: &str =
     "A lathe drills on the centre line: remove the hole selection and set the depth.";
 
-/// What generating a Turn, or a Drill on the centre, says until its passes
-/// are planned.
-pub const NOT_GENERATED: &str = "Turning passes are not generated yet.";
-
 /// The kinds of Turn (`turn_kind`).
 pub const TURN_KINDS: [&str; 7] = [
     "Face", "Outside", "Bore", "Chamfer", "Groove", "Part off", "Thread",

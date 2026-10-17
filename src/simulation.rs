@@ -84,6 +84,27 @@ pub struct Plan {
     pub rest_top: Option<f32>,
     pub spindle_clockwise: bool,
     pub milling_direction: &'static str,
+    /// A lathe plan's cuts (`turn::generate`), in the order they are made:
+    /// the simulation turns each ring away when its move ends, instead of
+    /// sweeping the cutter along the moves. Empty for every other plan.
+    pub rings: Vec<Ring>,
+}
+impl Plan {
+    /// Whether this is a lathe plan: its moves are a side view (X the
+    /// tool's distance from the spindle axis, Y 0, Z along the axis) and its
+    /// cuts are its `rings`.
+    pub fn is_lathe(&self) -> bool {
+        self.shape == CutterShape::Revolve
+    }
+}
+/// A lathe cut: the ring of the plan's setup frame between `z[0]` and `z[1]`
+/// along its Z axis and between the radii `r[0]` and `r[1]` from it (mm),
+/// turned away when move `at` of the plan ends (`volume::Volume::revolve`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ring {
+    pub at: usize,
+    pub z: [f32; 2],
+    pub r: [f32; 2],
 }
 fn number(operation: &Operation, key: &str) -> Result<f32, String> {
     num(&operation.p, key).ok_or_else(|| {
@@ -113,7 +134,7 @@ pub fn generate(
 ) -> Result<Plan, String> {
     // Turning and a lathe's centre drilling are planned in their own frame.
     if operation.strategy == Strategy::Turn || operation.on_centre(&setup.machine) {
-        return crate::cam::generate(setup, operation, tool, mesh);
+        return crate::turn::generate(setup, operation, tool, mesh);
     }
     // Keep coordinates within the preview polygon kernel's integer range.
     // This applies to every strategy before its geometry-specific calculations.
@@ -373,6 +394,7 @@ pub fn generate(
         } else {
             "Conventional"
         },
+        rings: vec![],
     };
     let mut position = [area.min[0], area.min[1], clearance];
     let mut push = |to: [f32; 3], motion: Motion, rate: f32, cutting_pass: bool| {
@@ -671,7 +693,8 @@ impl Simulation {
             }
             let from = movement.at(self.seconds.max(movement.start));
             let to = movement.at(seconds.min(movement.end));
-            if movement.motion == Motion::Feed {
+            // A lathe plan cuts with its rings, below, not along its moves.
+            if movement.motion == Motion::Feed && !self.plan.is_lathe() {
                 self.stock
                     .cut_shape(from, to, self.plan.radius, self.plan.shape);
                 if let (Some(volume), Some(frame)) = (&mut self.volume, self.frame) {
@@ -689,6 +712,18 @@ impl Simulation {
             self.position = to;
             if movement.end > seconds {
                 break;
+            }
+            if let (Some(volume), Some(frame)) = (&mut self.volume, self.frame) {
+                for ring in self.plan.rings.iter().filter(|r| r.at == self.current) {
+                    volume.revolve(
+                        ring.z[0],
+                        ring.z[1],
+                        ring.r[0],
+                        ring.r[1],
+                        frame,
+                        self.source,
+                    );
+                }
             }
             self.current += 1;
         }

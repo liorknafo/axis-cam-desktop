@@ -1008,6 +1008,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         rest_top: (highest < top - 0.0001).then_some(highest),
         spindle_clockwise: clockwise,
         milling_direction: if climb { "Climb" } else { "Conventional" },
+        rings: vec![],
     };
     let first = planned[0].0[0][0][0];
     let mut position = [first.0 as f32, first.1 as f32, clearance];

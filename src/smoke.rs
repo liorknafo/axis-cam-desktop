@@ -16774,10 +16774,16 @@ flood = { pin = 8 }
             checks.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
         assert_eq!(checks[0].key, Some("diameter"));
-        // Generating says the passes are not planned yet.
+        // Generating plans the passes, a lathe plan the simulation turns.
         let _ = a.update(Message::Edit(Target::Operation, "diameter", "40".into()));
         let _ = a.update(Message::Generate);
-        assert_eq!(a.status, crate::lathe::NOT_GENERATED, "{}", a.status);
+        assert!(
+            a.status.starts_with("Turning preview ready"),
+            "{}",
+            a.status
+        );
+        let sim = a.simulation.as_ref().unwrap();
+        assert!(sim.plan.is_lathe() && !sim.plan.rings.is_empty());
     }
     #[test]
     fn a_lathe_drill_has_a_centre_tab_and_no_hole_selection() {

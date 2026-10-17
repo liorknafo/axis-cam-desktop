@@ -2685,6 +2685,7 @@ pub(crate) mod fixture {
             rest_top: None,
             spindle_clockwise: true,
             milling_direction: "Climb",
+            rings: vec![],
         };
         let mut at = start;
         for (motion, to, rate) in moves {
