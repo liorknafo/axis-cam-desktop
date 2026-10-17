@@ -50,7 +50,7 @@ The script (rewritten for #32 and untested on a Mac since) builds the release bi
 | Tool library | Editable tool types, diameter, flutes, flute length, stickout and holder diameter; in-use tool deletion protection |
 | Material library | Saved materials with group, hardness, notes and cutting data for carbide tools (surface speed and chip load per tooth by tool diameter); fifteen starter materials marked as starting points; a project material picked from the library; warnings when an operation's speed or feed is outside the material's data |
 | Workholding library | Saved vises and toe clamps with their sizes (two starters); a setup models a vise or clamps from the library, the app suggests where they go, the 3D view draws them, and every move is checked against them as boxes with a clearance gap; a later setup starts from the stock the earlier setups left, and its holder is checked on that stock (see **Workholding**) |
-| Operations | Six implemented imported-mesh preview strategies; explicit status for all eleven strategies; unavailable operations cannot be added to imported jobs |
+| Operations | Six implemented imported-mesh preview strategies and Box for a manual mill; explicit status for all twelve strategies; unavailable operations cannot be added to imported jobs |
 | Geometry | Imported planar surface selection for Facing, Pocket and Drilling; whole-model Contour/Parallel/Waterline; separate selectable example housing; depth-tested rendering; orbit, pan, zoom and orthographic views |
 | STL | Real binary and ASCII mesh preview |
 | OBJ | Real mesh preview; polygon fan triangulation and negative face indices |
@@ -65,7 +65,7 @@ The script (rewritten for #32 and untested on a Mac since) builds the release bi
 
 ### Operation strategies
 
-Facing, adaptive clearing, pocket, contour, drilling, parallel finishing, waterline finishing, scallop finishing, indexed face, rotary finishing and 5-axis surface.
+Facing, adaptive clearing, pocket, contour, drilling, parallel finishing, waterline finishing, scallop finishing, indexed face, rotary finishing, 5-axis surface and Box (manual mill only: see **Manual mill**).
 
 Milling operations use **Tool → Geometry → Heights → Passes → Linking**. Drilling replaces Passes with Cycle. Indexed, rotary and 5-axis strategies add Orientation.
 
@@ -346,6 +346,8 @@ left of the toolbar:
 - **MACHINE** runs the CNC through the UC100 (the Control page below): its
   toolbar has **Control** and **Controller configuration**, and the red
   **E-STOP** while connected.
+  A setup on a manual mill shows its **Steps** page there instead (see
+  **Manual mill**).
 
 As in Fusion 360, each toolbar button has an icon above its label, and the
 switcher shows the open workspace's icon. Each icon is a solid tile with a
@@ -362,6 +364,91 @@ Picking MANUFACTURE goes back to the page left for MACHINE. While the
 machine moves (a tool run, held or paused, a probe, a jog or homing) the
 switcher stays on MACHINE and says "Manufacture opens when the machine
 stops": nothing of the job can be opened, edited or previewed until then.
+
+## Manual mill
+
+A job can use a hand-fed milling machine with a DRO for the cuts that move one axis at a time, before the CNC. The app plans those cuts and simulates them like any other operation, so the CNC setups after them start from the stock they leave. It makes **no G-code** for them: MACHINE shows the setup as steps.
+
+**The app does not read the DRO.** It shows the numbers the DRO should read and you move the axes. Nothing in the app confirms that the machine is where a step says; tapping a readout only lights the next number.
+
+### The manual machine
+
+A machine has a kind, **CNC** (the default, so older projects read unchanged) or **Manual**. The wizard's first step chooses it and fills the manual defaults. A manual machine has the name, travel and power of any machine and these fields. The post, probe and controller fields do not apply and are hidden; the editor says "Manual mill — no G-code; MACHINE shows the steps."
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| Gears (`speeds`) | The spindle speeds the gearbox has, in rpm, comma-separated; `min-max` means a variable drive | 90, 150, 250, 400, 640, 1000, 1600 |
+| Hand feed | The fastest feed you can turn steadily by hand, mm/min; no manual operation feeds faster | 150 |
+| Hand rapid | How fast you move an axis off the cut, mm/min | 1500 |
+| Handwheel mm per turn | X, Y and Z | 5, 5, 2.5 |
+| DRO compensation | Whether the DRO has tool-radius compensation | Yes |
+| Pass time | Seconds to reset, set and lock the axes for one pass | 20 |
+| Tool time | Minutes to change a tool and pick up the zero again | 3 |
+| Move time | Minutes to move the stock between this machine and another | 10 |
+
+These are placeholders until you enter your machine's numbers. On save the machine's rpm becomes the highest gear and its feed the hand feed, so the speed, feed and material checks apply as on any machine. An operation's rpm must be one of the gears (within 1 %, or in the range of a variable drive) and its feed at most the hand feed; a new operation is snapped to them. There is no power feed: every cut is fed by hand.
+
+### Tools and vises are marked per machine
+
+A tool and a library vise or clamp set have a check box for each machine that holds them. With none checked, the entry fits every CNC machine and no manual machine, so existing tools and vises keep working on the CNC and do not show on the manual mill. An operation whose tool does not fit its setup's machine has an operation issue, and the plan check stops on it. The vise picker lists only holders that fit the setup's machine.
+
+### + Add manual setup
+
+**+ Add manual setup** on the setup list adds a setup on a manual machine from the library, before the first CNC setup. When it becomes the first setup it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock the manual setup leaves. Later manual setups go before the first CNC setup; they can be moved, for example to face the bottom after a flip.
+
+Only **Box** and **Drill** can run on a manual setup. The ribbon dims the other strategies there, and a plan that puts one on a manual setup is refused. Box is refused on a CNC setup.
+
+### Box
+
+Box removes an axis-aligned block with one flat end mill. Facing, squaring a side, a step, a slot and a pocket are all boxes with different open sides. A side of the block that is on or beyond the stock's face is open; the others are closed.
+
+- **Fields**, in the setup's work frame: X min and max, Y min and max, Z top and bottom, **allowance**, stepover and stepdown, rpm and feed. The allowance is 0.5 mm by default. It is left on every closed side and on the floor, for the CNC to finish; 0 makes the manual cut final. Open sides and the top keep none. Stepover is a percentage of the diameter (default 70 %). An empty stepdown means automatic: the depth the machine's spindle power can take at that width, rpm and feed, at most the flute length.
+- **One axis at a time.** Every move changes exactly one of X, Y and Z. A pass goes up, along, across, down, then feeds along its length, and lifts off the cut; it never cuts back the other way.
+- **Conventional milling with M3.** The uncut material stays on the right of the feed. A pass returns to its start off the cut, because backlash on a hand-fed mill can pull the cutter into a climb cut.
+- **Equal levels and rows.** The depth is cut in equal levels, none deeper than the stepdown, and the width in equal rows, none wider than the stepover, so no pass is a thin sliver. Levels start from the highest material left in the cut, after earlier operations.
+- **Entry.** A pass that starts at an open side drops outside the stock. A box closed at both ends of its passes (a pocket or a closed slot) plunges straight down at a quarter of the feed, which needs a centre-cutting end mill. Inside corners of a pocket keep the tool's radius.
+- **Part check.** The cut is tested against the part's triangles. A box that reaches into the part is refused, and the message gives the X, Y and Z where it does. The usual gouge check and the checks of speed, feed, power and holding then apply.
+- **From selected face.** In the Box tab, **From selected face** fills the six fields from one flat face of the part that faces up or sideways: a floor or a wall. The box runs to the stock's edge or the next part face in each direction, inside the stock the earlier operations left. Several faces, a slanted, curved or downward face, and a wall on the stock's edge (nothing to remove) are refused.
+
+**Drill** is the same Drill as on the CNC. On the manual mill its moves are split so that Z goes up, then X, then Y, then Z down. The holes are drilled at the DRO's centres.
+
+### The Steps page
+
+Open a manual setup in MACHINE to see its **Steps** page in place of Run. It works with no controller connected, and while the CNC runs another job. The steps are made from the setup's simulated operations, so each picture and number is a move the app checked. Every number is a work coordinate: Z 0 is the top picked up in the Zero step, for the whole setup.
+
+The page is split into sections: **Set up** (Hold, Zero), one section per cutting operation, and **Hand over**. A bar of sections on top shows progress ("pass 2/4"), ticks finished ones and ends with "→ CNC setup N". Tapping a section jumps to where you left it, or its first step. Each section header gives the tool, the number of passes or holes and the minutes. The last button of a section is "Section done"; you can stop after any section and come back. The place is saved with the project, without marking the plan changed.
+
+| Screen | What it shows |
+| --- | --- |
+| Hold | The stock in the vise or clamps, which face is up, the jaws, the size |
+| Zero | The corner to pick up with the edge finder, the side to approach each axis from, and the DRO set to the zero |
+| Tool | The tool drawn to scale, the gear, and with compensation on the diameter to enter and the sides to set (a Comp screen follows when only the sides change) |
+| Face | The whole facing on one screen: tool, gear, how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
+| Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
+| Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
+| Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to |
+| Check | The stock after the operation next to the one before, and the allowance left |
+| Hand over | The stock as it leaves and the next setup it goes to |
+
+**The DRO numbers.**
+
+- **In the order they are moved.** A pass lists Z up, X to the start, Y to the pass, Z down, then the feed along the cut. The current one is bright. Tapping a readout lights the next; this is for you to keep your place.
+- **Edge or centre.** With DRO compensation on, X and Y show the **tool edge**, with the tool-centre number small beside it. Otherwise they show the tool centre. The compensation side is fixed for each operation and axis, toward the box's closed side on that axis (plus when both or neither are closed), so one operation never asks for a change. Holes always show centres.
+- **Locks.** A padlock tag names the axes to lock during the cut, and the axis that is set for the last time before it.
+- **Never below.** The lowest Z and the extreme X and Y the tool's edge reaches in the operation are drawn as red lines on the views.
+- **Handwheel turn rate.** The feed is shown in turns, such as "1 turn every 2 s", from the hand feed and the axis's mm per turn, with a dot that blinks once per turn.
+
+### Minutes
+
+The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Manual 18 min · CNC 42 min · moving 10 min" beside the total. The Steps page shows the setup's minutes.
+
+### No G-code
+
+A manual setup is left out of the export and the Run strip. The NC review page says "manual mill, no G-code — follow the steps on the MACHINE page", and the setup sheet names the machine. A job of manual setups alone has nothing to export. The manual setups still take part in the plan check: generation, the simulation, the speed and feed checks and the holding check.
+
+### Not in this version
+
+Power feed, a DRO connection, arcs or two axes moving together on the manual mill, a rotary table, boring heads and tapping are not planned. Choosing the manual work for you (suggested boxes, the AI planner) and saving the steps as pages to take to the machine are not built yet; you mark the manual work yourself. The Steps screens can be drawn headless to PNG files with the ignored test `steps::tests::render_the_steps` (it writes to `/tmp/manual-steps`).
 
 ## Machine control (UC100)
 
@@ -874,6 +961,9 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-nine s
 - `src/settings.rs`: non-secret app settings.
 - `src/openai.rs`: Responses API client on the ChatGPT plan: conversation items with images, the tools and their calls, and the text of a streamed reply for the planner's timeline.
 - `src/fake_openai.rs`: test-only loopback stand-in for OpenAI.
+- `src/manual.rs`: the manual machine: its defaults, gears and speeds, handwheel turns, which tools and vises fit a machine, the minutes the stock spends moving, and the Box fill from a part face.
+- `src/guide.rs`: the step guide of a manual setup: sections, steps and the DRO targets (edge or centre, locks), made from the simulated plans.
+- `src/steps.rs`: the Steps page that draws the guide: the section bar, the step screens and their pictures.
 - `src/smoke.rs`: renderer smoke workflow and application action tests.
 - `assets/op-*.svg`: the eleven original operation icons from the web prototype.
 - `assets/tb-*.svg`: the nine toolbar icons (white glyphs on solid tiles, checked for contrast by `toolbar_glyphs_meet_contrast_on_their_tiles`).
