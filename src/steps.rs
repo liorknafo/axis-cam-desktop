@@ -683,7 +683,11 @@ impl Drawing<'_> {
                     f.stroke(&canvas::Path::line(m, n), dashed(NEVER, 1.8));
                     // Inside the stock: above a level's right end, beside a
                     // side's top.
-                    if (m.x - n.x).abs() > (m.y - n.y).abs() {
+                    if (m.x - n.x).abs() > (m.y - n.y).abs() && (m.x - n.x).abs() < 80. {
+                        // A short line (a hole's floor): its label right of it.
+                        let at = Point::new(m.x.max(n.x) + 5., m.y);
+                        write(f, s.clone(), at, NEVER, 12., Align::Left);
+                    } else if (m.x - n.x).abs() > (m.y - n.y).abs() {
                         let at = Point::new(m.x.max(n.x) - 8., m.y - 9.);
                         write(f, s.clone(), at, NEVER, 12., Align::Right);
                     } else {
@@ -2171,21 +2175,16 @@ fn pass<'a>(
                 arrows[t.axis][usize::from(end[t.axis] > start[t.axis])]
             );
             tags.push("feed".into());
-        } else if t.axis == 2
-            && let Some(z) = last[2]
-            && (z - t.centre).abs() > 0.005
-        {
-            tags.push(format!(
-                "{} {}",
-                mm((z - t.centre).abs()),
-                if t.centre < z { "down" } else { "up" }
-            ));
+        } else if t.axis == 2 && (t.centre - cut.min[2]).abs() < 0.005 {
+            // Down to the pass's level: how much deeper it cuts.
+            tags.push(format!("{} deeper", mm(cut.max[2] - cut.min[2])));
             if t.feed {
                 tags.push("plunge".into());
             }
-        } else if t.feed {
+        } else if t.axis < 2 && t.feed {
             tags.push("feed, cuts".into());
-        } else if let Some(v) = last[t.axis]
+        } else if t.axis < 2
+            && let Some(v) = last[t.axis]
             && (v - t.centre).abs() < 1.
         {
             tags.push("off the wall".into());
@@ -2277,20 +2276,17 @@ fn pass<'a>(
             _ => None,
         })
         .collect();
-    let levels = {
-        let mut z: Vec<i64> = passes
-            .iter()
-            .map(|(_, c)| (c.min[2] * 100.).round() as i64)
-            .collect();
-        z.dedup();
-        z.len() == passes.len()
-    };
+    // Each tile is its pass's depth (work Z), and its row on that level
+    // when a level has more than one.
+    let level = |c: &Bounds| (c.min[2] * 100.).round() as i64;
     let labels = (passes.iter().enumerate())
         .map(|(n, (i, c))| {
-            let s = if levels {
-                dro(c.min[2])
-            } else {
-                (n + 1).to_string()
+            let on: Vec<usize> = (0..passes.len())
+                .filter(|&m| level(&passes[m].1) == level(c))
+                .collect();
+            let s = match on.iter().position(|&m| m == n) {
+                Some(row) if on.len() > 1 => format!("{} · {}", dro(c.min[2]), row + 1),
+                _ => dro(c.min[2]),
             };
             (s, Some(Message::Guide(GuideAction::Go(*i))))
         })
@@ -2544,6 +2540,18 @@ pub(crate) mod tests {
                 .any(|s| s.contains(&format!("centre {}", dro(edge.centre)))),
             "{t:?}"
         );
+        // Down to the level: how much deeper it cuts, from the faced top at
+        // −2 to −6.75; not how far from the retract height.
+        assert_eq!(
+            t.iter().filter(|s| s.starts_with("4.75 deeper")).count(),
+            1,
+            "{t:?}"
+        );
+        assert!(!t.iter().any(|s| s.contains(" down")), "{t:?}");
+        // The tiles are the passes' depths, two rows on each level.
+        for tile in ["−6.75 · 1", "−6.75 · 2", "−11.50 · 1", "−11.50 · 2"] {
+            assert!(t.iter().any(|s| s == tile), "{tile} in {t:?}");
+        }
         // Tapping a readout lights the next.
         send(&mut a, GuideAction::Reached(0));
         assert_eq!(a.guide_item, 1);
