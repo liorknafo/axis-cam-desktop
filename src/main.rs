@@ -5341,7 +5341,8 @@ pub(crate) fn tab_move(typing: bool, back: bool, jogging: bool) -> TabMove {
     }
 }
 /// The axis and direction a jog key moves: the arrows jog X and Y (up is
-/// +Y, away from the operator), Page Up and Page Down jog Z.
+/// +Y, away from the operator), Page Up and Page Down jog Z, Home and End
+/// jog A (on a machine without A they move nothing).
 fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
     use iced::keyboard::key::Named;
     match key {
@@ -5351,6 +5352,8 @@ fn jog_key(key: iced::keyboard::key::Named) -> Option<(usize, bool)> {
         Named::ArrowDown => Some((1, true)),
         Named::PageUp => Some((2, false)),
         Named::PageDown => Some((2, true)),
+        Named::Home => Some((3, false)),
+        Named::End => Some((3, true)),
         _ => None,
     }
 }

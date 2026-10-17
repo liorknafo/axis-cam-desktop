@@ -539,6 +539,16 @@ Once the machine is Idle, the Control page has everything needed before a job:
   nothing in the Controller configuration view, which hides these controls,
   or while a text field is being edited. **0.01/0.1/1/10 mm** move one step
   per press; the speed slider is a share of each axis's maximum speed.
+- **A axis.** On a profile with `[axes.a]` (LIO-185), A shows under
+  Position and in the DRO in degrees, with **Set machine zero** for A (it has
+  no switch; **Set machine zero here** sets it with X, Y and Z), **A+/A−**
+  and **Home/End** to jog it, its own **0.1/1/15/90°** steps, and **Zero A**
+  and **Set A** in each of G54–G59; MDI takes A words. A never moves before
+  it has a machine position: it does not jog, and the driver runs no MDI
+  line or tool run, until Set machine gave it one, and every E-stop clears
+  it with the others'. Cycle Start lists A among the axes without one. A
+  state file from before A (X, Y and Z only) is padded with zeros so its
+  offsets still load. Without `[axes.a]` the page is as before.
 - **Work zero.** Under Position and Jog, across the page, a line per axis
   as on a milling machine's DRO: the work position, **Zero X**, **1/2** (half) and a
   value field with **Set X**, all in the active coordinate system. **1/2**

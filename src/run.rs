@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uc100::controller::{Command, State};
 use uc100::gcode::{Action as Do, Located, Spindle};
 
-const AXES: [&str; 3] = ["X", "Y", "Z"];
+const AXES: [&str; 6] = crate::control::AXIS_NAMES;
 
 /// What the Run panel asks for.
 #[derive(Debug, Clone)]
@@ -477,8 +477,10 @@ impl Run {
         if !c.idle() {
             e.push("The machine is not Idle.".into());
         }
-        let unset: Vec<&str> = (0..3)
-            .filter(|&a| !s.referenced[a])
+        // A too: the driver runs nothing while A has soft limits and no
+        // position, and a program never moves an A without one.
+        let unset: Vec<&str> = (0..6)
+            .filter(|&a| (a < 3 || c.axis(a)) && !s.referenced[a])
             .map(|a| AXES[a])
             .collect();
         if !unset.is_empty() {

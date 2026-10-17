@@ -5316,6 +5316,282 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
     }
 
+    /// The A axis of a rotary unit, in degrees, to put after `LIMITED`'s
+    /// or `FAST`'s axes: 40 steps per degree, so every step here is whole.
+    const A_AXIS: &str = r#"
+[axes.a]
+steps_per_unit = 40.0
+max_velocity = 3600.0
+acceleration = 360.0
+step = { pin = 9 }
+dir = { pin = 14 }
+soft_min = -180.0
+soft_max = 180.0
+"#;
+
+    /// LIO-185 on the simulated UC100: A jogs, in degree steps or held,
+    /// only once Set machine gave it a position; Zero A sets G54's A offset
+    /// and leaves G55's; MDI takes A words; E-stop clears A's position as
+    /// the others' and nothing moves A until it is set again; the state
+    /// file keeps A's offset and where it was left. The page shows A in
+    /// degrees, and on a machine without A nothing of it.
+    #[test]
+    fn a_jogs_and_zeroes_in_degrees_and_never_moves_before_set_machine() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &format!("{LIMITED}{A_AXIS}"));
+        idle(&mut a);
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2, 3]);
+        assert!(conn(&a).jog_blocked(3).is_some() && conn(&a).jog_blocked(0).is_none());
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        let _ = a.update(Message::Machine(Action::JogAngle(None)));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        assert_eq!(conn(&a).held(), None);
+        tick_for(&mut a, 200);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        assert!(at(&a)[3].abs() < 1e-9, "{:?}", at(&a));
+        // Set machine A: A alone, X, Y and Z still wait for theirs.
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2]);
+        assert_eq!(conn(&a).jog_blocked(3), None);
+        // A 15° step, whatever the mm step is.
+        let _ = a.update(Message::Machine(Action::JogStep(Some(1.))));
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        assert_eq!(conn(&a).held(), None);
+        tick_until(&mut a, 3.0, "A at 15°", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[3] - 15.).abs() < 1e-3
+        });
+        assert!(at(&a)[..3].iter().all(|v| v.abs() < 1e-9), "{:?}", at(&a));
+        // Held past the driver's 400 ms: the keepalive keeps A turning.
+        let _ = a.update(Message::Machine(Action::JogAngle(None)));
+        let _ = a.update(Message::Machine(Action::JogPress(3, true)));
+        assert_eq!(conn(&a).held(), Some((3, true)));
+        tick_for(&mut a, 700);
+        assert_eq!(conn(&a).snapshot.state, Some(State::Jog));
+        assert!(at(&a)[3] < 10., "{:?}", at(&a));
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle after the release", |s| {
+            s.state == Some(State::Idle)
+        });
+        // Zero A in G54; G55 keeps its own A offset.
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(3))));
+        tick_until(&mut a, 2.0, "A zeroed in G54", |s| {
+            s.work_pos[3].abs() < 1e-6
+        });
+        let zero = at(&a)[3];
+        assert!((conn(&a).snapshot.work_offset[3] - zero).abs() < 1e-6);
+        let _ = a.update(Message::Machine(Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| {
+            s.active_wcs == 1 && (s.work_pos[3] - zero).abs() < 1e-6
+        });
+        let _ = a.update(Message::Machine(Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| {
+            s.active_wcs == 0 && s.work_pos[3].abs() < 1e-6
+        });
+        // MDI takes A words, in the work system.
+        mdi(&mut a, "G0 A90");
+        assert!((conn(&a).snapshot.work_pos[3] - 90.).abs() < 1e-3);
+        assert!((at(&a)[3] - zero - 90.).abs() < 1e-3, "{:?}", at(&a));
+        // A in degrees on the page: its row, its DRO and its jog controls.
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        let has = |t: &str| texts.iter().any(|x| x == t);
+        assert!(
+            has("90.000°") && has("A+") && has("A−") && has("15°") && has("Zero A"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Home/End (A)")),
+            "{texts:?}"
+        );
+        // E-stop clears A's position with the others': A neither jogs nor
+        // runs an MDI line until it is set again.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        assert!(!conn(&a).snapshot.referenced[3]);
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert_eq!(conn(&a).unset_limited_axes(), vec![0, 1, 2, 3]);
+        let left = at(&a)[3];
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, false)));
+        // Nor does a calibration move, whose Move button says why.
+        for action in [
+            Action::CalAxis(3),
+            Action::CalDistance("90".into()),
+            Action::CalMove,
+        ] {
+            let _ = a.update(Message::Machine(action));
+        }
+        let _ = a.update(Message::ControlSetup(true));
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.starts_with("A has no machine position")),
+            "{:?}",
+            page_texts(&a)
+        );
+        let _ = a.update(Message::ControlSetup(false));
+        mdi(&mut a, "G0 A0");
+        assert_eq!(at(&a)[3], left);
+        assert!(
+            conn(&a)
+                .snapshot
+                .log
+                .iter()
+                .any(|l| l.starts_with("MDI:") && l.contains("declare A with Set machine")),
+            "{:?}",
+            conn(&a).snapshot.log
+        );
+        let texts = page_texts(&a);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("A has no machine position")),
+            "{texts:?}"
+        );
+        // The state file keeps A: G54's A offset and where A was left.
+        let _ = a.update(Message::Disconnect);
+        idle(&mut a);
+        assert!((conn(&a).snapshot.work_offset[3] - zero).abs() < 1e-6);
+        assert!((at(&a)[3] - left).abs() < 1e-3, "{:?}", at(&a));
+        let _ = a.update(Message::Machine(Action::KeepPosition));
+        tick_until(&mut a, 3.0, "every axis set", |s| {
+            s.referenced[..4].iter().all(|r| *r)
+        });
+        assert!((at(&a)[3] - left).abs() < 1e-3);
+        let _ = a.update(Message::Disconnect);
+        // Without [axes.a] the page has nothing of A.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), LIMITED);
+        idle(&mut a);
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        assert!(
+            !texts.iter().any(|t| t.ends_with('°')
+                || t.starts_with("A") && t.len() <= 2
+                || t.contains("Home/End")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Z+") && !texts.iter().any(|t| t == "Zero A"));
+    }
+
+    /// A state file from before A (offsets and position of X, Y and Z
+    /// only) loads: every work system keeps its X, Y and Z, A is 0.
+    #[test]
+    fn a_state_file_without_a_loads_with_its_offsets() {
+        use crate::control::Action;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &format!("{LIMITED}{A_AXIS}"));
+        let id = a.doc.machines[0].id.clone();
+        let file = dir
+            .path()
+            .join("uc100")
+            .join(format!("{id}-simulated.toml"));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut wcs = vec!["[10.0, 20.0, -5.0]", "[1.0, 2.0, 3.0]"];
+        wcs.extend(std::iter::repeat_n("[0.0, 0.0, 0.0]", 4));
+        std::fs::write(
+            &file,
+            format!(
+                "wcs = [{}]\nactive_wcs = 1\nlast_position = [12.0, 7.0, -3.0]\n",
+                wcs.join(", ")
+            ),
+        )
+        .unwrap();
+        idle(&mut a);
+        let s = &conn(&a).snapshot;
+        assert_eq!(s.active_wcs, 1);
+        assert_eq!(s.work_offset, [1., 2., 3., 0., 0., 0.]);
+        let here = at(&a);
+        assert!(
+            [12., 7., -3., 0.]
+                .iter()
+                .zip(here)
+                .all(|(w, v)| (w - v).abs() < 1e-3),
+            "{here:?}"
+        );
+        // The driver switches work systems by MDI, which waits for A's
+        // machine position; setting it leaves every offset as it was.
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        assert_eq!(conn(&a).snapshot.work_offset, [1., 2., 3., 0., 0., 0.]);
+        let _ = a.update(Message::Machine(Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        assert_eq!(conn(&a).snapshot.work_offset, [10., 20., -5., 0., 0., 0.]);
+    }
+
+    /// Cycle Start lists A among the axes without a machine position, as
+    /// long as it has none: from connecting and after every E-stop.
+    #[test]
+    fn cycle_start_names_a_while_it_has_no_machine_position() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &format!("{FAST}{A_AXIS}"));
+        idle(&mut a);
+        check_run(&mut a, 0);
+        let unset = |a: &App| {
+            problems(a)
+                .into_iter()
+                .find(|p| p.contains("no machine position"))
+        };
+        let starts = |a: &App, t: &str| unset(a).is_some_and(|p| p.starts_with(t));
+        assert!(
+            starts(&a, "X, Y, Z, A have no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        assert!(
+            starts(&a, "X, Y, Z have no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+        // Set machine zero here sets A with X, Y and Z.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert!(
+            starts(&a, "X, Y, Z, A have no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "every axis set", |s| {
+            s.referenced[..4].iter().all(|r| *r)
+        });
+        assert_eq!(unset(&a), None, "{:?}", problems(&a));
+        // After an E-stop, X, Y and Z set one by one leave A listed alone.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        for axis in 0..3 {
+            let _ = a.update(Message::Machine(Action::MachineZero(Some(axis))));
+        }
+        tick_until(&mut a, 3.0, "X, Y and Z set", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        assert!(
+            starts(&a, "A has no machine position"),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
     #[test]
     fn a_jog_into_a_soft_limit_ends_at_the_limit() {
         use crate::control::Action;
@@ -5363,6 +5639,8 @@ flood = { pin = 8 }
             (Named::ArrowDown, (1, true)),
             (Named::PageUp, (2, false)),
             (Named::PageDown, (2, true)),
+            (Named::Home, (3, false)),
+            (Named::End, (3, true)),
         ];
         for (key, jog) in keys {
             assert_eq!(crate::jog_key(key), Some(jog));

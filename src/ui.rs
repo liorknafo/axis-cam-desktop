@@ -4730,7 +4730,17 @@ pub(crate) fn machine_panel<'a>(title: &str, body: Column<'a, Message>) -> Eleme
         .into()
 }
 
-const AXES: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
+const AXES: [&str; 6] = crate::control::AXIS_NAMES;
+
+/// A position on axis `a` as the Control page shows it: mm bare, as ever,
+/// and a rotary axis's degrees with their sign.
+fn reading(a: usize, v: f64) -> String {
+    if crate::control::rotary(a) {
+        format!("{v:.3}°")
+    } else {
+        format!("{v:.3}")
+    }
+}
 
 /// "X", "X and Y", "X, Y and Z".
 fn axis_names(axes: &[usize]) -> String {
@@ -4983,13 +4993,17 @@ fn control(app: &App) -> Element<'_, Message> {
         if let Some((heading, lines)) = limits_off_warning(&unlimited, &unset, c.home_switches()) {
             caution(heading, lines)
         } else {
-            let ranges: Vec<String> = (0..6)
-                .filter_map(|a| {
-                    let x = c.config.axes.get(a)?;
-                    Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
-                })
+            let range = |a: usize| {
+                let x = c.config.axes.get(a)?;
+                Some(format!("{} {}…{}", AXES[a], x.soft_min?, x.soft_max?))
+            };
+            let ranges: Vec<String> = (0..3).filter_map(range).collect();
+            // A rotary axis's range is in degrees, after the mm.
+            let angles: String = (3..6)
+                .filter_map(range)
+                .map(|r| format!(", {r}°"))
                 .collect();
-            muted(format!("Soft limits on: {} mm.", ranges.join(", ")))
+            muted(format!("Soft limits on: {} mm{angles}.", ranges.join(", ")))
                 .color(Color::from_rgb8(39, 130, 93))
                 .into()
         };
@@ -5035,8 +5049,8 @@ fn control(app: &App) -> Element<'_, Message> {
     for &i in &enabled {
         table = table.push(row![
             text(AXES[i]).size(14).width(50),
-            mono(format!("{:.3}", s.machine_pos[i])),
-            mono(format!("{:.3}", s.work_pos[i])),
+            mono(reading(i, s.machine_pos[i])),
+            mono(reading(i, s.work_pos[i])),
             text(if s.referenced[i] { "Yes" } else { "No" }).size(14),
         ]);
     }
@@ -5045,7 +5059,7 @@ fn control(app: &App) -> Element<'_, Message> {
     let declared: Vec<usize> = enabled
         .iter()
         .copied()
-        .filter(|&a| a < 3 && c.switchless(a))
+        .filter(|&a| c.switchless(a))
         .collect();
     let mut zero = column![bold("Machine zero", 13)].spacing(10);
     if !declared.is_empty() {
@@ -5117,12 +5131,34 @@ fn control(app: &App) -> Element<'_, Message> {
             c.jog_step == Some(step),
         ));
     }
+    // A steps in degrees, on its own row: a step in mm means nothing to it.
+    let angles = c.axis(3).then(|| {
+        let mut angles = row![
+            text("A").size(13).width(24),
+            act(
+                "Continuous",
+                Some(Message::Machine(Action::JogAngle(None))),
+                c.jog_angle.is_none()
+            )
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        for step in [0.1, 1., 15., 90.] {
+            angles = angles.push(act(
+                format!("{step}°"),
+                Some(Message::Machine(Action::JogAngle(Some(step)))),
+                c.jog_angle == Some(step),
+            ));
+        }
+        angles
+    });
     // Hold to jog: a press starts it; a release, anywhere, or leaving the
     // button stops it.
     let jog = |axis: usize, negative: bool| -> Element<'_, Message> {
         if !c.axis(axis) {
             return space().width(64).height(44).into();
         }
+        let can_jog = can_jog && c.jog_blocked(axis).is_none();
         let held = c.held() == Some((axis, negative));
         let label = format!("{}{}", AXES[axis], if negative { "−" } else { "+" });
         let face = container(bold(label, 15).color(if held {
@@ -5168,6 +5204,12 @@ fn control(app: &App) -> Element<'_, Message> {
         column![jog(2, false), gap(), jog(2, true)].spacing(6),
     ]
     .spacing(6);
+    let pad = if c.axis(3) {
+        pad.push(space().width(18))
+            .push(column![jog(3, false), gap(), jog(3, true)].spacing(6))
+    } else {
+        pad
+    };
     let speed = row![
         text(format!(
             "Speed {:.0} % · X {:.0} mm/min",
@@ -5187,17 +5229,20 @@ fn control(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let jog_panel = machine_panel(
-        "Jog",
-        column![
-            modes,
-            pad,
-            speed,
-            muted(
-                "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The arrow and Page keys jog while these controls are on screen and no text field is being edited."
-            )
-        ],
-    );
+    let keys = if c.axis(3) {
+        "Hold a button, an arrow key (X, Y), Page Up/Down (Z) or Home/End (A) to jog, and let go to stop. These keys jog while these controls are on screen and no text field is being edited."
+    } else {
+        "Hold a button, an arrow key (X, Y) or Page Up/Down (Z) to jog, and let go to stop. The arrow and Page keys jog while these controls are on screen and no text field is being edited."
+    };
+    let mut jog_column = column![modes];
+    if let Some(angles) = angles {
+        jog_column = jog_column.push(angles);
+    }
+    let mut jog_column = jog_column.push(pad).push(speed);
+    if let Some(why) = c.jog_blocked(3) {
+        jog_column = jog_column.push(text(why).size(12).color(Color::from_rgb8(166, 101, 32)));
+    }
+    let jog_panel = machine_panel("Jog", jog_column.push(muted(keys)));
     let manual = |a: Action| c.manual().then_some(Message::Machine(a));
     // A milling machine's DRO: each axis's work position with Zero, ½ and
     // a value to set it to.
@@ -5207,7 +5252,7 @@ fn control(app: &App) -> Element<'_, Message> {
             row![
                 bold(AXES[a], 18).width(24),
                 // Right-aligned so the decimal points line up, as on a DRO.
-                text(format!("{:.3}", s.work_pos[a]))
+                text(reading(a, s.work_pos[a]))
                     .size(22)
                     .font(Font {
                         weight: iced::font::Weight::Bold,
@@ -5233,7 +5278,15 @@ fn control(app: &App) -> Element<'_, Message> {
                         .padding([7, 9])
                         .size(13),
                     "work_set",
-                    &format!("Set {} · mm", AXES[a]),
+                    &format!(
+                        "Set {} · {}",
+                        AXES[a],
+                        if crate::control::rotary(a) {
+                            "°"
+                        } else {
+                            "mm"
+                        }
+                    ),
                     Target::Machine
                 ),
                 act(

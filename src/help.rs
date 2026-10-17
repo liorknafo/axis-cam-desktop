@@ -1455,7 +1455,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         MachineZero(None) => (
-            "Declare the current position machine zero for X, Y and Z. First jog X to its left end, Y to its front end and Z to the top. The soft limits apply once every limited axis has a machine position.",
+            "Declare the current position machine zero for X, Y and Z, and A on a machine with one. First jog X to its left end, Y to its front end and Z to the top. The soft limits apply once every limited axis has a machine position, and A jogs and runs only once it has one.",
             "",
         ),
         MachineZero(Some(_)) => (
@@ -1467,11 +1467,13 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         JogPress(..) | JogRelease => (
-            "Hold to jog this axis; release to stop. In step mode each press moves one step. The arrow keys and Page Up/Down do the same on this page.",
+            "Hold to jog this axis; release to stop. In step mode each press moves one step. The arrow keys, Page Up/Down and Home/End (A) do the same on this page. A jogs only once it has a machine position.",
             "",
         ),
         JogStep(None) => ("Jog for as long as the button or key is held.", ""),
         JogStep(Some(_)) => ("Move exactly this far for each press.", ""),
+        JogAngle(None) => ("Jog A for as long as the button or key is held.", ""),
+        JogAngle(Some(_)) => ("Turn A exactly this many degrees for each press.", ""),
         JogSpeed(_) => (
             "Jog speed, as a share of each axis's maximum speed in the profile.",
             "",
@@ -4058,6 +4060,8 @@ mod tests {
             Ctl::JogRelease,
             Ctl::JogStep(None),
             Ctl::JogStep(Some(1.)),
+            Ctl::JogAngle(None),
+            Ctl::JogAngle(Some(15.)),
             Ctl::JogSpeed(50.),
             Ctl::WorkZero(None),
             Ctl::WorkZero(Some(0)),
