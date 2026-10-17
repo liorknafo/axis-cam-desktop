@@ -227,6 +227,17 @@ pub enum Message {
     RunOnMachine(usize),
     /// A setup's tool runs, checked for a UC100 run (the check's epoch).
     RunChecked(u64, std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>),
+    /// `RunChecked`, with the stock the check left after each operation of
+    /// the setup, to picture (`run::check`).
+    RunCheckedStock(
+        u64,
+        std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>,
+        std::sync::Arc<run::Left>,
+    ),
+    /// The pictures of the stock after each operation of the setup being
+    /// run, by its index in the setup (`run::op_pictures`), for the check
+    /// whose epoch it is.
+    RunPictures(u64, Vec<(usize, iced::widget::image::Handle)>),
     EditTool(String),
     NewTool,
     SaveTool,
@@ -757,6 +768,9 @@ pub struct App {
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
     post_epoch: u64,
+    /// The check epoch of the run whose stock is being pictured
+    /// (`picture_run`).
+    picture_job: Option<u64>,
     pub settings: settings::Settings,
     settings_path: PathBuf,
     pub account: Account,
@@ -931,6 +945,8 @@ fn while_locked(m: &Message) -> bool {
             | EscapeKey
             | Run(_)
             | RunChecked(..)
+            | RunCheckedStock(..)
+            | RunPictures(..)
             | ToggleStock
             | ToggleUncut
             | TogglePaths
@@ -1215,6 +1231,7 @@ impl App {
             bottom_holes: std::cell::RefCell::new(None),
             stock_pictures: Default::default(),
             post_epoch: 0,
+            picture_job: None,
             settings,
             settings_path,
             account: Account::SignedOut,
@@ -1676,6 +1693,8 @@ impl App {
     pub fn planning_busy(&self) -> Option<&'static str> {
         if matches!(self.planner, Planner::Running(_)) || self.plan_busy.running() > 0 {
             Some("The AI planner is working: wait for it, or cancel it.")
+        } else if self.picturing() {
+            Some("The stock after each operation is still being pictured: wait a moment.")
         } else if self.stock_mesh_job.is_some()
             || self.post_busy
             || self.left_job.is_some()
@@ -1959,19 +1978,88 @@ impl App {
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
         let check = move || match mesh {
-            Some(mesh) => run::programs(&doc, &mesh, si),
-            None => Err(vec![
-                "Load the imported part before running a setup.".into(),
-            ]),
+            Some(mesh) => run::check(&doc, &mesh, si),
+            None => (
+                Err(vec![
+                    "Load the imported part before running a setup.".into(),
+                ]),
+                run::Left::default(),
+            ),
         };
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(check)
                     .await
-                    .unwrap_or_else(|e| Err(vec![format!("The check failed: {e}")]))
+                    .unwrap_or_else(|e| {
+                        (
+                            Err(vec![format!("The check failed: {e}")]),
+                            run::Left::default(),
+                        )
+                    })
             },
-            move |programs| Message::RunChecked(epoch, std::sync::Arc::new(programs)),
+            move |(programs, left)| {
+                Message::RunCheckedStock(
+                    epoch,
+                    std::sync::Arc::new(programs),
+                    std::sync::Arc::new(left),
+                )
+            },
         )
+    }
+    /// Pictures the stock the last check of the setup being run left after
+    /// each of its operations (`run::Run::left`), for the Tool runs panel: in
+    /// the background (in line in the smoke run), one run at a time, and
+    /// only while the machine stands still, as the check is (#167): the Tick
+    /// starts it once the machine stops. Each stock is meshed at Draft detail
+    /// and seen in its jaws or clamps as the setup browser's pictures are.
+    fn picture_run(&mut self) -> Task<Message> {
+        if self.picture_job.is_some() || self.locked() {
+            return Task::none();
+        }
+        let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) else {
+            return Task::none();
+        };
+        let (si, epoch) = (r.setup, r.epoch);
+        let (Some(_), Some(setup), Some(mesh)) =
+            (&r.left, self.doc.setups.get(si), self.part_mesh())
+        else {
+            return Task::none();
+        };
+        let frame = volume::Frame::new(setup, mesh);
+        let jaws: Vec<mesh::Bounds> = self
+            .known_stock(si)
+            .0
+            .map(|stock| ui::pictured_holding(self, si, stock))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| b.bounds)
+            .collect();
+        let Some(left) = self
+            .control
+            .as_mut()
+            .and_then(|c| c.run.as_mut()?.left.take())
+        else {
+            return Task::none();
+        };
+        self.picture_job = Some(epoch);
+        let work = move || run::op_pictures(&left, frame, &jaws);
+        if self.smoke_dir.is_some() {
+            return self.update(Message::RunPictures(epoch, work()));
+        }
+        Task::perform(
+            async move { tokio::task::spawn_blocking(work).await.unwrap_or_default() },
+            move |pictures| Message::RunPictures(epoch, pictures),
+        )
+    }
+    /// The stock of the setup being run is being pictured, or waits to be
+    /// (`picture_run`): Cycle Start waits for it.
+    fn picturing(&self) -> bool {
+        self.picture_job.is_some()
+            || self
+                .control
+                .as_ref()
+                .and_then(|c| c.run.as_ref())
+                .is_some_and(|r| r.left.is_some())
     }
     /// While the machine moves (`locked`), the setup being run is only marked
     /// to be checked: the Tick checks it once the machine stops, so that the
@@ -3687,13 +3775,33 @@ impl App {
                 }
             }
             Message::RunChecked(epoch, programs) => {
+                return self.update(Message::RunCheckedStock(
+                    epoch,
+                    programs,
+                    Default::default(),
+                ));
+            }
+            Message::RunCheckedStock(epoch, programs, left) => {
                 if let Some(c) = self.control.as_mut()
                     && let Some(r) = c.run.as_mut()
                     && r.epoch == epoch
                 {
-                    r.checked_as(programs);
+                    // A check without stock (the smoke run's) is not pictured.
+                    let left = (!left.after.is_empty() || left.last.is_some()).then_some(left);
+                    r.checked_as(programs, left);
                     c.fit_sim_block();
+                    return self.picture_run();
                 }
+            }
+            Message::RunPictures(epoch, pictures) => {
+                self.picture_job = None;
+                if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+                    && r.epoch == epoch
+                {
+                    r.pictures = pictures;
+                }
+                // A check answered meanwhile is pictured next.
+                return self.picture_run();
             }
             Message::SaveMachine => {
                 if manual::is_manual(&self.machine_draft) {
@@ -4389,6 +4497,7 @@ impl App {
                 };
                 return Task::batch([
                     close,
+                    self.picture_run(),
                     self.refresh_stock_surface(),
                     self.refresh_post(),
                     left,

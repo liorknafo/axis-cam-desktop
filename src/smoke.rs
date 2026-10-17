@@ -2051,6 +2051,13 @@ flood = { pin = 8 }
     }
 
     fn run_app_on(dir: &std::path::Path, profile: &str) -> App {
+        run_app_of(dir, profile, &[0, 3])
+    }
+
+    /// `run_app_on` with the fixture job's operations `ops` (by index):
+    /// Face and Drill there.
+    fn run_app_of(dir: &std::path::Path, profile: &str, ops: &[usize]) -> App {
+        use crate::model::Strategy;
         let mut a = profile_app(dir, profile);
         let mut m = a.doc.machines.pop().unwrap();
         for (k, v) in [
@@ -2064,17 +2071,26 @@ flood = { pin = 8 }
         }
         let (mut doc, mesh) = crate::post::fixture::job();
         let setup = &mut doc.setups[0];
-        setup.operations = vec![setup.operations[0].clone(), setup.operations[3].clone()];
+        setup.operations = ops.iter().map(|&i| setup.operations[i].clone()).collect();
         for op in &mut setup.operations {
             op.p.insert("feed".into(), "30000".into());
+            // A few seconds each: wide facing passes, holes without pecks.
+            match op.strategy {
+                Strategy::Face => {
+                    op.p.insert("stepover".into(), "90".into());
+                    op.p.insert("stepdown".into(), "5".into());
+                }
+                Strategy::Pocket | Strategy::Contour => {
+                    op.p.insert("stepover".into(), "50".into());
+                    op.p.insert("stepdown".into(), "10".into());
+                }
+                Strategy::Drill => {
+                    op.p.insert("cycle".into(), "Drilling".into());
+                    op.p.insert("coolant".into(), "Off".into());
+                }
+                _ => {}
+            }
         }
-        // A few seconds each: wide facing passes, holes without pecks.
-        setup.operations[0].p.insert("stepover".into(), "90".into());
-        setup.operations[0].p.insert("stepdown".into(), "5".into());
-        setup.operations[1]
-            .p
-            .insert("cycle".into(), "Drilling".into());
-        setup.operations[1].p.insert("coolant".into(), "Off".into());
         setup.machine = m.clone();
         doc.machines = vec![m];
         a.replace_document(doc, None);
@@ -2247,6 +2263,150 @@ flood = { pin = 8 }
             s.work_pos[2]
         );
         assert!(problems(&a).iter().any(|p| p.contains("Every tool run")));
+    }
+
+    /// The fixture job's Face, Pocket and Contour with the 10 mm flat, then
+    /// its Drill: two tool runs, the first of three operations.
+    fn ops_app(dir: &std::path::Path) -> App {
+        run_app_of(dir, FAST, &[0, 1, 2, 3])
+    }
+
+    /// `check_run`, with the stock the check leaves (`run::check`),
+    /// pictured in line, as in the smoke run.
+    fn check_run_pictured(a: &mut App, dir: &std::path::Path, si: usize) {
+        let _ = a.update(Message::Run(crate::run::Action::Setup(si)));
+        answer_with_stock(a, dir, si);
+    }
+
+    /// Answers the run's check of setup `si` with the stock it leaves, as
+    /// `App::check_run` does, pictures made in line.
+    fn answer_with_stock(a: &mut App, dir: &std::path::Path, si: usize) {
+        use std::sync::Arc;
+        let epoch = run_of(a).epoch;
+        let (programs, left) = crate::run::check(&a.doc, a.part_mesh().unwrap(), si);
+        a.smoke_dir = Some(dir.to_path_buf());
+        let _ = a.update(Message::RunCheckedStock(
+            epoch,
+            Arc::new(programs),
+            Arc::new(left),
+        ));
+        a.smoke_dir = None;
+    }
+
+    /// The Tool runs panel shows each operation with a picture of the stock
+    /// it leaves, each different, and where it stands: the first marked
+    /// next, then the one being cut and those done before it while its tool
+    /// run cuts, all done after (#229).
+    #[test]
+    fn each_operation_of_a_run_is_pictured_with_where_it_stands() {
+        use crate::run::{Action as R, Stage::*};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let run = run_of(&a);
+        let programs = run.checked().unwrap();
+        assert_eq!(
+            programs
+                .iter()
+                .map(|p| p.indexes.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1, 2], vec![3]]
+        );
+        let pixels = |op| {
+            let Some(iced::widget::image::Handle::Rgba { pixels, .. }) = run_of(&a).picture(op)
+            else {
+                panic!(
+                    "no picture of operation {op}: {:?}",
+                    run_of(&a).pictures.len()
+                )
+            };
+            pixels.clone()
+        };
+        let drawn = run_of(&a).pictures.clone();
+        let pictures = move |_: &App| drawn.clone();
+        let pixels: Vec<_> = (0..4).map(pixels).collect();
+        for k in 1..4 {
+            assert_ne!(pixels[k - 1], pixels[k], "operation {k}");
+        }
+        let line = |a: &App| conn(a).snapshot.current_line;
+        let stages = |a: &App, i| run_of(a).stages(i, line(a));
+        assert_eq!(stages(&a, 0), [Next, ToCome, ToCome]);
+        assert_eq!(stages(&a, 1), [ToCome]);
+        let _ = a.view();
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let mut deadline = Deadline::new(30.);
+        while stages(&a, 0) != [Done, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "{:?}", stages(&a, 0));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The pictures stay through the run.
+        assert_eq!(run_of(&a).pictures.len(), 4);
+        // A check answered while the machine cuts is not pictured then: the
+        // meshing would compete with the driver feeding it (#167).
+        answer_with_stock(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Tick);
+        assert!(run_of(&a).pictures.is_empty() && run_of(&a).left.is_some());
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        // Once tool run 1 is done, as when it ends.
+        let r = a.control.as_mut().unwrap().run.as_mut().unwrap();
+        r.running = None;
+        (r.done[0], r.next) = (true, 1);
+        assert_eq!(stages(&a, 0), [Done, Done, Done]);
+        assert_eq!(stages(&a, 1), [Next]);
+        // Stopped: Cycle Start waits for the pictures, which the Tick makes.
+        assert_eq!(
+            a.planning_busy(),
+            Some("The stock after each operation is still being pictured: wait a moment.")
+        );
+        let epoch = run_of(&a).epoch;
+        let _ = a.update(Message::Tick);
+        assert!(a.picture_job == Some(epoch) && run_of(&a).left.is_none());
+        assert!(a.planning_busy().is_some());
+        let _ = a.update(Message::RunPictures(epoch, pictures(&a)));
+        assert_eq!(run_of(&a).pictures.len(), 4);
+        assert_eq!(a.planning_busy(), None);
+    }
+
+    /// Renders the Control page's Tool runs panel to PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/op-cards): before the run, while the
+    /// Pocket of tool run 1 is cut, and at the tool change after it. Not a
+    /// check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_operation_cards() {
+        use crate::run::{Action as R, Stage::*};
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/op-cards".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1600., 1500.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-before-the-run.png"));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let mut deadline = Deadline::new(30.);
+        while run_of(&a).stages(0, conn(&a).snapshot.current_line) != [Done, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-cutting-the-pocket.png"));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-tool-change.png"));
     }
 
     /// The driver refuses a job sent while it is not idle for it: for a few

@@ -1710,19 +1710,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
         return None;
     }
     let stock = app.known_stock(si).0?;
-    let mut jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
-        let held = app
-            .known_held(si)
-            .filter(|held| held.stock == stock)
-            .unwrap_or(crate::holding::Gripped::whole(stock));
-        app.doc
-            .holding_boxes(setup, held)
-            .map(|b| crate::holding::shown(&b, stock))
-            .unwrap_or_default()
-    } else {
-        vec![]
-    };
-    jaws.extend(pin_boxes(app, setup, stock));
+    let jaws = pictured_holding(app, si, stock);
     // What the picture shows: the stock meshed, else its box, and the jaws.
     // A meshed stock is named by the job it was worked out for, not by its
     // address, which a later stock can take once this one is freed.
@@ -1768,6 +1756,31 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     }
     drawn.push((key, picture.clone()));
     Some(picture)
+}
+/// The jaws or clamps and the fixture pins in setup `si`'s pictures of its
+/// `stock` (`stock_picture`, the Tool runs panel's), in its frame in mm.
+pub(crate) fn pictured_holding(
+    app: &App,
+    si: usize,
+    stock: crate::mesh::Bounds,
+) -> Vec<crate::holding::HoldBox> {
+    let Some(setup) = app.doc.setups.get(si) else {
+        return vec![];
+    };
+    let mut jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+        let held = app
+            .known_held(si)
+            .filter(|held| held.stock == stock)
+            .unwrap_or(crate::holding::Gripped::whole(stock));
+        app.doc
+            .holding_boxes(setup, held)
+            .map(|b| crate::holding::shown(&b, stock))
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    jaws.extend(pin_boxes(app, setup, stock));
+    jaws
 }
 /// The part's holes offered for the fixture pins in the 3D view: shown
 /// while the Work zero step of a setup on the pins is open, each hole not
@@ -5719,6 +5732,11 @@ pub(crate) fn run_panel<'a>(
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let mut body = column![].spacing(10);
     let count = programs.len();
+    body = body.push(muted(
+        "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green.",
+    ));
+    // Operations are numbered through the setup, across its tool runs.
+    let mut number = 0;
     for (i, p) in programs.iter().enumerate() {
         let mark = if run.running.as_ref().is_some_and(|r| r.index == i) {
             "running"
@@ -5729,7 +5747,6 @@ pub(crate) fn run_panel<'a>(
         } else {
             ""
         };
-        let ops: Vec<&str> = p.ops.iter().map(|o| o.name.as_str()).collect();
         body = body.push(
             row![
                 text(mark).size(12).width(52),
@@ -5743,11 +5760,25 @@ pub(crate) fn run_panel<'a>(
                     msg(!running, R::Next(i)),
                     i == run.next,
                 ),
-                muted(ops.join(" → ")),
+                muted(match p.ops.len() {
+                    1 => "1 operation".to_string(),
+                    n => format!("{n} operations"),
+                }),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
+        let mut cards = row![].spacing(8);
+        for ((o, &oi), stage) in p
+            .ops
+            .iter()
+            .zip(&p.indexes)
+            .zip(run.stages(i, s.current_line))
+        {
+            number += 1;
+            cards = cards.push(op_card(number, o, run.picture(oi), stage));
+        }
+        body = body.push(cards.wrap().vertical_spacing(8));
     }
     if run.stale && run.programs.is_some() {
         body = body
@@ -5860,6 +5891,78 @@ pub(crate) fn run_panel<'a>(
             .push(buttons);
     }
     Some(machine_panel("Tool runs", body))
+}
+/// The size the Tool runs panel shows its pictures of the stock at.
+const OP_CARD_PICTURE: (f32, f32) = (150., 112.5);
+/// One operation of a tool run in the Tool runs panel, the `n`th the setup
+/// cuts: the picture of the stock it leaves (a blank while that is worked
+/// out), its name, strategy and tool, and its `stage`. The one being cut is
+/// framed in blue, those done in green.
+fn op_card<'a>(
+    n: usize,
+    o: &'a crate::post::OpState,
+    picture: Option<&widget::image::Handle>,
+    stage: crate::run::Stage,
+) -> Element<'a, Message> {
+    use crate::run::Stage;
+    let (w, h) = OP_CARD_PICTURE;
+    let picture: Element<'a, Message> = match picture {
+        Some(p) => widget::image(p.clone()).width(w).height(h).into(),
+        None => container(muted("Picturing the stock…").size(11))
+            .width(w)
+            .height(h)
+            .center_x(w)
+            .center_y(h)
+            .into(),
+    };
+    const DONE: Color = Color::from_rgb8(39, 130, 93);
+    const CUTTING: Color = Color::from_rgb8(37, 110, 190);
+    let (label, color) = match stage {
+        Stage::Done => ("✓ Done", DONE),
+        Stage::Cutting => ("▶ Cutting now", CUTTING),
+        Stage::Next => ("Next: Cycle Start cuts it", CUTTING),
+        Stage::ToCome => ("To come", MUTED),
+    };
+    let card = column![
+        picture,
+        row![
+            bold(format!("{n}."), 12),
+            text(ellipsize(&o.name, 20))
+                .size(12)
+                .wrapping(Wrapping::None)
+        ]
+        .spacing(4),
+        muted(if o.name == o.strategy {
+            format!("T{} {}", o.tool, o.tool_name)
+        } else {
+            format!("{} · T{}", o.strategy, o.tool)
+        })
+        .size(11),
+        text(label).size(12).color(color),
+    ]
+    .spacing(4)
+    .width(w);
+    container(card)
+        .padding(8)
+        .style(move |_| {
+            let (background, border, width) = match stage {
+                Stage::Cutting => (SELECTED_ROW, CUTTING, 2.),
+                Stage::Done => (Color::from_rgb8(243, 249, 245), DONE, 1.),
+                Stage::Next => (Color::WHITE, CUTTING, 1.),
+                Stage::ToCome => (Color::WHITE, LINE, 1.),
+            };
+            container::Style {
+                background: Some(background.into()),
+                border: Border {
+                    color: border,
+                    width,
+                    radius: 6.into(),
+                },
+                text_color: Some(INK),
+                ..Default::default()
+            }
+        })
+        .into()
 }
 /// Work zero on the stock, in the Run panel until the setup's first tool run
 /// starts: how to put the work zero its tool runs are cut from on the stock,
