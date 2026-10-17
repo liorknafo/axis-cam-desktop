@@ -1,4 +1,4 @@
-use crate::model::{Machine, get, num};
+use crate::model::{Fields, Machine, get, num};
 
 const TURNS: [&str; 3] = ["turn_x", "turn_y", "turn_z"];
 
@@ -65,6 +65,31 @@ pub fn gear(m: &Machine, rpm: f32) -> f32 {
         .unwrap_or(rpm)
 }
 
+/// Whether `rpm` is a speed the machine runs: within 1 % of a gear, or
+/// anywhere in the range of a variable drive.
+pub fn on_gear(m: &Machine, rpm: f32) -> bool {
+    match variable(m) {
+        Some((a, b)) => (a..=b).contains(&rpm),
+        None => (gear(m, rpm) - rpm).abs() <= rpm * 0.01,
+    }
+}
+
+/// The machine's speeds as the checks list them.
+pub fn speeds(m: &Machine) -> String {
+    let list: Vec<&str> = get(&m.p, "speeds").split(',').map(str::trim).collect();
+    list.join(", ")
+}
+
+/// Puts a new operation's `rpm` on a gear and its `feed` at most the hand feed.
+pub fn snap(m: &Machine, p: &mut Fields) {
+    if let Some(rpm) = num(p, "rpm") {
+        p.insert("rpm".into(), gear(m, rpm).to_string());
+    }
+    if let Some((feed, hand)) = num(p, "feed").zip(num(&m.p, "hand_feed")) {
+        p.insert("feed".into(), feed.min(hand).to_string());
+    }
+}
+
 /// Handwheel turns per minute that give `feed` mm/min on an axis (0 X, 1 Y, 2 Z).
 pub fn turns(m: &Machine, axis: usize, feed: f32) -> f32 {
     TURNS
@@ -123,10 +148,13 @@ pub fn toggle(machines: &str, id: &str, on: bool) -> String {
 
 /// Why a strategy is dimmed on a setup of the manual mill.
 pub const ONE_AXIS: &str = "The big mill cuts one axis at a time.";
+/// Why Box is dimmed on a setup of a CNC machine.
+pub const BOX_ON_CNC: &str = "Box runs on a manual mill.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::fields;
     fn with(m: &mut Machine, k: &str, v: &str) {
         m.p.insert(k.into(), v.into());
     }
@@ -191,6 +219,28 @@ mod tests {
         with(&mut m, "speeds", "100-1800");
         settle(&mut m);
         assert_eq!(get(&m.p, "rpm"), "1800");
+    }
+    #[test]
+    fn a_speed_is_on_a_gear_within_one_percent_or_in_the_range_of_a_variable_drive() {
+        let mut m = defaults();
+        assert!(on_gear(&m, 640.));
+        assert!(on_gear(&m, 644.));
+        assert!(!on_gear(&m, 600.));
+        assert_eq!(speeds(&m), "90, 150, 250, 400, 640, 1000, 1600");
+        with(&mut m, "speeds", "100-2000");
+        assert!(on_gear(&m, 1234.));
+        assert!(!on_gear(&m, 2100.));
+        assert_eq!(speeds(&m), "100-2000");
+    }
+    #[test]
+    fn a_new_operations_speed_and_feed_are_snapped_to_the_machine() {
+        let m = defaults();
+        let mut p = fields(&[("rpm", "2400"), ("feed", "280")]);
+        snap(&m, &mut p);
+        assert_eq!((get(&p, "rpm"), get(&p, "feed")), ("1600", "150"));
+        let mut p = fields(&[("rpm", "600"), ("feed", "120")]);
+        snap(&m, &mut p);
+        assert_eq!((get(&p, "rpm"), get(&p, "feed")), ("640", "120"));
     }
     #[test]
     fn handwheel_turns_follow_the_axis_pitch() {

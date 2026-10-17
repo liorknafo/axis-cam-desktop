@@ -1102,6 +1102,7 @@ impl App {
             include_bytes!("../assets/op-8.svg"),
             include_bytes!("../assets/op-9.svg"),
             include_bytes!("../assets/op-10.svg"),
+            include_bytes!("../assets/op-11.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -2749,19 +2750,22 @@ impl App {
                     self.page = Page::Audit;
                     return Task::none();
                 }
+                let machine = &self.doc.setup().machine;
                 let Some(tool) = self
                     .doc
                     .tools
                     .iter()
                     .find(|t| {
-                        if strategy == Strategy::Drill {
-                            get(&t.p, "type") == "Drill"
-                        } else if strategy == Strategy::Parallel {
-                            get(&t.p, "type") == "Ball end mill"
-                        } else {
-                            get(&t.p, "type") == "Flat end mill"
-                                || (strategy == Strategy::Face && get(&t.p, "type") == "Face mill")
-                        }
+                        manual::fits(get(&t.p, "machines"), machine)
+                            && if strategy == Strategy::Drill {
+                                get(&t.p, "type") == "Drill"
+                            } else if strategy == Strategy::Parallel {
+                                get(&t.p, "type") == "Ball end mill"
+                            } else {
+                                get(&t.p, "type") == "Flat end mill"
+                                    || (strategy == Strategy::Face
+                                        && get(&t.p, "type") == "Face mill")
+                            }
                     })
                     .or(self.doc.tools.first())
                 else {
@@ -2775,10 +2779,12 @@ impl App {
                     return Task::none();
                 };
                 let mut operation = Operation::new(strategy, tool.id.clone());
-                operation.p.insert(
-                    "coolant".into(),
-                    control::default_coolant(&self.doc.setup().machine).into(),
-                );
+                operation
+                    .p
+                    .insert("coolant".into(), control::default_coolant(machine).into());
+                if manual::is_manual(machine) {
+                    manual::snap(machine, &mut operation.p);
+                }
                 if !self.is_sample() {
                     operation.geometry.clear();
                 }

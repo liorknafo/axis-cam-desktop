@@ -14816,6 +14816,15 @@ flood = { pin = 8 }
     fn with_manual(a: &mut App) {
         a.doc.machines.push(crate::manual::defaults());
     }
+    /// A 10 mm end mill on the manual machine added by `with_manual`.
+    fn with_big_cutter(a: &mut App) -> crate::model::Tool {
+        with_manual(a);
+        let mut tool = crate::model::Tool::new("Big cutter", "Flat end mill", "10");
+        let id = a.doc.machines.last().unwrap().id.clone();
+        tool.p.insert("machines".into(), id);
+        a.doc.tools.insert(1, tool.clone());
+        tool
+    }
     fn lacks(a: &App, texts: &[&str]) {
         let seen = page_texts(a);
         for text in texts {
@@ -15033,7 +15042,7 @@ flood = { pin = 8 }
         assert!(b.status.contains("manual machine"), "{}", b.status);
     }
     #[test]
-    fn the_ribbon_dims_all_but_drill_on_a_manual_setup() {
+    fn the_ribbon_dims_all_but_box_and_drill_on_a_manual_setup() {
         let mut a = app();
         with_manual(&mut a);
         let sent = |a: &App| crate::ui::probe::clicks(a.view(), WINDOW);
@@ -15042,23 +15051,132 @@ flood = { pin = 8 }
                 .iter()
                 .any(|m| matches!(m, Message::AddOp(x) if *x == s))
         };
-        let reason = crate::manual::ONE_AXIS;
-        let reasons = |a: &App| {
+        let reasons = |a: &App, reason: &str| {
             let (_, cards) = laid(a).run(Helps::default()).expect("the view");
             cards.iter().filter(|c| c.body == reason).count()
         };
+        let (one_axis, box_on_cnc) = (crate::manual::ONE_AXIS, crate::manual::BOX_ON_CNC);
         assert!(adds(&a, Strategy::Face) && adds(&a, Strategy::Drill));
-        assert_eq!(reasons(&a), 0);
+        assert!(!adds(&a, Strategy::Box));
+        assert_eq!(reasons(&a, one_axis), 0);
+        assert_eq!(reasons(&a, box_on_cnc), 1);
         let _ = a.update(Message::AddManualSetup);
         a.doc.active = a.doc.setups[0].id.clone();
         assert!(!adds(&a, Strategy::Face));
         assert!(!adds(&a, Strategy::FiveAxis));
-        assert!(adds(&a, Strategy::Drill));
-        // The ten dimmed tiles each say why.
-        assert_eq!(reasons(&a), Strategy::ALL.len() - 1);
-        // Back on the CNC setup nothing is dimmed.
+        assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
+        // The ten dimmed tiles each say why; Box and Drill are not dimmed.
+        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 2);
+        assert_eq!(reasons(&a, box_on_cnc), 0);
+        // Back on the CNC setup only Box is dimmed.
         a.doc.active = a.doc.setups[1].id.clone();
-        assert!(adds(&a, Strategy::Face));
-        assert_eq!(reasons(&a), 0);
+        assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Box));
+        assert_eq!(reasons(&a, one_axis), 0);
+        assert_eq!(reasons(&a, box_on_cnc), 1);
+    }
+    #[test]
+    fn adding_a_box_on_the_big_mill_takes_a_fitting_tool_and_a_gear() {
+        let mut a = app();
+        let tool = with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let op = a.operation().unwrap().clone();
+        assert_eq!(op.strategy, Strategy::Box);
+        assert_eq!(op.tool, tool.id);
+        assert_eq!((get(&op.p, "rpm"), get(&op.p, "feed")), ("640", "120"));
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        // Drill's own defaults are above the machine: they come down to it.
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let drill = a.operation().unwrap();
+        assert_eq!(
+            (get(&drill.p, "rpm"), get(&drill.p, "feed")),
+            ("1600", "150")
+        );
+        // On the CNC setup nothing changes.
+        a.doc.active = a.doc.setups[1].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let drill = a.operation().unwrap();
+        assert_eq!(
+            (get(&drill.p, "rpm"), get(&drill.p, "feed")),
+            ("2400", "280")
+        );
+    }
+    #[test]
+    fn the_box_editor_has_the_six_fields_in_x_y_z_rows_and_the_passes() {
+        let mut a = app();
+        with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let tabs = Strategy::Box.tabs();
+        for tab in &tabs {
+            let _ = a.update(Message::Tab(tab.to_string()));
+            let _view = a.view();
+        }
+        let _ = a.update(Message::Tab("Box".into()));
+        let texts = page_texts(&a);
+        let at = |label: &str| {
+            (texts.iter().position(|t| t == label)).unwrap_or_else(|| panic!("{label}: {texts:?}"))
+        };
+        let order = [
+            "X min · mm",
+            "X max · mm",
+            "Y min · mm",
+            "Y max · mm",
+            "Z top · mm",
+            "Z bottom · mm",
+        ]
+        .map(at);
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        let _ = a.update(Message::Tab("Passes".into()));
+        shows(
+            &a,
+            &[
+                "Stock to leave · mm",
+                "Stepover · % tool diameter",
+                "Maximum stepdown · mm",
+            ],
+        );
+        lacks(&a, &["Pass direction · degrees", "Tolerance · mm"]);
+        let _ = a.update(Message::Edit(Target::Operation, "x_max", "-5".into()));
+        let _ = a.update(Message::Tab("Box".into()));
+        let checks = crate::ui::op_checks(&a);
+        assert_eq!(
+            checks.len(),
+            1,
+            "{:?}",
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(checks[0].key, Some("x_max"));
+    }
+    #[test]
+    fn a_box_message_opens_the_tab_with_its_field() {
+        for (issue, tab) in [
+            ("x min must be a finite number.", Some("Box")),
+            ("x max must be greater than x min.", Some("Box")),
+            ("y max must be greater than y min.", Some("Box")),
+            ("z top must be greater than z bottom.", Some("Box")),
+            ("z bottom must be a finite number.", Some("Box")),
+            (
+                "The box must be at least as wide as the tool across its passes.",
+                Some("Box"),
+            ),
+            ("stepover must be between 10 and 100.", Some("Passes")),
+            ("stepdown must be greater than zero.", Some("Passes")),
+            ("allowance cannot be negative or blank.", Some("Passes")),
+            ("End mill 10 is not on Manual Mill.", Some("Tool")),
+            (
+                "Spindle speed must be one of the machine's gears: 90, 150.",
+                Some("Tool"),
+            ),
+            (
+                "The big mill cuts one axis at a time: use Box or Drill.",
+                None,
+            ),
+            ("Box runs on a manual mill.", None),
+        ] {
+            assert_eq!(crate::ui::issue_tab(issue), tab, "{issue}");
+        }
     }
 }

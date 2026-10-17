@@ -298,6 +298,17 @@ fn checked_field<'a>(
     target: Target,
     checks: &[&Check],
 ) -> Element<'a, Message> {
+    hinted_field(p, key, label, label, target, checks)
+}
+/// A checked text field that shows `hint` while it is empty.
+fn hinted_field<'a>(
+    p: &'a Fields,
+    key: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    target: Target,
+    checks: &[&Check],
+) -> Element<'a, Message> {
     let mark = checks
         .iter()
         .find(|c| c.error)
@@ -305,7 +316,7 @@ fn checked_field<'a>(
         .map(|c| c.colors()[1]);
     let mut c = column![
         muted(label),
-        text_input(label, get(p, key))
+        text_input(hint, get(p, key))
             .on_input(move |v| Message::Edit(target, key, v))
             .padding([7, 9])
             .size(13)
@@ -475,14 +486,20 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("name") | None => {
             return if issue.contains("feature or surface") {
                 Some("Geometry")
-            } else if issue.starts_with("Choose a tool") || issue.starts_with("Choose a drill") {
+            } else if issue.starts_with("Choose a tool")
+                || issue.starts_with("Choose a drill")
+                || issue.contains(" is not on ")
+            {
                 Some("Tool")
+            } else if issue.starts_with("The box must be") {
+                Some("Box")
             } else {
                 None
             };
         }
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
+        Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
         Some("clearance" | "retract" | "top" | "bottom" | "breakthrough") => "Heights",
         Some(
             "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
@@ -515,9 +532,19 @@ impl Checks {
         key: &'static str,
         label: &'static str,
     ) -> Element<'a, Message> {
+        self.hinted(p, key, label, label)
+    }
+    /// An operation field that shows `hint` while it is empty.
+    fn hinted<'a>(
+        &mut self,
+        p: &'a Fields,
+        key: &'static str,
+        label: &'static str,
+        hint: &'static str,
+    ) -> Element<'a, Message> {
         self.drawn.push(key);
         let at: Vec<&Check> = self.list.iter().filter(|c| c.key == Some(key)).collect();
-        checked_field(p, key, label, Target::Operation, &at)
+        hinted_field(p, key, label, hint, Target::Operation, &at)
     }
     /// The checks no field drawn shows.
     pub(crate) fn rest(&self) -> Vec<&Check> {
@@ -1025,11 +1052,16 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         ("2D MILLING", 0..5),
         ("3D FINISHING", 5..8),
         ("MULTI-AXIS", 8..11),
+        ("MANUAL", 11..12),
     ] {
         let mut buttons = Row::new().spacing(1);
         for s in &Strategy::ALL[range] {
             let s = *s;
-            let reason = (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS);
+            let reason = if s == Strategy::Box {
+                (!manual_setup).then_some(manual::BOX_ON_CNC)
+            } else {
+                (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
+            };
             let available = reason.is_none() && (app.is_sample() || s.imported_preview());
             // An unavailable strategy is dimmed: the icon at low opacity and
             // the label in a light grey, with its reason in the hover help.
@@ -2142,7 +2174,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 .push(secondary("Open tool library", Message::Page(Page::Tools)))
                 .push(section("Feeds & speeds"))
                 .push(checks.field(p, "rpm", "Spindle speed · rpm"));
-            if o.strategy.imported_preview() && !app.is_sample() {
+            if o.strategy.imported_preview() && o.strategy != Strategy::Box && !app.is_sample() {
                 c = c
                     .push(choice_value(
                         p,
@@ -2333,8 +2365,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ));
             }
         }
+        "Box" => {
+            c = c.push(note("The block to remove, in the setup's frame from the work zero. Passes run along the longer side."));
+            for (a, b) in [
+                (("x_min", "X min · mm"), ("x_max", "X max · mm")),
+                (("y_min", "Y min · mm"), ("y_max", "Y max · mm")),
+                (("z_top", "Z top · mm"), ("z_bottom", "Z bottom · mm")),
+            ] {
+                c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
+            }
+        }
         "Heights" => {
-            c = c.push(note(if !app.is_sample() && o.strategy == Strategy::Face {
+            c = c.push(note(if o.strategy == Strategy::Box {
+                "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
+            } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
             } else if !app.is_sample() && o.strategy == Strategy::Pocket {
                 "Cutting starts from the remaining stock after earlier operations, plus positive Top offset. A fully faced-off layer is skipped; uncut regions keep the higher start. Bottom offset and axial stock to leave are added to the selected floor. Clearance/retract stay referenced to the original stock top."
@@ -2356,7 +2400,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ("top", "Top offset · mm"),
                 ("bottom", "Bottom offset · mm"),
             ] {
-                c = c.push(checks.field(p, k, label));
+                if o.strategy != Strategy::Box || !matches!(k, "top" | "bottom") {
+                    c = c.push(checks.field(p, k, label));
+                }
             }
             if o.strategy == Strategy::Drill {
                 c = c.push(choice(
@@ -2585,6 +2631,14 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
     let t = Target::Operation;
     let s = o.strategy;
     let mut c = Column::new().spacing(12);
+    if s == Strategy::Box {
+        return c
+            .push(checks.field(p, "allowance", "Stock to leave · mm"))
+            .push(checks.field(p, "stepover", "Stepover · % tool diameter"))
+            .push(checks.hinted(p, "stepdown", "Maximum stepdown · mm", "Auto"))
+            .push(note("Stock to leave stays on every side that touches the part, for the CNC to finish; 0 makes the cut final. Leave the stepdown empty for Auto."))
+            .into();
+    }
     if !app.is_sample()
         && matches!(
             s,

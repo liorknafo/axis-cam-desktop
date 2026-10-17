@@ -1967,6 +1967,16 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Operation(Strategy::Parallel)),
         ),
+        (_, "x_min" | "x_max" | "y_min" | "y_max") => (
+            "One side of the block a Box removes, in mm in the setup's frame, measured from the work zero. The block must be at least as wide as the tool across its passes.",
+            "Passes run along the block's longer side. A side the block shares with open air is cut from outside the stock; a side that touches the part keeps the stock to leave.",
+            Some(Operation(Strategy::Box)),
+        ),
+        (_, "z_top" | "z_bottom") => (
+            "The top and the floor of the block a Box removes, in mm in the setup's frame, measured from the work zero. The floor is below the top.",
+            "The tool goes down by the stepdown until it reaches the floor.",
+            Some(Operation(Strategy::Box)),
+        ),
         (_, "stepover") => (
             "Sideways spacing of adjacent passes, as a percentage of cutter diameter. For a 10 mm tool, 40% means 4 mm. Smaller spacing increases overlap and pass count. Pocket accepts up to 50%.",
             "",
@@ -2815,6 +2825,17 @@ impl canvas::Program<Message> for Illustration {
                             15.
                         },
                     ]
+                }
+                Strategy::Box => {
+                    // Passes along X, stepping across by Y: one axis at a time.
+                    let row = (t * 4.).floor().min(3.);
+                    let k = (t * 4.).fract();
+                    let x = if row as i32 % 2 == 0 {
+                        2. * k
+                    } else {
+                        2. - 2. * k
+                    };
+                    [-30. + 30. * x, -18. + row * 10., 25.]
                 }
                 Strategy::Contour => [44. * a.cos(), 27. * a.sin(), 21.],
                 Strategy::Drill => {

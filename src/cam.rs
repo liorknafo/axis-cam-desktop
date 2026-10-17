@@ -320,6 +320,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Drill => drill(setup, op, tool, mesh),
         Strategy::Parallel => parallel(setup, op, tool, mesh),
         Strategy::Waterline => waterline(setup, op, tool, mesh),
+        Strategy::Box => Err("Box paths are not generated yet.".into()),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -1897,7 +1898,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn all_eleven_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn all_twelve_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -1914,8 +1915,14 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            6
+            7
         );
+    }
+    #[test]
+    fn box_says_its_paths_are_not_generated_yet() {
+        let (setup, op, tool) = fixture(Strategy::Box);
+        let error = generate(&setup, &op, &tool, &block()).unwrap_err();
+        assert_eq!(error, "Box paths are not generated yet.");
     }
     #[test]
     fn real_step_and_3mf_new_operations_generate_and_survive_save_reload() {
