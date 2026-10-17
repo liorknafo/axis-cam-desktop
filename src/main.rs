@@ -296,6 +296,11 @@ pub enum Message {
     },
     Tick,
     Plan,
+    /// The text of the planner chat's box changes.
+    PlanAsk(String),
+    /// The chat's request goes to the planner: a change to the current plan,
+    /// or to the preview when one is open, or what to plan.
+    PlanSend,
     PlanProgress(u64, planner::Event),
     PlanFinished(u64, Result<std::sync::Arc<PlanPreview>, planner::Failure>),
     PlanCancel,
@@ -886,6 +891,13 @@ pub struct App {
     plan_dropped: Option<&'static str>,
     /// The plan preview's own camera: the machining viewport's stays put.
     pub plan_camera: viewport::Camera,
+    /// The text in the planner chat's box.
+    pub plan_request: String,
+    /// The planner chat's exchanges so far in this project, oldest first.
+    pub plan_chat: Vec<planner::Turn>,
+    /// The chat request of the current run, or of the preview or failure it
+    /// left; None for a run of Plan this job.
+    pub plan_asked: Option<String>,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
     /// The operation editor asks before deleting the selected operation.
@@ -990,6 +1002,7 @@ fn while_locked(m: &Message) -> bool {
             | ConnectionChecked(..)
             | PlanNoticeDismissed
             | PlanPictures(_)
+            | PlanAsk(_)
             | OpenUrl(_)
             | Close(_)
             | Captured(_)
@@ -1008,17 +1021,21 @@ pub(crate) async fn run_plan(
     backend: &(impl planner::Backend + Sync),
     doc: Document,
     mesh: mesh::Mesh,
+    chat: planner::Chat,
     busy: planner::Busy,
     epoch: u64,
     sender: PlanSender,
 ) {
-    run_plan_with(backend, doc, mesh, busy, epoch, sender, planner::final_view).await
+    let view = planner::final_view;
+    run_plan_with(backend, doc, mesh, chat, busy, epoch, sender, view).await
 }
 /// `run_plan` with the 3D view's blocking stage given, so tests can hold it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_plan_with(
     backend: &(impl planner::Backend + Sync),
     doc: Document,
     mesh: mesh::Mesh,
+    chat: planner::Chat,
     busy: planner::Busy,
     epoch: u64,
     mut sender: PlanSender,
@@ -1026,7 +1043,7 @@ pub(crate) async fn run_plan_with(
 ) {
     use iced::futures::SinkExt;
     let mut stages = sender.clone();
-    let result = planner::plan(backend, doc, mesh.clone(), &busy, move |event| {
+    let result = planner::plan_chat(backend, doc, mesh.clone(), chat, &busy, move |event| {
         // Events are only shown; one that does not fit the channel is skipped.
         let _ = stages.try_send(Message::PlanProgress(epoch, event));
     })
@@ -1290,6 +1307,9 @@ impl App {
             plan_enlarged: None,
             plan_expanded: Default::default(),
             plan_camera: viewport::Camera::default(),
+            plan_request: String::new(),
+            plan_chat: vec![],
+            plan_asked: None,
             plan_busy: planner::Busy::default(),
             plan_dropped: None,
             undo: None,
@@ -1377,6 +1397,9 @@ impl App {
         self.help_animating = false;
         self.drop_plan();
         self.undo = None;
+        // The chat was about the project that is gone.
+        self.plan_chat.clear();
+        self.plan_request.clear();
     }
     fn create_setup(&mut self, machine: Machine) {
         let mut setup = Setup::new(machine, &self.doc.next_offset());
@@ -2551,6 +2574,55 @@ impl App {
             Message::ModelsLoaded(epoch, result)
         })
     }
+    /// Starts a planner run with `chat`: Plan this job when it has no
+    /// request, else a change. A change starts from the preview when one is
+    /// open (as Apply would make it), else from the job.
+    fn start_plan(&mut self, chat: planner::Chat) -> Task<Message> {
+        if matches!(self.planner, Planner::Running(_)) {
+            return Task::none();
+        }
+        // A cancelled run's blocking work cannot be interrupted.
+        if self.plan_busy.running() > 0 {
+            self.status = PLAN_BUSY.into();
+            return Task::none();
+        }
+        if let Some(unmet) = self.plan_checklist().into_iter().find(|line| !line.ok) {
+            self.status = format!("{}: {}", unmet.label, unmet.hint);
+            return Task::none();
+        }
+        let (Some(client), Some(mesh)) = (self.client.clone(), self.imported_mesh.clone()) else {
+            return Task::none();
+        };
+        let asked = (!chat.request.is_empty()).then(|| chat.request.clone());
+        let doc = match (&self.planner, &asked) {
+            (Planner::Preview(preview), Some(_)) => planner::applied(&preview.outcome),
+            _ => self.doc.clone(),
+        };
+        let edit = planner::editing(&doc, &chat);
+        self.drop_plan();
+        let epoch = self.plan_epoch;
+        self.plan_account_epoch = self.account_epoch;
+        self.plan_model = self.settings.model.clone();
+        self.planner = Planner::Running(planner::Progress::Analyzing);
+        if asked.is_some() {
+            self.plan_request.clear();
+        }
+        self.plan_asked = asked;
+        self.status = if edit {
+            "Asking the planner for the change. Nothing changes until you apply it."
+        } else {
+            "Planning. Nothing changes until you apply a plan."
+        }
+        .into();
+        let backend = self.plan_backend(client);
+        let busy = self.plan_busy.clone();
+        let run = iced::stream::channel(16, async move |sender: PlanSender| {
+            run_plan(&backend, doc, mesh, chat, busy, epoch, sender).await
+        });
+        let (task, handle) = Task::run(run, |message| message).abortable();
+        self.plan_run = Some(handle);
+        task
+    }
     /// Stop a running plan and forget a preview: both describe the job as it was.
     fn drop_plan(&mut self) {
         if let Some(handle) = self.plan_run.take() {
@@ -2562,6 +2634,7 @@ impl App {
         self.plan_overview = None;
         self.plan_enlarged = None;
         self.plan_expanded.clear();
+        self.plan_asked = None;
         // The aborted run may still write to the old text.
         self.plan_stream = Default::default();
     }
@@ -2843,6 +2916,7 @@ impl App {
                     | Message::SetClamps(_)
                     | Message::SuggestLayout
                     | Message::Plan
+                    | Message::PlanSend
             )
         {
             self.status =
@@ -4505,38 +4579,18 @@ impl App {
                     self.refresh_guide(),
                 ]);
             }
-            Message::Plan => {
-                if matches!(self.planner, Planner::Running(_)) {
+            Message::Plan => return self.start_plan(planner::Chat::default()),
+            Message::PlanAsk(text) => self.plan_request = text,
+            Message::PlanSend => {
+                let request = self.plan_request.trim().to_string();
+                if request.is_empty() || matches!(self.planner, Planner::Running(_)) {
                     return Task::none();
                 }
-                // A cancelled run's blocking work cannot be interrupted.
-                if self.plan_busy.running() > 0 {
-                    self.status = PLAN_BUSY.into();
-                    return Task::none();
-                }
-                if let Some(unmet) = self.plan_checklist().into_iter().find(|line| !line.ok) {
-                    self.status = format!("{}: {}", unmet.label, unmet.hint);
-                    return Task::none();
-                }
-                let (Some(client), Some(mesh)) = (self.client.clone(), self.imported_mesh.clone())
-                else {
-                    return Task::none();
+                let chat = planner::Chat {
+                    turns: self.plan_chat.clone(),
+                    request,
                 };
-                self.drop_plan();
-                let epoch = self.plan_epoch;
-                self.plan_account_epoch = self.account_epoch;
-                self.plan_model = self.settings.model.clone();
-                self.planner = Planner::Running(planner::Progress::Analyzing);
-                self.status = "Planning. Nothing changes until you apply a plan.".into();
-                let backend = self.plan_backend(client);
-                let doc = self.doc.clone();
-                let busy = self.plan_busy.clone();
-                let run = iced::stream::channel(16, async move |sender: PlanSender| {
-                    run_plan(&backend, doc, mesh, busy, epoch, sender).await
-                });
-                let (task, handle) = Task::run(run, |message| message).abortable();
-                self.plan_run = Some(handle);
-                return task;
+                return self.start_plan(chat);
             }
             Message::PlanProgress(epoch, event) => {
                 if epoch == self.plan_epoch && matches!(self.planner, Planner::Running(_)) {
@@ -4550,6 +4604,16 @@ impl App {
                 self.plan_run = None;
                 self.end_plan_step();
                 let same_client = self.plan_account_epoch == self.account_epoch;
+                if let Some(request) = self.plan_asked.clone() {
+                    let answer = match &result {
+                        Ok(preview) if preview.outcome.proposal.summary.is_empty() => {
+                            "Here is the plan to review.".into()
+                        }
+                        Ok(preview) => preview.outcome.proposal.summary.clone(),
+                        Err(failure) => failure.message.clone(),
+                    };
+                    self.plan_chat.push(planner::Turn { request, answer });
+                }
                 match result {
                     Ok(preview) => {
                         self.status = format!(
@@ -4599,6 +4663,12 @@ impl App {
             }
             Message::PlanCancel => {
                 if matches!(self.planner, Planner::Running(_)) {
+                    // The request goes back in the box, to send again.
+                    if let Some(asked) = self.plan_asked.take()
+                        && self.plan_request.trim().is_empty()
+                    {
+                        self.plan_request = asked;
+                    }
                     self.drop_plan();
                     self.status = "Planning cancelled. The job is unchanged.".into();
                 }
@@ -4616,30 +4686,15 @@ impl App {
                     self.planner = Planner::Idle;
                     self.plan_timeline.clear();
                     self.plan_expanded.clear();
+                    self.plan_asked = None;
                 }
             }
             Message::ApplyPlan => {
                 let Planner::Preview(preview) = &self.planner else {
                     return Task::none();
                 };
-                let mut job = preview.outcome.job.clone();
-                // The planner's workholding note for setup 1 joins setup 1's
-                // own notes on the same line, in place of the exact note an
-                // earlier Apply added, which setup 1 keeps for this; Undo
-                // removes both with the rest of the plan.
-                let note = preview.outcome.proposal.setups.first();
-                if let Some(first) = job.setups.first_mut() {
-                    let note = note.map_or("", |s| s.workholding.as_str());
-                    let earlier = get(&first.p, planner::PLANNER_NOTE_KEY);
-                    let (notes, added) =
-                        planner::setup_1_notes(get(&first.p, "notes"), earlier, note);
-                    first.p.insert("notes".into(), notes);
-                    if added.is_empty() {
-                        first.p.remove(planner::PLANNER_NOTE_KEY);
-                    } else {
-                        first.p.insert(planner::PLANNER_NOTE_KEY.into(), added);
-                    }
-                }
+                // Undo removes setup 1's planner note with the rest of the plan.
+                let job = planner::applied(&preview.outcome);
                 // The previous job goes to History first, as on New project.
                 // Applying is not a project switch: Recover previous keeps
                 // pointing at the project before the last switch.

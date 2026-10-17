@@ -29,12 +29,15 @@ pub const MAX_TOOL_ROUNDS: usize = 16;
 /// in tests.
 pub trait Backend {
     /// One send of the conversation with the planner tools it offers, none
-    /// when `tools` is empty, and how the model may use them.
+    /// when `tools` is empty, and how the model may use them. With `edit`
+    /// the planner changes the current plan, and its reply follows
+    /// `proposal::schema_for(true)`.
     fn reply(
         &self,
         messages: &[Item],
         tools: &[Tool],
         choice: ToolChoice,
+        edit: bool,
     ) -> impl Future<Output = Result<Reply, ApiError>> + Send;
     /// Whether this run may show the model pictures.
     fn pictures(&self) -> bool {
@@ -174,6 +177,80 @@ pub struct Failure {
     pub api: Option<ApiError>,
     pub requests: usize,
 }
+/// One exchange of the planner chat: what the user asked, and what the
+/// planner answered (its summary of the plan, or why it found none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub request: String,
+    pub answer: String,
+}
+/// What the user asks the planner in the chat, and the exchanges before it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chat {
+    pub turns: Vec<Turn>,
+    pub request: String,
+}
+/// The most of one request, or of one earlier answer, the model is sent.
+pub const MAX_REQUEST_CHARS: usize = 2000;
+/// The earlier exchanges of the chat the model is sent, the latest.
+pub const KEPT_TURNS: usize = 8;
+impl Chat {
+    /// The messages after the part report and the overview: the earlier
+    /// exchanges, then the request, with the plan to change (`current`, the
+    /// JSON of `proposal::describe`) when there is one. None without a
+    /// request.
+    fn messages(&self, current: Option<&str>) -> Vec<Item> {
+        let request = proposal::clip(&self.request, MAX_REQUEST_CHARS);
+        if request.is_empty() {
+            return vec![];
+        }
+        let mut items = vec![];
+        let skip = self.turns.len().saturating_sub(KEPT_TURNS);
+        for turn in &self.turns[skip..] {
+            let asked = proposal::clip(&turn.request, MAX_REQUEST_CHARS);
+            let answer = proposal::clip(&turn.answer, MAX_REQUEST_CHARS);
+            items.push(Item::text(
+                Role::User,
+                format!("Earlier the user asked: {asked}"),
+            ));
+            items.push(Item::text(
+                Role::Assistant,
+                if answer.is_empty() {
+                    "(no answer)".into()
+                } else {
+                    answer
+                },
+            ));
+        }
+        items.push(Item::text(
+            Role::User,
+            match current {
+                Some(current) => format!("The job's current plan: {current}\n\nThe user asks for this change: {request}"),
+                None => format!("Plan the job, and follow this request of the user where the rules allow it: {request}"),
+            },
+        ));
+        items
+    }
+}
+/// Whether a run with `chat` changes the current plan of `doc` rather than
+/// planning from scratch: the user asked something, and the job has an
+/// operation.
+pub fn editing(doc: &Document, chat: &Chat) -> bool {
+    !proposal::clip(&chat.request, MAX_REQUEST_CHARS).is_empty()
+        && doc.setups.iter().any(|s| !s.operations.is_empty())
+}
+/// The section the instructions end with when the planner changes the
+/// current plan.
+const EDITING: &str = "
+
+CHANGING THE CURRENT PLAN
+- The job already has a plan, sent as `current_plan` in the format of your reply, and the user asks for a change. Reply with the whole revised plan: every setup and operation it is to have, in order.
+- Each setup and operation of `current_plan` carries `from`, its number there. Copy `from` onto every setup and operation you keep or change, and set it to null on a new one. Leave out what is to be removed.
+- Change only what the user asks for, and what the checks then require. Copy every other setup and operation as it is, with the same values, names and order: the program keeps an operation you did not change exactly as the user left it, with settings the format does not show, and writes only the values you changed. Fields `current_plan` leaves null stay null unless you change them.
+- An operation keeps its `from` only in the setup it came from, and only while that setup keeps its `from` and orientation; to move one to another setup, add it there with `from` null. Each `from` may be used once. Setup 1 stays first, with `from` 1.
+- `kept_operations` lists operations of the current plan that you cannot see or change (strategies the format does not offer). They stay in their setups at their place: keep those setups, with their `from` and orientation, and do not count them against the limits.
+- Say in `summary`, in a sentence or two for the user, what you changed. When the change cannot be made with these tools and strategies, reply with the current plan unchanged and say why in `summary`.
+- The earlier messages of the chat, if any, are for context only: `current_plan` is the job as it stands now.";
 /// The PLANNING THE HOLDING section, with its blank line after it: how the
 /// planner is to hold every setup, which stock it starts from and what a holder
 /// needs of it. With `tools`, a last rule names the planner tools that test a
@@ -459,7 +536,7 @@ fn name_form(c: char) -> char {
 /// become one, so words and numbers never run together, and no quotation or
 /// check mark, or listed look-alike, can close the app's quotes around the
 /// name or pass for the app's check lines or the " · " between their fields.
-fn name(text: &str) -> String {
+pub(crate) fn name(text: &str) -> String {
     let mut kept = String::new();
     let mut chars = text
         .chars()
@@ -640,6 +717,27 @@ pub(crate) fn setup_1_notes(notes: &str, earlier: &str, note: &str) -> (String, 
     };
     (notes, note)
 }
+/// The job Apply puts in place of the current one: the outcome's, with the
+/// planner's workholding note for setup 1 joined to setup 1's own notes on
+/// the same line, in place of the exact note an earlier Apply added, which
+/// setup 1 keeps for this (`setup_1_notes`). A change asked for in the chat
+/// while a preview is open starts from this too.
+pub fn applied(outcome: &Outcome) -> Document {
+    let mut job = outcome.job.clone();
+    let note = outcome.proposal.setups.first();
+    if let Some(first) = job.setups.first_mut() {
+        let note = note.map_or("", |s| s.workholding.as_str());
+        let earlier = crate::model::get(&first.p, PLANNER_NOTE_KEY);
+        let (notes, added) = setup_1_notes(crate::model::get(&first.p, "notes"), earlier, note);
+        first.p.insert("notes".into(), notes);
+        if added.is_empty() {
+            first.p.remove(PLANNER_NOTE_KEY);
+        } else {
+            first.p.insert(PLANNER_NOTE_KEY.into(), added);
+        }
+    }
+    job
+}
 /// Problems as a failed run keeps them: each message one line of at most
 /// 300 characters.
 fn bounded(mut problems: Vec<Problem>) -> Vec<Problem> {
@@ -743,6 +841,8 @@ struct Sight {
     tool: bool,
     /// The conversation carries the overview: it was drawn.
     overview: bool,
+    /// The planner changes the current plan the conversation carries.
+    edit: bool,
 }
 /// Whether the text of an HTTP 400 (its message, and its parameter when it
 /// names one) says the tools or the pictures are what was refused. Any other
@@ -805,16 +905,17 @@ async fn ask(
             ToolChoice::Auto
         };
         let tools = if sight.tool {
-            planner_tools::offered(sight.pictures)
+            planner_tools::offered_with(sight.pictures, sight.edit)
         } else {
             vec![]
         };
-        let mut messages = vec![Item::text(
-            Role::System,
-            instructions_with(sight.pictures, sight.tool, sight.overview),
-        )];
+        let mut system = instructions_with(sight.pictures, sight.tool, sight.overview);
+        if sight.edit {
+            system.push_str(EDITING);
+        }
+        let mut messages = vec![Item::text(Role::System, system)];
         messages.extend(outgoing(conversation, sight.pictures, sight.tool));
-        let reply = match backend.reply(&messages, &tools, choice).await {
+        let reply = match backend.reply(&messages, &tools, choice, sight.edit).await {
             Ok(reply) => reply,
             Err(error) => {
                 let Some(dropped) = dropped_for(&error, sight) else {
@@ -908,6 +1009,7 @@ async fn ask(
 /// Runs the planner. `progress` is called as each stage starts and with each
 /// check's result. The job and mesh are taken by value so the returned
 /// future can move between threads.
+#[cfg(test)]
 pub async fn plan(
     backend: &(impl Backend + Sync),
     doc: Document,
@@ -915,10 +1017,23 @@ pub async fn plan(
     busy: &Busy,
     progress: impl FnMut(Event) + Send,
 ) -> Result<Outcome, Failure> {
-    plan_with(
+    plan_chat(backend, doc, mesh, Chat::default(), busy, progress).await
+}
+/// `plan` with what the user asked in the chat: a change to the job's
+/// current plan when it has one (see [`editing`]), else what to plan.
+pub async fn plan_chat(
+    backend: &(impl Backend + Sync),
+    doc: Document,
+    mesh: Mesh,
+    chat: Chat,
+    busy: &Busy,
+    progress: impl FnMut(Event) + Send,
+) -> Result<Outcome, Failure> {
+    plan_with_chat(
         backend,
         doc,
         mesh,
+        chat,
         busy,
         progress,
         analysis::report,
@@ -933,10 +1048,30 @@ type Checking = (CheckReport, Option<Document>, Option<plan_check::Checked>);
 /// and the plan check (`check`, which also returns what the planner's tools
 /// read of the checked job). Tests use it to hold a stage while it runs, or
 /// to make a check fail to run.
+#[cfg(test)]
 async fn plan_with<A, C>(
     backend: &(impl Backend + Sync),
     doc: Document,
     mesh: Mesh,
+    busy: &Busy,
+    progress: impl FnMut(Event) + Send,
+    analyze: A,
+    check: C,
+) -> Result<Outcome, Failure>
+where
+    A: FnOnce(&Document, &Mesh) -> Result<PartReport, String> + Send + 'static,
+    C: Fn(&Document, &Mesh, &PartReport, &Proposal) -> Checking + Clone + Send + 'static,
+{
+    let chat = Chat::default();
+    plan_with_chat(backend, doc, mesh, chat, busy, progress, analyze, check).await
+}
+/// `plan_with` with what the user asked in the chat.
+#[allow(clippy::too_many_arguments)]
+async fn plan_with_chat<A, C>(
+    backend: &(impl Backend + Sync),
+    doc: Document,
+    mesh: Mesh,
+    chat: Chat,
     busy: &Busy,
     mut progress: impl FnMut(Event) + Send,
     analyze: A,
@@ -946,6 +1081,7 @@ where
     A: FnOnce(&Document, &Mesh) -> Result<PartReport, String> + Send + 'static,
     C: Fn(&Document, &Mesh, &PartReport, &Proposal) -> Checking + Clone + Send + 'static,
 {
+    let edit = editing(&doc, &chat);
     let real = doc;
     let doc = anonymized(&real);
     let fail = |message: String, problems, api, requests| Failure {
@@ -968,6 +1104,13 @@ where
         })?
         .map_err(|e| fail(e, vec![], None, 0))?;
     let part = serde_json::to_string(&report).map_err(|e| fail(e.to_string(), vec![], None, 0))?;
+    // The plan to change, read before anything is sent.
+    let current = if edit {
+        let current = proposal::describe(&doc, &report).map_err(|e| fail(e, vec![], None, 0))?;
+        Some(serde_json::to_string(&current).map_err(|e| fail(e.to_string(), vec![], None, 0))?)
+    } else {
+        None
+    };
     // The system message is added to each send, as the pictures allow.
     let mut conversation = vec![Item::text(Role::User, part)];
     let mut state = ToolState::new(look::Scene {
@@ -981,6 +1124,7 @@ where
         pictures: backend.pictures(),
         tool: true,
         overview: false,
+        edit,
     };
     if sight.pictures {
         let s = state.scene.clone();
@@ -1007,6 +1151,7 @@ where
             sight.overview = true;
         }
     }
+    conversation.extend(chat.messages(current.as_deref()));
     let mut best: Option<Outcome> = None;
     let mut problems = vec![];
     let mut asked_for_coverage = false;
@@ -1100,10 +1245,19 @@ where
         progress(Event::Checked(request, StepResult::of(&check)));
         let next = feedback(&check);
         if let (true, Some(mut job)) = (check.passed, job) {
-            // The job is the user's again: Apply keeps setup 1's real name.
+            // The job is the user's again: Apply keeps the real names of
+            // setup 1 and of every setup a change kept and did not rename.
             job.title = real.title.clone();
-            if let (Some(first), Some(user)) = (job.setups.first_mut(), real.setups.first()) {
-                first.p.insert("name".into(), user.name().into());
+            for setup in &mut job.setups {
+                if let Some((i, user)) = real
+                    .setups
+                    .iter()
+                    .enumerate()
+                    .find(|(_, u)| u.id == setup.id)
+                    && setup.name() == format!("Setup {}", i + 1)
+                {
+                    setup.p.insert("name".into(), user.name().into());
+                }
             }
             let exposed = |c: &CheckReport| c.coverage.as_ref().map_or(0., |c| c.exposed_percent);
             let covered = check
@@ -1126,8 +1280,9 @@ where
                     note: None,
                 });
             }
-            // One round to machine what is still covered; then the best plan stands.
-            if !covered || asked_for_coverage {
+            // One round to machine what is still covered; then the best plan
+            // stands. A change asked for is not added to.
+            if !covered || asked_for_coverage || edit {
                 break;
             }
             asked_for_coverage = true;
@@ -1149,9 +1304,15 @@ where
             ..outcome
         }),
         None => Err(fail(
-            format!(
-                "The planner could not produce a plan that passes every check in {MAX_REQUESTS} attempts."
-            ),
+            if edit {
+                format!(
+                    "The planner could not change the plan so that it passes every check in {MAX_REQUESTS} attempts."
+                )
+            } else {
+                format!(
+                    "The planner could not produce a plan that passes every check in {MAX_REQUESTS} attempts."
+                )
+            },
             bounded(problems),
             None,
             made,
@@ -1193,13 +1354,14 @@ impl Backend for OpenAiBackend {
         messages: &[Item],
         tools: &[Tool],
         choice: ToolChoice,
+        edit: bool,
     ) -> Result<Reply, ApiError> {
         use std::sync::atomic::Ordering;
         let request = crate::openai::Request {
             model: self.model.clone(),
             messages: messages.to_vec(),
             schema_name: "machining_plan",
-            schema: proposal::schema(),
+            schema: proposal::schema_for(edit),
             tools: tools.to_vec(),
             tool_choice: choice,
         };
@@ -1321,6 +1483,7 @@ pub(crate) mod tests {
             messages: &[Item],
             tools: &[Tool],
             choice: ToolChoice,
+            _edit: bool,
         ) -> Result<Reply, ApiError> {
             let texts = messages.iter().filter_map(Item::as_text).collect();
             self.seen.lock().unwrap().push(texts);
@@ -3241,6 +3404,7 @@ pub(crate) mod tests {
                     proposal::tests::op("Face", 1, top),
                     proposal::tests::op("Contour", 1, vec![]),
                 ],
+                from: None,
             }],
             unmachined: vec![],
             warnings: vec![],

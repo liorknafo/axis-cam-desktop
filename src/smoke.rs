@@ -1581,6 +1581,7 @@ impl App {
                         op("Pocket", floor.clone()),
                         op("Contour", vec![]),
                     ],
+                    from: None,
                 },
                 ProposedSetup {
                     orientation: "-Z".into(),
@@ -1589,6 +1590,7 @@ impl App {
                     workholding: "Turn over; the vise on the long sides.".into(),
                     holder: Some(1),
                     operations: vec![op("Face", plane("-Z", "top"))],
+                    from: None,
                 },
             ],
             unmachined: vec![],
@@ -1656,7 +1658,7 @@ impl App {
                     op("Face", plane(0.)),
                     op("Pocket", plane(12.)),
                     op("Contour", vec![]),
-                ],
+                ], from: None,
             }],
             unmachined: vec![Unmachined {
                 feature: "Four counterbored through holes".into(),
@@ -13308,7 +13310,16 @@ flood = { pin = 8 }
         let (sender, receiver) = iced::futures::channel::mpsc::channel(16);
         let mesh = a.imported_mesh.clone().unwrap();
         let busy = a.plan_busy.clone();
-        crate::run_plan(&script, a.doc.clone(), mesh, busy, a.plan_epoch, sender).await;
+        crate::run_plan(
+            &script,
+            a.doc.clone(),
+            mesh,
+            Default::default(),
+            busy,
+            a.plan_epoch,
+            sender,
+        )
+        .await;
         receiver.collect().await
     }
     #[tokio::test]
@@ -13405,6 +13416,7 @@ flood = { pin = 8 }
             &script,
             a.doc.clone(),
             a.imported_mesh.clone().unwrap(),
+            Default::default(),
             busy.clone(),
             a.plan_epoch,
             sender,

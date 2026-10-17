@@ -62,6 +62,10 @@ pub struct ProposedSetup {
     /// or None: setup 1's own, which for a later setup is setup 1's.
     pub holder: Option<usize>,
     pub operations: Vec<ProposedOp>,
+    /// When the planner changes a plan: the number of the current setup this
+    /// one keeps (see [`describe`]), None for a new setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<usize>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +96,10 @@ pub struct ProposedOp {
     pub through: Option<bool>,
     pub coolant: String,
     pub reason: String,
+    /// When the planner changes a plan: the number of the current operation
+    /// this one keeps (see [`describe`]), None for a new operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<usize>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,6 +143,12 @@ fn choice(options: &[&str], nullable: bool) -> Value {
 }
 /// Strict JSON Schema for a proposal: every field required, nothing extra.
 pub fn schema() -> Value {
+    schema_for(false)
+}
+/// [`schema`], with `edit` (the planner changes the current plan) a `from`
+/// on every setup and operation: the number of the current one it keeps, or
+/// null.
+pub fn schema_for(edit: bool) -> Value {
     let text = || json!({"type": "string"});
     let number = || json!({"type": "number"});
     let optional = || json!({"type": ["number", "null"]});
@@ -168,6 +182,15 @@ pub fn schema() -> Value {
         "coolant": choice(&COOLANTS, false),
         "reason": text(),
     }));
+    let from = || json!({"type": ["integer", "null"]});
+    let mut operation = operation;
+    if edit {
+        operation["properties"]["from"] = from();
+        operation["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("from"));
+    }
     let setup = object(json!({
         "orientation": choice(&ups, false),
         "name": text(),
@@ -176,6 +199,14 @@ pub fn schema() -> Value {
         "holder": {"type": ["integer", "null"]},
         "operations": {"type": "array", "items": operation},
     }));
+    let mut setup = setup;
+    if edit {
+        setup["properties"]["from"] = from();
+        setup["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("from"));
+    }
     object(json!({
         "summary": text(),
         "setups": {"type": "array", "items": setup},
@@ -734,9 +765,319 @@ fn operation(
     }
     Ok(op)
 }
+/// An operation of the current plan the planner cannot see or change: its
+/// strategy is not one of the six, its tool has no number, or it machines a
+/// selection that is not surfaces. It stays in its setup, at its place.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KeptOp {
+    pub setup: usize,
+    pub from: usize,
+    /// Its place in the setup, from 1.
+    pub position: usize,
+    pub strategy: &'static str,
+    pub name: String,
+}
+/// The current plan as the planner is shown it when it is asked to change
+/// it: every setup and operation in the proposal's own format, each with
+/// its `from` (setups numbered from 1, operations from 1 across the whole
+/// job), and the operations it cannot change.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Current {
+    pub current_plan: Proposal,
+    pub kept_operations: Vec<KeptOp>,
+}
+/// `op` as a proposal writes it, or None when a proposal cannot (see
+/// [`KeptOp`]). Fields its strategy does not use are null, and `reason` is
+/// empty; a coolant that is not a choice reads `Off`.
+fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
+    let strategy = STRATEGIES.iter().find(|(_, s)| *s == op.strategy)?.0;
+    let tool = tools.iter().find(|t| t.id == op.tool)?.number()?;
+    if op.surfaces.is_none() && !op.geometry.is_empty() {
+        return None;
+    }
+    let mut surfaces = op
+        .surfaces
+        .as_ref()
+        .map(|s| s.ids.clone())
+        .unwrap_or_default();
+    surfaces.sort_unstable();
+    surfaces.dedup();
+    let value = |key: &str| num(&op.p, key).filter(|v| v.is_finite());
+    let coolant = get(&op.p, "coolant");
+    let mut p = ProposedOp {
+        strategy: strategy.into(),
+        name: crate::planner::name(get(&op.p, "name")),
+        tool,
+        surfaces,
+        rpm: value("rpm").unwrap_or(0.),
+        feed: value("feed").unwrap_or(0.),
+        coolant: if COOLANTS.contains(&coolant) {
+            coolant
+        } else {
+            "Off"
+        }
+        .into(),
+        ..ProposedOp::default()
+    };
+    let clearance = value("clearance").filter(|c| *c != CLEARANCE);
+    let passes = value("finish_passes").map(|n| n.max(0.).round() as u32);
+    let entry = Some(get(&op.p, "pocket_entry"))
+        .filter(|e| ENTRIES.contains(e))
+        .map(String::from);
+    p.clearance = clearance;
+    match op.strategy {
+        Strategy::Face => {
+            p.stepdown = value("stepdown");
+            p.stepover_percent = value("stepover");
+            p.bottom_offset = value("bottom");
+            let model = get(&op.p, "boundary") == "Model silhouette";
+            p.facing_area = Some(if model { "model" } else { "stock" }.into());
+        }
+        Strategy::Pocket => {
+            p.stepdown = value("stepdown");
+            p.stepover_percent = value("stepover");
+            p.radial_allowance = value("allowance");
+            p.axial_allowance = value("axial_allowance");
+            p.finish_passes = passes;
+            p.pocket_entry = entry;
+            p.ramp_angle = value("ramp_angle");
+            let through = get(&op.p, "openings") == crate::model::POCKET_OPENINGS[1];
+            p.through = Some(through);
+            p.breakthrough = value("breakthrough").filter(|_| through);
+        }
+        Strategy::Contour => {
+            let inside = get(&op.p, "side") == "Inside";
+            p.contour_mode = Some(if inside { "inside_floor" } else { "outside" }.into());
+            p.stepdown = value("stepdown");
+            p.radial_allowance = value("allowance");
+            p.axial_allowance = value("axial_allowance");
+            p.finish_passes = passes;
+            if inside {
+                p.pocket_entry = entry;
+                p.ramp_angle = value("ramp_angle");
+            } else {
+                p.bottom_offset = value("bottom");
+            }
+        }
+        Strategy::Drill => {
+            let cycle = get(&op.p, "cycle");
+            p.drill_cycle = Some(
+                if CYCLES.contains(&cycle) {
+                    cycle
+                } else {
+                    CYCLES[0]
+                }
+                .into(),
+            );
+            p.peck = value("peck");
+            let through = get(&op.p, "through") == "Yes";
+            p.through = Some(through);
+            p.breakthrough = value("breakthrough").filter(|_| through);
+            p.hole_diameter = value("hole_diameter").filter(|d| *d > 0.);
+        }
+        Strategy::Parallel => {
+            p.surface_stepover = value("surface_stepover");
+            p.tolerance = value("tolerance");
+            p.radial_allowance = value("allowance");
+            p.axial_allowance = value("axial_allowance");
+        }
+        _ => {
+            p.stepdown = value("stepdown");
+            p.bottom_offset = value("bottom");
+            p.radial_allowance = value("allowance");
+            p.axial_allowance = value("axial_allowance");
+        }
+    }
+    Some(p)
+}
+/// Whether two names are one: `proposed` is the name as the planner cleans
+/// it, `current` the operation's or setup's own.
+fn same_name(proposed: &str, current: &str) -> bool {
+    proposed == current || proposed == crate::planner::name(current)
+}
+/// Whether `p` asks for nothing other than `d`, the operation it keeps as
+/// [`described`] writes it: its reason does not count, nor a name the
+/// planner only cleaned, nor the order of its surfaces.
+fn unchanged(p: &ProposedOp, d: &ProposedOp, current_name: &str) -> bool {
+    let mut p = p.clone();
+    p.reason.clone_from(&d.reason);
+    p.from = d.from;
+    p.surfaces.sort_unstable();
+    p.surfaces.dedup();
+    if same_name(&p.name, current_name) {
+        p.name.clone_from(&d.name);
+    }
+    p == *d
+}
+/// `base`, an operation the planner keeps, with what `p` changed of `d` (its
+/// description) written from `fresh` (`p` built from scratch): every other
+/// setting stays as the user left it, including those a proposal does not
+/// carry.
+fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -> Operation {
+    let mut op = base.clone();
+    let mut copy = |keys: &[&str]| {
+        for key in keys {
+            match fresh.p.get(*key) {
+                Some(value) => op.p.insert((*key).into(), value.clone()),
+                None => op.p.remove(*key),
+            };
+        }
+    };
+    let mut surfaces = p.surfaces.clone();
+    surfaces.sort_unstable();
+    surfaces.dedup();
+    if !same_name(&p.name, get(&base.p, "name")) {
+        copy(&["name"]);
+    }
+    if p.rpm != d.rpm {
+        copy(&["rpm"]);
+    }
+    if p.feed != d.feed {
+        copy(&["feed"]);
+    }
+    if p.coolant != d.coolant {
+        copy(&["coolant"]);
+    }
+    for (changed, keys) in [
+        (p.stepdown != d.stepdown, &["stepdown"][..]),
+        (p.stepover_percent != d.stepover_percent, &["stepover"]),
+        (p.radial_allowance != d.radial_allowance, &["allowance"]),
+        (p.axial_allowance != d.axial_allowance, &["axial_allowance"]),
+        (p.bottom_offset != d.bottom_offset, &["bottom"]),
+        (p.clearance != d.clearance, &["clearance"]),
+        (p.finish_passes != d.finish_passes, &["finish_passes"]),
+        (p.facing_area != d.facing_area, &["boundary"]),
+        (p.pocket_entry != d.pocket_entry, &["pocket_entry"]),
+        (p.ramp_angle != d.ramp_angle, &["ramp_angle"]),
+        (
+            p.surface_stepover != d.surface_stepover,
+            &["surface_stepover"],
+        ),
+        (p.tolerance != d.tolerance, &["tolerance"]),
+        (p.drill_cycle != d.drill_cycle, &["cycle"]),
+        (p.peck != d.peck, &["peck"]),
+        (p.breakthrough != d.breakthrough, &["breakthrough"]),
+        (p.hole_diameter != d.hole_diameter, &["hole_diameter"]),
+        (p.through != d.through, &["through", "openings"]),
+    ] {
+        if changed {
+            copy(keys);
+        }
+    }
+    if p.tool != d.tool {
+        op.tool.clone_from(&fresh.tool);
+    }
+    if surfaces != d.surfaces {
+        op.surfaces.clone_from(&fresh.surfaces);
+        op.geometry.clone_from(&fresh.geometry);
+    }
+    op
+}
+/// What a proposal writes of setup `si` of `doc`, the planner's last note
+/// for setup 1 as its `workholding`: its name, work zero, workholding note
+/// and holder.
+fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<usize>) {
+    let setup = &doc.setups[si];
+    let setup1 = &doc.setups[0];
+    let origin = get(&setup.p, "origin");
+    let origin = if ORIGINS.contains(&origin) {
+        origin
+    } else {
+        "Model origin"
+    };
+    let (notes, holder) = if si == 0 {
+        let note = get(&setup.p, crate::planner::PLANNER_NOTE_KEY);
+        (note, analysis::own_entry(doc, setup1))
+    } else {
+        let same = ["holding", "holder"]
+            .iter()
+            .all(|k| get(&setup.p, k) == get(&setup1.p, k));
+        let holder = (!same && crate::holding::modelled(setup))
+            .then(|| {
+                analysis::library(doc)
+                    .iter()
+                    .position(|h| h.id == get(&setup.p, "holder"))
+            })
+            .flatten()
+            .map(|i| i + 1);
+        (get(&setup.p, "notes"), holder)
+    };
+    (
+        crate::planner::name(setup.name()),
+        origin.into(),
+        clip(notes, 500),
+        holder,
+    )
+}
+/// The current plan of `doc` as the planner is shown it when it is asked to
+/// change it. Fails when a setup after the first is not turned square to the
+/// part: no orientation names it.
+pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> {
+    if doc.setups.is_empty() {
+        return Err("The project has no setup 1.".into());
+    }
+    let (mut setups, mut kept, mut number) = (vec![], vec![], 0);
+    for (si, setup) in doc.setups.iter().enumerate() {
+        let up = if si == 0 {
+            report.orientations.first().map(|o| o.up)
+        } else {
+            analysis::up_axis(setup)
+        };
+        let Some(up) = up else {
+            return Err(format!(
+                "Setup {} is not turned square to the part, so the planner cannot change this plan.",
+                si + 1
+            ));
+        };
+        let mut operations = vec![];
+        for (oi, op) in setup.operations.iter().enumerate() {
+            number += 1;
+            match described(op, &doc.tools) {
+                Some(p) => operations.push(ProposedOp {
+                    from: Some(number),
+                    ..p
+                }),
+                None => kept.push(KeptOp {
+                    setup: si + 1,
+                    from: number,
+                    position: oi + 1,
+                    strategy: op.strategy.name(),
+                    name: crate::planner::name(get(&op.p, "name")),
+                }),
+            }
+        }
+        let (name, origin, workholding, holder) = setup_fields(doc, si);
+        setups.push(ProposedSetup {
+            orientation: up.into(),
+            name,
+            origin,
+            workholding,
+            holder,
+            operations,
+            from: Some(si + 1),
+        });
+    }
+    Ok(Current {
+        current_plan: Proposal {
+            summary: String::new(),
+            setups,
+            unmachined: vec![],
+            warnings: vec![],
+        },
+        kept_operations: kept,
+    })
+}
 /// Builds the job a proposal describes. Setup 1 keeps the user's machine,
 /// stock, work zero and fixture; its operations and all later setups are
 /// replaced. Returns every reference problem instead when there is any.
+///
+/// When the planner changes the current plan, a setup or operation whose
+/// `from` names one of `doc` (numbered as [`describe`] numbers them) keeps
+/// it: an operation it does not change stays exactly as it is, a changed
+/// one has only the changed settings written, and a kept setup keeps its id,
+/// work offset, notes and workholding placement but for what the proposal
+/// changes. The operations a proposal cannot carry ([`KeptOp`]) stay in
+/// their kept setups, at their place.
 pub fn build(
     doc: &Document,
     mesh: &Mesh,
@@ -786,11 +1127,35 @@ pub fn build(
             first.unwrap_or("?")
         ));
     }
+    let editing = proposal
+        .setups
+        .iter()
+        .any(|s| s.from.is_some() || s.operations.iter().any(|o| o.from.is_some()));
+    // The current plan's operations by their number, from 1: (setup, operation).
+    let numbered: Vec<(usize, usize)> = doc
+        .setups
+        .iter()
+        .enumerate()
+        .flat_map(|(si, s)| (0..s.operations.len()).map(move |oi| (si, oi)))
+        .collect();
+    // The work offsets of the current setups a later setup may keep, which
+    // a new setup does not take.
+    let reserved: Vec<&str> = proposal
+        .setups
+        .iter()
+        .skip(1)
+        .filter_map(|s| s.from.and_then(|n| n.checked_sub(1)))
+        .filter(|&b| b > 0)
+        .filter_map(|b| doc.setups.get(b))
+        .map(|s| get(&s.p, "offset"))
+        .collect();
     // The entries a proposal's `holder` counts over, as the report numbers
     // them, and the number of setup 1's own, which only setup 1 may name.
     let library = analysis::library(doc);
     let own = analysis::own_entry(doc, setup1);
     let mut setups: Vec<Setup> = vec![];
+    // The current setups and operations kept so far, by index and number.
+    let (mut kept_setups, mut kept_ops) = (vec![], vec![]);
     for (si, proposed) in proposal.setups.iter().take(MAX_SETUPS).enumerate() {
         let mut wrong = |operation: Option<usize>, message: String| {
             problems.push(Problem {
@@ -831,9 +1196,51 @@ pub fn build(
             );
             continue;
         };
-        if proposal.setups[..si]
-            .iter()
-            .any(|s| s.orientation == proposed.orientation)
+        // The current setup this one keeps: the one its `from` names, when
+        // that is still turned the same way (else this is a new setup).
+        let base = match proposed.from {
+            None => None,
+            Some(n) if n == 0 || n > doc.setups.len() => {
+                wrong(
+                    None,
+                    format!("from {n} is not a setup of the current plan."),
+                );
+                None
+            }
+            Some(n) if si == 0 && n != 1 => {
+                wrong(
+                    None,
+                    "The first setup is the current setup 1: its from must be 1 or null.".into(),
+                );
+                None
+            }
+            Some(1) if si > 0 => {
+                wrong(
+                    None,
+                    "Setup 1 stays first: no later setup can have from 1.".into(),
+                );
+                None
+            }
+            Some(n) if kept_setups.contains(&(n - 1)) => {
+                wrong(None, format!("from {n} is used by an earlier setup."));
+                None
+            }
+            Some(n) => {
+                let up = if n == 1 {
+                    first
+                } else {
+                    analysis::up_axis(&doc.setups[n - 1])
+                };
+                (up == Some(proposed.orientation.as_str())).then_some(n - 1)
+            }
+        };
+        if let Some(b) = base {
+            kept_setups.push(b);
+        }
+        if base.is_none()
+            && proposal.setups[..si]
+                .iter()
+                .any(|s| s.orientation == proposed.orientation)
         {
             wrong(
                 None,
@@ -843,7 +1250,20 @@ pub fn build(
                 ),
             );
         }
-        if si > 0 && !ORIGINS.contains(&proposed.origin.as_str()) {
+        // What a kept setup was, as a proposal writes it; a field the
+        // proposal changes is written, the rest stay.
+        let current = base.map(|b| setup_fields(doc, b));
+        let changed = |i: usize| {
+            current
+                .as_ref()
+                .is_none_or(|(name, origin, notes, holder)| match i {
+                    0 => !same_name(&proposed.name, name),
+                    1 => proposed.origin != *origin,
+                    2 => clip(&proposed.workholding, 500) != *notes,
+                    _ => proposed.holder != *holder,
+                })
+        };
+        if si > 0 && changed(1) && !ORIGINS.contains(&proposed.origin.as_str()) {
             wrong(
                 None,
                 format!("\"{}\" is not a work zero choice.", proposed.origin),
@@ -863,10 +1283,45 @@ pub fn build(
         }
         let mut setup = if si == 0 {
             setup1.clone()
+        } else if let Some(b) = base {
+            let mut setup = doc.setups[b].clone();
+            if changed(1) {
+                setup.p.insert("origin".into(), proposed.origin.clone());
+            }
+            if changed(2) {
+                setup
+                    .p
+                    .insert("notes".into(), clip(&proposed.workholding, 500));
+            }
+            if changed(3) {
+                // Another entry, or setup 1's: laid out afresh by the check.
+                for key in ["holding", "holder"] {
+                    match setup1.p.get(key) {
+                        Some(value) => setup.p.insert(key.into(), value.clone()),
+                        None => setup.p.remove(key),
+                    };
+                }
+                if let Some(holder) = holder {
+                    let holding = if holder.kind() == "Vise" {
+                        "Vise"
+                    } else {
+                        "Clamps"
+                    };
+                    setup.p.insert("holding".into(), holding.into());
+                    setup.p.insert("holder".into(), holder.id.clone());
+                }
+                for key in ["vise_axis", "vise_offset", "vise_grip", "clamps"] {
+                    setup.p.remove(key);
+                }
+            }
+            setup
         } else {
             let offset = (54..=59)
                 .map(|n| format!("G{n}"))
-                .find(|o| !setups.iter().any(|s| get(&s.p, "offset") == o))
+                .find(|o| {
+                    !setups.iter().any(|s| get(&s.p, "offset") == o)
+                        && !reserved.contains(&o.as_str())
+                })
                 .unwrap_or_default();
             let mut setup = Setup::new(setup1.machine.clone(), &offset);
             let rotation = analysis::rotation_for(setup1, orientation.up).unwrap_or_default();
@@ -904,7 +1359,7 @@ pub fn build(
                 .insert("notes".into(), clip(&proposed.workholding, 500));
             setup
         };
-        if si > 0 {
+        if si > 0 && changed(0) {
             let name = clip(&proposed.name, 60);
             setup.p.insert(
                 "name".into(),
@@ -922,18 +1377,117 @@ pub fn build(
             .take(MAX_SETUP_OPERATIONS)
             .enumerate()
         {
-            match operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint) {
+            // The current operation this one keeps, and what it was.
+            let kept = match op.from {
+                None => None,
+                Some(n) => match numbered.get(n.wrapping_sub(1)) {
+                    None => {
+                        wrong(
+                            Some(oi + 1),
+                            format!("from {n} is not an operation of the current plan."),
+                        );
+                        continue;
+                    }
+                    Some(&(bs, _)) if Some(bs) != base => {
+                        wrong(
+                            Some(oi + 1),
+                            format!(
+                                "from {n} is an operation of setup {} of the current plan, which this setup does not keep; an operation keeps its from only in its own setup. Set from to null to add it here as a new operation.",
+                                bs + 1
+                            ),
+                        );
+                        continue;
+                    }
+                    Some(_) if kept_ops.contains(&n) => {
+                        wrong(
+                            Some(oi + 1),
+                            format!("from {n} is used by an earlier operation."),
+                        );
+                        continue;
+                    }
+                    Some(&(bs, bo)) => {
+                        let current = &doc.setups[bs].operations[bo];
+                        let Some(d) = described(current, &doc.tools) else {
+                            wrong(
+                                Some(oi + 1),
+                                format!(
+                                    "from {n} is one of the kept_operations, which cannot be changed and stays as it is: leave it out."
+                                ),
+                            );
+                            continue;
+                        };
+                        kept_ops.push(n);
+                        Some((current, d))
+                    }
+                },
+            };
+            let built = match kept {
+                Some((current, d)) if unchanged(op, &d, get(&current.p, "name")) => {
+                    Ok(current.clone())
+                }
+                Some((current, d))
+                    if op.strategy == d.strategy && op.contour_mode == d.contour_mode =>
+                {
+                    operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint)
+                        .map(|fresh| merged(current, &fresh, op, &d))
+                }
+                _ => operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint),
+            };
+            match built {
                 Ok(op) => setup.operations.push(op),
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
             }
         }
+        // The operations a proposal cannot carry stay at their place.
+        if let Some(b) = base {
+            for (oi, op) in doc.setups[b].operations.iter().enumerate() {
+                if described(op, &doc.tools).is_none() {
+                    let at = oi.min(setup.operations.len());
+                    setup.operations.insert(at, op.clone());
+                }
+            }
+        }
         setups.push(setup);
+    }
+    if editing {
+        for (b, setup) in doc.setups.iter().enumerate() {
+            let locked: Vec<String> = setup
+                .operations
+                .iter()
+                .filter(|op| described(op, &doc.tools).is_none())
+                .map(|op| format!("\"{}\"", clip(get(&op.p, "name"), 60)))
+                .collect();
+            if !locked.is_empty() && !kept_setups.contains(&b) {
+                let up = if b == 0 {
+                    first
+                } else {
+                    analysis::up_axis(setup)
+                };
+                problems.push(Problem {
+                    setup: 0,
+                    operation: None,
+                    stage: "structure",
+                    message: format!(
+                        "Setup {} of the current plan has kept_operations ({}), which cannot be removed: keep that setup with from {} and orientation {}.",
+                        b + 1,
+                        locked.join(", "),
+                        b + 1,
+                        up.unwrap_or("?")
+                    ),
+                });
+            }
+        }
     }
     if !problems.is_empty() {
         return Err(problems);
     }
     let mut built = doc.clone();
-    built.active = setups[0].id.clone();
+    // A change keeps the setup the user was on when it is still there.
+    built.active = if editing && setups.iter().any(|s| s.id == doc.active) {
+        doc.active.clone()
+    } else {
+        setups[0].id.clone()
+    };
     built.setups = setups;
     built.sync_stock_sources();
     Ok(built)
@@ -1051,6 +1605,7 @@ pub(crate) mod tests {
                         op("Contour", 1, vec![]),
                         drill,
                     ],
+                    from: None,
                 },
                 ProposedSetup {
                     orientation: "-Z".into(),
@@ -1062,6 +1617,7 @@ pub(crate) mod tests {
                         op("Face", 1, ids(report, "-Z", 0.)),
                         op("Pocket", 1, ids(report, "-Z", 6.)),
                     ],
+                    from: None,
                 },
             ],
             unmachined: vec![Unmachined {
