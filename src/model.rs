@@ -311,7 +311,14 @@ impl Machine {
             if manual::gears(self).is_empty() {
                 e.push("Speeds must be positive rpm, comma-separated, or a range min-max.".into())
             }
-            for k in ["hand_feed", "hand_rapid", "turn_x", "turn_y", "turn_z"] {
+            for k in [
+                "hand_feed",
+                "hand_rapid",
+                "turn_x",
+                "turn_y",
+                "turn_z",
+                "edge_finder",
+            ] {
                 positive(&self.p, k, &mut e)
             }
             for k in ["pass_time", "tool_time", "move_time"] {

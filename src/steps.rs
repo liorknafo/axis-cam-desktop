@@ -259,7 +259,7 @@ fn lit(i: usize, at: usize) -> Lit {
 /// and short tags on its right (a line with a lock first when `lock`).
 struct Readout {
     order: Option<u8>,
-    lead: Option<&'static str>,
+    lead: Option<String>,
     axis: String,
     value: String,
     lock: Option<String>,
@@ -664,13 +664,18 @@ impl Drawing<'_> {
                         2.,
                     );
                     if from[0] != 0. {
+                        // Outside the stock, clear of its face.
                         write(
                             f,
                             s.clone(),
-                            Point::new(c.x + from[0] * 14., c.y - 16.),
+                            Point::new(c.x + from[0] * 4., c.y - 16.),
                             INK,
                             13.,
-                            Align::Center,
+                            if from[0] < 0. {
+                                Align::Right
+                            } else {
+                                Align::Left
+                            },
                         );
                     } else {
                         write(
@@ -1395,22 +1400,31 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 right,
             )
         }
-        Step::Zero { corner, approach } => {
+        Step::Zero {
+            approach,
+            touch,
+            finder,
+            ..
+        } => {
             let stock = p.shown.boxes[0];
-            let sides = [["left", "centre", "right"], ["front", "centre", "back"]];
-            let side = |k: usize| sides[k][(approach[k] + 1) as usize];
-            let top = corner[2] >= stock.max[2] - 0.01;
+            let sides = [["left", "right"], ["front", "back"]];
+            let side = |k: usize| sides[k][usize::from(approach[k] > 0)];
+            // The work Z 0 is on the top, or the top is at a height.
+            let top = touch[2].abs() < 0.005;
             let mut shapes = vec![];
             for k in 0..2 {
-                let mut at = [corner[0], corner[1], stock.max[2]];
+                let mut at = [0., 0., stock.max[2]];
                 let o = 1 - k;
                 at[o] = (stock.min[o] + stock.max[o]) / 2.;
+                at[k] = if approach[k] > 0 {
+                    stock.max[k]
+                } else {
+                    stock.min[k]
+                };
                 let mut from = [0.; 2];
-                from[k] = if approach[k] > 0 { 1. } else { -1. };
-                if approach[k] == 0 {
-                    at[k] = stock.min[k];
-                }
-                shapes.push(Shape::Finder(at, from, format!("{} 0", AXES[k])));
+                from[k] = f32::from(approach[k].signum());
+                let set = format!("{} {}", AXES[k], dro(touch[k]));
+                shapes.push(Shape::Finder(at, from, set));
             }
             shapes.push(Shape::Word(
                 [
@@ -1418,23 +1432,27 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     (stock.min[1] + stock.max[1]) / 2.,
                     0.,
                 ],
-                format!("Z 0 = {}", if top { "top" } else { "bottom" }),
+                if top {
+                    "Z 0 = top".into()
+                } else {
+                    format!("top = Z {}", dro(touch[2]))
+                },
                 INK,
             ));
             let rows = (0..3).map(|k| {
                 let what = if k == 2 {
-                    if top { "top" } else { "bottom" }
+                    "touch the top → set".to_string()
                 } else {
-                    side(k)
+                    format!("touch the {} face → set", side(k))
                 };
                 readout(
                     Readout {
                         order: Some(k as u8 + 1),
-                        lead: None,
+                        lead: Some(what),
                         axis: AXES[k].into(),
-                        value: dro(corner[k]),
+                        value: dro(touch[k]),
                         lock: None,
-                        tags: vec![format!("{what} face")],
+                        tags: vec![],
                         lit: lit(k, p.item),
                         big: false,
                     },
@@ -1443,12 +1461,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             });
             let right = column![
                 chips(vec![
-                    chip("edge finder"),
-                    chip(format!("{} → X", side(0))),
-                    chip(format!("{} → Y", side(1))),
-                    chip(format!("{} → Z", if top { "top" } else { "bottom" }))
+                    chip(format!("Ø{} edge finder", mm(*finder))),
+                    warn_chip("DRO comp off"),
                 ]),
-                label("Set the DRO"),
+                label("Touch, then set the DRO"),
             ]
             .extend(rows);
             (
@@ -1499,7 +1515,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 readout(
                     Readout {
                         order: None,
-                        lead: Some("comp"),
+                        lead: Some("comp".into()),
                         axis: AXES[k].into(),
                         value: side.into(),
                         lock: None,
@@ -1559,7 +1575,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 readout(
                     Readout {
                         order: None,
-                        lead: Some("Face to"),
+                        lead: Some("Face to".into()),
                         axis: "Z".into(),
                         value: dro(*to),
                         lock: None,
@@ -2215,6 +2231,29 @@ pub(crate) mod tests {
         assert!(t.iter().any(|s| s == "DRO comp off: centres"), "{t:?}");
         assert!(t.iter().any(|s| s == "135.50"), "{t:?}");
         assert!(!t.iter().any(|s| s.contains("comp X")), "{t:?}");
+    }
+    #[test]
+    fn the_zero_step_sets_each_touch_less_the_edge_finders_radius() {
+        let mut a = app("Yes");
+        send(&mut a, GuideAction::Go(1));
+        let t = texts(&a);
+        for want in [
+            "Ø10 edge finder",
+            "DRO comp off",
+            "touch the left face → set",
+            "touch the front face → set",
+            "touch the top → set",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // Each number follows its touch: X −5, Y −5, Z 0.
+        let after = |lead: &str| {
+            let i = t.iter().position(|s| s == lead).unwrap();
+            t[i + 1..i + 3].to_vec()
+        };
+        assert_eq!(after("touch the left face → set"), ["X", "−5.00"]);
+        assert_eq!(after("touch the front face → set"), ["Y", "−5.00"]);
+        assert_eq!(after("touch the top → set"), ["Z", "0.00"]);
     }
     #[test]
     fn a_pass_shows_its_number_and_its_readouts_in_order() {

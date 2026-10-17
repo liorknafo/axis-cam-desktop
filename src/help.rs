@@ -2168,6 +2168,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             None,
         ),
+        (_, "edge_finder") => (
+            "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off each face it touches.",
+            "",
+            None,
+        ),
         (_, "pass_time") => (
             "Seconds to reset, set and lock the axes for one pass. It adds to the setup's minutes.",
             "",

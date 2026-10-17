@@ -35,6 +35,7 @@ Power feed, a DRO connection (the app does not read the DRO), arcs or two axes m
 | `hand_rapid` | How fast the user moves an axis off the cut, mm/min | `1500` |
 | `turn_x`, `turn_y`, `turn_z` | mm per handwheel turn on each axis | `5`, `5`, `2.5` |
 | `dro_comp` | `Yes` when the DRO has tool-radius compensation | `Yes` |
+| `edge_finder` | Diameter of the edge finder the Zero step uses, mm; its radius is taken off each face touched | `10` |
 | `pass_time` | Seconds to reset, set and lock the axes for one pass | `20` |
 | `tool_time` | Minutes to change a tool and pick up the zero again | `3` |
 | `move_time` | Minutes to move the stock between this machine and another | `10` |
@@ -97,7 +98,7 @@ A manual setup in MACHINE shows a **Steps** page instead of Run. It works with n
 | Step | The screen shows |
 | --- | --- |
 | Hold | 3D view of the stock in the vise: which face is up, which faces go to the jaws, parallels under it, the grip height |
-| Zero | The corner to pick up with the edge finder, the direction to approach each side from, and Z 0 on the top. The DRO is set to 0, 0, 0 there |
+| Zero | The corner to pick up with the edge finder (DRO compensation off), the face each of X and Y is touched on and the number to set there (the zero less or plus the finder's radius, e.g. X −5.00 with a Ø10 finder on the left face), and Z set on the top |
 | Tool | The tool drawn to scale, its diameter, the gear to select (rpm), and on a DRO with compensation the diameter to enter in it |
 | Face | **One screen for a whole facing cut** (a Box open on all four sides, over the whole top): the tool and its gear, how much comes off, and the Z to face down to. Top and front views show the area and the final top. The user plans the passes themselves, so there is no Pass step and no Check step for it |
 | Square | **One screen for squaring a side** (a Box with exactly one closed X/Y side, the wall, and no closed floor): the tool and its gear, the side, the X or Y to cut the side to (an edge readout with compensation), how much comes off, and how deep to go. No Pass or Check steps |

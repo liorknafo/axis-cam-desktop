@@ -26,6 +26,7 @@ pub fn defaults() -> Machine {
         ("turn_y", "5"),
         ("turn_z", "2.5"),
         ("dro_comp", "Yes"),
+        ("edge_finder", "10"),
         ("pass_time", "20"),
         ("tool_time", "3"),
         ("move_time", "10"),
@@ -360,6 +361,7 @@ mod tests {
         assert_eq!(get(&m.p, "hand_rapid"), "1500");
         assert_eq!(get(&m.p, "turn_z"), "2.5");
         assert_eq!(get(&m.p, "dro_comp"), "Yes");
+        assert_eq!(get(&m.p, "edge_finder"), "10");
         assert_eq!(get(&m.p, "pass_time"), "20");
         assert_eq!(get(&m.p, "tool_time"), "3");
         assert_eq!(get(&m.p, "move_time"), "10");
@@ -491,6 +493,7 @@ mod tests {
             "turn_x",
             "turn_y",
             "turn_z",
+            "edge_finder",
         ] {
             let mut bad = m.clone();
             with(&mut bad, k, if k == "speeds" { "" } else { "0" });

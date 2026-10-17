@@ -45,10 +45,18 @@ pub struct Limits {
 pub enum Step {
     /// The stock box the setup starts from and what the vise or clamps hold.
     Hold { stock: Bounds, holding: Gripped },
-    /// The point the edge finder picks up, set to `corner` on the DRO, and
-    /// the side each of X and Y is approached from (−1 the − face, +1 the +
-    /// face, 0 both, for a centre).
-    Zero { corner: [f32; 3], approach: [i8; 2] },
+    /// The work zero, `corner` on the DRO, picked up with an edge finder of
+    /// diameter `finder` and the DRO's compensation off: X and Y each touch
+    /// one face (`approach`: −1 the − face from outside it, +1 the + face; a
+    /// centre zero touches the − face) and are set there to `touch`, the
+    /// face less or plus the finder's radius; Z touches the top, set to
+    /// `touch[2]`.
+    Zero {
+        corner: [f32; 3],
+        approach: [i8; 2],
+        touch: [f32; 3],
+        finder: f32,
+    },
     /// Put in the tool `tool` (an id) at `rpm`; with the DRO's compensation
     /// on, enter `diameter` and set X and Y to `comp` (0 off: centres).
     Tool {
@@ -362,6 +370,10 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     let found = crate::post::references(origin)
         .zip(crate::post::touch_point(origin, stock))
         .ok_or("Choose a work zero for the setup.")?;
+    let finder = num(&machine.p, "edge_finder")
+        .filter(|d| *d > 0.)
+        .ok_or("Enter the edge finder's diameter on the manual mill.")?;
+    let approach = found.0.map(|a| if a == At::Max { 1 } else { -1 });
     let mut steps = vec![
         Step::Hold {
             stock: work(stock),
@@ -373,11 +385,13 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         },
         Step::Zero {
             corner: std::array::from_fn(|k| found.1[k] - zero[k]),
-            approach: found.0.map(|a| match a {
-                At::Min => -1,
-                At::Mid => 0,
-                At::Max => 1,
+            approach,
+            touch: std::array::from_fn(|k| match approach.get(k) {
+                Some(1) => stock.max[k] + finder / 2. - zero[k],
+                Some(_) => stock.min[k] - finder / 2. - zero[k],
+                None => stock.max[2] - zero[2],
             }),
+            finder,
         },
     ];
     let mut sections = vec![Section {
@@ -706,11 +720,15 @@ pub(crate) mod tests {
         assert_eq!((stock.min[0], stock.min[1], stock.max[2]), (0., 0., 0.));
         close(stock.max[1], 120.);
         assert_eq!(holding.stock, *stock);
+        // The Ø10 edge finder touches the left and front faces from outside:
+        // its centre is 5 mm off them when the DRO is set.
         assert_eq!(
             guide.steps[1],
             Step::Zero {
                 corner: [0.; 3],
-                approach: [-1, -1]
+                approach: [-1, -1],
+                touch: [-5., -5., 0.],
+                finder: 10.,
             }
         );
         let Step::Face {
@@ -733,6 +751,50 @@ pub(crate) mod tests {
         assert_eq!(guide.steps[12], Step::HandOver { next: Some(1) });
         // The Step's floor is closed: not a squaring Box.
         assert!(matches!(guide.steps[3], Step::Tool { op: 1, .. }));
+    }
+    #[test]
+    fn the_zero_takes_the_edge_finders_radius_off_each_face_it_touches() {
+        let (mut doc, mesh) = job("Yes");
+        // Only the holes, which do not depend on the zero.
+        doc.setups[0].operations.drain(..2);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("edge_finder".into(), "6".into());
+        // 124 × 120 × 47 stock: the back-right corner, the centre, the bottom.
+        for (origin, corner, approach, touch) in [
+            ("Stock top back-right", [0., 0., 0.], [1, 1], [3., 3., 0.]),
+            ("Stock top center", [0., 0., 0.], [-1, -1], [-65., -63., 0.]),
+            (
+                "Stock bottom front-left",
+                [0., 0., 47.],
+                [-1, -1],
+                [-3., -3., 47.],
+            ),
+        ] {
+            doc.setups[0].p.insert("origin".into(), origin.into());
+            let guide = build(&doc, &mesh, 0).unwrap();
+            let Step::Zero {
+                corner: c,
+                approach: a,
+                touch: t,
+                finder,
+            } = &guide.steps[1]
+            else {
+                panic!()
+            };
+            assert_eq!((*a, *finder), (approach, 6.), "{origin}");
+            for k in 0..3 {
+                close(c[k], corner[k]);
+                close(t[k], touch[k]);
+            }
+        }
+        doc.setups[0]
+            .machine
+            .p
+            .insert("edge_finder".into(), "0".into());
+        let error = build(&doc, &mesh, 0).unwrap_err();
+        assert!(error.contains("edge finder"), "{error}");
     }
     #[test]
     fn a_squaring_box_is_one_square_step_cut_to_the_wall() {

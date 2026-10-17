@@ -4152,6 +4152,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     &["Yes", "No"],
                     t,
                 ))
+                .push(field(p, "edge_finder", "Edge finder diameter · mm", t))
                 .push(field(p, "pass_time", "Time per pass · s", t))
                 .push(field(p, "tool_time", "Time per tool change · min", t))
                 .push(field(
