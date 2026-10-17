@@ -24,7 +24,7 @@ use clipper2::{EndType, FillRule, JoinType, Milli, difference, union};
 
 type P = (f64, f64);
 /// The most moves an adaptive plan may hold.
-const MAX_MOVES: usize = 100_000;
+const MAX_MOVES: usize = 300_000;
 /// The most cells a zone's grid may hold; a larger zone uses larger cells.
 const MAX_CELLS: f64 = 4_000_000.;
 /// Directions the walker weighs at each step, evenly over its turn limit,
@@ -50,8 +50,8 @@ const MAX_TURN: f64 = 2.1;
 const DRY: usize = 8;
 /// The most places whose first step is weighed as the start of a pass,
 /// and the most of those whose pass is tried (`Level::promise`).
-const START_JUDGED: usize = 400;
-const START_TRIES: usize = 40;
+const START_JUDGED: usize = 60;
+const START_TRIES: usize = 12;
 /// How far ahead, in tool radii, a pass is tried to weigh its start.
 const PROMISE: f64 = 2.;
 /// The least share of the load a pass must promise; below it, what is left
@@ -104,6 +104,13 @@ impl Bits {
         let row = &self.bits[j * self.words..];
         Self::masks(i0, i1)
             .map(|(w, m)| (row[w] & m).count_ones())
+            .sum()
+    }
+    /// `count` of the cells also set in `other`.
+    fn count_and(&self, other: &Bits, j: usize, i0: usize, i1: usize) -> u32 {
+        let (row, mask) = (&self.bits[j * self.words..], &other.bits[j * self.words..]);
+        Self::masks(i0, i1)
+            .map(|(w, m)| (row[w] & mask[w] & m).count_ones())
             .sum()
     }
     fn clear(&mut self, j: usize, i0: usize, i1: usize) -> u32 {
@@ -178,10 +185,24 @@ impl Cells {
     /// Each row's run of the cells whose centres lie within `r` of the
     /// segment `a`–`b`: the row, its first cell and its last.
     fn capsule(&self, a: P, b: P, r: f64, mut f: impl FnMut(usize, usize, usize)) {
+        self.capsule_until(a, b, r, |j, i0, i1| {
+            f(j, i0, i1);
+            false
+        });
+    }
+    /// `capsule`, stopping at the first row `f` says true for; whether one
+    /// did.
+    fn capsule_until(
+        &self,
+        a: P,
+        b: P,
+        r: f64,
+        mut f: impl FnMut(usize, usize, usize) -> bool,
+    ) -> bool {
         let j0 = ((a.1.min(b.1) - r - self.y0) / self.h - 0.5).ceil().max(0.) as usize;
         let j1 = ((a.1.max(b.1) + r - self.y0) / self.h - 0.5).floor();
         if j1 < 0. {
-            return;
+            return false;
         }
         let j1 = (j1 as usize).min(self.ny.saturating_sub(1));
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
@@ -209,10 +230,12 @@ impl Cells {
             if let Some((i0, i1)) = (span.0 <= span.1)
                 .then(|| self.run(span.0, span.1))
                 .flatten()
+                && f(j, i0, i1)
             {
-                f(j, i0, i1);
+                return true;
             }
         }
+        false
     }
     /// The cells whose centres lie inside `region` (each loop's inside to
     /// its left, holes clockwise).
@@ -482,19 +505,19 @@ impl Level<'_> {
             .capsule(a, b, r, |j, i0, i1| n += self.material.count(j, i0, i1));
         n
     }
-    /// The material the walker must clear within `r` of `p`.
-    fn inner(&self, p: P, r: f64) -> u32 {
-        let mut n = 0;
-        self.walk.cells.capsule(p, p, r, |j, i0, i1| {
-            for i in i0..=i1 {
-                if self.material.get(i as isize, j as isize)
-                    && self.walk.inner.get(i as isize, j as isize)
-                {
-                    n += 1;
-                }
-            }
-        });
-        n
+    /// Whether any of the material the walker must clear lies within `r`
+    /// of `p`.
+    fn inner(&self, p: P, r: f64) -> bool {
+        let w = self.walk;
+        w.cells.capsule_until(p, p, r, |j, i0, i1| {
+            self.material.count_and(&w.inner, j, i0, i1) > 0
+        })
+    }
+    /// Whether any material lies within `r` of `p`.
+    fn any(&self, p: P, r: f64) -> bool {
+        self.walk
+            .cells
+            .capsule_until(p, p, r, |j, i0, i1| self.material.count(j, i0, i1) > 0)
     }
     /// Whether any material the walker must clear is left.
     fn unfinished(&self) -> bool {
@@ -703,8 +726,8 @@ impl Level<'_> {
         let p = w.cells.centre(i, j);
         w.allowed.get(i as isize, j as isize)
             && !self.barren.contains(&(i as isize, j as isize))
-            && self.count(p, p, w.r + 0.5 * w.cells.h) == 0
-            && self.inner(p, w.r + (w.lattice as f64 + 0.5) * w.cells.h) > 0
+            && !self.any(p, w.r + 0.5 * w.cells.h)
+            && self.inner(p, w.r + (w.lattice as f64 + 0.5) * w.cells.h)
     }
     /// The heading at `p` that keeps the material beside it on the
     /// walker's side.
@@ -732,8 +755,7 @@ impl Level<'_> {
         }
     }
     /// Where the next pass begins, its heading and whether it begins
-    /// settled: the nearest place, first within a few tool radii of the
-    /// tool and then over the whole grid, whose pass promises at least
+    /// settled: the nearest place (`ahead`) whose pass promises at least
     /// half the load (`promise`); else the most promising place; else,
     /// where every place would overload the cutter, the one that overloads
     /// it least. None where only crumbs are left: the walls' pass and the
@@ -793,46 +815,54 @@ impl Level<'_> {
             }
             None
         };
-        // Every `lattice`th cell within a few tool radii.
-        let (ci, cj) = w.cells.cell(self.at);
-        let k = w.lattice as isize;
-        let reach = (3. * w.r / w.cells.h / k as f64).ceil() as isize;
-        let mut near = vec![];
-        for dj in -reach..=reach {
-            for di in -reach..=reach {
-                let (i, j) = (ci + di * k, cj + dj * k);
-                if i < 0 || j < 0 || i as usize >= w.cells.nx || j as usize >= w.cells.ny {
-                    continue;
+        // Over the whole grid: the distances to the material, on cells a
+        // lattice spacing wide (16 times fewer), point to the blocks whose
+        // middle cell may touch; each is then tried exactly.
+        let k = w.lattice;
+        let coarse = Cells {
+            x0: w.cells.x0,
+            y0: w.cells.y0,
+            h: w.cells.h * k as f64,
+            nx: w.cells.nx.div_ceil(k),
+            ny: w.cells.ny.div_ceil(k),
+        };
+        let (mut solid, mut must) = (
+            vec![false; coarse.nx * coarse.ny],
+            vec![false; coarse.nx * coarse.ny],
+        );
+        for j in 0..w.cells.ny {
+            for bi in 0..coarse.nx {
+                let (i0, i1) = (bi * k, ((bi + 1) * k - 1).min(w.cells.nx - 1));
+                let at = (j / k) * coarse.nx + bi;
+                if !solid[at] && self.material.count(j, i0, i1) > 0 {
+                    solid[at] = true;
                 }
-                if self.touches(i as usize, j as usize) {
-                    let p = w.cells.centre(i as usize, j as usize);
-                    near.push((self.ahead(p), p));
+                if !must[at] && self.material.count_and(&w.inner, j, i0, i1) > 0 {
+                    must[at] = true;
                 }
             }
         }
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        if let Some(start) = weigh(self, near) {
-            return Some(start);
-        }
-        let gap = distances(&w.cells, |i, j| self.material.get(i as isize, j as isize));
-        let must = distances(&w.cells, |i, j| {
-            self.material.get(i as isize, j as isize) && w.inner.get(i as isize, j as isize)
-        });
+        let gap = distances(&coarse, |i, j| solid[j * coarse.nx + i]);
+        let near = distances(&coarse, |i, j| must[j * coarse.nx + i]);
+        // How far, in blocks, a block's middle may be from its cells.
+        let slack = 1.5;
         let (lo, hi) = (
-            ((w.r + 0.5 * w.cells.h) / w.cells.h) as f32,
-            (w.r / w.cells.h) as f32 + w.lattice as f32 + 0.5,
+            (w.r / coarse.h) as f32 - slack,
+            ((w.r + (k as f64 + 0.5) * w.cells.h) / coarse.h) as f32 + slack,
         );
         let mut all = vec![];
-        for j in 0..w.cells.ny {
-            for i in 0..w.cells.nx {
-                let k = j * w.cells.nx + i;
-                if gap[k] > lo
-                    && must[k] <= hi
-                    && w.allowed.get(i as isize, j as isize)
-                    && !self.barren.contains(&(i as isize, j as isize))
-                {
-                    let p = w.cells.centre(i, j);
-                    all.push((self.ahead(p), p));
+        for bj in 0..coarse.ny {
+            for bi in 0..coarse.nx {
+                let at = bj * coarse.nx + bi;
+                if gap[at] > lo && near[at] <= hi {
+                    let (i, j) = (
+                        (bi * k + k / 2).min(w.cells.nx - 1),
+                        (bj * k + k / 2).min(w.cells.ny - 1),
+                    );
+                    if self.touches(i, j) {
+                        let p = w.cells.centre(i, j);
+                        all.push((self.ahead(p), p));
+                    }
                 }
             }
         }
@@ -1103,7 +1133,7 @@ impl Motions {
         cutting: bool,
     ) -> Result<(), String> {
         if self.plan.moves.len() >= MAX_MOVES {
-            return Err("Adaptive clearing exceeds 100,000 moves. Increase the optimal load, the stepdown or the tolerance.".into());
+            return Err("Adaptive clearing exceeds 300,000 moves. Increase the optimal load or the stepdown, or use a larger cutter.".into());
         }
         let distance = (0..3)
             .map(|i| (self.at[i] - to[i]).powi(2))
@@ -2500,6 +2530,53 @@ mod tests {
         });
         let plan = generate(&setup, &op, &tool, &mesh).unwrap();
         assert_eq!(plan.levels, 1);
+    }
+    #[test]
+    fn the_totem_plate_clears_with_a_2_mm_cutter_at_its_default_load_in_two_levels() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        // What a new Adaptive clearing with a Ø2 starts with: a 0.3 mm load
+        // and a 4 mm stepdown, with 0.3 mm stock to leave.
+        let (setup, mut op, mut tool, _) = ring();
+        tool.p.insert("diameter".into(), "2".into());
+        for (k, v) in [
+            ("optimal_load", "0.3"),
+            ("stepdown", "4"),
+            ("allowance", "0.3"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
+        let (id, _) = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.normal[2] > 0.999999
+                    && placement.transform(s.center)[2] < top - 0.1
+                    && placement.transform(s.center)[2] > bottom + 0.1
+            })
+            .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            .unwrap();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![id],
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 2);
+        let moves = plan.moves.len();
+        let started = std::time::Instant::now();
+        let mut sim = Simulation::new(plan);
+        sim.seek(1.);
+        eprintln!("{moves} moves, simulated in {:?}", started.elapsed());
+        assert!(sim.stock.removed_volume() > 10_000.);
     }
     #[test]
     fn settings_out_of_range_are_refused_with_their_limits() {
