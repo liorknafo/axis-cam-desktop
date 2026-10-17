@@ -146,6 +146,10 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     if !operation.strategy.imported_preview() {
         return vec![operation.strategy.availability().into()];
     }
+    // A Box is a block of numbers: it selects no surfaces.
+    if operation.strategy == crate::model::Strategy::Box {
+        return vec![];
+    }
     let Some(mesh) = mesh else {
         return vec!["Load the imported model before selecting its surfaces.".into()];
     };
@@ -252,6 +256,14 @@ mod tests {
             first.fingerprint,
             crate::mesh::normalize(modified).unwrap().fingerprint
         );
+    }
+    #[test]
+    fn a_box_selects_no_surfaces_and_needs_no_model_for_them() {
+        let setup = Setup::new(crate::manual::defaults(), "G54");
+        let op = Operation::new(crate::model::Strategy::Box, "t".into());
+        assert!(issues(&op, &setup, None).is_empty());
+        let drill = Operation::new(crate::model::Strategy::Drill, "t".into());
+        assert!(!issues(&drill, &setup, None).is_empty());
     }
     #[test]
     fn facing_rejects_different_heights_and_missing_surfaces() {

@@ -99,6 +99,18 @@ impl<'a> HelpButton<'a> {
             help: unavailable_help(strategy),
         }
     }
+    /// A ribbon tile for a strategy the active setup's machine cannot run:
+    /// the hover help is the machine's `reason`.
+    pub fn dimmed(
+        button: widget::Button<'a, Message>,
+        strategy: Strategy,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            button,
+            help: dimmed_help(strategy, reason),
+        }
+    }
     pub fn width(mut self, width: impl Into<Length>) -> Self {
         self.button = self.button.width(width);
         self
@@ -119,6 +131,13 @@ pub fn unavailable_help(strategy: Strategy) -> Help {
     )
     .more(strategy.help())
     .animated(Diagram::Operation(strategy))
+}
+/// The hover help of a strategy dimmed by the machine: its reason, and under
+/// More… what the strategy does.
+pub fn dimmed_help(strategy: Strategy, reason: &'static str) -> Help {
+    Help::text(format!("{} (unavailable)", strategy.name()), reason)
+        .more(strategy.help())
+        .animated(Diagram::Operation(strategy))
 }
 impl<'a> From<HelpButton<'a>> for Element<'a, Message> {
     fn from(b: HelpButton<'a>) -> Self {
@@ -1027,6 +1046,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Add another machining position with its own machine, stock, work offset and operations. Use a new setup when you reclamp, flip or reorient the part. Without a setup, choose or configure your machine first.",
             "",
         ),
+        AddManualSetup => (
+            "Add a setup on the manual mill before the CNC setups, for the cuts the big mill makes first. Put first, it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock it leaves.",
+            "",
+        ),
         SetupEditor => (
             "Set the machine, work coordinate system, stock, part orientation and workholding for the current setup.",
             "",
@@ -1095,6 +1118,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this operation's saved surface selections so you can choose new surfaces on the current part.",
             "",
         ),
+        BoxFromFace => (
+            "Fill the six Box fields from the part face selected on this operation: a floor facing up, or a wall facing sideways. A floor is grown to the stock's edge or the next part material above it. A wall is cut from the wall out to the stock's edge. The numbers are in the setup's frame from the work zero.",
+            "",
+        ),
         PickPinHoles => (
             "Pick the part's holes for the fixture pins in the 3D view: click inside a hole, on its wall or its end, to choose it or remove it; drag to orbit (turn the view to see under the part, where the holes open), and click Finish picking when done. The holes offered are ringed and numbered as listed.",
             "",
@@ -1152,8 +1179,20 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this profile from the reusable library. Existing setup snapshots remain available.",
             "",
         ),
+        WizardStep(2) if label.ends_with("Manual mill") => (
+            "Say if the DRO compensates the tool radius, and the minutes a pass, a tool change and moving the stock cost on this mill.",
+            "",
+        ),
+        WizardStep(3) if label.ends_with("Review") => (
+            "Review the profile and resolve configuration issues before saving it to your local machine library.",
+            "",
+        ),
+        ToolMachine(..) | HolderMachine(..) => (
+            "Check the machines that hold this entry. With none checked it fits every CNC machine and no manual machine.",
+            "",
+        ),
         WizardStep(0) => (
-            "Name the machine and choose 3, 4 or 5 axes and the units used by its specification.",
+            "Name the machine, choose a CNC or a manual mill, then 3, 4 or 5 axes for a CNC, and the units used by its specification.",
             "",
         ),
         WizardStep(1) => (
@@ -1371,6 +1410,7 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         Machine(a) => machine_help(a),
         Run(a) => run_help(a),
+        Guide(a) => guide_help(a),
         ControlSetup(false) => ("Jog, zero and run the machine.", ""),
         ControlSetup(true) => (
             "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm.",
@@ -1527,6 +1567,32 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Set the X and Y work offset of the active work system to the one the pins give this setup: pin 1's recorded machine place less where pin 1 stands in the setup's work coordinates. Exact, with no probing. Z is touched off as for any setup.",
             "",
         ),
+    }
+}
+
+/// What a button of a manual setup's Steps page does.
+fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
+    use crate::GuideAction::*;
+    match a {
+        Next => (
+            "This step is done: show the next one. The place is saved with the project, so you can stop and come back.",
+            "",
+        ),
+        Back => ("Show the step before.", ""),
+        Go(_) => ("Show this pass.", ""),
+        Section(_) => (
+            "Jump to this section: where you left it, else its first step.",
+            "",
+        ),
+        Reached(_) => (
+            "The DRO reads this number: light the next one. The app does not read the DRO.",
+            "",
+        ),
+        Open(_) => (
+            "Open this setup in MACHINE: a setup on the manual mill shows its steps, with the DRO numbers to move to, whether or not the CNC is connected.",
+            "",
+        ),
+        Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
     }
 }
 
@@ -1975,6 +2041,16 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Operation(Strategy::Parallel)),
         ),
+        (_, "x_min" | "x_max" | "y_min" | "y_max") => (
+            "One side of the block a Box removes, in mm in the setup's frame, measured from the work zero. The block must be at least as wide as the tool across its passes.",
+            "Passes run along the block's longer side. A side the block shares with open air is cut from outside the stock; a side that touches the part keeps the stock to leave.",
+            Some(Operation(Strategy::Box)),
+        ),
+        (_, "z_top" | "z_bottom") => (
+            "The top and the floor of the block a Box removes, in mm in the setup's frame, measured from the work zero. The floor is below the top.",
+            "The tool goes down by the stepdown until it reaches the floor.",
+            Some(Operation(Strategy::Box)),
+        ),
         (_, "stepover") => (
             "Sideways spacing of adjacent passes, as a percentage of cutter diameter. For a 10 mm tool, 40% means 4 mm. Smaller spacing increases overlap and pass count. Pocket accepts up to 50%.",
             "",
@@ -2117,6 +2193,61 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "probe_retract") => (
             "How far the tool lifts after the contact, in mm, so the plate can come away. 0 leaves it on the plate.",
+            "",
+            None,
+        ),
+        (Target::Machine, "kind") => (
+            "CNC runs G-code. Manual is a hand-operated mill with a DRO: no G-code, no Run, and its setups are shown as steps on the MACHINE page.",
+            "",
+            None,
+        ),
+        (_, "speeds") => (
+            "The spindle speeds the gearbox has, in rpm, comma-separated. A range such as 100-2000 means a variable drive. The rpm of a manual operation must be one of them.",
+            "",
+            None,
+        ),
+        (_, "hand_feed") => (
+            "The fastest feed you can turn steadily by hand, in mm/min. No manual operation feeds faster.",
+            "",
+            None,
+        ),
+        (_, "hand_rapid") => (
+            "How fast you move an axis off the cut by hand, in mm/min. It sets the time of the moves between cuts.",
+            "",
+            None,
+        ),
+        (_, "turn_x" | "turn_y" | "turn_z") => (
+            "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
+            "",
+            None,
+        ),
+        (_, "dro_comp") => (
+            "Yes when the DRO has tool-radius compensation, so it reads the tool's edge instead of its centre.",
+            "",
+            None,
+        ),
+        (_, "edge_finder") => (
+            "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off each face it touches.",
+            "",
+            None,
+        ),
+        (_, "pass_time") => (
+            "Seconds to reset, set and lock the axes for one pass. It adds to the setup's minutes.",
+            "",
+            None,
+        ),
+        (_, "tool_time") => (
+            "Minutes to change a tool and pick up the zero again. It adds to the setup's minutes.",
+            "",
+            None,
+        ),
+        (_, "move_time") => (
+            "Minutes to move the stock between this machine and another. The plan adds it each time the stock changes machine.",
+            "",
+            None,
+        ),
+        (_, "machines") => (
+            "The machines that hold this entry. None checked means every CNC machine and no manual machine.",
             "",
             None,
         ),
@@ -2793,6 +2924,17 @@ impl canvas::Program<Message> for Illustration {
                             15.
                         },
                     ]
+                }
+                Strategy::Box => {
+                    // Passes along X, stepping across by Y: one axis at a time.
+                    let row = (t * 4.).floor().min(3.);
+                    let k = (t * 4.).fract();
+                    let x = if row as i32 % 2 == 0 {
+                        2. * k
+                    } else {
+                        2. - 2. * k
+                    };
+                    [-30. + 30. * x, -18. + row * 10., 25.]
                 }
                 Strategy::Contour => [44. * a.cos(), 27. * a.sin(), 21.],
                 Strategy::Drill => {
@@ -3757,6 +3899,9 @@ mod tests {
             RunOnMachine(0),
             NewMachine,
             AddSetup,
+            AddManualSetup,
+            ToolMachine("m".into(), true),
+            HolderMachine("m".into(), true),
             StockDetail(Detail::Draft),
             StockDetail(Detail::Standard),
             StockDetail(Detail::Fine),
@@ -3776,6 +3921,7 @@ mod tests {
             MoveOp(-1),
             MoveOp(1),
             PickMode,
+            BoxFromFace,
             PickPinHoles,
             Generate,
             GenerateAll,
@@ -3906,6 +4052,16 @@ mod tests {
         ] {
             messages.push(Message::Run(a));
         }
+        for a in [
+            crate::GuideAction::Next,
+            crate::GuideAction::Back,
+            crate::GuideAction::Go(0),
+            crate::GuideAction::Section(0),
+            crate::GuideAction::Reached(0),
+            crate::GuideAction::Open(0),
+        ] {
+            messages.push(Message::Guide(a));
+        }
         commands.extend(messages.into_iter().map(|m| ("x".to_string(), m)));
         let mut cards: Vec<(String, Help)> = commands
             .into_iter()
@@ -3913,6 +4069,10 @@ mod tests {
             .collect();
         for s in Strategy::ALL {
             cards.push((format!("unavailable:{s:?}"), unavailable_help(s)));
+            cards.push((
+                format!("dimmed:{s:?}"),
+                dimmed_help(s, crate::manual::ONE_AXIS),
+            ));
             let b = HelpButton::operation(
                 widget::button("x"),
                 s,

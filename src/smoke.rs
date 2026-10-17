@@ -216,6 +216,7 @@ impl App {
                 121 => "97-machine-run-panel".into(),
                 122 => "98-machine-setup".into(),
                 123 => "99-machine-work-zero".into(),
+                124 => "100-manual-steps".into(),
                 _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
             })
     }
@@ -1274,6 +1275,12 @@ impl App {
                     Message::Machine(crate::control::Action::WorkText(0, "-5".into())),
                 ]
             }
+            // MACHINE on a setup of the manual mill put first: its Steps
+            // page, with the CNC still connected.
+            124 => {
+                self.smoke_manual_setup();
+                vec![Message::Page(Page::Control)]
+            }
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.disconnect_machine();
@@ -1288,6 +1295,10 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
+            124 => {
+                let line = self.smoke_manual_check();
+                eprintln!("Screen 100: {line}");
+            }
             // The machine drawn under the work zero, in view.
             120 => {
                 return iced::widget::operation::scroll_to(
@@ -1389,6 +1400,64 @@ impl App {
             return Task::batch([top("inspector"), top("planner-result"), top("control")]);
         }
         Task::none()
+    }
+    /// Screen 100's job: a manual mill in the library with a Ø25 end mill
+    /// that fits it, and a setup on it put first that faces 2 mm off the
+    /// whole top, made the active setup.
+    pub(crate) fn smoke_manual_setup(&mut self) {
+        use crate::model::{BOX_FIELDS, Operation, Strategy, Tool};
+        let machine = crate::manual::defaults();
+        let mut mill = Tool::new("End mill 25", "Flat end mill", "25");
+        for (k, v) in [
+            ("length", "60"),
+            ("stickout", "65"),
+            ("machines", &machine.id),
+        ] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let mut face = Operation::new(Strategy::Box, mill.id.clone());
+        face.p.insert("name".into(), "Face".into());
+        for (k, v) in BOX_FIELDS
+            .iter()
+            .zip(["-500", "500", "-500", "500", "0", "-2"])
+        {
+            face.p.insert((*k).into(), v.into());
+        }
+        face.p.insert("allowance".into(), "0".into());
+        crate::manual::snap(&machine, &mut face.p);
+        self.doc.machines.push(machine);
+        self.doc.tools.push(mill);
+        self.doc.add_manual_setup().expect("a manual setup");
+        self.doc.setups[0].operations = vec![face];
+        self.doc.active = self.doc.setups[0].id.clone();
+    }
+    /// What screen 100 shows: the Steps page on the manual setup, its
+    /// guide built (set up, the face, the hand-over) at its first step.
+    pub(crate) fn smoke_manual_check(&self) -> String {
+        use crate::guide::Step;
+        assert!(self.steps_page(), "the Steps page");
+        let (shown, at) = self.guide_at().unwrap_or_else(|| {
+            panic!(
+                "the guide: {:?}",
+                self.current_guide().map(|r| r.as_ref().err())
+            )
+        });
+        let g = &shown.guide;
+        let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Set up", "Face", "Hand over"]);
+        assert_eq!(at, 0);
+        assert!(matches!(g.steps[0], Step::Hold { .. }), "{:?}", g.steps[0]);
+        let Some(Step::Face { to, remove, .. }) =
+            g.steps.iter().find(|s| matches!(s, Step::Face { .. }))
+        else {
+            panic!("no Face step: {:?}", g.steps)
+        };
+        assert!((to + 2.).abs() < 1e-3 && *remove > 0., "{to} {remove}");
+        format!(
+            "{} steps, face to Z {to:.2}, {remove:.2} mm off, ~{:.0} min",
+            g.steps.len(),
+            g.minutes.ceil()
+        )
     }
     /// What the planner's pictures are drawn from: the imported part as the
     /// planner reads it.
@@ -2812,6 +2881,29 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Stop));
         tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
         assert_eq!(conn(&a).snapshot.estop_reason, None);
+    }
+
+    /// A manual mill's setup has steps, not a run: the Run strip does not list
+    /// it, even on a machine it shares with the connected one, and picking it
+    /// by message does nothing.
+    #[test]
+    fn the_run_strip_lists_no_manual_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        let name = a.doc.setups[0].name().to_string();
+        let mut hand = crate::manual::defaults();
+        hand.id = conn(&a).machine_id.clone();
+        let mut setup = crate::model::Setup::new(hand, "G55");
+        setup.p.insert("name".into(), "Hand mill".into());
+        a.doc.setups.push(setup);
+        let texts = page_texts(&a);
+        assert!(texts.contains(&format!("1. {name}")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Hand mill")), "{texts:?}");
+        let _ = a.update(Message::Run(crate::run::Action::Setup(1)));
+        assert!(conn(&a).run.is_none());
+        let _ = a.update(Message::Run(crate::run::Action::Setup(0)));
+        assert_eq!(run_of(&a).setup, 0);
     }
 
     /// The blind review's dead end (LIO-140): machine zero where the machine
@@ -4326,6 +4418,53 @@ flood = { pin = 8 }
         assert!(a.live_tool().is_none() && !a.locked() && a.status.is_empty());
         let _ = a.update(Message::Play);
         assert!(a.playing);
+    }
+
+    #[test]
+    fn screen_100_shows_the_steps_of_a_manual_setup_put_first() {
+        let mut a = imported_app();
+        a.smoke_manual_setup();
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        a.smoke_manual_check();
+        let texts = page_texts(&a);
+        for want in ["Big mill", "Set up", "Face", "Hold"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+    }
+
+    #[test]
+    fn the_steps_page_works_while_the_cnc_jogs() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        tick_until(&mut a, 2.0, "the jog", |s| s.state == Some(State::Jog));
+        assert!(a.locked());
+        // The manual setup of the guide's job, its steps built.
+        let manual = crate::steps::tests::app("Yes");
+        a.doc = manual.doc.clone();
+        a.imported_mesh = manual.imported_mesh.clone();
+        a.guide = manual.guide.clone();
+        a.status.clear();
+        let _ = a.update(Message::Page(Page::Control));
+        assert!(a.steps_page() && a.guide_at().is_some());
+        let _ = a.update(Message::Guide(crate::GuideAction::Next));
+        let _ = a.update(Message::Guide(crate::GuideAction::Section(2)));
+        assert_ne!(a.status, crate::LOCKED);
+        assert_eq!(
+            a.guide_at().unwrap().1,
+            a.guide_at().unwrap().0.guide.sections[2].steps.start
+        );
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "Tool"), "{texts:?}");
+        // The way back to the CNC works too.
+        let _ = a.update(Message::Guide(crate::GuideAction::Open(1)));
+        assert!(!a.steps_page() && a.doc.active == a.doc.setups[1].id);
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     #[test]
@@ -6070,6 +6209,27 @@ flood = { pin = 8 }
         assert_eq!(refused.problems().len(), 1);
         assert!(refused.run_buttons().is_empty());
         let _ = b.view();
+    }
+    /// The NC page lists a manual mill's setup with the line that says it has
+    /// no G-code, and exports the CNC setup's program beside it.
+    #[test]
+    fn the_nc_page_says_a_manual_setup_has_no_gcode() {
+        use crate::ui::{NcCard, nc_page};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        crate::post::fixture::with_manual_setup(&mut doc, [-500., 34., -500., 34., 0., -2.]);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.update(Message::Page(Page::Post));
+        let page = nc_page(&a);
+        assert!(page.ready && page.problems().is_empty());
+        assert!(matches!(page.cards[0].1, NcCard::Manual));
+        assert!(matches!(page.cards[1].1, NcCard::Programs(_)));
+        let line = "Big mill: manual mill, no G-code — follow the steps on the MACHINE page.";
+        assert_eq!(crate::manual::no_gcode("Big mill"), line);
+        assert!(page_texts(&a).iter().any(|t| t == line));
     }
     #[test]
     fn first_launch_and_empty_project_roundtrip() {
@@ -15693,5 +15853,453 @@ flood = { pin = 8 }
         let (pinned, scrolled) = split(&a);
         assert_eq!((pinned, scrolled), (1, 2));
         let _ = a.view();
+    }
+    fn with_manual(a: &mut App) {
+        a.doc.machines.push(crate::manual::defaults());
+    }
+    /// A 10 mm end mill on the manual machine added by `with_manual`.
+    fn with_big_cutter(a: &mut App) -> crate::model::Tool {
+        with_manual(a);
+        let mut tool = crate::model::Tool::new("Big cutter", "Flat end mill", "10");
+        let id = a.doc.machines.last().unwrap().id.clone();
+        tool.p.insert("machines".into(), id);
+        a.doc.tools.insert(1, tool.clone());
+        tool
+    }
+    fn lacks(a: &App, texts: &[&str]) {
+        let seen = page_texts(a);
+        for text in texts {
+            assert!(!seen.iter().any(|t| t == text), "{text}");
+        }
+    }
+    fn shows(a: &App, texts: &[&str]) {
+        let seen = page_texts(a);
+        for text in texts {
+            assert!(seen.iter().any(|t| t == text), "{text}: {seen:?}");
+        }
+    }
+    #[test]
+    fn the_wizard_shows_the_manual_fields_and_hides_the_post_and_probe_ones() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        assert!(crate::manual::is_manual(&a.machine_draft));
+        shows(&a, &["Machine kind", "3  Manual mill"]);
+        lacks(&a, &["Number of axes"]);
+        let _ = a.update(Message::WizardStep(1));
+        shows(
+            &a,
+            &[
+                "X travel",
+                "Spindle power · W",
+                "Spindle speeds · rpm, or a range",
+                "Hand feed · mm/min",
+                "Hand rapid · mm/min",
+                "X per handwheel turn · mm",
+                "Y per handwheel turn · mm",
+                "Z per handwheel turn · mm",
+            ],
+        );
+        lacks(
+            &a,
+            &[
+                "Maximum spindle speed · rpm",
+                "Maximum feed · machine units/min",
+            ],
+        );
+        // Steps 2 and 3 are one step; the last is the review.
+        let _ = a.update(Message::WizardStep(2));
+        shows(
+            &a,
+            &[
+                "DRO tool radius compensation",
+                "Time per pass · s",
+                "Time per tool change · min",
+                "Time to move the stock to another machine · min",
+                "Manual mill — no G-code; MACHINE shows the steps.",
+            ],
+        );
+        lacks(
+            &a,
+            &["Motion capability", "Controller / intended postprocessor"],
+        );
+        let _ = a.update(Message::WizardStep(9));
+        assert_eq!(a.wizard_step, 3);
+        shows(&a, &["Review", "Save machine profile"]);
+        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::SaveMachine)));
+        // The post and probe fields of a UC100 machine are on no step.
+        let mut cnc = app();
+        let _ = cnc.update(Message::NewMachine);
+        cnc.machine_draft
+            .p
+            .insert("controller".into(), "UC100".into());
+        let _ = cnc.update(Message::WizardStep(3));
+        shows(
+            &cnc,
+            &["Spindle start dwell · s", "Touch plate thickness · mm"],
+        );
+        for step in 0..4 {
+            let _ = a.update(Message::WizardStep(step));
+            lacks(
+                &a,
+                &[
+                    "Spindle start dwell · s",
+                    "Touch plate thickness · mm",
+                    "Probe feed · mm/min",
+                    "Safe retract",
+                    "Tool length",
+                ],
+            );
+        }
+    }
+    #[test]
+    fn choosing_the_manual_kind_keeps_the_name_travel_and_power() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        for (k, v) in [("name", "Bridgeport"), ("x", "800"), ("power", "2200")] {
+            let _ = a.update(Message::Edit(Target::Machine, k, v.into()));
+        }
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        let p = &a.machine_draft.p;
+        assert_eq!(
+            [
+                get(p, "name"),
+                get(p, "x"),
+                get(p, "power"),
+                get(p, "speeds")
+            ],
+            ["Bridgeport", "800", "2200", "90,150,250,400,640,1000,1600"]
+        );
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "CNC".into()));
+        assert!(!crate::manual::is_manual(&a.machine_draft));
+        assert_eq!(crate::ui::wizard_steps(&a.machine_draft).len(), 5);
+    }
+    #[test]
+    fn saving_a_manual_machine_settles_its_rpm_and_feed() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        for (k, v) in [("speeds", "100, 400,2500"), ("hand_feed", "120")] {
+            let _ = a.update(Message::Edit(Target::Machine, k, v.into()));
+        }
+        let id = a.machine_draft.id.clone();
+        let _ = a.update(Message::SaveMachine);
+        let saved = a.doc.machines.iter().find(|m| m.id == id).expect("saved");
+        assert_eq!(
+            (get(&saved.p, "rpm"), get(&saved.p, "feed")),
+            ("2500", "120")
+        );
+        assert_eq!(a.page, Page::Machines);
+        // A manual machine without gears is refused.
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        let _ = a.update(Message::Edit(Target::Machine, "speeds", "".into()));
+        let count = a.doc.machines.len();
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(a.doc.machines.len(), count);
+    }
+    #[test]
+    fn the_tool_editor_has_a_check_box_per_machine_that_edits_machines() {
+        let mut a = app();
+        with_manual(&mut a);
+        let id = a.doc.machines.last().unwrap().id.clone();
+        a.tool_draft = a.doc.tools[0].clone();
+        a.page = Page::Tools;
+        shows(&a, &["Machines", "Manual Mill"]);
+        // Tall enough for the whole form, which scrolls in the real window.
+        let sent = |a: &App| crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 2400.));
+        let mid = id.clone();
+        let on = move |m: &Message, want: bool| matches!(m, Message::ToolMachine(i, o) if *i == mid && *o == want);
+        assert!(sent(&a).iter().any(|m| on(m, true)));
+        assert!(!sent(&a).iter().any(|m| on(m, false)));
+        let _ = a.update(Message::ToolMachine(id.clone(), true));
+        assert_eq!(get(&a.tool_draft.p, "machines"), id);
+        assert!(sent(&a).iter().any(|m| on(m, false)));
+        let other = a.doc.machines[0].id.clone();
+        let _ = a.update(Message::ToolMachine(other.clone(), true));
+        assert_eq!(get(&a.tool_draft.p, "machines"), format!("{id},{other}"));
+        let _ = a.update(Message::ToolMachine(id, false));
+        let _ = a.update(Message::ToolMachine(other, false));
+        assert_eq!(get(&a.tool_draft.p, "machines"), "");
+    }
+    #[test]
+    fn the_holder_editor_has_a_check_box_per_machine_that_edits_machines() {
+        let mut a = app();
+        with_manual(&mut a);
+        let id = a.doc.machines.last().unwrap().id.clone();
+        a.holder_draft = crate::holding::starters().remove(0);
+        a.page = Page::Workholding;
+        shows(&a, &["Machines", "Manual Mill"]);
+        let _ = a.update(Message::HolderMachine(id.clone(), true));
+        assert_eq!(get(&a.holder_draft.p, "machines"), id);
+        let _ = a.update(Message::HolderMachine(id, false));
+        assert_eq!(get(&a.holder_draft.p, "machines"), "");
+    }
+    #[test]
+    fn a_holder_that_does_not_fit_the_setups_machine_is_missing_from_the_picker() {
+        let mut a = app();
+        with_manual(&mut a);
+        let manual_id = a.doc.machines.last().unwrap().id.clone();
+        a.doc.workholding = crate::holding::starters();
+        let mut big = crate::holding::Holder::new("Vise", "Big vise");
+        big.p.insert("machines".into(), manual_id);
+        a.doc.workholding.push(big);
+        let names = |a: &App| -> Vec<String> {
+            crate::ui::fitting_holders(a, "Vise")
+                .iter()
+                .map(|h| h.name().to_string())
+                .collect()
+        };
+        // A CNC setup sees the vises with no machines, not the big one.
+        assert!(names(&a).contains(&"100 mm machine vise".to_string()));
+        assert!(!names(&a).contains(&"Big vise".to_string()));
+        // The manual setup sees only the big one.
+        a.doc.add_manual_setup().unwrap();
+        a.doc.active = a.doc.setups[0].id.clone();
+        assert_eq!(names(&a), ["Big vise"]);
+        assert_eq!(crate::ui::fitting_holders(&a, "Clamp").len(), 0);
+    }
+    #[test]
+    fn add_manual_setup_shows_with_a_manual_machine_and_inserts_the_setup() {
+        let mut a = app();
+        lacks(&a, &["+ Add manual setup"]);
+        with_manual(&mut a);
+        shows(&a, &["+ Add manual setup"]);
+        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::AddManualSetup)));
+        let old = a.doc.active.clone();
+        let _ = a.update(Message::AddManualSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        assert_eq!(a.doc.setups[0].name(), "Big mill");
+        assert_eq!(a.doc.setups[1].id, old);
+        assert_eq!(a.doc.active, old);
+        assert_eq!(a.page, Page::Work);
+        assert_eq!(a.selected, None);
+        // Without a manual machine the press says so and changes nothing.
+        let mut b = app();
+        let _ = b.update(Message::AddManualSetup);
+        assert_eq!(b.doc.setups.len(), 1);
+        assert!(b.status.contains("manual machine"), "{}", b.status);
+    }
+    #[test]
+    fn the_ribbon_dims_all_but_box_and_drill_on_a_manual_setup() {
+        let mut a = app();
+        with_manual(&mut a);
+        let sent = |a: &App| crate::ui::probe::clicks(a.view(), WINDOW);
+        let adds = |a: &App, s: Strategy| {
+            sent(a)
+                .iter()
+                .any(|m| matches!(m, Message::AddOp(x) if *x == s))
+        };
+        let reasons = |a: &App, reason: &str| {
+            let (_, cards) = laid(a).run(Helps::default()).expect("the view");
+            cards.iter().filter(|c| c.body == reason).count()
+        };
+        let (one_axis, box_on_cnc) = (crate::manual::ONE_AXIS, crate::manual::BOX_ON_CNC);
+        assert!(adds(&a, Strategy::Face) && adds(&a, Strategy::Drill));
+        assert!(!adds(&a, Strategy::Box));
+        assert_eq!(reasons(&a, one_axis), 0);
+        assert_eq!(reasons(&a, box_on_cnc), 1);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        assert!(!adds(&a, Strategy::Face));
+        assert!(!adds(&a, Strategy::FiveAxis));
+        assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
+        // The ten dimmed tiles each say why; Box and Drill are not dimmed.
+        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 2);
+        assert_eq!(reasons(&a, box_on_cnc), 0);
+        // Back on the CNC setup only Box is dimmed.
+        a.doc.active = a.doc.setups[1].id.clone();
+        assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Box));
+        assert_eq!(reasons(&a, one_axis), 0);
+        assert_eq!(reasons(&a, box_on_cnc), 1);
+    }
+    #[test]
+    fn adding_a_box_on_the_big_mill_takes_a_fitting_tool_and_a_gear() {
+        let mut a = app();
+        let tool = with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let op = a.operation().unwrap().clone();
+        assert_eq!(op.strategy, Strategy::Box);
+        assert_eq!(op.tool, tool.id);
+        assert_eq!((get(&op.p, "rpm"), get(&op.p, "feed")), ("640", "120"));
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        // Drill's own defaults are above the machine: they come down to it.
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let drill = a.operation().unwrap();
+        assert_eq!(
+            (get(&drill.p, "rpm"), get(&drill.p, "feed")),
+            ("1600", "150")
+        );
+        // On the CNC setup nothing changes.
+        a.doc.active = a.doc.setups[1].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let drill = a.operation().unwrap();
+        assert_eq!(
+            (get(&drill.p, "rpm"), get(&drill.p, "feed")),
+            ("2400", "280")
+        );
+    }
+    #[test]
+    fn the_box_editor_has_the_six_fields_in_x_y_z_rows_and_the_passes() {
+        let mut a = app();
+        with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let tabs = Strategy::Box.tabs();
+        for tab in &tabs {
+            let _ = a.update(Message::Tab(tab.to_string()));
+            let _view = a.view();
+        }
+        let _ = a.update(Message::Tab("Box".into()));
+        let texts = page_texts(&a);
+        let at = |label: &str| {
+            (texts.iter().position(|t| t == label)).unwrap_or_else(|| panic!("{label}: {texts:?}"))
+        };
+        let order = [
+            "X min · mm",
+            "X max · mm",
+            "Y min · mm",
+            "Y max · mm",
+            "Z top · mm",
+            "Z bottom · mm",
+        ]
+        .map(at);
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        let _ = a.update(Message::Tab("Passes".into()));
+        shows(
+            &a,
+            &[
+                "Stock to leave · mm",
+                "Stepover · % tool diameter",
+                "Maximum stepdown · mm",
+            ],
+        );
+        lacks(&a, &["Pass direction · degrees", "Tolerance · mm"]);
+        let _ = a.update(Message::Edit(Target::Operation, "x_max", "-5".into()));
+        let _ = a.update(Message::Tab("Box".into()));
+        let checks = crate::ui::op_checks(&a);
+        assert_eq!(
+            checks.len(),
+            1,
+            "{:?}",
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(checks[0].key, Some("x_max"));
+    }
+    #[test]
+    fn a_box_message_opens_the_tab_with_its_field() {
+        for (issue, tab) in [
+            ("x min must be a finite number.", Some("Box")),
+            ("x max must be greater than x min.", Some("Box")),
+            ("y max must be greater than y min.", Some("Box")),
+            ("z top must be greater than z bottom.", Some("Box")),
+            ("z bottom must be a finite number.", Some("Box")),
+            (
+                "The box must be at least as wide as the tool across its passes.",
+                Some("Box"),
+            ),
+            ("stepover must be between 10 and 100.", Some("Passes")),
+            ("stepdown must be greater than zero.", Some("Passes")),
+            ("allowance cannot be negative or blank.", Some("Passes")),
+            ("End mill 10 is not on Manual Mill.", Some("Tool")),
+            (
+                "Spindle speed must be one of the machine's gears: 90, 150.",
+                Some("Tool"),
+            ),
+            (
+                "The big mill cuts one axis at a time: use Box or Drill.",
+                None,
+            ),
+            ("Box runs on a manual mill.", None),
+        ] {
+            assert_eq!(crate::ui::issue_tab(issue), tab, "{issue}");
+        }
+    }
+    #[test]
+    fn the_box_tab_fills_its_fields_from_the_picked_face() {
+        let mut a = imported_app();
+        with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let _ = a.update(Message::Tab("Box".into()));
+        shows(
+            &a,
+            &["From the part", "From selected face", "0 faces selected"],
+        );
+        assert!(
+            crate::ui::probe::clicks(a.view(), iced::Size::new(WINDOW.width, 2400.))
+                .iter()
+                .any(|m| matches!(m, Message::BoxFromFace))
+        );
+        let fields = |a: &App| -> Vec<String> {
+            crate::model::BOX_FIELDS
+                .iter()
+                .map(|k| get(&a.operation().unwrap().p, k).to_string())
+                .collect()
+        };
+        let before = fields(&a);
+        // No face yet: the message, and the fields stay.
+        let _ = a.update(Message::BoxFromFace);
+        assert_eq!(a.status, crate::manual::ONE_FACE);
+        assert_eq!(fields(&a), before);
+        // Picking stays on the Box tab, and a click replaces the face before it.
+        let _ = a.update(Message::PickMode);
+        assert!(a.picking && a.tab == "Box");
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let top = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2] > 0.99999)
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let chamfer = mesh
+            .surfaces
+            .iter()
+            .position(|s| s.normal[2] > 0.5 && s.normal[2] < 0.9)
+            .unwrap();
+        let picked = |a: &App| {
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .unwrap()
+                .ids
+                .clone()
+        };
+        let _ = a.update(Message::Surface(chamfer));
+        let _ = a.update(Message::Surface(top));
+        assert_eq!(picked(&a), vec![top]);
+        shows(&a, &["1 face selected"]);
+        // The block's top, under 10 mm of stock: the whole stock above it.
+        let _ = a.update(Message::BoxFromFace);
+        let stock = a.known_stock(0).0.unwrap();
+        let zero = crate::post::datum(a.doc.setup(), stock, a.part_mesh().unwrap()).unwrap();
+        let whole: Vec<String> = [
+            stock.min[0] - zero[0],
+            stock.max[0] - zero[0],
+            stock.min[1] - zero[1],
+            stock.max[1] - zero[1],
+            0.,
+            -10.,
+        ]
+        .map(|v| format!("{}", (v * 1000.).round() / 1000.))
+        .to_vec();
+        assert_eq!(fields(&a), whole);
+        assert_eq!(a.status, "Box filled from the selected face.");
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        // A slanted face is refused, and the fields stay.
+        let _ = a.update(Message::Surface(chamfer));
+        let _ = a.update(Message::BoxFromFace);
+        assert_eq!(a.status, crate::manual::ONE_FACE);
+        assert_eq!(fields(&a), whole);
     }
 }

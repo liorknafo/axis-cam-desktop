@@ -1,3 +1,4 @@
+use crate::manual;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ pub enum Strategy {
     Indexed,
     Rotary,
     FiveAxis,
+    Box,
 }
 impl Strategy {
     pub fn imported_preview(self) -> bool {
@@ -43,6 +45,7 @@ impl Strategy {
                 | Self::Drill
                 | Self::Parallel
                 | Self::Waterline
+                | Self::Box
         )
     }
     pub fn needs_surfaces(self) -> bool {
@@ -71,9 +74,12 @@ impl Strategy {
             Self::FiveAxis => {
                 "Unavailable · tool-axis planning and machine kinematics are not implemented"
             }
+            Self::Box => {
+                "Available · rectangular block removed one axis at a time on a manual mill"
+            }
         }
     }
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Face,
         Self::Adaptive,
         Self::Pocket,
@@ -85,6 +91,7 @@ impl Strategy {
         Self::Indexed,
         Self::Rotary,
         Self::FiveAxis,
+        Self::Box,
     ];
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).unwrap()
@@ -102,6 +109,7 @@ impl Strategy {
             "Indexed face",
             "Rotary finishing",
             "5-axis surface",
+            "Box",
         ][self.index()]
     }
     pub fn short(self) -> &'static str {
@@ -117,6 +125,7 @@ impl Strategy {
             "Indexed",
             "Rotary",
             "5-axis",
+            "Box",
         ][self.index()]
     }
     pub fn help(self) -> &'static str {
@@ -132,6 +141,7 @@ impl Strategy {
             "Position a rotary axis, lock it, then machine a face. Set the indexed angles within the machine travel limits.",
             "Finish around a rotary axis. Choose an axis, angular range and line, circular or spiral motion.",
             "Orient the cutter along a surface. Set axis control, tilt limits and lead/lean before checking machine motion.",
+            "Remove a rectangular block of material, one axis at a time, on a manual mill.",
         ][self.index()]
     }
     pub fn features(self) -> &'static [usize] {
@@ -140,10 +150,14 @@ impl Strategy {
             Self::Face | Self::Indexed => &[0, 1],
             Self::Adaptive | Self::Pocket => &[1],
             Self::Contour => &[2, 3],
+            Self::Box => &[],
             _ => &[0, 1, 2, 4],
         }
     }
     pub fn tabs(self) -> Vec<&'static str> {
+        if self == Self::Box {
+            return vec!["Tool", "Box", "Heights", "Passes"];
+        }
         let mut v = vec!["Tool", "Geometry"];
         if matches!(self, Self::Indexed | Self::Rotary | Self::FiveAxis) {
             v.push("Orientation")
@@ -173,6 +187,38 @@ pub const FEATURES: [&str; 9] = [
     "Hole 2 · Ø8",
     "Hole 3 · Ø8",
     "Hole 4 · Ø8",
+];
+
+/// The keys of a setup's vise or clamps.
+const HOLDING: [&str; 7] = [
+    "holding",
+    "holder",
+    "holding_gap",
+    "vise_axis",
+    "vise_offset",
+    "vise_grip",
+    "clamps",
+];
+/// The setup keys a manual setup put first takes from the old first setup,
+/// besides its stock: orientation, zero, offset and holding.
+const HANDED_OVER: [&str; 17] = [
+    "rx",
+    "ry",
+    "rz",
+    "tx",
+    "ty",
+    "tz",
+    "origin",
+    "offset",
+    "holding",
+    "holder",
+    "holding_gap",
+    "vise_axis",
+    "vise_offset",
+    "vise_grip",
+    "clamps",
+    "fixture",
+    "clearance",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,8 +313,31 @@ impl Machine {
         if self.name().trim().is_empty() {
             e.push("Give the machine a name.".into())
         }
-        for k in ["x", "y", "z", "rpm", "feed"] {
+        let manual = manual::is_manual(self);
+        for k in ["x", "y", "z"] {
             positive(&self.p, k, &mut e)
+        }
+        if manual {
+            if manual::gears(self).is_empty() {
+                e.push("Speeds must be positive rpm, comma-separated, or a range min-max.".into())
+            }
+            for k in [
+                "hand_feed",
+                "hand_rapid",
+                "turn_x",
+                "turn_y",
+                "turn_z",
+                "edge_finder",
+            ] {
+                positive(&self.p, k, &mut e)
+            }
+            for k in ["pass_time", "tool_time", "move_time"] {
+                nonnegative(&self.p, k, &mut e)
+            }
+        } else {
+            for k in ["rpm", "feed"] {
+                positive(&self.p, k, &mut e)
+            }
         }
         // Optional: empty takes `forces::SPINDLE_POWER`.
         if !get(&self.p, "power").trim().is_empty() {
@@ -289,7 +358,9 @@ impl Machine {
                 finite(&self.p, k, &mut e)
             }
         }
-        if get(&self.p, "controller") == "UC100" && get(&self.p, "uc100_profile").trim().is_empty()
+        if !manual
+            && get(&self.p, "controller") == "UC100"
+            && get(&self.p, "uc100_profile").trim().is_empty()
         {
             e.push("Choose the machine's UC100 profile file.".into())
         }
@@ -616,7 +687,25 @@ impl Operation {
         if s == Strategy::Parallel {
             p.insert("surface_stepover".into(), "1".into());
         }
+        if s == Strategy::Box {
+            for (k, v) in [
+                ("x_min", "0"),
+                ("x_max", "50"),
+                ("y_min", "0"),
+                ("y_max", "20"),
+                ("z_top", "0"),
+                ("z_bottom", "-2"),
+                ("rpm", "640"),
+                ("feed", "120"),
+                ("allowance", "0.5"),
+                ("stepover", "70"),
+                ("stepdown", ""),
+            ] {
+                p.insert(k.into(), v.into());
+            }
+        }
         let geometry = match s {
+            Strategy::Box => vec![],
             Strategy::Drill => vec![5, 6, 7, 8],
             Strategy::Face | Strategy::Indexed => vec![0],
             Strategy::Contour => vec![2],
@@ -653,6 +742,32 @@ impl Operation {
         }
         self.preview = false;
     }
+    /// What is wrong with a Box's block, its stepover and its stepdown.
+    fn box_issues(&self, tool: Option<&Tool>) -> Vec<String> {
+        let (p, mut e) = (&self.p, vec![]);
+        for k in BOX_FIELDS {
+            finite(p, k, &mut e)
+        }
+        if e.is_empty() {
+            range(p, "x_min", "x_max", &mut e);
+            range(p, "y_min", "y_max", &mut e);
+            range(p, "z_bottom", "z_top", &mut e);
+            let [x, y] = [("x_min", "x_max"), ("y_min", "y_max")]
+                .map(|(a, b)| num(p, b).zip(num(p, a)).map_or(0., |(b, a)| b - a));
+            if e.is_empty()
+                && tool
+                    .and_then(|t| num(&t.p, "diameter"))
+                    .is_some_and(|d| x.min(y) < d)
+            {
+                e.push("The box must be at least as wide as the tool across its passes.".into())
+            }
+        }
+        bounded(p, "stepover", 10., 100., &mut e);
+        if !get(p, "stepdown").trim().is_empty() {
+            positive(p, "stepdown", &mut e)
+        }
+        e
+    }
     pub fn issues(&self, m: &Machine, tools: &[Tool], preceding: &[Operation]) -> Vec<String> {
         let mut e = vec![];
         if self.strategy == Strategy::Face {
@@ -678,7 +793,8 @@ impl Operation {
         {
             e.push("Geometry is incompatible with this strategy.".into())
         }
-        if let Some(t) = tools.iter().find(|t| t.id == self.tool) {
+        let tool = tools.iter().find(|t| t.id == self.tool);
+        if let Some(t) = tool {
             e.extend(t.issues());
             if self.strategy == Strategy::Drill
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
@@ -687,6 +803,9 @@ impl Operation {
                     "Choose a drill, or a chamfer mill to countersink, for a drilling cycle."
                         .into(),
                 )
+            }
+            if !manual::fits(get(&t.p, "machines"), m) {
+                e.push(format!("{} is not on {}.", t.name(), m.name()))
             }
         } else {
             e.push("Choose a tool from the library.".into())
@@ -704,6 +823,14 @@ impl Operation {
                 e.push(format!("{} exceeds the saved machine limit.", label(k)));
             }
         }
+        if manual::is_manual(m)
+            && num(&self.p, "rpm").is_some_and(|rpm| rpm > 0. && !manual::on_gear(m, rpm))
+        {
+            e.push(format!(
+                "Spindle speed must be one of the machine's gears: {}.",
+                manual::speeds(m)
+            ))
+        }
         for k in ["clearance", "retract"] {
             nonnegative(&self.p, k, &mut e)
         }
@@ -714,6 +841,12 @@ impl Operation {
             e.push("Clearance must be above retract height.".into())
         }
         let s = self.strategy;
+        if manual::is_manual(m) && !matches!(s, Strategy::Box | Strategy::Drill) {
+            e.push("The big mill cuts one axis at a time: use Box or Drill.".into())
+        }
+        if s == Strategy::Box && !manual::is_manual(m) {
+            e.push(manual::BOX_ON_CNC.into())
+        }
         if matches!(s, Strategy::Indexed | Strategy::Rotary) && m.axes() < 4 {
             e.push("This strategy needs at least 4 machine axes.".into())
         }
@@ -771,6 +904,9 @@ impl Operation {
                 bounded(&self.p, "slope_min", 0., 90., &mut e);
                 bounded(&self.p, "slope_max", 0., 90., &mut e);
                 range_equal(&self.p, "slope_min", "slope_max", &mut e)
+            }
+            if s == Strategy::Box {
+                e.extend(self.box_issues(tool));
             }
             if s == Strategy::Adaptive {
                 positive(&self.p, "optimal_load", &mut e);
@@ -1017,6 +1153,9 @@ pub struct Document {
     pub tools: Vec<Tool>,
     pub setups: Vec<Setup>,
     pub active: String,
+    /// The step each manual setup's guide is at, by setup id (`guide::place`).
+    #[serde(default)]
+    pub guide: BTreeMap<String, usize>,
 }
 impl Default for Document {
     fn default() -> Self {
@@ -1034,6 +1173,7 @@ impl Default for Document {
             tools: vec![],
             setups: vec![],
             active: String::new(),
+            guide: BTreeMap::new(),
         }
     }
 }
@@ -1410,6 +1550,12 @@ impl Document {
         } else if !kind.is_empty() && entry.is_none() {
             issues.push(DELETED.into());
         }
+        if !kind.is_empty()
+            && let Some(entry) = entry
+            && !crate::manual::fits(get(&entry.p, "machines"), &s.machine)
+        {
+            issues.push(format!("{} is not on {}.", entry.name(), s.machine.name()));
+        }
         // The jaws and clamps are boxes along the axes of setup 1's frame, which
         // a later setup turned from it by another angle does not share.
         let square = self
@@ -1728,7 +1874,7 @@ impl Document {
         let mut offsets = HashSet::new();
         for s in &self.setups {
             e.extend(s.issues().into_iter().map(|x| format!("{}: {x}", s.name())));
-            if !offsets.insert(get(&s.p, "offset")) {
+            if !crate::manual::is_manual(&s.machine) && !offsets.insert(get(&s.p, "offset")) {
                 e.push(format!(
                     "{}: work offset is also used by another setup.",
                     s.name()
@@ -1746,6 +1892,46 @@ impl Document {
             e.push(x)
         }
         e
+    }
+    /// Inserts a setup named "Big mill" on the first manual machine of the
+    /// library, before the first CNC setup. Put first, it takes the stock,
+    /// orientation, zero and holding of the old first setup, which then starts
+    /// from the stock it leaves. `active` is a setup id, so it keeps its setup.
+    pub fn add_manual_setup(&mut self) -> Result<(), String> {
+        let Some(machine) = self.machines.iter().find(|m| crate::manual::is_manual(m)) else {
+            return Err("Add a manual machine to the library first.".into());
+        };
+        let at = self
+            .setups
+            .iter()
+            .position(|s| !crate::manual::is_manual(&s.machine))
+            .unwrap_or(self.setups.len());
+        let mut setup = Setup::new(machine.clone(), &self.next_offset());
+        setup.p.insert("name".into(), "Big mill".into());
+        match (at, self.setups.first()) {
+            (0, Some(old)) => {
+                // A vise or clamps not on the manual mill stay behind.
+                let fits = (self.holder(get(&old.p, "holder")))
+                    .is_none_or(|h| crate::manual::fits(get(&h.p, "machines"), machine));
+                for (k, v) in &old.p {
+                    let holding = HOLDING.contains(&k.as_str());
+                    if (HANDED_OVER.contains(&k.as_str()) && (fits || !holding))
+                        || k.starts_with("stock_")
+                    {
+                        setup.p.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            _ if !self.sample_model => {
+                for key in ["stock_x", "stock_y", "stock_z"] {
+                    setup.p.insert(key.into(), String::new());
+                }
+            }
+            _ => {}
+        }
+        self.setups.insert(at, setup);
+        self.sync_stock_sources();
+        Ok(())
     }
     pub fn setup_sheet(&self, mesh: Option<&crate::mesh::Mesh>) -> String {
         let mut s = format!(
@@ -1770,11 +1956,17 @@ impl Document {
                 None => "not set".into(),
             };
             s += &format!(
-                "\n## {} · {}\n\nMachine: {} (v{})\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
+                "\n## {} · {}\n\nMachine: {}\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
                 setup.name(),
                 get(&setup.p, "offset"),
-                setup.machine.name(),
-                setup.machine.version,
+                if crate::manual::is_manual(&setup.machine) {
+                    format!(
+                        "{} (manual mill)\n\nManual mill: steps on the MACHINE page",
+                        setup.machine.name()
+                    )
+                } else {
+                    format!("{} (v{})", setup.machine.name(), setup.machine.version)
+                },
                 crate::stock::sheet_description(setup, mesh),
                 get(&setup.p, "origin"),
                 crate::holding::fixture_note(setup)
@@ -1806,10 +1998,18 @@ impl Document {
 fn label(k: &str) -> String {
     k.replace('_', " ")
 }
+/// The six fields of a Box's block, by key.
+pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 36] = [
+const OPERATION_FIELDS: [&str; 42] = [
     "name",
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "z_top",
+    "z_bottom",
     "hole_diameter",
     "rpm",
     "feed",
@@ -1856,7 +2056,7 @@ const OPERATION_FIELDS: [&str; 36] = [
 pub fn issue_field(issue: &str) -> Option<&'static str> {
     let lower = issue.to_lowercase();
     let m = lower.strip_prefix("pocket ").unwrap_or(&lower);
-    if m.starts_with("surface speed ") {
+    if m.starts_with("surface speed ") || m.starts_with("spindle speed ") {
         return Some("rpm");
     }
     if m.starts_with("chip load ") {
@@ -3362,5 +3562,398 @@ mod tests {
             none.holding_issues(0, None),
             ["\"Glue\" is not a workholding choice."]
         );
+    }
+}
+#[cfg(test)]
+mod manual_setups {
+    use super::*;
+    fn with_manual() -> Document {
+        let mut d = Document::sample();
+        d.machines.push(crate::manual::defaults());
+        d
+    }
+    fn stock(s: &Setup) -> Vec<(&String, &String)> {
+        s.p.iter()
+            .filter(|(k, _)| k.starts_with("stock_") && *k != "stock_source")
+            .collect()
+    }
+    #[test]
+    fn a_manual_setup_put_first_takes_what_the_old_first_setup_had() {
+        let mut d = with_manual();
+        d.setup_mut().p.insert("stock_left".into(), "7".into());
+        d.setup_mut().p.insert("rz".into(), "90".into());
+        d.setup_mut().p.insert("tx".into(), "3".into());
+        d.setup_mut()
+            .p
+            .insert("origin".into(), "Stock top corner".into());
+        d.setup_mut().p.insert("holding".into(), "Vise".into());
+        d.setup_mut().p.insert("vise_axis".into(), "Y".into());
+        let (old, was) = (d.setups[0].id.clone(), d.setups[0].clone());
+        d.add_manual_setup().unwrap();
+        assert_eq!(d.setups.len(), 2);
+        let (new, kept) = (&d.setups[0], &d.setups[1]);
+        assert_eq!(new.name(), "Big mill");
+        assert!(crate::manual::is_manual(&new.machine));
+        assert_eq!(stock(new), stock(&was));
+        for k in [
+            "rx",
+            "ry",
+            "rz",
+            "tx",
+            "ty",
+            "tz",
+            "origin",
+            "offset",
+            "holding",
+            "vise_axis",
+        ] {
+            assert_eq!(get(&new.p, k), get(&was.p, k), "{k}");
+        }
+        assert!(new.operations.is_empty());
+        assert_eq!(kept.id, old);
+        assert_eq!(get(&new.p, "stock_source"), "fresh");
+        assert_eq!(get(&kept.p, "stock_source"), new.id);
+        assert_eq!(d.active, old);
+        assert_eq!(d.index(), 1);
+        assert_eq!(d.issues(), Vec::<String>::new());
+    }
+    #[test]
+    fn a_manual_setup_put_first_leaves_a_cnc_vise_behind() {
+        let mut d = with_manual();
+        d.adopt_holders();
+        let vise = (d.workholding.iter())
+            .find(|h| h.kind() == "Vise")
+            .unwrap()
+            .id
+            .clone();
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", &vise),
+            ("vise_axis", "Y"),
+            ("vise_grip", "8"),
+        ] {
+            d.setup_mut().p.insert(k.into(), v.into());
+        }
+        let was = d.setups[0].clone();
+        d.add_manual_setup().unwrap();
+        // The vise fits every CNC machine and no manual one: not copied.
+        let (new, kept) = (&d.setups[0], &d.setups[1]);
+        for k in HOLDING {
+            assert_eq!(get(&new.p, k), "", "{k}");
+            assert_eq!(get(&kept.p, k), get(&was.p, k), "{k}");
+        }
+        assert_eq!(get(&new.p, "origin"), get(&was.p, "origin"));
+        assert_eq!(stock(new), stock(&was));
+        assert!(d.holding_issues(0, None).is_empty());
+        // Marked for the manual mill too, it goes with the stock.
+        let mut d = with_manual();
+        d.adopt_holders();
+        let manual = d.machines.last().unwrap().id.clone();
+        for h in &mut d.workholding {
+            h.p.insert("machines".into(), format!("{},{manual}", was.machine.id));
+        }
+        d.setups[0].p = was.p.clone();
+        d.add_manual_setup().unwrap();
+        for k in ["holding", "holder", "vise_axis", "vise_grip"] {
+            assert_eq!(get(&d.setups[0].p, k), get(&was.p, k), "{k}");
+        }
+    }
+    #[test]
+    fn a_holder_not_on_the_setups_machine_is_a_workholding_issue() {
+        let mut d = with_manual();
+        d.adopt_holders();
+        let vise = (d.workholding.iter())
+            .find(|h| h.kind() == "Vise")
+            .unwrap()
+            .clone();
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", vise.id.as_str()),
+            ("vise_grip", "8"),
+        ] {
+            d.setup_mut().p.insert(k.into(), v.into());
+        }
+        let not_on = |d: &Document, si: usize| {
+            let issue = format!("{} is not on {}.", vise.name(), d.setups[si].machine.name());
+            d.holding_issues(si, None).contains(&issue)
+        };
+        assert!(!not_on(&d, 0));
+        // Only on the manual mill: not on the CNC.
+        let manual = d.machines.last().unwrap().clone();
+        for h in &mut d.workholding {
+            h.p.insert("machines".into(), manual.id.clone());
+        }
+        assert!(not_on(&d, 0), "{:?}", d.holding_issues(0, None));
+        // A manual setup with it is fine; with a CNC-only vise it is not.
+        d.setups[0].machine = manual;
+        assert!(!not_on(&d, 0), "{:?}", d.holding_issues(0, None));
+        for h in &mut d.workholding {
+            h.p.insert("machines".into(), String::new());
+        }
+        assert!(not_on(&d, 0), "{:?}", d.holding_issues(0, None));
+    }
+    #[test]
+    fn a_second_manual_setup_goes_before_the_first_cnc_setup() {
+        let mut d = with_manual();
+        d.add_manual_setup().unwrap();
+        let first = d.setups[0].id.clone();
+        d.add_manual_setup().unwrap();
+        assert_eq!(d.setups.len(), 3);
+        assert_eq!(d.setups[0].id, first);
+        assert!(crate::manual::is_manual(&d.setups[1].machine));
+        assert!(!crate::manual::is_manual(&d.setups[2].machine));
+        assert_eq!(get(&d.setups[1].p, "stock_source"), first);
+        assert_eq!(get(&d.setups[2].p, "stock_source"), d.setups[1].id);
+        assert_eq!(d.active, d.setups[2].id);
+        assert_eq!(d.issues(), Vec::<String>::new());
+    }
+    #[test]
+    fn a_manual_setup_needs_a_manual_machine_in_the_library() {
+        let mut d = Document::sample();
+        assert!(d.add_manual_setup().is_err());
+        assert_eq!(d.setups.len(), 1);
+    }
+    #[test]
+    fn the_setup_sheet_names_the_manual_mill_and_points_to_the_steps() {
+        let mut d = with_manual();
+        let cnc = d.setup_sheet(None);
+        assert!(cnc.contains("Machine: Workshop Mill (v1)"), "{cnc}");
+        assert!(!cnc.contains("Manual mill"));
+        d.add_manual_setup().unwrap();
+        let sheet = d.setup_sheet(None);
+        assert!(
+            sheet.contains(
+                "Machine: Manual Mill (manual mill)\n\nManual mill: steps on the MACHINE page"
+            ),
+            "{sheet}"
+        );
+        assert!(sheet.contains("Machine: Workshop Mill (v1)"));
+        assert_eq!(sheet.matches("steps on the MACHINE page").count(), 1);
+    }
+    fn on_the_big_mill() -> (Machine, Vec<Tool>, Operation) {
+        let m = manual::defaults();
+        let mut tool = Tool::new("End mill 10", "Flat end mill", "10");
+        tool.p.insert("machines".into(), m.id.clone());
+        let op = Operation::new(Strategy::Box, tool.id.clone());
+        (m, vec![tool], op)
+    }
+    fn box_issues(m: &Machine, tools: &[Tool], op: &Operation) -> Vec<String> {
+        op.issues(m, tools, &[])
+    }
+    #[test]
+    fn box_is_the_twelfth_strategy_with_its_name_and_help() {
+        assert_eq!(Strategy::ALL.len(), 12);
+        assert_eq!(Strategy::Box.index(), 11);
+        for s in Strategy::ALL {
+            assert!(!s.name().is_empty() && !s.short().is_empty() && !s.help().is_empty());
+            assert!(!s.availability().is_empty());
+        }
+        assert_eq!(
+            (Strategy::Box.name(), Strategy::Box.short()),
+            ("Box", "Box")
+        );
+        assert_eq!(
+            Strategy::Box.help(),
+            "Remove a rectangular block of material, one axis at a time, on a manual mill."
+        );
+        assert!(Strategy::Box.imported_preview());
+        assert_eq!(
+            Strategy::Box.tabs(),
+            vec!["Tool", "Box", "Heights", "Passes"]
+        );
+    }
+    #[test]
+    fn a_new_box_has_its_defaults_and_no_issues_on_a_manual_setup() {
+        let (m, tools, op) = on_the_big_mill();
+        for (k, v) in [
+            ("rpm", "640"),
+            ("feed", "120"),
+            ("allowance", "0.5"),
+            ("stepover", "70"),
+            ("stepdown", ""),
+        ] {
+            assert_eq!(get(&op.p, k), v, "{k}");
+        }
+        for k in BOX_FIELDS {
+            assert!(num(&op.p, k).is_some(), "{k}");
+        }
+        assert!(op.geometry.is_empty());
+        assert_eq!(box_issues(&m, &tools, &op), Vec::<String>::new());
+        let mut auto = op.clone();
+        auto.p.insert("stepdown".into(), "1.5".into());
+        assert!(box_issues(&m, &tools, &auto).is_empty());
+    }
+    #[test]
+    fn only_box_and_drill_are_allowed_on_a_manual_machine() {
+        let (m, mut tools, _) = on_the_big_mill();
+        tools[0].p.insert("type".into(), "Drill".into());
+        for s in Strategy::ALL {
+            let mut op = Operation::new(s, tools[0].id.clone());
+            op.p.insert("rpm".into(), "640".into());
+            op.p.insert("feed".into(), "100".into());
+            let refused = box_issues(&m, &tools, &op)
+                .contains(&"The big mill cuts one axis at a time: use Box or Drill.".to_string());
+            assert_eq!(
+                refused,
+                !matches!(s, Strategy::Box | Strategy::Drill),
+                "{s:?}"
+            );
+        }
+    }
+    #[test]
+    fn box_is_refused_on_a_cnc_machine() {
+        let d = Document::sample();
+        let op = Operation::new(Strategy::Box, d.tools[0].id.clone());
+        let issues = op.issues(&d.setup().machine, &d.tools, &[]);
+        assert!(
+            issues.contains(&"Box runs on a manual mill.".to_string()),
+            "{issues:?}"
+        );
+        let (m, tools, op) = on_the_big_mill();
+        assert!(!box_issues(&m, &tools, &op).contains(&"Box runs on a manual mill.".to_string()));
+    }
+    #[test]
+    fn a_tool_must_fit_the_operations_machine() {
+        let (m, mut tools, op) = on_the_big_mill();
+        tools[0].p.insert("machines".into(), "elsewhere".into());
+        assert_eq!(
+            box_issues(&m, &tools, &op),
+            vec!["End mill 10 is not on Manual Mill.".to_string()]
+        );
+        tools[0].p.remove("machines");
+        assert_eq!(
+            box_issues(&m, &tools, &op),
+            vec!["End mill 10 is not on Manual Mill.".to_string()]
+        );
+        // A CNC machine keeps the tools it had: an empty list fits it.
+        let d = Document::sample();
+        let cnc = &d.setup().machine;
+        assert!(
+            d.tools
+                .iter()
+                .all(|t| manual::fits(get(&t.p, "machines"), cnc))
+        );
+        let mut op = Operation::new(Strategy::Face, d.tools[0].id.clone());
+        op.p.insert("rpm".into(), "8000".into());
+        assert!(
+            !op.issues(cnc, &d.tools, &[])
+                .iter()
+                .any(|i| i.contains("is not on"))
+        );
+    }
+    #[test]
+    fn the_spindle_speed_of_a_manual_operation_must_be_a_gear() {
+        let (mut m, tools, mut op) = on_the_big_mill();
+        let message =
+            "Spindle speed must be one of the machine's gears: 90, 150, 250, 400, 640, 1000, 1600.";
+        op.p.insert("rpm".into(), "600".into());
+        assert_eq!(box_issues(&m, &tools, &op), vec![message.to_string()]);
+        assert_eq!(issue_field(message), Some("rpm"));
+        op.p.insert("rpm".into(), "645".into());
+        assert!(box_issues(&m, &tools, &op).is_empty());
+        m.p.insert("speeds".into(), "100-2000".into());
+        op.p.insert("rpm".into(), "1234".into());
+        assert!(box_issues(&m, &tools, &op).is_empty());
+        op.p.insert("rpm".into(), "2100".into());
+        assert_eq!(
+            box_issues(&m, &tools, &op).len(),
+            2,
+            "above the range and the machine limit"
+        );
+    }
+    #[test]
+    fn a_manual_operation_feeds_no_faster_than_the_hand_feed() {
+        let (m, tools, mut op) = on_the_big_mill();
+        op.p.insert("feed".into(), "151".into());
+        assert_eq!(
+            box_issues(&m, &tools, &op),
+            vec!["feed exceeds the saved machine limit.".to_string()]
+        );
+        op.p.insert("feed".into(), "150".into());
+        assert!(box_issues(&m, &tools, &op).is_empty());
+    }
+    #[test]
+    fn the_box_must_have_its_sides_in_order() {
+        let (m, tools, mut op) = on_the_big_mill();
+        for (k, v, message, field) in [
+            ("x_max", "0", "x max must be greater than x min.", "x_max"),
+            ("y_max", "-1", "y max must be greater than y min.", "y_max"),
+            (
+                "z_bottom",
+                "0",
+                "z top must be greater than z bottom.",
+                "z_top",
+            ),
+            ("x_min", "", "x min must be a finite number.", "x_min"),
+        ] {
+            let mut bad = op.clone();
+            bad.p.insert(k.into(), v.into());
+            assert_eq!(
+                box_issues(&m, &tools, &bad),
+                vec![message.to_string()],
+                "{k}"
+            );
+            assert_eq!(issue_field(message), Some(field));
+        }
+        op.p.insert("z_top".into(), "5".into());
+        assert!(box_issues(&m, &tools, &op).is_empty());
+    }
+    #[test]
+    fn the_box_is_at_least_the_tools_diameter_across_its_passes() {
+        let (m, tools, mut op) = on_the_big_mill();
+        let message = "The box must be at least as wide as the tool across its passes.";
+        op.p.insert("y_max".into(), "9.9".into());
+        assert_eq!(box_issues(&m, &tools, &op), vec![message.to_string()]);
+        op.p.insert("y_max".into(), "10".into());
+        assert!(box_issues(&m, &tools, &op).is_empty());
+        // The narrower of the two sides counts, whichever is longer.
+        op.p.insert("y_max".into(), "200".into());
+        op.p.insert("x_max".into(), "9".into());
+        assert_eq!(box_issues(&m, &tools, &op), vec![message.to_string()]);
+    }
+    #[test]
+    fn the_allowance_stepover_and_stepdown_of_a_box_are_checked() {
+        let (m, tools, op) = on_the_big_mill();
+        for (k, v, message) in [
+            (
+                "allowance",
+                "-0.1",
+                "allowance cannot be negative or blank.",
+            ),
+            ("stepover", "9", "stepover must be between 10 and 100."),
+            ("stepover", "101", "stepover must be between 10 and 100."),
+            ("stepdown", "0", "stepdown must be greater than zero."),
+            ("stepdown", "-1", "stepdown must be greater than zero."),
+            ("stepdown", "x", "stepdown must be greater than zero."),
+        ] {
+            let mut bad = op.clone();
+            bad.p.insert(k.into(), v.into());
+            assert_eq!(
+                box_issues(&m, &tools, &bad),
+                vec![message.to_string()],
+                "{k} {v}"
+            );
+            assert_eq!(issue_field(message), Some(k));
+        }
+        for (k, v) in [
+            ("allowance", "0"),
+            ("stepover", "10"),
+            ("stepover", "100"),
+            ("stepdown", "  "),
+        ] {
+            let mut ok = op.clone();
+            ok.p.insert(k.into(), v.into());
+            assert!(box_issues(&m, &tools, &ok).is_empty(), "{k} {v}");
+        }
+    }
+    #[test]
+    fn the_box_keys_are_operation_fields_a_message_can_name() {
+        for k in BOX_FIELDS {
+            let label = k.replace('_', " ");
+            assert_eq!(
+                issue_field(&format!("{label} must be a finite number.")),
+                Some(k)
+            );
+        }
     }
 }

@@ -231,6 +231,31 @@ pub fn pushes(
         })
         .collect()
 }
+/// The least chip thickness the stepdown counts, mm: thinner chips would
+/// raise kc without bound.
+const THINNEST: f32 = 0.01;
+/// The depth of cut, mm, that 70 % of `machine`'s spindle power (`power`,
+/// else `SPINDLE_POWER`) takes at `width` mm across and `feed` mm/min with
+/// `flutes` at `rpm` in `material`: P = kc × ap × width × feed ÷ 60 000,
+/// kc being its group's kc1.1 × h^-mc (`KC`) at the chip h = feed ÷ (rpm ×
+/// flutes), at least `THINNEST`. At most the Ø`diameter` tool's diameter.
+pub fn power_stepdown(
+    machine: &Machine,
+    material: Option<&Material>,
+    diameter: f32,
+    width: f32,
+    feed: f32,
+    rpm: f32,
+    flutes: f32,
+) -> f32 {
+    let power = num(&machine.p, "power")
+        .filter(|p| *p > 0.)
+        .unwrap_or(SPINDLE_POWER);
+    let (kc11, mc) = kc(material);
+    let chip = (feed / (rpm * flutes)).max(THINNEST);
+    let kc = kc11 * chip.powf(-mc);
+    (0.7 * power * 60_000. / (kc * width * feed)).min(diameter)
+}
 /// How the stock would give way.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Way {
@@ -591,6 +616,41 @@ mod tests {
     }
     fn starter(kind: &str) -> Holder {
         starters().into_iter().find(|h| h.kind() == kind).unwrap()
+    }
+    #[test]
+    fn power_stepdown_is_what_seventy_percent_of_the_spindle_takes() {
+        let mut machine = Machine::new(3);
+        machine.p.remove("power");
+        // A 0.0625 mm chip (120 mm/min at 640 rpm on 3 flutes) in steel:
+        // kc = 1700 × 0.0625^-0.25 = 3400 N/mm², and
+        // 0.7 × 800 W × 60 000 ÷ (3400 N/mm² × 17.5 mm × 120 mm/min).
+        let ap = power_stepdown(&machine, None, 25., 17.5, 120., 640., 3.);
+        assert!((ap - 4.7059).abs() < 0.001, "{ap}");
+        // Half the width, twice the depth, up to the diameter; twice the
+        // power, twice the depth.
+        let half = power_stepdown(&machine, None, 25., 8.75, 120., 640., 3.);
+        assert!((half - 2. * ap).abs() < 0.001);
+        assert_eq!(power_stepdown(&machine, None, 4., 8.75, 120., 640., 3.), 4.);
+        machine.p.insert("power".into(), "1600".into());
+        let more = power_stepdown(&machine, None, 25., 17.5, 120., 640., 3.);
+        assert!((more - 2. * ap).abs() < 0.001);
+        machine.p.remove("power");
+        // Twice the flutes, a chip half as thick: kc 2^0.25 times higher,
+        // the depth as much less.
+        let thin = power_stepdown(&machine, None, 25., 17.5, 120., 640., 6.);
+        assert!((thin - ap / 2_f32.powf(0.25)).abs() < 0.001, "{thin}");
+        // Below 0.01 mm the chip counts as 0.01 mm.
+        let floor = power_stepdown(&machine, None, 25., 17.5, 120., 6000., 4.);
+        let at = power_stepdown(&machine, None, 25., 17.5, 120., 3000., 4.);
+        assert_eq!(floor, at);
+        assert!(
+            (at - 0.7 * 800. * 60_000. / (1700. * 100_f32.powf(0.25) * 17.5 * 120.)).abs() < 0.001
+        );
+        // Aluminium cuts with less force: deeper.
+        let mut aluminium = Material::new("6061");
+        aluminium.p.insert("group".into(), "Aluminium".into());
+        let soft = power_stepdown(&machine, Some(&aluminium), 25., 17.5, 120., 640., 3.);
+        assert!((soft - ap * 1700. / 700.).abs() < 0.001, "{soft}");
     }
     #[test]
     fn a_slot_pushes_with_the_stock_it_removes_up_to_what_the_spindle_drives() {

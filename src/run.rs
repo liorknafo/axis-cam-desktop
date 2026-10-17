@@ -681,6 +681,16 @@ pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
     } else {
         crate::post::checked(doc, mesh, si, &sims, PostSettings::from_machine).map(|_| ())
     };
+    // A setup that cannot be walked: its holding was not checked. Said as a
+    // problem, not as a refusal of its jaws or clamps.
+    let mut problems = problems.err().unwrap_or_default();
+    let held = match crate::post::held_walked(doc, mesh, si, &sims) {
+        Ok(held) => held,
+        Err(errors) => {
+            problems.push(crate::post::not_checked(&errors));
+            vec![]
+        }
+    };
     Ready {
         key,
         setup: si,
@@ -689,8 +699,8 @@ pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
             .filter(|(_, r)| r.is_ok())
             .map(|(oi, _)| *oi)
             .collect(),
-        held: crate::post::held_walked(doc, mesh, si, &sims).unwrap_or_default(),
-        problems: problems.err().unwrap_or_default(),
+        held,
+        problems,
         zero: crate::post::zero_checked(doc, mesh, si, &sims),
     }
 }
@@ -733,6 +743,9 @@ pub(crate) fn plan_problems(
     si: usize,
     sims: &[(usize, Result<crate::simulation::Simulation, String>)],
 ) -> Result<(), Vec<String>> {
+    if crate::manual::is_manual(&doc.setups[si].machine) {
+        return Ok(());
+    }
     let programs = crate::post::checked(doc, mesh, si, sims, PostSettings::for_uc100)?;
     let config = crate::control::profile(&doc.setups[si].machine).map_err(|e| vec![e])?;
     let e: Vec<String> = programs
@@ -915,6 +928,35 @@ mod tests {
             dwell: 2.,
             air: None,
         }
+    }
+
+    #[test]
+    fn a_setup_that_cannot_be_walked_says_its_holding_was_not_checked() {
+        let (doc, mesh) = crate::guide::tests::job("Yes");
+        // The manual mill's tools have no numbers: it makes no programs, so
+        // its holding is not checked, and that is said.
+        let sims = simulated(&doc, &mesh, 0);
+        let errors = crate::post::held_walked(&doc, &mesh, 0, &sims).unwrap_err();
+        let line = crate::post::not_checked(&errors);
+        let why = errors[0].trim_end_matches('.');
+        assert_eq!(line, format!("Holding not checked: {why}."));
+        assert!(
+            line.contains("tool number") || line.contains("number"),
+            "{line}"
+        );
+        let held: Vec<(Option<usize>, String)> = (crate::post::held(&doc, &mesh, 0, &sims))
+            .into_iter()
+            .map(|h| (h.operation, h.message))
+            .collect();
+        assert_eq!(held, [(None, line.clone())]);
+        // The marks do not call it a refused vise: it is one of the problems.
+        let ready = ready(&doc, &mesh, 0, 1);
+        assert!(ready.held.is_empty(), "{:?}", ready.held);
+        assert!(ready.problems.contains(&line), "{:?}", ready.problems);
+        assert_eq!(
+            crate::post::not_checked(&[]),
+            "Holding not checked: its programs cannot be made."
+        );
     }
 
     /// One tool run of `ops` and their `plans`, checked.

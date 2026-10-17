@@ -2,6 +2,7 @@ use crate::{
     App, Message, Page, Target,
     help::{self, Help, HelpButton},
     holding::Held,
+    manual,
     material::SpeedFeed,
     model::*,
     planner::Dropped,
@@ -17,26 +18,26 @@ use iced::{
         pick_list, row, rule, scrollable, slider, space, svg, text, text::Wrapping, text_input,
     },
 };
-const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
+pub(crate) const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
 /// Secondary text. At least 4.5:1 on every surface below
 /// (`muted_text_meets_contrast_on_every_surface`).
-const MUTED: Color = Color::from_rgb(0.30, 0.37, 0.44);
-const BLUE: Color = Color::from_rgb(0.13, 0.42, 0.71);
-const LINE: Color = Color::from_rgb(0.85, 0.88, 0.91);
-const BG: Color = Color::from_rgb(0.95, 0.96, 0.975);
+pub(crate) const MUTED: Color = Color::from_rgb(0.30, 0.37, 0.44);
+pub(crate) const BLUE: Color = Color::from_rgb(0.13, 0.42, 0.71);
+pub(crate) const LINE: Color = Color::from_rgb(0.85, 0.88, 0.91);
+pub(crate) const BG: Color = Color::from_rgb(0.95, 0.96, 0.975);
 // The fills that MUTED text is drawn on besides white panels and BG.
 const SELECTED_ROW: Color = Color::from_rgb8(218, 235, 249);
 const ACTIVE_TILE: Color = Color::from_rgb8(223, 237, 249);
 const SETUP_ROW: Color = Color::from_rgb8(230, 239, 248);
 const HOVER_ROW: Color = Color::from_rgb8(239, 244, 249);
-const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
+pub(crate) const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
 /// The opacity of an icon whose command is unavailable.
 const DIMMED: f32 = 0.45;
 /// The label of an unavailable command: lighter than `MUTED`, so it reads as
 /// greyed out beside its neighbours, and still 3:1 on white.
 const DIMMED_TEXT: Color = Color::from_rgb8(128, 140, 152);
 /// The amber of a warning: its box, its heading and its text.
-const WARNING: [Color; 3] = [
+pub(crate) const WARNING: [Color; 3] = [
     Color::from_rgb8(255, 247, 232),
     Color::from_rgb8(166, 101, 32),
     Color::from_rgb8(141, 90, 39),
@@ -107,7 +108,7 @@ fn flat(active: bool, status: button::Status) -> button::Style {
 const BUTTON_PAD: u16 = 8;
 /// The edge of an outlined button: darker than `LINE`, so the button is seen
 /// as one on a white panel.
-const BUTTON_EDGE: Color = Color::from_rgb8(190, 201, 212);
+pub(crate) const BUTTON_EDGE: Color = Color::from_rgb8(190, 201, 212);
 /// The edge of a button that deletes.
 const DANGER_EDGE: Color = Color::from_rgb8(226, 172, 172);
 /// A command beside other content: white with a border, so it reads as a
@@ -247,7 +248,7 @@ fn switcher(app: &App) -> Element<'_, Message> {
         widget::tooltip::Position::Right,
     )
 }
-fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
+pub(crate) fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
     let label = label.into();
     let action = msg.clone();
     let b = button(text(label.clone()).size(13))
@@ -297,6 +298,17 @@ fn checked_field<'a>(
     target: Target,
     checks: &[&Check],
 ) -> Element<'a, Message> {
+    hinted_field(p, key, label, label, target, checks)
+}
+/// A checked text field that shows `hint` while it is empty.
+fn hinted_field<'a>(
+    p: &'a Fields,
+    key: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    target: Target,
+    checks: &[&Check],
+) -> Element<'a, Message> {
     let mark = checks
         .iter()
         .find(|c| c.error)
@@ -304,7 +316,7 @@ fn checked_field<'a>(
         .map(|c| c.colors()[1]);
     let mut c = column![
         muted(label),
-        text_input(label, get(p, key))
+        text_input(hint, get(p, key))
             .on_input(move |v| Message::Edit(target, key, v))
             .padding([7, 9])
             .size(13)
@@ -488,14 +500,20 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("name") | None => {
             return if issue.contains("feature or surface") {
                 Some("Geometry")
-            } else if issue.starts_with("Choose a tool") || issue.starts_with("Choose a drill") {
+            } else if issue.starts_with("Choose a tool")
+                || issue.starts_with("Choose a drill")
+                || issue.contains(" is not on ")
+            {
                 Some("Tool")
+            } else if issue.starts_with("The box must be") {
+                Some("Box")
             } else {
                 None
             };
         }
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
+        Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
         Some(
             "clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings" | "tab_count"
             | "tab_width" | "tab_height",
@@ -531,9 +549,19 @@ impl Checks {
         key: &'static str,
         label: &'static str,
     ) -> Element<'a, Message> {
+        self.hinted(p, key, label, label)
+    }
+    /// An operation field that shows `hint` while it is empty.
+    fn hinted<'a>(
+        &mut self,
+        p: &'a Fields,
+        key: &'static str,
+        label: &'static str,
+        hint: &'static str,
+    ) -> Element<'a, Message> {
         self.drawn.push(key);
         let at: Vec<&Check> = self.list.iter().filter(|c| c.key == Some(key)).collect();
-        checked_field(p, key, label, Target::Operation, &at)
+        hinted_field(p, key, label, hint, Target::Operation, &at)
     }
     /// The checks no field drawn shows.
     pub(crate) fn rest(&self) -> Vec<&Check> {
@@ -1033,15 +1061,25 @@ fn ribbon(app: &App) -> Element<'_, Message> {
     .spacing(2)
     .align_x(Alignment::Center);
     groups = groups.push(setup).push(rule::vertical(1));
+    let manual_setup = app
+        .doc
+        .active_setup()
+        .is_some_and(|s| manual::is_manual(&s.machine));
     for (label, range) in [
         ("2D MILLING", 0..5),
         ("3D FINISHING", 5..8),
         ("MULTI-AXIS", 8..11),
+        ("MANUAL", 11..12),
     ] {
         let mut buttons = Row::new().spacing(1);
         for s in &Strategy::ALL[range] {
             let s = *s;
-            let available = app.is_sample() || s.imported_preview();
+            let reason = if s == Strategy::Box {
+                (!manual_setup).then_some(manual::BOX_ON_CNC)
+            } else {
+                (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
+            };
+            let available = reason.is_none() && (app.is_sample() || s.imported_preview());
             // An unavailable strategy is dimmed: the icon at low opacity and
             // the label in a light grey, with its reason in the hover help.
             let glyph = icon(app, s, 29.).opacity(if available { 1. } else { DIMMED });
@@ -1061,16 +1099,16 @@ fn ribbon(app: &App) -> Element<'_, Message> {
                 .align_x(Alignment::Center),
             )
             .padding([5, 5])
-            .on_press(if available {
-                Message::AddOp(s)
-            } else {
-                Message::Page(Page::Audit)
+            .on_press(match (available, reason) {
+                (true, _) => Message::AddOp(s),
+                (false, Some(_)) => Message::Noop,
+                (false, None) => Message::Page(Page::Audit),
             })
             .style(button::text);
-            buttons = buttons.push(if available {
-                HelpButton::new(tile, &Message::AddOp(s), s.name())
-            } else {
-                HelpButton::unavailable(tile, s)
+            buttons = buttons.push(match (available, reason) {
+                (true, _) => HelpButton::new(tile, &Message::AddOp(s), s.name()),
+                (false, Some(reason)) => HelpButton::dimmed(tile, s, reason),
+                (false, None) => HelpButton::unavailable(tile, s),
             });
         }
         groups = groups
@@ -1429,6 +1467,15 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(12))
                     .padding([0, 16]),
             );
+            if manual::is_manual(&s.machine) {
+                tree = tree.push(
+                    container(
+                        secondary("Steps ▶", Message::Guide(crate::GuideAction::Open(si)))
+                            .width(Fill),
+                    )
+                    .padding([0, 10]),
+                );
+            }
             let checks = app.current_ready();
             for (i, o) in s.operations.iter().enumerate() {
                 let selected = app.selected == Some(i) && app.page == Page::Work;
@@ -1501,6 +1548,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
     tree = tree
         .push(space().height(6))
         .push(secondary("+ Add setup", Message::AddSetup).width(Fill));
+    if app.doc.machines.iter().any(manual::is_manual) {
+        tree = tree.push(secondary("+ Add manual setup", Message::AddManualSetup).width(Fill));
+    }
     let footer = column![
         rule::horizontal(1),
         muted("PROJECT UNITS"),
@@ -2196,7 +2246,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 .push(secondary("Open tool library", Message::Page(Page::Tools)))
                 .push(section("Feeds & speeds"))
                 .push(checks.field(p, "rpm", "Spindle speed · rpm"));
-            if o.strategy.imported_preview() && !app.is_sample() {
+            if o.strategy.imported_preview() && o.strategy != Strategy::Box && !app.is_sample() {
                 c = c
                     .push(choice_value(
                         p,
@@ -2387,8 +2437,40 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ));
             }
         }
+        "Box" => {
+            c = c.push(note("The block to remove, in the setup's frame from the work zero. Passes run along the longer side."));
+            for (a, b) in [
+                (("x_min", "X min · mm"), ("x_max", "X max · mm")),
+                (("y_min", "Y min · mm"), ("y_max", "Y max · mm")),
+                (("z_top", "Z top · mm"), ("z_bottom", "Z bottom · mm")),
+            ] {
+                c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
+            }
+            if app.part_mesh().is_some() && !app.is_sample() {
+                let count = o.surfaces.as_ref().map_or(0, |s| s.ids.len());
+                c = c
+                    .push(section("From the part"))
+                    .push(note("Pick one flat face: a floor facing up, or a wall facing sideways. Drag to orbit, then click Finish picking."))
+                    .push(
+                        btn(
+                            if app.picking {
+                                "Finish picking"
+                            } else {
+                                "Select face on part"
+                            },
+                            Message::PickMode,
+                            app.picking,
+                        )
+                        .width(Fill),
+                    )
+                    .push(muted(format!("{} selected", plural(count, "face"))))
+                    .push(secondary("From selected face", Message::BoxFromFace).width(Fill));
+            }
+        }
         "Heights" => {
-            c = c.push(note(if !app.is_sample() && o.strategy == Strategy::Face {
+            c = c.push(note(if o.strategy == Strategy::Box {
+                "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
+            } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
             } else if !app.is_sample() && o.strategy == Strategy::Pocket {
                 "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
@@ -2410,7 +2492,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ("top", "Top offset · mm"),
                 ("bottom", "Bottom offset · mm"),
             ] {
-                c = c.push(checks.field(p, k, label));
+                if o.strategy != Strategy::Box || !matches!(k, "top" | "bottom") {
+                    c = c.push(checks.field(p, k, label));
+                }
             }
             if !app.is_sample()
                 && o.strategy == Strategy::Contour
@@ -2671,6 +2755,14 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
     let t = Target::Operation;
     let s = o.strategy;
     let mut c = Column::new().spacing(12);
+    if s == Strategy::Box {
+        return c
+            .push(checks.field(p, "allowance", "Stock to leave · mm"))
+            .push(checks.field(p, "stepover", "Stepover · % tool diameter"))
+            .push(checks.hinted(p, "stepdown", "Maximum stepdown · mm", "Auto"))
+            .push(note("Stock to leave stays on every side that touches the part, for the CNC to finish; 0 makes the cut final. Leave the stepdown empty for Auto."))
+            .into();
+    }
     if !app.is_sample()
         && matches!(
             s,
@@ -3681,13 +3773,42 @@ fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
     }
     c.into()
 }
-/// The picker of the library's vises or clamps (`kind`) for the active setup.
-fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
-    let choices: Vec<Named> = app
-        .doc
+/// A check box per library machine for the `machines` of a tool or holder
+/// (`p`): none checked fits every CNC machine.
+fn machine_boxes<'a>(
+    app: &'a App,
+    p: &Fields,
+    toggle: fn(String, bool) -> Message,
+) -> Element<'a, Message> {
+    let listed: Vec<&str> = get(p, "machines").split(',').map(str::trim).collect();
+    let mut c = column![muted("Machines")].spacing(5);
+    for m in &app.doc.machines {
+        let id = m.id.clone();
+        c = c.push(help::wrap(
+            checkbox(listed.contains(&m.id.as_str()))
+                .label(m.name().to_string())
+                .on_toggle(move |on| toggle(id.clone(), on))
+                .text_size(12),
+            help::command(&toggle(m.id.clone(), true), m.name().to_string()),
+            widget::tooltip::Position::Right,
+        ));
+    }
+    c.push(muted("None checked: every CNC machine.").size(12))
+        .into()
+}
+/// The library's vises or clamps (`kind`) that fit the active setup's machine.
+pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::holding::Holder> {
+    let machine = &app.doc.setup().machine;
+    app.doc
         .workholding
         .iter()
-        .filter(|h| h.kind() == kind)
+        .filter(|h| h.kind() == kind && manual::fits(get(&h.p, "machines"), machine))
+        .collect()
+}
+/// The picker of the library's vises or clamps (`kind`) for the active setup.
+fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
+    let choices: Vec<Named> = fitting_holders(app, kind)
+        .into_iter()
         .map(|h| Named {
             id: h.id.clone(),
             name: h.name().to_string(),
@@ -4168,7 +4289,11 @@ fn machines(app: &App) -> Element<'_, Message> {
                 space().width(35),
                 muted(format!("Spindle  {} rpm", get(&m.p, "rpm"))),
                 space().width(35),
-                muted(format!("Controller  {}", get(&m.p, "controller"))),
+                muted(if manual::is_manual(m) {
+                    "Manual mill  ·  no G-code".to_string()
+                } else {
+                    format!("Controller  {}", get(&m.p, "controller"))
+                }),
                 space().width(35),
                 muted(get(&m.p, "arrangement"))
             ]
@@ -4203,43 +4328,103 @@ fn machines(app: &App) -> Element<'_, Message> {
     .height(Fill)
     .into()
 }
+/// The wizard's steps for `m`: a manual mill has no kinematics or controller
+/// to describe, and one step of its own in their place.
+pub(crate) fn wizard_steps(m: &Machine) -> Vec<&'static str> {
+    if manual::is_manual(m) {
+        vec!["Identity", "Travel & spindle", "Manual mill", "Review"]
+    } else {
+        vec![
+            "Identity",
+            "Travel & spindle",
+            "Kinematics",
+            "Controller",
+            "Review",
+        ]
+    }
+}
 fn wizard(app: &App) -> Element<'_, Message> {
     let m = &app.machine_draft;
     let p = &m.p;
     let t = Target::Machine;
-    let steps = [
-        "Identity",
-        "Travel & spindle",
-        "Kinematics",
-        "Controller",
-        "Review",
-    ];
+    let steps = wizard_steps(m);
+    let step = app.wizard_step.min(steps.len() - 1);
     let mut nav = Row::new().spacing(8);
     for (i, label) in steps.iter().enumerate() {
         nav = nav.push(btn(
             format!("{}  {label}", i + 1),
             Message::WizardStep(i),
-            i == app.wizard_step,
+            i == step,
         ));
     }
-    let mut form = column![bold(steps[app.wizard_step], 22)].spacing(16);
-    match app.wizard_step {
-        0 => {
-            form=form.push(field(p,"name","Machine name",t)).push(choice(p,"axes","Number of axes",&["3","4","5"],t)).push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
+    let mut form = column![bold(steps[step], 22)].spacing(16);
+    match steps[step] {
+        "Identity" => {
+            form = form
+                .push(field(p, "name", "Machine name", t))
+                .push(choice_value(
+                    p,
+                    if manual::is_manual(m) {
+                        "Manual"
+                    } else {
+                        "CNC"
+                    },
+                    "kind",
+                    "Machine kind",
+                    &["CNC", "Manual"],
+                    t,
+                ));
+            if !manual::is_manual(m) {
+                form = form.push(choice(p, "axes", "Number of axes", &["3", "4", "5"], t));
+            }
+            form=form.push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
         }
-        1 => {
-            for (k, l) in [
-                ("x", "X travel"),
-                ("y", "Y travel"),
-                ("z", "Z travel"),
-                ("rpm", "Maximum spindle speed · rpm"),
-                ("power", "Spindle power · W"),
-                ("feed", "Maximum feed · machine units/min"),
-            ] {
+        "Travel & spindle" => {
+            let spindle = if manual::is_manual(m) {
+                vec![
+                    ("power", "Spindle power · W"),
+                    ("speeds", "Spindle speeds · rpm, or a range"),
+                    ("hand_feed", "Hand feed · mm/min"),
+                    ("hand_rapid", "Hand rapid · mm/min"),
+                    ("turn_x", "X per handwheel turn · mm"),
+                    ("turn_y", "Y per handwheel turn · mm"),
+                    ("turn_z", "Z per handwheel turn · mm"),
+                ]
+            } else {
+                vec![
+                    ("rpm", "Maximum spindle speed · rpm"),
+                    ("power", "Spindle power · W"),
+                    ("feed", "Maximum feed · machine units/min"),
+                ]
+            };
+            for (k, l) in [("x", "X travel"), ("y", "Y travel"), ("z", "Z travel")]
+                .into_iter()
+                .chain(spindle)
+            {
                 form = form.push(field(p, k, l, t));
             }
         }
-        2 => {
+        "Manual mill" => {
+            form = form
+                .push(choice(
+                    p,
+                    "dro_comp",
+                    "DRO tool radius compensation",
+                    &["Yes", "No"],
+                    t,
+                ))
+                .push(field(p, "edge_finder", "Edge finder diameter · mm", t))
+                .push(field(p, "pass_time", "Time per pass · s", t))
+                .push(field(p, "tool_time", "Time per tool change · min", t))
+                .push(field(
+                    p,
+                    "move_time",
+                    "Time to move the stock to another machine · min",
+                    t,
+                ))
+                .push(note("Manual mill — no G-code; MACHINE shows the steps."));
+        }
+        "Kinematics" => {
             let modes = match m.axes() {
                 4 => vec!["Indexed (3+1)", "Continuous 4-axis"],
                 5 => vec!["Indexed (3+2)", "Simultaneous 5-axis"],
@@ -4321,7 +4506,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 ));
             }
         }
-        3 => {
+        "Controller" => {
             form=form.push(choice(p,"controller","Controller / intended postprocessor",&["LinuxCNC","UC100","GRBL","Mach3 / Mach4","Fanuc","Haas","Siemens","Heidenhain","Custom"],t)).push(choice(p,"tool_change","Tool change",&["Manual","Automatic"],t)).push(choice(p,"tcp","Tool center point control",&["No","Yes"],t)).push(note("LinuxCNC has a 3-axis postprocessor. AXIS CAM drives a UC100 machine itself. Other controllers are saved for planning; exporting G-code for them is refused."));
             if get(p, "controller") == "LinuxCNC" {
                 form = form
@@ -4400,6 +4585,15 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: I/O pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
+        _ if manual::is_manual(m) => {
+            form = form
+                .push(bold(m.name(), 18))
+                .push(muted(format!("Manual mill · speeds {} rpm", get(p, "speeds"))))
+                .push(muted(format!("Travel: {} × {} × {} {}", get(p, "x"), get(p, "y"), get(p, "z"), get(p, "units"))))
+                .push(muted(format!("Hand feed {} · hand rapid {} mm/min", get(p, "hand_feed"), get(p, "hand_rapid"))))
+                .push(warnings(m.issues()))
+                .push(note("Save this profile to your local library. Assign it to a setup, or add a manual setup, to cut on it."));
+        }
         _ => {
             form=form.push(bold(m.name(),18)).push(muted(format!("{}-axis · {} · {}",m.axes(),get(p,"mode"),get(p,"controller")))).push(muted(format!("Travel: {} × {} × {} {}",get(p,"x"),get(p,"y"),get(p,"z"),get(p,"units")))).push(muted(format!("Spindle: {} rpm · Feed: {} {}/min",get(p,"rpm"),get(p,"feed"),get(p,"units")))).push(muted(format!("Post: {} · {} · G64 P{} · dwell {} s", post_setting(p, "post_tool_length"), post_setting(p, "post_retract"), post_setting(p, "post_blend"), post_setting(p, "post_dwell")))).push(warnings(m.issues())).push(note("Save this profile to your local library. Assign it to a setup to capture this version of its settings."));
         }
@@ -4409,14 +4603,11 @@ fn wizard(app: &App) -> Element<'_, Message> {
         space().width(Fill)
     ]
     .spacing(8);
-    if app.wizard_step > 0 {
-        actions = actions.push(secondary(
-            "Previous",
-            Message::WizardStep(app.wizard_step - 1),
-        ));
+    if step > 0 {
+        actions = actions.push(secondary("Previous", Message::WizardStep(step - 1)));
     }
-    actions = actions.push(if app.wizard_step < 4 {
-        primary("Continue", Message::WizardStep(app.wizard_step + 1))
+    actions = actions.push(if step + 1 < steps.len() {
+        primary("Continue", Message::WizardStep(step + 1))
     } else {
         primary(
             app.resume_label().unwrap_or("Save machine profile".into()),
@@ -4597,6 +4788,11 @@ pub(crate) fn limits_off_warning(
 fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
+    // A setup on the manual mill shows its steps, with or without the CNC
+    // connected.
+    if app.steps_page() {
+        return crate::steps::view(app);
+    }
     let target = app.control_target();
     let mut left = column![bold("Machine", 18)].spacing(10);
     let machines: Vec<&Machine> = app
@@ -5376,6 +5572,14 @@ fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
     }
 }
 
+/// The setups the Run strip lists for machine `machine_id`: those that use
+/// it, except a manual mill's, which have steps instead of a run.
+pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize, &'a Setup)> {
+    (doc.setups.iter().enumerate())
+        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_manual(&x.machine))
+        .collect()
+}
+
 /// The Run strip: the setup of this machine run tool run by tool run, with
 /// Cycle Start, Hold, Resume and Stop, fixed above the part of the Control
 /// page that scrolls, so they never scroll out of sight below the tool-run
@@ -5394,13 +5598,7 @@ pub(crate) fn run_strip<'a>(
     let running = c.run.as_ref().is_some_and(|r| r.running.is_some());
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let mut body = column![].spacing(10);
-    let setups: Vec<(usize, &Setup)> = app
-        .doc
-        .setups
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.machine.id == c.machine_id)
-        .collect();
+    let setups = run_setups(&app.doc, &c.machine_id);
     if setups.is_empty() {
         body = body.push(muted("No setup uses this machine. In MANUFACTURE, choose it as a setup's machine (Assign to current setup) to run that setup here."));
     } else {
@@ -6246,6 +6444,7 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     if get(p, "type") == "Chamfer mill" {
         form = form.push(field(p, "tip_angle", "Tip angle · °", t));
     }
+    form = form.push(machine_boxes(app, p, Message::ToolMachine));
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues));
@@ -6424,6 +6623,7 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let mut issues = draft.issues();
     issues.extend(app.doc.holder_name_issues(draft));
     form = form
+        .push(machine_boxes(app, p, Message::HolderMachine))
         .push(field(p, "notes", "Notes", t))
         .push(warnings(issues));
     let (save, delete) = holder_labels(draft);
@@ -6833,6 +7033,7 @@ pub(crate) fn preview_totals(outcome: &crate::planner::Outcome) -> Vec<String> {
         check.total_minutes,
         plural(outcome.requests, "model request"),
     )];
+    lines.extend(check.split_line());
     if let Some(error) = &outcome.note {
         lines.push(format!("A follow-up request failed: {}", error.message()));
     }
@@ -7956,6 +8157,8 @@ pub(crate) enum NcCard<'a> {
         problems: &'a [String],
         setup: usize,
     },
+    /// A manual mill's setup: no program, its steps are on the MACHINE page.
+    Manual,
 }
 /// The NC review page, before it is drawn: its words and its setups' cards.
 pub(crate) struct NcPage<'a> {
@@ -7975,7 +8178,7 @@ impl NcPage<'_> {
     pub(crate) fn problems(&self) -> Vec<&str> {
         let cards = self.cards.iter().flat_map(|(_, card)| match card {
             NcCard::Refused(p) | NcCard::Run { problems: p, .. } => p.iter(),
-            NcCard::Programs(_) => [].iter(),
+            NcCard::Programs(_) | NcCard::Manual => [].iter(),
         });
         self.errors
             .iter()
@@ -8031,7 +8234,11 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
         for s in &job.setups {
             let uc100 = (app.doc.setups.get(s.setup))
                 .is_some_and(|x| get(&x.machine.p, "controller") == "UC100");
-            let card = if uc100 {
+            let manual =
+                (app.doc.setups.get(s.setup)).is_some_and(|x| crate::manual::is_manual(&x.machine));
+            let card = if manual {
+                NcCard::Manual
+            } else if uc100 {
                 NcCard::Run {
                     problems: match &s.run {
                         Some(Err(problems)) => problems,
@@ -8103,6 +8310,9 @@ fn post(app: &App) -> Element<'_, Message> {
                         summary = summary
                             .push(bold(format!("!  {name}"), 13))
                             .push(warnings(problems.to_vec()));
+                    }
+                    NcCard::Manual => {
+                        summary = summary.push(muted(crate::manual::no_gcode(name)));
                     }
                     NcCard::Run { problems, setup } => {
                         let mark = if problems.is_empty() { "✓" } else { "!" };
@@ -8583,5 +8793,34 @@ mod tests {
             scan(&root.join(path), &mut hits);
         }
         assert!(hits.is_empty(), "mojibake found:\n{}", hits.join("\n"));
+    }
+
+    #[test]
+    fn the_run_strip_lists_no_manual_setup() {
+        use crate::model::{Document, Machine, Setup};
+        let (cnc, big) = (Machine::new(3), crate::manual::defaults());
+        let doc = Document {
+            setups: vec![
+                Setup::new(big.clone(), "G54"),
+                Setup::new(cnc.clone(), "G55"),
+                Setup::new(cnc.clone(), "G56"),
+            ],
+            ..Default::default()
+        };
+        let listed = |id: &str| -> Vec<usize> {
+            super::run_setups(&doc, id)
+                .iter()
+                .map(|(si, _)| *si)
+                .collect()
+        };
+        assert_eq!(listed(&cnc.id), vec![1, 2]);
+        assert!(listed(&big.id).is_empty());
+        // Even a manual mill that claims the UC100 controller.
+        let mut clash = doc.clone();
+        clash.setups[0]
+            .machine
+            .p
+            .insert("controller".into(), "UC100".into());
+        assert!(super::run_setups(&clash, &big.id).is_empty());
     }
 }

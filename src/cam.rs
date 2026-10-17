@@ -168,6 +168,10 @@ struct Builder {
     clearance: f32,
     retract: f32,
     retract_margin: f32,
+    /// Rapid rate, mm/min: the hand rapid on a manual mill.
+    rapid: f32,
+    /// A manual mill moves one axis at a time (`push`).
+    single_axis: bool,
 }
 impl Builder {
     fn new(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Self, String> {
@@ -206,6 +210,14 @@ impl Builder {
         if !crate::model::SPINDLE_ROTATIONS.contains(&facing_setting(&op.p, "spindle_rotation")) {
             return Err("Choose a valid spindle rotation.".into());
         }
+        let single_axis = crate::manual::is_manual(&setup.machine);
+        let rapid = if single_axis {
+            num(&setup.machine.p, "hand_rapid")
+                .filter(|v| *v > 0.)
+                .ok_or("Enter a positive hand rapid for the manual mill.")?
+        } else {
+            6000.
+        };
         Ok(Self {
             plan: Plan {
                 strategy: op.strategy,
@@ -235,9 +247,29 @@ impl Builder {
             clearance,
             retract,
             retract_margin: number(op, "retract")?,
+            rapid,
+            single_axis,
         })
     }
+    /// A move to `to`. With `single_axis`, legs of one axis each: Z first
+    /// when it rises, then X, then Y, then Z when it falls.
     fn push(&mut self, to: [f32; 3], motion: Motion, cut: bool, rate: f32) -> Result<(), String> {
+        if !self.single_axis {
+            return self.leg(to, motion, cut, rate);
+        }
+        let order = if to[2] > self.pos[2] {
+            [2, 0, 1]
+        } else {
+            [0, 1, 2]
+        };
+        let mut at = self.pos;
+        for k in order {
+            at[k] = to[k];
+            self.leg(at, motion, cut, rate)?;
+        }
+        Ok(())
+    }
+    fn leg(&mut self, to: [f32; 3], motion: Motion, cut: bool, rate: f32) -> Result<(), String> {
         if self.plan.moves.len() >= LIMIT {
             return Err("Preview exceeds 30,000 moves. Increase spacing or stepdown.".into());
         }
@@ -264,12 +296,28 @@ impl Builder {
         self.pos = to;
         Ok(())
     }
+    /// A stop of `seconds` where the tool is; none for 0.
+    fn dwell(&mut self, seconds: f32) {
+        if seconds > 0. {
+            let end = self.plan.duration + seconds;
+            self.plan.moves.push(Move {
+                from: self.pos,
+                to: self.pos,
+                motion: Motion::Dwell,
+                cutting_pass: false,
+                feed: 0.,
+                start: self.plan.duration,
+                end,
+            });
+            self.plan.duration = end;
+        }
+    }
     fn retract(&mut self) -> Result<(), String> {
         self.push(
             [self.pos[0], self.pos[1], self.clearance],
             Motion::Rapid,
             false,
-            6000.,
+            self.rapid,
         )
     }
     fn start(&mut self, p: [f32; 3]) -> Result<(), String> {
@@ -277,11 +325,16 @@ impl Builder {
     }
     fn start_at(&mut self, p: [f32; 3], top: Option<f32>) -> Result<(), String> {
         self.retract()?;
-        self.push([p[0], p[1], self.clearance], Motion::Rapid, false, 6000.)?;
+        self.push(
+            [p[0], p[1], self.clearance],
+            Motion::Rapid,
+            false,
+            self.rapid,
+        )?;
         let approach = top.map_or(self.retract, |z| {
             (z + self.retract_margin).min(self.retract)
         });
-        self.push([p[0], p[1], approach], Motion::Rapid, false, 6000.)?;
+        self.push([p[0], p[1], approach], Motion::Rapid, false, self.rapid)?;
         self.push(p, Motion::Feed, false, self.feed * 0.25)
     }
     fn stroke(&mut self, points: &[[f32; 3]]) -> Result<(), String> {
@@ -338,6 +391,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         Strategy::Drill => drill(setup, op, tool, mesh),
         Strategy::Parallel => parallel(setup, op, tool, mesh),
         Strategy::Waterline => waterline(setup, op, tool, mesh),
+        Strategy::Box => boxed(setup, op, tool, mesh),
         _ => Err(op.strategy.availability().into()),
     }
 }
@@ -519,6 +573,274 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             }
         }
     }
+    b.finish()
+}
+/// How near a box side must be to a stock face to be open, and how far the
+/// cut may touch the part, mm.
+pub(crate) const ON: f32 = 0.001;
+/// A Box's block in the stock frame: its keys (`BOX_FIELDS`, work frame)
+/// moved by the work zero `zero`, as (low corner, high corner).
+pub(crate) fn box_block(op: &Operation, zero: [f32; 3]) -> Result<([f32; 3], [f32; 3]), String> {
+    let [x0, x1, y0, y1, z1, z0] = crate::model::BOX_FIELDS.map(|k| number(op, k));
+    Ok((
+        [x0? + zero[0], y0? + zero[1], z0? + zero[2]],
+        [x1? + zero[0], y1? + zero[1], z1? + zero[2]],
+    ))
+}
+/// Which sides of the block `low`..`high` are open on the stock `s`, as
+/// [low side, high side] per axis: a side on or beyond the stock's face.
+/// The others, and a floor (`[2][0]`) above the stock's bottom, are closed
+/// and keep the allowance; the top keeps none whatever it is.
+pub(crate) fn open_sides(low: [f32; 3], high: [f32; 3], s: &Bounds) -> [[bool; 2]; 3] {
+    std::array::from_fn(|k| [low[k] <= s.min[k] + ON, high[k] >= s.max[k] - ON])
+}
+/// What a Box cuts of the block `low`..`high` on the stock `s`: the block
+/// inside the stock, its closed sides and floor (`open_sides`) moved in by
+/// `allowance`, as (low corner, high corner).
+pub(crate) fn box_cut(
+    low: [f32; 3],
+    high: [f32; 3],
+    s: &Bounds,
+    allowance: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let open = open_sides(low, high, s);
+    let keep = |open: bool| if open { 0. } else { allowance };
+    (
+        std::array::from_fn(|k| low[k].max(s.min[k]) + keep(open[k][0])),
+        std::array::from_fn(|k| high[k].min(s.max[k]) - if k == 2 { 0. } else { keep(open[k][1]) }),
+    )
+}
+/// Whether triangle `t` meets box `b`: no separating axis among the box's
+/// faces, the triangle's plane and the nine edge crossings.
+fn meets(t: &[[f32; 3]; 3], b: &Bounds) -> bool {
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let half: [f32; 3] = std::array::from_fn(|k| (b.max[k] - b.min[k]) / 2.);
+    let v = t.map(|p| std::array::from_fn::<f32, 3, _>(|k| p[k] - (b.min[k] + b.max[k]) / 2.));
+    let edges: [[f32; 3]; 3] =
+        std::array::from_fn(|i| std::array::from_fn(|k| v[(i + 1) % 3][k] - v[i][k]));
+    let apart = |axis: [f32; 3]| {
+        let p = v.map(|q| dot(q, axis));
+        let reach: f32 = (0..3).map(|k| half[k] * axis[k].abs()).sum();
+        p.iter().copied().fold(f32::INFINITY, f32::min) > reach
+            || p.iter().copied().fold(f32::NEG_INFINITY, f32::max) < -reach
+    };
+    let units: [[f32; 3]; 3] =
+        std::array::from_fn(|i| std::array::from_fn(|k| (i == k) as u8 as f32));
+    !(units.iter().any(|&u| apart(u))
+        || apart(cross(edges[0], edges[1]))
+        || units
+            .iter()
+            .any(|&u| edges.iter().any(|&e| apart(cross(u, e)))))
+}
+/// A Box on a manual mill: the block `x_min`..`z_bottom`, in the setup's work
+/// frame (`post::datum` on the stock the setup starts from), cleared in rows
+/// along its longer side, every move along one axis. Its sides on or beyond
+/// the stock's faces are open; the others, and a floor above the stock's
+/// bottom, keep `allowance`. Rows start at the open side and step toward the
+/// uncut material, which stays on the left of the feed (conventional, M3).
+fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    if !crate::manual::is_manual(&setup.machine) {
+        return Err("Box runs on a manual mill.".into());
+    }
+    let mut b = Builder::new(setup, op, tool, mesh)?;
+    if get(&tool.p, "type") != "Flat end mill" {
+        return Err("Box needs a flat end mill.".into());
+    }
+    let (s, r) = (b.plan.stock, b.plan.radius);
+    let zero = crate::post::datum(setup, s, mesh)?;
+    let (low, high) = box_block(op, zero)?;
+    let allowance = number(op, "allowance")?;
+    let stepover = number(op, "stepover")?;
+    if (0..3).any(|k| low[k] >= high[k]) || allowance < 0. || !(10. ..=100.).contains(&stepover) {
+        return Err("Give the box a positive size, a stock to leave of 0 or more and a stepover of 10–100 %.".into());
+    }
+    // 1. Open sides, and the cut inside the stock and the allowance.
+    let open = open_sides(low, high, &s);
+    let (lo, hi) = box_cut(low, high, &s, allowance);
+    if lo[2] >= hi[2] - ON || (0..2).any(|k| lo[k] >= hi[k]) {
+        return Err(
+            "The box leaves nothing to cut inside the stock and the stock to leave.".into(),
+        );
+    }
+    // 2. Passes along the longer side.
+    let size = |k: usize| high[k].min(s.max[k]) - low[k].max(s.min[k]);
+    let (p, c) = if size(0) >= size(1) { (0, 1) } else { (1, 0) };
+    // The stepdown: given, or what the spindle takes at a full stepover,
+    // at the operation's rpm with the tool's flutes. The project's material
+    // does not reach `generate`: it is counted as steel, the hardest common
+    // group but stainless. Rows cut one stepover wide, except the first row
+    // of a box closed on both cross-axis sides: it starts inside the stock
+    // and cuts a full slot, the tool's whole diameter, so the depth is
+    // sized for that width.
+    let width = stepover / 100. * 2. * r;
+    let down = if get(&op.p, "stepdown").trim().is_empty() {
+        let rpm = number(op, "rpm").ok().filter(|n| *n > 0.);
+        let flutes = num(&tool.p, "flutes").filter(|z| *z >= 1.);
+        let (Some(rpm), Some(flutes)) = (rpm, flutes) else {
+            return Err("An automatic stepdown needs a positive rpm and the tool's flutes.".into());
+        };
+        let slot = open[c] == [false, false];
+        let cut_width = if slot { 2. * r } else { width };
+        crate::forces::power_stepdown(&setup.machine, None, 2. * r, cut_width, b.feed, rpm, flutes)
+            .min(b.plan.flute_length)
+    } else {
+        number(op, "stepdown")?
+    };
+    if !(down > 0. && down <= b.plan.flute_length) {
+        return Err("Use a stepdown within the flute length.".into());
+    }
+    // Equal steps of at most `by` from `from` (left out) to exactly `to`.
+    let steps = |from: f32, to: f32, by: f32| -> Vec<f32> {
+        let n = ((to - from).abs() / by - 0.0001)
+            .ceil()
+            .clamp(1., LIMIT as f32) as usize;
+        (1..=n)
+            .map(|i| {
+                if i == n {
+                    to
+                } else {
+                    from + (to - from) * i as f32 / n as f32
+                }
+            })
+            .collect()
+    };
+    // 4. Rows from the open side (else −) toward the closed side (else +).
+    let side = open[c];
+    let (first, last) = match side {
+        [false, true] => ((hi[c] - width + r).max(hi[c]), lo[c] + r),
+        [false, false] => (lo[c] + r, hi[c] - r),
+        _ if side[1] => (
+            (lo[c] + width - r).min(lo[c]),
+            (hi[c] - width + r).max(hi[c]),
+        ),
+        _ => ((lo[c] + width - r).min(lo[c]), hi[c] - r),
+    };
+    let toward = if side == [false, true] { -1. } else { 1. };
+    if (last - first) * toward < -ON && side == [false, false] {
+        return Err("The box is narrower than the tool after the stock to leave.".into());
+    }
+    let rows = if (last - first) * toward > ON {
+        [vec![first], steps(first, last, width)].concat()
+    } else {
+        vec![last]
+    };
+    // Conventional with M3: the uncut material (toward) on the left of the
+    // feed. Left of +X is +Y, left of +Y is −X.
+    let forward = if p == 0 { toward } else { -toward };
+    let ends = open[p];
+    let near = [
+        if ends[0] {
+            s.min[p] - r - 2.
+        } else {
+            lo[p] + r
+        },
+        if ends[1] {
+            s.max[p] + r + 2.
+        } else {
+            hi[p] - r
+        },
+    ];
+    if near[1] < near[0] {
+        return Err("The box is shorter than the tool after the stock to leave.".into());
+    }
+    let (start, end, outside) = if forward > 0. {
+        (near[0], near[1], ends[0])
+    } else {
+        (near[1], near[0], ends[1])
+    };
+    // 6. The cut, from the floor up through the stock top, clear of the part.
+    let mut cut = Bounds {
+        min: [0., 0., lo[2] + ON],
+        max: [0., 0., s.max[2]],
+    };
+    for (k, a, z) in [(p, start, end), (c, rows[0], rows[rows.len() - 1])] {
+        cut.min[k] = (a.min(z) - r).max(s.min[k]) + ON;
+        cut.max[k] = (a.max(z) + r).min(s.max[k]) - ON;
+    }
+    if let Some(t) = Geometry::new(setup, mesh)
+        .triangles
+        .iter()
+        .find(|t| meets(&t.p, &cut))
+    {
+        let at: [f32; 3] = std::array::from_fn(|k| {
+            let (a, z) =
+                t.p.iter()
+                    .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, z), q| {
+                        (a.min(q[k]), z.max(q[k]))
+                    });
+            (a.max(cut.min[k]) + z.min(cut.max[k])) / 2. - zero[k]
+        });
+        return Err(format!(
+            "The box cuts into the part at X{:.2}, Y{:.2}, Z{:.2}.",
+            at[0], at[1], at[2]
+        ));
+    }
+    // 3. Levels from the highest material left in the cut, whatever `z_top`
+    // says: the flutes take all of it, so no level is deeper than `stepdown`.
+    let top = crate::rest::start(setup, cut, lo[2], s.max[2], 0.);
+    b.plan.rest_top = (top < s.max[2] - 0.0001).then_some(top);
+    let levels = steps(top, lo[2], down);
+    // 5. Each row: up, along, across, down, a pause to set the axes, one
+    // feed, up. A row that starts inside the stock does not go up between
+    // rows of a level: one plunge at the level's first row; after each
+    // pass the tool backs off the wall it just cut (at most 0.2 mm, never
+    // past the stock to leave), returns along the cleared row and feeds
+    // across into the next row.
+    let pause = num(&setup.machine.p, "pass_time")
+        .filter(|t| *t >= 0.)
+        .unwrap_or(0.);
+    let rapid = b.rapid;
+    // The room behind a row, away from the uncut material, before the cut's
+    // edge on that side: unbounded when that side is open.
+    let behind = usize::from(toward < 0.);
+    let room = |row: f32| match open[c][behind] {
+        true => f32::INFINITY,
+        false => ((row - toward * r) - [lo[c], hi[c]][behind]) * toward,
+    };
+    for &z in &levels {
+        for (i, &row) in rows.iter().enumerate() {
+            let mut at = b.pos;
+            if i > 0 && !outside {
+                at[c] -= toward * room(at[c]).clamp(0., 0.2);
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[p] = start;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[c] = row;
+                b.push(at, Motion::Feed, false, b.feed)?;
+            } else {
+                at[2] = b.retract;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[p] = start;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[c] = row;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[2] = z;
+                if outside {
+                    b.push(at, Motion::Rapid, false, rapid)?;
+                } else {
+                    b.push(at, Motion::Feed, false, b.feed * 0.25)?;
+                }
+            }
+            b.dwell(pause);
+            at[p] = end;
+            b.push(at, Motion::Feed, true, b.feed)?;
+            if outside || i + 1 == rows.len() {
+                at[2] = b.retract;
+                b.push(at, Motion::Rapid, false, rapid)?;
+            }
+        }
+    }
+    b.plan.milling_direction = "Conventional";
+    b.plan.spindle_clockwise = true;
+    b.plan.target = lo[2];
+    b.plan.levels = levels.len();
     b.finish()
 }
 /// The stock, mm, a tab must reach past the cut's outer edge.
@@ -1112,13 +1434,13 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
                     [h.center[0], h.center[1], retract],
                     Motion::Rapid,
                     false,
-                    6000.,
+                    b.rapid,
                 )?;
                 b.push(
                     [h.center[0], h.center[1], (depth + 0.1).min(top)],
                     Motion::Rapid,
                     false,
-                    6000.,
+                    b.rapid,
                 )?;
             }
         }
@@ -1127,19 +1449,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             if !(0. ..=600.).contains(&dwell) {
                 return Err("Dwell must be 0–600 seconds.".into());
             }
-            if dwell > 0. {
-                let end = b.plan.duration + dwell;
-                b.plan.moves.push(Move {
-                    from: b.pos,
-                    to: b.pos,
-                    motion: Motion::Dwell,
-                    cutting_pass: false,
-                    feed: 0.,
-                    start: b.plan.duration,
-                    end,
-                });
-                b.plan.duration = end;
-            }
+            b.dwell(dwell);
         }
         b.retract()?;
     }
@@ -2380,7 +2690,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn all_eleven_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn all_twelve_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -2397,8 +2707,641 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            6
+            7
         );
+    }
+    /// FNV-1a over every bit of every move, and the move count and duration.
+    fn fingerprint(plan: &Plan) -> (usize, u32, u64) {
+        let mut h = 0xcbf29ce484222325u64;
+        for m in &plan.moves {
+            let words = m
+                .from
+                .iter()
+                .chain(&m.to)
+                .chain([&m.feed, &m.start, &m.end]);
+            for w in words
+                .map(|v| v.to_bits())
+                .chain([m.motion as u32, m.cutting_pass as u32])
+            {
+                h = (h ^ u64::from(w)).wrapping_mul(0x100000001b3);
+            }
+        }
+        (plan.moves.len(), plan.duration.to_bits(), h)
+    }
+    #[test]
+    fn cnc_drill_and_contour_plans_are_unchanged() {
+        let (setup, op, tool) = fixture(Strategy::Contour);
+        let contour = generate(&setup, &op, &tool, &block()).unwrap();
+        let mesh = hole_part();
+        let (setup, mut op, tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        op.p.insert("cycle".into(), "Chip breaking".into());
+        let drill = generate(&setup, &op, &tool, &mesh).unwrap();
+        // Taken before the manual mill's rapid and single-axis moves.
+        assert_eq!(
+            fingerprint(&contour),
+            (355, 1111861812, 9253085170742949517)
+        );
+        assert_eq!(fingerprint(&drill), (14, 1088593833, 9009359337400031547));
+    }
+    /// Every move of `plan` changes at most one of X, Y and Z, and a dwell none.
+    fn assert_single_axis(plan: &Plan) {
+        for m in &plan.moves {
+            let moved = (0..3).filter(|&k| m.from[k] != m.to[k]).count();
+            assert!(moved <= 1, "{m:?}");
+            assert!(m.motion != Motion::Dwell || moved == 0, "{m:?}");
+        }
+    }
+    /// A Box on the manual mill's defaults: a 120 × 80 × 40 block (plan X
+    /// −60..60, Y −40..40, Z 0..40, the work zero on the top's centre, so a
+    /// work Z is the plan Z less 40) round the `block()` part (X −10..10,
+    /// Y −8..8, Z ≈ 0.57..8.57), a Ø25 end mill with 40 mm flutes.
+    /// `b` is the box: x_min, x_max, y_min, y_max, z_top, z_bottom.
+    fn big_mill(b: [f32; 6]) -> (Setup, Operation, Tool) {
+        let mut setup = Setup::new(crate::manual::defaults(), "G54");
+        for (k, v) in [
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "120"),
+            ("stock_y", "80"),
+            ("stock_z", "40"),
+        ] {
+            setup.p.insert(k.into(), v.into());
+        }
+        let mut tool = Tool::new("End mill 25", "Flat end mill", "25");
+        for (k, v) in [("length", "40"), ("stickout", "60")] {
+            tool.p.insert(k.into(), v.into());
+        }
+        tool.p.insert("machines".into(), setup.machine.id.clone());
+        let mut op = Operation::new(Strategy::Box, tool.id.clone());
+        for (k, v) in crate::model::BOX_FIELDS.iter().zip(b) {
+            op.p.insert((*k).into(), v.to_string());
+        }
+        (setup, op, tool)
+    }
+    /// Every row of a Box `plan` is conventional with M3, by the rule the
+    /// CNC's one-way facing is checked with (`simulation::uncut_sides`): the
+    /// uncut material on the left of the feed. The rows' sides, for checks
+    /// that there are some.
+    fn assert_conventional(plan: &Plan) -> Vec<f32> {
+        let along = |m: &Move| usize::from(m.from[1] != m.to[1]);
+        let cuts = cuts(plan);
+        let rows: Vec<&Move> = (cuts.iter().copied())
+            .filter(|m| cuts.first().is_some_and(|f| along(f) == along(m)))
+            .collect();
+        let sides = crate::simulation::uncut_sides(&rows);
+        assert!(plan.spindle_clockwise && plan.milling_direction == "Conventional");
+        assert!(sides.iter().all(|s| *s > 0.001), "climb: {sides:?}");
+        sides
+    }
+    fn boxed_plan(b: [f32; 6], fields: &[(&str, &str)]) -> Result<Plan, String> {
+        let (setup, mut op, tool) = big_mill(b);
+        for (k, v) in fields {
+            op.p.insert((*k).into(), (*v).into());
+        }
+        let plan = generate(&setup, &op, &tool, &block());
+        if let Ok(plan) = &plan {
+            assert_single_axis(plan);
+            assert_conventional(plan);
+        }
+        plan
+    }
+    /// The cutting moves: feeds along X or Y.
+    fn cuts(plan: &Plan) -> Vec<&Move> {
+        plan.moves.iter().filter(|m| m.cutting_pass).collect()
+    }
+    #[test]
+    fn manual_box_and_drill_plans_move_one_axis_at_a_time() {
+        let plan = boxed_plan([-100., 100., -100., 15.5, 0., -5.], &[]).unwrap();
+        assert!(cuts(&plan).len() > 3);
+        assert_plan(plan);
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/four-setup-block.3mf"),
+        )
+        .unwrap();
+        let (mut setup, mut op, tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        assert!(holes(&setup, &op, &mesh).unwrap().len() >= 3);
+        let cnc = generate(&setup, &op, &tool, &mesh).unwrap();
+        // The CNC still moves X and Y together between the holes, at 6000 mm/min.
+        assert!(
+            cnc.moves
+                .iter()
+                .any(|m| m.from[0] != m.to[0] && m.from[1] != m.to[1])
+        );
+        setup.machine = crate::manual::defaults();
+        let manual = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_single_axis(&manual);
+        let rapids = |plan: &Plan| -> Vec<f32> {
+            plan.moves
+                .iter()
+                .filter(|m| m.motion == Motion::Rapid)
+                .map(|m| m.feed)
+                .collect()
+        };
+        assert!(rapids(&cnc).iter().all(|f| *f == 6000.));
+        assert!(rapids(&manual).iter().all(|f| *f == 1500.));
+        // The same holes, drilled to the same depths.
+        let plunges = |plan: &Plan| -> Vec<[f32; 3]> {
+            plan.moves
+                .iter()
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.to)
+                .collect()
+        };
+        let (mut a, mut b) = (plunges(&cnc), plunges(&manual));
+        for v in [&mut a, &mut b] {
+            v.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        }
+        assert_eq!(a, b);
+        assert_plan(manual);
+    }
+    #[test]
+    fn box_coordinates_are_work_coordinates_on_the_setups_zero() {
+        let (mut setup, mut op, tool) = big_mill([0., 10., -10., 200., 0., -2.]);
+        setup
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        op.p.insert("allowance".into(), "0".into());
+        let plan = generate(&setup, &op, &tool, &block()).unwrap();
+        assert_single_axis(&plan);
+        let s = plan.stock;
+        assert_eq!((s.min[0], s.max[2]), (-60., 40.));
+        // X 0..10 from the stock's front-left corner: the tool's edge stops at X 10.
+        let edge = cuts(&plan)
+            .iter()
+            .map(|m| m.to[0] + 12.5)
+            .fold(f32::MIN, f32::max);
+        assert!((edge - (s.min[0] + 10.)).abs() < 1e-4, "{edge}");
+        assert!(
+            cuts(&plan)
+                .iter()
+                .all(|m| (m.to[2] - (s.max[2] - 2.)).abs() < 1e-4)
+        );
+        // Passes along Y, with the material (+X) on the left: feeds toward −Y.
+        assert!(
+            cuts(&plan)
+                .iter()
+                .all(|m| m.to[1] < m.from[1] && m.to[0] == m.from[0])
+        );
+        // One row: its direction is the rule's, checked on wider boxes in
+        // `a_step_stops_at_the_allowance_and_cuts_conventionally`.
+    }
+    #[test]
+    fn meets_finds_only_triangles_that_reach_into_the_box() {
+        let unit = Bounds {
+            min: [0.; 3],
+            max: [1.; 3],
+        };
+        // Through the box, and lying on its top face.
+        assert!(meets(
+            &[[0.5, 0.5, -1.], [0.5, 0.5, 2.], [3., 3., 0.5]],
+            &unit
+        ));
+        assert!(meets(
+            &[[-1., -1., 1.], [3., -1., 1.], [-1., 3., 1.]],
+            &unit
+        ));
+        // Their boxes overlap the box, but past its corner: the plane and an
+        // edge's crossing separate them.
+        assert!(!meets(
+            &[[3.5, 0., 0.], [0., 3.5, 0.], [0., 0., 3.5]],
+            &unit
+        ));
+        assert!(!meets(
+            &[[0.8, 2.5, 0.5], [2.5, 0.8, 0.5], [2.5, 2.5, 0.5]],
+            &unit
+        ));
+    }
+    #[test]
+    fn box_runs_only_on_a_manual_mill() {
+        let (mut setup, op, tool) = big_mill([-100., 100., -100., 100., 0., -2.]);
+        setup.machine = Machine::new(3);
+        let error = generate(&setup, &op, &tool, &block()).unwrap_err();
+        assert_eq!(error, "Box runs on a manual mill.");
+    }
+    #[test]
+    fn a_box_over_the_whole_top_faces_it_in_one_level() {
+        let plan = boxed_plan([-100., 100., -100., 100., 0., -2.], &[("allowance", "0")]).unwrap();
+        assert_eq!(plan.levels, 1);
+        assert_eq!(plan.milling_direction, "Conventional");
+        assert!(plan.spindle_clockwise);
+        let rows: Vec<f32> = cuts(&plan).iter().map(|m| m.to[1]).collect();
+        // From the − side's face to the + side's in five equal steps of
+        // 16 (at most 17.5), every row's tool inside Y ± the radius.
+        assert_eq!(rows, [-40., -24., -8., 8., 24., 40.]);
+        assert!(
+            rows.windows(2)
+                .all(|w| w[1] > w[0] && w[1] - w[0] <= 17.5 + 1e-4)
+        );
+        for m in cuts(&plan) {
+            assert!((-52.5..=52.5).contains(&m.to[1]));
+            assert_eq!(m.to[2], 38.);
+            // Off the stock at both ends, toward +X (the material on +Y, on the left).
+            assert_eq!((m.from[0], m.to[0]), (-74.5, 74.5));
+        }
+        // Down outside the stock: no feed into it from above.
+        assert!(
+            plan.moves
+                .iter()
+                .all(|m| m.motion == Motion::Rapid || m.to[2] == m.from[2])
+        );
+    }
+    #[test]
+    fn a_step_stops_at_the_allowance_and_cuts_conventionally() {
+        let plan = boxed_plan([-100., 100., -100., 15.5, 0., -5.], &[]).unwrap();
+        let cuts = cuts(&plan);
+        let edges: Vec<f32> = cuts.iter().map(|m| m.to[1] + 12.5).collect();
+        assert!(edges.iter().all(|e| *e <= 15. + 1e-4), "{edges:?}");
+        assert!((edges[edges.len() - 1] - 15.).abs() < 1e-4);
+        // From the open face at −40 to 2.5 in three equal steps.
+        let rows: Vec<f32> = cuts.iter().map(|m| m.to[1]).collect();
+        for (row, want) in rows
+            .iter()
+            .zip([-40., -40. + 42.5 / 3., 2.5 - 42.5 / 3., 2.5])
+        {
+            assert!((row - want).abs() < 1e-4, "{rows:?}");
+        }
+        // Rows step toward +Y (the uncut material), so they feed along +X
+        // with it on their left.
+        assert!(
+            cuts.windows(2)
+                .all(|w| w[1].to[1] > w[0].to[1] || w[1].to[2] < w[0].to[2])
+        );
+        assert!(
+            cuts.iter()
+                .all(|m| m.to[0] > m.from[0] && m.from[1] == m.to[1])
+        );
+        assert_eq!(assert_conventional(&plan).len(), 3);
+        // The mirror step, open on +Y: rows step toward −Y and feed along −X.
+        let back = boxed_plan([-100., 100., -15.5, 100., 0., -5.], &[]).unwrap();
+        assert!(
+            (back.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .all(|m| m.to[0] < m.from[0] && m.from[1] == m.to[1])
+        );
+        assert_eq!(assert_conventional(&back).len(), 3);
+        // Longer in Y, open on +X: rows step toward −X and feed along +Y.
+        let side = boxed_plan([15.5, 100., -100., 100., 0., -5.], &[]).unwrap();
+        let rows: Vec<&Move> = (side.moves.iter()).filter(|m| m.cutting_pass).collect();
+        assert!(
+            rows.iter()
+                .all(|m| m.to[1] > m.from[1] && m.from[0] == m.to[0])
+        );
+        assert!(rows.windows(2).all(|w| w[1].to[0] < w[0].to[0]));
+        assert!(assert_conventional(&side).len() >= 2);
+        // The floor is closed: 5 mm down less the allowance.
+        assert!(cuts.iter().all(|m| (m.to[2] - 35.5).abs() < 1e-4));
+        assert_eq!(plan.target, 35.5);
+    }
+    /// The tool's edge of every move of `plan` below the stock's top (Z 40)
+    /// stays inside `lo`..`hi` on X and Y (the box less its allowance) and
+    /// above `lo[2]`.
+    fn assert_inside(plan: &Plan, lo: [f32; 3], hi: [f32; 3]) {
+        for m in plan.moves.iter().filter(|m| m.from[2].min(m.to[2]) < 40.) {
+            for q in [m.from, m.to] {
+                for k in 0..2 {
+                    assert!(q[k] - 12.5 >= lo[k] - 1e-4, "{k} {m:?}");
+                    assert!(q[k] + 12.5 <= hi[k] + 1e-4, "{k} {m:?}");
+                }
+                assert!(q[2] >= lo[2] - 1e-4, "{m:?}");
+            }
+        }
+    }
+    #[test]
+    fn a_closed_pocket_plunges_once_per_level_and_feeds_across_between_rows() {
+        // X −50..50, Y −30..30, 6 mm deep in levels of 2, 0.5 left on every
+        // side and the floor: three rows (Y −17, 0, 17) on three levels.
+        let fields = [("stepdown", "2"), ("allowance", "0.5")];
+        let plan = boxed_plan([-50., 50., -30., 30., 0., -6.], &fields).unwrap();
+        assert_inside(&plan, [-49.5, -29.5, 34.5], [49.5, 29.5, 40.]);
+        let down: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.to[2] < m.from[2] && m.to[2] < 40.)
+            .collect();
+        assert_eq!(plan.levels, 3);
+        assert_eq!(down.len(), 3, "{down:?}");
+        let rows = cuts(&plan);
+        assert_eq!(rows.len(), 9);
+        for (level, d) in down.iter().enumerate() {
+            // At a quarter feed, onto the level, where its first row starts.
+            assert!(d.motion == Motion::Feed && d.feed == 30., "{d:?}");
+            let first = rows[level * 3];
+            assert_eq!(d.to, first.from);
+        }
+        // Between rows: off the wall 0.2 mm (a rapid), back along the row
+        // at the hand rapid, then a cutting feed across, a pause, the pass.
+        // The first row lies on the −Y wall's allowance: no room behind it,
+        // so it goes back along its own cut.
+        for pair in rows.windows(2).filter(|w| w[0].to[2] == w[1].to[2]) {
+            let mut between: Vec<&Move> = (plan.moves.iter())
+                .filter(|m| m.start >= pair[0].end && m.end <= pair[1].start)
+                .collect();
+            let first = (pair[0].to[1] + 17.).abs() < 1e-4;
+            let kinds: Vec<Motion> = between.iter().map(|m| m.motion).collect();
+            assert_eq!(
+                kinds,
+                [Motion::Rapid, Motion::Rapid, Motion::Feed, Motion::Dwell][usize::from(first)..],
+                "{between:?}"
+            );
+            if first {
+                between.insert(0, pair[0]);
+            }
+            let (off, back, across) = (between[0], between[1], between[2]);
+            let backed = if first { 0. } else { 0.2 };
+            assert!(
+                (off.to[1] - (pair[0].to[1] - backed)).abs() < 1e-4,
+                "{off:?}"
+            );
+            assert_eq!(back.feed, 1500.);
+            assert_eq!(back.to[0], pair[1].from[0]);
+            assert!(back.to[2] == pair[0].to[2] && back.from[1] == back.to[1]);
+            assert!(across.to[1] > across.from[1] && across.feed == 120.);
+            assert_eq!(across.to, pair[1].from);
+        }
+        assert_eq!(assert_conventional(&plan).len(), 6);
+        // The first row's cross side is closed with nothing behind it: it
+        // goes back along its own cut, not into the wall's allowance.
+        let fields = [("stepdown", "6"), ("allowance", "0")];
+        let plan = boxed_plan([-50., 50., -30., 30., 0., -6.], &fields).unwrap();
+        assert_inside(&plan, [-50., -30., 34.], [50., 30., 40.]);
+        let first = cuts(&plan)[0];
+        let next = (plan.moves.iter())
+            .find(|m| m.start >= first.end && m.motion != Motion::Dwell)
+            .unwrap();
+        assert!(
+            next.from[1] == next.to[1] && next.to[0] < next.from[0],
+            "{next:?}"
+        );
+        // A step closed at both X ends, open on −Y: off the open side
+        // without limit, once per level.
+        let fields = [("stepdown", "5"), ("allowance", "0.5")];
+        let plan = boxed_plan([-50., 50., -100., 15.5, 0., -5.], &fields).unwrap();
+        assert_inside(&plan, [-49.5, -100., 35.5], [49.5, 15., 40.]);
+        let plunges = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed && m.to[2] < m.from[2])
+            .count();
+        assert_eq!((plunges, plan.levels), (1, 1));
+        assert!(assert_conventional(&plan).len() >= 2);
+    }
+    #[test]
+    fn a_closed_pocket_plunges_at_a_quarter_feed_onto_its_floor_and_allowance() {
+        // One level: the slot is 4.5 mm deep, the stepdown given.
+        let plan = boxed_plan([-55., -15., 12., 38., 0., -5.], &[("stepdown", "5")]).unwrap();
+        let downs: Vec<&Move> = plan
+            .moves
+            .iter()
+            .filter(|m| m.to[2] < m.from[2] && m.to[2] < 40.)
+            .collect();
+        assert!(!downs.is_empty());
+        assert!(
+            downs
+                .iter()
+                .all(|m| m.motion == Motion::Feed && m.feed == 30.)
+        );
+        assert!(downs.iter().all(|m| (m.to[2] - 35.5).abs() < 1e-4));
+        assert_eq!(plan.target, 35.5);
+        // Inside the walls less the allowance.
+        for m in cuts(&plan) {
+            for x in [m.from[0], m.to[0]] {
+                assert!(x - 12.5 >= -54.5 - 1e-4 && x + 12.5 <= -15.5 + 1e-4, "{x}");
+            }
+            assert!(m.to[1] - 12.5 >= 12.5 - 1e-4 && m.to[1] + 12.5 <= 37.5 + 1e-4);
+        }
+    }
+    #[test]
+    fn box_levels_step_down_to_the_floor() {
+        let levels = |plan: &Plan| {
+            let mut z: Vec<f32> = cuts(plan).iter().map(|m| m.to[2] - 40.).collect();
+            z.dedup();
+            z
+        };
+        let deep = [-100., 100., -100., 100., 0., -9.5];
+        let plan = boxed_plan(deep, &[("allowance", "0"), ("stepdown", "2.5")]).unwrap();
+        // Equal steps of at most 2.5: four of 2.375, the last on the floor.
+        assert_eq!(levels(&plan), [-2.375, -4.75, -7.125, -9.5]);
+        assert_eq!(plan.levels, 4);
+        // The closed floor keeps 0.5: four of 2.25 down to −9.
+        let plan = boxed_plan(deep, &[("stepdown", "2.5")]).unwrap();
+        assert_eq!(levels(&plan), [-2.25, -4.5, -6.75, -9.]);
+        // Automatic: what the 800 W spindle takes at 17.5 mm wide in steel
+        // with the 0.0625 mm chip of 120 mm/min at 640 rpm on 3 flutes
+        // (4.71 mm), here below the flute length and the diameter, so three
+        // of 9.5 / 3.
+        let (setup, op, tool) = big_mill(deep);
+        assert_eq!(
+            [
+                num(&op.p, "rpm"),
+                num(&op.p, "feed"),
+                num(&tool.p, "flutes")
+            ],
+            [Some(640.), Some(120.), Some(3.)]
+        );
+        let auto = crate::forces::power_stepdown(&setup.machine, None, 25., 17.5, 120., 640., 3.);
+        assert!((auto - 4.7059).abs() < 0.001, "{auto}");
+        let plan = boxed_plan(deep, &[("allowance", "0")]).unwrap();
+        let z = levels(&plan);
+        assert_eq!((z.len(), z[2]), (3, -9.5), "{z:?}");
+        assert!((z[0] + 9.5 / 3.).abs() < 1e-4, "{z:?}");
+        // Without the rpm or the flutes it cannot say.
+        let error = boxed_plan(deep, &[("rpm", "")]).unwrap_err();
+        assert!(error.contains("automatic stepdown"), "{error}");
+        // Capped at 4 mm flutes: three of 9.5 / 3.
+        let (setup, mut op, mut tool) = big_mill(deep);
+        tool.p.insert("length".into(), "4".into());
+        op.p.insert("allowance".into(), "0".into());
+        let plan = generate(&setup, &op, &tool, &block()).unwrap();
+        let z = levels(&plan);
+        assert_eq!((z.len(), z[2]), (3, -9.5));
+        assert!(
+            (z[0] + 9.5 / 3.).abs() < 1e-4 && (z[1] + 19. / 3.).abs() < 1e-4,
+            "{z:?}"
+        );
+        op.p.insert("stepdown".into(), "5".into());
+        assert!(generate(&setup, &op, &tool, &block()).is_err());
+    }
+    /// A box closed on both cross sides cuts a full slot with its first row:
+    /// its automatic stepdown is sized at the tool's diameter, not the
+    /// stepover. An open face only ever engages the stepover.
+    #[test]
+    fn a_closed_pockets_automatic_stepdown_is_sized_for_the_full_slot() {
+        let (setup, ..) = big_mill([0.; 6]);
+        // Ø25 at 120 mm/min, 640 rpm, 3 flutes; stepover 70 % is 17.5 mm.
+        let power = |width: f32| {
+            crate::forces::power_stepdown(&setup.machine, None, 25., width, 120., 640., 3.)
+        };
+        let (narrow, full) = (power(17.5), power(25.));
+        assert!(full < narrow && narrow < 12., "{full} {narrow}");
+        // Equal levels of at most `down` down a 12 mm block.
+        let levels = |plan: &Plan| {
+            let mut z: Vec<f32> = cuts(plan).iter().map(|m| m.to[2] - 40.).collect();
+            z.dedup();
+            z
+        };
+        let steps = |down: f32| (12. / down - 0.0001).ceil() as usize;
+        assert_ne!(steps(full), steps(narrow));
+        let closed = boxed_plan([-50., 50., -30., 30., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(closed.levels, steps(full), "{:?}", levels(&closed));
+        let open = boxed_plan([-100., 100., -100., 100., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(open.levels, steps(narrow), "{:?}", levels(&open));
+        // Closed on one cross side only, the first row hangs off the open one.
+        let step = boxed_plan([-50., 50., -100., 30., 0., -12.], &[("allowance", "0")]).unwrap();
+        assert_eq!(step.levels, steps(narrow));
+    }
+    /// Steps between levels (from the top) and between rows: none under half
+    /// of the stepdown or the stepover, and none over it, unless it is the
+    /// only one.
+    #[test]
+    fn box_levels_and_rows_are_never_thin() {
+        for b in [
+            [-100., 100., -100., 100., 0., -9.5],
+            [-100., 100., -100., 15.5, 0., -5.3],
+            [-100., 100., -31., 100., 0., -12.],
+            [-55., -15., 12., 38., 0., -2.],
+        ] {
+            for (down, over) in [("1.7", "30"), ("2.5", "50"), ("3", "70"), ("4.1", "100")] {
+                let fields = [("stepdown", down), ("stepover", over)];
+                let plan = boxed_plan(b, &fields).unwrap();
+                let (down, width) = (
+                    down.parse::<f32>().unwrap(),
+                    over.parse::<f32>().unwrap() / 4.,
+                );
+                let mut z = vec![40.];
+                z.extend(cuts(&plan).iter().map(|m| m.to[2]));
+                z.dedup();
+                let mut levels = z.windows(2).map(|w| w[0] - w[1]).collect::<Vec<_>>();
+                let rows: Vec<f32> = cuts(&plan)
+                    .iter()
+                    .take_while(|m| m.to[2] == z[1])
+                    .map(|m| m.to[1])
+                    .collect();
+                let mut across = rows
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .collect::<Vec<_>>();
+                for (steps, by) in [(&mut levels, down), (&mut across, width)] {
+                    assert!(
+                        steps.iter().all(|s| *s <= by + 1e-4),
+                        "{b:?} {steps:?} {by}"
+                    );
+                    if steps.len() > 1 {
+                        assert!(
+                            steps.iter().all(|s| *s >= by / 2. - 1e-4),
+                            "{b:?} {steps:?} {by}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn a_box_into_the_part_is_refused() {
+        let error = boxed_plan([-100., 100., -100., 100., 0., -35.], &[]).unwrap_err();
+        assert!(
+            error.starts_with("The box cuts into the part at X"),
+            "{error}"
+        );
+        let (setup, ..) = big_mill([0.; 6]);
+        let part = stock::resolve(&setup, Some(&block()))
+            .unwrap()
+            .part
+            .unwrap();
+        // 0.5 mm over the part's top, and 0.5 mm off its +X side.
+        let top = part.max[2] - 40. + 0.5;
+        let face = [-100., 100., -100., 100., 0., top];
+        assert!(boxed_plan(face, &[("allowance", "0")]).is_ok());
+        let side = [part.max[0] + 0.5, 100., -100., 100., 0., -39.];
+        assert!(boxed_plan(side, &[("allowance", "0")]).is_ok());
+        let into = [part.max[0] - 0.5, 100., -100., 100., 0., -39.];
+        let error = boxed_plan(into, &[("allowance", "0")]).unwrap_err();
+        let x: f32 = error
+            .strip_prefix("The box cuts into the part at X")
+            .and_then(|rest| rest.split(',').next())
+            .and_then(|x| x.parse().ok())
+            .unwrap_or_else(|| panic!("{error}"));
+        assert!((part.max[0] - 0.5..=part.max[0]).contains(&x), "{error}");
+    }
+    #[test]
+    fn a_one_row_square_checks_only_its_row_against_the_part() {
+        // The +X side of a 24 mm wide block round the 20 mm part squared 1
+        // mm, down through the stock's bottom: one row, 1 mm off the part.
+        let (mut setup, mut op, tool) = big_mill([11., 100., -100., 100., 0., -100.]);
+        setup.p.insert("stock_x".into(), "24".into());
+        op.p.insert("allowance".into(), "0".into());
+        let plan = generate(&setup, &op, &tool, &block()).unwrap();
+        assert_single_axis(&plan);
+        assert_eq!(cuts(&plan).len(), plan.levels);
+        assert!(cuts(&plan).iter().all(|m| m.to[0] == 23.5));
+        assert_eq!(plan.target, 0.);
+    }
+    #[test]
+    fn a_single_row_box_takes_its_feeds_rapids_and_pause() {
+        let (setup, mut op, tool) = big_mill([-55., -15., 12., 38., 0., -5.]);
+        // One level: the stepdown given (automatic, the full slot takes two).
+        op.p.insert("stepdown".into(), "5".into());
+        let plan = generate(&setup, &op, &tool, &block()).unwrap();
+        assert_eq!(cuts(&plan).len(), 1);
+        let clearance = 40. + num(&op.p, "clearance").unwrap();
+        let retract = 45.;
+        // From the corner at clearance: down to retract, along X to −42,
+        // across Y to 25, plunge at 30 mm/min to 35.5, pause 20 s, feed
+        // 14 mm at 120 mm/min, up to retract and clearance.
+        let rapids = (clearance - retract) * 2. + 18. + 65. + (retract - 35.5);
+        let expected = rapids / 1500. * 60. + (retract - 35.5) / 30. * 60. + 20. + 14. / 120. * 60.;
+        assert!(
+            (plan.duration - expected).abs() < 0.1,
+            "{} {expected}",
+            plan.duration
+        );
+    }
+    #[test]
+    fn a_faced_top_on_the_manual_mill_lowers_the_next_setups_stock() {
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let machine = crate::manual::defaults();
+        let mut tool = Tool::new("End mill 25", "Flat end mill", "25");
+        for (k, v) in [
+            ("length", "40"),
+            ("stickout", "60"),
+            ("machines", &machine.id),
+        ] {
+            tool.p.insert(k.into(), v.into());
+        }
+        let mut face = Operation::new(Strategy::Box, tool.id.clone());
+        for (k, v) in crate::model::BOX_FIELDS
+            .iter()
+            .zip(["-500", "500", "-500", "500", "0", "-2"])
+            .chain([(&"allowance", "0")])
+        {
+            face.p.insert((*k).into(), v.into());
+        }
+        doc.machines.push(machine);
+        doc.tools.push(tool);
+        doc.add_manual_setup().unwrap();
+        doc.setups[0].operations = vec![face];
+        let mut starts = vec![];
+        let mut first = None;
+        simulation::sequence_walk(
+            &doc,
+            &mesh,
+            Some((1, 0)),
+            |si, _, result| {
+                if si == 0 {
+                    let sim = result.unwrap();
+                    assert_single_axis(&sim.plan);
+                    first = Some(sim.plan.stock);
+                }
+            },
+            |_, _, _| {},
+            |si, start| starts.push((si, start)),
+        );
+        let (first, second) = (first.unwrap(), starts[1].1.unwrap());
+        assert_eq!(starts[1].0, 1);
+        assert!(
+            (first.max[2] - 2. - second.max[2]).abs() < 0.05,
+            "{first:?} {second:?}"
+        );
+        for k in 0..2 {
+            assert!((first.min[k] - second.min[k]).abs() < 0.05);
+            assert!((first.max[k] - second.max[k]).abs() < 0.05);
+        }
     }
     #[test]
     fn real_step_and_3mf_new_operations_generate_and_survive_save_reload() {

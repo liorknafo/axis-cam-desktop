@@ -6,10 +6,12 @@ mod control;
 #[cfg(test)]
 mod fake_openai;
 mod forces;
+mod guide;
 mod help;
 mod holding;
 mod look;
 mod machine_view;
+mod manual;
 mod material;
 mod mesh;
 mod model;
@@ -31,6 +33,7 @@ mod setup;
 mod simulation;
 mod smoke;
 mod step;
+mod steps;
 mod stock;
 mod stock_surface;
 mod storage;
@@ -153,6 +156,7 @@ pub enum Message {
     Feature(usize),
     Surface(usize),
     ClearSurfaces,
+    BoxFromFace,
     PickMode,
     /// "Pick holes on the part" (and "Finish picking") in the Work zero step.
     PickPinHoles,
@@ -161,6 +165,8 @@ pub enum Message {
     Generate,
     GenerateAll,
     AddSetup,
+    /// Inserts a setup on the first manual machine, before the CNC setups.
+    AddManualSetup,
     DuplicateSetup,
     RemoveSetup,
     MoveSetup(isize),
@@ -171,6 +177,10 @@ pub enum Message {
     WizardStep(usize),
     SaveMachine,
     DeleteMachine(String),
+    /// A machine's check box in the tool editor (machine id, checked).
+    ToolMachine(String, bool),
+    /// A machine's check box in the workholding editor (machine id, checked).
+    HolderMachine(String, bool),
     /// Opens a file dialog for the machine draft's UC100 profile.
     BrowseUc100Profile,
     /// The chosen UC100 profile; None when the dialog was cancelled.
@@ -345,7 +355,30 @@ pub enum Message {
     /// app's, for that card.
     HelpMore(bool),
     HelpPause(bool),
+    /// The Steps page of a manual setup.
+    Guide(GuideAction),
     Noop,
+}
+/// What the Steps page of a setup on a manual mill does (`steps::view`).
+#[derive(Debug, Clone)]
+pub enum GuideAction {
+    /// The next step, or the next hole of a Holes step.
+    Next,
+    /// The step before, or the hole before.
+    Back,
+    /// Step `i` of the guide.
+    Go(usize),
+    /// The first unfinished step of section `i`: the place when it is in
+    /// the section, else the section's first step.
+    Section(usize),
+    /// The readout `i` of the step shown is reached: the next is lit.
+    Reached(usize),
+    /// Setup `i` on the MACHINE page: its steps, or the CNC's control.
+    Open(usize),
+    /// The page's clock, for the handwheel's beat.
+    Beat(Instant),
+    /// The guide of the job with this fingerprint (`App::guide_key`), built.
+    Built(u64, Result<std::sync::Arc<steps::Shown>, String>),
 }
 /// A plan that passed every check, with the stock it leaves for the 3D view.
 #[derive(Debug)]
@@ -706,6 +739,18 @@ pub struct App {
     /// The fingerprint of the job a background run is working out the stock
     /// for.
     left_job: Option<u64>,
+    /// The step guide of the active setup on a manual mill and its
+    /// pictures, built in the background (`refresh_guide`) for the job whose
+    /// fingerprint is the first value (`guide_key`).
+    pub guide: Option<(u64, Result<std::sync::Arc<steps::Shown>, String>)>,
+    /// The fingerprint of the job a background run is building a guide for.
+    guide_job: Option<u64>,
+    /// The readout the Steps page is at within its step, or the hole of a
+    /// Holes step.
+    pub guide_item: usize,
+    /// When the step shown was opened, and the page's clock since
+    /// (`GuideAction::Beat`): the handwheel's beat.
+    pub guide_clock: (Instant, Instant),
     /// The checks before a run of a setup, once worked out (`current_ready`).
     pub ready: run::Ready,
     /// The fingerprint of the job a background run is checking a setup of.
@@ -951,6 +996,7 @@ fn while_locked(m: &Message) -> bool {
             | HelpHover(_)
             | HelpMore(_)
             | HelpPause(_)
+            | Guide(_)
             | Noop
     )
 }
@@ -1123,6 +1169,7 @@ impl App {
             include_bytes!("../assets/op-8.svg"),
             include_bytes!("../assets/op-9.svg"),
             include_bytes!("../assets/op-10.svg"),
+            include_bytes!("../assets/op-11.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -1173,6 +1220,10 @@ impl App {
             left_stock: LeftStock::default(),
             holding_checks: HoldingChecks::default(),
             left_job: None,
+            guide: None,
+            guide_job: None,
+            guide_item: 0,
+            guide_clock: (Instant::now(), Instant::now()),
             ready: run::Ready::default(),
             ready_job: None,
             holding_note: std::cell::RefCell::new(None),
@@ -1413,7 +1464,7 @@ impl App {
         self.operation().is_some_and(|o| {
             self.is_sample()
                 || (self.doc.file.is_some()
-                    && o.needs_surfaces()
+                    && (o.needs_surfaces() || o.strategy == Strategy::Box)
                     && o.strategy.imported_preview()
                     && self.imported_mesh.is_some())
         })
@@ -2270,6 +2321,142 @@ impl App {
             |found| Message::LeftStock(Box::new(found)),
         )
     }
+    /// The fingerprint of the job as the step guide of the active setup is
+    /// concerned: the stock it starts from and how it is held
+    /// (`holding_fingerprint`), and which setup it is. None when the active
+    /// setup is not on a manual mill, and when `left_key` is.
+    pub(crate) fn guide_key(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let setup = self.doc.active_setup()?;
+        if !manual::is_manual(&setup.machine) {
+            return None;
+        }
+        let mut hasher = std::hash::DefaultHasher::new();
+        (self.holding_key()?, &setup.id).hash(&mut hasher);
+        Some(hasher.finish())
+    }
+    /// MACHINE shows the Steps page: the active setup is on a manual mill.
+    pub(crate) fn steps_page(&self) -> bool {
+        self.page == Page::Control
+            && !self.machine_setup
+            && (self.doc.active_setup()).is_some_and(|s| manual::is_manual(&s.machine))
+    }
+    /// The guide as built, when that was for the job as it is now.
+    pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
+        let key = self.guide_key()?;
+        let (built, result) = self.guide.as_ref()?;
+        (*built == key).then_some(result)
+    }
+    /// The guide shown and the step it is at (`guide::place`).
+    pub(crate) fn guide_at(&self) -> Option<(std::sync::Arc<steps::Shown>, usize)> {
+        let shown = self.current_guide()?.as_ref().ok()?.clone();
+        let at = guide::place(&self.doc, &shown.guide);
+        Some((shown, at))
+    }
+    /// Builds the active manual setup's guide (`steps::shown`) while the
+    /// Steps page is open, when the job changed since and no run is building
+    /// it: on the blocking pool, in line in the smoke run. Not held back
+    /// while the machine moves: the page is for the manual mill beside it,
+    /// and editing, which would build it again, is locked then.
+    fn refresh_guide(&mut self) -> Task<Message> {
+        if !self.steps_page() {
+            return Task::none();
+        }
+        let Some(key) = self.guide_key() else {
+            return Task::none();
+        };
+        if self.guide_job == Some(key) || self.guide.as_ref().is_some_and(|(k, _)| *k == key) {
+            return Task::none();
+        }
+        let Some(mesh) = self.part_mesh().cloned() else {
+            return Task::none();
+        };
+        let (doc, si) = (self.doc.clone(), self.doc.index());
+        let run = move || steps::shown(&doc, &mesh, si).map(std::sync::Arc::new);
+        if self.smoke_dir.is_some() {
+            self.guide = Some((key, run()));
+            return Task::none();
+        }
+        self.guide_job = Some(key);
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(run)
+                    .await
+                    .unwrap_or_else(|_| Err("The steps could not be worked out.".into()))
+            },
+            move |result| Message::Guide(GuideAction::Built(key, result)),
+        )
+    }
+    /// Puts the guide of `shown` at step `at`, saved with the project as
+    /// `SelectSetup` saves the active setup: no undo step.
+    fn guide_to(&mut self, shown: &steps::Shown, at: usize) {
+        let at = at.min(shown.guide.steps.len().saturating_sub(1));
+        if let Some(setup) = self.doc.setups.get(shown.guide.setup)
+            && self.doc.guide.get(&setup.id) != Some(&at)
+        {
+            self.doc.guide.insert(setup.id.clone(), at);
+            self.dirty = true;
+            self.last_edit = Instant::now();
+        }
+        self.guide_item = 0;
+        self.guide_clock.0 = Instant::now();
+    }
+    fn guide_action(&mut self, action: GuideAction) -> Task<Message> {
+        match action {
+            GuideAction::Built(key, result) => {
+                self.guide_job = None;
+                // A job edited while it was built gets a guide of its own.
+                if self.guide_key() == Some(key) {
+                    self.guide = Some((key, result));
+                    self.guide_clock.0 = Instant::now();
+                }
+                return Task::none();
+            }
+            GuideAction::Beat(at) => {
+                self.guide_clock.1 = at;
+                return Task::none();
+            }
+            GuideAction::Open(si) => {
+                let Some(s) = self.doc.setups.get(si) else {
+                    return Task::none();
+                };
+                if s.id != self.doc.active {
+                    self.doc.active = s.id.clone();
+                    self.stop_selection();
+                    self.dirty = true;
+                    self.last_edit = Instant::now();
+                    self.guide_item = 0;
+                }
+                self.machine_setup = false;
+                return self.update(Message::Page(Page::Control));
+            }
+            _ => {}
+        }
+        let Some((shown, at)) = self.guide_at() else {
+            return Task::none();
+        };
+        let holes = match &shown.guide.steps[at] {
+            guide::Step::Holes { holes, .. } => holes.len(),
+            _ => 0,
+        };
+        match action {
+            GuideAction::Next if self.guide_item + 1 < holes => self.guide_item += 1,
+            GuideAction::Next => self.guide_to(&shown, at + 1),
+            GuideAction::Back if holes > 0 && self.guide_item > 0 => self.guide_item -= 1,
+            GuideAction::Back => self.guide_to(&shown, at.saturating_sub(1)),
+            GuideAction::Go(i) => self.guide_to(&shown, i),
+            GuideAction::Section(i) => {
+                if let Some(s) = shown.guide.sections.get(i)
+                    && !s.steps.contains(&at)
+                {
+                    self.guide_to(&shown, s.steps.start);
+                }
+            }
+            GuideAction::Reached(i) => self.guide_item = i + 1,
+            _ => {}
+        }
+        Task::none()
+    }
     /// The checks before a run of the active setup, when they were worked out
     /// for the job as it is now.
     pub(crate) fn current_ready(&self) -> Option<&run::Ready> {
@@ -2737,7 +2924,7 @@ impl App {
                 } else {
                     Task::none()
                 };
-                return Task::batch([self.refresh_post(), restore]);
+                return Task::batch([self.refresh_post(), restore, self.refresh_guide()]);
             }
             Message::SelectSetup(i) => {
                 if let Some(s) = self.doc.setups.get(i) {
@@ -2859,7 +3046,11 @@ impl App {
                     }
                 }
                 Target::Machine => {
-                    self.machine_draft.p.insert(k.into(), v.clone());
+                    if k == "kind" {
+                        manual::set_kind(&mut self.machine_draft, &v);
+                    } else {
+                        self.machine_draft.p.insert(k.into(), v.clone());
+                    }
                     if k == "axes" {
                         let axes = self.machine_draft.axes();
                         self.machine_draft.p.insert(
@@ -2903,19 +3094,22 @@ impl App {
                     self.page = Page::Audit;
                     return Task::none();
                 }
+                let machine = &self.doc.setup().machine;
                 let Some(tool) = self
                     .doc
                     .tools
                     .iter()
                     .find(|t| {
-                        if strategy == Strategy::Drill {
-                            get(&t.p, "type") == "Drill"
-                        } else if strategy == Strategy::Parallel {
-                            get(&t.p, "type") == "Ball end mill"
-                        } else {
-                            get(&t.p, "type") == "Flat end mill"
-                                || (strategy == Strategy::Face && get(&t.p, "type") == "Face mill")
-                        }
+                        manual::fits(get(&t.p, "machines"), machine)
+                            && if strategy == Strategy::Drill {
+                                get(&t.p, "type") == "Drill"
+                            } else if strategy == Strategy::Parallel {
+                                get(&t.p, "type") == "Ball end mill"
+                            } else {
+                                get(&t.p, "type") == "Flat end mill"
+                                    || (strategy == Strategy::Face
+                                        && get(&t.p, "type") == "Face mill")
+                            }
                     })
                     .or(self.doc.tools.first())
                 else {
@@ -2929,10 +3123,12 @@ impl App {
                     return Task::none();
                 };
                 let mut operation = Operation::new(strategy, tool.id.clone());
-                operation.p.insert(
-                    "coolant".into(),
-                    control::default_coolant(&self.doc.setup().machine).into(),
-                );
+                operation
+                    .p
+                    .insert("coolant".into(), control::default_coolant(machine).into());
+                if manual::is_manual(machine) {
+                    manual::snap(machine, &mut operation.p);
+                }
                 if !self.is_sample() {
                     operation.geometry.clear();
                 }
@@ -3025,9 +3221,12 @@ impl App {
                         selected.mesh_fingerprint = fingerprint;
                         selected.ids.clear();
                     }
-                    if selected.ids.contains(&n) {
-                        selected.ids.retain(|id| *id != n);
-                    } else {
+                    let had = selected.ids.contains(&n);
+                    // A Box takes one face: a click replaces the one before.
+                    if had || o.strategy == Strategy::Box {
+                        selected.ids.clear();
+                    }
+                    if !had {
                         selected.ids.push(n);
                     }
                     o.geometry.clear();
@@ -3067,7 +3266,39 @@ impl App {
                     self.simulation = None;
                     self.progress = 0.;
                 }
-                self.tab = "Geometry".into();
+                // A Box is picked on its own tab.
+                if self.operation().is_none_or(|o| o.strategy != Strategy::Box) {
+                    self.tab = "Geometry".into();
+                }
+            }
+            Message::BoxFromFace => {
+                let found = (|| {
+                    let mesh = self.part_mesh().ok_or("Load the part first.")?;
+                    let selection = self
+                        .operation()
+                        .filter(|o| o.strategy == Strategy::Box)
+                        .ok_or("Select a Box operation first.")?
+                        .surfaces
+                        .as_ref()
+                        .ok_or(manual::ONE_FACE)?;
+                    let stock = self
+                        .known_stock(self.doc.index())
+                        .0
+                        .ok_or("The stock is not known yet.")?;
+                    manual::box_from_face(self.doc.setup(), mesh, selection, stock)
+                })();
+                match found {
+                    Ok(block) => {
+                        if let Some(o) = self.operation_mut() {
+                            for (k, v) in model::BOX_FIELDS.into_iter().zip(block) {
+                                o.p.insert(k.into(), v.to_string());
+                            }
+                        }
+                        self.touch();
+                        self.status = "Box filled from the selected face.".into();
+                    }
+                    Err(error) => self.status = error,
+                }
             }
             Message::Generate => {
                 let mut issues = self.doc.setup().issues();
@@ -3192,6 +3423,14 @@ impl App {
                     self.status = "Choose the machine for the first setup.".into();
                 }
             }
+            Message::AddManualSetup => match self.doc.add_manual_setup() {
+                Ok(()) => {
+                    self.stop_selection();
+                    self.touch();
+                    self.status = "Manual setup added before the CNC setups.".into();
+                }
+                Err(e) => self.status = e,
+            },
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());
                 self.doc.active = s.id.clone();
@@ -3264,7 +3503,9 @@ impl App {
                     self.page = Page::Wizard;
                 }
             }
-            Message::WizardStep(s) => self.wizard_step = s.min(4),
+            Message::WizardStep(s) => {
+                self.wizard_step = s.min(ui::wizard_steps(&self.machine_draft).len() - 1)
+            }
             Message::BrowseUc100Profile => {
                 return Task::perform(
                     async {
@@ -3461,7 +3702,10 @@ impl App {
                 };
                 // Not while a tool run or a probe is under way: the probe
                 // sets the work zero of the setup it started with (#165).
-                if si >= self.doc.setups.len() || c.setup_locked() {
+                if si >= self.doc.setups.len()
+                    || c.setup_locked()
+                    || manual::is_manual(&self.doc.setups[si].machine)
+                {
                     return Task::none();
                 }
                 self.run_epoch += 1;
@@ -3560,6 +3804,9 @@ impl App {
                 return self.picture_run();
             }
             Message::SaveMachine => {
+                if manual::is_manual(&self.machine_draft) {
+                    manual::settle(&mut self.machine_draft);
+                }
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
                     let mut m = self.machine_draft.clone();
@@ -3580,6 +3827,16 @@ impl App {
                 } else {
                     self.status = errors.join(" ");
                 }
+            }
+            Message::ToolMachine(id, on) => {
+                let p = &mut self.tool_draft.p;
+                let list = manual::toggle(get(p, "machines"), &id, on);
+                p.insert("machines".into(), list);
+            }
+            Message::HolderMachine(id, on) => {
+                let p = &mut self.holder_draft.p;
+                let list = manual::toggle(get(p, "machines"), &id, on);
+                p.insert("machines".into(), list);
             }
             Message::DeleteMachine(id) => {
                 if self.control.as_ref().is_some_and(|c| c.machine_id == id) {
@@ -4245,6 +4502,7 @@ impl App {
                     self.refresh_post(),
                     left,
                     recheck,
+                    self.refresh_guide(),
                 ]);
             }
             Message::Plan => {
@@ -4471,6 +4729,7 @@ impl App {
             Message::Close(id) => return self.request_close(id),
             Message::Exported(p) => self.status = format!("Exported {}", p.display()),
             Message::ExportError(e) => self.status = format!("Export failed: {e}"),
+            Message::Guide(action) => return self.guide_action(action),
             Message::LeftStock(found) => {
                 self.left_job = None;
                 // A job edited while it ran gets a run of its own at the next pause.
@@ -4862,6 +5121,16 @@ impl App {
         if self.smoke_dir.is_some() {
             subscriptions.push(smoke::frames());
         }
+        // The handwheel's beat on a pass, only while its page shows.
+        if self.steps_page()
+            && let Some((shown, at)) = self.guide_at()
+            && matches!(shown.guide.steps[at], guide::Step::Pass { turns_per_minute, .. } if turns_per_minute > 0.)
+        {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(100))
+                    .map(|at| Message::Guide(GuideAction::Beat(at))),
+            );
+        }
         Subscription::batch(subscriptions)
     }
     fn view(&self) -> Element<'_, Message> {
@@ -5033,8 +5302,11 @@ fn check_plan(args: &[String]) -> Result<(String, String, bool), String> {
     let (check, _) = plan_check::check(&doc, &mesh, &report, &proposal);
     let json = serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?;
     let summary = if check.passed {
+        let split = check
+            .split_line()
+            .map_or(String::new(), |l| format!(" ({l})"));
         format!(
-            "The plan passes every check: {}, {} min.",
+            "The plan passes every check: {}, {} min{split}.",
             ui::plural(check.operations.len(), "operation"),
             check.total_minutes
         )
@@ -5082,6 +5354,10 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         eprintln!("! {e}");
     }
     for setup in &job.setups {
+        if manual::is_manual(&doc.setups[setup.setup].machine) {
+            println!("{}", manual::no_gcode(&setup.name));
+            continue;
+        }
         match &setup.result {
             Ok(programs) => programs
                 .iter()
