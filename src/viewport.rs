@@ -42,11 +42,22 @@ pub enum Event {
     Zoom(f32),
     Pick(usize),
     PickSurface(usize),
+    /// Where pin 1 would stand under the pointer while placing the pins
+    /// (`PinAim`), in plan mm; None once the pointer leaves the view.
+    AimPins(Option<[f32; 2]>),
+    /// A click, or a drag of the pins ending, while placing them: pin 1
+    /// stands there (plan mm).
+    PlacePins([f32; 2]),
 }
 #[derive(Default)]
 pub struct State {
     drag: Option<(Point, Point, mouse::Button)>,
     moved: bool,
+    /// While the placed pins are dragged: where the pointer took them, from
+    /// pin 1 (plan mm).
+    grab: Option<[f32; 2]>,
+    /// Whether the pins follow the pointer, so that leaving the view says so.
+    aiming: bool,
     raster: RefCell<Option<(String, RasterFrame)>>,
 }
 
@@ -134,6 +145,28 @@ pub struct PinHolePick {
     pub pick: bool,
     pub holes: Vec<(usize, [f32; 3], f32)>,
 }
+/// The fixture pins being placed in the stock's leftover ("Place the pins
+/// on the leftover", the Work zero step): the plate's pins follow the
+/// pointer on the stock's bottom, and a click, or a drag of the placed
+/// pins, puts pin 1 there.
+#[derive(Clone, Debug, Default)]
+pub struct PinAim {
+    /// Whether the pointer places them.
+    pub on: bool,
+    /// The height of the stock's bottom they stand on (plan mm).
+    pub z: f32,
+    /// Each pin from pin 1, as the plate has them (mm).
+    pub offsets: Vec<[f32; 2]>,
+    pub diameter: f32,
+    pub height: f32,
+    /// Where pin 1 stands, placed (plan mm).
+    pub placed: Option<[f32; 2]>,
+    pub ghost: Option<Ghost>,
+}
+/// The pins under the pointer while placing them (`PinAim`): pin 1 (plan
+/// mm), and how far they keep from the part and the stock's edge, or why
+/// they do not fit there.
+pub type Ghost = ([f32; 2], Result<(f32, f32), String>);
 #[derive(Clone)]
 pub struct Viewport<'a> {
     pub setup: Option<&'a Setup>,
@@ -145,6 +178,8 @@ pub struct Viewport<'a> {
     pub picking: bool,
     /// The part's holes offered for the fixture pins (the Work zero step).
     pub pin_holes: PinHolePick,
+    /// The pins being placed in the stock's leftover (the Work zero step).
+    pub pin_aim: PinAim,
     pub show_stock: bool,
     pub show_paths: bool,
     pub progress: Option<f32>,
@@ -159,6 +194,10 @@ pub struct Viewport<'a> {
     /// The machine's tool while a tool run of this setup cuts: its tip in
     /// plan coordinates (mm), radius and stickout. Drawn over the scene.
     pub live: Option<([f32; 3], f32, f32)>,
+    /// The stock a run of this setup has carved, or starts from, in plan
+    /// coordinates (`run::Run::stock`) with its version: drawn instead of the
+    /// setup's stock when no simulation is shown.
+    pub live_stock: Option<(&'a crate::simulation::StockGrid, u64)>,
     /// Per face of the part (`Mesh::faces`): whether the whole job still
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
@@ -257,6 +296,22 @@ impl Projector {
             self.center.x + (x * c + y * s) * self.scale,
             self.center.y - (-x * s * se + y * c * se + z * ce) * self.scale,
         )
+    }
+    /// The point of the plane at height `z` the screen point `at` shows
+    /// (`p` back): None when the view looks along that plane.
+    pub(crate) fn unproject(&self, at: Point, z: f32) -> Option<[f32; 3]> {
+        let (s, c) = self.camera.yaw.sin_cos();
+        let (se, ce) = self.camera.pitch.sin_cos();
+        if se.abs() < 0.05 {
+            return None;
+        }
+        let a = (at.x - self.center.x) / self.scale;
+        let b = ((self.center.y - at.y) / self.scale - (z - self.target[2]) * ce) / se;
+        Some([
+            self.target[0] + a * c - b * s,
+            self.target[1] + a * s + b * c,
+            z,
+        ])
     }
     /// How far toward the viewer: larger is nearer.
     pub(crate) fn depth(&self, v: [f32; 3]) -> f32 {
@@ -375,6 +430,32 @@ impl Viewport<'_> {
             })
             .collect()
     }
+    /// The point of the stock's bottom under the screen point `at` while
+    /// placing the pins (plan mm).
+    fn aimed(&self, b: Rectangle, at: Point) -> Option<[f32; 2]> {
+        let scale = self.mesh.display_scale();
+        let q = self.projector(b).unproject(at, self.pin_aim.z * scale)?;
+        Some([q[0] / scale, q[1] / scale])
+    }
+    /// Where the pointer took the placed pins at the screen point `at`,
+    /// from pin 1 (plan mm): None off them.
+    fn grabbed(&self, b: Rectangle, at: Point) -> Option<[f32; 2]> {
+        let (aim, placed) = (&self.pin_aim, self.pin_aim.placed?);
+        let q = self.aimed(b, at)?;
+        let p = self.projector(b);
+        let scale = self.mesh.display_scale();
+        // Near a pin on the screen, or within its hole.
+        let reach = (aim.diameter / 2. * scale * p.scale).max(10.);
+        aim.offsets
+            .iter()
+            .any(|d| {
+                let c = [placed[0] + d[0], placed[1] + d[1]];
+                p.p([c[0] * scale, c[1] * scale, aim.z * scale])
+                    .distance(at)
+                    <= reach
+            })
+            .then(|| [q[0] - placed[0], q[1] - placed[1]])
+    }
     fn picked(&self, b: Rectangle, point: Point) -> Option<usize> {
         if !self.picking
             || (!self.sample
@@ -439,10 +520,11 @@ impl Viewport<'_> {
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             self.holding,
             self.leftover,
             self.live,
+            self.live_stock.map(|(g, v)| (std::ptr::from_ref(g), v)),
             self.uncut.first().map(std::ptr::from_ref),
             self.uncut.len(),
             self.show_uncut
@@ -487,7 +569,8 @@ impl Viewport<'_> {
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
         // Only the faces still under stock are drawn then, after the stock.
-        let behind_stock = self.simulation.is_some() && self.show_stock;
+        let carved = self.simulation.is_none() && self.show_stock && self.live_stock.is_some();
+        let behind_stock = (self.simulation.is_some() && self.show_stock) || carved;
         let faces = if behind_stock && !self.show_uncut {
             vec![]
         } else {
@@ -589,8 +672,36 @@ impl Viewport<'_> {
                 }
             }
         }
-        if let Some(simulation) = self.simulation {
-            self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
+        if self.simulation.is_some() || carved {
+            match (self.simulation, self.live_stock) {
+                (Some(simulation), _) => {
+                    self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio)
+                }
+                (None, Some((grid, _))) => {
+                    let scale = self.mesh.display_scale();
+                    let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
+                        let v: Vec<_> = (points.iter())
+                            .map(|v| {
+                                let v = v.map(|n| n * scale);
+                                let q = p.p(v);
+                                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                            })
+                            .collect();
+                        for i in 1..v.len() - 1 {
+                            raster_triangle(
+                                &mut rgba,
+                                &mut depths,
+                                w,
+                                h,
+                                [v[0], v[i], v[i + 1]],
+                                color,
+                            );
+                        }
+                    };
+                    grid_faces(grid, &mut face);
+                }
+                (None, None) => {}
+            }
             for (fi, face) in faces.iter().enumerate() {
                 if !behind_stock || self.uncut.get(fi) != Some(&true) {
                     continue;
@@ -793,95 +904,7 @@ impl Viewport<'_> {
             }
         }
         if self.show_stock && sim.volume.is_none() {
-            let g = &sim.stock;
-            for y in 0..g.ny {
-                for x in 0..g.nx {
-                    let z = g.heights[y * g.nx + x];
-                    let a = g.bounds.min[0] + x as f32 * g.dx;
-                    let b = a + g.dx;
-                    let c = g.bounds.min[1] + y as f32 * g.dy;
-                    let d = c + g.dy;
-                    let cut = z < g.bounds.max[2] - 0.0001;
-                    face(
-                        &[[a, c, z], [b, c, z], [b, d, z], [a, d, z]],
-                        if cut {
-                            [103, 181, 151, 255]
-                        } else {
-                            [219, 183, 113, 255]
-                        },
-                    );
-                    for (adjacent, edge, tone) in [
-                        (
-                            if x == 0 {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[y * g.nx + x - 1]
-                            },
-                            [[a, c, z], [a, d, z]],
-                            0,
-                        ),
-                        (
-                            if x + 1 == g.nx {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[y * g.nx + x + 1]
-                            },
-                            [[b, c, z], [b, d, z]],
-                            1,
-                        ),
-                        (
-                            if y == 0 {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[(y - 1) * g.nx + x]
-                            },
-                            [[a, c, z], [b, c, z]],
-                            1,
-                        ),
-                        (
-                            if y + 1 == g.ny {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[(y + 1) * g.nx + x]
-                            },
-                            [[a, d, z], [b, d, z]],
-                            0,
-                        ),
-                    ] {
-                        if adjacent < z - 0.00001 {
-                            face(
-                                &[
-                                    edge[0],
-                                    edge[1],
-                                    [edge[1][0], edge[1][1], adjacent],
-                                    [edge[0][0], edge[0][1], adjacent],
-                                ],
-                                if cut {
-                                    if tone == 0 {
-                                        [70, 135, 115, 255]
-                                    } else {
-                                        [86, 155, 129, 255]
-                                    }
-                                } else if tone == 0 {
-                                    [157, 127, 78, 255]
-                                } else {
-                                    [183, 149, 88, 255]
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            let z = g.bounds.min[2];
-            face(
-                &[
-                    [g.bounds.min[0], g.bounds.min[1], z],
-                    [g.bounds.max[0], g.bounds.min[1], z],
-                    [g.bounds.max[0], g.bounds.max[1], z],
-                    [g.bounds.min[0], g.bounds.max[1], z],
-                ],
-                [148, 121, 76, 255],
-            );
+            grid_faces(&sim.stock, &mut face);
         }
         let pos = sim.position;
         // Cylinders use the saved cutter diameter, flute length and stickout.
@@ -1096,52 +1119,73 @@ impl<'a> Viewport<'a> {
         for (n, pin) in (self.holding.iter())
             .filter_map(|h| Some((h.label.strip_prefix("fixture pin ")?, h.bounds)))
         {
-            let (c, r) = (
-                [
-                    (pin.min[0] + pin.max[0]) / 2.,
-                    (pin.min[1] + pin.max[1]) / 2.,
-                ],
-                (pin.max[0] - pin.min[0]) / 2.,
+            let c = [
+                (pin.min[0] + pin.max[0]) / 2.,
+                (pin.min[1] + pin.max[1]) / 2.,
+            ];
+            let r = (pin.max[0] - pin.min[0]) / 2.;
+            let z = [pin.min[2], pin.max[2]].map(|z| z * scale);
+            let c = c.map(|v| v * scale);
+            pin_outline(
+                &mut frame,
+                &p,
+                c,
+                r * scale,
+                z,
+                steel,
+                &format!("Pin {n}"),
+                false,
             );
-            let ring = |z: f32| -> Vec<Point> {
-                (0..=32)
-                    .map(|i| {
-                        let a = i as f32 * std::f32::consts::TAU / 32.;
-                        p.p([
-                            (c[0] + r * a.cos()) * scale,
-                            (c[1] + r * a.sin()) * scale,
-                            z * scale,
-                        ])
-                    })
-                    .collect()
+        }
+        // The pins being placed in the stock's leftover, under the pointer:
+        // green where they fit, red where they do not, with how far they
+        // keep from the part and the stock's edge or why not.
+        if let Some((pin1, fit)) = &self.pin_aim.ghost {
+            let aim = &self.pin_aim;
+            let color = match fit {
+                Ok(_) => Color::from_rgb8(22, 132, 64),
+                Err(_) => Color::from_rgb8(200, 36, 36),
             };
-            let (foot, top) = (ring(pin.min[2]), ring(pin.max[2]));
-            // The sides: the ring points furthest left and right on screen.
-            let (left, right) = (0..foot.len()).fold((0, 0), |(l, r), i| {
-                (
-                    if foot[i].x < foot[l].x { i } else { l },
-                    if foot[i].x > foot[r].x { i } else { r },
-                )
-            });
-            let sides = [[foot[left], top[left]], [foot[right], top[right]]];
-            for (width, color) in [(4.5, halo), (2., steel)] {
-                line(&mut frame, &foot, color, width);
-                line(&mut frame, &top, color, width);
-                for side in &sides {
-                    line(&mut frame, side, color, width);
-                }
+            let z = [aim.z, aim.z + aim.height].map(|z| z * scale);
+            let mut label_at = None;
+            for (i, d) in aim.offsets.iter().enumerate() {
+                let c = [(pin1[0] + d[0]) * scale, (pin1[1] + d[1]) * scale];
+                let top = pin_outline(
+                    &mut frame,
+                    &p,
+                    c,
+                    aim.diameter / 2. * scale,
+                    z,
+                    color,
+                    &format!("Pin {}", i + 1),
+                    true,
+                );
+                label_at.get_or_insert(top);
             }
-            let at = top[right];
-            let size = iced::Size::new(40., 16.);
-            let corner = Point::new(at.x + 6., at.y - size.height / 2.);
-            frame.fill_rectangle(corner, size, halo);
-            frame.fill_text(Text {
-                content: format!("Pin {n}"),
-                position: Point::new(corner.x + 3., corner.y + 1.),
-                color: steel,
-                size: 11.into(),
-                ..Text::default()
-            });
+            let said = match fit {
+                Ok((part, edge)) => format!(
+                    "{} mm to the part · {} mm to the edge · click to place",
+                    crate::post::exact_mm((part * 10.).floor() / 10.),
+                    crate::post::exact_mm((edge * 10.).floor() / 10.)
+                ),
+                Err(why) => why.clone(),
+            };
+            if let Some(at) = label_at {
+                let width = (said.chars().count() as f32 * 6.2 + 8.).min(bounds.width - 12.);
+                let size = iced::Size::new(width, 18.);
+                let corner = Point::new(
+                    (at.x - width / 2.).clamp(6., (bounds.width - width - 6.).max(6.)),
+                    (at.y - 44.).max(6.),
+                );
+                frame.fill_rectangle(corner, size, halo);
+                frame.fill_text(Text {
+                    content: said,
+                    position: Point::new(corner.x + 4., corner.y + 2.),
+                    color,
+                    size: 11.into(),
+                    ..Text::default()
+                });
+            }
         }
         // The part's holes offered for the pins, a ring at each opening.
         let amber = Color::from_rgb8(176, 96, 8);
@@ -1265,10 +1309,41 @@ impl canvas::Program<Event> for Viewport<'_> {
                 ) =>
             {
                 if let Some(p) = cursor.position_in(bounds) {
+                    if self.pin_aim.on
+                        && *b == mouse::Button::Left
+                        && let Some(grab) = self.grabbed(bounds, p)
+                    {
+                        state.grab = Some(grab);
+                        return Some(Action::capture());
+                    }
                     state.drag = Some((p, p, *b));
                     state.moved = false;
                     return Some(Action::capture());
                 }
+            }
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. })
+                if self.pin_aim.on && state.drag.is_none() =>
+            {
+                let at = cursor
+                    .position_in(bounds)
+                    .and_then(|p| self.aimed(bounds, p));
+                let grab = state.grab.unwrap_or_default();
+                if at.is_some() || state.aiming {
+                    state.aiming = at.is_some();
+                    let pin1 = at.map(|q| [q[0] - grab[0], q[1] - grab[1]]);
+                    return Some(Action::publish(Event::AimPins(pin1)).and_capture());
+                }
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(_)) if state.grab.is_some() => {
+                let grab = state.grab.take().unwrap_or_default();
+                if let Some(q) = cursor
+                    .position_in(bounds)
+                    .and_then(|p| self.aimed(bounds, p))
+                {
+                    let pin1 = [q[0] - grab[0], q[1] - grab[1]];
+                    return Some(Action::publish(Event::PlacePins(pin1)).and_capture());
+                }
+                return Some(Action::capture());
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if let Some((start, last, b)) = state.drag {
@@ -1297,6 +1372,15 @@ impl canvas::Program<Event> for Viewport<'_> {
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(_)) => {
                 if let Some((_, _, button)) = state.drag.take() {
+                    if !state.moved
+                        && button == mouse::Button::Left
+                        && self.pin_aim.on
+                        && let Some(q) = cursor
+                            .position_in(bounds)
+                            .and_then(|p| self.aimed(bounds, p))
+                    {
+                        return Some(Action::publish(Event::PlacePins(q)).and_capture());
+                    }
                     if !state.moved
                         && button == mouse::Button::Left
                         && let Some(p) = cursor.position_in(bounds)
@@ -1428,6 +1512,65 @@ fn polygon(points: &[Point]) -> Path {
             b.close()
         }
     })
+}
+/// A fixture pin standing at `c` (display units) from `z[0]` up to `z[1]`,
+/// `r` round, drawn over the scene as its cylinder's outline (the rings at
+/// its foot and top and the sides between them) in `color`, outlined in
+/// white and labelled `label` on its right, or on its `left`: where its
+/// top's centre is on the screen.
+#[allow(clippy::too_many_arguments)]
+fn pin_outline(
+    frame: &mut Frame,
+    p: &Projector,
+    c: [f32; 2],
+    r: f32,
+    z: [f32; 2],
+    color: Color,
+    label: &str,
+    left: bool,
+) -> Point {
+    let halo = Color::from_rgba8(255, 255, 255, 0.92);
+    let ring = |z: f32| -> Vec<Point> {
+        (0..=32)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::TAU / 32.;
+                p.p([c[0] + r * a.cos(), c[1] + r * a.sin(), z])
+            })
+            .collect()
+    };
+    let (foot, top) = (ring(z[0]), ring(z[1]));
+    // The sides: the ring points furthest left and right on screen.
+    let (left_most, right) = (0..foot.len()).fold((0, 0), |(l, r), i| {
+        (
+            if foot[i].x < foot[l].x { i } else { l },
+            if foot[i].x > foot[r].x { i } else { r },
+        )
+    });
+    let sides = [[foot[left_most], top[left_most]], [foot[right], top[right]]];
+    for (width, color) in [(4.5, halo), (2., color)] {
+        line(frame, &foot, color, width);
+        line(frame, &top, color, width);
+        for side in &sides {
+            line(frame, side, color, width);
+        }
+    }
+    let size = iced::Size::new(40., 16.);
+    let corner = if left {
+        let at = top[left_most];
+        Point::new(at.x - 6. - size.width, at.y - size.height / 2.)
+    } else {
+        let at = top[right];
+        Point::new(at.x + 6., at.y - size.height / 2.)
+    };
+    frame.fill_rectangle(corner, size, halo);
+    frame.fill_text(Text {
+        content: label.into(),
+        position: Point::new(corner.x + 3., corner.y + 1.),
+        color,
+        size: 11.into(),
+        ..Text::default()
+    });
+    p.p([c[0], c[1], z[1]])
 }
 fn line(frame: &mut Frame, points: &[Point], c: Color, w: f32) {
     let path = Path::new(|b| {
@@ -1899,6 +2042,105 @@ fn paths(s: Strategy) -> Vec<Vec<[f32; 3]>> {
             .collect(),
     }
 }
+/// The faces of the stock grid `g` (plan mm): its top, cut cells green; the
+/// steps between cells of different heights, green as they were cut; its
+/// sides and bottom in the stock's colours.
+fn grid_faces(g: &crate::simulation::StockGrid, face: &mut impl FnMut(&[[f32; 3]], [u8; 4])) {
+    for y in 0..g.ny {
+        for x in 0..g.nx {
+            let z = g.heights[y * g.nx + x];
+            let a = g.bounds.min[0] + x as f32 * g.dx;
+            let b = a + g.dx;
+            let c = g.bounds.min[1] + y as f32 * g.dy;
+            let d = c + g.dy;
+            let cut = z < g.bounds.max[2] - 0.0001;
+            face(
+                &[[a, c, z], [b, c, z], [b, d, z], [a, d, z]],
+                if cut {
+                    [103, 181, 151, 255]
+                } else {
+                    [219, 183, 113, 255]
+                },
+            );
+            for (adjacent, edge, tone, outer) in [
+                (
+                    if x == 0 {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[y * g.nx + x - 1]
+                    },
+                    [[a, c, z], [a, d, z]],
+                    0,
+                    x == 0,
+                ),
+                (
+                    if x + 1 == g.nx {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[y * g.nx + x + 1]
+                    },
+                    [[b, c, z], [b, d, z]],
+                    1,
+                    x + 1 == g.nx,
+                ),
+                (
+                    if y == 0 {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[(y - 1) * g.nx + x]
+                    },
+                    [[a, c, z], [b, c, z]],
+                    1,
+                    y == 0,
+                ),
+                (
+                    if y + 1 == g.ny {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[(y + 1) * g.nx + x]
+                    },
+                    [[a, d, z], [b, d, z]],
+                    0,
+                    y + 1 == g.ny,
+                ),
+            ] {
+                if adjacent < z - 0.00001 {
+                    face(
+                        &[
+                            edge[0],
+                            edge[1],
+                            [edge[1][0], edge[1][1], adjacent],
+                            [edge[0][0], edge[0][1], adjacent],
+                        ],
+                        // A step between cells was cut; the block's own
+                        // sides are stock under any cut on top.
+                        if !outer {
+                            if tone == 0 {
+                                [70, 135, 115, 255]
+                            } else {
+                                [86, 155, 129, 255]
+                            }
+                        } else if tone == 0 {
+                            [157, 127, 78, 255]
+                        } else {
+                            [183, 149, 88, 255]
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let z = g.bounds.min[2];
+    face(
+        &[
+            [g.bounds.min[0], g.bounds.min[1], z],
+            [g.bounds.max[0], g.bounds.min[1], z],
+            [g.bounds.max[0], g.bounds.max[1], z],
+            [g.bounds.min[0], g.bounds.max[1], z],
+        ],
+        [148, 121, 76, 255],
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1921,12 +2163,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -1989,12 +2233,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &all,
             show_uncut: true,
         };
@@ -2038,12 +2284,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &all,
             show_uncut: true,
         };
@@ -2098,12 +2346,14 @@ mod tests {
                 camera: Camera::default(),
                 picking: false,
                 pin_holes: Default::default(),
+                pin_aim: Default::default(),
                 show_stock: true,
                 show_paths: false,
                 progress: None,
                 holding: vec![],
                 leftover: None,
                 live: None,
+                live_stock: None,
                 uncut,
                 show_uncut: true,
             }
@@ -2140,12 +2390,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2215,12 +2467,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2348,12 +2602,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2441,12 +2697,14 @@ mod tests {
             },
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2499,12 +2757,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2544,12 +2804,14 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2590,12 +2852,14 @@ mod tests {
             camera,
             picking: true,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2634,12 +2898,14 @@ mod tests {
             },
             picking: true,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2727,12 +2993,14 @@ mod tests {
             },
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
             holding,
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };

@@ -3718,9 +3718,9 @@ flood = { pin = 8 }
             a.status
         );
         assert_eq!(pick(&mut a, end), 2);
-        let datum =
-            crate::post::datum(&a.doc.setups[1], a.known_stock(1).0.unwrap(), &mesh).unwrap();
-        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, datum).unwrap();
+        let stock = a.known_stock(1).0.unwrap();
+        let datum = crate::post::datum(&a.doc.setups[1], stock, &mesh).unwrap();
+        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, stock, datum).unwrap();
         assert!(
             (on.places[0][0] - holes[0].center[0]).abs() < 0.01,
             "{on:?}"
@@ -3731,6 +3731,193 @@ flood = { pin = 8 }
         let _ = a.update(Message::SetupStep("Stock"));
         assert!(!a.picking_pin_holes());
         assert_eq!(pick(&mut a, wall), 1);
+    }
+
+    /// `post::fixture::leftover_flip("rx", tool)` in the app: the cube
+    /// flipped onto pins in its leftover, on the flipped setup's Work zero
+    /// step.
+    fn leftover_pins_app(tool: Option<&str>) -> App {
+        let mut a = app();
+        let (doc, mesh) = crate::post::fixture::leftover_flip("rx", tool);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupStep("Work zero"));
+        a
+    }
+
+    #[test]
+    fn the_work_zero_step_places_the_pins_on_the_leftover_in_the_3d_view() {
+        use crate::viewport::Event;
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 0.01;
+        let mut a = leftover_pins_app(None);
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[1], &mesh);
+        let placed = crate::post::leftover_places(&a.doc, &mesh, 1).unwrap();
+        // Not placing: the pointer and a click move nothing.
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([0., 0.]))));
+        let _ = a.update(Message::Viewport(Event::PlacePins([0., 0.])));
+        assert_eq!(a.pin_aim, None);
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            placed[0]
+        ));
+        assert!(!crate::ui::pin_aim(&a).on);
+        let _ = a.update(Message::PlacePins);
+        assert!(a.placing_leftover_pins());
+        assert!(!a.picking_pin_holes());
+        // Over the part they are red, with why.
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            part.min[0] + 5.,
+            y,
+        ]))));
+        let aim = crate::ui::pin_aim(&a);
+        assert!(aim.on && aim.offsets.len() == 2, "{aim:?}");
+        assert!(near(aim.placed.unwrap(), placed[0]), "{aim:?}");
+        assert_eq!(
+            aim.ghost.unwrap().1,
+            Err(
+                "Pin 1 would stand under the part: place the pins on the leftover beside it."
+                    .into()
+            )
+        );
+        // A click there leaves them where they were, and says why.
+        let _ = a.update(Message::Viewport(Event::PlacePins([part.min[0] + 5., y])));
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            placed[0]
+        ));
+        assert_eq!(
+            a.status,
+            "The pins do not fit there: Pin 1 would stand under the part: place the pins on the leftover beside it."
+        );
+        // On the leftover they fit, 2 mm further from the part, and a click
+        // puts pin 1 there.
+        let to = [placed[0][0] - 2., placed[0][1]];
+        let _ = a.update(Message::Viewport(Event::AimPins(Some(to))));
+        let (_, fit) = crate::ui::pin_aim(&a).ghost.unwrap();
+        let (gap, _) = fit.unwrap();
+        assert!((gap - 11.95).abs() < 0.01, "{gap}");
+        let _ = a.view();
+        let _ = a.update(Message::Viewport(Event::PlacePins(to)));
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            to
+        ));
+        // Add the pin holes to Top: a Drill of them with the Ø4.1 drill,
+        // its holes where the pins are.
+        let _ = a.update(Message::AddPinDrilling);
+        assert!(
+            a.status
+                .starts_with("Added Pin holes to Top, with Drill 4.1."),
+            "{}",
+            a.status
+        );
+        let op = a.doc.setups[0].operations.last().unwrap().clone();
+        assert!(op.drills_pin_holes());
+        assert_eq!(
+            a.doc.tools.iter().find(|t| t.id == op.tool).unwrap().name(),
+            "Drill 4.1"
+        );
+        assert_eq!(crate::post::pin_drillings(&a.doc, 1), vec![(0, 1)]);
+        let points = crate::post::drill_pin_points(&op);
+        assert_eq!(points.len(), 2);
+        let _ = a.view();
+        // Moving the pins moves their holes.
+        let _ = a.update(Message::Viewport(Event::PlacePins([to[0], to[1] + 1.])));
+        let moved = crate::post::drill_pin_points(&a.doc.setups[0].operations[1]);
+        assert!(moved.len() == 2 && moved != points, "{moved:?} {points:?}");
+        // Away from the Work zero step the pointer places nothing.
+        let _ = a.update(Message::SetupStep("Stock"));
+        assert!(!a.placing_leftover_pins());
+        assert!(!crate::ui::pin_aim(&a).on);
+    }
+
+    /// Renders the pins placed in the stock's leftover to PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/leftover-pins): the flipped setup's
+    /// Work zero step with the pins under the pointer where they fit and
+    /// where they do not, then placed; setup 1's Drill of their holes, its
+    /// drilled and its milled holes; the pins seen from below. Not a check:
+    /// run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_pins_in_the_leftover() {
+        use crate::viewport::Event;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/leftover-pins".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let tall = iced::Size::new(1600., 1300.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_pins_app(None);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.refresh_left_stock();
+        a.smoke_dir = None;
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[1], &mesh);
+        let placed = crate::post::leftover_places(&a.doc, &mesh, 1).unwrap();
+        let _ = a.update(Message::PlacePins);
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            placed[0][0] - 1.,
+            placed[0][1] + 3.,
+        ]))));
+        render_png(&a, tall, &out.join("1-aim-fits.png"));
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            part.min[0] - 5.,
+            y,
+        ]))));
+        render_png(&a, tall, &out.join("2-aim-too-near-the-part.png"));
+        let _ = a.update(Message::PlacePins);
+        render_png(&a, tall, &out.join("3-placed.png"));
+        a.camera.pitch = -0.6;
+        render_png(&a, tall, &out.join("4-placed-from-below.png"));
+        a.camera = Default::default();
+        let _ = a.update(Message::AddPinDrilling);
+        let _ = a.view();
+        render_png(&a, tall, &out.join("5-add-the-pin-holes.png"));
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        // At the end of each, with the stock it leaves meshed in line.
+        let ended = |a: &mut App| {
+            let _ = a.update(Message::Generate);
+            let _ = a.update(Message::Scrub(1.));
+            let key = a.stock_mesh_key().unwrap();
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let result = crate::stock_surface::Snapshot {
+                bounds: volume.bounds,
+                frame: volume.frame,
+                cuts: volume.cuts.clone(),
+                detail: crate::stock_surface::Detail::Fine,
+            }
+            .build()
+            .map(std::sync::Arc::new);
+            let seconds = sim.seconds;
+            a.stock_mesh_job = None;
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        ended(&mut a);
+        render_png(&a, tall, &out.join("6-pin-holes-drilled.png"));
+        a.camera.zoom = 2.5;
+        render_png(&a, tall, &out.join("7-pin-holes-drilled-close.png"));
+        a.camera = Default::default();
+        let flat = (a.doc.tools.iter())
+            .find(|t| t.name() == "Flat 3")
+            .unwrap()
+            .id
+            .clone();
+        let _ = a.update(Message::SetOpTool(flat));
+        ended(&mut a);
+        a.camera.zoom = 2.5;
+        render_png(&a, tall, &out.join("8-pin-holes-milled-close.png"));
     }
 
     /// The example block's pocket cleared adaptively, its editor tabs and
@@ -4773,6 +4960,90 @@ flood = { pin = 8 }
         assert!(!a.locked());
         // Nothing was set.
         work_offset(&a, [195., 140., -20.]);
+    }
+
+    /// The Control page's 3D view shows the stock a run cuts, where the
+    /// machine's tool has gone and not ahead of it; MANUFACTURE keeps the
+    /// planned view, and picking the start again drops the carve (LIO-181).
+    #[test]
+    fn a_run_cuts_the_stock_where_the_machines_tool_goes() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        a.page = Page::Control;
+        // Nothing is shown before the tool moves: the view keeps the part.
+        assert!(a.live_stock().is_none());
+        let start = (run_of(&a).before.iter())
+            .find(|b| b.op == 0)
+            .expect("the stock before the facing")
+            .stock
+            .clone();
+        let top = start.bounds.max[2];
+        assert!(
+            start.heights.iter().all(|h| (h - top).abs() < 1e-3),
+            "uncut"
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 20.0, "a cut into the stock", |r| {
+            r.carving
+                .as_ref()
+                .is_some_and(|c| c.stock.heights.iter().any(|h| *h < top - 0.05))
+        });
+        // The passes go along X, stepping over in +Y: nothing past the tool
+        // in Y is cut while it faces, though the driver's line runs ahead.
+        let mut seen = 0;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while run_of(&a).done.first() != Some(&true) {
+            assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
+            assert!(
+                std::time::Instant::now() < end,
+                "the facing tool run did not end"
+            );
+            let _ = a.update(Message::Tick);
+            let (Some((tip, radius, _)), Some((g, _))) = (a.live_tool(), a.live_stock()) else {
+                continue;
+            };
+            if tip[2] > top {
+                continue;
+            }
+            seen += 1;
+            for y in 0..g.ny {
+                let cy = g.bounds.min[1] + (y as f32 + 0.5) * g.dy;
+                if cy > tip[1] + radius + 2. * g.dy {
+                    let row = &g.heights[y * g.nx..(y + 1) * g.nx];
+                    assert!(
+                        row.iter().all(|h| (h - top).abs() < 1e-3),
+                        "Y {cy} cut, tool at {tip:?}"
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(seen > 3, "{seen}");
+        // MANUFACTURE keeps its planned view.
+        a.page = Page::Work;
+        assert!(a.live_stock().is_none());
+        a.page = Page::Control;
+        let _ = a.view();
+        // The facing tool run done, its passes have cut the whole top, every
+        // pass however late the ticks came.
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let faced = a.live_stock().unwrap().0;
+        assert!(
+            faced.heights.iter().all(|h| *h < top - 0.05),
+            "{:?}",
+            faced.heights
+        );
+        // Jogging between tool runs cuts nothing; the carve is kept.
+        let kept = faced.heights.clone();
+        mdi(&mut a, "G0 X5 Y5 Z-5");
+        assert_eq!(a.live_stock().unwrap().0.heights, kept);
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        assert!(run_of(&a).carving.is_none() && a.live_stock().is_none());
     }
 
     #[test]
@@ -6375,6 +6646,69 @@ flood = { pin = 8 }
         // The machine position counted with 200 steps per mm is gone.
         assert!(conn(&a).snapshot.referenced.iter().all(|r| !r));
         let _ = a.view();
+    }
+
+    #[test]
+    fn picking_another_machine_while_connected_asks_then_switches() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        let mut other = a.doc.machines[0].clone();
+        other.id = "other".into();
+        other.p.insert("name".into(), "Second router".into());
+        a.doc.machines.push(other);
+        let first = a.doc.machines[0].id.clone();
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        // The connected machine itself asks nothing.
+        let _ = a.update(Message::ControlMachine(first.clone()));
+        assert!(a.switch_machine.is_none());
+        let _ = a.update(Message::ControlMachine("other".into()));
+        assert_eq!(conn(&a).machine_id, first);
+        shows(&a, &["Switch to Second router?", "Disconnect and switch"]);
+        let _ = a.update(Message::SwitchMachine(false));
+        assert!(a.switch_machine.is_none() && conn(&a).machine_id == first);
+        lacks(&a, &["Switch to Second router?"]);
+        let _ = a.update(Message::ControlMachine("other".into()));
+        let _ = a.update(Message::SwitchMachine(true));
+        assert_eq!(conn(&a).machine_id, "other");
+        assert_eq!(a.control_target().unwrap().id, "other");
+        tick_until(&mut a, 3.0, "E-stop after switching", |s| {
+            s.state == Some(State::EStop)
+        });
+        // A Disconnect drops a question still open.
+        let _ = a.update(Message::ControlMachine(first));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.switch_machine.is_none() && a.control.is_none());
+    }
+
+    #[test]
+    fn the_real_or_simulated_switch_saves_the_machines_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        a.page = Page::Control;
+        a.machine_draft = a.doc.machines[0].clone();
+        shows(&a, &["Real (USB)", "Simulated"]);
+        let _ = a.update(Message::MachineConnection(false));
+        assert!(!crate::control::simulated(&a.doc.machines[0]));
+        assert!(!crate::control::simulated(&a.machine_draft));
+        assert_eq!(a.doc.machines[0].version, 1, "not a planning change");
+        assert!(a.control.is_none(), "choosing does not connect");
+        let _ = a.update(Message::MachineConnection(true));
+        assert!(crate::control::simulated(&a.doc.machines[0]));
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).simulated);
+        // The way it is connected already keeps the connection.
+        a.control.as_mut().unwrap().mdi = "G0 X1".into();
+        let _ = a.update(Message::MachineConnection(true));
+        assert_eq!(conn(&a).mdi, "G0 X1");
+        shows(
+            &a,
+            &["Real (USB) disconnects the simulator and connects to the machine itself."],
+        );
     }
 
     #[test]

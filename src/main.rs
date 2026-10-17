@@ -163,6 +163,12 @@ pub enum Message {
     PickPinHoles,
     /// A click on the part's surface while picking the pin holes.
     PinHoleSurface(usize),
+    /// "Place the pins on the leftover" (and "Finish placing") in the Work
+    /// zero step of a setup on pins in its stock's leftover.
+    PlacePins,
+    /// "Add the pin holes to …": a Drill of the pin holes in the earlier
+    /// setup that has the face the pins stand on facing up.
+    AddPinDrilling,
     Generate,
     GenerateAll,
     AddSetup,
@@ -186,8 +192,17 @@ pub enum Message {
     BrowseUc100Profile,
     /// The chosen UC100 profile; None when the dialog was cancelled.
     Uc100ProfilePicked(Option<PathBuf>),
-    /// Chooses the UC100 machine for the Control page (machine id).
+    /// Chooses the UC100 machine for the Control page (machine id). While
+    /// another machine is connected it asks first (`SwitchMachine`).
     ControlMachine(String),
+    /// The answer to "disconnect and switch?": true disconnects, chooses the
+    /// machine asked about and connects to it.
+    SwitchMachine(bool),
+    /// Back to the manual mill's steps from the CNC's Control page.
+    ShowGuide,
+    /// The Control page's Real | Simulated switch for its machine (true:
+    /// simulated). Connected the other way, it reconnects.
+    MachineConnection(bool),
     Connect,
     Disconnect,
     MachineReset,
@@ -830,6 +845,14 @@ pub struct App {
     /// chooses or removes the hole it is in for the fixture pins, while
     /// that step of a setup on the pins is open (`picking_pin_holes`).
     pub picking_pins: bool,
+    /// "Place the pins on the leftover" in the Work zero step: the pins
+    /// follow the pointer over the 3D view and a click puts pin 1 there,
+    /// while that step of a setup on pins in its leftover is open
+    /// (`placing_leftover_pins`).
+    pub placing_pins: bool,
+    /// Where pin 1 would stand under the pointer while placing the pins
+    /// (plan mm): drawn as the pins there, red where they do not fit.
+    pub pin_aim: Option<[f32; 2]>,
     pub playing: bool,
     pub simulation: Option<simulation::Simulation>,
     pub stock_detail: stock_surface::Detail,
@@ -853,6 +876,13 @@ pub struct App {
     pub profile_draft: Option<(String, Result<setup::Draft, String>)>,
     /// The UC100 machine chosen on the Control page (machine id).
     pub control_machine: Option<String>,
+    /// The machine (id) picked on the Control page while another is
+    /// connected: the page asks whether to disconnect and switch to it.
+    pub switch_machine: Option<String>,
+    /// The manual-mill setup (id) whose Control page shows the CNC instead of
+    /// its steps, after a CNC machine was picked there. Making another setup
+    /// active shows the steps again.
+    pub cnc_over_guide: Option<String>,
     /// The setup (id) Run on the machine picked while disconnected: Connect
     /// picks it in the Run panel.
     run_on_connect: Option<String>,
@@ -1062,7 +1092,10 @@ fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
         viewport::Event::Zoom(v) => {
             camera.zoom = (camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(0.3, 4.)
         }
-        viewport::Event::Pick(_) | viewport::Event::PickSurface(_) => {}
+        viewport::Event::Pick(_)
+        | viewport::Event::PickSurface(_)
+        | viewport::Event::AimPins(_)
+        | viewport::Event::PlacePins(_) => {}
     }
 }
 impl App {
@@ -1183,6 +1216,8 @@ impl App {
             machine_setup: false,
             profile_draft: None,
             control_machine: None,
+            switch_machine: None,
+            cnc_over_guide: None,
             run_on_connect: None,
             jog_key: None,
             run_epoch: 0,
@@ -1264,6 +1299,8 @@ impl App {
             paths: true,
             picking: false,
             picking_pins: false,
+            placing_pins: false,
+            pin_aim: None,
             playing: false,
             simulation: None,
             stock_detail: Default::default(),
@@ -1459,7 +1496,21 @@ impl App {
             && self.setup_step == "Work zero"
             && !self.is_sample()
             && self.part_mesh().is_some()
-            && self.doc.active_setup().is_some_and(post::sits_on_pins)
+            && (self.doc.active_setup())
+                .is_some_and(|s| post::sits_on_pins(s) && !post::pins_in_leftover(s))
+    }
+    /// Whether the pointer places the pins in the stock's leftover: "Place
+    /// the pins on the leftover" is on, and the Work zero step of a setup on
+    /// pins in its leftover is open on an imported part.
+    pub fn placing_leftover_pins(&self) -> bool {
+        self.placing_pins
+            && self.page == Page::Work
+            && self.selected.is_none()
+            && self.setup_step == "Work zero"
+            && !self.is_sample()
+            && self.part_mesh().is_some()
+            && (self.doc.active_setup())
+                .is_some_and(|s| post::sits_on_pins(s) && post::pins_in_leftover(s))
     }
     pub fn can_pick(&self) -> bool {
         self.operation().is_some_and(|o| {
@@ -1570,6 +1621,11 @@ impl App {
     fn touch(&mut self) {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
+            if self.doc.file.is_some()
+                && let Some(mesh) = &self.imported_mesh
+            {
+                post::sync_pin_drilling(&mut self.doc, mesh);
+            }
         }
         self.audit_report.clear();
         self.invalidate_post();
@@ -1666,6 +1722,20 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
+    /// The stock the run of the active setup has carved (`run::Run::stock`),
+    /// for the Control page's 3D view: MANUFACTURE keeps the part and the
+    /// planned stock.
+    pub fn live_stock(&self) -> Option<(&simulation::StockGrid, u64)> {
+        if self.page != Page::Control {
+            return None;
+        }
+        let r = self.control.as_ref()?.run.as_ref()?;
+        let setup = self.doc.setups.get(r.setup)?;
+        if setup.id != self.doc.active {
+            return None;
+        }
+        r.stock()
+    }
     /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
     /// out in the background, the Run panel's check of its setup included
@@ -1749,6 +1819,7 @@ impl App {
     }
     /// Disables the machine and stops its controller, if connected.
     pub fn disconnect_machine(&mut self) {
+        self.switch_machine = None;
         if let Some(c) = self.control.take() {
             c.close();
             self.status = "Disconnected from the machine.".into();
@@ -2341,7 +2412,9 @@ impl App {
     pub(crate) fn steps_page(&self) -> bool {
         self.page == Page::Control
             && !self.machine_setup
-            && (self.doc.active_setup()).is_some_and(|s| manual::is_manual(&s.machine))
+            && (self.doc.active_setup()).is_some_and(|s| {
+                manual::is_manual(&s.machine) && self.cnc_over_guide.as_ref() != Some(&s.id)
+            })
     }
     /// The guide as built, when that was for the job as it is now.
     pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
@@ -2422,6 +2495,7 @@ impl App {
                 let Some(s) = self.doc.setups.get(si) else {
                     return Task::none();
                 };
+                self.cnc_over_guide = None;
                 if s.id != self.doc.active {
                     self.doc.active = s.id.clone();
                     self.stop_selection();
@@ -3259,6 +3333,60 @@ impl App {
             Message::PickPinHoles => {
                 self.picking_pins = !self.picking_pins;
                 self.picking = false;
+                self.placing_pins = false;
+            }
+            Message::PlacePins => {
+                self.placing_pins = !self.placing_pins;
+                self.picking = false;
+                self.picking_pins = false;
+                self.pin_aim = None;
+            }
+            Message::AddPinDrilling => {
+                let si = self.doc.index();
+                let Some(mesh) = self.part_mesh() else {
+                    return Task::none();
+                };
+                let Some(to) = post::pin_drilling_setup(&self.doc, mesh, si) else {
+                    self.status = "No earlier setup has the face the pins stand on facing up: add one before this setup to drill the pin holes in.".into();
+                    return Task::none();
+                };
+                let setup = &self.doc.setups[to];
+                let pins = control::pins_settings(&setup.machine.p).ok().flatten();
+                let tool = (pins.as_ref()).and_then(|pins| {
+                    post::pin_drilling_tool(&self.doc.tools, &setup.machine, pins)
+                });
+                let mut op = Operation::new(
+                    Strategy::Drill,
+                    tool.map(|t| t.id.clone()).unwrap_or_default(),
+                );
+                op.p.insert("name".into(), "Pin holes".into());
+                op.p.insert("holes".into(), model::DRILL_HOLES[1].into());
+                op.p.insert("pin_setup".into(), self.doc.setup().id.clone());
+                if tool.is_some_and(|t| get(&t.p, "type") == "Flat end mill") {
+                    op.p.insert("rpm".into(), "8000".into());
+                    op.p.insert("feed".into(), "400".into());
+                }
+                op.p.insert(
+                    "coolant".into(),
+                    control::default_coolant(&setup.machine).into(),
+                );
+                op.geometry.clear();
+                let named = setup.name().to_string();
+                self.status = match (tool, pins) {
+                    (Some(t), _) => format!("Added Pin holes to {named}, with {}.", t.name()),
+                    (None, Some(pins)) => format!(
+                        "Added Pin holes to {named}: choose its tool, a Ø{} to Ø{} drill or a flat end mill from Ø{} to Ø{}.",
+                        post::exact_mm(pins.diameter as f32),
+                        post::exact_mm(pins.diameter as f32 + post::PIN_FIT),
+                        post::exact_mm((pins.diameter as f32 + post::PIN_CLEARANCE) / 2. + 0.05),
+                        post::exact_mm(pins.diameter as f32 + post::PIN_CLEARANCE - 0.05)
+                    ),
+                    (None, None) => format!("Added Pin holes to {named}: choose its tool."),
+                };
+                let status = std::mem::take(&mut self.status);
+                self.doc.setups[to].operations.push(op);
+                self.touch();
+                self.status = status;
             }
             Message::PinHoleSurface(n) => {
                 let Some(mesh) = self.part_mesh().filter(|_| self.picking_pin_holes()) else {
@@ -3546,11 +3674,55 @@ impl App {
                 }
             }
             Message::ControlMachine(id) => {
-                if self.control.is_none() {
-                    self.control_machine = Some(id);
+                if let Some(s) = (self.doc.active_setup()).filter(|s| manual::is_manual(&s.machine))
+                {
+                    self.cnc_over_guide = Some(s.id.clone());
+                }
+                match &self.control {
+                    None => self.control_machine = Some(id),
+                    Some(c) => {
+                        self.switch_machine = (c.machine_id != id).then_some(id);
+                    }
                 }
                 if self.machine_setup {
                     self.open_profile(false);
+                }
+            }
+            Message::SwitchMachine(yes) => {
+                let Some(id) = self.switch_machine.take() else {
+                    return Task::none();
+                };
+                if !yes {
+                    self.run_on_connect = None;
+                } else if self.doc.machines.iter().any(|m| m.id == id) {
+                    self.disconnect_machine();
+                    self.control_machine = Some(id);
+                    return self.update(Message::Connect);
+                }
+            }
+            Message::ShowGuide => self.cnc_over_guide = None,
+            Message::MachineConnection(sim) => {
+                let Some(id) = self.control_target().map(|m| m.id.clone()) else {
+                    return Task::none();
+                };
+                let value = if sim { "Simulated" } else { "USB" };
+                // Not a planning setting: the setups' snapshots keep their
+                // version. A machine being edited takes the choice too.
+                for m in (self.doc.machines.iter_mut())
+                    .chain(std::iter::once(&mut self.machine_draft))
+                    .filter(|m| m.id == id)
+                {
+                    m.p.insert("uc100_connection".into(), value.into());
+                }
+                self.dirty = true;
+                self.project_dirty = true;
+                self.last_edit = Instant::now();
+                if let Some(c) = &self.control
+                    && c.machine_id == id
+                    && c.simulated != sim
+                {
+                    self.disconnect_machine();
+                    return self.update(Message::Connect);
                 }
             }
             Message::ControlSetup(on) => {
@@ -3756,8 +3928,13 @@ impl App {
                     Some(c) if c.machine_id == machine => {
                         Task::batch([page, self.update(Message::Run(run::Action::Setup(si)))])
                     }
-                    // Connected to another machine: its Run panel lists its own setups.
-                    Some(_) => page,
+                    // Connected to another machine: the page asks whether to
+                    // switch, and the setup is picked after connecting.
+                    Some(_) => {
+                        self.switch_machine = Some(machine);
+                        self.run_on_connect = Some(setup);
+                        page
+                    }
                 };
             }
             Message::Run(run::Action::Check) => return self.recheck_run(),
@@ -4190,6 +4367,12 @@ impl App {
                         self.undo = None;
                         self.invalidate_post();
                         self.status = "Saved model geometry restored.".into();
+                        // The pin holes follow the pins as the part places them.
+                        if self.doc.file.is_some()
+                            && let Some(mesh) = &self.imported_mesh
+                        {
+                            post::sync_pin_drilling(&mut self.doc, mesh);
+                        }
                         // Migrate legacy imported projects that stored sample
                         // feature IDs through the old viewport toggle.
                         if self.doc.file.is_some() {
@@ -4321,6 +4504,39 @@ impl App {
                 viewport::Event::Pick(n) => {
                     if self.picking {
                         return self.update(Message::Feature(n));
+                    }
+                }
+                viewport::Event::AimPins(at) => {
+                    if self.placing_leftover_pins() {
+                        self.pin_aim = at;
+                    }
+                }
+                viewport::Event::PlacePins(at) => {
+                    let si = self.doc.index();
+                    if self.placing_leftover_pins() {
+                        self.pin_aim = Some(at);
+                    }
+                    if let (true, Some(mesh), (Some(stock), _)) = (
+                        self.placing_leftover_pins(),
+                        self.part_mesh(),
+                        self.known_stock(si),
+                    ) {
+                        // Where the pins do not fit they stay where they were.
+                        let setup = self.doc.setup();
+                        if let Ok(Some(pins)) = control::pins_settings(&setup.machine.p)
+                            && let Some(issue) = post::leftover_issue(
+                                setup,
+                                mesh,
+                                stock,
+                                &pins,
+                                &post::plate_places(&pins, at),
+                            )
+                        {
+                            self.status = format!("The pins do not fit there: {issue}");
+                            return Task::none();
+                        }
+                        let text = post::leftover_pin_text(setup, mesh, stock, at);
+                        return self.update(Message::Edit(Target::Setup, "pin_place", text));
                     }
                 }
                 viewport::Event::PickSurface(n) => {

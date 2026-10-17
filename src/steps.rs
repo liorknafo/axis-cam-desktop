@@ -1334,6 +1334,22 @@ fn setups(app: &App) -> Element<'_, Message> {
             .width(Fill),
         );
     }
+    // The CNC machines, for the Control page without a CNC setup.
+    let cnc_machines: Vec<_> = (app.doc.machines.iter())
+        .filter(|m| crate::model::get(&m.p, "controller") == "UC100")
+        .collect();
+    if !cnc_machines.is_empty() {
+        c = c.push(space().height(8)).push(muted("CNC machines"));
+        for m in cnc_machines {
+            c = c.push(
+                crate::ui::secondary(
+                    format!("{} ▶", m.name()),
+                    Message::ControlMachine(m.id.clone()),
+                )
+                .width(Fill),
+            );
+        }
+    }
     container(c)
         .padding(14)
         .width(210)
@@ -2673,6 +2689,28 @@ pub(crate) mod tests {
         assert!(!a.steps_page());
         assert!(has(&a, "Not connected."));
         assert!(!has(&a, "Set up"));
+    }
+    #[test]
+    fn a_cnc_machine_on_the_steps_page_shows_its_control_page_and_back() {
+        let mut a = app_with("Yes", |doc| {
+            let mut m = crate::model::Machine::new(3);
+            m.p.insert("name".into(), "Router".into());
+            m.p.insert("controller".into(), "UC100".into());
+            doc.machines.push(m);
+        });
+        let id = a.doc.machines.last().unwrap().id.clone();
+        assert!(a.steps_page() && has(&a, "CNC machines") && has(&a, "Router ▶"));
+        let _ = a.update(Message::ControlMachine(id.clone()));
+        assert!(!a.steps_page());
+        assert_eq!(a.control_target().map(|m| &m.id), Some(&id));
+        assert!(has(&a, "Not connected.") && has(&a, "Manual mill steps"));
+        let _ = a.update(Message::ShowGuide);
+        assert!(a.steps_page());
+        // Opening the setup's steps again shows them.
+        let _ = a.update(Message::ControlMachine(id));
+        assert!(!a.steps_page());
+        send(&mut a, GuideAction::Open(0));
+        assert!(a.steps_page());
     }
     /// Draws the window's view on tiny-skia into a PNG.
     fn render(a: &App, (w, h): (u32, u32), path: &std::path::Path) {

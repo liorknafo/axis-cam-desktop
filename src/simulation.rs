@@ -465,7 +465,39 @@ impl StockGrid {
     fn cut(&mut self, a: [f32; 3], b: [f32; 3], radius: f32) {
         self.cut_shape(a, b, radius, CutterShape::Flat);
     }
-    fn cut_shape(&mut self, a: [f32; 3], b: [f32; 3], radius: f32, shape: CutterShape) {
+    /// The stock `volume` holds, seen from above in the frame `frame` over
+    /// `bounds`: each cell as high as the highest voxel left under its centre,
+    /// at the bottom where none is. A running setup's starting stock for the
+    /// live carve (`run::Carving`).
+    pub fn from_volume(
+        bounds: Bounds,
+        volume: &crate::volume::Volume,
+        frame: crate::volume::Frame,
+    ) -> Self {
+        let mut grid = Self::new(bounds);
+        let step = volume
+            .cell
+            .into_iter()
+            .fold(f32::INFINITY, f32::min)
+            .max(0.05)
+            / 2.;
+        let levels = ((bounds.max[2] - bounds.min[2]) / step).ceil().max(1.) as usize;
+        for y in 0..grid.ny {
+            for x in 0..grid.nx {
+                let (px, py) = (
+                    bounds.min[0] + (x as f32 + 0.5) * grid.dx,
+                    bounds.min[1] + (y as f32 + 0.5) * grid.dy,
+                );
+                grid.heights[y * grid.nx + x] = (0..levels)
+                    .map(|i| bounds.max[2] - (i as f32 + 0.5) * step)
+                    .find(|&z| volume.filled([px, py, z], frame))
+                    .map_or(bounds.min[2], |z| (z + step / 2.).min(bounds.max[2]));
+            }
+        }
+        grid
+    }
+    /// Cuts the sweep of a cutter of `radius` and `shape` from `a` to `b`.
+    pub(crate) fn cut_shape(&mut self, a: [f32; 3], b: [f32; 3], radius: f32, shape: CutterShape) {
         let ranges: [(usize, usize); 2] = std::array::from_fn(|k| {
             let cell = if k == 0 { self.dx } else { self.dy };
             let count = if k == 0 { self.nx } else { self.ny };
@@ -866,6 +898,44 @@ pub(crate) fn uncut_sides(cuts: &[&Move]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_heightmap_of_a_volume_is_as_high_as_the_material_left_under_each_cell() {
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = crate::volume::Frame::new(
+            &crate::model::Setup::new(crate::model::Machine::new(3), "G54"),
+            &mesh,
+        );
+        let bounds = Bounds {
+            min: [0., 0., 0.],
+            max: [96., 48., 20.],
+        };
+        let mut volume = crate::volume::Volume::new(bounds, frame);
+        // A 10 mm slot 5 mm deep along X at Y 24, and nothing else.
+        volume.cut(
+            [-10., 24., 15.],
+            [110., 24., 15.],
+            5.,
+            30.,
+            CutterShape::Flat,
+            frame,
+            (0, 0),
+        );
+        let grid = StockGrid::from_volume(bounds, &volume, frame);
+        let at = |x: f32, y: f32| {
+            grid.heights[((y / grid.dy) as usize) * grid.nx + (x / grid.dx) as usize]
+        };
+        assert!((at(48., 5.) - 20.).abs() < 0.01, "{}", at(48., 5.));
+        assert!((at(48., 24.) - 15.).abs() < 0.6, "{}", at(48., 24.));
+        // Carving the grid on deepens the slot where the tool goes.
+        let mut carved = grid.clone();
+        carved.cut_shape([0., 24., 12.], [50., 24., 12.], 2., CutterShape::Flat);
+        assert!((carved.heights[..].iter().zip(&grid.heights)).all(|(c, g)| c <= g));
+        let at = |x: f32, y: f32| {
+            carved.heights[((y / grid.dy) as usize) * grid.nx + (x / grid.dx) as usize]
+        };
+        assert!((at(25., 24.) - 12.).abs() < 0.01 && (at(80., 24.) - 15.).abs() < 0.6);
+    }
     #[test]
     fn sloped_stock_sweep_is_independent_of_playback_subdivision() {
         let bounds = Bounds {

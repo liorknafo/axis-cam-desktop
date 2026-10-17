@@ -1793,7 +1793,7 @@ fn pin_hole_marks(app: &App) -> viewport::PinHolePick {
     let (true, Some(s), Some(mesh)) = (open, app.doc.active_setup(), app.part_mesh()) else {
         return viewport::PinHolePick::default();
     };
-    if !crate::post::sits_on_pins(s) {
+    if !crate::post::sits_on_pins(s) || crate::post::pins_in_leftover(s) {
         return viewport::PinHolePick::default();
     }
     let pick = app.picking_pin_holes();
@@ -1813,6 +1813,51 @@ fn pin_hole_marks(app: &App) -> viewport::PinHolePick {
     };
     viewport::PinHolePick { pick, holes }
 }
+/// The pins being placed in the active setup's leftover, while "Place the
+/// pins on the leftover" is on (`App::placing_leftover_pins`): the plate's
+/// pins on the bottom of the stock it starts from, where they stand and,
+/// under the pointer, whether they fit there (`post::leftover_issue`).
+pub(crate) fn pin_aim(app: &App) -> viewport::PinAim {
+    let si = app.doc.index();
+    let (true, Some(s), Some(mesh), (Some(stock), _)) = (
+        app.placing_leftover_pins(),
+        app.doc.active_setup(),
+        app.part_mesh(),
+        app.known_stock(si),
+    ) else {
+        return viewport::PinAim::default();
+    };
+    let Ok(Some(pins)) = crate::control::pins_settings(&s.machine.p) else {
+        return viewport::PinAim::default();
+    };
+    let offsets = crate::post::plate_places(&pins, [0., 0.]);
+    let placed = crate::post::leftover_places(&app.doc, mesh, si).map(|at| at[0]);
+    let ghost = app.pin_aim.map(|pin1| {
+        let places = crate::post::plate_places(&pins, pin1);
+        let fit = match crate::post::leftover_issue(s, mesh, stock, &pins, &places) {
+            Some(why) => Err(why),
+            None => {
+                let r = crate::post::leftover_hole_radius(&pins);
+                let gaps = crate::post::leftover_gaps(s, mesh, stock, &places);
+                Ok(gaps
+                    .iter()
+                    .fold((f32::INFINITY, f32::INFINITY), |(p, e), g| {
+                        (p.min(g.0 - r), e.min(g.1 - r))
+                    }))
+            }
+        };
+        (pin1, fit)
+    });
+    viewport::PinAim {
+        on: true,
+        z: stock.min[2],
+        offsets,
+        diameter: pins.diameter as f32,
+        height: pins.height as f32,
+        placed,
+        ghost,
+    }
+}
 /// The 3D view of the active setup, as MANUFACTURE shows it: the part,
 /// stock, workholding, the preview and the machine's tool while a tool run of
 /// the setup cuts. None without a part to show.
@@ -1827,6 +1872,7 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         camera: app.camera,
         picking: app.picking || app.picking_pin_holes(),
         pin_holes: pin_hole_marks(app),
+        pin_aim: pin_aim(app),
         show_stock: app.stock && s.is_some(),
         show_paths: app.paths && app.playback_ready(),
         progress: if app.operation().is_some_and(|o| o.preview) {
@@ -1837,6 +1883,7 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         holding: holding_boxes(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
+        live_stock: app.live_stock(),
         uncut: job_uncut(app)
             .and_then(|found| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
@@ -2281,7 +2328,19 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         "Geometry" => {
             if let Some(file) = &app.doc.file {
                 c = c.push(muted(format!("Part · {}", file.name)));
-                if !o.needs_surfaces() && o.strategy.imported_preview() {
+                if o.strategy == Strategy::Drill {
+                    c = c.push(choice_value(
+                        p,
+                        DRILL_HOLES[usize::from(o.drills_pin_holes())],
+                        "holes",
+                        "Holes",
+                        &DRILL_HOLES,
+                        t,
+                    ));
+                }
+                if o.drills_pin_holes() {
+                    c = c.push(pin_hole_drilling(app, o));
+                } else if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
                     c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
@@ -2492,6 +2551,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Bottom offset is relative to model bottom. Contour normally starts at stock top; Waterline at model top. Earlier cuts lower the start only when the whole machining area is cleared. Positive top offset adds an approach margin. Clearance/retract retain the original stock reference."
             } else if !app.is_sample() && o.strategy == Strategy::Parallel {
                 "Bottom offset is added to the cutter-compensated surface height; stock to leave is a vertical offset. Top offset raises approach heights. Finishing starts with the stock left by the earlier roughing operations."
+            } else if o.drills_pin_holes() {
+                "Each pin hole goes down from the face the pins stand on, as earlier cuts leave it, 1 mm deeper than the pins stand at its full width: a drill goes on by its point under that. Top offset raises the approach. Clearance/retract retain their original reference."
             } else if !app.is_sample() && o.strategy == Strategy::Drill {
                 "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. With a chamfer mill each opening is countersunk instead: the point goes down until its cone is as wide as the opening at the rim. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal follows the drill's 118° point or the chamfer mill's cone."
             } else { "All heights are in the current setup coordinate system. Clearance/retract are measured above stock top; offsets are relative to selected geometry." }));
@@ -2504,7 +2565,13 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ("top", "Top offset · mm"),
                 ("bottom", "Bottom offset · mm"),
             ] {
-                if o.strategy != Strategy::Box || !matches!(k, "top" | "bottom") {
+                // A Box's depths are its own, a pin hole's the pins'.
+                let own = match k {
+                    "top" => o.strategy != Strategy::Box,
+                    "bottom" => o.strategy != Strategy::Box && !o.drills_pin_holes(),
+                    _ => true,
+                };
+                if own {
                     c = c.push(checks.field(p, k, label));
                 }
             }
@@ -2540,7 +2607,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
                 }
             }
-            if o.strategy == Strategy::Drill {
+            if o.strategy == Strategy::Drill && !o.drills_pin_holes() {
                 c = c.push(choice(
                     p,
                     "through",
@@ -2599,6 +2666,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
             _ => {}
         },
+        "Cycle" if o.drills_pin_holes() && !op_tool_is(app, o, "Drill") => {
+            c = c.push(note(
+                "A flat end mill mills the pin holes: pin 1's hole on a helix, a slot round the others, ramping down a quarter of its diameter a lap, then a lap at the bottom. The drilling cycles are for a drill.",
+            ));
+        }
         "Cycle" => {
             c = c.push(choice(
                 p,
@@ -3226,17 +3298,26 @@ fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
     {
         return c.push(caution("Not on the pins yet", vec![issue])).into();
     }
+    let leftover = crate::post::pins_in_leftover(s);
+    c = c.push(choice_value(
+        p,
+        crate::post::PIN_SOURCES[usize::from(leftover)],
+        "pin_source",
+        "Pin holes in",
+        &crate::post::PIN_SOURCES,
+        t,
+    ));
     let Some(mesh) = app.part_mesh() else {
         return c
-            .push(muted(
-                "Load the part to choose the holes it drops over the pins by.",
-            ))
+            .push(muted(if leftover {
+                "Load the part to place the pins on the stock's leftover."
+            } else {
+                "Load the part to choose the holes it drops over the pins by."
+            }))
             .into();
     };
-    let datum = app
-        .known_stock(app.doc.index())
-        .0
-        .and_then(|stock| crate::post::datum(s, stock, mesh).ok());
+    let stock = app.known_stock(app.doc.index()).0;
+    let datum = stock.and_then(|stock| crate::post::datum(s, stock, mesh).ok());
     // In work coordinates; in the setup's own frame, said so, until the
     // stock it starts from (and so its work zero) is known.
     let work = |c: [f32; 2]| match datum {
@@ -3251,7 +3332,12 @@ fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
             crate::post::exact_mm(c[1])
         ),
     };
-    let placed = datum.map(|d| crate::post::placed_on_pins(s, mesh, d));
+    let placed = stock
+        .zip(datum)
+        .map(|(stock, d)| crate::post::placed_on_pins(s, mesh, stock, d));
+    if leftover {
+        return leftover_pins(app, c, s, mesh, placed, &work).into();
+    }
     let chosen = crate::post::chosen_pin_holes(s);
     c = c.push(section("Pin holes")).push(muted(
         "Choose the part's holes that drop over the pins, as drawn in the part: the round holes it opens on its bottom in this setup, ringed and numbered in the 3D view. Click them here, or Pick holes on the part and click inside each hole in the 3D view (turn the view to see under the part). Which hole takes which pin follows from the plate.",
@@ -3331,6 +3417,159 @@ fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
         _ => {}
     }
     c.into()
+}
+/// Whether the tool of `o` is a `kind` ("Drill", "Flat end mill" and the
+/// like).
+fn op_tool_is(app: &App, o: &Operation, kind: &str) -> bool {
+    (app.doc.tools.iter()).any(|t| t.id == o.tool && get(&t.p, "type") == kind)
+}
+/// What a Drill of the pin holes in the stock's leftover makes: the holes
+/// of the setup on the pins it names (`pin_setup`) as its Work zero step
+/// placed them, how they are made with its tool; or the later setups on
+/// pins in their leftover to choose from.
+fn pin_hole_drilling<'a>(app: &'a App, o: &'a Operation) -> Element<'a, Message> {
+    let mut c = column![].spacing(8);
+    let named = get(&o.p, "pin_setup");
+    let mine = (app.doc.setups.iter()).position(|s| s.id == named);
+    let Some(si) = mine.filter(|&si| {
+        let s = &app.doc.setups[si];
+        crate::post::sits_on_pins(s) && crate::post::pins_in_leftover(s)
+    }) else {
+        c = c.push(note(
+            "Choose the setup whose pins these holes are for: a later setup that sits on the pins, with its pin holes in the stock's leftover (its Work zero step).",
+        ));
+        for s in app.doc.setups.iter().skip(app.doc.index() + 1) {
+            if crate::post::sits_on_pins(s) && crate::post::pins_in_leftover(s) {
+                c = c.push(
+                    btn(
+                        format!("For {}", s.name()),
+                        Message::Edit(Target::Operation, "pin_setup", s.id.clone()),
+                        false,
+                    )
+                    .width(Fill),
+                );
+            }
+        }
+        return c.into();
+    };
+    let s = &app.doc.setups[si];
+    let points = crate::post::drill_pin_points(o);
+    let issue = get(&o.p, "pin_issue");
+    c = c.push(note(if !issue.is_empty() {
+        format!(
+            "No holes for {}'s pins: they do not fit where they are placed. {issue} Move them in its Work zero step.",
+            s.name()
+        )
+    } else if points.is_empty() {
+        format!(
+            "The holes for {}'s pins, which are not placed yet: place them in its Work zero step.",
+            s.name()
+        )
+    } else {
+        format!(
+            "The holes for {}'s {} pins in the stock's leftover, where its Work zero step places them; they follow the pins when they move. Each goes {} mm deeper than the pins stand. A drill from the pins' diameter to {} mm over drills them all round; a flat end mill mills them {} mm over the pins: pin 1's hole round, a slot along the line from pin 1 for the others.",
+            s.name(),
+            points.len(),
+            crate::post::exact_mm(crate::post::PIN_DEPTH_EXTRA),
+            crate::post::exact_mm(crate::post::PIN_FIT),
+            crate::post::exact_mm(crate::post::PIN_CLEARANCE)
+        )
+    }));
+    c.into()
+}
+/// The Work zero step's pins in the stock's leftover, under `c`: placing
+/// them by a click in the 3D view, where they stand and why they do not fit
+/// (`placed`, `post::placed_on_pins`), and the Drill of their holes in an
+/// earlier setup, or a button that adds one. `work` says a plan point in
+/// work coordinates.
+fn leftover_pins<'a>(
+    app: &'a App,
+    mut c: widget::Column<'a, Message>,
+    s: &'a Setup,
+    mesh: &'a crate::mesh::Mesh,
+    placed: Option<Result<crate::post::OnPins, String>>,
+    work: &dyn Fn([f32; 2]) -> String,
+) -> widget::Column<'a, Message> {
+    let t = Target::Setup;
+    c = c.push(section("Pins in the leftover")).push(muted(
+        "Holes for the pins in the stock beside the part, cut away with it later: an earlier setup drills them in the face this setup sits on. Place the pins on the leftover, then click in the 3D view: pin 1 goes where you click and the plate puts the others. They follow the pointer, red where they do not fit. Drag the placed pins to move them.",
+    ));
+    let placing = app.placing_leftover_pins();
+    c = c.push(
+        btn(
+            if placing {
+                "Finish placing"
+            } else if crate::post::leftover_pin(s).is_some() {
+                "Move the pins"
+            } else {
+                "Place the pins on the leftover"
+            },
+            Message::PlacePins,
+            placing,
+        )
+        .width(Fill),
+    );
+    let si = app.doc.index();
+    let drills = crate::post::pin_drillings(&app.doc, si);
+    // What makes the holes: a drill all round, an end mill a slot for each
+    // pin after pin 1.
+    let tool = (drills.first())
+        .map(|&(i, j)| &app.doc.setups[i].operations[j].tool)
+        .and_then(|id| app.doc.tools.iter().find(|t| &t.id == id))
+        .map(|t| get(&t.p, "type"));
+    match &placed {
+        Some(Err(issue)) => c = c.push(caution("Not on the pins yet", vec![issue.clone()])),
+        Some(Ok(on)) => {
+            let at: Vec<String> = (on.places.iter().enumerate())
+                .map(|(i, c)| format!("pin {} {}", i + 1, work(*c)))
+                .collect();
+            let holes = match tool {
+                Some("Drill") => "A drill makes every hole round, at most 0.2 mm over the pins.",
+                Some("Flat end mill") => {
+                    "Pin 1's hole is round; the others are slots along the line from pin 1, so the part is placed by pin 1 and turned by the others without binding."
+                }
+                _ => {
+                    "With a flat end mill pin 1's hole is round and the others are slots along the line from pin 1, so the pins never bind; a drill makes them all round."
+                }
+            };
+            c = c.push(muted(format!(
+                "The Ø{} mm pins, {} mm tall, stand in the leftover at {} in work coordinates. {holes} The pins give X and Y: on the Control page, Set X Y from the pins sets them exactly; Z is still touched off on the stock.",
+                crate::post::exact_mm(on.diameter),
+                crate::post::exact_mm(on.height),
+                at.join(", ")
+            )));
+        }
+        None => {}
+    }
+    if crate::post::leftover_pin(s).is_some() {
+        c = c.push(secondary(
+            "Clear the pins' place",
+            Message::Edit(t, "pin_place", String::new()),
+        ));
+    }
+    if let Some(&(i, j)) = drills.first() {
+        let (setup, op) = (&app.doc.setups[i], &app.doc.setups[i].operations[j]);
+        c = c.push(muted(format!(
+            "{}'s {} makes the holes, following the pins wherever they are placed.",
+            setup.name(),
+            op.name()
+        )));
+    } else if matches!(placed, Some(Ok(_))) {
+        c = match crate::post::pin_drilling_setup(&app.doc, mesh, si) {
+            Some(to) => c.push(
+                btn(
+                    format!("Add the pin holes to {}", app.doc.setups[to].name()),
+                    Message::AddPinDrilling,
+                    false,
+                )
+                .width(Fill),
+            ),
+            None => c.push(note(
+                "No earlier setup has the face this setup sits on facing up: add one before it to drill the pin holes in.",
+            )),
+        };
+    }
+    c
 }
 /// Where the active setup's work zero is on the stock it starts from, how
 /// it is touched off and probed, and what the checks before a run found of
@@ -3908,7 +4147,7 @@ pub(crate) fn pin_boxes(
     };
     let on = crate::post::datum(setup, stock, mesh)
         .ok()
-        .and_then(|datum| crate::post::on_pins(setup, mesh, datum));
+        .and_then(|datum| crate::post::on_pins(setup, mesh, stock, datum));
     crate::holding::pin_boxes(on.as_ref(), stock)
 }
 /// What the active setup's workholding holds of `stock`, the box it starts
@@ -4848,11 +5087,54 @@ fn control(app: &App) -> Element<'_, Message> {
             target.is_some_and(|t| t.id == m.id),
         ));
     }
+    if let (Some(c), Some(to)) = (
+        &app.control,
+        (app.switch_machine.as_ref()).and_then(|id| app.doc.machines.iter().find(|m| &m.id == id)),
+    ) {
+        let from = (app.doc.machines.iter())
+            .find(|m| m.id == c.machine_id)
+            .map_or("the machine", |m| m.name());
+        left = left.push(
+            container(
+                column![
+                    bold(format!("Switch to {}?", to.name()), 14),
+                    muted(format!(
+                        "This disconnects from {from} (it is left in E-stop) and connects to {}.",
+                        to.name()
+                    ))
+                    .size(13),
+                    row![
+                        primary("Disconnect and switch", Message::SwitchMachine(true)),
+                        secondary("Cancel", Message::SwitchMachine(false))
+                    ]
+                    .spacing(8)
+                ]
+                .spacing(8),
+            )
+            .padding(12)
+            .width(Fill)
+            .style(panel_style),
+        );
+    }
+    if (app.doc.active_setup()).is_some_and(|s| crate::manual::is_manual(&s.machine)) {
+        left = left.push(secondary("Manual mill steps", Message::ShowGuide));
+    }
     if let Some(m) = target {
-        left = left.push(muted(format!(
-            "Connection: {}",
-            crate::control::connection_label(m)
-        )));
+        let sim = crate::control::simulated(m);
+        left = left.push(muted("Connection")).push(
+            row![
+                btn("Real (USB)", Message::MachineConnection(false), !sim),
+                btn("Simulated", Message::MachineConnection(true), sim),
+            ]
+            .spacing(6),
+        );
+        if app.control.as_ref().is_some_and(|c| c.machine_id == m.id) {
+            left = left.push(note(if sim {
+                "Real (USB) disconnects the simulator and connects to the machine itself."
+            } else {
+                "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator."
+            }));
+        }
         // The profile is read only while disconnected, not on every 33 ms tick.
         left = match &app.control {
             Some(_) => left.push(secondary("Disconnect", Message::Disconnect)),
@@ -4989,7 +5271,7 @@ fn control(app: &App) -> Element<'_, Message> {
                 "Job",
                 column![
                     container(view).height(360),
-                    muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts."),
+                    muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes."),
                     uncut_line(app).map(muted),
                     uncut_legend(app)
                 ],
@@ -7111,6 +7393,10 @@ pub(crate) fn operation_lines(
             [radial, bottom].into_iter().flatten().for_each(&mut push);
             push(finish);
         }
+        Strategy::Drill if op.drills_pin_holes() => {
+            push("pin holes in the leftover".into());
+            bottom.into_iter().for_each(&mut push);
+        }
         Strategy::Drill => {
             let cycle = get(p, "cycle");
             push(if ["Chip breaking", "Deep drilling"].contains(&cycle) {
@@ -7705,12 +7991,14 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             camera: app.plan_camera,
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         }
