@@ -4813,11 +4813,54 @@ fn control(app: &App) -> Element<'_, Message> {
             target.is_some_and(|t| t.id == m.id),
         ));
     }
+    if let (Some(c), Some(to)) = (
+        &app.control,
+        (app.switch_machine.as_ref()).and_then(|id| app.doc.machines.iter().find(|m| &m.id == id)),
+    ) {
+        let from = (app.doc.machines.iter())
+            .find(|m| m.id == c.machine_id)
+            .map_or("the machine", |m| m.name());
+        left = left.push(
+            container(
+                column![
+                    bold(format!("Switch to {}?", to.name()), 14),
+                    muted(format!(
+                        "This disconnects from {from} (it is left in E-stop) and connects to {}.",
+                        to.name()
+                    ))
+                    .size(13),
+                    row![
+                        primary("Disconnect and switch", Message::SwitchMachine(true)),
+                        secondary("Cancel", Message::SwitchMachine(false))
+                    ]
+                    .spacing(8)
+                ]
+                .spacing(8),
+            )
+            .padding(12)
+            .width(Fill)
+            .style(panel_style),
+        );
+    }
+    if (app.doc.active_setup()).is_some_and(|s| crate::manual::is_manual(&s.machine)) {
+        left = left.push(secondary("Manual mill steps", Message::ShowGuide));
+    }
     if let Some(m) = target {
-        left = left.push(muted(format!(
-            "Connection: {}",
-            crate::control::connection_label(m)
-        )));
+        let sim = crate::control::simulated(m);
+        left = left.push(muted("Connection")).push(
+            row![
+                btn("Real (USB)", Message::MachineConnection(false), !sim),
+                btn("Simulated", Message::MachineConnection(true), sim),
+            ]
+            .spacing(6),
+        );
+        if app.control.as_ref().is_some_and(|c| c.machine_id == m.id) {
+            left = left.push(note(if sim {
+                "Real (USB) disconnects the simulator and connects to the machine itself."
+            } else {
+                "Simulated disconnects the machine (it is left in E-stop) and connects to the simulator."
+            }));
+        }
         // The profile is read only while disconnected, not on every 33 ms tick.
         left = match &app.control {
             Some(_) => left.push(secondary("Disconnect", Message::Disconnect)),
