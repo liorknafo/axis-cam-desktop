@@ -3718,9 +3718,9 @@ flood = { pin = 8 }
             a.status
         );
         assert_eq!(pick(&mut a, end), 2);
-        let datum =
-            crate::post::datum(&a.doc.setups[1], a.known_stock(1).0.unwrap(), &mesh).unwrap();
-        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, datum).unwrap();
+        let stock = a.known_stock(1).0.unwrap();
+        let datum = crate::post::datum(&a.doc.setups[1], stock, &mesh).unwrap();
+        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, stock, datum).unwrap();
         assert!(
             (on.places[0][0] - holes[0].center[0]).abs() < 0.01,
             "{on:?}"
@@ -3731,6 +3731,193 @@ flood = { pin = 8 }
         let _ = a.update(Message::SetupStep("Stock"));
         assert!(!a.picking_pin_holes());
         assert_eq!(pick(&mut a, wall), 1);
+    }
+
+    /// `post::fixture::leftover_flip("rx", tool)` in the app: the cube
+    /// flipped onto pins in its leftover, on the flipped setup's Work zero
+    /// step.
+    fn leftover_pins_app(tool: Option<&str>) -> App {
+        let mut a = app();
+        let (doc, mesh) = crate::post::fixture::leftover_flip("rx", tool);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupStep("Work zero"));
+        a
+    }
+
+    #[test]
+    fn the_work_zero_step_places_the_pins_on_the_leftover_in_the_3d_view() {
+        use crate::viewport::Event;
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 0.01;
+        let mut a = leftover_pins_app(None);
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[1], &mesh);
+        let placed = crate::post::leftover_places(&a.doc, &mesh, 1).unwrap();
+        // Not placing: the pointer and a click move nothing.
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([0., 0.]))));
+        let _ = a.update(Message::Viewport(Event::PlacePins([0., 0.])));
+        assert_eq!(a.pin_aim, None);
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            placed[0]
+        ));
+        assert!(!crate::ui::pin_aim(&a).on);
+        let _ = a.update(Message::PlacePins);
+        assert!(a.placing_leftover_pins());
+        assert!(!a.picking_pin_holes());
+        // Over the part they are red, with why.
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            part.min[0] + 5.,
+            y,
+        ]))));
+        let aim = crate::ui::pin_aim(&a);
+        assert!(aim.on && aim.offsets.len() == 2, "{aim:?}");
+        assert!(near(aim.placed.unwrap(), placed[0]), "{aim:?}");
+        assert_eq!(
+            aim.ghost.unwrap().1,
+            Err(
+                "Pin 1 would stand under the part: place the pins on the leftover beside it."
+                    .into()
+            )
+        );
+        // A click there leaves them where they were, and says why.
+        let _ = a.update(Message::Viewport(Event::PlacePins([part.min[0] + 5., y])));
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            placed[0]
+        ));
+        assert_eq!(
+            a.status,
+            "The pins do not fit there: Pin 1 would stand under the part: place the pins on the leftover beside it."
+        );
+        // On the leftover they fit, 2 mm further from the part, and a click
+        // puts pin 1 there.
+        let to = [placed[0][0] - 2., placed[0][1]];
+        let _ = a.update(Message::Viewport(Event::AimPins(Some(to))));
+        let (_, fit) = crate::ui::pin_aim(&a).ghost.unwrap();
+        let (gap, _) = fit.unwrap();
+        assert!((gap - 11.95).abs() < 0.01, "{gap}");
+        let _ = a.view();
+        let _ = a.update(Message::Viewport(Event::PlacePins(to)));
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            to
+        ));
+        // Add the pin holes to Top: a Drill of them with the Ø4.1 drill,
+        // its holes where the pins are.
+        let _ = a.update(Message::AddPinDrilling);
+        assert!(
+            a.status
+                .starts_with("Added Pin holes to Top, with Drill 4.1."),
+            "{}",
+            a.status
+        );
+        let op = a.doc.setups[0].operations.last().unwrap().clone();
+        assert!(op.drills_pin_holes());
+        assert_eq!(
+            a.doc.tools.iter().find(|t| t.id == op.tool).unwrap().name(),
+            "Drill 4.1"
+        );
+        assert_eq!(crate::post::pin_drillings(&a.doc, 1), vec![(0, 1)]);
+        let points = crate::post::drill_pin_points(&op);
+        assert_eq!(points.len(), 2);
+        let _ = a.view();
+        // Moving the pins moves their holes.
+        let _ = a.update(Message::Viewport(Event::PlacePins([to[0], to[1] + 1.])));
+        let moved = crate::post::drill_pin_points(&a.doc.setups[0].operations[1]);
+        assert!(moved.len() == 2 && moved != points, "{moved:?} {points:?}");
+        // Away from the Work zero step the pointer places nothing.
+        let _ = a.update(Message::SetupStep("Stock"));
+        assert!(!a.placing_leftover_pins());
+        assert!(!crate::ui::pin_aim(&a).on);
+    }
+
+    /// Renders the pins placed in the stock's leftover to PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/leftover-pins): the flipped setup's
+    /// Work zero step with the pins under the pointer where they fit and
+    /// where they do not, then placed; setup 1's Drill of their holes, its
+    /// drilled and its milled holes; the pins seen from below. Not a check:
+    /// run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_pins_in_the_leftover() {
+        use crate::viewport::Event;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/leftover-pins".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let tall = iced::Size::new(1600., 1300.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_pins_app(None);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.refresh_left_stock();
+        a.smoke_dir = None;
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[1], &mesh);
+        let placed = crate::post::leftover_places(&a.doc, &mesh, 1).unwrap();
+        let _ = a.update(Message::PlacePins);
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            placed[0][0] - 1.,
+            placed[0][1] + 3.,
+        ]))));
+        render_png(&a, tall, &out.join("1-aim-fits.png"));
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            part.min[0] - 5.,
+            y,
+        ]))));
+        render_png(&a, tall, &out.join("2-aim-too-near-the-part.png"));
+        let _ = a.update(Message::PlacePins);
+        render_png(&a, tall, &out.join("3-placed.png"));
+        a.camera.pitch = -0.6;
+        render_png(&a, tall, &out.join("4-placed-from-below.png"));
+        a.camera = Default::default();
+        let _ = a.update(Message::AddPinDrilling);
+        let _ = a.view();
+        render_png(&a, tall, &out.join("5-add-the-pin-holes.png"));
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        // At the end of each, with the stock it leaves meshed in line.
+        let ended = |a: &mut App| {
+            let _ = a.update(Message::Generate);
+            let _ = a.update(Message::Scrub(1.));
+            let key = a.stock_mesh_key().unwrap();
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let result = crate::stock_surface::Snapshot {
+                bounds: volume.bounds,
+                frame: volume.frame,
+                cuts: volume.cuts.clone(),
+                detail: crate::stock_surface::Detail::Fine,
+            }
+            .build()
+            .map(std::sync::Arc::new);
+            let seconds = sim.seconds;
+            a.stock_mesh_job = None;
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        ended(&mut a);
+        render_png(&a, tall, &out.join("6-pin-holes-drilled.png"));
+        a.camera.zoom = 2.5;
+        render_png(&a, tall, &out.join("7-pin-holes-drilled-close.png"));
+        a.camera = Default::default();
+        let flat = (a.doc.tools.iter())
+            .find(|t| t.name() == "Flat 3")
+            .unwrap()
+            .id
+            .clone();
+        let _ = a.update(Message::SetOpTool(flat));
+        ended(&mut a);
+        a.camera.zoom = 2.5;
+        render_png(&a, tall, &out.join("8-pin-holes-milled-close.png"));
     }
 
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default

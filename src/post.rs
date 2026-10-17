@@ -1633,12 +1633,363 @@ pub fn pins_issue(setup: &Setup) -> Option<String> {
             "This setup sits on the pins, but its machine's fixture pins do not read: {}",
             e.join(" ")
         )),
+        Ok(Some(_)) if pins_in_leftover(setup) => leftover_pin(setup).is_none().then(|| {
+            "This setup sits on the pins in the stock's leftover: place them under Pin holes in the Work zero step, a click on the leftover in the 3D view."
+                .into()
+        }),
         Ok(Some(_)) if chosen_pin_holes(setup).is_empty() => Some(
             "This setup sits on the pins: choose the part's holes that drop over them, under Pin holes in the Work zero step."
                 .into(),
         ),
         Ok(Some(_)) => None,
     }
+}
+/// Where a setup on the pins has the holes it drops over them by
+/// (`pin_source`, the Work zero step): holes in the part's design, or holes
+/// an earlier setup drills in the stock's leftover beside the part.
+pub const PIN_SOURCES: [&str; 2] = ["Part's holes", "Stock leftover"];
+/// Whether `setup` drops over its pins by holes in the stock's leftover,
+/// placed by a click (`leftover_pin`), rather than holes of the part.
+pub fn pins_in_leftover(setup: &Setup) -> bool {
+    get(&setup.p, "pin_source") == PIN_SOURCES[1]
+}
+/// Where pin 1 stands in the stock's leftover (`pin_place`), a point of the
+/// stock's bottom in this setup carried into the part's own frame (its
+/// file's coordinates, mm). None until the pins are placed.
+pub fn leftover_pin(setup: &Setup) -> Option<[f32; 3]> {
+    let v: Vec<f32> = (get(&setup.p, "pin_place").split_whitespace())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    <[f32; 3]>::try_from(v)
+        .ok()
+        .filter(|p| p.iter().all(|v| v.is_finite()))
+}
+/// `pin_place` with pin 1 at `at`, a point of this setup's plan (mm) on the
+/// bottom of `stock`, the box it starts from.
+pub fn leftover_pin_text(setup: &Setup, mesh: &Mesh, stock: Bounds, at: [f32; 2]) -> String {
+    let p = crate::volume::Frame::new(setup, mesh).unmap([at[0], at[1], stock.min[2]]);
+    p.map(exact_mm).join(" ")
+}
+/// The least wall between a pin hole in the leftover and the stock's edge
+/// (mm).
+pub const PIN_WALL: f32 = 2.;
+/// The least gap between a pin hole in the leftover and the part (mm): a
+/// Ø6 tool cutting round the part and a wall of `PIN_WALL` beside it.
+pub const PIN_PART_GAP: f32 = 8.;
+/// How much deeper than the pins stand a pin hole in the leftover is
+/// drilled or milled (mm), so the part sits on the plate, not on a pin.
+pub const PIN_DEPTH_EXTRA: f32 = 1.;
+/// How much longer than its pin the slot of each pin after pin 1 is, along
+/// the line from pin 1 (mm): pin 1 places the part, the others only turn
+/// it, so two pins never bind it.
+pub const SLOT_PLAY: f32 = 1.;
+/// How much wider than its pin a milled pin hole or slot is (mm): a slip
+/// fit, well within `PIN_FIT`.
+pub const PIN_CLEARANCE: f32 = 0.05;
+/// The pins of `pins` standing with pin 1 at `pin1` in this setup's plan,
+/// pin 1 first (mm): the plate is square to X and Y.
+pub fn plate_places(pins: &crate::control::Pins, pin1: [f32; 2]) -> Vec<[f32; 2]> {
+    (0..pins.at.len())
+        .map(|i| {
+            let d = pins.offset(i);
+            [pin1[0] + d[0] as f32, pin1[1] + d[1] as f32]
+        })
+        .collect()
+}
+/// How far each of `places` (plan mm) is from the part in `setup` seen from
+/// above, 0 over it, and from the edge of `stock`, negative off it: the
+/// gaps a pin hole of the leftover keeps (`leftover_issue`).
+pub fn leftover_gaps(
+    setup: &Setup,
+    mesh: &Mesh,
+    stock: Bounds,
+    places: &[[f32; 2]],
+) -> Vec<(f32, f32)> {
+    // The placement is a turn and a shift: its plan X and Y once per axis,
+    // so that each vertex costs a few products (this runs as the pointer
+    // moves).
+    let placement = Placement::new(mesh, Some(setup));
+    let scale = mesh.display_scale();
+    let o = placement.transform([0.; 3]);
+    let axes: [[f32; 3]; 3] = std::array::from_fn(|i| {
+        let mut e = [0.; 3];
+        e[i] = 1.;
+        let q = placement.transform(e);
+        std::array::from_fn(|k| q[k] - o[k])
+    });
+    let plan = |p: [f32; 3]| -> [f32; 2] {
+        std::array::from_fn(|k| (o[k] + (0..3).map(|i| axes[i][k] * p[i]).sum::<f32>()) / scale)
+    };
+    let mut part = vec![f32::INFINITY; places.len()];
+    let mut points = vec![];
+    for face in &mesh.faces {
+        points.clear();
+        points.extend(face.points.iter().map(|p| plan(*p)));
+        let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for q in &points {
+            lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+            hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+        }
+        for (gap, c) in part.iter_mut().zip(places) {
+            // No nearer than its box.
+            let dx = (lo[0] - c[0]).max(c[0] - hi[0]).max(0.);
+            let dy = (lo[1] - c[1]).max(c[1] - hi[1]).max(0.);
+            if dx.hypot(dy) >= *gap {
+                continue;
+            }
+            for i in 1..points.len().saturating_sub(1) {
+                *gap = gap.min(triangle_gap([points[0], points[i], points[i + 1]], *c));
+            }
+        }
+    }
+    (places.iter().zip(part))
+        .map(|(c, part)| {
+            let edge = (c[0] - stock.min[0])
+                .min(stock.max[0] - c[0])
+                .min(c[1] - stock.min[1])
+                .min(stock.max[1] - c[1]);
+            (part, edge)
+        })
+        .collect()
+}
+/// How far the point `c` is from the triangle `t`, 0 inside it (mm).
+fn triangle_gap(t: [[f32; 2]; 3], c: [f32; 2]) -> f32 {
+    let side =
+        |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let s = [side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0])];
+    if s.iter().all(|v| *v >= 0.) || s.iter().all(|v| *v <= 0.) {
+        return 0.;
+    }
+    (0..3)
+        .map(|k| {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let l = d[0] * d[0] + d[1] * d[1];
+            let u = if l > 0. {
+                (((c[0] - a[0]) * d[0] + (c[1] - a[1]) * d[1]) / l).clamp(0., 1.)
+            } else {
+                0.
+            };
+            (c[0] - a[0] - u * d[0]).hypot(c[1] - a[1] - u * d[1])
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+/// The pin holes a Drill of them makes (`Operation::drills_pin_holes`):
+/// each pin's centre on the face it stands on, pin 1 first, in the part's
+/// own frame (`pin_points`, mm).
+pub fn drill_pin_points(op: &crate::model::Operation) -> Vec<[f32; 3]> {
+    (get(&op.p, "pin_points").split(';'))
+        .filter_map(|p| {
+            let v: Vec<f32> = (p.split_whitespace())
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            <[f32; 3]>::try_from(v)
+                .ok()
+                .filter(|p| p.iter().all(|v| v.is_finite()))
+        })
+        .collect()
+}
+/// The way a Drill of the pin holes goes into the stock from the face the
+/// pins stand on, in the part's own frame (`pin_axis`): up in the setup on
+/// the pins.
+pub fn drill_pin_axis(op: &crate::model::Operation) -> Option<[f32; 3]> {
+    let v: Vec<f32> = (get(&op.p, "pin_axis").split_whitespace())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    <[f32; 3]>::try_from(v)
+        .ok()
+        .filter(|p| p.iter().all(|v| v.is_finite()))
+}
+/// The `pin_points` and `pin_axis` a Drill of the pin holes of `setup`, on
+/// pins in its leftover standing at `places` on the bottom of `stock` (plan
+/// mm), takes.
+pub fn pin_drilling(
+    setup: &Setup,
+    mesh: &Mesh,
+    stock: Bounds,
+    places: &[[f32; 2]],
+) -> (String, String) {
+    let frame = crate::volume::Frame::new(setup, mesh);
+    let points: Vec<String> = (places.iter())
+        .map(|c| {
+            frame
+                .unmap([c[0], c[1], stock.min[2]])
+                .map(exact_mm)
+                .join(" ")
+        })
+        .collect();
+    let (o, up) = (frame.unmap([0.; 3]), frame.unmap([0., 0., 1.]));
+    let axis: [f32; 3] = std::array::from_fn(|k| ((up[k] - o[k]) * 1e4).round() / 1e4);
+    (points.join("; "), axis.map(exact_mm).join(" "))
+}
+/// Where the pins of setup `si` of `doc`, on pins in its leftover, stand
+/// in its plan (mm), pin 1 first, whether or not they fit there: None until
+/// they are placed, or without pins that read.
+pub fn leftover_places(doc: &Document, mesh: &Mesh, si: usize) -> Option<Vec<[f32; 2]>> {
+    let s = doc.setups.get(si)?;
+    if !(sits_on_pins(s) && pins_in_leftover(s)) {
+        return None;
+    }
+    let pins = crate::control::pins_settings(&s.machine.p).ok().flatten()?;
+    let at = crate::volume::Frame::new(s, mesh).map(leftover_pin(s)?);
+    Some(plate_places(&pins, [at[0], at[1]]))
+}
+/// The Drills of the pin holes of setup `si` (`pin_setup`), as setup and
+/// operation indices.
+pub fn pin_drillings(doc: &Document, si: usize) -> Vec<(usize, usize)> {
+    let Some(id) = doc.setups.get(si).map(|s| s.id.as_str()) else {
+        return vec![];
+    };
+    (doc.setups.iter().enumerate())
+        .flat_map(|(i, s)| {
+            (s.operations.iter().enumerate())
+                .filter(|(_, o)| o.drills_pin_holes() && get(&o.p, "pin_setup") == id)
+                .map(move |(j, _)| (i, j))
+        })
+        .collect()
+}
+/// The last setup before `si` that has the face setup `si` stands on its
+/// pins by facing up, where the holes in its leftover are drilled.
+pub fn pin_drilling_setup(doc: &Document, mesh: &Mesh, si: usize) -> Option<usize> {
+    let on = crate::volume::Frame::new(doc.setups.get(si)?, mesh);
+    (0..si).rev().find(|&i| {
+        let frame = crate::volume::Frame::new(&doc.setups[i], mesh);
+        on.transfer_vector([0., 0., 1.], frame)[2] < -0.999
+    })
+}
+/// The tool a Drill of the pin holes on `machine` takes from `tools`: a
+/// drill from the pins' diameter to `PIN_FIT` over, the nearest it, else a
+/// flat end mill that mills them (`cam::pin_holes`), the nearest 0.7 of
+/// their width, which goes round its helix rather than plunging. None
+/// without one.
+pub fn pin_drilling_tool<'a>(
+    tools: &'a [Tool],
+    machine: &Machine,
+    pins: &crate::control::Pins,
+) -> Option<&'a Tool> {
+    let d = pins.diameter as f32;
+    let width = d + PIN_CLEARANCE;
+    let size = |t: &Tool| num(&t.p, "diameter").unwrap_or(0.);
+    let on = |t: &&Tool| crate::manual::fits(get(&t.p, "machines"), machine);
+    let kind = |k: &'static str| move |t: &&Tool| get(&t.p, "type") == k;
+    (tools.iter().filter(on).filter(kind("Drill")))
+        .filter(|t| (d - 0.001..=d + PIN_FIT + 0.001).contains(&size(t)))
+        .min_by(|a, b| size(a).total_cmp(&size(b)))
+        .or_else(|| {
+            let off = |t: &&Tool| (size(t) - 0.7 * width).abs();
+            (tools.iter().filter(on).filter(kind("Flat end mill")))
+                .filter(|t| size(t) >= width / 2. + 0.05 && size(t) <= width - 0.05)
+                .min_by(|a, b| off(a).total_cmp(&off(b)))
+        })
+}
+/// Keeps each Drill of the pin holes in step with the pins of the setup it
+/// drills for (`pin_drillings`): their places and the way into the stock
+/// (`pin_drilling`), cleared when that setup no longer stands on pins
+/// placed in its leftover, or when they do not fit where they are placed
+/// (`leftover_issue`, then said in `pin_issue`), so that no hole is made
+/// where they do not fit. Only what differs is written.
+pub fn sync_pin_drilling(doc: &mut Document, mesh: &Mesh) {
+    let wanted: Vec<(String, [String; 3])> = (0..doc.setups.len())
+        .filter_map(|si| {
+            let places = leftover_places(doc, mesh, si)?;
+            let stock = doc.setup_stock(si, Some(mesh))?;
+            let s = &doc.setups[si];
+            let pins = crate::control::pins_settings(&s.machine.p).ok().flatten()?;
+            let w = match leftover_issue(s, mesh, stock, &pins, &places) {
+                Some(issue) => [String::new(), String::new(), issue],
+                None => {
+                    let (points, axis) = pin_drilling(s, mesh, stock, &places);
+                    [points, axis, String::new()]
+                }
+            };
+            Some((s.id.clone(), w))
+        })
+        .collect();
+    for o in doc.setups.iter_mut().flat_map(|s| s.operations.iter_mut()) {
+        if !o.drills_pin_holes() {
+            continue;
+        }
+        let [points, axis, issue] = (wanted.iter())
+            .find(|(id, _)| id == get(&o.p, "pin_setup"))
+            .map(|(_, w)| w.clone())
+            .unwrap_or_default();
+        for (k, v) in [
+            ("pin_points", points),
+            ("pin_axis", axis),
+            ("pin_issue", issue),
+        ] {
+            if get(&o.p, k) != v {
+                o.p.insert(k.into(), v);
+            }
+        }
+    }
+}
+/// The radius a pin hole of the leftover takes round its pin's centre
+/// (mm): its pin's, its clearance and, for a slot, half its play.
+pub fn leftover_hole_radius(pins: &crate::control::Pins) -> f32 {
+    pins.diameter as f32 / 2. + PIN_CLEARANCE + SLOT_PLAY / 2.
+}
+/// Why the pins of `pins` cannot stand at `places` (plan mm) in holes of
+/// the leftover of `stock`, the box `setup` starts from: a hole off the
+/// stock, nearer its edge than `PIN_WALL`, over the part or nearer it than
+/// `PIN_PART_GAP`, or a stock too thin for holes `PIN_DEPTH_EXTRA` deeper
+/// than the pins stand with a floor under them. None when they can.
+pub fn leftover_issue(
+    setup: &Setup,
+    mesh: &Mesh,
+    stock: Bounds,
+    pins: &crate::control::Pins,
+    places: &[[f32; 2]],
+) -> Option<String> {
+    let r = leftover_hole_radius(pins);
+    for (i, (part, edge)) in leftover_gaps(setup, mesh, stock, places)
+        .into_iter()
+        .enumerate()
+    {
+        let pin = i + 1;
+        if edge < 0. {
+            return Some(format!("Pin {pin} would stand off the stock."));
+        }
+        if edge - r < PIN_WALL {
+            return Some(format!(
+                "Pin {pin}'s hole would leave {} mm of wall to the stock's edge: keep at least {} mm.",
+                exact_mm((edge - r).max(0.)),
+                exact_mm(PIN_WALL)
+            ));
+        }
+        if part <= 0. {
+            return Some(format!(
+                "Pin {pin} would stand under the part: place the pins on the leftover beside it."
+            ));
+        }
+        if part - r < PIN_PART_GAP {
+            return Some(format!(
+                "Pin {pin}'s hole would be {} mm from the part: keep at least {} mm, room for a Ø6 tool round the part and a {} mm wall.",
+                exact_mm((part - r).max(0.)),
+                exact_mm(PIN_PART_GAP),
+                exact_mm(PIN_WALL)
+            ));
+        }
+    }
+    // A drill the pins' size goes on by its point.
+    let depth = pins.height as f32 + PIN_DEPTH_EXTRA;
+    let point = pins.diameter as f32 / 2. * crate::simulation::POINT_RISE;
+    let need = ((depth + point + PIN_WALL) * 10.).ceil() / 10.;
+    let thick = stock.max[2] - stock.min[2];
+    if thick < need {
+        return Some(format!(
+            "The stock is {} mm thick: holes {} mm deep for the {} mm pins, and a drill's point under them, need at least {} mm, with a {} mm floor under them.",
+            exact_mm(thick),
+            exact_mm(depth),
+            exact_mm(pins.height as f32),
+            exact_mm(need),
+            exact_mm(PIN_WALL)
+        ));
+    }
+    None
 }
 /// How far a chosen hole may be from a hole of the part, and a pin from
 /// the hole it goes into, and still be taken for it (mm).
@@ -1650,13 +2001,39 @@ const PIN_PLACE: f32 = 0.05;
 /// (`cam::bottom_holes`), the pins' diameter to `PIN_FIT` over from its
 /// opening on, and at least their height deep. Why not, in work
 /// coordinates, when it cannot be placed so.
-pub fn placed_on_pins(setup: &Setup, mesh: &Mesh, datum: [f32; 3]) -> Result<OnPins, String> {
+///
+/// On pins in the leftover (`pins_in_leftover`), pin 1 stands where it was
+/// placed (`leftover_pin`) and the plate puts the others: refused when they
+/// do not fit in the leftover of `stock`, the box the setup starts from
+/// (`leftover_issue`).
+pub fn placed_on_pins(
+    setup: &Setup,
+    mesh: &Mesh,
+    stock: Bounds,
+    datum: [f32; 3],
+) -> Result<OnPins, String> {
     if let Some(issue) = pins_issue(setup) {
         return Err(issue);
     }
     let Ok(Some(pins)) = crate::control::pins_settings(&setup.machine.p) else {
         return Err("This setup does not sit on the fixture pins.".into());
     };
+    if pins_in_leftover(setup) {
+        let Some(at) = leftover_pin(setup) else {
+            return Err("Place the pins on the stock's leftover.".into());
+        };
+        let at = crate::volume::Frame::new(setup, mesh).map(at);
+        let places = plate_places(&pins, [at[0], at[1]]);
+        if let Some(issue) = leftover_issue(setup, mesh, stock, &pins, &places) {
+            return Err(issue);
+        }
+        return Ok(OnPins {
+            pin1: [places[0][0] - datum[0], places[0][1] - datum[1]],
+            places,
+            diameter: pins.diameter as f32,
+            height: pins.height as f32,
+        });
+    }
     let found = crate::cam::bottom_holes(setup, mesh)?;
     let frame = crate::volume::Frame::new(setup, mesh);
     let (diameter, height) = (pins.diameter as f32, pins.height as f32);
@@ -1754,88 +2131,103 @@ pub fn placed_on_pins(setup: &Setup, mesh: &Mesh, datum: [f32; 3]) -> Result<OnP
 }
 /// `placed_on_pins` when `setup` sits on the pins and can be placed on
 /// them, else None.
-pub fn on_pins(setup: &Setup, mesh: &Mesh, datum: [f32; 3]) -> Option<OnPins> {
+pub fn on_pins(setup: &Setup, mesh: &Mesh, stock: Bounds, datum: [f32; 3]) -> Option<OnPins> {
     sits_on_pins(setup)
-        .then(|| placed_on_pins(setup, mesh, datum).ok())
+        .then(|| placed_on_pins(setup, mesh, stock, datum).ok())
         .flatten()
 }
 /// How much wider than its pin a hole may be and still locate the part
 /// (mm): a pocket or a larger hole the pin stands in leaves the part free
 /// to move by the difference.
 pub const PIN_FIT: f32 = 0.2;
-/// The pins of `on` that no earlier cut of `volume` has drilled a hole
-/// for, in the frame `frame` of the setup on them whose stock bottom is at
-/// `bottom` (plan mm), each with why. Straight cuts along Z in that frame
-/// that cover the pin with its full diameter (above a drill's point) must
-/// clear it from the bottom up to its height, and those at most `PIN_FIT`
-/// wider must hold at least half of that height, so that the part is
-/// located by them: drilled from the other side and flipped, or through
-/// from this side, maybe under a wider pocket.
+/// The pins of `on` that no earlier cut of `volume` has made a hole for,
+/// in the frame `frame` of the setup on them whose stock bottom is at
+/// `bottom` (plan mm), each with why. The cuts must clear each pin's whole
+/// width from the bottom up to its height, and leave stock round it no more
+/// than `PIN_FIT` wider for at least half of that height, so that the part
+/// is located by them: all round pin 1, which places the part, and across
+/// the line from pin 1 for the others, which only turn it, so a slot along
+/// that line holds them. Drilled or milled, from the other side and
+/// flipped or through from this side, maybe under a wider pocket.
 pub fn undrilled_pins(
     on: &OnPins,
     volume: &crate::volume::Volume,
     frame: crate::volume::Frame,
     bottom: f32,
 ) -> Vec<(usize, String)> {
+    use std::f32::consts::TAU;
     let r = on.diameter / 2.;
+    // Just past the widest hole that fits.
+    let fit = r + PIN_FIT / 2. + 0.02;
+    // Stock is the box the stock started as, less every cut.
+    let in_stock = |p: [f32; 3]| {
+        let q = frame.transfer(p, volume.frame);
+        (0..3).all(|k| q[k] >= volume.bounds.min[k] && q[k] <= volume.bounds.max[k])
+    };
+    let steps = ((on.height / 0.1).ceil() as usize).max(4);
+    let dz = on.height / steps as f32;
     on.places
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            // The heights each cut over the pin has its full width at, and
-            // whether it fits the pin.
-            let mut spans: Vec<(f32, f32, bool)> = volume
-                .cuts
-                .iter()
-                .filter_map(|cut| {
-                    let [a, b] = [cut.a, cut.b].map(|p| cut.frame.transfer(p, frame));
-                    let vertical = (0..2).all(|k| (a[k] - b[k]).abs() < 0.01);
-                    let off = (a[0] - c[0]).hypot(a[1] - c[1]);
-                    if !vertical || off + r > cut.radius + 0.005 {
-                        return None;
+            // The cuts that come near the pin: those of setups square to
+            // this one by their sweep's plan, the others all.
+            let near: Vec<&crate::stock_surface::Cut> = (volume.cuts.iter())
+                .filter(|cut| {
+                    if !cut.frame.square_to(frame) {
+                        return true;
                     }
-                    let fits = cut.radius <= r + PIN_FIT / 2. + 0.005;
-                    let point = match cut.shape {
-                        crate::simulation::CutterShape::Drill => {
-                            cut.radius * crate::simulation::POINT_RISE
-                        }
-                        _ => 0.,
-                    };
-                    // The tip is at `b` once a plunge ends; its point leaves
-                    // less than the full width for that far from it.
-                    let (lo, hi) = if b[2] >= a[2] {
-                        (a[2].min(b[2]), b[2] - point)
+                    let [a, b] = [cut.a, cut.b].map(|p| cut.frame.transfer(p, frame));
+                    let d = [b[0] - a[0], b[1] - a[1]];
+                    let l = d[0] * d[0] + d[1] * d[1];
+                    let u = if l > 0. {
+                        (((c[0] - a[0]) * d[0] + (c[1] - a[1]) * d[1]) / l).clamp(0., 1.)
                     } else {
-                        (b[2] + point, a[2].max(b[2]))
+                        0.
                     };
-                    Some((lo, hi, fits))
+                    (c[0] - a[0] - u * d[0]).hypot(c[1] - a[1] - u * d[1])
+                        <= cut.radius + fit + 0.01
                 })
-                .filter(|(lo, hi, _)| hi > lo)
                 .collect();
-            spans.sort_by(|x, y| x.0.total_cmp(&y.0));
-            let need = (bottom + 0.01, bottom + on.height);
-            // How high the pin is clear, and how much of it fitting holes
-            // hold: where no wider cut has cleared round it (a fitting hole
-            // drilled under a pocket holds nothing there).
-            let mut reach = need.0;
-            for &(lo, hi, _) in &spans {
-                if lo <= reach + 0.2 {
-                    reach = reach.max(hi);
+            let cleared = |p: [f32; 3]| {
+                near.iter().any(|cut| {
+                    let q = frame.transfer(p, cut.frame);
+                    crate::volume::swept(q, cut.a, cut.b, cut.radius, cut.flute, cut.shape)
+                })
+            };
+            // The ways the hole must fit: all round pin 1, across the line
+            // from pin 1 for the others.
+            let ways: Vec<f32> = if i == 0 {
+                (0..16).map(|k| k as f32 * TAU / 16.).collect()
+            } else {
+                let along = (c[1] - on.places[0][1]).atan2(c[0] - on.places[0][0]);
+                [-1., 1.]
+                    .into_iter()
+                    .flat_map(|side| [-0.2, 0., 0.2].map(|spread| along + side * TAU / 4. + spread))
+                    .collect()
+            };
+            let mut clear = true;
+            let mut held = 0.;
+            for k in 0..steps {
+                let z = bottom + (k as f32 + 0.5) * dz;
+                let within = (0..16)
+                    .map(|n| {
+                        let a = n as f32 * TAU / 16.;
+                        [c[0] + 0.97 * r * a.cos(), c[1] + 0.97 * r * a.sin(), z]
+                    })
+                    .chain([[c[0], c[1], z]]);
+                if !within.into_iter().all(cleared) {
+                    clear = false;
+                    break;
+                }
+                if ways.iter().all(|a| {
+                    let p = [c[0] + fit * a.cos(), c[1] + fit * a.sin(), z];
+                    in_stock(p) && !cleared(p)
+                }) {
+                    held += dz;
                 }
             }
-            let within = |z: f32, fits: bool| {
-                spans
-                    .iter()
-                    .any(|&(lo, hi, f)| f == fits && (lo..=hi).contains(&z))
-            };
-            let steps = (on.height / 0.05).ceil() as usize;
-            let held = (0..steps)
-                .map(|k| need.0 + (k as f32 + 0.5) * (need.1 - need.0) / steps as f32)
-                .filter(|&z| within(z, true) && !within(z, false))
-                .count() as f32
-                * (need.1 - need.0)
-                / steps as f32;
-            (reach < need.1 || held < on.height / 2.).then(|| {
+            (!clear || held < on.height / 2. - 0.001).then(|| {
                 (
                     i,
                     format!(
@@ -1896,7 +2288,7 @@ pub(crate) fn zero_check(
         return found;
     }
     let name = setup.name();
-    let on = match placed_on_pins(setup, mesh, datum) {
+    let on = match placed_on_pins(setup, mesh, stock, datum) {
         Ok(on) => on,
         Err(issue) => {
             found.refused.push(format!("{name}: {issue}"));
@@ -2233,7 +2625,7 @@ fn holding_boxes(
         .holding_boxes(setup, held)
         .map_err(|e| format!("{}: {e}", setup.name()))?;
     boxes.extend(crate::holding::pin_boxes(
-        on_pins(setup, mesh, datum).as_ref(),
+        on_pins(setup, mesh, held.stock, datum).as_ref(),
         held.stock,
     ));
     Ok(boxes)
@@ -3289,6 +3681,109 @@ pub(crate) mod fixture {
             ..Default::default()
         };
         doc.sync_stock_sources();
+        (doc, mesh)
+    }
+    /// `examples/preview-cube.obj`, a 30 × 20 × 10 mm block with no holes,
+    /// in stock 25 mm over it each way along X, 10 mm along Y and 2 mm top
+    /// and bottom: faced on G54 and, with `tool` ("Drill" or "Mill"), the
+    /// holes for the pins drilled there by a Drill of the pin holes with a
+    /// Ø4.1 drill or a Ø3 flat end mill; then flipped 180° about `axis`
+    /// ("rx" or "ry") and faced on G55, standing on fixture pins Ø4, 6 mm
+    /// tall and 60 mm apart along X placed in its leftover, pin 1 12.5 mm
+    /// beyond the part's lowest X (the machine of both setups).
+    pub fn leftover_flip(axis: &str, tool: Option<&str>) -> (Document, Mesh) {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("examples/preview-cube.obj");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let mut tools = vec![
+            Tool::new("Flat 10", "Flat end mill", "10"),
+            Tool::new("Drill 4.1", "Drill", "4.1"),
+            Tool::new("Flat 3", "Flat end mill", "3"),
+        ];
+        for (n, t) in tools.iter_mut().enumerate() {
+            t.p.insert("length".into(), "30".into());
+            t.p.insert("stickout".into(), "35".into());
+            t.p.insert("number".into(), (n + 1).to_string());
+        }
+        let mut machine = Machine::new(3);
+        for (k, v) in [
+            ("pins", "0 0; 60 0"),
+            ("pin_diameter", "4"),
+            ("pin_height", "6"),
+        ] {
+            machine.p.insert(k.into(), v.into());
+        }
+        let face = |setup: &Setup| {
+            let mut face = Operation::new(Strategy::Face, tools[0].id.clone());
+            face.p.insert("boundary".into(), "Stock silhouette".into());
+            face.p
+                .insert("containment".into(), "Tool outside boundary".into());
+            face.p.insert("allowance".into(), "0".into());
+            face.surfaces = Some(Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: top_surfaces(&mesh, setup),
+            });
+            face.geometry.clear();
+            face
+        };
+        let margins = [
+            ("stock_top", "2"),
+            ("stock_bottom", "2"),
+            ("stock_left", "25"),
+            ("stock_right", "25"),
+            ("stock_front", "10"),
+            ("stock_back", "10"),
+        ];
+        let mut top = Setup::new(machine.clone(), "G54");
+        top.p.insert("name".into(), "Top".into());
+        let mut flipped = Setup::new(machine.clone(), "G55");
+        flipped.p.insert("name".into(), "Flipped".into());
+        flipped.p.insert(axis.into(), "180".into());
+        for s in [&mut top, &mut flipped] {
+            for (k, v) in margins {
+                s.p.insert(k.into(), v.into());
+            }
+        }
+        top.operations.push(face(&top));
+        flipped.operations.push(face(&flipped));
+        if let Some(kind) = tool {
+            let tool = &tools[if kind == "Drill" { 1 } else { 2 }];
+            let mut op = Operation::new(Strategy::Drill, tool.id.clone());
+            op.p.insert("name".into(), "Pin holes".into());
+            op.p.insert("holes".into(), DRILL_HOLES[1].into());
+            op.p.insert("pin_setup".into(), flipped.id.clone());
+            if kind != "Drill" {
+                op.p.insert("rpm".into(), "8000".into());
+                op.p.insert("feed".into(), "400".into());
+            }
+            op.geometry.clear();
+            top.operations.push(op);
+        }
+        flipped.p.insert("on_pins".into(), "Yes".into());
+        flipped
+            .p
+            .insert("pin_source".into(), super::PIN_SOURCES[1].into());
+        let mut doc = Document {
+            title: "Leftover pins".into(),
+            machines: vec![machine],
+            tools,
+            active: top.id.clone(),
+            setups: vec![top, flipped],
+            file: Some(ModelFile {
+                name: "preview-cube.obj".into(),
+                path,
+                format: "obj".into(),
+                bytes: 0,
+            }),
+            ..Default::default()
+        };
+        doc.sync_stock_sources();
+        let part = crate::simulation::part_box(&doc.setups[1], &mesh);
+        let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
+        let pin1 = [part.min[0] - 12.5, (part.min[1] + part.max[1]) / 2.];
+        let text = super::leftover_pin_text(&doc.setups[1], &mesh, stock, pin1);
+        doc.setups[1].p.insert("pin_place".into(), text);
+        super::sync_pin_drilling(&mut doc, &mesh);
         (doc, mesh)
     }
     /// `job`'s first `keep` operations on G54, then the part flipped about
@@ -5392,6 +5887,246 @@ M2
         }
     }
     #[test]
+    fn a_flipped_setup_stands_on_pins_placed_in_the_stock_leftover() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        for axis in ["rx", "ry"] {
+            for kind in ["Drill", "Mill"] {
+                let (doc, mesh) = fixture::leftover_flip(axis, Some(kind));
+                let sims = results(&doc, &mesh);
+                let program = checked(&doc, &mesh, 1, &sims[1], PostSettings::from_machine)
+                    .unwrap_or_else(|e| panic!("{axis} {kind}: {e:?}"));
+                // The pins stand where pin 1 was placed, 12.5 mm beyond the
+                // part's lowest X, and the plate puts pin 2 60 mm along +X.
+                let on = program[0].pins.clone().unwrap();
+                let part = crate::simulation::part_box(&doc.setups[1], &mesh);
+                let y = (part.min[1] + part.max[1]) / 2.;
+                assert!(
+                    near(on.places[0][0], part.min[0] - 12.5)
+                        && near(on.places[1][0], part.min[0] + 47.5)
+                        && near(on.places[0][1], y)
+                        && near(on.places[1][1], y),
+                    "{axis} {kind}: {on:?}"
+                );
+                let d = program[0].datum;
+                assert!(near(on.pin1[0], on.places[0][0] - d[0]), "{on:?} {d:?}");
+                // Setup 1 made their holes: no warning.
+                let zero = zero_checked(&doc, &mesh, 1, &sims[1]).unwrap();
+                assert!(
+                    zero.refused.is_empty() && zero.warnings.is_empty(),
+                    "{axis} {kind}: {zero:?}"
+                );
+                // From the face setup 2 sits on, faced 2 mm down, 7 mm deep
+                // at their full width: 1 mm deeper than the pins stand.
+                let (own, theirs) = (
+                    crate::volume::Frame::new(&doc.setups[0], &mesh),
+                    crate::volume::Frame::new(&doc.setups[1], &mesh),
+                );
+                let made = &sims[0].last().unwrap().1.as_ref().unwrap().plan;
+                for (i, c) in on.places.iter().enumerate() {
+                    let p = theirs.transfer([c[0], c[1], program[0].stock.min[2]], own);
+                    let here: Vec<[f32; 3]> = (made.moves.iter())
+                        .filter(|m| m.cutting_pass)
+                        .map(|m| m.to)
+                        .filter(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < 2.)
+                        .collect();
+                    let deepest = here.iter().map(|q| q[2]).fold(f32::INFINITY, f32::min);
+                    // A drill on by its point under that.
+                    let point = if kind == "Drill" {
+                        2.05 * crate::simulation::POINT_RISE
+                    } else {
+                        0.
+                    };
+                    assert!(
+                        near(deepest, p[2] - 7. - point),
+                        "{axis} {kind} pin {}: Z{deepest} at {p:?}",
+                        i + 1
+                    );
+                    if kind == "Mill" {
+                        // The Ø3 tool's centre 0.525 mm in from a Ø4.05
+                        // wall: pin 1's hole round, pin 2's a slot 1 mm
+                        // longer along X.
+                        let span = |k: usize| {
+                            let (lo, hi) = here
+                                .iter()
+                                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), q| {
+                                    (lo.min(q[k]), hi.max(q[k]))
+                                });
+                            hi - lo
+                        };
+                        let long = if i == 0 { 1.05 } else { 2.05 };
+                        assert!(
+                            (span(0) - long).abs() < 0.02 && (span(1) - 1.05).abs() < 0.02,
+                            "{axis} pin {}: {} × {}",
+                            i + 1,
+                            span(0),
+                            span(1)
+                        );
+                    }
+                }
+            }
+            // Without the holes setup 2 still runs, warned that no earlier
+            // setup makes them.
+            let (doc, mesh) = fixture::leftover_flip(axis, None);
+            let sims = results(&doc, &mesh);
+            let zero = zero_checked(&doc, &mesh, 1, &sims[1]).unwrap();
+            assert!(zero.refused.is_empty(), "{zero:?}");
+            assert_eq!(zero.warnings.len(), 1, "{zero:?}");
+            assert!(
+                zero.warnings[0].starts_with("No earlier setup drills holes for pin 1 (Ø4 at X")
+                    && zero.warnings[0].contains("and pin 2"),
+                "{}",
+                zero.warnings[0]
+            );
+        }
+    }
+    #[test]
+    fn pins_in_the_leftover_are_refused_where_they_do_not_fit() {
+        let (doc, mesh) = fixture::leftover_flip("rx", Some("Drill"));
+        let s = &doc.setups[1];
+        let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
+        let pins = crate::control::pins_settings(&s.machine.p)
+            .unwrap()
+            .unwrap();
+        let part = crate::simulation::part_box(s, &mesh);
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let issue = |stock: Bounds, pin1: [f32; 2]| {
+            leftover_issue(s, &mesh, stock, &pins, &plate_places(&pins, pin1)).unwrap_or_default()
+        };
+        assert_eq!(issue(stock, [part.min[0] - 12.5, y]), "");
+        assert_eq!(
+            issue(stock, [part.min[0] + 5., y]),
+            "Pin 1 would stand under the part: place the pins on the leftover beside it."
+        );
+        // Each hole is 2.55 mm round its pin: Ø4, 0.05 over and half the
+        // slot's 1 mm play.
+        assert_eq!(
+            issue(stock, [part.min[0] - 6., y]),
+            "Pin 1's hole would be 3.45 mm from the part: keep at least 8 mm, room for a Ø6 tool round the part and a 2 mm wall."
+        );
+        assert_eq!(
+            issue(stock, [stock.min[0] + 4., y]),
+            "Pin 1's hole would leave 1.45 mm of wall to the stock's edge: keep at least 2 mm."
+        );
+        assert_eq!(
+            issue(stock, [stock.min[0] - 1., y]),
+            "Pin 1 would stand off the stock."
+        );
+        // Near the front edge, and pin 1 beyond the part's far end: pin 2
+        // 60 mm on is off the stock.
+        assert_eq!(
+            issue(stock, [part.min[0] - 12.5, stock.min[1] + 4.]),
+            "Pin 1's hole would leave 1.45 mm of wall to the stock's edge: keep at least 2 mm."
+        );
+        assert_eq!(
+            issue(stock, [part.max[0] + 12.5, y]),
+            "Pin 2 would stand off the stock."
+        );
+        let mut thin = stock;
+        thin.max[2] = thin.min[2] + 8.;
+        assert_eq!(
+            issue(thin, [part.min[0] - 12.5, y]),
+            "The stock is 8 mm thick: holes 7 mm deep for the 6 mm pins, and a drill's point under them, need at least 10.3 mm, with a 2 mm floor under them."
+        );
+        // Placed under the part, the export refuses setup 2.
+        let refused = |change: &dyn Fn(&mut Document)| {
+            let (mut doc, mesh) = fixture::leftover_flip("rx", Some("Drill"));
+            change(&mut doc);
+            let sims = results(&doc, &mesh);
+            checked(&doc, &mesh, 1, &sims[1], PostSettings::from_machine)
+                .unwrap_err()
+                .join(" ")
+        };
+        let e = refused(&|doc| {
+            let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
+            let text = leftover_pin_text(&doc.setups[1], &mesh, stock, [part.min[0] + 5., y]);
+            doc.setups[1].p.insert("pin_place".into(), text);
+        });
+        assert!(
+            e.contains("Flipped: Pin 1 would stand under the part"),
+            "{e}"
+        );
+        let mut doc = doc.clone();
+        doc.setups[1].p.remove("pin_place");
+        let issues = doc.setups[1].issues();
+        assert!(
+            issues
+                .iter()
+                .any(|e| e.contains("place them under Pin holes in the Work zero step")),
+            "{issues:?}"
+        );
+    }
+    #[test]
+    fn a_drill_of_the_pin_holes_follows_the_pins_it_drills_for() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let (mut doc, mesh) = fixture::leftover_flip("rx", Some("Drill"));
+        assert_eq!(pin_drillings(&doc, 1), vec![(0, 1)]);
+        assert_eq!(pin_drilling_setup(&doc, &mesh, 1), Some(0));
+        // Setup 1 is not after setup 2, nor is its own top up in it.
+        assert_eq!(pin_drilling_setup(&doc, &mesh, 0), None);
+        let before = drill_pin_points(&doc.setups[0].operations[1]);
+        assert_eq!(before.len(), 2);
+        // Pins moved 3 mm along Y in setup 2 move the holes 3 mm along Y in
+        // setup 1, the other way: flipped about X.
+        let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
+        let at = leftover_places(&doc, &mesh, 1).unwrap()[0];
+        let text = leftover_pin_text(&doc.setups[1], &mesh, stock, [at[0], at[1] + 3.]);
+        doc.setups[1].p.insert("pin_place".into(), text);
+        sync_pin_drilling(&mut doc, &mesh);
+        let after = drill_pin_points(&doc.setups[0].operations[1]);
+        let own = crate::volume::Frame::new(&doc.setups[0], &mesh);
+        for (a, b) in before.iter().zip(&after) {
+            let (a, b) = (own.map(*a), own.map(*b));
+            assert!(near(a[0], b[0]) && near(a[1] - b[1], 3.), "{a:?} {b:?}");
+        }
+        // Placed where they do not fit, under the part, the Drill makes no
+        // hole, and says why.
+        let good = get(&doc.setups[1].p, "pin_place").to_string();
+        let part = crate::simulation::part_box(&doc.setups[1], &mesh);
+        let text = leftover_pin_text(&doc.setups[1], &mesh, stock, [part.min[0] + 5., at[1]]);
+        doc.setups[1].p.insert("pin_place".into(), text);
+        sync_pin_drilling(&mut doc, &mesh);
+        let op = &doc.setups[0].operations[1];
+        assert!(drill_pin_points(op).is_empty());
+        let e = crate::cam::generate(&doc.setups[0], op, &doc.tools[1], &mesh).unwrap_err();
+        assert_eq!(
+            e,
+            "The pins these holes are for do not fit where they are placed, so no hole is made: Pin 1 would stand under the part: place the pins on the leftover beside it. Move them in the Work zero step of the setup that sits on them."
+        );
+        doc.setups[1].p.insert("pin_place".into(), good);
+        sync_pin_drilling(&mut doc, &mesh);
+        let op = &doc.setups[0].operations[1];
+        assert_eq!(drill_pin_points(op).len(), 2);
+        assert_eq!(get(&op.p, "pin_issue"), "");
+        // On the part's holes instead, the Drill has none to make.
+        doc.setups[1]
+            .p
+            .insert("pin_source".into(), PIN_SOURCES[0].into());
+        sync_pin_drilling(&mut doc, &mesh);
+        let op = &doc.setups[0].operations[1];
+        assert!(drill_pin_points(op).is_empty());
+        let e = crate::cam::generate(&doc.setups[0], op, &doc.tools[1], &mesh).unwrap_err();
+        assert!(
+            e.starts_with("Place the pins on the stock's leftover"),
+            "{e}"
+        );
+        // The tool a new Drill of them takes: the drill that fits the pins,
+        // else the flat end mill nearest 0.7 of their width that mills them.
+        let machine = &doc.setups[0].machine;
+        let pins = crate::control::pins_settings(&machine.p).unwrap().unwrap();
+        let mut tools = doc.tools.clone();
+        assert_eq!(
+            pin_drilling_tool(&tools, machine, &pins).unwrap().name(),
+            "Drill 4.1"
+        );
+        tools.retain(|t| t.name() != "Drill 4.1");
+        assert_eq!(
+            pin_drilling_tool(&tools, machine, &pins).unwrap().name(),
+            "Flat 3"
+        );
+        tools.retain(|t| t.name() != "Flat 3");
+        assert!(pin_drilling_tool(&tools, machine, &pins).is_none());
+    }
+    #[test]
     fn a_setup_on_the_pins_is_refused_until_its_chosen_holes_fit_them() {
         let issues = |doc: &Document| doc.setups[1].issues();
         let (mut doc, mesh) = fixture::pinned_flip("rx", true);
@@ -5471,7 +6206,13 @@ M2
         // Facing is refused before, for its face is not square to Z).
         let (mut doc, _) = fixture::pinned_flip("rx", true);
         doc.setups[1].p.insert("rx".into(), "90".into());
-        let e = placed_on_pins(&doc.setups[1], &mesh, [0.; 3]).unwrap_err();
+        let e = placed_on_pins(
+            &doc.setups[1],
+            &mesh,
+            crate::simulation::part_box(&doc.setups[1], &mesh),
+            [0.; 3],
+        )
+        .unwrap_err();
         assert!(
             e.contains("is not a round hole the part opens on its bottom in this setup"),
             "{e}"

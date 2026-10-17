@@ -388,6 +388,7 @@ impl Builder {
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     match op.strategy {
         Strategy::Contour => contour(setup, op, tool, mesh),
+        Strategy::Drill if op.drills_pin_holes() => pin_holes(setup, op, tool, mesh),
         Strategy::Drill => drill(setup, op, tool, mesh),
         Strategy::Parallel => parallel(setup, op, tool, mesh),
         Strategy::Waterline => waterline(setup, op, tool, mesh),
@@ -1260,6 +1261,206 @@ pub fn surface_hole(
             && at[2] > h.z + 0.01
             && at[2] <= h.z + h.depth + 0.01
     })
+}
+/// A Drill of the pin holes in the stock's leftover
+/// (`Operation::drills_pin_holes`): a hole for each of the machine's
+/// fixture pins where a later setup's Work zero step placed them
+/// (`post::drill_pin_points`), going down from the face its pins stand on,
+/// which must be up here, `post::PIN_DEPTH_EXTRA` deeper than they stand
+/// at their full width (a drill's point on under that).
+/// A drill from the pins' diameter to `post::PIN_FIT` over drills them all
+/// round, pecking as its cycle says. A flat end mill mills them
+/// `post::PIN_CLEARANCE` wider than the pins: pin 1's hole round, on a
+/// helix, and a slot `post::SLOT_PLAY` longer than its pin along the line
+/// from pin 1 for each of the others, ramping down round it, then a lap at
+/// the bottom of each.
+fn pin_holes(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    use crate::post::{PIN_CLEARANCE, PIN_DEPTH_EXTRA, PIN_FIT, PIN_WALL, SLOT_PLAY, exact_mm};
+    let mut b = Builder::new(setup, op, tool, mesh)?;
+    let drill = get(&tool.p, "type") == "Drill";
+    if !drill && get(&tool.p, "type") != "Flat end mill" {
+        return Err("Choose a drill, or a flat end mill to mill them, for the pin holes.".into());
+    }
+    let pins = match crate::control::pins_settings(&setup.machine.p) {
+        Ok(Some(pins)) => pins,
+        Ok(None) => {
+            return Err(format!(
+                "This setup's machine {} has no fixture pins: the pin holes are sized and placed for them.",
+                setup.machine.name()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "The machine's fixture pins do not read: {}",
+                e.join(" ")
+            ));
+        }
+    };
+    let points = crate::post::drill_pin_points(op);
+    let issue = get(&op.p, "pin_issue");
+    if !issue.is_empty() {
+        return Err(format!(
+            "The pins these holes are for do not fit where they are placed, so no hole is made: {issue} Move them in the Work zero step of the setup that sits on them."
+        ));
+    }
+    if points.len() != pins.at.len() {
+        return Err("Place the pins on the stock's leftover in the Work zero step of the setup that sits on them: this operation has no holes for the machine's pins yet.".into());
+    }
+    let frame = crate::volume::Frame::new(setup, mesh);
+    let o = frame.map([0.; 3]);
+    let down = crate::post::drill_pin_axis(op)
+        .map(|v| frame.map(v)[2] - o[2])
+        .is_some_and(|z| z < -0.999);
+    if !down {
+        return Err("The pin holes open on a face that is not up in this setup: drill them in a setup that has the face the pins stand on facing up.".into());
+    }
+    let at: Vec<[f32; 2]> = (points.iter())
+        .map(|p| {
+            let q = frame.map(*p);
+            [q[0], q[1]]
+        })
+        .collect();
+    let d = pins.diameter as f32;
+    let width = d + PIN_CLEARANCE;
+    let r = b.plan.radius;
+    let fits = if drill {
+        (d - 0.001..=d + PIN_FIT + 0.001).contains(&(2. * r))
+    } else {
+        2. * r >= width / 2. + 0.05 && 2. * r <= width - 0.05
+    };
+    if !fits {
+        return Err(format!(
+            "Make the holes for the Ø{} pins with a Ø{} to Ø{} drill, or mill them with a flat end mill from Ø{} to Ø{}.",
+            exact_mm(d),
+            exact_mm(d),
+            exact_mm(d + PIN_FIT),
+            exact_mm(width / 2. + 0.05),
+            exact_mm(width - 0.05)
+        ));
+    }
+    let peck = if drill && ["Chip breaking", "Deep drilling"].contains(&get(&op.p, "cycle")) {
+        number(op, "peck")?
+    } else {
+        f32::MAX
+    };
+    if peck <= 0. {
+        return Err("Peck depth must be positive.".into());
+    }
+    if drill {
+        b.plan.milling_direction = "Drilling · axial feed";
+        b.plan.shape = CutterShape::Drill;
+    } else {
+        b.plan.milling_direction = "Helical and slot milling · axial ramp";
+    }
+    let depth = pins.height as f32 + PIN_DEPTH_EXTRA;
+    let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
+    // A milled hole's ramp: down a quarter of the tool's diameter a lap.
+    let pitch = (r / 2.).min(1.);
+    for (i, c) in at.iter().enumerate() {
+        let reach = width / 2. + SLOT_PLAY / 2.;
+        let region = Bounds {
+            min: [c[0] - reach, c[1] - reach, b.plan.stock.min[2]],
+            max: [c[0] + reach, c[1] + reach, top],
+        };
+        // The face the pins stand on, as the cuts before this one leave it.
+        let face = crate::rest::start(setup, region, b.plan.stock.min[2], b.plan.stock.max[2], 0.);
+        // A drill goes on by its point, so the hole is its full width all
+        // the way down.
+        let point = if drill {
+            r * crate::simulation::POINT_RISE
+        } else {
+            0.
+        };
+        let target = face - depth - point;
+        if target < b.plan.stock.min[2] + PIN_WALL - 0.001 {
+            return Err(format!(
+                "Pin {}'s hole, {} mm deep for the {} mm pins, would leave less than a {} mm floor under it: the stock is too thin there.",
+                i + 1,
+                exact_mm(depth),
+                exact_mm(pins.height as f32),
+                exact_mm(PIN_WALL)
+            ));
+        }
+        if top - target >= b.plan.flute_length {
+            return Err("The pin holes are deeper than the tool's flutes reach.".into());
+        }
+        b.plan.target = b.plan.target.min(target);
+        if drill {
+            let levels = ((face - target) / peck).ceil().max(1.) as usize;
+            b.plan.levels += levels;
+            b.start_at([c[0], c[1], face], Some(face))?;
+            for level in 1..=levels {
+                let z = (face - level as f32 * peck).max(target);
+                b.push([c[0], c[1], z], Motion::Feed, true, b.feed)?;
+                if level < levels {
+                    // Deep drilling clears the hole between pecks; chip
+                    // breaking only lifts off the chip.
+                    let up = if get(&op.p, "cycle") == "Deep drilling" {
+                        b.retract
+                    } else {
+                        (z + 0.5).min(face + 0.5)
+                    };
+                    b.push([c[0], c[1], up], Motion::Rapid, false, b.rapid)?;
+                    b.push([c[0], c[1], z + 0.1], Motion::Rapid, false, b.rapid)?;
+                }
+            }
+            b.retract()?;
+            continue;
+        }
+        // The tool's centre goes round a circle for pin 1, round a slot
+        // along the line from pin 1 for the others.
+        let (along, length) = if i == 0 {
+            ([1., 0.], 0.)
+        } else {
+            let v = [c[0] - at[0][0], c[1] - at[0][1]];
+            let l = v[0].hypot(v[1]).max(1e-6);
+            ([v[0] / l, v[1] / l], SLOT_PLAY)
+        };
+        let lap = slot_lap(*c, along, length, width / 2. - r);
+        let total: f32 = lap
+            .windows(2)
+            .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+            .sum();
+        let laps = ((face - target) / pitch).ceil().max(1.) as usize;
+        b.plan.levels += laps + 1;
+        b.start_at([lap[0][0], lap[0][1], face], Some(face))?;
+        for k in 0..=laps {
+            let mut gone = 0.;
+            for w in lap.windows(2) {
+                gone += (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+                let z =
+                    (face - (k as f32 + gone / total) * (face - target) / laps as f32).max(target);
+                b.push([w[1][0], w[1][1], z], Motion::Feed, true, b.feed)?;
+            }
+        }
+        // Off the wall to the middle before rising.
+        b.push([c[0], c[1], target], Motion::Feed, true, b.feed)?;
+        b.retract()?;
+    }
+    b.finish()
+}
+/// One lap of a tool's centre `offset` in from the wall of a slot: round
+/// the slot centred on `c`, its ends' centres `length` apart along the unit
+/// `along`, a circle at `c` for 0, starting and ending at the same point
+/// (plan mm).
+fn slot_lap(c: [f32; 2], along: [f32; 2], length: f32, offset: f32) -> Vec<[f32; 2]> {
+    use std::f32::consts::PI;
+    let h = length / 2.;
+    let ends = [
+        [c[0] - along[0] * h, c[1] - along[1] * h],
+        [c[0] + along[0] * h, c[1] + along[1] * h],
+    ];
+    let base = along[1].atan2(along[0]);
+    let mut lap = vec![];
+    // Round the far end, then back round the near one: each half a circle.
+    for (end, from) in [(ends[1], -PI / 2.), (ends[0], PI / 2.)] {
+        for k in 0..=16 {
+            let a = base + from + k as f32 * PI / 16.;
+            lap.push([end[0] + offset * a.cos(), end[1] + offset * a.sin()]);
+        }
+    }
+    lap.push(lap[0]);
+    lap
 }
 fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;

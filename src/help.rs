@@ -956,6 +956,18 @@ pub fn command(m: &Message, label: String) -> Help {
             "Choose or remove this hole of the part for the fixture pins. Choose one hole per pin, as the part's design has them: round holes it opens on the face this setup sits on, the pins' diameter to 0.2 mm over from their opening on (not counterbored), at least the pins' height deep. Which hole takes which pin follows from the plate, and pin 1's hole gives the X and Y work offset with pin 1's recorded machine place. Drill them in an earlier setup with a Drill operation on the face they open on, or before the job.",
         );
     }
+    if let Edit(Target::Setup, "pin_place", _) = m {
+        return Help::text(
+            label,
+            "Clear where the pins stand in the stock's leftover, to place them again. A Drill of their holes keeps its place in the job and has no holes until they are placed.",
+        );
+    }
+    if let Edit(Target::Operation, "pin_setup", _) = m {
+        return Help::text(
+            label,
+            "Make the holes for this setup's fixture pins, where its Work zero step places them in the stock's leftover.",
+        );
+    }
     if let StockDetail(detail) = m {
         return crate::choice_help::selected(
             "stock_detail",
@@ -1124,6 +1136,14 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         PickPinHoles => (
             "Pick the part's holes for the fixture pins in the 3D view: click inside a hole, on its wall or its end, to choose it or remove it; drag to orbit (turn the view to see under the part, where the holes open), and click Finish picking when done. The holes offered are ringed and numbered as listed.",
+            "",
+        ),
+        PlacePins => (
+            "Place the fixture pins on the stock's leftover in the 3D view: the plate's pins follow the pointer on the stock's bottom, green where they fit and red, with why, where they do not. Click to put pin 1 there; drag the placed pins to move them; drag elsewhere to orbit. Click Finish placing when done.",
+            "",
+        ),
+        AddPinDrilling => (
+            "Add a Drill of the pin holes to the last earlier setup that has the face this setup sits on facing up: holes where the pins are placed, 1 mm deeper than the pins stand, with a drill or flat end mill from the library that fits the pins.",
             "",
         ),
         PickMode => (
@@ -3931,6 +3951,8 @@ mod tests {
             PickMode,
             BoxFromFace,
             PickPinHoles,
+            PlacePins,
+            AddPinDrilling,
             Generate,
             GenerateAll,
             DuplicateSetup,
