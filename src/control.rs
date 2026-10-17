@@ -1302,6 +1302,47 @@ fn job(name: &str, actions: Vec<Do>) -> Command {
     }
 }
 
+/// The axes' letters, by the driver's index.
+pub const AXIS_NAMES: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
+
+/// A rotary axis (A, B, C): in degrees, without switches.
+pub fn rotary(a: usize) -> bool {
+    a >= 3
+}
+
+/// Pads a state file written before its axes were six (offsets and the
+/// last position of X, Y and Z only) with zeros, so the driver loads it:
+/// it drops a file it cannot read, and with it every offset. A file it
+/// wrote, or none, is left as it is.
+fn pad_state(file: &Path) {
+    let Some(mut doc) = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| t.parse::<toml_edit::DocumentMut>().ok())
+    else {
+        return;
+    };
+    let mut padded = false;
+    let mut pad = |a: &mut toml_edit::Array| {
+        while a.len() < 6 {
+            a.push(0.0);
+            padded = true;
+        }
+    };
+    if let Some(wcs) = doc.get_mut("wcs").and_then(|w| w.as_array_mut()) {
+        for system in wcs.iter_mut() {
+            if let Some(a) = system.as_array_mut() {
+                pad(a);
+            }
+        }
+    }
+    if let Some(a) = doc.get_mut("last_position").and_then(|w| w.as_array_mut()) {
+        pad(a);
+    }
+    if padded {
+        let _ = std::fs::write(file, doc.to_string());
+    }
+}
+
 /// How often a held jog is sent again: the driver ends a jog that is not
 /// refreshed within 400 ms, so a lost release cannot run an axis away.
 const JOG_RESEND: Duration = Duration::from_millis(100);
@@ -1315,7 +1356,8 @@ const JOG_START: Duration = Duration::from_millis(400);
 pub enum Action {
     /// Home every axis in the profile's order.
     Home,
-    /// Declare the current position machine zero: X, Y and Z, or one axis.
+    /// Declare the current position machine zero: every axis without a
+    /// home switch (A too), or one axis.
     MachineZero(Option<usize>),
     /// Declare every axis at the machine position it shows, which after
     /// connecting is where the machine was left.
@@ -1328,6 +1370,8 @@ pub enum Action {
     JogRelease,
     /// The step size in mm; None jogs continuously.
     JogStep(Option<f64>),
+    /// A's step size in degrees; None jogs A continuously.
+    JogAngle(Option<f64>),
     /// Jog speed, % of each axis's maximum velocity.
     JogSpeed(f32),
     /// Make the current position work zero of the active coordinate
@@ -1467,6 +1511,8 @@ pub struct Connection {
     declare: VecDeque<(usize, f64)>,
     held: Option<Held>,
     pub jog_step: Option<f64>,
+    /// A's step in degrees (`Action::JogAngle`).
+    pub jog_angle: Option<f64>,
     /// Jog speed, % of each axis's maximum velocity.
     pub jog_speed: f32,
     /// Feed override, %.
@@ -1556,6 +1602,7 @@ impl Connection {
         cfg.controller.simulated = simulated;
         let suffix = if simulated { "-simulated" } else { "" };
         let file = state_dir.join(format!("{}{suffix}.toml", m.id));
+        pad_state(&file);
         let controller = Controller::start(cfg.clone(), Some(file));
         let block = sim_block(&cfg, None).filter(|_| simulated);
         let pins = pins_settings(&m.p);
@@ -1575,6 +1622,7 @@ impl Connection {
             declare: VecDeque::new(),
             held: None,
             jog_step: None,
+            jog_angle: None,
             jog_speed: 50.,
             feed_override: 100.,
             rpm: String::new(),
@@ -1881,7 +1929,7 @@ impl Connection {
         match action {
             Action::Home if self.idle() && self.home_switches() => self.send(Command::Home(vec![])),
             Action::MachineZero(axis) if self.idle() => {
-                let axes = axis.map_or(0..3, |a| a..a + 1);
+                let axes = axis.map_or(0..6, |a| a..a + 1);
                 let zero: Vec<_> = axes
                     .filter(|&a| self.axis(a) && self.switchless(a))
                     .map(|a| (a, 0.))
@@ -1895,8 +1943,15 @@ impl Connection {
                     .collect();
                 self.declared(&here);
             }
-            Action::JogPress(axis, negative) if self.manual() && self.axis(axis) => {
-                match self.jog_step {
+            Action::JogPress(axis, negative)
+                if self.manual() && self.axis(axis) && self.jog_blocked(axis).is_none() =>
+            {
+                let step = if rotary(axis) {
+                    self.jog_angle
+                } else {
+                    self.jog_step
+                };
+                match step {
                     Some(step) => self.send(Command::JogStep {
                         axis,
                         distance: if negative { -step } else { step },
@@ -1925,6 +1980,7 @@ impl Connection {
                 }
             }
             Action::JogStep(step) => self.jog_step = step,
+            Action::JogAngle(step) => self.jog_angle = step,
             Action::JogSpeed(percent) => self.jog_speed = percent.clamp(1., 100.),
             Action::WorkZero(axis) if self.manual() => {
                 if let (Some(run), None | Some(2)) = (&mut self.run, axis) {
@@ -2011,9 +2067,12 @@ impl Connection {
             Action::CalMeasured(text) => self.calibration.measured = text,
             Action::CalMove => {
                 let axis = self.calibration.axis;
-                if let (true, Some(distance), Some(st)) =
-                    (self.idle(), self.cal_distance(), &self.snapshot.status)
-                {
+                if let (true, None, Some(distance), Some(st)) = (
+                    self.idle(),
+                    self.jog_blocked(axis),
+                    self.cal_distance(),
+                    &self.snapshot.status,
+                ) {
                     self.calibration.start = Some(st.position[axis]);
                     self.send(Command::JogStep {
                         axis,
@@ -2474,9 +2533,16 @@ impl Connection {
         if !self.idle() {
             return Err("The machine is not Idle.".into());
         }
-        if !self.unset_limited_axes().is_empty() || !(0..2).all(|a| self.snapshot.referenced[a]) {
+        let mut unset = self.unset_limited_axes();
+        unset.extend((0..2).filter(|&a| !self.snapshot.referenced[a]));
+        unset.sort_unstable();
+        unset.dedup();
+        if !unset.is_empty() {
+            let names: Vec<&str> = unset.iter().map(|&a| AXIS_NAMES[a]).collect();
             return Err(format!(
-                "X and Y need a machine position first: {}.",
+                "{} {} a machine position first: {}.",
+                names.join(", "),
+                if names.len() == 1 { "needs" } else { "need" },
                 if self.home_switches() {
                     "home"
                 } else {
@@ -3000,6 +3066,17 @@ impl Connection {
         a < 6 && self.config.axis_enabled(a)
     }
 
+    /// Why a jog of `axis` (or a calibration move) cannot start now: a
+    /// rotary axis never moves before its machine position is declared, as
+    /// a program would not move it either. The driver checks that for a
+    /// program but not for a jog. None when it can.
+    pub fn jog_blocked(&self, axis: usize) -> Option<String> {
+        (rotary(axis) && self.axis(axis) && !self.snapshot.referenced[axis]).then(|| {
+            let name = AXIS_NAMES[axis];
+            format!("{name} has no machine position (every E-stop clears it): set machine {name} first, then jog it.")
+        })
+    }
+
     /// An axis without a home switch: declaring its machine position
     /// references it. The driver references an axis with a switch only by
     /// homing, and a declaration takes that away.
@@ -3347,6 +3424,47 @@ soft_max = 0.0
     }
 
     #[test]
+    fn a_state_file_of_x_y_and_z_is_padded_to_six_axes_and_any_other_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.toml");
+        std::fs::write(
+            &old,
+            "wcs = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0, 7.0, 8.0, 9.0]]\nactive_wcs = 1\nlast_position = [4.0, 5.0, 6.0]\n",
+        )
+        .unwrap();
+        pad_state(&old);
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&old).unwrap().parse().unwrap();
+        let floats = |v: &toml_edit::Item| -> Vec<f64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_float().unwrap())
+                .collect()
+        };
+        let wcs = doc["wcs"].as_array().unwrap();
+        let system = |i: usize| -> Vec<f64> {
+            let a = wcs.get(i).unwrap().as_array().unwrap();
+            a.iter().map(|x| x.as_float().unwrap()).collect()
+        };
+        assert_eq!(system(0), [1., 2., 3., 0., 0., 0.]);
+        assert_eq!(system(1), [4., 5., 6., 7., 8., 9.]);
+        assert_eq!(floats(&doc["last_position"]), [4., 5., 6., 0., 0., 0.]);
+        assert_eq!(doc["active_wcs"].as_integer(), Some(1));
+        // A file of six axes, one that is not TOML, and none, stay as they are.
+        for text in [
+            "wcs = [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]\nactive_wcs = 0\n",
+            "not = [toml",
+        ] {
+            std::fs::write(&old, text).unwrap();
+            pad_state(&old);
+            assert_eq!(std::fs::read_to_string(&old).unwrap(), text);
+        }
+        let none = dir.path().join("none.toml");
+        pad_state(&none);
+        assert!(!none.exists());
+    }
+
+    #[test]
     fn a_profile_that_is_missing_is_refused_not_kept() {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("gone.toml");
@@ -3488,8 +3606,8 @@ soft_max = 0.0
         until(&mut c, 3.0, "Idle after Reset", |s| {
             s.state == Some(State::Idle)
         });
+        // Set machine zero here sets A with X, Y and Z (LIO-185).
         c.act(Action::MachineZero(None));
-        c.act(Action::MachineZero(Some(3)));
         until(&mut c, 3.0, "X, Y, Z and A set", |s| {
             s.state == Some(State::Idle) && s.referenced[..4].iter().all(|r| *r)
         });

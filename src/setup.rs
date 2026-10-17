@@ -846,7 +846,10 @@ fn calibration(c: &Connection) -> Element<'_, Message> {
         .spacing(8)
         .align_y(Alignment::Center)
     };
-    let go = (c.idle() && c.cal_distance().is_some()).then_some(Message::Machine(Action::CalMove));
+    // A moves only once it has a machine position (`Connection::jog_blocked`).
+    let blocked = c.jog_blocked(axis);
+    let go = (c.idle() && c.cal_distance().is_some() && blocked.is_none())
+        .then_some(Message::Machine(Action::CalMove));
     let spu = c.config.axes.get(axis).map_or(1., |a| a.steps_per_unit);
     let mut travel = field(
         &format!("Commanded travel · {u}"),
@@ -864,6 +867,9 @@ fn calibration(c: &Connection) -> Element<'_, Message> {
         }
     }
     let mut body = column![axes, travel.push(act("Move", go, false))];
+    if let Some(why) = blocked {
+        body = body.push(muted(why));
+    }
     if let Some(pulses) = c.cal_pulses() {
         body = body.push(muted(format!(
             "{pulses} step pulses since the move began: {:.3} {u} at the profile's {} steps per {per}.",
