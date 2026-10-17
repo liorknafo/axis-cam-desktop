@@ -73,14 +73,22 @@ impl Draft {
         }
         let original =
             std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+        Self::from_text(m.id.clone(), path.into(), original)
+    }
+
+    /// A profile given as text, which is `path`'s content.
+    pub fn from_text(machine_id: String, path: PathBuf, original: String) -> Result<Self, String> {
         // toml_edit writes LF, so a CRLF file is read as LF and written back as CRLF.
         let crlf = original.contains("\r\n");
         let doc: DocumentMut = original.replace("\r\n", "\n").parse().map_err(|e| {
-            format!("{path} is not valid TOML, so it cannot be edited here; fix it in a text editor: {e}")
+            format!(
+                "{} is not valid TOML, so it cannot be edited here; fix it in a text editor: {e}",
+                path.display()
+            )
         })?;
         let mut d = Draft {
-            machine_id: m.id.clone(),
-            path: path.into(),
+            machine_id,
+            path,
             original,
             shown: doc.to_string(),
             crlf,
@@ -91,6 +99,11 @@ impl Draft {
         };
         d.check();
         Ok(d)
+    }
+
+    /// The document as it is now.
+    pub fn to_text(&self) -> String {
+        self.doc.to_string()
     }
 
     fn check(&mut self) {
@@ -209,13 +222,30 @@ impl Draft {
                 return;
             }
         }
-        let mut axis = A_AXIS.parse::<DocumentMut>().expect("A_AXIS is TOML");
+        let mut axis = crate::control::ROTARY_AXIS
+            .parse::<DocumentMut>()
+            .expect("ROTARY_AXIS is TOML");
         let Some(Item::Table(a)) = axis
             .remove("axes")
             .and_then(|mut axes| axes.as_table_mut()?.remove("a"))
         else {
             return;
         };
+        let mut a = a;
+        // After the last axis in the file, not first or last of the document.
+        let after = self
+            .item("axes")
+            .and_then(Item::as_table)
+            .into_iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|(_, t)| t.as_table()?.position())
+            .max();
+        if let Some(after) = after {
+            shift_tables(self.doc.as_table_mut(), after);
+            a.set_position(Some(after + 1));
+        } else {
+            a.set_position(None);
+        }
         let Some(axes) = self.table("axes") else {
             self.note = Some("axes is not a table, so the A axis cannot be added.".into());
             return;
@@ -374,25 +404,20 @@ impl Draft {
 }
 
 const AXES: [&str; 6] = ["x", "y", "z", "a", "b", "c"];
-/// The A axis' step and direction pins: the free pair on this UC100.
+/// The A axis' step and direction pins: the free pair on this UC100
+/// (`control::ROTARY_AXIS` is the section added).
 const A_PINS: [u8; 2] = [8, 9];
-/// The section the form adds for A. The numbers are placeholders that run a
-/// motor safely, not a calibration: the commissioning checks stay open.
-const A_AXIS: &str = "[axes.a]
-# ROTARY axis, in DEGREES, added from the Setup form. Its pins and its steps
-# per degree are NOT verified: check them and calibrate before any A motion.
-# steps_per_unit = 200 x microsteps x gear ratio / 360, for example 35.556 for
-# 16 microsteps and a 4:1 unit, 53.333 for 6:1. Calibrate it on the machine.
-steps_per_unit = 8.889
-# Degrees per minute (the form shows degrees per second) and degrees/s^2.
-max_velocity = 3600
-acceleration = 100
-step = { pin = 8 }
-dir = { pin = 9 }
-reversed = false
-# A has no switches: declare its position with Set machine. Soft limits are
-# optional, but with them no program starts until A is declared.
-";
+/// Moves every table placed after `after` one place down, to make room.
+fn shift_tables(t: &mut Table, after: isize) {
+    for (_, item) in t.iter_mut() {
+        if let Item::Table(sub) = item {
+            if let Some(p) = sub.position().filter(|p| *p > after) {
+                sub.set_position(Some(p + 1));
+            }
+            shift_tables(sub, after);
+        }
+    }
+}
 
 /// What the form's number is multiplied by to get the file's: the A axis'
 /// speed is shown in degrees per second and the driver reads degrees per minute.
@@ -1274,18 +1299,23 @@ order = \"X\"\n";
         d.edit(Edit::AddAxis("a".into()));
         let text = d.doc.to_string();
         // Every line of the file is still there, in order.
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| PROFILE.lines().any(|p| p == *l))
-            .collect();
-        assert_eq!(kept, PROFILE.lines().collect::<Vec<_>>());
+        let mut lines = text.lines();
+        for l in PROFILE.lines() {
+            assert!(lines.any(|t| t == l), "{l} is lost or moved: {text}");
+        }
+        // A sits after the last axis, before the homing section.
+        assert!(
+            text.find("[axes.x]") < text.find("[axes.a]")
+                && text.find("[axes.a]") < text.find("[homing]"),
+            "{text}"
+        );
         assert!(text.contains("[axes.a]"), "{text}");
         let cfg = d.checked.clone().unwrap();
         let a = cfg.axes.a.as_ref().unwrap();
         assert_eq!((a.step.pin, a.dir.pin), (8, 9));
-        assert!(a.soft_min.is_none() && a.soft_max.is_none());
+        assert_eq!((a.soft_min, a.soft_max), (Some(-180.), Some(180.)));
         assert_eq!(cfg.axes.x.as_ref().unwrap().steps_per_unit, 320.);
-        assert_eq!(a.max_velocity / 60., 60.);
+        assert_eq!((a.steps_per_unit, a.max_velocity / 60.), (44.444, 60.));
         // The form shows it in degrees per second.
         assert_eq!(d.number("axes.a.max_velocity"), "60");
         d.edit(Edit::Number("axes.a.max_velocity".into(), "30".into()));
@@ -1302,7 +1332,13 @@ order = \"X\"\n";
         );
         // Taking it out again gives back the file it was.
         d.edit(Edit::RemoveAxis("a".into()));
-        assert!(!d.doc.to_string().contains("[axes.a]"));
+        // What is left of it is the commissioning section the gate needs.
+        assert_eq!(
+            d.doc.to_string(),
+            format!(
+                "{PROFILE}\n[commissioning]\nrequired = true\npinout_verified = false\nsteps_per_unit_verified = false\n"
+            )
+        );
         assert!(d.checked.as_ref().unwrap().axes.a.is_none());
     }
 
@@ -1475,5 +1511,95 @@ order = \"X\"\n";
         // The controller drives them, so the High/Low test leaves them alone.
         assert!(cfg.firmware_output_pin(8) && cfg.firmware_output_pin(9));
         assert!(!before.firmware_output_pin(8));
+    }
+
+    #[test]
+    fn the_rotary_machines_profile_shows_a_in_degrees_and_its_assumed_values_are_not_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = crate::control::rotary_machine(dir.path()).unwrap();
+        let mut d = Draft::open(&m).unwrap();
+        let cfg = d.checked.clone().unwrap();
+        assert!(cfg.axes.a.is_some() && cfg.axes.x.is_some());
+        // X, Y, Z keep their evidence, A's pins and steps/deg are not checked.
+        assert!(cfg.commissioning.estop_verified && cfg.commissioning.drive_enable_verified);
+        assert!(!cfg.commissioning.pinout_verified && !cfg.commissioning.steps_per_unit_verified);
+        let why = cfg.commissioning_blocker().unwrap();
+        assert!(
+            why.contains("pins and polarity") && why.contains("steps per unit"),
+            "{why}"
+        );
+        assert_eq!(d.number("axes.a.steps_per_unit"), "44.444");
+        assert_eq!(d.number("axes.a.max_velocity"), "60");
+        assert_eq!(d.number("axes.a.acceleration"), "360");
+        assert_eq!(
+            (d.number("axes.a.soft_min"), d.number("axes.a.soft_max")),
+            ("-180".into(), "180".into())
+        );
+        // The form's own gate stays shut until both are ticked.
+        d.edit(Edit::Flag("commissioning.pinout_verified".into(), true));
+        assert!(
+            d.checked
+                .as_ref()
+                .unwrap()
+                .commissioning_blocker()
+                .is_some()
+        );
+        d.edit(Edit::Flag(
+            "commissioning.steps_per_unit_verified".into(),
+            true,
+        ));
+        assert!(
+            d.checked
+                .as_ref()
+                .unwrap()
+                .commissioning_blocker()
+                .is_none()
+        );
+        // Taking A out leaves the owner's XYZ profile text.
+        d.edit(Edit::RemoveAxis("a".into()));
+        assert!(d.checked.as_ref().unwrap().axes.a.is_none());
+        assert!(!d.to_text().contains("[axes.a]"));
+        assert_eq!(
+            d.checked
+                .as_ref()
+                .unwrap()
+                .axes
+                .x
+                .as_ref()
+                .unwrap()
+                .steps_per_unit,
+            320.
+        );
+        assert!(d.to_text().contains("# MEASURED 2026-10-10: 32000 pulses"));
+    }
+
+    #[test]
+    fn a_rotary_profile_copy_written_before_the_gate_is_replaced_but_an_edited_one_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jy5800-rotary.toml");
+        let old = format!(
+            "{}{}",
+            include_str!("../assets/jy5800.toml"),
+            crate::control::ROTARY_AXIS
+        );
+        std::fs::write(&path, &old).unwrap();
+        assert!(
+            MachineConfig::from_toml(&old)
+                .unwrap()
+                .commissioning_blocker()
+                .is_none()
+        );
+        crate::control::rotary_machine(dir.path()).unwrap();
+        let now = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            MachineConfig::from_toml(&now)
+                .unwrap()
+                .commissioning_blocker()
+                .is_some()
+        );
+        let edited = old.replace("44.444", "35.556");
+        std::fs::write(&path, &edited).unwrap();
+        crate::control::rotary_machine(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 }

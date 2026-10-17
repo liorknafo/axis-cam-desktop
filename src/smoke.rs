@@ -6349,6 +6349,63 @@ flood = { pin = 8 }
     }
 
     #[test]
+    fn the_rotary_profile_refuses_reset_until_a_is_checked_and_then_calibrates_a_in_degrees() {
+        use crate::control::Action;
+        use crate::setup::{Edit, Msg};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &crate::control::rotary_profile());
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        // A's assumed pins and steps per degree are not verified: no Reset.
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Reset refused", |s| {
+            s.log
+                .iter()
+                .any(|l| l.starts_with("Cannot reset: machine setup is unverified"))
+        });
+        assert_eq!(conn(&a).snapshot.state, Some(State::EStop));
+        // Check them in the form and save: the machine reconnects.
+        let _ = a.update(Message::ControlSetup(true));
+        for flag in ["pinout_verified", "steps_per_unit_verified"] {
+            setup_edit(&mut a, Edit::Flag(format!("commissioning.{flag}"), true));
+        }
+        let _ = a.update(Message::Setup(Msg::Save));
+        tick_until(&mut a, 3.0, "E-stop after reconnecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        for action in [
+            Action::CalAxis(3),
+            Action::CalDistance("90".into()),
+            Action::CalMove,
+        ] {
+            let _ = a.update(Message::Machine(action));
+        }
+        let _ = a.view();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        tick_until(&mut a, 8.0, "A at 90", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[3] - 90.).abs() < 1e-3
+        });
+        // 90 degrees at the profile's 44.444 steps per degree.
+        assert_eq!(conn(&a).cal_pulses(), Some(4000));
+        let _ = a.update(Message::Machine(Action::CalMeasured("89".into())));
+        let v = conn(&a).calibrated().unwrap().unwrap();
+        assert!((v - 4000. / 89.).abs() < 1e-9, "{v}");
+        let _ = a.view();
+        let _ = a.update(Message::Setup(Msg::UseCalibration));
+        assert_eq!(draft(&a).number("axes.a.steps_per_unit"), "44.944");
+    }
+
+    #[test]
     fn saving_while_connected_reconnects_with_the_new_profile() {
         use crate::control::Action;
         use crate::setup::{Edit, Msg};

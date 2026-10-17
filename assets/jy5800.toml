@@ -5,11 +5,12 @@
 # No coolant, enable, or charge-pump output is guessed here.
 # Measured axis checks below permit Reset/motion; spindle direction, RPM,
 # hardware E-stop power cutoff and power/USB-loss behavior remain unverified.
-# A 4th, rotary A axis (degrees) is NOT in this profile: the rotary is not
-# wired yet. When it is, add it from Control > Setup > Add the A axis (pins 8
-# and 9); the form keeps these comments, unticks pinout_verified and
+# A 4th, rotary A axis (degrees) is not in this shipped profile: the rotary is
+# not wired yet. Add it from Control > Setup > Add the A axis (pins 8 and 9);
+# the form keeps these comments, unticks pinout_verified and
 # steps_per_unit_verified below, and Reset stays refused until A's pins are
-# checked and its steps per degree are calibrated there.
+# checked and its steps per degree are calibrated there. The "Jingyan CNC4030
+# + rotary" machine has its own copy made that way, with ASSUMED A values.
 
 [controller]
 serial = "CD9090D3"
