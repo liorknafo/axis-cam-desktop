@@ -550,6 +550,26 @@ Once the machine is Idle, the Control page has everything needed before a job:
   it with the others'. Cycle Start lists A among the axes without one. A
   state file from before A (X, Y and Z only) is padded with zeros so its
   offsets still load. Without `[axes.a]` the page is as before.
+- **Rotary A calibration.** On a machine with the rotary unit's geometry
+  (LIO-186), the **Rotary A** panel says whether the A centreline is
+  assumed, measured or stale. **Probe the centreline** touches a test bar
+  in the chuck (its diameter typed) on top, down beside it on both sides
+  and on top over the middle found, at A and A + 180°, so the means cancel
+  the bar's runout: Y is the middle, Z the top less the radius (with the
+  probe in the spindle). **Check the line to the tailstock** probes the bar
+  again near the tailstock and warns when the centreline runs more than
+  0.05 mm off X between the two. **Find A zero on a flat** touches a flat
+  at two points along Y, turns A by the slope until they are level and
+  zeroes A there. **Save the centreline** keeps it in the machine's rotary
+  geometry as measured, and warns when the largest part on it leaves less
+  than 5 mm to retract under the top of Z (the default centreline does:
+  a Ø80 part reaches Z 0). Every move down beside the bar is a probe move,
+  A turns only in a move of its own with the tip lifted 5 mm over the
+  bar's highest point and the probe clear, and nothing starts before A has
+  a machine position. An E-stop (once Y or Z had one) or **Rotary unit
+  remounted** marks a measured centreline stale. On the simulator a test
+  bar of the typed diameter sits on an A axis a little off the assumed
+  one, tilted, running out and with a flat (driver `SimBars`).
 - **Work zero.** Under Position and Jog, across the page, a line per axis
   as on a milling machine's DRO: the work position, **Zero X**, **1/2** (half) and a
   value field with **Set X**, all in the active coordinate system. **1/2**
