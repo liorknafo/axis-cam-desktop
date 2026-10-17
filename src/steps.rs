@@ -1,5 +1,7 @@
 //! The Steps page: a setup on the manual mill shown screen by screen
-//! (`guide`), as pictures and the large numbers its DRO should read.
+//! (`guide`), as pictures and the large numbers its DRO should read; a
+//! setup on the manual lathe as side views and dial pictures (`turning`).
+mod turning;
 use crate::{
     App, GuideAction, Message,
     guide::{Guide, Limits, Section, Step, Target},
@@ -55,6 +57,25 @@ pub struct Shown {
     pictures: Vec<Option<image::Handle>>,
     /// The stock in 3D as it starts, in the vise on its parallels.
     held: Option<image::Handle>,
+    /// On the lathe: what its side views draw.
+    side: Option<turning::Side>,
+}
+impl Shown {
+    /// The same pictures with the guide worked out again for `doc`
+    /// (`guide::again`): after a measurement or the dial check's answer.
+    pub fn again(&self, doc: &Document, mesh: &Mesh) -> Result<Shown, String> {
+        Ok(Shown {
+            guide: crate::guide::again(doc, mesh, &self.guide)?,
+            part: self.part.clone(),
+            boxes: self.boxes.clone(),
+            jaws: self.jaws.clone(),
+            vise: self.vise.clone(),
+            parallels: self.parallels.clone(),
+            pictures: self.pictures.clone(),
+            held: self.held.clone(),
+            side: self.side.clone(),
+        })
+    }
 }
 /// The normal of a planar polygon (Newell's), not normalised.
 fn normal(p: &[[f32; 3]]) -> [f32; 3] {
@@ -173,6 +194,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         let tall = solid(&[&vise[..], &parallels].concat());
         picture(&guide.before, boxes[0], &tall)
     };
+    let side = crate::lathe::is_lathe(&setup.machine).then(|| turning::side(doc, mesh, &guide));
     Ok(Shown {
         guide,
         part,
@@ -182,6 +204,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         parallels,
         pictures,
         held,
+        side,
     })
 }
 
@@ -1283,11 +1306,16 @@ fn card(_: &Theme) -> container::Style {
         ..Default::default()
     }
 }
-/// The left column: the setups on the manual mill, and the way to the CNC.
+/// The left column: the setups on the hand machines (the manual mill, the
+/// lathe), and the way to the CNC.
 fn setups(app: &App) -> Element<'_, Message> {
-    let mut c = column![bold("Manual mill", 16), muted("Setups")].spacing(8);
+    let title = match app.doc.active_setup() {
+        Some(s) if crate::lathe::is_lathe(&s.machine) => "Manual lathe",
+        _ => "Manual mill",
+    };
+    let mut c = column![bold(title, 16), muted("Setups")].spacing(8);
     for (si, s) in app.doc.setups.iter().enumerate() {
-        if !manual::is_manual(&s.machine) {
+        if !manual::is_hand(&s.machine) {
             continue;
         }
         let on = s.id == app.doc.active;
@@ -1345,18 +1373,25 @@ fn section_of(g: &Guide, at: usize) -> usize {
 }
 /// Where the place is in its section: "pass 2/4", "hole 1/4", "2/6".
 fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
+    use crate::guide::LatheStep as L;
     match &g.steps[at] {
-        Step::Pass { index, of, .. } => format!("pass {index}/{of}"),
+        Step::Pass { index, of, .. }
+        | Step::Lathe(L::Pass { index, of, .. } | L::ThreadPass { index, of, .. }) => {
+            format!("pass {index}/{of}")
+        }
         Step::Holes { holes, .. } => format!("hole {}/{}", item + 1, holes.len()),
         _ if s.steps.len() > 1 => format!("{}/{}", at - s.steps.start + 1, s.steps.len()),
         _ => String::new(),
     }
 }
 fn section_name(app: &App, g: &Guide, s: &Section) -> String {
+    let lathe = (app.doc.setups.get(g.setup)).is_some_and(|s| crate::lathe::is_lathe(&s.machine));
     match (s.op, &g.steps[s.steps.start]) {
         (None, Step::HandOver { next: Some(n) }) => {
             format!("→ {}", app.doc.setups.get(*n).map_or("", |s| s.name()))
         }
+        // On the lathe every operation turns: "Outside", not "Turn · Outside".
+        (Some(_), _) if lathe => (s.name.strip_prefix("Turn · ").unwrap_or(&s.name)).to_string(),
         _ => s.name.clone(),
     }
 }
@@ -1429,7 +1464,10 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     .spacing(10)
     .align_y(Alignment::Center);
     let mut tags = vec![];
-    if let Some(op) = s.op
+    let lathe = crate::lathe::is_lathe(&setup.machine);
+    if lathe && let Some(op) = s.op {
+        tags.extend(turning::header(&page, op, s));
+    } else if let Some(op) = s.op
         && let Some(o) = setup.operations.get(op)
     {
         let d = num(
@@ -1485,7 +1523,9 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
 fn next_label(g: &Guide, at: usize, item: usize) -> String {
     let s = &g.sections[section_of(g, at)];
     match &g.steps[at] {
-        Step::Pass { .. } => "Pass done ▶".into(),
+        Step::Pass { .. }
+        | Step::Lathe(crate::guide::LatheStep::Pass { .. })
+        | Step::Lathe(crate::guide::LatheStep::ThreadPass { .. }) => "Pass done ▶".into(),
         Step::Holes { holes, .. } if item + 1 < holes.len() => "Hole done ▶".into(),
         _ if s.op.is_some() && at + 1 == s.steps.end => "Section done ▶".into(),
         _ => "Next ▶".into(),
@@ -1992,12 +2032,10 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 right,
             )
         }
-        Step::Lathe(step) => (
-            step.title().into(),
-            "the dials",
-            space().into(),
-            column![chips(step.lines().into_iter().map(chip).collect())],
-        ),
+        Step::Lathe(step) => turning::screen(p, step),
+        Step::HandOver { next: to } if p.shown.side.is_some() => {
+            return turning::hand_over(p, *to);
+        }
         Step::HandOver { next: to } => {
             let last = p.shown.pictures.len() - 1;
             let mut c = vec![chip(format!("manual ~{} min", g.minutes.ceil()))];
@@ -2788,5 +2826,405 @@ pub(crate) mod tests {
         render(&a, (1280, 800), &dir.join("13-pass-plunge.png"));
         at(&mut a, first + 1, 2);
         render(&a, (1280, 800), &dir.join("14-pass-across.png"));
+    }
+
+    // ---- The lathe ----
+
+    /// The lathe guide's sample job (`guide::tests::sample`: a sleeve in a
+    /// Ø50.2 bar, faced, turned to Ø40, drilled, grooved, threaded and
+    /// parted off) with its cross dial reading `reads` ("" = not known),
+    /// `edit` made to it, on MACHINE with its guide built.
+    pub(crate) fn lathe_app(reads: &str, edit: impl FnOnce(&mut Document)) -> App {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.test_dir = Some(dir);
+        let (mut doc, mesh) = crate::guide::tests::sample(reads);
+        doc.file = Some(crate::model::ModelFile {
+            name: "sleeve.stl".into(),
+            path: std::path::PathBuf::from("sleeve.stl"),
+            format: "stl".into(),
+            bytes: 1,
+        });
+        doc.active = doc.setups[0].id.clone();
+        edit(&mut doc);
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::Page(Page::Control));
+        build(&mut a);
+        a
+    }
+    use crate::guide::LatheStep as L;
+    /// The index of the `n`th step (from 0) that `pick` is true of.
+    fn nth(a: &App, n: usize, pick: impl Fn(&L) -> bool) -> usize {
+        (guide(a).steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Lathe(l) if pick(l)))
+            .nth(n)
+            .unwrap_or_else(|| panic!("no step {n} in {:?}", guide(a).steps))
+            .0
+    }
+    fn shows(a: &App, wants: &[&str]) {
+        let t = texts(a);
+        for want in wants {
+            assert!(t.iter().any(|s| s == want), "{want:?} in {t:?}");
+        }
+    }
+    fn measure_key(a: &App) -> String {
+        let s = &a.doc.setups[0];
+        crate::guide::measure_key(&s.id, &s.operations[1].id)
+    }
+    #[test]
+    fn each_lathe_screen_shows_its_dials_and_short_labels() {
+        let mut a = lathe_app("Diameter", |_| {});
+        assert!(a.steps_page() && a.control.is_none());
+        let shown = a.guide_at().unwrap().0;
+        assert!(shown.side.is_some());
+        // Hold, Zero, the Face.
+        shows(
+            &a,
+            &[
+                "Manual lathe",
+                "Hold",
+                "3-jaw chuck",
+                "Ø50.20 × 100 bar",
+                "stick out",
+            ],
+        );
+        let Step::Lathe(L::Hold { stickout, grip, .. }) = guide(&a).steps[0] else {
+            panic!()
+        };
+        shows(&a, &[&mm(stickout), "in the jaws", &mm(grip)]);
+        send(&mut a, GuideAction::Next);
+        shows(
+            &a,
+            &[
+                "Zero",
+                "touch the end",
+                "zero the carriage dial",
+                "zero the cross dial",
+                "Ø",
+            ],
+        );
+        let face = nth(&a, 0, |l| matches!(l, L::Face { .. }));
+        send(&mut a, GuideAction::Go(face));
+        shows(
+            &a,
+            &[
+                "Face",
+                "top slide",
+                "in 1.00 from the touch",
+                "lock the carriage",
+                "on the new end",
+                "Section done ▶",
+            ],
+        );
+        // The Outside: the touch on the bar, then a pass with two dials.
+        send(&mut a, GuideAction::Go(face + 1));
+        shows(&a, &["Touch", "touch Ø50.20", "zero the cross dial"]);
+        let third = nth(&a, 2, |l| matches!(l, L::Pass { .. }));
+        send(&mut a, GuideAction::Go(third));
+        shows(
+            &a,
+            &[
+                "Pass 3 of 6",
+                "pass 3/6",
+                "power feed 0.10",
+                "cross slide · 1 turn +",
+                "in to 6.00 (Ø44.20)",
+                "carriage · 3 turns +",
+                "stop at 3 t + 4.0",
+                "6.00",
+                "1 turn + 2.00 on the dial",
+                "3 t + 4.0",
+                "◀ feed off at 3 t + 3.0",
+                "last 1 mm by hand",
+                "Pass done ▶",
+            ],
+        );
+        // The tiles are the passes' diameters, the measure before the last.
+        let t = texts(&a);
+        let tiles: Vec<&str> = [
+            "48.20", "46.20", "44.20", "42.20", "40.20", "measure", "40.00",
+        ]
+        .into_iter()
+        .collect();
+        let at: Vec<usize> = (tiles.iter())
+            .map(|w| {
+                t.iter()
+                    .rposition(|s| s == w)
+                    .unwrap_or_else(|| panic!("{w} in {t:?}"))
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?} {t:?}");
+        // The drill on the quill, the groove, a thread pass, the part off.
+        let drill = nth(&a, 0, |l| matches!(l, L::TailDrill { .. }));
+        send(&mut a, GuideAction::Go(drill));
+        shows(
+            &a,
+            &[
+                "Drill",
+                "centre drill first",
+                "quill · 13 turns +",
+                "30 deep + 3.00 for the point",
+                "lock",
+                "33.00",
+                "13 turns + 0.50 on the dial",
+                "peck every 10",
+                "tailstock",
+            ],
+        );
+        let groove = nth(&a, 0, |l| {
+            matches!(
+                l,
+                L::Plunge {
+                    part_off: false,
+                    ..
+                }
+            )
+        });
+        send(&mut a, GuideAction::Go(groove));
+        shows(
+            &a,
+            &[
+                "Groove",
+                "carriage · 2 turns +",
+                "blade's left side at 2 t + 5.0",
+                "cross slide · 1 turn +",
+                "in 4.00 → Ø36.00",
+                "from the touch on Ø40.00",
+                "lock the carriage",
+            ],
+        );
+        let thread = nth(&a, 2, |l| matches!(l, L::ThreadPass { .. }));
+        send(&mut a, GuideAction::Go(thread - 3));
+        shows(&a, &["Touch", "top slide", "29.5°", "zero it on the touch"]);
+        send(&mut a, GuideAction::Go(thread));
+        shows(
+            &a,
+            &[
+                "Thread pass 3 of 8",
+                "top slide 29.5°",
+                "gearbox 1.5",
+                "pass 3: in to 0.64",
+                "0.64",
+                "half-nuts",
+                "close",
+                "back to its zero",
+                "8 passes",
+            ],
+        );
+        let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
+        send(&mut a, GuideAction::Go(part));
+        shows(
+            &a,
+            &[
+                "Part off",
+                "catch the part",
+                "centre",
+                "in until the part drops",
+            ],
+        );
+        send(&mut a, GuideAction::Next);
+        let minutes = format!("lathe ~{} min", guide(&a).minutes.ceil());
+        shows(
+            &a,
+            &[
+                "Hand over",
+                "the part leaves the lathe",
+                "the last setup",
+                &minutes,
+            ],
+        );
+        // No dial check while the dial is known.
+        assert!(!has(&a, "Check the cross-slide dial"));
+    }
+    #[test]
+    fn until_the_dial_check_is_answered_the_cross_slide_shows_no_number() {
+        let mut a = lathe_app("", |_| {});
+        shows(
+            &a,
+            &[
+                "Check the cross-slide dial",
+                "TURN A LIGHT SKIN, THEN:",
+                "10 div",
+                "Ø ?",
+                "Ø went down by 0.40",
+                "Ø went down by 0.80",
+                "by 1× → diameter",
+                "by 2× → radius",
+            ],
+        );
+        let third = nth(&a, 2, |l| matches!(l, L::Pass { .. }));
+        send(&mut a, GuideAction::Go(third));
+        let t = texts(&a);
+        assert!(t.iter().any(|s| s == lathe::CHECK_THE_DIAL), "{t:?}");
+        assert!(
+            !t.iter()
+                .any(|s| s.contains("6.00") || s.contains("1 turn +")),
+            "{t:?}"
+        );
+        // The carriage is known all the same.
+        shows(&a, &["stop at 3 t + 4.0"]);
+    }
+    use crate::lathe;
+    #[test]
+    fn the_dial_check_answer_is_saved_to_the_lathe_and_its_setups_and_the_numbers_show() {
+        for (reads, key, reading) in [
+            (
+                lathe::Reads::Diameter,
+                "Diameter",
+                "1 turn + 2.00 on the dial",
+            ),
+            (lathe::Reads::Radius, "Radius", "3.00 on the dial"),
+        ] {
+            let mut a = lathe_app("", |doc| {
+                doc.add_lathe_setup().unwrap();
+                assert!(doc.setups.len() == 2);
+            });
+            let id = a.doc.setups[0].machine.id.clone();
+            assert_eq!(a.doc.setups[1].machine.id, id);
+            let edits = a.project_dirty;
+            send(&mut a, GuideAction::CrossReads(reads));
+            let library = a.doc.machines.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(get(&library.p, "cross_reads"), key);
+            for s in &a.doc.setups {
+                assert_eq!(get(&s.machine.p, "cross_reads"), key);
+            }
+            assert!(a.project_dirty && a.dirty, "{edits}");
+            // The guide is worked out again at once: no dial check, and the
+            // place is on the Hold.
+            let (shown, at) = a.guide_at().expect("the guide, built again");
+            assert!(
+                !shown
+                    .guide
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, Step::Lathe(L::DialCheck { .. })))
+            );
+            assert_eq!(at, 0);
+            assert!(has(&a, "Hold"));
+            let third = nth(&a, 2, |l| matches!(l, L::Pass { .. }));
+            send(&mut a, GuideAction::Go(third));
+            shows(&a, &[reading]);
+            assert!(!has(&a, lathe::CHECK_THE_DIAL));
+        }
+    }
+    #[test]
+    fn the_measured_diameter_sets_the_finish_pass_reading() {
+        let mut a = lathe_app("Diameter", |_| {});
+        let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
+        send(&mut a, GuideAction::Go(measure));
+        shows(
+            &a,
+            &[
+                "Measure",
+                "MEASURE THE Ø",
+                "Ø40.20",
+                "THEN THE LAST PASS",
+                "in to 10.20 → Ø40.00",
+                "cross slide · 2 turns +",
+            ],
+        );
+        let key = measure_key(&a);
+        let (edits, at) = (a.project_dirty, place(&a));
+        send(&mut a, GuideAction::Typed(key.clone(), "40.32".into()));
+        assert_eq!(a.guide_typed, Some((key.clone(), "40.32".into())));
+        assert!(has(&a, "Keep ▶"));
+        // Not a number: nothing is kept.
+        send(&mut a, GuideAction::Measured(key.clone(), f32::NAN));
+        assert!(a.doc.measured.is_empty());
+        send(&mut a, GuideAction::Measured(key.clone(), -1.));
+        assert!(a.doc.measured.is_empty());
+        send(&mut a, GuideAction::Measured(key.clone(), 40.32));
+        assert_eq!(a.doc.measured.get(&key), Some(&40.32));
+        // A measurement, as the place: saved, no edit of the job.
+        assert!(a.dirty && a.undo.is_none());
+        assert_eq!(a.project_dirty, edits);
+        assert!(a.guide_typed.is_none());
+        assert_eq!(place(&a), at);
+        shows(
+            &a,
+            &["in to 10.32 → Ø40.00", "Measured Ø40.32 kept.", "✓ kept"],
+        );
+        send(&mut a, GuideAction::Next);
+        shows(
+            &a,
+            &[
+                "Pass 6 of 6",
+                "in to 10.32 (Ø40.00)",
+                "2 turns + 2.32 on the dial",
+                "from the Ø40.32 measured",
+            ],
+        );
+        // The passes before it do not change.
+        let fifth = nth(&a, 4, |l| matches!(l, L::Pass { .. }));
+        send(&mut a, GuideAction::Go(fifth));
+        shows(&a, &["in to 10.00 (Ø40.20)"]);
+        // The key of the guide changed with it: a guide built for the job
+        // as it was is not shown.
+        let built = a.guide.clone();
+        a.doc.measured.insert(key.clone(), 40.4);
+        assert!(a.current_guide().is_none());
+        a.doc.measured.insert(key, 40.32);
+        a.guide = built;
+        assert!(a.current_guide().is_some());
+    }
+    /// Every lathe screen at 1280 × 800, one PNG per kind, in
+    /// /tmp/lathe-steps.
+    #[test]
+    #[ignore]
+    fn render_the_lathe_steps() {
+        let dir = std::path::Path::new("/tmp/lathe-steps");
+        std::fs::create_dir_all(dir).unwrap();
+        let shot = |a: &mut App, name: &str, step: usize, item: usize| {
+            at(a, step, item);
+            render(a, (1280, 800), &dir.join(format!("{name}.png")));
+        };
+        let mut a = lathe_app("", |_| {});
+        shot(&mut a, "01-dial-check", 0, 1);
+        let third = nth(&a, 2, |l| matches!(l, L::Pass { .. }));
+        shot(&mut a, "02-pass-check-the-dial-first", third, 1);
+        let mut a = lathe_app("Diameter", |_| {});
+        shot(&mut a, "03-hold", 0, 0);
+        shot(&mut a, "04-zero", 1, 1);
+        let face = nth(&a, 0, |l| matches!(l, L::Face { .. }));
+        shot(&mut a, "05-face", face, 0);
+        shot(&mut a, "06-touch", face + 1, 0);
+        let first = nth(&a, 0, |l| matches!(l, L::Pass { .. }));
+        shot(&mut a, "07-pass-1", first, 0);
+        let third = nth(&a, 2, |l| matches!(l, L::Pass { .. }));
+        shot(&mut a, "08-pass-3", third, 1);
+        let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
+        shot(&mut a, "09-measure", measure, 0);
+        let key = measure_key(&a);
+        send(&mut a, GuideAction::Measured(key, 40.32));
+        shot(&mut a, "10-measured", measure, 0);
+        shot(&mut a, "11-finish-pass-measured", measure + 1, 1);
+        let drill = nth(&a, 0, |l| matches!(l, L::TailDrill { .. }));
+        shot(&mut a, "12-tail-drill", drill, 1);
+        let groove = nth(&a, 0, |l| {
+            matches!(
+                l,
+                L::Plunge {
+                    part_off: false,
+                    ..
+                }
+            )
+        });
+        shot(&mut a, "13-groove", groove, 0);
+        let thread = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
+        shot(&mut a, "14-thread-touch", thread - 1, 0);
+        shot(&mut a, "15-thread-pass-3", thread + 2, 1);
+        let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
+        shot(&mut a, "16-part-off", part, 0);
+        shot(&mut a, "17-hand-over", part + 1, 0);
+        // Chamfers: a shoulder one on the carriage, an end one.
+        let mut a = lathe_app("Diameter", |doc| {
+            doc.setups[0].operations.truncate(2);
+            crate::turn::tests::add(doc, "Chamfer", &[("edge", "Shoulder"), ("size", "1")]);
+            crate::turn::tests::add(doc, "Chamfer", &[("edge", "End outside"), ("size", "1")]);
+        });
+        let chamfer = nth(&a, 0, |l| matches!(l, L::Chamfer { .. }));
+        shot(&mut a, "18-chamfer-shoulder", chamfer, 0);
+        shot(&mut a, "19-chamfer-end", chamfer + 1, 0);
     }
 }

@@ -406,196 +406,6 @@ impl LatheStep {
             LatheStep::ThreadPass { .. } => "Thread pass",
         }
     }
-    /// The step's numbers as short labels: what the Steps page shows until
-    /// it draws the dials.
-    pub fn lines(&self) -> Vec<String> {
-        let ø = |d: f32| format!("Ø{d:.2}");
-        let zero_on = |c: &Contact| {
-            let m = c.measured.map_or(String::new(), |_| " measured".into());
-            let side = if c.inside { "inside " } else { "" };
-            format!("cross slide 0 · touch the {side}{}{m}", ø(c.diameter()))
-        };
-        match self {
-            LatheStep::DialCheck {
-                divisions,
-                reading,
-                length,
-            } => vec![
-                format!("cross slide in {divisions} div ({reading:.2}), cut {length} long"),
-                format!(
-                    "Ø down {reading:.2} → diameter · {:.2} → radius",
-                    2. * reading
-                ),
-            ],
-            LatheStep::Hold {
-                holder: _,
-                jaws,
-                grip,
-                stickout,
-                diameter,
-                length,
-                reach,
-            } => vec![
-                format!("{jaws}-jaw chuck · {} × {length} bar", ø(*diameter)),
-                format!("stick out {stickout} · {grip} in the jaws · cuts to {reach}"),
-            ],
-            LatheStep::Zero {
-                tool: _,
-                key: _,
-                planned,
-                measured,
-            } => vec![
-                "carriage 0 · touch the end".into(),
-                match measured {
-                    Some(m) => format!("measured {}", ø(*m)),
-                    None => format!("measure · about {}", ø(*planned)),
-                },
-                "cross slide 0 · touch the Ø".into(),
-            ],
-            LatheStep::Touch {
-                op: _,
-                tool: _,
-                rpm,
-                carriage,
-                end,
-                cross,
-                top,
-            } => {
-                let mut l = vec![format!("{rpm} rpm")];
-                if let Some(a) = top {
-                    l.push(format!("top slide {a}° · 0 on the touch"));
-                }
-                if *carriage {
-                    l.push(format!("carriage 0 · touch the end (Z {end:.2})"));
-                }
-                l.extend(cross.as_ref().map(zero_on));
-                l
-            }
-            LatheStep::Face {
-                op: _,
-                tool: _,
-                rpm,
-                face_off,
-                to_diameter,
-                top,
-                new_end,
-            } => vec![
-                format!("{rpm} rpm · lock the carriage"),
-                format!(
-                    "top slide {} ({face_off:.2} off) to {}",
-                    top.text(),
-                    ø(*to_diameter)
-                ),
-                format!("carriage 0 · on the new end (Z {new_end:.2})"),
-            ],
-            LatheStep::Pass {
-                op: _,
-                index,
-                of,
-                bore,
-                diameter,
-                rpm,
-                feed,
-                cross,
-                carriage,
-                feed_off,
-            } => {
-                let way = if *bore { "out" } else { "in" };
-                let mut l = vec![
-                    format!(
-                        "pass {index}/{of} · {} · {rpm} rpm · feed {feed:.2}",
-                        ø(*diameter)
-                    ),
-                    format!("cross slide {way} {}", cross.text()),
-                ];
-                if let Some(off) = feed_off {
-                    l.push(format!("feed off at {} · last 1 mm by hand", off.text()));
-                }
-                l.push(format!("carriage stop {}", carriage.text()));
-                l
-            }
-            LatheStep::Measure {
-                op: _,
-                key: _,
-                expect,
-                target,
-                bore,
-                measured,
-            } => vec![
-                format!(
-                    "measure the {} · about {}",
-                    if *bore { "bore" } else { "Ø" },
-                    ø(*expect)
-                ),
-                match measured {
-                    Some(m) => format!("measured {} → {}", ø(*m), ø(*target)),
-                    None => format!("→ {}", ø(*target)),
-                },
-            ],
-            LatheStep::TailDrill {
-                op: _,
-                tool: _,
-                rpm,
-                diameter,
-                depth,
-                point,
-                peck,
-                quill,
-            } => vec![
-                format!("centre drill, then {} · {rpm} rpm", ø(*diameter)),
-                format!("quill {} ({depth:.2} + {point:.2})", quill.text()),
-                format!("peck every {peck:.2}"),
-            ],
-            LatheStep::Chamfer {
-                op: _,
-                tool: _,
-                rpm,
-                edge,
-                size,
-                top,
-                carriage,
-            } => {
-                let mut l = vec![format!("{edge} · {size:.2} × 45° · {rpm} rpm")];
-                l.extend(carriage.as_ref().map(|c| format!("carriage {}", c.text())));
-                l.push(format!("top slide {}", top.text()));
-                l
-            }
-            LatheStep::Plunge {
-                op: _,
-                tool: _,
-                rpm,
-                width,
-                part_off,
-                bottom,
-                cross,
-                carriages,
-            } => {
-                let mut l = vec![format!("{width:.2} wide · {rpm} rpm · lock the carriage")];
-                l.extend(carriages.iter().map(|c| format!("carriage {}", c.text())));
-                l.push(match (cross, part_off) {
-                    (Some(c), _) => format!("cross slide in {} ({})", c.text(), ø(*bottom)),
-                    (None, _) => "cross slide to the centre".into(),
-                });
-                l
-            }
-            LatheStep::ThreadPass {
-                op: _,
-                index,
-                of,
-                rpm,
-                pitch,
-                angle,
-                infeed,
-                top,
-                carriage,
-            } => vec![
-                format!("pass {index}/{of} · gearbox {pitch} · {rpm} rpm"),
-                "cross slide 0".into(),
-                format!("top slide ({angle}°) {} · {infeed:.3} in", top.text()),
-                format!("half-nuts closed to {}", carriage.text()),
-            ],
-        }
-    }
 }
 /// A stretch of the steps: "Set up", one per operation, "Hand over".
 #[derive(Debug, Clone, PartialEq)]
@@ -1488,6 +1298,23 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
         done: done_ops,
     })
 }
+/// The lathe `guide` worked out again for `doc` from its own simulation,
+/// which neither a measurement nor the dial check's answer changes: the
+/// cross-slide numbers and the measure steps as they are now, at once.
+pub fn again(doc: &Document, mesh: &Mesh, guide: &Guide) -> Result<Guide, String> {
+    let setup = doc.setups.get(guide.setup).ok_or("Choose a setup.")?;
+    if !lathe::is_lathe(&setup.machine) {
+        return build(doc, mesh, guide.setup);
+    }
+    let walked = Walked {
+        done: (guide.done.iter())
+            .map(|d| (d.op, d.plan.clone()))
+            .collect(),
+        afters: guide.done.iter().map(|d| d.after.clone()).collect(),
+        before: guide.before.clone(),
+    };
+    lathe_guide(doc, mesh, guide.setup, walked)
+}
 /// The step the guide was left at (`Document::guide`), within its steps.
 pub fn place(doc: &Document, guide: &Guide) -> usize {
     (doc.setups.get(guide.setup))
@@ -2212,7 +2039,7 @@ pub(crate) mod tests {
     /// dial reads `reads` ("" = not known yet). Face 1, Outside Ø40 to the
     /// shoulder at −65 (2 a pass, 0.2 finish), Drill Ø10 30 deep, Groove 3
     /// wide to Ø36 at −46, Thread M40 × 1.5 to −40, Part off at −62.
-    fn sample(reads: &str) -> (Document, Mesh) {
+    pub(crate) fn sample(reads: &str) -> (Document, Mesh) {
         let (mut doc, mesh) = lathe_job(50.2, 100., tube(5.5, 17.5, 0., 61.), -62.);
         doc.setups[0]
             .machine

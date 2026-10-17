@@ -364,7 +364,8 @@ pub enum Message {
     Guide(GuideAction),
     Noop,
 }
-/// What the Steps page of a setup on a manual mill does (`steps::view`).
+/// What the Steps page of a setup on a manual mill or lathe does
+/// (`steps::view`).
 #[derive(Debug, Clone)]
 pub enum GuideAction {
     /// The next step, or the next hole of a Holes step.
@@ -384,6 +385,14 @@ pub enum GuideAction {
     Beat(Instant),
     /// The guide of the job with this fingerprint (`App::guide_key`), built.
     Built(u64, Result<std::sync::Arc<steps::Shown>, String>),
+    /// The lathe's dial check answered: what its cross-slide dial reads,
+    /// saved to the machine in the library and in every setup on it.
+    CrossReads(lathe::Reads),
+    /// What is typed in a lathe step's measure box (its `guide::measure_key`).
+    Typed(String, String),
+    /// A diameter measured at a lathe step, mm, kept under its key in
+    /// `Document::measured`.
+    Measured(String, f32),
 }
 /// A plan that passed every check, with the stock it leaves for the 3D view.
 #[derive(Debug)]
@@ -753,6 +762,8 @@ pub struct App {
     /// The readout the Steps page is at within its step, or the hole of a
     /// Holes step.
     pub guide_item: usize,
+    /// What is typed in a lathe step's measure box: its key and the text.
+    pub guide_typed: Option<(String, String)>,
     /// When the step shown was opened, and the page's clock since
     /// (`GuideAction::Beat`): the handwheel's beat.
     pub guide_clock: (Instant, Instant),
@@ -1229,6 +1240,7 @@ impl App {
             guide: None,
             guide_job: None,
             guide_item: 0,
+            guide_typed: None,
             guide_clock: (Instant::now(), Instant::now()),
             ready: run::Ready::default(),
             ready_job: None,
@@ -2352,23 +2364,43 @@ impl App {
     }
     /// The fingerprint of the job as the step guide of the active setup is
     /// concerned: the stock it starts from and how it is held
-    /// (`holding_fingerprint`), and which setup it is. None when the active
-    /// setup is not on a manual mill, and when `left_key` is.
+    /// (`holding_fingerprint`), which setup it is and what was measured on
+    /// it. None when the active setup is not on a hand machine (the manual
+    /// mill, the lathe), and when `left_key` is.
     pub(crate) fn guide_key(&self) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let setup = self.doc.active_setup()?;
-        if !manual::is_manual(&setup.machine) {
+        if !manual::is_hand(&setup.machine) {
             return None;
         }
         let mut hasher = std::hash::DefaultHasher::new();
         (self.holding_key()?, &setup.id).hash(&mut hasher);
+        let mine = guide::measure_key(&setup.id, "");
+        for (k, v) in self
+            .doc
+            .measured
+            .iter()
+            .filter(|(k, _)| k.starts_with(&mine))
+        {
+            (k, v.to_bits()).hash(&mut hasher);
+        }
         Some(hasher.finish())
     }
-    /// MACHINE shows the Steps page: the active setup is on a manual mill.
+    /// MACHINE shows the Steps page: the active setup is on a hand machine.
     pub(crate) fn steps_page(&self) -> bool {
         self.page == Page::Control
             && !self.machine_setup
-            && (self.doc.active_setup()).is_some_and(|s| manual::is_manual(&s.machine))
+            && (self.doc.active_setup()).is_some_and(|s| manual::is_hand(&s.machine))
+    }
+    /// The guide shown worked out again at once from its own simulation
+    /// (`steps::Shown::again`), for the job as it is now: after a measurement
+    /// or the dial check's answer, which change no cut.
+    fn guide_again(&mut self, shown: &steps::Shown) {
+        let (Some(key), Some(mesh)) = (self.guide_key(), self.part_mesh()) else {
+            return;
+        };
+        let again = shown.again(&self.doc, mesh).map(std::sync::Arc::new);
+        self.guide = Some((key, again));
     }
     /// The guide as built, when that was for the job as it is now.
     pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
@@ -2482,6 +2514,64 @@ impl App {
                 }
             }
             GuideAction::Reached(i) => self.guide_item = i + 1,
+            GuideAction::Typed(key, text) => self.guide_typed = Some((key, text)),
+            GuideAction::Measured(key, value) => {
+                if !(value.is_finite() && value > 0. && value < 10_000.) {
+                    self.status = "Type the diameter the calipers read, in mm.".into();
+                    return Task::none();
+                }
+                let mine = (self.doc.setups.get(shown.guide.setup))
+                    .is_some_and(|s| key.starts_with(&guide::measure_key(&s.id, "")));
+                if !mine {
+                    return Task::none();
+                }
+                // A measurement, not a setting: kept with the project, as the
+                // place is, with no undo step.
+                if self.doc.measured.get(&key) != Some(&value) {
+                    self.doc.measured.insert(key.clone(), value);
+                    self.dirty = true;
+                    self.last_edit = Instant::now();
+                }
+                if self.guide_typed.as_ref().is_some_and(|(k, _)| *k == key) {
+                    self.guide_typed = None;
+                }
+                self.status = format!("Measured Ø{value:.2} kept.");
+                self.guide_again(&shown);
+            }
+            GuideAction::CrossReads(reads) => {
+                let Some(setup) = self.doc.setups.get(shown.guide.setup) else {
+                    return Task::none();
+                };
+                if !lathe::is_lathe(&setup.machine) {
+                    return Task::none();
+                }
+                let id = setup.machine.id.clone();
+                let set = |m: &mut Machine| {
+                    if m.id == id {
+                        m.p.insert("cross_reads".into(), reads.key().into());
+                    }
+                };
+                self.doc.machines.iter_mut().for_each(set);
+                for s in &mut self.doc.setups {
+                    set(&mut s.machine);
+                }
+                set(&mut self.machine_draft);
+                // An edit of the machine. While the CNC runs, nothing it
+                // runs depends on the lathe: its run is not marked stale.
+                if self.locked() {
+                    self.dirty = true;
+                    self.project_dirty = true;
+                    self.last_edit = Instant::now();
+                } else {
+                    self.touch();
+                }
+                self.status = format!(
+                    "The cross-slide dial reads the {}: saved to {}.",
+                    reads.key().to_lowercase(),
+                    self.doc.setups[shown.guide.setup].machine.name()
+                );
+                self.guide_again(&shown);
+            }
             _ => {}
         }
         Task::none()

@@ -1605,10 +1605,23 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "",
         ),
         Open(_) => (
-            "Open this setup in MACHINE: a setup on the manual mill shows its steps, with the DRO numbers to move to, whether or not the CNC is connected.",
+            "Open this setup in MACHINE: a setup on the manual mill shows its steps with the DRO numbers to move to, one on the lathe with its dial pictures, whether or not the CNC is connected.",
             "",
         ),
         Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
+        CrossReads(crate::lathe::Reads::Diameter) => (
+            "The diameter went down by the dial's reading: the cross-slide dial reads the diameter. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
+            "",
+        ),
+        CrossReads(crate::lathe::Reads::Radius) => (
+            "The diameter went down by twice the dial's reading: the cross-slide dial reads the radius. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
+            "",
+        ),
+        Typed(..) => ("Type the diameter the calipers read, in mm.", ""),
+        Measured(..) => (
+            "Keep this measured diameter with the project: the cross-slide numbers that follow are worked out from it, the last pass taking all that is left. The app does not read the calipers.",
+            "",
+        ),
     }
 }
 
@@ -1688,6 +1701,10 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         }
         (Target::Machine, "mdi_line") => {
             let (body, more) = machine_help(&crate::control::Action::MdiText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "measured") => {
+            let (body, more) = guide_help(&crate::GuideAction::Measured(String::new(), 0.));
             (body, more, None)
         }
         (Target::Machine, "work_set") => {

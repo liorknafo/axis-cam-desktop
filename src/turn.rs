@@ -196,6 +196,13 @@ impl Material {
         }
         (outer - inner > ON).then_some((inner, outer))
     }
+    /// This material less the ring `[z0, z1, r0, r1]` (setup frame): what is
+    /// left once a lathe cut turned it away.
+    pub fn with(&self, ring: [f32; 4]) -> Self {
+        let mut out = self.clone();
+        out.rings.push(ring);
+        out
+    }
     /// The material between `a` and `b` (setup frame Z), in sections of one
     /// inner and outer radius, lowest first; none where nothing is left.
     pub fn sections(&self, a: f32, b: f32) -> Vec<Section> {
@@ -1111,6 +1118,76 @@ fn part_check(
         }
     }
     Ok(())
+}
+/// The part's outline about the setup's Z axis, as a lathe step's side view
+/// draws it, read from its triangles as `part_check` reads them: in slabs
+/// along Z (setup frame) of at most half a millimetre, the part's nearest
+/// and farthest distance from the axis in each, `[z0, z1, inner, outer]`
+/// (inner 0 where the axis runs through the solid). Only the slabs the part
+/// reaches; neighbours within 0.05 mm of each other are one slab.
+pub fn profile(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 4]> {
+    const SLAB: f32 = 0.5;
+    const SAME: f32 = 0.05;
+    let geometry = Geometry::new(setup, mesh);
+    let b = geometry.bounds;
+    let length = b.max[2] - b.min[2];
+    if !length.is_finite() || length <= ON {
+        return vec![];
+    }
+    let n = ((length / SLAB).ceil() as usize).clamp(1, 2000);
+    let dz = length / n as f32;
+    let slab = |z: f32| (((z - b.min[2]) / dz).floor().max(0.) as usize).min(n - 1);
+    // (inner, outer) per slab; outer < 0 where no triangle reaches it.
+    let mut found = vec![(f32::INFINITY, -1f32); n];
+    for t in &geometry.triangles {
+        let lo = t.p.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        let hi = t.p.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+        for (i, at) in found
+            .iter_mut()
+            .enumerate()
+            .take(slab(hi) + 1)
+            .skip(slab(lo))
+        {
+            let low = b.min[2] + i as f32 * dz;
+            let polygon = clip(&t.p, low, low + dz);
+            let Some((near, _)) = nearest(&polygon) else {
+                continue;
+            };
+            let far = polygon.iter().map(|p| p[0].hypot(p[1])).fold(0., f32::max);
+            *at = (at.0.min(near), at.1.max(far));
+        }
+    }
+    let index = Index::new(&geometry);
+    let axis = [1e-4, 1e-4];
+    if (0..2).all(|k| b.min[k] <= axis[k] && axis[k] <= b.max[k]) {
+        for (a, z) in analysis::solid(&index, axis, b.max[2]) {
+            for (i, at) in found.iter_mut().enumerate() {
+                let low = b.min[2] + i as f32 * dz;
+                if low + dz > a + ON && low < z - ON {
+                    at.0 = 0.;
+                }
+            }
+        }
+    }
+    let mut out: Vec<[f32; 4]> = vec![];
+    for (i, (inner, outer)) in found.into_iter().enumerate() {
+        if outer < 0. {
+            continue;
+        }
+        let low = b.min[2] + i as f32 * dz;
+        let inner = inner.min(outer);
+        match out.last_mut() {
+            Some(last)
+                if (last[1] - low).abs() < 1e-4
+                    && (last[2] - inner).abs() < SAME
+                    && (last[3] - outer).abs() < SAME =>
+            {
+                last[1] = low + dz;
+            }
+            _ => out.push([low, low + dz, inner, outer]),
+        }
+    }
+    out
 }
 /// Triangle `t` clipped to the heights `low`..`high`: a convex polygon,
 /// empty when it lies outside them.

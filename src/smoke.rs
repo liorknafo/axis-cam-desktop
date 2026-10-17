@@ -217,6 +217,7 @@ impl App {
                 122 => "98-machine-setup".into(),
                 123 => "99-machine-work-zero".into(),
                 124 => "100-manual-steps".into(),
+                125 => "101-lathe-steps".into(),
                 _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
             })
     }
@@ -1281,6 +1282,12 @@ impl App {
                 self.smoke_manual_setup();
                 vec![Message::Page(Page::Control)]
             }
+            // MACHINE on a lathe setup put first: its Steps page at the dial
+            // check, the cross-slide dial not known yet.
+            125 => {
+                self.smoke_lathe_setup();
+                vec![Message::Page(Page::Control)]
+            }
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.disconnect_machine();
@@ -1298,6 +1305,10 @@ impl App {
             124 => {
                 let line = self.smoke_manual_check();
                 eprintln!("Screen 100: {line}");
+            }
+            125 => {
+                let line = self.smoke_lathe_check();
+                eprintln!("Screen 101: {line}");
             }
             // The machine drawn under the work zero, in view.
             120 => {
@@ -1430,6 +1441,69 @@ impl App {
         self.doc.add_manual_setup().expect("a manual setup");
         self.doc.setups[0].operations = vec![face];
         self.doc.active = self.doc.setups[0].id.clone();
+    }
+    /// Screen 101's job: the manual lathe in the library with a turning
+    /// tool, and a lathe setup on a relative round bar put first that faces
+    /// 0.5 mm off the end, made the active setup.
+    pub(crate) fn smoke_lathe_setup(&mut self) {
+        use crate::model::{Operation, Strategy, Tool};
+        let lathe = crate::lathe::defaults();
+        let tool = Tool::lathe("RH turning tool", "Turning tool");
+        let mut face = Operation::for_machine(Strategy::Turn, tool.id.clone(), &lathe);
+        face.set_turn_kind("Face");
+        face.p.insert("face_off".into(), "0.5".into());
+        self.doc.machines.push(lathe);
+        self.doc.tools.push(tool);
+        self.doc.add_lathe_setup().expect("a lathe setup");
+        let at = (self.doc.setups.iter())
+            .position(|s| crate::lathe::is_lathe(&s.machine))
+            .expect("the lathe setup");
+        let mut setup = self.doc.setups.remove(at);
+        for (k, v) in [
+            ("stock_type", "Relative round bar"),
+            ("stock_radial", "2"),
+            ("stock_top", "1"),
+            ("stock_bottom", "30"),
+        ] {
+            setup.p.insert(k.into(), v.into());
+        }
+        setup.operations = vec![face];
+        self.doc.active = setup.id.clone();
+        self.doc.setups.insert(0, setup);
+        self.doc.sync_stock_sources();
+    }
+    /// What screen 101 shows: the Steps page on the lathe setup, its guide
+    /// built (set up with the dial check, the face, the hand-over) at the
+    /// dial check, the face's top slide read off its dial.
+    pub(crate) fn smoke_lathe_check(&self) -> String {
+        use crate::guide::{LatheStep, Step};
+        assert!(self.steps_page(), "the Steps page");
+        let (shown, at) = self.guide_at().unwrap_or_else(|| {
+            panic!(
+                "the guide: {:?}",
+                self.current_guide().map(|r| r.as_ref().err())
+            )
+        });
+        let g = &shown.guide;
+        let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Set up", "Turn · Face", "Hand over"]);
+        assert_eq!(at, 0);
+        assert!(
+            matches!(g.steps[0], Step::Lathe(LatheStep::DialCheck { .. })),
+            "{:?}",
+            g.steps[0]
+        );
+        let Some(Step::Lathe(LatheStep::Face { top, .. })) =
+            (g.steps.iter()).find(|s| matches!(s, Step::Lathe(LatheStep::Face { .. })))
+        else {
+            panic!("no Face step: {:?}", g.steps)
+        };
+        assert_eq!(top.reading, Ok((0, 0.5)), "{top:?}");
+        format!(
+            "{} steps, the dial check first, the face 0.50 on the top slide, ~{:.0} min",
+            g.steps.len(),
+            g.minutes.ceil()
+        )
     }
     /// What screen 100 shows: the Steps page on the manual setup, its
     /// guide built (set up, the face, the hand-over) at its first step.
@@ -4431,6 +4505,75 @@ flood = { pin = 8 }
         for want in ["Big mill", "Set up", "Face", "Hold"] {
             assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
+    }
+
+    #[test]
+    fn screen_101_shows_the_dial_steps_of_a_lathe_setup_put_first() {
+        let mut a = imported_app();
+        a.smoke_lathe_setup();
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        a.smoke_lathe_check();
+        let texts = page_texts(&a);
+        for want in [
+            "Manual lathe",
+            "Set up",
+            "Face",
+            "Check the cross-slide dial",
+            "by 1× → diameter",
+        ] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+    }
+
+    #[test]
+    fn the_lathe_steps_work_while_the_cnc_jogs() {
+        use crate::control::Action;
+        use crate::guide::{LatheStep, Step};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        tick_until(&mut a, 2.0, "the jog", |s| s.state == Some(State::Jog));
+        assert!(a.locked());
+        // The lathe guide's job, its dial not known yet, its steps built.
+        let lathe = crate::steps::tests::lathe_app("", |_| {});
+        a.doc = lathe.doc.clone();
+        a.imported_mesh = lathe.imported_mesh.clone();
+        a.guide = lathe.guide.clone();
+        a.status.clear();
+        let _ = a.update(Message::Page(Page::Control));
+        assert!(a.steps_page() && a.guide_at().is_some());
+        // The dial check answered, a measurement typed, places moved: all
+        // while the CNC jogs, its run not disturbed.
+        let _ = a.update(Message::Guide(crate::GuideAction::CrossReads(
+            crate::lathe::Reads::Diameter,
+        )));
+        assert_ne!(a.status, crate::LOCKED);
+        assert_eq!(
+            crate::model::get(&a.doc.setups[0].machine.p, "cross_reads"),
+            "Diameter"
+        );
+        let (shown, _) = a.guide_at().expect("the guide, built again");
+        let measure = (shown.guide.steps.iter())
+            .position(|s| matches!(s, Step::Lathe(LatheStep::Measure { .. })))
+            .unwrap();
+        let _ = a.update(Message::Guide(crate::GuideAction::Go(measure)));
+        let key = crate::guide::measure_key(&a.doc.setups[0].id, &a.doc.setups[0].operations[1].id);
+        let _ = a.update(Message::Guide(crate::GuideAction::Measured(
+            key.clone(),
+            40.36,
+        )));
+        assert_eq!(a.doc.measured.get(&key), Some(&40.36));
+        assert_eq!(a.guide_at().unwrap().1, measure);
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t == "in to 10.36 → Ø40.00"),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     #[test]

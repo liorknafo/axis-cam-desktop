@@ -32,6 +32,25 @@ impl Slide {
     }
 }
 
+/// What the cross-slide dial's numbers mean, the dial check's answer
+/// (`cross_reads`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// A reading of `d` takes `d` off the diameter.
+    Diameter,
+    /// A reading of `d` takes `d` off the radius, `2d` off the diameter.
+    Radius,
+}
+impl Reads {
+    /// The machine's `cross_reads` value.
+    pub fn key(self) -> &'static str {
+        match self {
+            Reads::Diameter => "Diameter",
+            Reads::Radius => "Radius",
+        }
+    }
+}
+
 /// The tool types a lathe uses besides drills (held in the tailstock).
 pub const TOOLS: [&str; 5] = [
     "Turning tool",

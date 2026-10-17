@@ -1484,7 +1484,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(12))
                     .padding([0, 16]),
             );
-            if manual::is_manual(&s.machine) {
+            if manual::is_hand(&s.machine) {
                 tree = tree.push(
                     container(
                         secondary("Steps ▶", Message::Guide(crate::GuideAction::Open(si)))
@@ -5149,8 +5149,8 @@ pub(crate) fn limits_off_warning(
 fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
-    // A setup on the manual mill shows its steps, with or without the CNC
-    // connected.
+    // A setup on the manual mill or the lathe shows its steps, with or
+    // without the CNC connected.
     if app.steps_page() {
         return crate::steps::view(app);
     }
