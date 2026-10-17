@@ -299,6 +299,7 @@
   - `Tool { op, tool, rpm, diameter, comp: [i8; 2] }`
   - `Comp { op, comp }`
   - `Pass { op, index, of, targets: Vec<Target>, cut: Bounds, earlier: Vec<Bounds>, never: Limits, turns_per_minute: f32 }`
+  - `Face { op, tool, rpm, diameter, remove: f32, to: f32 }` (`to` is the final top Z in work coordinates, `remove` the material taken off)
   - `Holes { op, holes: Vec<[f32; 2]>, depth }`
   - `Check { op }`
   - `HandOver { next: Option<usize> }`
@@ -306,7 +307,9 @@
   Here `Target { order: u8, axis: usize, centre: f32, shown: f32, edge: bool, lock: [bool; 3] }`.
 - **Order:**
   1. Hold, then Zero;
-  2. then per operation: Tool when the tool or the operation changes (Comp instead when only the compensation sides change), then one Pass per Box row and level (or Holes for Drill), then Check;
+  2. then per operation:
+     - a **facing** Box (open on all four X/Y sides) is one Face step and nothing else: no Tool, Pass or Check steps (user decision, 17 October 2026: facing needs only the tool and the depth to cut to);
+     - any other operation: Tool when the tool or the operation changes (Comp instead when only the compensation sides change), then one Pass per Box row and level (or Holes for Drill), then Check;
   3. HandOver last.
 - **Targets** come straight from the plan's one-axis moves before each cutting Feed: the rapids and the plunge, then the cut. `centre` is the move's end in work coordinates, and `shown` is the readout:
   - with `dro_comp` "Yes", X and Y are shown as the edge, `centre + comp × radius`;
@@ -320,7 +323,8 @@
 
 - [ ] Write tests (the Task 4 block, a manual setup with Face 2 mm, Step on −Y, and Drill × 4, followed by a CNC setup):
   - **step list:**
-    - the kinds in order (Hold, Zero, Tool, Pass…, Check, Tool, Pass…, Check, Tool, Holes, Check, HandOver);
+    - the kinds in order (Hold, Zero, Face, Tool, Pass…, Check, Tool, Holes, Check, HandOver), with exactly one step for the facing operation;
+    - the Face step's `to` is the face Box's floor (−2.00) and `remove` is 2.00;
     - `HandOver.next` is the CNC setup;
   - **targets:**
     - each Pass's targets replay the plan's moves exactly (applying them in order from the previous position reaches the cut's end);
@@ -365,6 +369,7 @@
       - the DRO zero marker and the axis arrows;
       - the `never` lines in red;
     - or, for Hold, Check and HandOver, the 3D `stock_picture` of the volume at 480 × 320;
+    - for Face: the top view with the faced area and the front view with the stock top and the final top; on the right only the tool chip, the gear and one large readout "Face to Z −2.00" with "2.00 mm off";
     - a small legend.
   - **Right:**
     - chips for the tool, rpm (gear) and feed, with "1 turn every N s" and a dot that blinks once per turn, via `iced::time::every` while the page is visible;
@@ -378,7 +383,8 @@
 - **Saving the place.** Next and Back save `Document.guide` with `dirty = true; last_edit = now` (as `SelectSetup` does, `main.rs:2582`), not `touch()`.
 
 - [ ] Write tests with the `ui::probe` pattern on the Task 7 document:
-  - the page shows "Pass 1 of N" and the readouts' numbers for the first pass;
+  - the Face step shows the tool, the gear and "Face to Z −2.00", and no pass boxes;
+  - the page shows "Pass 1 of N" and the readouts' numbers for the first pass of the step operation;
   - Next and Back move the place and keep it after a save and load;
   - the page shows with no controller and while `app.locked()`;
   - a CNC setup still shows today's MACHINE page.

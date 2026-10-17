@@ -11,6 +11,7 @@ Date: 17 October 2026. Branch: `t3/manual-milling-planning` (from `main` f85235d
 
 ## Decisions made by the user
 
+- Facing needs **no sub-steps**: only the tool and the depth to cut to (17 October 2026).
 - The big mill is manual with a DRO. The DRO has **tool-radius compensation**.
 - **No power feed** on any axis: every cut is fed by hand.
 - The big mill does **everything that needs only one axis moving at a time**. Anything more complicated goes to the CNC.
@@ -96,6 +97,7 @@ A manual setup in MACHINE shows a **Steps** page instead of Run. It works with n
 | Hold | 3D view of the stock in the vise: which face is up, which faces go to the jaws, parallels under it, the grip height |
 | Zero | The corner to pick up with the edge finder, the direction to approach each side from, and Z 0 on the top. The DRO is set to 0, 0, 0 there |
 | Tool | The tool drawn to scale, its diameter, the gear to select (rpm), and on a DRO with compensation the diameter to enter in it |
+| Face | **One screen for a whole facing cut** (a Box open on all four sides, over the whole top): the tool and its gear, how much comes off, and the Z to face down to. Top and front views show the area and the final top. The user plans the passes themselves, so there is no Pass step and no Check step for it |
 | Pass | One pass (the mockup): top view and front view, the hatched band this pass removes, the tool where it starts, an arrow to where it stops, what earlier passes removed |
 | Holes | Top view with every hole numbered, the current hole highlighted, its X and Y, and the depth on the quill or Z |
 | Check | 3D view of the stock after the operation, next to the previous one, with the main sizes |
