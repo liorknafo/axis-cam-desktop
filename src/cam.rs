@@ -480,7 +480,7 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
 }
 /// How near a box side must be to a stock face to be open, and how far the
 /// cut may touch the part, mm.
-const ON: f32 = 0.001;
+pub(crate) const ON: f32 = 0.001;
 /// A Box's block in the stock frame: its keys (`BOX_FIELDS`, work frame)
 /// moved by the work zero `zero`, as (low corner, high corner).
 pub(crate) fn box_block(op: &Operation, zero: [f32; 3]) -> Result<([f32; 3], [f32; 3]), String> {
@@ -496,6 +496,22 @@ pub(crate) fn box_block(op: &Operation, zero: [f32; 3]) -> Result<([f32; 3], [f3
 /// and keep the allowance; the top keeps none whatever it is.
 pub(crate) fn open_sides(low: [f32; 3], high: [f32; 3], s: &Bounds) -> [[bool; 2]; 3] {
     std::array::from_fn(|k| [low[k] <= s.min[k] + ON, high[k] >= s.max[k] - ON])
+}
+/// What a Box cuts of the block `low`..`high` on the stock `s`: the block
+/// inside the stock, its closed sides and floor (`open_sides`) moved in by
+/// `allowance`, as (low corner, high corner).
+pub(crate) fn box_cut(
+    low: [f32; 3],
+    high: [f32; 3],
+    s: &Bounds,
+    allowance: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let open = open_sides(low, high, s);
+    let keep = |open: bool| if open { 0. } else { allowance };
+    (
+        std::array::from_fn(|k| low[k].max(s.min[k]) + keep(open[k][0])),
+        std::array::from_fn(|k| high[k].min(s.max[k]) - if k == 2 { 0. } else { keep(open[k][1]) }),
+    )
 }
 /// Whether triangle `t` meets box `b`: no separating axis among the box's
 /// faces, the triangle's plane and the nine edge crossings.
@@ -550,10 +566,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     }
     // 1. Open sides, and the cut inside the stock and the allowance.
     let open = open_sides(low, high, &s);
-    let keep = |open: bool| if open { 0. } else { allowance };
-    let lo: [f32; 3] = std::array::from_fn(|k| low[k].max(s.min[k]) + keep(open[k][0]));
-    let hi: [f32; 3] =
-        std::array::from_fn(|k| high[k].min(s.max[k]) - if k == 2 { 0. } else { keep(open[k][1]) });
+    let (lo, hi) = box_cut(low, high, &s, allowance);
     if lo[2] >= hi[2] - ON || (0..2).any(|k| lo[k] >= hi[k]) {
         return Err(
             "The box leaves nothing to cut inside the stock and the stock to leave.".into(),

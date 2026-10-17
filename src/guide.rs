@@ -4,7 +4,7 @@
 //! checked. Every coordinate a step shows is a work coordinate (the stock
 //! frame less the work zero); `Guide::zero` converts the kept plans.
 use crate::{
-    cam::{box_block, open_sides},
+    cam::{box_block, box_cut, open_sides},
     holding::Gripped,
     manual,
     mesh::{Bounds, Mesh},
@@ -82,10 +82,11 @@ pub enum Step {
         remove: f32,
         to: f32,
     },
-    /// A squaring Box (one closed X or Y side, the wall, and an open floor):
-    /// cut the stock's `side` (−1 or +1) of `axis` to `to` (the wall),
-    /// which the DRO reads as `shown` (the edge with compensation, else the
-    /// centre), taking off `remove`, down to `down_to`.
+    /// A squaring Box (one closed X or Y side, the wall, and a slab off it
+    /// one row wide): cut the stock's `side` (−1 or +1) of `axis` to `to`
+    /// (the wall as cut, with its allowance), which the DRO reads as `shown`
+    /// (the edge with compensation, else the centre), taking off `remove`,
+    /// down to `down_to` (the floor as cut).
     Square {
         op: usize,
         tool: String,
@@ -142,21 +143,26 @@ pub struct Guide {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
     Face,
-    /// The closed side is on `axis`, on its − side when `low`.
+    /// The closed side, the wall, is on `axis`, on its − side when `low`.
     Square {
         axis: usize,
         low: bool,
     },
     Other,
 }
-fn kind(open: [[bool; 2]; 3]) -> Kind {
+/// A Box with its sides `open` that cuts `lo`..`hi` (`cam::box_cut`) with a
+/// tool of radius `r`: facing when all four X and Y sides are open;
+/// squaring when exactly one is closed (the wall; its ends along the wall
+/// are then open) and the slab off the wall is at most `r` wide, so one row
+/// per level takes it, whatever its floor; otherwise passes.
+fn kind(open: [[bool; 2]; 3], lo: [f32; 3], hi: [f32; 3], r: f32) -> Kind {
     let closed: Vec<(usize, bool)> = (0..2)
         .flat_map(|k| [(k, true), (k, false)])
         .filter(|&(k, low)| !open[k][usize::from(!low)])
         .collect();
     match closed[..] {
         [] => Kind::Face,
-        [(axis, low)] if open[2][0] => Kind::Square { axis, low },
+        [(axis, low)] if hi[axis] - lo[axis] <= r + crate::cam::ON => Kind::Square { axis, low },
         _ => Kind::Other,
     }
 }
@@ -414,8 +420,10 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
             Strategy::Box => {
                 let (low, high) = box_block(op, zero)?;
                 let open = open_sides(low, high, &plan.stock);
+                let allowance = crate::cam::number(op, "allowance")?;
+                let (lo, hi) = box_cut(low, high, &plan.stock, allowance);
                 let comp = if dro { comp_sides(open) } else { [0; 2] };
-                match kind(open) {
+                match kind(open, lo, hi, r) {
                     Kind::Face => {
                         steps.push(Step::Face {
                             op: oi,
@@ -724,18 +732,20 @@ mod tests {
     }
     #[test]
     fn a_squaring_box_is_one_square_step_cut_to_the_wall() {
-        for (dro, readout) in [("Yes", 0.), ("No", 12.5)] {
+        let (width, height) = (124., 47.);
+        // The +X side, 1 mm off as cut: down to a closed floor at −30 with
+        // and without compensation, with 0.5 left on the wall and the floor,
+        // and down through the stock's bottom.
+        for (dro, readout, x_min, z_bottom, allowance, down_to) in [
+            ("Yes", 0., 123., -30., "0", -30.),
+            ("No", 12.5, 123., -30., "0", -30.),
+            ("Yes", 0., 122.5, -30., "0.5", -29.5),
+            ("Yes", 0., 123., -100., "0", -height),
+        ] {
             let (mut doc, mesh) = job(dro);
             let mill = doc.tools[3].id.clone();
-            let (width, height) = (124., 47.);
-            // The +X side, 1 mm off, down through the stock's bottom.
-            let wall = width - 1.;
-            let square = boxed(
-                "Square",
-                &mill,
-                [wall, 500., -500., 500., 0., -100.],
-                &[("allowance", "0")],
-            );
+            let b = [x_min, 500., -500., 500., 0., z_bottom];
+            let square = boxed("Square", &mill, b, &[("allowance", allowance)]);
             doc.setups[0].operations.insert(1, square);
             let guide = build(&doc, &mesh, 0).unwrap();
             let Step::Hold { stock, .. } = &guide.steps[0] else {
@@ -751,7 +761,7 @@ mod tests {
                 to,
                 shown,
                 remove,
-                down_to,
+                down_to: down,
                 diameter,
                 ..
             } = &guide.steps[3]
@@ -759,18 +769,25 @@ mod tests {
                 panic!("{:?}", guide.steps[3])
             };
             assert_eq!((*op, *axis, *side, *diameter), (1, 0, 1, 25.));
-            close(*to, wall);
-            close(*shown, wall + readout);
+            close(*to, 123.);
+            close(*shown, 123. + readout);
             close(*remove, 1.);
-            close(*down_to, -height);
-            // The plan's cut nearest the wall has its centre a radius off it.
-            let near = (guide.done[1].plan.moves.iter())
+            close(*down, down_to);
+            // The plan's cut nearest the wall has its centre a radius off it,
+            // on the floor.
+            let plan = &guide.done[1].plan;
+            let near = (plan.moves.iter())
                 .filter(|m| m.cutting_pass)
                 .map(|m| m.to[0] - guide.zero[0])
                 .fold(f32::INFINITY, f32::min);
-            close(near, wall + 12.5);
-            // The front step is the next section, starting with its tool.
-            assert_eq!(kinds(&guide, guide.sections[3].steps.clone())[0], "Tool");
+            close(near, 123. + 12.5);
+            close(plan.target - guide.zero[2], down_to);
+            // The 15.5 mm front step, wider than the radius, is not squaring:
+            // its section starts with its tool and runs its passes.
+            assert_eq!(
+                kinds(&guide, guide.sections[3].steps.clone()),
+                ["Tool", "Pass", "Pass", "Pass", "Pass", "Check"]
+            );
         }
     }
     #[test]
@@ -989,19 +1006,38 @@ mod tests {
     #[test]
     fn faces_squares_and_comp_sides_follow_the_open_sides() {
         let all = [[true; 2]; 3];
-        assert_eq!(kind(all), Kind::Face);
+        let (lo, hi, r) = ([0., 0., -10.], [124., 120., 0.], 12.5);
+        assert_eq!(kind(all, lo, hi, r), Kind::Face);
+        // A wall on −X with a 1 mm slab off it: squaring, floor open or closed.
         let mut wall = all;
         wall[0][0] = false;
-        assert_eq!(kind(wall), Kind::Square { axis: 0, low: true });
+        let slab = [123., 0., -10.];
+        assert_eq!(kind(wall, slab, hi, r), Kind::Square { axis: 0, low: true });
         assert_eq!(comp_sides(wall), [-1, 1]);
         wall[2][0] = false;
-        assert_eq!(kind(wall), Kind::Other);
+        assert_eq!(kind(wall, slab, hi, r), Kind::Square { axis: 0, low: true });
+        // As wide as the radius still is; wider is not.
+        assert_eq!(
+            kind(wall, [111.5, 0., -10.], hi, r),
+            Kind::Square { axis: 0, low: true }
+        );
+        assert_eq!(kind(wall, [111.4, 0., -10.], hi, r), Kind::Other);
+        // The front step: 15 mm off its +Y wall, wider than the radius.
         let mut step = all;
         (step[1][1], step[2][0]) = (false, false);
-        assert_eq!((kind(step), comp_sides(step)), (Kind::Other, [1, 1]));
+        let front = [124., 15., 0.];
+        assert_eq!(
+            (kind(step, lo, front, r), comp_sides(step)),
+            (Kind::Other, [1, 1])
+        );
+        // Two closed sides are never squaring, however thin.
         let mut slot = all;
-        (slot[1], slot[2][0]) = ([false; 2], true);
-        assert_eq!((kind(slot), comp_sides(slot)), (Kind::Other, [1, 1]));
+        slot[1] = [false; 2];
+        let thin = ([0., 50., -10.], [124., 60., 0.]);
+        assert_eq!(
+            (kind(slot, thin.0, thin.1, r), comp_sides(slot)),
+            (Kind::Other, [1, 1])
+        );
     }
     #[test]
     fn only_a_manual_setup_with_an_enabled_operation_has_steps() {
