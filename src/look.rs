@@ -265,7 +265,7 @@ impl View {
                         .unwrap_or_default();
                     let on = crate::post::datum(&setup, stock, mesh)
                         .ok()
-                        .and_then(|datum| crate::post::on_pins(&setup, datum));
+                        .and_then(|datum| crate::post::on_pins(&setup, mesh, datum));
                     boxes.extend(crate::holding::pin_boxes(on.as_ref(), stock));
                     boxes
                 }
@@ -282,6 +282,7 @@ impl View {
             sample: false,
             camera,
             picking: false,
+            pin_holes: Default::default(),
             show_stock: args.show_stock,
             show_paths: false,
             progress: None,
@@ -363,6 +364,7 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         // Unused: the picture is drawn with the view's projector.
         camera: Camera::default(),
         picking: false,
+        pin_holes: Default::default(),
         show_stock: args.show_stock,
         show_paths: view.operation.is_some(),
         progress: None,

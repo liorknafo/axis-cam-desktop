@@ -2742,9 +2742,9 @@ flood = { pin = 8 }
 
     /// `post::fixture::pinned_flip("rx", true)` on a simulated FAST machine
     /// with a probe input and the setups' fixture pins (Ø4, 6 mm tall, 80 mm
-    /// apart along X): setup 1 drills the pin holes, setup 2 ("Flipped", G55)
-    /// sits on the pins flipped about X with pin 1 at X-40 Y-25, so that the
-    /// part on the simulator's pins is on the table. A Ø2 probe tip and a
+    /// apart along X): setup 1 drills the block's two dowel holes, setup 2
+    /// ("Flipped", G55) sits on the pins by them, flipped about X, so that
+    /// the part on the simulator's pins is on the table. A Ø2 probe tip and a
     /// touch plate of no thickness.
     fn pins_app(dir: &std::path::Path) -> App {
         let mut a = profile_app(dir, &probe_profile());
@@ -2908,7 +2908,8 @@ flood = { pin = 8 }
             "{back:?} {kept:?}"
         );
 
-        // G55, X Y from the pins: the offset is pin 1's place less X-40 Y-25.
+        // G55, X Y from the pins: the offset is pin 1's place less where pin
+        // 1 stands in work coordinates, in its hole.
         // Pressed again while the driver re-anchors after the declarations.
         for _ in 0..10 {
             if conn(&a).snapshot.active_wcs == 1 {
@@ -2928,8 +2929,10 @@ flood = { pin = 8 }
             conn(&a).snapshot.log
         );
         let want = conn(&a).pin_offset().unwrap();
+        let pin1 = conn(&a).run_program().unwrap().pins.clone().unwrap().pin1;
         assert!(
-            (want[0] - (kept[0] + 40.)).abs() < 1e-9 && (want[1] - (kept[1] + 25.)).abs() < 1e-9
+            (0..2).all(|k| (want[k] - (kept[k] - pin1[k] as f64)).abs() < 1e-6),
+            "{want:?} {kept:?} {pin1:?}"
         );
         assert!(
             problems(&a)
@@ -3045,11 +3048,76 @@ flood = { pin = 8 }
         eprintln!("Rendered {}", path.display());
     }
 
+    #[test]
+    fn the_work_zero_step_picks_the_parts_holes_for_the_pins_in_the_3d_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = pins_app(dir.path());
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupStep("Work zero"));
+        let _ = a.update(Message::Edit(Target::Setup, "pin_holes", String::new()));
+        let mesh = a.part_mesh().unwrap().clone();
+        let setup = a.doc.setups[1].clone();
+        let holes = crate::cam::bottom_holes(&setup, &mesh).unwrap();
+        assert_eq!(holes.len(), 2);
+        // A facet of the −X hole's wall, the +X hole's end and the face
+        // they open on.
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let normal_z = |i: usize| {
+            placement.transform(mesh.surfaces[i].normal)[2] - placement.transform([0.; 3])[2]
+        };
+        let of = |i| crate::cam::surface_hole(&setup, &mesh, &holes, i);
+        let wall = (0..mesh.surfaces.len())
+            .find(|&i| of(i) == Some(0) && normal_z(i).abs() < 0.01)
+            .unwrap();
+        let end = (0..mesh.surfaces.len())
+            .find(|&i| of(i) == Some(1) && normal_z(i).abs() > 0.99)
+            .unwrap();
+        let face = (0..mesh.surfaces.len())
+            .filter(|&i| of(i).is_none() && normal_z(i).abs() > 0.99)
+            .find(|&i| {
+                let z = placement.transform(mesh.surfaces[i].center)[2] / mesh.display_scale();
+                (z - holes[0].z).abs() < 0.01
+            })
+            .unwrap();
+        let pick = |a: &mut App, n: usize| {
+            let _ = a.update(Message::Viewport(crate::viewport::Event::PickSurface(n)));
+            crate::post::chosen_pin_holes(&a.doc.setups[1]).len()
+        };
+        // Not picking: a click chooses nothing.
+        assert_eq!(pick(&mut a, wall), 0);
+        let _ = a.update(Message::PickPinHoles);
+        assert!(a.picking_pin_holes());
+        assert_eq!(pick(&mut a, wall), 1);
+        // The face the holes open on is no hole.
+        assert_eq!(pick(&mut a, face), 1);
+        assert!(
+            a.status.starts_with("That is not in a round hole"),
+            "{}",
+            a.status
+        );
+        assert_eq!(pick(&mut a, end), 2);
+        let datum =
+            crate::post::datum(&a.doc.setups[1], a.known_stock(1).0.unwrap(), &mesh).unwrap();
+        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, datum).unwrap();
+        assert!(
+            (on.places[0][0] - holes[0].center[0]).abs() < 0.01,
+            "{on:?}"
+        );
+        // A second click on a chosen hole removes it.
+        assert_eq!(pick(&mut a, wall), 1);
+        // Away from the Work zero step the clicks pick nothing.
+        let _ = a.update(Message::SetupStep("Stock"));
+        assert!(!a.picking_pin_holes());
+        assert_eq!(pick(&mut a, wall), 1);
+    }
+
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
-    /// setup's Work zero step with the pins in the 3D view, the drill's pin
-    /// holes, and the Control page's Run steps before and after X Y from the
-    /// pins. Not a check: run it with --ignored.
+    /// setup's Work zero step before and after its holes are chosen for the
+    /// pins, setup 1's Drill of those holes, and the Control page's Run steps
+    /// before and after X Y from the pins. Not a check: run it with
+    /// --ignored.
     #[test]
     #[ignore]
     fn render_the_fixture_pins() {
@@ -3084,14 +3152,25 @@ flood = { pin = 8 }
         a.ready = crate::run::ready(&a.doc, a.part_mesh().unwrap(), 1, key);
         let _ = a.view();
         let tall = iced::Size::new(1600., 1700.);
+        // Before the part's holes are chosen for the pins, then with them.
+        let chosen = get(&a.doc.setups[1].p, "pin_holes").to_string();
+        let edit = |a: &mut App, v: String| {
+            let _ = a.update(Message::Edit(Target::Setup, "pin_holes", v));
+            a.ready =
+                crate::run::ready(&a.doc, a.part_mesh().unwrap(), 1, a.holding_key().unwrap());
+            let _ = a.view();
+        };
+        edit(&mut a, String::new());
+        render_png(&a, tall, &out.join("2a-work-zero-choose-holes.png"));
+        edit(&mut a, chosen);
         render_png(&a, tall, &out.join("2-work-zero-step.png"));
-        // Setup 1's drill of the pin holes.
+        // Setup 1's Drill of the part's dowel holes, found in its top face.
         let _ = a.update(Message::SelectSetup(0));
         let drill = a.doc.setups[0].operations.len() - 1;
         let _ = a.update(Message::SelectOp(drill));
         let _ = a.update(Message::Tab("Geometry".into()));
         let _ = a.view();
-        render_png(&a, size, &out.join("3-drill-pin-holes.png"));
+        render_png(&a, tall, &out.join("3-drill-dowel-holes.png"));
         let _ = a.update(Message::SelectSetup(1));
         // Control: pins recorded, then an E-stop: the Run steps for the
         // flipped setup on the pins.

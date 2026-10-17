@@ -1702,6 +1702,37 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     drawn.push((key, picture.clone()));
     Some(picture)
 }
+/// The part's holes offered for the fixture pins in the 3D view: shown
+/// while the Work zero step of a setup on the pins is open, each hole not
+/// chosen numbered as `pins_block` lists it.
+fn pin_hole_marks(app: &App) -> viewport::PinHolePick {
+    let open = app.page == Page::Work
+        && app.selected.is_none()
+        && app.setup_step == "Work zero"
+        && !app.is_sample();
+    let (true, Some(s), Some(mesh)) = (open, app.doc.active_setup(), app.part_mesh()) else {
+        return viewport::PinHolePick::default();
+    };
+    if !crate::post::sits_on_pins(s) {
+        return viewport::PinHolePick::default();
+    }
+    let pick = app.picking_pin_holes();
+    let holes = match &*app.bottom_holes(mesh) {
+        Ok(holes) => (holes.iter().enumerate())
+            .take(48)
+            .filter(|(_, h)| crate::post::chosen_index(s, mesh, h).is_none())
+            .map(|(i, h)| {
+                (
+                    i + 1,
+                    [h.center[0], h.center[1], h.z],
+                    h.diameter.max(h.opening) / 2.,
+                )
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+    viewport::PinHolePick { pick, holes }
+}
 /// The 3D view of the active setup, as MANUFACTURE shows it: the part,
 /// stock, workholding, the preview and the machine's tool while a tool run of
 /// the setup cuts. None without a part to show.
@@ -1714,7 +1745,8 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         simulation: app.active_simulation(),
         sample: app.is_sample(),
         camera: app.camera,
-        picking: app.picking,
+        picking: app.picking || app.picking_pin_holes(),
+        pin_holes: pin_hole_marks(app),
         show_stock: app.stock && s.is_some(),
         show_paths: app.paths && app.playback_ready(),
         progress: if app.operation().is_some_and(|o| o.preview) {
@@ -2169,12 +2201,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         "Geometry" => {
             if let Some(file) = &app.doc.file {
                 c = c.push(muted(format!("Part · {}", file.name)));
-                if o.strategy == Strategy::Drill {
-                    c = c.push(hole_source(app, o));
-                }
-                if o.drills_pin_holes() {
-                    c = c.push(pin_hole_list(app, o));
-                } else if !o.needs_surfaces() && o.strategy.imported_preview() {
+                if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
                     c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
@@ -2885,71 +2912,6 @@ fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             "The work zero and its offset (G54–G59) are in the Work zero step.",
         ))
 }
-/// A drilling operation's Holes: found in the part, or the pin holes of a
-/// later setup that sits on the fixture pins (`cam::pin_holes`), one button
-/// each. Nothing when no later setup sits on them and none is picked.
-fn hole_source<'a>(app: &'a App, o: &'a crate::model::Operation) -> Element<'a, Message> {
-    let si = app.doc.index();
-    let source = get(&o.p, "hole_source");
-    let later: Vec<&Setup> = (app.doc.setups.iter().skip(si + 1))
-        .filter(|s| crate::post::sits_on_pins(s) || s.id == source)
-        .collect();
-    if later.is_empty() && source.is_empty() {
-        return column![].into();
-    }
-    let pick = |id: String| Some(Message::Edit(Target::Operation, "hole_source", id));
-    let mut c = column![
-        muted("Holes"),
-        act_sized(
-            "Found in the part",
-            pick(String::new()),
-            source.is_empty(),
-            Some(Fill)
-        )
-    ]
-    .spacing(4);
-    for s in later {
-        c = c.push(act_sized(
-            format!("Pin holes for {}", s.name()),
-            pick(s.id.clone()),
-            source == s.id,
-            Some(Fill),
-        ));
-    }
-    c.into()
-}
-/// The holes a drill of pin holes drills (`cam::pin_holes`): each pin's
-/// centre in this setup and how deep, or why there are none.
-fn pin_hole_list<'a>(app: &'a App, o: &'a crate::model::Operation) -> Element<'a, Message> {
-    let mut c = column![].spacing(6);
-    if let Some(mesh) = &app.imported_mesh {
-        let source = get(&o.p, "hole_source");
-        match crate::cam::pin_holes(&app.doc, mesh, app.doc.index(), None, source) {
-            Ok(holes) => {
-                let depth = if get(&o.p, "through") == "Yes" {
-                    "through the stock".to_string()
-                } else {
-                    format!(
-                        "{} mm deep at full diameter",
-                        crate::post::exact_mm(holes[0].height + crate::cam::PIN_HOLE_EXTRA)
-                    )
-                };
-                for (i, h) in holes.iter().enumerate() {
-                    c = c.push(muted(format!(
-                        "Pin {} hole · for the Ø{} pin · X{:.2} Y{:.2} · {depth}",
-                        i + 1,
-                        crate::post::exact_mm(h.diameter),
-                        h.center[0],
-                        h.center[1],
-                    )));
-                }
-            }
-            Err(error) => c = c.push(note(error)),
-        }
-    }
-    c.push(note("Pin holes are not found in the part: they are where the later setup's fixture pins go into it, carried back into this setup, at the drill's diameter, which must be the pins' to 0.2 mm over. The later setup's work zero check then finds them."))
-        .into()
-}
 /// The setup editor's Work zero step: where the program's X0 Y0 Z0 is, on
 /// the stock's top or bottom at a corner, an edge's middle or the centre
 /// (picked on a grid of the stock seen from above), or Model origin; and the
@@ -3039,14 +3001,14 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
             &["G54", "G55", "G56", "G57", "G58", "G59"],
             t,
         ))
-        .push(pins_block(s))
+        .push(pins_block(app, s))
         .push(zero_note(app))
 }
 /// The Work zero step's fixture pins: whether the setup sits on its
-/// machine's pins, where pin 1 stands in its work coordinates, and where
-/// that puts every pin. Shown when the machine has pins or the setup sits
-/// on them.
-fn pins_block(s: &Setup) -> Element<'_, Message> {
+/// machine's pins, the part's holes chosen to drop over them (one button
+/// per round hole it opens on its bottom), and where that puts every pin.
+/// Shown when the machine has pins or the setup sits on them.
+fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
     let (p, t) = (&s.p, Target::Setup);
     let pins = crate::control::pins_settings(&s.machine.p);
     let on = crate::post::sits_on_pins(s);
@@ -3069,29 +3031,109 @@ fn pins_block(s: &Setup) -> Element<'_, Message> {
             ))
             .into();
     }
+    // Without pins that read there is nothing to choose holes for.
+    if !matches!(pins, Ok(Some(_)))
+        && let Some(issue) = crate::post::pins_issue(s)
+    {
+        return c.push(caution("Not on the pins yet", vec![issue])).into();
+    }
+    let Some(mesh) = app.part_mesh() else {
+        return c
+            .push(muted(
+                "Load the part to choose the holes it drops over the pins by.",
+            ))
+            .into();
+    };
+    let datum = app
+        .known_stock(app.doc.index())
+        .0
+        .and_then(|stock| crate::post::datum(s, stock, mesh).ok());
+    // In work coordinates; in the setup's own frame, said so, until the
+    // stock it starts from (and so its work zero) is known.
+    let work = |c: [f32; 2]| match datum {
+        Some(d) => format!(
+            "X{} Y{}",
+            crate::post::exact_mm(c[0] - d[0]),
+            crate::post::exact_mm(c[1] - d[1])
+        ),
+        None => format!(
+            "X{} Y{} in the part's place, work zero not known yet",
+            crate::post::exact_mm(c[0]),
+            crate::post::exact_mm(c[1])
+        ),
+    };
+    let placed = datum.map(|d| crate::post::placed_on_pins(s, mesh, d));
+    let chosen = crate::post::chosen_pin_holes(s);
+    c = c.push(section("Pin holes")).push(muted(
+        "Choose the part's holes that drop over the pins, as drawn in the part: the round holes it opens on its bottom in this setup, ringed and numbered in the 3D view. Click them here, or Pick holes on the part and click inside each hole in the 3D view (turn the view to see under the part). Which hole takes which pin follows from the plate.",
+    ));
     c = c.push(
-        row![
-            container(field(p, "pin1_x", "Pin 1 X · mm", t)).width(Length::FillPortion(1)),
-            container(field(p, "pin1_y", "Pin 1 Y · mm", t)).width(Length::FillPortion(1)),
-        ]
-        .spacing(10),
+        btn(
+            if app.picking_pin_holes() {
+                "Finish picking"
+            } else {
+                "Pick holes on the part"
+            },
+            Message::PickPinHoles,
+            app.picking_pin_holes(),
+        )
+        .width(Fill),
     );
-    match (crate::post::pins_issue(s), &pins, crate::post::pin1_work(s)) {
-        (Some(issue), ..) => c = c.push(caution("Not on the pins yet", vec![issue])),
-        (None, Ok(Some(pins)), Some(pin1)) => {
-            let at: Vec<String> = (0..pins.at.len())
-                .map(|i| {
-                    let d = pins.offset(i);
-                    format!(
-                        "pin {} X{} Y{}",
-                        i + 1,
-                        crate::post::exact_mm(pin1[0] + d[0] as f32),
-                        crate::post::exact_mm(pin1[1] + d[1] as f32)
+    match &*app.bottom_holes(mesh) {
+        Ok(holes) if holes.is_empty() => {
+            c = c.push(note(
+                "The part opens no round holes on its bottom in this setup: it needs holes in its design that drop over the pins, opening on the face this setup sits on.",
+            ));
+        }
+        Ok(holes) => {
+            for (n, h) in holes.iter().enumerate().take(48) {
+                let mine = crate::post::chosen_index(s, mesh, h).is_some();
+                let pin = match &placed {
+                    Some(Ok(on)) if mine => (on.places.iter())
+                        .position(|c| (c[0] - h.center[0]).hypot(c[1] - h.center[1]) <= 0.05)
+                        .map(|i| format!(" · pin {}", i + 1)),
+                    _ => None,
+                }
+                .unwrap_or_default();
+                let deep = if h.through {
+                    "through".to_string()
+                } else {
+                    format!("{} mm deep", crate::post::exact_mm(h.depth))
+                };
+                let label = format!(
+                    "{}Hole {} · Ø{} · {} · {deep}{pin} · {}",
+                    if mine { "✓ " } else { "" },
+                    n + 1,
+                    crate::post::exact_mm(h.diameter.max(h.opening)),
+                    work(h.center),
+                    if mine { "remove" } else { "choose" }
+                );
+                c = c.push(
+                    btn(
+                        label,
+                        Message::Edit(t, "pin_holes", crate::post::pin_holes_toggled(s, mesh, h)),
+                        mine,
                     )
-                })
+                    .width(Fill),
+                );
+            }
+        }
+        Err(e) => c = c.push(note(e.clone())),
+    }
+    if !chosen.is_empty() {
+        c = c.push(secondary(
+            "Clear the pin holes",
+            Message::Edit(t, "pin_holes", String::new()),
+        ));
+    }
+    match (placed, &pins) {
+        (Some(Err(issue)), _) => c = c.push(caution("Not on the pins yet", vec![issue])),
+        (Some(Ok(on)), Ok(Some(pins))) => {
+            let at: Vec<String> = (on.places.iter().enumerate())
+                .map(|(i, c)| format!("pin {} {}", i + 1, work(*c)))
                 .collect();
             c = c.push(muted(format!(
-                "Pin 1 X and Y are where pin 1 stands in this setup's work coordinates: the spot of the part whose hole drops over it. The plate, square to X and Y, puts the Ø{} mm pins, {} mm tall, at {} in work coordinates. The pins give X and Y: on the Control page, Set X Y from the pins sets them exactly; Z is still touched off on the stock.",
+                "The plate, square to X and Y, puts the Ø{} mm pins, {} mm tall, in these holes: {} in work coordinates. The pins give X and Y: on the Control page, Set X Y from the pins sets them exactly; Z is still touched off on the stock.",
                 crate::post::exact_mm(pins.diameter as f32),
                 crate::post::exact_mm(pins.height as f32),
                 at.join(", ")
@@ -3648,7 +3690,7 @@ pub(crate) fn pin_boxes(
     };
     let on = crate::post::datum(setup, stock, mesh)
         .ok()
-        .and_then(|datum| crate::post::on_pins(setup, datum));
+        .and_then(|datum| crate::post::on_pins(setup, mesh, datum));
     crate::holding::pin_boxes(on.as_ref(), stock)
 }
 /// What the active setup's workholding holds of `stock`, the box it starts
@@ -7105,6 +7147,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             sample: false,
             camera: app.plan_camera,
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,

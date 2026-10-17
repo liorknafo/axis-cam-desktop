@@ -269,7 +269,6 @@ pub fn check_clamps(setup: &Setup, text: &str) -> Result<(), String> {
     let copy = Setup {
         preview_stock: None,
         preview_remaining: None,
-        preview_pin_holes: None,
         id: setup.id.clone(),
         machine: setup.machine.clone(),
         p: fields(&[("holding", "Clamps"), ("clamps", text)]),

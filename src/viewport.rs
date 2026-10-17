@@ -124,6 +124,16 @@ impl RasterFrame {
         }
     }
 }
+/// The part's holes the setup editor offers for the fixture pins and has
+/// not chosen: each one's number in its list (from 1), its opening's centre
+/// in the setup's frame and radius (mm), drawn as a ring labelled "Hole N";
+/// and whether a click on the part picks one (`picking` then picks
+/// surfaces with no operation).
+#[derive(Clone, Debug, Default)]
+pub struct PinHolePick {
+    pub pick: bool,
+    pub holes: Vec<(usize, [f32; 3], f32)>,
+}
 #[derive(Clone)]
 pub struct Viewport<'a> {
     pub setup: Option<&'a Setup>,
@@ -133,6 +143,8 @@ pub struct Viewport<'a> {
     pub sample: bool,
     pub camera: Camera,
     pub picking: bool,
+    /// The part's holes offered for the fixture pins (the Work zero step).
+    pub pin_holes: PinHolePick,
     pub show_stock: bool,
     pub show_paths: bool,
     pub progress: Option<f32>,
@@ -366,6 +378,7 @@ impl Viewport<'_> {
     fn picked(&self, b: Rectangle, point: Point) -> Option<usize> {
         if !self.picking
             || (!self.sample
+                && !self.pin_holes.pick
                 && !self
                     .operation
                     .is_some_and(|o| o.strategy.imported_preview()))
@@ -1130,6 +1143,36 @@ impl<'a> Viewport<'a> {
                 ..Text::default()
             });
         }
+        // The part's holes offered for the pins, a ring at each opening.
+        let amber = Color::from_rgb8(176, 96, 8);
+        for (n, c, r) in &self.pin_holes.holes {
+            let ring: Vec<Point> = (0..=32)
+                .map(|k| {
+                    let a = k as f32 * std::f32::consts::TAU / 32.;
+                    p.p([
+                        (c[0] + r * a.cos()) * scale,
+                        (c[1] + r * a.sin()) * scale,
+                        c[2] * scale,
+                    ])
+                })
+                .collect();
+            for (width, color) in [(4.5, halo), (2., amber)] {
+                line(&mut frame, &ring, color, width);
+            }
+            let right = ring
+                .iter()
+                .fold(ring[0], |m, q| if q.x > m.x { *q } else { m });
+            let size = iced::Size::new(50., 16.);
+            let corner = Point::new(right.x + 6., right.y - size.height / 2.);
+            frame.fill_rectangle(corner, size, halo);
+            frame.fill_text(Text {
+                content: format!("Hole {n}"),
+                position: Point::new(corner.x + 3., corner.y + 1.),
+                color: amber,
+                size: 11.into(),
+                ..Text::default()
+            });
+        }
         // The work zero: an X/Y/Z cross where the program's X0 Y0 Z0 is, the
         // same size on the screen at any zoom and outlined in white, so it
         // stands out on the part, the stock and the background alike.
@@ -1874,6 +1917,7 @@ mod tests {
             sample: false,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -1941,6 +1985,7 @@ mod tests {
             sample: false,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -1989,6 +2034,7 @@ mod tests {
             sample: false,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
@@ -2048,6 +2094,7 @@ mod tests {
                 sample: false,
                 camera: Camera::default(),
                 picking: false,
+                pin_holes: Default::default(),
                 show_stock: true,
                 show_paths: false,
                 progress: None,
@@ -2089,6 +2136,7 @@ mod tests {
             sample: false,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock,
             show_paths: false,
             progress: None,
@@ -2163,6 +2211,7 @@ mod tests {
             sample: false,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
@@ -2184,7 +2233,7 @@ mod tests {
         let stocked = Viewport {
             show_stock: true,
             holding: vec![],
-            ..view
+            ..view.clone()
         };
         let (under, _) = stocked.render(&p, (300, 200), 1., None, &features);
         assert_eq!(tinted(&under), tinted(&marked));
@@ -2295,6 +2344,7 @@ mod tests {
             sample: true,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -2387,6 +2437,7 @@ mod tests {
                 ..Default::default()
             },
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -2444,6 +2495,7 @@ mod tests {
             sample: true,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -2488,6 +2540,7 @@ mod tests {
             sample: true,
             camera: Camera::default(),
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -2533,6 +2586,7 @@ mod tests {
             sample: true,
             camera,
             picking: true,
+            pin_holes: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,
@@ -2569,6 +2623,7 @@ mod tests {
                 ..Default::default()
             },
             picking: true,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,
@@ -2661,6 +2716,7 @@ mod tests {
                 ..Default::default()
             },
             picking: false,
+            pin_holes: Default::default(),
             show_stock: false,
             show_paths: false,
             progress: None,

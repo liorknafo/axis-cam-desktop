@@ -930,19 +930,12 @@ pub fn command(m: &Message, label: String) -> Help {
             &crate::model::Fields::new(),
         );
     }
-    // A drill's Holes: found in the part, or a later setup's pin holes.
-    if let Edit(Target::Operation, "hole_source", id) = m {
-        return if id.is_empty() {
-            Help::text(
-                label,
-                "Drill the holes found in the part: circular openings found along setup Z, narrowed by the hole diameter filter.",
-            )
-        } else {
-            Help::text(
-                label,
-                "Drill the holes the later setup's fixture pins go into, not holes found in the part: each pin where that setup puts it, carried back into this setup's frame, its full diameter for the pin's height and 1 mm from the face the later setup sits on, or through the stock with Drill tip through bottom. The drill must be the pins' diameter to 0.2 mm over, so that the part is located by them. Drill them in the waste or in the part; the later setup's work zero check then finds them.",
-            )
-        };
+    // A hole of the part chosen, or no longer chosen, for the fixture pins.
+    if let Edit(Target::Setup, "pin_holes", _) = m {
+        return Help::text(
+            label,
+            "Choose or remove this hole of the part for the fixture pins. Choose one hole per pin, as the part's design has them: round holes it opens on the face this setup sits on, the pins' diameter to 0.2 mm over from their opening on (not counterbored), at least the pins' height deep. Which hole takes which pin follows from the plate, and pin 1's hole gives the X and Y work offset with pin 1's recorded machine place. Drill them in an earlier setup with a Drill operation on the face they open on, or before the job.",
+        );
     }
     if let StockDetail(detail) = m {
         return crate::choice_help::selected(
@@ -1100,6 +1093,10 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         ClearSurfaces => (
             "Remove this operation's saved surface selections so you can choose new surfaces on the current part.",
+            "",
+        ),
+        PickPinHoles => (
+            "Pick the part's holes for the fixture pins in the 3D view: click inside a hole, on its wall or its end, to choose it or remove it; drag to orbit (turn the view to see under the part, where the holes open), and click Finish picking when done. The holes offered are ringed and numbered as listed.",
             "",
         ),
         PickMode => (
@@ -2079,13 +2076,8 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "pin_height") => (
-            "How far the pins stand above the plate, in mm: measure it. Pin holes are drilled this and 1 mm deep at full diameter, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
+            "How far the pins stand above the plate, in mm: measure it. The part's holes for them must be at least this deep, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
             "",
-            None,
-        ),
-        (_, "pin1_x" | "pin1_y") => (
-            "Where pin 1 stands in this setup's work coordinates, in mm: the spot of the part whose hole drops over pin 1. With pin 1's recorded machine place it gives the work offset exactly: X/Y offset = pin 1's machine place − this.",
-            "For holes drilled by an earlier setup with Holes set to Pin holes for this setup, it is where those holes are put; for holes made off the machine, read it off the part's drawing from this setup's work zero.",
             None,
         ),
         (_, "probe_tip") => (
@@ -3759,6 +3751,7 @@ mod tests {
             MoveOp(-1),
             MoveOp(1),
             PickMode,
+            PickPinHoles,
             Generate,
             GenerateAll,
             DuplicateSetup,

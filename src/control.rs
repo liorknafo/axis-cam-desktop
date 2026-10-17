@@ -3931,7 +3931,7 @@ soft_max = 0.0
                 let first = first.unwrap().unwrap_or_else(|e| panic!("{state}: {e}"));
                 let (setup, stock) = (&doc.setups[si], first.plan.stock);
                 let zero = datum(setup, stock, &mesh).unwrap();
-                let found = zero_check(setup, stock, zero, &first, &[]);
+                let found = zero_check(setup, &mesh, stock, zero, &first, &[]);
                 if !found.refused.is_empty() {
                     refused.push(format!("{state} {origin}"));
                     continue;

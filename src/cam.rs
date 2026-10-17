@@ -450,11 +450,27 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
         return Err(crate::simulation::COORDINATE_LIMIT_MESSAGE.into());
     }
     let selected = g.selected(op);
-    let top = selected
-        .first()
-        .ok_or("Select the horizontal face containing the hole openings.")?
-        .p[0][2];
-    let loops: Vec<Polygon> = g.silhouette(true, op)?.into();
+    if selected.is_empty() {
+        return Err("Select the horizontal face containing the hole openings.".into());
+    }
+    let holes = round_holes(&g, &selected)?;
+    if holes.is_empty() {
+        Err("No unobstructed circular holes were found in the selected face. Select the top rim containing hole openings.".into())
+    } else {
+        Ok(holes)
+    }
+}
+/// The round holes whose openings are loops in the horizontal face
+/// `selected` (of `g`'s triangles), going down from it along Z, sorted by X
+/// then Y.
+fn round_holes(g: &Geometry, selected: &[&Triangle]) -> Result<Vec<Hole>, String> {
+    let top = selected[0].p[0][2];
+    let loops: Vec<Polygon> = region(
+        (selected.iter())
+            .map(|t| t.p.iter().map(|v| (v[0] as f64, v[1] as f64)).collect())
+            .collect(),
+    )?
+    .into();
     let mut holes = vec![];
     for path in loops.iter().filter(|p| area(p) < 0. && p.len() >= 8) {
         let low = [
@@ -637,11 +653,7 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
             .total_cmp(&b.center[0])
             .then(a.center[1].total_cmp(&b.center[1]))
     });
-    if holes.is_empty() {
-        Err("No unobstructed circular holes were found in the selected face. Select the top rim containing hole openings.".into())
-    } else {
-        Ok(holes)
-    }
+    Ok(holes)
 }
 /// How many hole openings `holes` would examine for this selection (0 on any error).
 pub(crate) fn hole_candidates(setup: &Setup, op: &Operation, mesh: &Mesh) -> usize {
@@ -657,146 +669,99 @@ pub(crate) fn hole_candidates(setup: &Setup, op: &Operation, mesh: &Mesh) -> usi
             .count()
     })
 }
-/// A hole for a fixture pin of a later setup that sits on the pins, in the
-/// frame of the setup that drills it (mm): its centre, the face it opens
-/// on (that later setup's bottom) and the pin's diameter and height.
+/// A round hole the part opens on its bottom in a setup, the kind a part
+/// drops over a fixture pin by (plan mm): its centre, its narrowest
+/// diameter and that of its opening, the height of the face it opens on,
+/// and how deep it goes up into the part at its full diameter (to its top
+/// when it goes through).
 #[derive(Debug, Clone, PartialEq)]
-pub struct PinHole {
+pub struct BottomHole {
     pub center: [f32; 2],
-    pub top: f32,
     pub diameter: f32,
-    pub height: f32,
+    pub opening: f32,
+    pub z: f32,
+    pub depth: f32,
+    pub through: bool,
 }
-/// How much deeper than its pin's height a pin hole is drilled at full
-/// diameter (mm): the pin never bottoms out in it.
-pub const PIN_HOLE_EXTRA: f32 = 1.;
-/// The holes a later setup `target` (its id) needs for the pins it sits on,
-/// drilled in `setup` (index `si` of `doc`): its pins where they stand when
-/// it starts from the box the cuts in `volume` leave it
-/// (`simulation::leftover_box`), carried into this setup's frame. Refused
-/// when that setup is gone, not later or not on the pins, or the pins are
-/// not vertical here or go into this setup's bottom.
-pub fn pin_holes(
-    doc: &crate::model::Document,
-    mesh: &Mesh,
-    si: usize,
-    volume: Option<&crate::volume::Volume>,
-    target: &str,
-) -> Result<Vec<PinHole>, String> {
-    use crate::volume::{Frame, Volume};
-    let setup = &doc.setups[si];
-    let Some((ti, on)) = (doc.setups.iter().enumerate()).find(|(_, s)| s.id == target) else {
-        return Err(
-            "The setup these pin holes were for is gone: choose another under Holes.".into(),
-        );
-    };
-    let name = on.name();
-    if ti <= si || !crate::post::sits_on_pins(on) {
-        return Err(format!(
-            "Pin holes are drilled for a later setup that sits on the pins: {name} is not one. Choose another under Holes."
-        ));
+/// The round holes the part (`mesh`) opens on its lowest face in `setup`,
+/// going up into it along Z, sorted by X then Y: `holes` as a drill from
+/// below would find them in that face.
+pub fn bottom_holes(setup: &Setup, mesh: &Mesh) -> Result<Vec<BottomHole>, String> {
+    let mut g = Geometry::new(setup, mesh);
+    if crate::simulation::exceeds_coordinate_limit(&g.bounds) {
+        return Err(crate::simulation::COORDINATE_LIMIT_MESSAGE.into());
     }
-    if let Some(issue) = crate::post::pins_issue(on) {
-        return Err(format!("{name}: {issue}"));
-    }
-    let own = Frame::new(setup, mesh);
-    let start = match volume {
-        Some(v) => crate::simulation::leftover_box(v, on, mesh),
-        None => {
-            let stock = crate::stock::resolve(setup, Some(mesh))?.stock;
-            crate::simulation::leftover_box(&Volume::new(stock, own), on, mesh)
+    // Upside down, the bottom is the top a drill comes down on; X and Y
+    // stay as they are.
+    for t in &mut g.triangles {
+        for p in &mut t.p {
+            p[2] = -p[2];
         }
-    };
-    let datum = crate::post::datum(on, start, mesh)?;
-    let Some(pins) = crate::post::on_pins(on, datum) else {
-        return Err(format!("{name} cannot be placed on the pins."));
-    };
-    let theirs = Frame::new(on, mesh);
-    pins.places
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let [low, high] = [start.min[2], start.min[2] + pins.height]
-                .map(|z| theirs.transfer([c[0], c[1], z], own));
-            if (0..2).any(|k| (low[k] - high[k]).abs() > 0.01) {
-                return Err(format!(
-                    "The pins of {name} are not vertical in this setup, which is a side setup to it: drill their holes in a setup whose Z is along them."
-                ));
-            }
-            if high[2] < low[2] - 0.001 {
-                Ok(PinHole {
-                    center: [low[0], low[1]],
-                    top: low[2],
-                    diameter: pins.diameter,
-                    height: pins.height,
-                })
+    }
+    let [low, high] = [g.bounds.min[2], g.bounds.max[2]];
+    (g.bounds.min[2], g.bounds.max[2]) = (-high, -low);
+    let face: Vec<&Triangle> = (g.triangles.iter())
+        .filter(|t| t.p.iter().all(|p| (p[2] + low).abs() < 0.01))
+        .collect();
+    if face.is_empty() {
+        return Ok(vec![]);
+    }
+    Ok(round_holes(&g, &face)?
+        .into_iter()
+        .map(|h| {
+            // A blind hole's depth at its full diameter: its end where a
+            // pin's edge would meet it, round its rim (a drill's point or a
+            // fillet rises from the centre's depth towards it).
+            let r = h.diameter / 2. * 0.95;
+            let depth = if h.through {
+                h.top - h.bottom
             } else {
-                Err(format!(
-                    "Pin {} of {name} goes into this setup's bottom: drill the pin holes in a setup that has the face {name} sits on at its top.",
-                    i + 1
-                ))
+                (0..16)
+                    .filter_map(|k| {
+                        let a = k as f32 * std::f32::consts::TAU / 16.;
+                        g.height([h.center[0] + r * a.cos(), h.center[1] + r * a.sin()])
+                    })
+                    .map(|z| h.top - z)
+                    .fold(h.top - h.bottom, f32::min)
+            };
+            BottomHole {
+                center: h.center,
+                diameter: h.diameter,
+                opening: h.opening,
+                z: -h.top,
+                depth,
+                through: h.through,
             }
         })
-        .collect()
+        .collect())
+}
+/// Which of `holes` (`bottom_holes` of `setup`) the part's surface
+/// `surface` (`Mesh::surfaces`) is in: a facet of its wall or its far end,
+/// not the face it opens on.
+pub fn surface_hole(
+    setup: &Setup,
+    mesh: &Mesh,
+    holes: &[BottomHole],
+    surface: usize,
+) -> Option<usize> {
+    let s = mesh.surfaces.get(surface)?;
+    let at = Placement::new(mesh, Some(setup))
+        .transform(s.center)
+        .map(|v| v / mesh.display_scale());
+    holes.iter().position(|h| {
+        let r = h.diameter.max(h.opening) / 2.;
+        (at[0] - h.center[0]).hypot(at[1] - h.center[1]) <= r + 0.1
+            && at[2] > h.z + 0.01
+            && at[2] <= h.z + h.depth + 0.01
+    })
 }
 fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;
     if get(&tool.p, "type") != "Drill" {
         return Err("Choose a drill for a drilling cycle.".into());
     }
-    let mut holes = if op.drills_pin_holes() {
-        let pins = setup
-            .preview_pin_holes
-            .clone()
-            .unwrap_or_else(|| Err("Pin holes are worked out as the job is simulated.".into()))?;
-        let diameter = b.plan.radius * 2.;
-        if let Some(p) = pins.first() {
-            let fit = crate::post::PIN_FIT;
-            if diameter < p.diameter - 0.001 {
-                return Err(format!(
-                    "The Ø{:.2} drill is smaller than the Ø{:.2} pins: the part would not drop over them. Choose a drill of Ø{:.2} to Ø{:.2}.",
-                    diameter,
-                    p.diameter,
-                    p.diameter,
-                    p.diameter + fit
-                ));
-            }
-            if diameter > p.diameter + fit + 0.001 {
-                return Err(format!(
-                    "The Ø{:.2} drill is {:.2} mm wider than the Ø{:.2} pins: the part would move on them by that much. Choose a drill of Ø{:.2} to Ø{:.2}.",
-                    diameter,
-                    diameter - p.diameter,
-                    p.diameter,
-                    p.diameter,
-                    p.diameter + fit
-                ));
-            }
-        }
-        let through = get(&op.p, "through") == "Yes";
-        // Full diameter for the pin's height and 1 mm, the drill's point
-        // under that; or through the stock.
-        pins.iter()
-            .map(|p| Hole {
-                center: p.center,
-                diameter,
-                opening: diameter,
-                sagitta: 0.,
-                top: p.top,
-                bottom: if through {
-                    b.plan.stock.min[2]
-                } else {
-                    p.top
-                        - p.height
-                        - PIN_HOLE_EXTRA
-                        - b.plan.radius * crate::simulation::POINT_RISE
-                },
-                through,
-            })
-            .collect()
-    } else {
-        holes(setup, op, mesh)?
-    };
-    let filter = if op.p.contains_key("hole_diameter") && !op.drills_pin_holes() {
+    let mut holes = holes(setup, op, mesh)?;
+    let filter = if op.p.contains_key("hole_diameter") {
         number(op, "hole_diameter")?
     } else {
         0.
@@ -1640,6 +1605,28 @@ pub(crate) mod tests {
             }
         }
         t
+    }
+    #[test]
+    fn a_hole_open_below_is_as_deep_as_its_full_diameter_goes() {
+        // A Ø24 x 10 disc with a Ø8 hole up from its bottom: full diameter
+        // for 6 mm, then a 118° drill point up to its tip 2.4 mm higher.
+        let tip = 6. + 4. * 31f32.to_radians().tan();
+        let section = [
+            (0., 10.),
+            (12., 10.),
+            (12., 0.),
+            (4., 0.),
+            (4., 6.),
+            (0., tip),
+        ];
+        let mesh = mesh::normalize(revolved(&section)).unwrap();
+        let setup = Setup::new(Machine::new(3), "G54");
+        let holes = bottom_holes(&setup, &mesh).unwrap();
+        assert_eq!(holes.len(), 1, "{holes:?}");
+        let h = &holes[0];
+        assert!(!h.through && (h.diameter - 8.).abs() < 0.05, "{h:?}");
+        // Read where a pin's edge would meet the point, not at its tip.
+        assert!(h.depth > 6. && h.depth < 6.2, "{h:?}");
     }
     fn select_top(op: &mut Operation, mesh: &Mesh) {
         let top = mesh

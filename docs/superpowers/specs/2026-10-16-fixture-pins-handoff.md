@@ -13,6 +13,9 @@ Self-contained brief for an agent picking this up on another computer. Start fro
 - Never move the real machine unless the user is at it; test on the simulated UC100.
 
 
+## Changed after review (17 October 2026)
+The user: "the pins holes should be already part of the original design, in the app we should need to select the holes in the part". So the typed `pin1_x`/`pin1_y` of piece 3 and the drill source "Pin holes for <setup>" of piece 4 were replaced: the part's design has the holes, the Work zero step lists the round holes the part opens on its bottom and the user chooses them (in the list or by clicking them in the 3D view, setup key `pin_holes`); pin 1 is the chosen hole from which the plate puts every pin into another; an ordinary Drill on the face they open on drills them. See README "Fixture pins".
+
 ## Plan: Context
 Today every setup's X/Y work zero is found on the stock with Probe corner, edge or centre, or by hand. After a flip it has to be found again.
 

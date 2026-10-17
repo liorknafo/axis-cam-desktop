@@ -736,6 +736,53 @@ mod tests {
         )]
     }
     #[test]
+    fn a_fixture_pin_under_a_toolpath_is_hit_as_a_clamp_is() {
+        // Ø4 pins 6 mm tall from the stock's bottom at Z0, pin 1 under the
+        // tool's plunge.
+        let on = crate::post::OnPins {
+            pin1: [0., 0.],
+            places: vec![[0., 0.], [80., 0.]],
+            diameter: 4.,
+            height: 6.,
+        };
+        let stock = Bounds {
+            min: [-10., -10., 0.],
+            max: [10., 10., 10.],
+        };
+        let boxes = crate::holding::pin_boxes(Some(&on), stock);
+        let plunge = |z: f32| {
+            fixture::plan(
+                [-15., -15., 25.],
+                &[
+                    (Motion::Rapid, [0., 0., 25.], 6000.),
+                    (Motion::Feed, [0., 0., z], 250.),
+                    (Motion::Rapid, [0., 0., 25.], 6000.),
+                ],
+            )
+        };
+        let hits = walk(
+            Machine::new(3),
+            &[fixture::facing_op()],
+            &[&plunge(5.)],
+            &boxes,
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].starts_with("Face top: the tool hits the fixture pin 1 at X0.0 Y0.0"),
+            "{hits:?}"
+        );
+        // Above the pin's top and the 2 mm gap the plunge is clear.
+        assert!(
+            walk(
+                Machine::new(3),
+                &[fixture::facing_op()],
+                &[&plunge(8.5)],
+                &boxes
+            )
+            .is_empty()
+        );
+    }
+    #[test]
     fn a_feed_through_a_clamp_is_one_problem_for_the_tool_in_work_coordinates() {
         // The tool is Ø10 (reach 7 with the 2 mm gap), the holder Ø32 above 35 mm.
         let plan = fixture::plan(
