@@ -1683,6 +1683,20 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
+    /// The stock the run of the active setup has carved (`run::Run::stock`),
+    /// for the Control page's 3D view: MANUFACTURE keeps the part and the
+    /// planned stock.
+    pub fn live_stock(&self) -> Option<(&simulation::StockGrid, u64)> {
+        if self.page != Page::Control {
+            return None;
+        }
+        let r = self.control.as_ref()?.run.as_ref()?;
+        let setup = self.doc.setups.get(r.setup)?;
+        if setup.id != self.doc.active {
+            return None;
+        }
+        r.stock()
+    }
     /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
     /// out in the background, the Run panel's check of its setup included

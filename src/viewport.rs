@@ -159,6 +159,10 @@ pub struct Viewport<'a> {
     /// The machine's tool while a tool run of this setup cuts: its tip in
     /// plan coordinates (mm), radius and stickout. Drawn over the scene.
     pub live: Option<([f32; 3], f32, f32)>,
+    /// The stock a run of this setup has carved, or starts from, in plan
+    /// coordinates (`run::Run::stock`) with its version: drawn instead of the
+    /// setup's stock when no simulation is shown.
+    pub live_stock: Option<(&'a crate::simulation::StockGrid, u64)>,
     /// Per face of the part (`Mesh::faces`): whether the whole job still
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
@@ -439,10 +443,11 @@ impl Viewport<'_> {
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             self.holding,
             self.leftover,
             self.live,
+            self.live_stock.map(|(g, v)| (std::ptr::from_ref(g), v)),
             self.uncut.first().map(std::ptr::from_ref),
             self.uncut.len(),
             self.show_uncut
@@ -487,7 +492,8 @@ impl Viewport<'_> {
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
         // Only the faces still under stock are drawn then, after the stock.
-        let behind_stock = self.simulation.is_some() && self.show_stock;
+        let carved = self.simulation.is_none() && self.show_stock && self.live_stock.is_some();
+        let behind_stock = (self.simulation.is_some() && self.show_stock) || carved;
         let faces = if behind_stock && !self.show_uncut {
             vec![]
         } else {
@@ -589,8 +595,36 @@ impl Viewport<'_> {
                 }
             }
         }
-        if let Some(simulation) = self.simulation {
-            self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio);
+        if self.simulation.is_some() || carved {
+            match (self.simulation, self.live_stock) {
+                (Some(simulation), _) => {
+                    self.raster_simulation(simulation, p, &mut rgba, &mut depths, w, h, ratio)
+                }
+                (None, Some((grid, _))) => {
+                    let scale = self.mesh.display_scale();
+                    let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
+                        let v: Vec<_> = (points.iter())
+                            .map(|v| {
+                                let v = v.map(|n| n * scale);
+                                let q = p.p(v);
+                                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                            })
+                            .collect();
+                        for i in 1..v.len() - 1 {
+                            raster_triangle(
+                                &mut rgba,
+                                &mut depths,
+                                w,
+                                h,
+                                [v[0], v[i], v[i + 1]],
+                                color,
+                            );
+                        }
+                    };
+                    grid_faces(grid, &mut face);
+                }
+                (None, None) => {}
+            }
             for (fi, face) in faces.iter().enumerate() {
                 if !behind_stock || self.uncut.get(fi) != Some(&true) {
                     continue;
@@ -793,95 +827,7 @@ impl Viewport<'_> {
             }
         }
         if self.show_stock && sim.volume.is_none() {
-            let g = &sim.stock;
-            for y in 0..g.ny {
-                for x in 0..g.nx {
-                    let z = g.heights[y * g.nx + x];
-                    let a = g.bounds.min[0] + x as f32 * g.dx;
-                    let b = a + g.dx;
-                    let c = g.bounds.min[1] + y as f32 * g.dy;
-                    let d = c + g.dy;
-                    let cut = z < g.bounds.max[2] - 0.0001;
-                    face(
-                        &[[a, c, z], [b, c, z], [b, d, z], [a, d, z]],
-                        if cut {
-                            [103, 181, 151, 255]
-                        } else {
-                            [219, 183, 113, 255]
-                        },
-                    );
-                    for (adjacent, edge, tone) in [
-                        (
-                            if x == 0 {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[y * g.nx + x - 1]
-                            },
-                            [[a, c, z], [a, d, z]],
-                            0,
-                        ),
-                        (
-                            if x + 1 == g.nx {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[y * g.nx + x + 1]
-                            },
-                            [[b, c, z], [b, d, z]],
-                            1,
-                        ),
-                        (
-                            if y == 0 {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[(y - 1) * g.nx + x]
-                            },
-                            [[a, c, z], [b, c, z]],
-                            1,
-                        ),
-                        (
-                            if y + 1 == g.ny {
-                                g.bounds.min[2]
-                            } else {
-                                g.heights[(y + 1) * g.nx + x]
-                            },
-                            [[a, d, z], [b, d, z]],
-                            0,
-                        ),
-                    ] {
-                        if adjacent < z - 0.00001 {
-                            face(
-                                &[
-                                    edge[0],
-                                    edge[1],
-                                    [edge[1][0], edge[1][1], adjacent],
-                                    [edge[0][0], edge[0][1], adjacent],
-                                ],
-                                if cut {
-                                    if tone == 0 {
-                                        [70, 135, 115, 255]
-                                    } else {
-                                        [86, 155, 129, 255]
-                                    }
-                                } else if tone == 0 {
-                                    [157, 127, 78, 255]
-                                } else {
-                                    [183, 149, 88, 255]
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            let z = g.bounds.min[2];
-            face(
-                &[
-                    [g.bounds.min[0], g.bounds.min[1], z],
-                    [g.bounds.max[0], g.bounds.min[1], z],
-                    [g.bounds.max[0], g.bounds.max[1], z],
-                    [g.bounds.min[0], g.bounds.max[1], z],
-                ],
-                [148, 121, 76, 255],
-            );
+            grid_faces(&sim.stock, &mut face);
         }
         let pos = sim.position;
         // Cylinders use the saved cutter diameter, flute length and stickout.
@@ -1899,6 +1845,105 @@ fn paths(s: Strategy) -> Vec<Vec<[f32; 3]>> {
             .collect(),
     }
 }
+/// The faces of the stock grid `g` (plan mm): its top, cut cells green; the
+/// steps between cells of different heights, green as they were cut; its
+/// sides and bottom in the stock's colours.
+fn grid_faces(g: &crate::simulation::StockGrid, face: &mut impl FnMut(&[[f32; 3]], [u8; 4])) {
+    for y in 0..g.ny {
+        for x in 0..g.nx {
+            let z = g.heights[y * g.nx + x];
+            let a = g.bounds.min[0] + x as f32 * g.dx;
+            let b = a + g.dx;
+            let c = g.bounds.min[1] + y as f32 * g.dy;
+            let d = c + g.dy;
+            let cut = z < g.bounds.max[2] - 0.0001;
+            face(
+                &[[a, c, z], [b, c, z], [b, d, z], [a, d, z]],
+                if cut {
+                    [103, 181, 151, 255]
+                } else {
+                    [219, 183, 113, 255]
+                },
+            );
+            for (adjacent, edge, tone, outer) in [
+                (
+                    if x == 0 {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[y * g.nx + x - 1]
+                    },
+                    [[a, c, z], [a, d, z]],
+                    0,
+                    x == 0,
+                ),
+                (
+                    if x + 1 == g.nx {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[y * g.nx + x + 1]
+                    },
+                    [[b, c, z], [b, d, z]],
+                    1,
+                    x + 1 == g.nx,
+                ),
+                (
+                    if y == 0 {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[(y - 1) * g.nx + x]
+                    },
+                    [[a, c, z], [b, c, z]],
+                    1,
+                    y == 0,
+                ),
+                (
+                    if y + 1 == g.ny {
+                        g.bounds.min[2]
+                    } else {
+                        g.heights[(y + 1) * g.nx + x]
+                    },
+                    [[a, d, z], [b, d, z]],
+                    0,
+                    y + 1 == g.ny,
+                ),
+            ] {
+                if adjacent < z - 0.00001 {
+                    face(
+                        &[
+                            edge[0],
+                            edge[1],
+                            [edge[1][0], edge[1][1], adjacent],
+                            [edge[0][0], edge[0][1], adjacent],
+                        ],
+                        // A step between cells was cut; the block's own
+                        // sides are stock under any cut on top.
+                        if !outer {
+                            if tone == 0 {
+                                [70, 135, 115, 255]
+                            } else {
+                                [86, 155, 129, 255]
+                            }
+                        } else if tone == 0 {
+                            [157, 127, 78, 255]
+                        } else {
+                            [183, 149, 88, 255]
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let z = g.bounds.min[2];
+    face(
+        &[
+            [g.bounds.min[0], g.bounds.min[1], z],
+            [g.bounds.max[0], g.bounds.min[1], z],
+            [g.bounds.max[0], g.bounds.max[1], z],
+            [g.bounds.min[0], g.bounds.max[1], z],
+        ],
+        [148, 121, 76, 255],
+    );
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1927,6 +1972,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -1995,6 +2041,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &all,
             show_uncut: true,
         };
@@ -2044,6 +2091,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &all,
             show_uncut: true,
         };
@@ -2104,6 +2152,7 @@ mod tests {
                 holding: vec![],
                 leftover: None,
                 live: None,
+                live_stock: None,
                 uncut,
                 show_uncut: true,
             }
@@ -2146,6 +2195,7 @@ mod tests {
             holding: vec![],
             leftover,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2221,6 +2271,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2354,6 +2405,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2447,6 +2499,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2505,6 +2558,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2550,6 +2604,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2596,6 +2651,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2633,6 +2689,7 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2726,6 +2783,7 @@ mod tests {
             holding,
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };

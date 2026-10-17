@@ -6,6 +6,7 @@ use crate::control::Connection;
 use crate::mesh::Mesh;
 use crate::model::Document;
 use crate::post::{Block, Checked, Kind, OFFSETS, Partly, PostSettings, clearance_plane, extents};
+use crate::simulation::{CutterShape, StockGrid};
 use std::sync::Arc;
 use uc100::controller::{Command, State};
 use uc100::gcode::{Action as Do, Located, Spindle};
@@ -120,6 +121,36 @@ pub struct Run {
     pub pictures: Vec<(usize, iced::widget::image::Handle)>,
     /// The stock the check left, until it is pictured (`App::picture_run`).
     pub left: Option<Arc<Left>>,
+    /// The stock before each operation of the setup, from the check
+    /// (`Left::before`): where the live carve starts.
+    pub before: Arc<Vec<OpStock>>,
+    /// The stock as the machine's tool has cut it during this run's tool
+    /// runs (`carve`), from the stock before the operation the first started
+    /// at. None until a tool run moves, and again once the start is changed.
+    pub carving: Option<Carving>,
+}
+
+/// The stock before an operation of the setup being run, seen from above,
+/// and the shape of its cutter.
+#[derive(Debug, Clone)]
+pub struct OpStock {
+    /// The operation's index in the setup.
+    pub op: usize,
+    pub stock: StockGrid,
+    pub shape: CutterShape,
+}
+
+/// The stock a run's tool runs have cut, as the machine's tool moved: each
+/// tick, the moves of the program it has passed since the last tick whole,
+/// the move it is on up to the tool's tip, and the tool where it is.
+#[derive(Debug, Clone)]
+pub struct Carving {
+    pub stock: StockGrid,
+    /// The block of the running blocks at the last sample: None between
+    /// tool runs, so that a jog then does not cut.
+    last: Option<usize>,
+    /// Counts the cuts, for the 3D view's redraw.
+    pub version: u64,
 }
 
 impl Run {
@@ -145,7 +176,154 @@ impl Run {
             outcome: None,
             pictures: vec![],
             left: None,
+            before: Arc::new(vec![]),
+            carving: None,
         }
+    }
+
+    /// Cuts the stock the tool has gone through since the last sample, while
+    /// a tool run runs (`live`): every move of the program from the one it
+    /// was on (from the first block at the tool run's first sample) up to
+    /// the one it is on now, that one up to the tool's tip, and the tool
+    /// where it is. So a tick that comes late still cuts every pass. The
+    /// move it is on is the one nearest the tip up to the driver's line,
+    /// which runs ahead of the tool by its motion buffer. The first sample
+    /// of a run's first tool run starts from the stock before the operation
+    /// it started at.
+    pub fn carve(&mut self, s: &uc100::controller::Snapshot) {
+        let Some(live) = self.live(s) else {
+            if let Some(c) = &mut self.carving {
+                c.last = None;
+            }
+            return;
+        };
+        let Some((_, _, line)) = self.progress(s.current_line) else {
+            return;
+        };
+        if !self.start_carving() {
+            return;
+        }
+        let last = self.carving.as_ref().and_then(|c| c.last);
+        let now = self.nearest(last.unwrap_or(0), line, live.tip);
+        self.sweep(last, Some((now, live.tip)));
+        if let Some(c) = &mut self.carving {
+            c.last = Some(now);
+        }
+    }
+
+    /// The move of the running blocks `from..=to` nearest `tip`: the first
+    /// within a micron, else the nearest. `to` when none is a move.
+    fn nearest(&self, from: usize, to: usize, tip: [f32; 3]) -> usize {
+        let Some(blocks) = self.running_blocks() else {
+            return to;
+        };
+        let mut best = (to, f32::INFINITY);
+        for (i, block) in blocks.iter().enumerate().take(to + 1).skip(from) {
+            let Block::Move { from: a, to: b, .. } = block else {
+                continue;
+            };
+            let d: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
+            let length = d.iter().map(|v| v * v).sum::<f32>();
+            let t = if length < 1e-12 {
+                0.
+            } else {
+                ((0..3).map(|k| (tip[k] - a[k]) * d[k]).sum::<f32>() / length).clamp(0., 1.)
+            };
+            let gap = (0..3)
+                .map(|k| (a[k] + t * d[k] - tip[k]).powi(2))
+                .sum::<f32>();
+            if gap < 1e-6 {
+                return i;
+            }
+            if gap < best.1 {
+                best = (i, gap);
+            }
+        }
+        best.0
+    }
+
+    /// Starts the carve, unless it has: from the stock before the
+    /// operation the running tool run started at. Whether it is under way.
+    fn start_carving(&mut self) -> bool {
+        if self.carving.is_some() {
+            return true;
+        }
+        let first = (self.running.as_ref())
+            .and_then(|r| self.checked()?.get(r.index)?.indexes.get(r.from).copied());
+        let Some(b) = self.before.iter().find(|b| Some(b.op) == first) else {
+            return false;
+        };
+        self.carving = Some(Carving {
+            stock: b.stock.clone(),
+            last: None,
+            version: 0,
+        });
+        true
+    }
+
+    /// Cuts the rest of the running tool run's program from the last
+    /// sample (all of it without one): it ended, done, before a tick saw
+    /// its last moves.
+    fn finish_carve(&mut self) {
+        if self.start_carving() {
+            let last = self.carving.as_ref().and_then(|c| c.last);
+            self.sweep(last, None);
+        }
+    }
+
+    /// Cuts the moves of the running blocks from block `from` (None: the
+    /// first) up to `to` (block and tip; None: to the end), each with its
+    /// operation's cutter: those before `to`'s block whole, that one up to
+    /// the tip's place on it, and the cutter at the tip.
+    fn sweep(&mut self, from: Option<usize>, to: Option<(usize, [f32; 3])>) {
+        let (Some(blocks), Some(p)) = (
+            self.running_blocks(),
+            self.running
+                .as_ref()
+                .and_then(|r| self.checked()?.get(r.index)),
+        ) else {
+            return;
+        };
+        let ends = |b: usize| match blocks.get(b) {
+            Some(Block::Move { op, from, to, .. }) => Some((*op, *from, *to)),
+            _ => None,
+        };
+        let now = to.map_or(blocks.len(), |(b, _)| b);
+        let mut sweeps: Vec<_> = (from.unwrap_or(0)..now).filter_map(ends).collect();
+        if let (Some((_, tip)), Some((op, a, b))) = (to, ends(now)) {
+            // The tip's place on the move: the share of it done.
+            let d: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
+            let length = d.iter().map(|v| v * v).sum::<f32>();
+            let t = if length < 1e-12 {
+                1.
+            } else {
+                ((0..3).map(|k| (tip[k] - a[k]) * d[k]).sum::<f32>() / length).clamp(0., 1.)
+            };
+            sweeps.push((op, a, std::array::from_fn(|k| a[k] + t * d[k])));
+            sweeps.push((op, tip, tip));
+        }
+        let cutter = |op: usize| {
+            let shape = (self.before.iter())
+                .find(|b| Some(b.op) == p.indexes.get(op).copied())
+                .map_or(CutterShape::Flat, |b| b.shape);
+            (p.ops.get(op).map_or(0., |o| o.diameter / 2.), shape)
+        };
+        let sweeps: Vec<_> = (sweeps.into_iter())
+            .map(|(op, a, b)| (a, b, cutter(op)))
+            .collect();
+        if let Some(c) = &mut self.carving {
+            for (a, b, (radius, shape)) in sweeps {
+                c.stock.cut_shape(a, b, radius, shape);
+                c.version += 1;
+            }
+        }
+    }
+
+    /// The stock as this run's tool runs have cut it, once one has moved
+    /// (`carve`), with its version.
+    pub fn stock(&self) -> Option<(&StockGrid, u64)> {
+        let c = self.carving.as_ref()?;
+        Some((&c.stock, c.version))
     }
 
     /// A tool run has started: X/Y work zero is kept from then on.
@@ -201,6 +379,9 @@ impl Run {
         }
         self.zeroed = false;
         self.programs = Some(programs);
+        self.before = left
+            .as_ref()
+            .map_or_else(Default::default, |l| l.before.clone());
         self.left = left.filter(|_| self.checked().is_some());
         self.pictures.clear();
     }
@@ -232,6 +413,10 @@ impl Run {
             return;
         }
         if o.ok {
+            self.finish_carve();
+            let Some(r) = &self.running else {
+                return;
+            };
             self.done[r.index] = true;
             self.next = r.index + 1;
             self.from = 0;
@@ -541,6 +726,8 @@ impl Run {
         if self.running.is_none() && k < ops {
             (self.next, self.from) = (i, k);
             self.zeroed = false;
+            // The stock is the one this start finds again.
+            self.carving = None;
         }
     }
 }
@@ -693,7 +880,28 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
         .last()
         .filter(|(oi, _)| Some(*oi) == last)
         .and_then(|(oi, r)| Some((*oi, r.as_ref().ok()?.clone())));
-    (sims, Left { after, last })
+    let before = (sims.iter())
+        .filter_map(|(oi, r)| {
+            let sim = r.as_ref().ok()?;
+            let stock = match (&sim.initial_volume, sim.frame) {
+                (Some(v), Some(frame)) => StockGrid::from_volume(sim.plan.stock, v, frame),
+                _ => sim.initial_stock.clone(),
+            };
+            Some(OpStock {
+                op: *oi,
+                stock,
+                shape: sim.plan.shape,
+            })
+        })
+        .collect();
+    (
+        sims,
+        Left {
+            after,
+            last,
+            before: Arc::new(before),
+        },
+    )
 }
 
 /// The stock a run's check leaves after each operation of its setup, for
@@ -706,6 +914,9 @@ pub struct Left {
     /// The last operation's simulation, which `op_pictures` plays to its end:
     /// the check does not need the stock it leaves.
     pub last: Option<(usize, crate::simulation::Simulation)>,
+    /// The stock before each operation that could be generated on, seen
+    /// from above (`Run::before`).
+    pub before: Arc<Vec<OpStock>>,
 }
 
 /// How many stocks `op_pictures` meshes at once: each mesher also runs
@@ -1284,6 +1495,8 @@ mod tests {
             outcome: None,
             pictures: vec![],
             left: None,
+            before: Default::default(),
+            carving: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));

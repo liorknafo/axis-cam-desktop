@@ -124,6 +124,20 @@ impl Volume {
     pub fn point(&self, p: [usize; 3], offset: f32) -> [f32; 3] {
         std::array::from_fn(|k| self.bounds.min[k] + (p[k] as f32 + offset) * self.cell[k])
     }
+    /// Whether the voxel holding the point `p` of the frame `from` still has
+    /// material: false outside the stock.
+    pub fn filled(&self, p: [f32; 3], from: Frame) -> bool {
+        let q = from.transfer(p, self.frame);
+        let mut at = [0; 3];
+        for k in 0..3 {
+            let i = ((q[k] - self.bounds.min[k]) / self.cell[k]).floor();
+            if !(0. ..self.n[k] as f32).contains(&i) {
+                return false;
+            }
+            at[k] = i as usize;
+        }
+        self.occupied[self.index(at)] != 0
+    }
     pub fn removed_volume(&self) -> f32 {
         (self.occupied.len() - self.remaining) as f32 * self.cell.iter().product::<f32>()
     }

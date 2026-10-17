@@ -1837,6 +1837,7 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         holding: holding_boxes(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
+        live_stock: app.live_stock(),
         uncut: job_uncut(app)
             .and_then(|found| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
@@ -4997,7 +4998,7 @@ fn control(app: &App) -> Element<'_, Message> {
                 "Job",
                 column![
                     container(view).height(360),
-                    muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts."),
+                    muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes."),
                     uncut_line(app).map(muted),
                     uncut_legend(app)
                 ],
@@ -7705,6 +7706,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             holding: vec![],
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         }
