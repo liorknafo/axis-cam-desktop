@@ -575,10 +575,18 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // 2. Passes along the longer side.
     let size = |k: usize| high[k].min(s.max[k]) - low[k].max(s.min[k]);
     let (p, c) = if size(0) >= size(1) { (0, 1) } else { (1, 0) };
-    // The stepdown: given, or what the spindle takes at a full stepover.
+    // The stepdown: given, or what the spindle takes at a full stepover,
+    // at the operation's rpm with the tool's flutes. The project's material
+    // does not reach `generate`: it is counted as steel, the hardest common
+    // group but stainless.
     let width = stepover / 100. * 2. * r;
     let down = if get(&op.p, "stepdown").trim().is_empty() {
-        crate::forces::power_stepdown(&setup.machine, None, 2. * r, width, b.feed)
+        let rpm = number(op, "rpm").ok().filter(|n| *n > 0.);
+        let flutes = num(&tool.p, "flutes").filter(|z| *z >= 1.);
+        let (Some(rpm), Some(flutes)) = (rpm, flutes) else {
+            return Err("An automatic stepdown needs a positive rpm and the tool's flutes.".into());
+        };
+        crate::forces::power_stepdown(&setup.machine, None, 2. * r, width, b.feed, rpm, flutes)
             .min(b.plan.flute_length)
     } else {
         number(op, "stepdown")?
@@ -2625,12 +2633,28 @@ pub(crate) mod tests {
         // The closed floor keeps 0.5: four of 2.25 down to −9.
         let plan = boxed_plan(deep, &[("stepdown", "2.5")]).unwrap();
         assert_eq!(levels(&plan), [-2.25, -4.5, -6.75, -9.]);
-        // Automatic: what the 800 W spindle takes at 17.5 mm wide (9.41 mm),
-        // here below the flute length and the diameter, so two of 4.75.
-        let auto = crate::forces::power_stepdown(&crate::manual::defaults(), None, 25., 17.5, 120.);
-        assert!(auto > 4.75 && auto <= 25. && auto <= 40., "{auto}");
+        // Automatic: what the 800 W spindle takes at 17.5 mm wide in steel
+        // with the 0.0625 mm chip of 120 mm/min at 640 rpm on 3 flutes
+        // (4.71 mm), here below the flute length and the diameter, so three
+        // of 9.5 / 3.
+        let (setup, op, tool) = big_mill(deep);
+        assert_eq!(
+            [
+                num(&op.p, "rpm"),
+                num(&op.p, "feed"),
+                num(&tool.p, "flutes")
+            ],
+            [Some(640.), Some(120.), Some(3.)]
+        );
+        let auto = crate::forces::power_stepdown(&setup.machine, None, 25., 17.5, 120., 640., 3.);
+        assert!((auto - 4.7059).abs() < 0.001, "{auto}");
         let plan = boxed_plan(deep, &[("allowance", "0")]).unwrap();
-        assert_eq!(levels(&plan), [-4.75, -9.5]);
+        let z = levels(&plan);
+        assert_eq!((z.len(), z[2]), (3, -9.5), "{z:?}");
+        assert!((z[0] + 9.5 / 3.).abs() < 1e-4, "{z:?}");
+        // Without the rpm or the flutes it cannot say.
+        let error = boxed_plan(deep, &[("rpm", "")]).unwrap_err();
+        assert!(error.contains("automatic stepdown"), "{error}");
         // Capped at 4 mm flutes: three of 9.5 / 3.
         let (setup, mut op, mut tool) = big_mill(deep);
         tool.p.insert("length".into(), "4".into());
