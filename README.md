@@ -391,11 +391,11 @@ These are placeholders until you enter your machine's numbers. On save the machi
 
 ### Tools and vises are marked per machine
 
-A tool and a library vise or clamp set have a check box for each machine that holds them. With none checked, the entry fits every CNC machine and no manual machine, so existing tools and vises keep working on the CNC and do not show on the manual mill. An operation whose tool does not fit its setup's machine has an operation issue, and the plan check stops on it. The vise picker lists only holders that fit the setup's machine.
+A tool and a library vise or clamp set have a check box for each machine that holds them. With none checked, the entry fits every CNC machine and no manual machine, so existing tools and vises keep working on the CNC and do not show on the manual mill. An operation whose tool does not fit its setup's machine has an operation issue, and the plan check stops on it. The vise picker lists only holders that fit the setup's machine. A setup whose vise or clamps do not fit its machine has a workholding problem ("100 mm machine vise is not on Manual Mill.").
 
 ### + Add manual setup
 
-**+ Add manual setup** on the setup list adds a setup on a manual machine from the library, before the first CNC setup. When it becomes the first setup it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock the manual setup leaves. Later manual setups go before the first CNC setup; they can be moved, for example to face the bottom after a flip.
+**+ Add manual setup** on the setup list adds a setup on a manual machine from the library, before the first CNC setup. When it becomes the first setup it takes the stock, orientation, zero and holding of the old first setup (the holding only when its vise or clamps fit the manual machine; otherwise the manual setup starts with none), which then starts from the stock the manual setup leaves. Later manual setups go before the first CNC setup; they can be moved, for example to face the bottom after a flip.
 
 Only **Box** and **Drill** can run on a manual setup. The ribbon dims the other strategies there, and a plan that puts one on a manual setup is refused. Box is refused on a CNC setup.
 

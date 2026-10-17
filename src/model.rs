@@ -191,6 +191,16 @@ pub const FEATURES: [&str; 9] = [
 
 /// The setup keys a manual setup put first takes from the old first setup,
 /// besides its stock: orientation, zero, offset and holding.
+/// The keys of a setup's vise or clamps.
+const HOLDING: [&str; 7] = [
+    "holding",
+    "holder",
+    "holding_gap",
+    "vise_axis",
+    "vise_offset",
+    "vise_grip",
+    "clamps",
+];
 const HANDED_OVER: [&str; 17] = [
     "rx",
     "ry",
@@ -1483,6 +1493,12 @@ impl Document {
         } else if !kind.is_empty() && entry.is_none() {
             issues.push(DELETED.into());
         }
+        if !kind.is_empty()
+            && let Some(entry) = entry
+            && !crate::manual::fits(get(&entry.p, "machines"), &s.machine)
+        {
+            issues.push(format!("{} is not on {}.", entry.name(), s.machine.name()));
+        }
         // The jaws and clamps are boxes along the axes of setup 1's frame, which
         // a later setup turned from it by another angle does not share.
         let square = self
@@ -1806,8 +1822,14 @@ impl Document {
         setup.p.insert("name".into(), "Big mill".into());
         match (at, self.setups.first()) {
             (0, Some(old)) => {
+                // A vise or clamps not on the manual mill stay behind.
+                let fits = (self.holder(get(&old.p, "holder")))
+                    .is_none_or(|h| crate::manual::fits(get(&h.p, "machines"), machine));
                 for (k, v) in &old.p {
-                    if HANDED_OVER.contains(&k.as_str()) || k.starts_with("stock_") {
+                    let holding = HOLDING.contains(&k.as_str());
+                    if (HANDED_OVER.contains(&k.as_str()) && (fits || !holding))
+                        || k.starts_with("stock_")
+                    {
                         setup.p.insert(k.clone(), v.clone());
                     }
                 }
@@ -3503,6 +3525,81 @@ mod manual_setups {
         assert_eq!(d.active, old);
         assert_eq!(d.index(), 1);
         assert_eq!(d.issues(), Vec::<String>::new());
+    }
+    #[test]
+    fn a_manual_setup_put_first_leaves_a_cnc_vise_behind() {
+        let mut d = with_manual();
+        d.adopt_holders();
+        let vise = (d.workholding.iter())
+            .find(|h| h.kind() == "Vise")
+            .unwrap()
+            .id
+            .clone();
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", &vise),
+            ("vise_axis", "Y"),
+            ("vise_grip", "8"),
+        ] {
+            d.setup_mut().p.insert(k.into(), v.into());
+        }
+        let was = d.setups[0].clone();
+        d.add_manual_setup().unwrap();
+        // The vise fits every CNC machine and no manual one: not copied.
+        let (new, kept) = (&d.setups[0], &d.setups[1]);
+        for k in HOLDING {
+            assert_eq!(get(&new.p, k), "", "{k}");
+            assert_eq!(get(&kept.p, k), get(&was.p, k), "{k}");
+        }
+        assert_eq!(get(&new.p, "origin"), get(&was.p, "origin"));
+        assert_eq!(stock(new), stock(&was));
+        assert!(d.holding_issues(0, None).is_empty());
+        // Marked for the manual mill too, it goes with the stock.
+        let mut d = with_manual();
+        d.adopt_holders();
+        let manual = d.machines.last().unwrap().id.clone();
+        for h in &mut d.workholding {
+            h.p.insert("machines".into(), format!("{},{manual}", was.machine.id));
+        }
+        d.setups[0].p = was.p.clone();
+        d.add_manual_setup().unwrap();
+        for k in ["holding", "holder", "vise_axis", "vise_grip"] {
+            assert_eq!(get(&d.setups[0].p, k), get(&was.p, k), "{k}");
+        }
+    }
+    #[test]
+    fn a_holder_not_on_the_setups_machine_is_a_workholding_issue() {
+        let mut d = with_manual();
+        d.adopt_holders();
+        let vise = (d.workholding.iter())
+            .find(|h| h.kind() == "Vise")
+            .unwrap()
+            .clone();
+        for (k, v) in [
+            ("holding", "Vise"),
+            ("holder", vise.id.as_str()),
+            ("vise_grip", "8"),
+        ] {
+            d.setup_mut().p.insert(k.into(), v.into());
+        }
+        let not_on = |d: &Document, si: usize| {
+            let issue = format!("{} is not on {}.", vise.name(), d.setups[si].machine.name());
+            d.holding_issues(si, None).contains(&issue)
+        };
+        assert!(!not_on(&d, 0));
+        // Only on the manual mill: not on the CNC.
+        let manual = d.machines.last().unwrap().clone();
+        for h in &mut d.workholding {
+            h.p.insert("machines".into(), manual.id.clone());
+        }
+        assert!(not_on(&d, 0), "{:?}", d.holding_issues(0, None));
+        // A manual setup with it is fine; with a CNC-only vise it is not.
+        d.setups[0].machine = manual;
+        assert!(!not_on(&d, 0), "{:?}", d.holding_issues(0, None));
+        for h in &mut d.workholding {
+            h.p.insert("machines".into(), String::new());
+        }
+        assert!(not_on(&d, 0), "{:?}", d.holding_issues(0, None));
     }
     #[test]
     fn a_second_manual_setup_goes_before_the_first_cnc_setup() {
