@@ -1013,6 +1013,18 @@ The Machine library could save 4 axes but not where the rotary sits; the owner's
 - `run::tests::a_range_that_matches_…`, `…differs_from_the_profiles_a_soft_limits_is_refused`, `a_machine_with_an_a_axis_on_a_profile_without_one_is_refused`, `a_machine_without_an_a_axis_is_not_asked_about_a`: A is checked in Cycle Start's problems (`run::a_problems`) with both ends of the range; the XYZ checks are unchanged.
 - Not validated: the form in the window, the library button on screen, and anything on the real machine. The geometry and the profile's A axis are assumed, not measured.
 
+## Indexed setups: A turns the stock in one clamping (LIO-188, 18 October 2026)
+
+"Index rotary axis" was a label: every later setup was a re-clamp with its own probed origin.
+
+- `indexed::tests::positive_a_turns_the_part_by_the_right_hand_rule_about_x`: at A90 +Y goes to +Z and +Z to −Y about the centreline, which stays put (clockwise seen from the chuck along +X), the sense of the driver's `Bar` and of the chuck's jaw 1; a Negative machine turns the other way. `turned_angles_turn_as_the_placement_then_a_does`: the placement's angles followed by A compose exactly, at Y ±90° too.
+- `an_indexed_setup_turns_setup_1s_frame_about_the_centreline_and_keeps_work_zero`: on a Ø40 × 120 bar in the chuck, setup 2 indexed to 90 and 180 takes setup 1's work zero, offset, chuck and placement; `Document::at_angle` at A0 is setup 1's frame and at A90 turns every point of the part about the axis (Y0 Z20), work coordinates (x, y, z) to (x, −z, y); the work zero (A axis at stock end, X60 Y0 Z20) is the same at each angle and on the machine is the rotary unit's centreline (Y140 Z−40) and X 85, 40 mm stick-out and 25 mm jaws out from the face at X20; the setup's own frame, placement and datum match A90.
+- `a_re_clamp_after_indexed_setups_keeps_its_own_placement`: a Reclamp setup after an indexed one keeps its own rotation and work zero, a setup indexed after it turns its frame, and indexing the first setup is refused. `angles_are_listed_in_degrees`: lists by commas, slashes or spaces, refused when empty, not numbers or repeated, and outside the machine's A range or on a machine without A.
+- `indexed_setups_warn_while_the_centreline_is_not_measured`: assumed and stale (from the machine library's mark) are warned, measured is not.
+- `a_label_only_index_from_an_older_project_keeps_its_own_placement`, `storage::tests::a_project_with_index_rotary_axis_as_a_label_loads_unchanged`: a project saved before keeps its setup, frame and placement, and saves back to the same file.
+- `post::tests::an_indexed_setup_is_not_exported`: the export refuses it, as programs do not command A yet.
+- Not validated: anything on the machine; the frame is not used yet to generate or simulate cuts at each angle (LIO-189, LIO-190).
+
 ## Rotary calibration: the A centreline, A zero and the line to the tailstock (LIO-186, 18 October 2026)
 
 Indexed cuts need A's centreline in machine Y and Z: an error of e mm puts a feature cut at A 180° off by 2e. The driver's simulator could only place still boxes, so UC100-driver PR #2 added `SimBars`: round bars on A that turn with it, on an axis that may be off and tilted, running out, with a flat (`a_bar_on_the_a_axis_is_touched_where_it_turns_to`, `a_flat_on_the_bar_turns_with_a` there).

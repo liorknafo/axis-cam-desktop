@@ -1168,6 +1168,10 @@ pub struct Setup {
     pub preview_stock: Option<crate::mesh::Bounds>,
     #[serde(skip)]
     pub preview_remaining: Option<std::sync::Arc<crate::rest::RestStock>>,
+    /// How A turns the part of an indexed setup from its base's placement
+    /// (`indexed`), worked out by `Document::sync_turns`; None otherwise.
+    #[serde(skip)]
+    pub turn: Option<crate::indexed::Turn>,
     pub id: String,
     pub machine: Machine,
     pub p: Fields,
@@ -1178,6 +1182,7 @@ impl Setup {
         Self {
             preview_stock: None,
             preview_remaining: None,
+            turn: None,
             id: id(),
             machine,
             p: fields(&[
@@ -1228,9 +1233,15 @@ impl Setup {
         s
     }
     pub fn is_repositioned(&self) -> bool {
-        ["rx", "ry", "rz", "tx", "ty", "tz"]
-            .iter()
-            .any(|k| num(&self.p, k).unwrap_or(0.).abs() > 0.001)
+        // An indexed setup turned by A, other than a whole turn.
+        let turned = self.turn.is_some_and(|t| {
+            let r = t.turn.rem_euclid(360.);
+            r > 0.001 && r < 359.999
+        });
+        turned
+            || ["rx", "ry", "rz", "tx", "ty", "tz"]
+                .iter()
+                .any(|k| num(&self.p, k).unwrap_or(0.).abs() > 0.001)
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = self.machine.issues();
@@ -1245,6 +1256,7 @@ impl Setup {
             finite(&self.p, k, &mut e)
         }
         nonnegative(&self.p, "clearance", &mut e);
+        e.extend(crate::indexed::issues(self));
         // The machine's own issues say what is wrong with the pins.
         if crate::control::pins_settings(&self.machine.p).is_ok() {
             e.extend(crate::post::pins_issue(self));
@@ -1609,6 +1621,13 @@ impl Document {
         setup: &Setup,
         stock: crate::mesh::Bounds,
     ) -> Result<crate::chuck::Rig, String> {
+        // An indexed setup's chuck is its base's, round the stock it starts
+        // from, turned to the setup's A angle where it is drawn and checked.
+        if let Some(t) = setup.turn
+            && let Some(base) = self.setups.get(t.base)
+        {
+            return self.chuck_rig(base, t.stock);
+        }
         let round = self.setups.first().is_some_and(|first| {
             crate::stock::round_bar(first)
                 && ["rx", "ry", "rz"]
@@ -1826,9 +1845,11 @@ impl Document {
             return Err(issue);
         }
         if crate::chuck::holds(setup) {
-            // Today's operations all run at A0 (`chuck::Rig::hits_at` at any
-            // other angle).
-            return Ok(self.chuck_rig(setup, held.stock)?.boxes(0.));
+            // Operations run at A0 (`chuck::Rig::hits_at` at any other
+            // angle), an indexed setup's at its first A angle, as its 3D
+            // view shows it.
+            let a = setup.turn.map_or(0., |t| t.a);
+            return Ok(self.chuck_rig(setup, held.stock)?.boxes(a));
         }
         let layout = crate::holding::layout(setup)?;
         match self.holder(get(&setup.p, "holder")) {
@@ -2070,6 +2091,7 @@ impl Document {
             setup.p.insert("stock_source".into(), source);
             source = setup.id.clone();
         }
+        self.sync_indexed();
     }
     pub fn validate_order(&self, setups: &[Setup]) -> Result<(), String> {
         let mut seen = HashSet::new();
@@ -2240,7 +2262,7 @@ impl Document {
                 get(&setup.p, "tx"),
                 get(&setup.p, "ty"),
                 get(&setup.p, "tz"),
-                get(&setup.p, "reposition"),
+                self.reposition_text(i),
                 requested,
                 get(&setup.p, "notes")
             );

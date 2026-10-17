@@ -88,7 +88,26 @@ pub struct Placement {
     pub bounds: Bounds,
 }
 impl Placement {
+    /// The part placed as `setup` places it, turned by A when the setup is
+    /// indexed (`Setup::turn`): its base's placement turned about the A
+    /// centreline.
     pub fn new(mesh: &Mesh, setup: Option<&Setup>) -> Self {
+        let placed = Self::unturned(mesh, setup);
+        let Some(t) = setup.and_then(|s| s.turn) else {
+            return placed;
+        };
+        let axis = t.axis.map(|v| v * mesh.display_scale());
+        let angles = crate::indexed::turned_angles(placed.angles, t.turn);
+        let shift = crate::indexed::turn_point(placed.shift, axis, t.turn);
+        Self {
+            angles,
+            shift,
+            bounds: mesh.rotated_bounds(angles).translated(shift),
+        }
+    }
+    /// The part placed by `setup`'s own rotation and translation: an
+    /// indexed setup's base's placement, before A turns it.
+    pub fn unturned(mesh: &Mesh, setup: Option<&Setup>) -> Self {
         let angles = ["rx", "ry", "rz"].map(|k| setup.and_then(|s| num(&s.p, k)).unwrap_or(0.));
         let t = ["tx", "ty", "tz"]
             .map(|k| setup.and_then(|s| num(&s.p, k)).unwrap_or(0.) * mesh.display_scale());

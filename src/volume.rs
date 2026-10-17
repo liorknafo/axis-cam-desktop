@@ -21,9 +21,24 @@ impl Frame {
             ..Self::axes(setup)
         }
     }
-    /// The axes of `setup`'s frame, which its rotation alone gives, at no shift.
+    /// This frame with the part turned about the line along X through Y, Z
+    /// `axis` (mm) by `turn` degrees, by the right-hand rule about +X: an
+    /// indexed setup's frame at an A angle (`indexed`).
+    pub fn turned(self, axis: [f32; 2], turn: f32) -> Self {
+        let turn_axis = |v| crate::indexed::turn_point(v, [0., 0.], turn);
+        Self {
+            basis: self.basis.map(turn_axis),
+            shift: crate::indexed::turn_point(self.shift, axis, turn),
+        }
+    }
+    /// The axes of `setup`'s frame, which its rotation alone gives (turned
+    /// by A for an indexed setup), at no shift.
     fn axes(setup: &Setup) -> Self {
         let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+        let angles = match setup.turn {
+            Some(t) => crate::indexed::turned_angles(angles, t.turn),
+            None => angles,
+        };
         Self {
             basis: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|p| rotation(p, angles)),
             shift: [0.; 3],
