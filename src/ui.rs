@@ -476,6 +476,20 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     {
         checks.extend(problems.into_iter().map(|text| Check::new(text, false)));
     }
+    // A generated outside Contour that goes through the stock's bottom all
+    // the way round leaves the part loose for the cutter to throw.
+    if let Some(o) = app.operation()
+        && o.strategy == Strategy::Contour
+        && get(&o.p, "boundary") == "Model silhouette"
+        && pocket_setting(&o.p, "tabs") == CONTOUR_TABS[0]
+        && let Some(plan) = app.active_simulation().map(|s| &s.plan)
+        && plan.target <= plan.stock.min[2] + 0.001
+    {
+        checks.push(Check::new(
+            "Bottom offset takes the contour through the stock's bottom all the way round: the part comes loose and the cutter can throw it. Turn on Holding tabs, or raise Bottom offset to leave a skin.".into(),
+            false,
+        ));
+    }
     checks
 }
 /// The operation editor's tab a check's message is about: the one with the
@@ -500,7 +514,10 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
         Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
-        Some("clearance" | "retract" | "top" | "bottom" | "breakthrough") => "Heights",
+        Some(
+            "clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings" | "tab_count"
+            | "tab_width" | "tab_height",
+        ) => "Heights",
         Some(
             "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
             | "lead_angle" | "lean_angle",
@@ -1693,7 +1710,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
         return None;
     }
     let stock = app.known_stock(si).0?;
-    let jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+    let mut jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
         let held = app
             .known_held(si)
             .filter(|held| held.stock == stock)
@@ -1705,6 +1722,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     } else {
         vec![]
     };
+    jaws.extend(pin_boxes(app, setup, stock));
     // What the picture shows: the stock meshed, else its box, and the jaws.
     // A meshed stock is named by the job it was worked out for, not by its
     // address, which a later stock can take once this one is freed.
@@ -1751,6 +1769,37 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
     drawn.push((key, picture.clone()));
     Some(picture)
 }
+/// The part's holes offered for the fixture pins in the 3D view: shown
+/// while the Work zero step of a setup on the pins is open, each hole not
+/// chosen numbered as `pins_block` lists it.
+fn pin_hole_marks(app: &App) -> viewport::PinHolePick {
+    let open = app.page == Page::Work
+        && app.selected.is_none()
+        && app.setup_step == "Work zero"
+        && !app.is_sample();
+    let (true, Some(s), Some(mesh)) = (open, app.doc.active_setup(), app.part_mesh()) else {
+        return viewport::PinHolePick::default();
+    };
+    if !crate::post::sits_on_pins(s) {
+        return viewport::PinHolePick::default();
+    }
+    let pick = app.picking_pin_holes();
+    let holes = match &*app.bottom_holes(mesh) {
+        Ok(holes) => (holes.iter().enumerate())
+            .take(48)
+            .filter(|(_, h)| crate::post::chosen_index(s, mesh, h).is_none())
+            .map(|(i, h)| {
+                (
+                    i + 1,
+                    [h.center[0], h.center[1], h.z],
+                    h.diameter.max(h.opening) / 2.,
+                )
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+    viewport::PinHolePick { pick, holes }
+}
 /// The 3D view of the active setup, as MANUFACTURE shows it: the part,
 /// stock, workholding, the preview and the machine's tool while a tool run of
 /// the setup cuts. None without a part to show.
@@ -1763,7 +1812,8 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         simulation: app.active_simulation(),
         sample: app.is_sample(),
         camera: app.camera,
-        picking: app.picking,
+        picking: app.picking || app.picking_pin_holes(),
+        pin_holes: pin_hole_marks(app),
         show_stock: app.stock && s.is_some(),
         show_paths: app.paths && app.playback_ready(),
         progress: if app.operation().is_some_and(|o| o.preview) {
@@ -2410,7 +2460,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
             } else if !app.is_sample() && o.strategy == Strategy::Pocket {
-                "Cutting starts from the remaining stock after earlier operations, plus positive Top offset. A fully faced-off layer is skipped; uncut regions keep the higher start. Bottom offset and axial stock to leave are added to the selected floor. Clearance/retract stay referenced to the original stock top."
+                "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
             } else if !app.is_sample() && o.strategy==Strategy::Contour && get(p,"boundary")=="Selected geometry" {
                 "Inside contour skips fully cleared top layers and ends at the selected floor + bottom offset. Negative bottom offsets are rejected. Profile ramp/plunge are configured in Linking; the pocket interior is not cleared. Clearance/retract retain the original stock reference."
             } else if !app.is_sample() && matches!(o.strategy, Strategy::Contour | Strategy::Waterline) {
@@ -2418,7 +2468,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             } else if !app.is_sample() && o.strategy == Strategy::Parallel {
                 "Bottom offset is added to the cutter-compensated surface height; stock to leave is a vertical offset. Top offset raises approach heights. Finishing starts with the stock left by the earlier roughing operations."
             } else if !app.is_sample() && o.strategy == Strategy::Drill {
-                "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal is cylindrical without the drill-point cone."
+                "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. With a chamfer mill each opening is countersunk instead: the point goes down until its cone is as wide as the opening at the rim. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal follows the drill's 118° point or the chamfer mill's cone."
             } else { "All heights are in the current setup coordinate system. Clearance/retract are measured above stock top; offsets are relative to selected geometry." }));
             if let Some(z) = app.active_simulation().and_then(|s| s.plan.rest_top) {
                 c = c.push(note(format!("Automatic cutting start: Z {z:.2} mm. Earlier cuts cover the material above this height.")));
@@ -2431,6 +2481,38 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             ] {
                 if o.strategy != Strategy::Box || !matches!(k, "top" | "bottom") {
                     c = c.push(checks.field(p, k, label));
+                }
+            }
+            if !app.is_sample()
+                && o.strategy == Strategy::Contour
+                && get(p, "boundary") == "Model silhouette"
+            {
+                c = c.push(choice_value(
+                    p,
+                    pocket_setting(p, "tabs"),
+                    "tabs",
+                    "Holding tabs",
+                    &CONTOUR_TABS,
+                    t,
+                ));
+                if pocket_setting(p, "tabs") == CONTOUR_TABS[1] {
+                    c = c
+                        .push(checks.field(p, "tab_count", "Tabs on each outline"))
+                        .push(checks.field(p, "tab_width", "Tab width · mm"))
+                        .push(checks.field(p, "tab_height", "Tab height · mm"));
+                }
+            }
+            if !app.is_sample() && o.strategy == Strategy::Pocket {
+                c = c.push(choice_value(
+                    p,
+                    pocket_setting(p, "openings"),
+                    "openings",
+                    "Openings through the floor",
+                    &POCKET_OPENINGS,
+                    t,
+                ));
+                if pocket_setting(p, "openings") == POCKET_OPENINGS[1] {
+                    c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
                 }
             }
             if o.strategy == Strategy::Drill {
@@ -2858,6 +2940,7 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
         "Work zero" => {
             !get(&s.p, "offset").is_empty()
                 && crate::post::references(get(&s.p, "origin")).is_some()
+                && crate::post::pins_issue(s).is_none()
                 && !app
                     .current_ready()
                     .and_then(|r| r.zero.as_ref())
@@ -3059,7 +3142,147 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
             &["G54", "G55", "G56", "G57", "G58", "G59"],
             t,
         ))
+        .push(pins_block(app, s))
         .push(zero_note(app))
+}
+/// The Work zero step's fixture pins: whether the setup sits on its
+/// machine's pins, the part's holes chosen to drop over them (one button
+/// per round hole it opens on its bottom), and where that puts every pin.
+/// Shown when the machine has pins or the setup sits on them.
+fn pins_block<'a>(app: &'a App, s: &'a Setup) -> Element<'a, Message> {
+    let (p, t) = (&s.p, Target::Setup);
+    let pins = crate::control::pins_settings(&s.machine.p);
+    let on = crate::post::sits_on_pins(s);
+    if !on && !matches!(pins, Ok(Some(_))) {
+        return column![].into();
+    }
+    let mut c = column![choice_value(
+        p,
+        if on { "Yes" } else { "No" },
+        "on_pins",
+        "Sits on the fixture pins",
+        &["No", "Yes"],
+        t,
+    )]
+    .spacing(8);
+    if !on {
+        return c
+            .push(muted(
+                "Yes when the part drops over the machine's fixture pins by holes in it: the pins then give this setup's X and Y work offset, with no probing.",
+            ))
+            .into();
+    }
+    // Without pins that read there is nothing to choose holes for.
+    if !matches!(pins, Ok(Some(_)))
+        && let Some(issue) = crate::post::pins_issue(s)
+    {
+        return c.push(caution("Not on the pins yet", vec![issue])).into();
+    }
+    let Some(mesh) = app.part_mesh() else {
+        return c
+            .push(muted(
+                "Load the part to choose the holes it drops over the pins by.",
+            ))
+            .into();
+    };
+    let datum = app
+        .known_stock(app.doc.index())
+        .0
+        .and_then(|stock| crate::post::datum(s, stock, mesh).ok());
+    // In work coordinates; in the setup's own frame, said so, until the
+    // stock it starts from (and so its work zero) is known.
+    let work = |c: [f32; 2]| match datum {
+        Some(d) => format!(
+            "X{} Y{}",
+            crate::post::exact_mm(c[0] - d[0]),
+            crate::post::exact_mm(c[1] - d[1])
+        ),
+        None => format!(
+            "X{} Y{} in the part's place, work zero not known yet",
+            crate::post::exact_mm(c[0]),
+            crate::post::exact_mm(c[1])
+        ),
+    };
+    let placed = datum.map(|d| crate::post::placed_on_pins(s, mesh, d));
+    let chosen = crate::post::chosen_pin_holes(s);
+    c = c.push(section("Pin holes")).push(muted(
+        "Choose the part's holes that drop over the pins, as drawn in the part: the round holes it opens on its bottom in this setup, ringed and numbered in the 3D view. Click them here, or Pick holes on the part and click inside each hole in the 3D view (turn the view to see under the part). Which hole takes which pin follows from the plate.",
+    ));
+    c = c.push(
+        btn(
+            if app.picking_pin_holes() {
+                "Finish picking"
+            } else {
+                "Pick holes on the part"
+            },
+            Message::PickPinHoles,
+            app.picking_pin_holes(),
+        )
+        .width(Fill),
+    );
+    match &*app.bottom_holes(mesh) {
+        Ok(holes) if holes.is_empty() => {
+            c = c.push(note(
+                "The part opens no round holes on its bottom in this setup: it needs holes in its design that drop over the pins, opening on the face this setup sits on.",
+            ));
+        }
+        Ok(holes) => {
+            for (n, h) in holes.iter().enumerate().take(48) {
+                let mine = crate::post::chosen_index(s, mesh, h).is_some();
+                let pin = match &placed {
+                    Some(Ok(on)) if mine => (on.places.iter())
+                        .position(|c| (c[0] - h.center[0]).hypot(c[1] - h.center[1]) <= 0.05)
+                        .map(|i| format!(" · pin {}", i + 1)),
+                    _ => None,
+                }
+                .unwrap_or_default();
+                let deep = if h.through {
+                    "through".to_string()
+                } else {
+                    format!("{} mm deep", crate::post::exact_mm(h.depth))
+                };
+                let label = format!(
+                    "{}Hole {} · Ø{} · {} · {deep}{pin} · {}",
+                    if mine { "✓ " } else { "" },
+                    n + 1,
+                    crate::post::exact_mm(h.diameter.max(h.opening)),
+                    work(h.center),
+                    if mine { "remove" } else { "choose" }
+                );
+                c = c.push(
+                    btn(
+                        label,
+                        Message::Edit(t, "pin_holes", crate::post::pin_holes_toggled(s, mesh, h)),
+                        mine,
+                    )
+                    .width(Fill),
+                );
+            }
+        }
+        Err(e) => c = c.push(note(e.clone())),
+    }
+    if !chosen.is_empty() {
+        c = c.push(secondary(
+            "Clear the pin holes",
+            Message::Edit(t, "pin_holes", String::new()),
+        ));
+    }
+    match (placed, &pins) {
+        (Some(Err(issue)), _) => c = c.push(caution("Not on the pins yet", vec![issue])),
+        (Some(Ok(on)), Ok(Some(pins))) => {
+            let at: Vec<String> = (on.places.iter().enumerate())
+                .map(|(i, c)| format!("pin {} {}", i + 1, work(*c)))
+                .collect();
+            c = c.push(muted(format!(
+                "The plate, square to X and Y, puts the Ø{} mm pins, {} mm tall, in these holes: {} in work coordinates. The pins give X and Y: on the Control page, Set X Y from the pins sets them exactly; Z is still touched off on the stock.",
+                crate::post::exact_mm(pins.diameter as f32),
+                crate::post::exact_mm(pins.height as f32),
+                at.join(", ")
+            )));
+        }
+        _ => {}
+    }
+    c.into()
 }
 /// Where the active setup's work zero is on the stock it starts from, how
 /// it is touched off and probed, and what the checks before a run found of
@@ -3101,8 +3324,14 @@ fn zero_note(app: &App) -> Element<'_, Message> {
             crate::control::probe_name(refs)
         ));
     }
+    if crate::post::sits_on_pins(setup) {
+        lines.insert(0, "On the pins, the pins locate X and Y and the touch-off or probe sets Z: Probe corner, Probe edge and Probe centre stay available to check the part's place.".into());
+    }
     let mut c = column![muted(lines.join(" "))].spacing(8);
     if let Some(zero) = app.current_ready().and_then(|r| r.zero.as_ref()) {
+        if !zero.warnings.is_empty() {
+            c = c.push(caution("Pin holes", zero.warnings.clone()));
+        }
         if !zero.refused.is_empty() {
             c = c.push(caution(
                 "The work zero is not on the stock",
@@ -3602,18 +3831,37 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
 /// (the setup editor says why).
 pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
     let boxes = || {
-        let setup = app
-            .doc
-            .active_setup()
-            .filter(|s| app.stock && matches!(get(&s.p, "holding"), "Vise" | "Clamps"))?;
+        let setup = app.doc.active_setup().filter(|_| app.stock)?;
         let stock = app
             .active_simulation()
             .map(|sim| sim.plan.stock)
             .or_else(|| app.known_stock(app.doc.index()).0)?;
-        let boxes = app.doc.holding_boxes(setup, held_of(app, stock)).ok()?;
-        Some(crate::holding::shown(&boxes, stock))
+        let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+            let jaws = app.doc.holding_boxes(setup, held_of(app, stock));
+            crate::holding::shown(&jaws.unwrap_or_default(), stock)
+        } else {
+            vec![]
+        };
+        boxes.extend(pin_boxes(app, setup, stock));
+        Some(boxes)
     };
     boxes().unwrap_or_default()
+}
+/// The fixture pins `setup` sits on, standing under `stock`, the box it
+/// starts from (`holding::pin_boxes`): drawn with its jaws or clamps,
+/// whichever holds it down. None when it does not sit on them.
+pub(crate) fn pin_boxes(
+    app: &App,
+    setup: &Setup,
+    stock: crate::mesh::Bounds,
+) -> Vec<crate::holding::HoldBox> {
+    let Some(mesh) = app.part_mesh() else {
+        return vec![];
+    };
+    let on = crate::post::datum(setup, stock, mesh)
+        .ok()
+        .and_then(|datum| crate::post::on_pins(setup, mesh, datum));
+    crate::holding::pin_boxes(on.as_ref(), stock)
 }
 /// What the active setup's workholding holds of `stock`, the box it starts
 /// from: with the band its vise closes on when the editor knows it for that
@@ -4305,7 +4553,23 @@ fn wizard(app: &App) -> Element<'_, Message> {
                         field(p, "probe_retract", "Retract after the probe · mm", t),
                     ].spacing(8))
                     .push(warnings(crate::control::probe_settings(p).err().unwrap_or_default()))
-                    .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
+                    .push(bold("Fixture pins", 15))
+                    .push(field(p, "pins", "Pins on the plate · X Y; X Y; … mm, pin 1 first", t))
+                    .push(row![
+                        field(p, "pin_diameter", "Pin diameter · mm", t),
+                        field(p, "pin_height", "Pin height above the plate · mm", t),
+                    ].spacing(8))
+                    .push(match crate::control::pins_settings(p) {
+                        Ok(Some(crate::control::Pins { reference: Some(at), .. })) => muted(format!(
+                            "Pin 1's machine place: X {:.3} Y {:.3}, recorded on the Control page.",
+                            at[0], at[1]
+                        )).into(),
+                        Ok(Some(_)) => muted("Pin 1's machine place is not recorded yet: on the Control page, set machine zero, then Record the pins' place.").into(),
+                        Ok(None) => muted("No fixture pins.").into(),
+                        Err(e) => warnings(e),
+                    })
+                    .push(note("Dowel pins pressed into a plate on the table, square to X and Y, typed in the plate's own coordinates as drilled. A part drops over them by holes in it, so it sits in the same place and turn every time, also after a flip: a setup that sits on the pins (its Work zero step) gets its X and Y work offset from them without probing; Z is still touched off. Pin 1 is the reference pin: its machine place is recorded once on the Control page, and after every E-stop or power cycle Reference X Y from pin 1 makes machine X and Y, every saved work offset and the soft limits hold again."))
+                    .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: I/O pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
         }
         _ if manual::is_manual(m) => {
@@ -4735,6 +4999,9 @@ fn control(app: &App) -> Element<'_, Message> {
     if c.home_switches() {
         zero = zero.push(act("Home", idle(Action::Home), false));
     }
+    if let Some(pins) = pin_block(c) {
+        zero = zero.push(pins);
+    }
     let (envelope, assumed) = crate::machine_view::MachineView::envelope(&c.config);
     let model = crate::machine_view::MachineView {
         pos: [
@@ -4957,8 +5224,20 @@ fn control(app: &App) -> Element<'_, Message> {
             ),
             muted(match (own_why(blocked.clone()), &c.probe) {
                 (Some(why), _) if !c.probing() => why,
+                (_, Ok(p)) if c.direct() => format!(
+                    "{} conducts: no plate. The clip stays on the tool and the plate's lead goes on bare metal of the stock; touch the tool to the stock by hand first and see the probe input go active. Feeds down at {} mm/min, up to {} mm. Work Z where the tool touches the stock top becomes {}, then the tool lifts {} mm.",
+                    c.material.as_ref().map_or("The stock", |(name, _)| name.as_str()),
+                    p.feed,
+                    p.distance,
+                    crate::post::exact_mm(top as f32),
+                    p.retract
+                ),
                 (_, Ok(p)) => format!(
-                    "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
+                    "{}: touch plate on the stock top under the tool, the clip on the tool. Feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
+                    match &c.material {
+                        Some((name, _)) => format!("{name} does not conduct"),
+                        None => "No material chosen".into(),
+                    },
                     p.feed,
                     p.distance,
                     crate::post::exact_mm((top + p.plate.unwrap_or_default()) as f32),
@@ -5052,6 +5331,7 @@ fn control(app: &App) -> Element<'_, Message> {
         column![muted("Edge, probing toward"), edges].spacing(4),
         column![muted("Outside corner, seen from above"), corners].spacing(4),
         column![muted("Inside"), feature(Feature::Bore)].spacing(4),
+        column![muted("Outside"), feature(Feature::Boss)].spacing(4),
     ]
     .spacing(18);
     let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
@@ -5516,7 +5796,11 @@ pub(crate) fn run_panel<'a>(
                         msg(probe && run.reference.is_some(), R::ProbeFromReference),
                         false
                     ),
-                    muted("The same with the touch plate on the reference surface."),
+                    muted(if c.direct() {
+                        "The same with the plate's lead on the reference surface, which the tool touches."
+                    } else {
+                        "The same with the touch plate on the reference surface."
+                    }),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -5542,7 +5826,20 @@ pub(crate) fn run_panel<'a>(
             ));
         }
         let manual = checked.is_ok() && c.manual();
+        let pins = checked.as_ref().is_ok_and(|p| p.pins.is_some());
+        if pins {
+            buttons = buttons.push(act(
+                "Set X Y from the pins",
+                (manual && c.pin_offset().is_ok()).then_some(Message::Machine(Action::PinZero)),
+                false,
+            ));
+        }
         buttons = buttons.push(match c.touch_off() {
+            Some((_, work)) if pins => act(
+                format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
+                manual.then_some(Message::Machine(Action::TouchOff)),
+                false,
+            ),
             Some((_, work)) => act(
                 touch_label(work),
                 manual.then_some(Message::Machine(Action::TouchOff)),
@@ -5592,48 +5889,66 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     });
     let checks =
         "The checks above then say whether every tool run fits the soft limits from there.";
-    match (c.touch_off(), crate::post::references(&p.origin)) {
-        (Some((_, work)), Some(refs)) => {
-            let spot = match crate::control::probe_spot(refs).as_str() {
-                "its centre" => "the centre".to_string(),
-                spot => spot.to_string(),
-            };
-            steps.push(format!("3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top."));
-            let zero = match crate::post::stock_zero(&p.origin) {
-                None => " on Model origin".to_string(),
-                Some((_, false)) => format!(
-                    " on the stock bottom, {} mm below the top",
-                    crate::post::exact_mm(work[2] as f32)
-                ),
-                Some(_) => String::new(),
-            };
-            steps.push(format!(
-                "4. {}: that point becomes {}, putting the work zero{zero}. {checks}",
-                touch_label(work),
-                work_words(work)
-            ));
-        }
-        _ => {
-            steps.push(match work_zero_line(setup, p.located).split_once(" — ") {
-                Some((_, at)) => format!("3. Jog the tool tip to the work zero: {at}."),
-                None => "3. Jog the tool tip to the work zero.".into(),
-            });
-            steps.push(format!(
-                "4. Zero all: that point becomes X0 Y0 Z0. {checks}"
-            ));
+    if let Some(on) = &p.pins {
+        steps.truncate(1);
+        steps.extend(pin_steps(c, p, on));
+    } else {
+        match (c.touch_off(), crate::post::references(&p.origin)) {
+            (Some((_, work)), Some(refs)) => {
+                let spot = match crate::control::probe_spot(refs).as_str() {
+                    "its centre" => "the centre".to_string(),
+                    spot => spot.to_string(),
+                };
+                steps.push(format!("3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top."));
+                let zero = match crate::post::stock_zero(&p.origin) {
+                    None => " on Model origin".to_string(),
+                    Some((_, false)) => format!(
+                        " on the stock bottom, {} mm below the top",
+                        crate::post::exact_mm(work[2] as f32)
+                    ),
+                    Some(_) => String::new(),
+                };
+                steps.push(format!(
+                    "4. {}: that point becomes {}, putting the work zero{zero}. {checks}",
+                    touch_label(work),
+                    work_words(work)
+                ));
+            }
+            _ => {
+                steps.push(match work_zero_line(setup, p.located).split_once(" — ") {
+                    Some((_, at)) => format!("3. Jog the tool tip to the work zero: {at}."),
+                    None => "3. Jog the tool tip to the work zero.".into(),
+                });
+                steps.push(format!(
+                    "4. Zero all: that point becomes X0 Y0 Z0. {checks}"
+                ));
+            }
         }
     }
-    if c.config.inputs.probe.is_some() {
+    if c.config.inputs.probe.is_some() && p.pins.is_none() {
+        // On stock that does not conduct the probe touches only the plate:
+        // Probe Z sets Z, and X and Y are zeroed by hand.
+        let probe_z = |top: f64| {
+            format!(
+                "{}, Probe Z under Work zero sets Z{}.",
+                if c.direct() {
+                    "With the plate's lead on the stock"
+                } else {
+                    "With the touch plate on the stock top"
+                },
+                crate::post::exact_mm(top as f32)
+            )
+        };
         steps.push(match (c.edges_setup(), c.stock_top()) {
-            (Ok((refs, _)), _) => format!(
-                "With the probe clipped on, {} under Work zero does 3 and 4.",
+            (Ok((refs, _)), _) if c.sides_blocked().is_none() => format!(
+                "With the plate's lead on the stock and the clip on the tool, {} under Work zero does 3 and 4.",
                 crate::control::probe_name(refs)
             ),
-            (Err(why), Ok(top)) => format!(
-                "{why} With the touch plate on the stock top, Probe Z under Work zero sets Z{}.",
-                crate::post::exact_mm(top as f32)
-            ),
-            (Err(why), Err(_)) => why,
+            (Ok(_), Ok(top)) => {
+                format!("{} {}", c.sides_blocked().unwrap_or_default(), probe_z(top))
+            }
+            (Err(why), Ok(top)) => format!("{why} {}", probe_z(top)),
+            (Err(why), Err(_)) | (Ok(_), Err(why)) => why,
         });
     }
     if let (Some((lo, hi)), Some(z), Some(at)) = (c.block, c.sim_zero(), c.sim_touch()) {
@@ -5651,6 +5966,60 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         ));
     }
     Some(steps)
+}
+/// Work zero on the stock for a setup that sits on the fixture pins `on`:
+/// X and Y referenced from pin 1, its work system, X Y set from the pins,
+/// and Z touched off on the stock, each said done once it is.
+fn pin_steps(
+    c: &crate::control::Connection,
+    p: &crate::post::Checked,
+    on: &crate::post::OnPins,
+) -> Vec<String> {
+    let s = &c.snapshot;
+    let recorded = matches!(&c.pins, Ok(Some(pins)) if pins.reference.is_some());
+    let mut steps = vec![format!(
+        "The part sits on the fixture pins, pin 1 at X{} Y{} in work coordinates: the pins give X and Y exactly, and Z is touched off on the stock.",
+        crate::post::exact_mm(on.pin1[0]),
+        crate::post::exact_mm(on.pin1[1])
+    )];
+    steps.push(match (recorded, c.pin_referenced, s.referenced[2]) {
+        (_, true, true) => "1. X and Y are referenced from pin 1 since the last E-stop, and Z has a machine position.".into(),
+        (false, ..) => "1. Under Position, set machine zero, then with the part off the pins Record the pins' place (once for the plate).".into(),
+        (true, _, false) => "1. Under Position, set machine zero on Z at the top of its travel, then with the part off the pins Reference X Y from pin 1 (after every E-stop or power cycle).".into(),
+        (true, false, true) => "1. With the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1 under Position: every E-stop clears it.".into(),
+    });
+    steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
+        format!("2. {} is the active work system.", p.offset)
+    } else {
+        format!("2. Select {} under Work zero.", p.offset)
+    });
+    steps.push(match c.pin_offset() {
+        Ok(want) if (0..2).all(|a| (s.work_offset[a] - want[a]).abs() <= 1e-3) => format!(
+            "3. X and Y are set from the pins: the work offset of {} is machine X {:.3} Y {:.3}.",
+            p.offset, want[0], want[1]
+        ),
+        Ok(want) => format!(
+            "3. Put the part on the pins and press Set X Y from the pins: the work offset of {} becomes machine X {:.3} Y {:.3}, pin 1's recorded place less its X Y in work coordinates. Nothing is probed.",
+            p.offset, want[0], want[1]
+        ),
+        Err(why) => format!("3. Set X Y from the pins: {why}"),
+    });
+    steps.push(match c.touch_off() {
+        Some((_, work)) => {
+            let spot = crate::post::references(&p.origin).map_or("the stock top".to_string(), |refs| {
+                match crate::control::probe_spot(refs).as_str() {
+                    "its centre" => "the centre of the stock top".to_string(),
+                    spot => format!("{spot} of the stock top"),
+                }
+            });
+            format!(
+                "4. Jog the tool tip over {spot}, down until it just pinches a sheet of paper, and press Set Z{}, or put the touch plate there and press Probe Z under Work zero. The checks above then say whether every tool run fits the soft limits from there.",
+                crate::post::exact_mm(work[2] as f32)
+            )
+        }
+        None => "4. Touch Z off on the part with Set under Work zero: the program header says where Z0 is.".into(),
+    });
+    steps
 }
 /// A work position (mm) as it is said: "X0 Y0 Z12.5".
 fn work_words(work: [f64; 3]) -> String {
@@ -5751,6 +6120,79 @@ fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>
             .into(),
     )
 }
+/// The fixture pins under Machine zero: Record the pins' place and
+/// Reference X Y from pin 1, why either cannot start, and how the last one
+/// ended. None for a machine without pins.
+fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
+    use crate::control::Action;
+    let pins = match &c.pins {
+        Ok(None) => return None,
+        Ok(Some(pins)) => Some(pins),
+        Err(_) => None,
+    };
+    let (record, reference) = (c.record_blocked(), c.reference_blocked());
+    let mut col = column![
+        bold("Fixture pins", 12),
+        row![
+            act(
+                "Record the pins' place",
+                record
+                    .is_none()
+                    .then_some(Message::Machine(Action::RecordPins)),
+                c.pinning() == Some(true)
+            ),
+            act(
+                "Reference X Y from pin 1",
+                reference
+                    .is_none()
+                    .then_some(Message::Machine(Action::ReferencePins)),
+                c.pinning() == Some(false)
+            ),
+        ]
+        .spacing(6),
+    ]
+    .spacing(6);
+    let green = Color::from_rgb8(39, 130, 93);
+    let state = match pins.and_then(|p| p.reference) {
+        _ if c.pinning().is_some() => text("Probing pin 1: E-stop stops it.").size(12),
+        Some(at) if c.pin_referenced => text(format!(
+            "X and Y are referenced from pin 1, recorded at machine X {:.3} Y {:.3}.",
+            at[0], at[1]
+        ))
+        .size(12)
+        .color(green),
+        Some(at) => muted(format!(
+            "Pin 1 is recorded at machine X {:.3} Y {:.3}. After every E-stop or power cycle, take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference X Y from pin 1: X and Y need no machine position first, Z does.{}",
+            at[0],
+            at[1],
+            reference.map_or(String::new(), |why| format!(" {why}"))
+        )),
+        None => muted(format!(
+            "Not recorded yet. Once, after setting machine zero: take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Record the pins' place. It finds pin 1, then pin 2, and says how square the plate is.{}",
+            record.map_or(String::new(), |why| format!(" {why}"))
+        )),
+    };
+    col = col.push(state);
+    if let Some(top) = c.sim_pin1_top() {
+        col = col.push(muted(format!(
+            "Simulated: the simulator's pin 1 stands at machine X {:.3} Y {:.3}, its top at Z {:.3}. The MDI line G53 G0 X{:.1} Y{:.1} Z{:.1} puts the tip 3 mm over it.",
+            top[0],
+            top[1],
+            top[2],
+            top[0],
+            top[1],
+            top[2] + 3.
+        )));
+    }
+    if let Some((ok, said)) = &c.pin_said {
+        col = col.push(text(said.clone()).size(12).color(if *ok {
+            green
+        } else {
+            Color::from_rgb8(166, 101, 32)
+        }));
+    }
+    Some(col.into())
+}
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
 /// The note under a library editor's fields when its draft is not what the
@@ -5795,17 +6237,18 @@ pub(crate) fn holder_labels(h: &crate::holding::Holder) -> (String, String) {
     (format!("Save {word}"), format!("Delete {word}"))
 }
 /// The one layout of the library editors (Tools, Materials, Workholding): the
-/// fields scroll, and under them, outside the scroll, the unsaved-draft note
-/// and the Save and Delete buttons stay in sight at any window height.
+/// fields scroll, and under them, outside the scroll, the notes (an unsaved
+/// draft, an entry that cannot be deleted) and the Save and Delete buttons
+/// stay in sight at any window height.
 fn library_editor<'a>(
     form: Column<'a, Message>,
-    unsaved: Option<String>,
+    notes: impl IntoIterator<Item = String>,
     save: HelpButton<'a>,
     delete: HelpButton<'a>,
 ) -> Element<'a, Message> {
     let mut actions = column![].spacing(8);
-    if let Some(unsaved) = unsaved {
-        actions = actions.push(text(unsaved).size(12).color(Color::from_rgb8(166, 101, 32)));
+    for note in notes {
+        actions = actions.push(text(note).size(12).color(Color::from_rgb8(166, 101, 32)));
     }
     actions = actions.push(row![save, delete].spacing(10));
     let form = container(form).width(Fill).padding(iced::Padding {
@@ -5895,13 +6338,18 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     ] {
         form = form.push(field(p, k, l, t));
     }
+    if get(p, "type") == "Chamfer mill" {
+        form = form.push(field(p, "tip_angle", "Tip angle · °", t));
+    }
     form = form.push(machine_boxes(app, p, Message::ToolMachine));
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues));
     let editor = library_editor(
         form,
-        tool_unsaved(app),
+        tool_unsaved(app)
+            .into_iter()
+            .chain(app.doc.tool_in_use_note(&app.tool_draft.id)),
         primary(
             app.resume_label().unwrap_or("Save tool".into()),
             Message::SaveTool,
@@ -6984,6 +7432,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             sample: false,
             camera: app.plan_camera,
             picking: false,
+            pin_holes: Default::default(),
             show_stock: true,
             show_paths: false,
             progress: None,

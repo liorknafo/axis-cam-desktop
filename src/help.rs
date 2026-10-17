@@ -949,6 +949,13 @@ pub fn command(m: &Message, label: String) -> Help {
             &crate::model::Fields::new(),
         );
     }
+    // A hole of the part chosen, or no longer chosen, for the fixture pins.
+    if let Edit(Target::Setup, "pin_holes", _) = m {
+        return Help::text(
+            label,
+            "Choose or remove this hole of the part for the fixture pins. Choose one hole per pin, as the part's design has them: round holes it opens on the face this setup sits on, the pins' diameter to 0.2 mm over from their opening on (not counterbored), at least the pins' height deep. Which hole takes which pin follows from the plate, and pin 1's hole gives the X and Y work offset with pin 1's recorded machine place. Drill them in an earlier setup with a Drill operation on the face they open on, or before the job.",
+        );
+    }
     if let StockDetail(detail) = m {
         return crate::choice_help::selected(
             "stock_detail",
@@ -1113,6 +1120,10 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         BoxFromFace => (
             "Fill the six Box fields from the part face selected on this operation: a floor facing up, or a wall facing sideways. A floor is grown to the stock's edge or the next part material above it. A wall is cut from the wall out to the stock's edge. The numbers are in the setup's frame from the work zero.",
+            "",
+        ),
+        PickPinHoles => (
+            "Pick the part's holes for the fixture pins in the 3D view: click inside a hole, on its wall or its end, to choose it or remove it; drag to orbit (turn the view to see under the part, where the holes open), and click Finish picking when done. The holes offered are ringed and numbered as listed.",
             "",
         ),
         PickMode => (
@@ -1501,7 +1512,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         ProbeFeature(_) => (
-            "Probe a feature from where the tip is and set work zero on it in the active coordinate system, without a setup: a surface (Z top), a side (X+, X−, Y+, Y−), an outside corner, or the centre of a bore. The tip's radius is allowed for. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
+            "Probe a feature from where the tip is and set work zero on it in the active coordinate system, without a setup: a surface (Z top), a side (X+, X−, Y+, Y−), an outside corner, or the centre of a bore or of a boss or pin. The tip's radius is allowed for. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
             "",
         ),
         Wcs(_) => (
@@ -1529,7 +1540,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         ProbeZ => (
-            "With the touch plate on the stock top under the tool and the probe clipped on, feed Z down until the tool touches the plate, up to the maximum probe distance. Work Z at the contact becomes the stock top's Z plus the plate's thickness, then the tool lifts. Without contact nothing is set.",
+            "With the touch plate on the stock top under the tool and the clip on the tool, feed Z down until the tool touches the plate, at most the maximum probe distance. Work Z there becomes the stock top's Z plus the plate's thickness; the tool lifts. On a metal project the plate's lead goes on the stock: no thickness. Without contact nothing is set.",
             "The stock top's Z is the program's for the setup picked in the Run panel (Z 0, or the stock's height for a work zero on the bottom), and Z 0 without one.",
         ),
         ProbeEdges => (
@@ -1542,6 +1553,18 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         ToSimZero => (
             "Simulated only: rapid the tool tip up to the top of Z, over where this setup is touched off on the simulator's block, and down onto it. Then the button beside it sets the work zero, as touching off on real stock would.",
+            "",
+        ),
+        RecordPins => (
+            "Once, after setting machine zero, and again whenever the plate is moved: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and keep its machine X Y in the machine's profile. Then it flies over the top of Z to where the plate puts pin 2, finds it, and says how far it is off the line from pin 1: over 0.05 mm, square the plate.",
+            "Pin centre touches the pin's top, then probes its sides from −X, +X, −Y and +Y, min(3 mm, half the pin's height) below the top, starting outside it by the pin's and the tip's diameters and 1 mm. The tip's radius cancels out.",
+        ),
+        ReferencePins => (
+            "After every E-stop or power cycle, or at the start of a session: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and declare machine X and Y so that it is where it was recorded. Pin 1 acts as the machine's home for X and Y: every saved G54–G59 offset, the soft limits and the pins' place hold again. Z still gets its machine zero at the top of travel.",
+            "X and Y need no machine position first: they are declared where they show, the probe moves only a few mm from where the tip is, and then they are declared again from the pin. Z needs one, as the probe moves it.",
+        ),
+        PinZero => (
+            "Set the X and Y work offset of the active work system to the one the pins give this setup: pin 1's recorded machine place less where pin 1 stands in the setup's work coordinates. Exact, with no probing. Z is touched off as for any setup.",
             "",
         ),
     }
@@ -1835,7 +1858,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "pocket_entry") => (
             "Profile ramp descends along the pocket contour at the ramp angle, then cuts the loop at depth. Plunge feeds straight down and needs a plunge-capable end mill. Both enter at 25% feed. Between loops the tool stays down, stepping at most 1.5 stepovers clear of walls and islands; where it cannot, it retracts and enters again.",
-            "",
+            "A loop too short for its ramp, one the ramp would have to go round more than ten times (twice in a rest pass's corners, where little of the cutter meets material), plunges instead. Below the first level a loop the tool enters again rapids down to 0.5 mm over the level before, where the cutter has already been.",
             Some(Ramp),
         ),
         (_, "feed") => (
@@ -1883,15 +1906,35 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Offsets),
         ),
+        (_, "tab_count") => (
+            "How many tabs an outside Contour leaves on each outline it goes around, spaced evenly along it, the first half a spacing from where the cut starts. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
+            "",
+            Some(Operation(Strategy::Contour)),
+        ),
+        (_, "tab_width") => (
+            "Each tab's width at its narrowest, midway across the cut, in mm. Over each tab the tool's centre rises along this width plus its diameter; its round end leaves the tab wider toward the part's wall and the stock's, by up to that diameter.",
+            "",
+            Some(Operation(Strategy::Contour)),
+        ),
+        (_, "tab_height") => (
+            "How thick each tab is, in mm: over the tabs the cut stops this far above the stock's bottom, or above the contour's bottom where that is higher. It must be less than the depth the contour cuts.",
+            "A tab holds only where stock is left beyond the cut, so leave more stock beside the part than the stock to leave, the tool's diameter and a 2 mm wall. Levels above the tabs' top go round in full. Below it the tool rises straight up at each tab's start and plunges back down at its end at a quarter of the cutting feed, as it does entering the cut. Cut or file the tabs off after the part is unclamped.",
+            Some(Operation(Strategy::Contour)),
+        ),
         (_, "through") => (
             "Add Breakthrough below the bottom of each hole that goes through the part. A blind hole is refused with Yes, since the part goes on under its bottom. Check the extra depth and the material or fixture underneath.",
             "",
             Some(Operation(Strategy::Drill)),
         ),
         (_, "breakthrough") => (
-            "Additional drill travel past the exit of a hole that goes through, in mm; it is never added under a blind hole. The real required distance also depends on drill-point geometry.",
+            "Additional travel past the exit, in mm: of a hole that goes through, for a drill (never under a blind hole), or of a Pocket's openings cut through, below where their walls end. The real required distance also depends on drill-point geometry.",
             "",
             Some(Operation(Strategy::Drill)),
+        ),
+        (_, "openings") => (
+            "Holes in the selected floors with nothing of the part over or under them, such as switch cut-outs in a plate: Leave clears over them at the floor's height, Cut through also cuts each down to where its walls end, plus Breakthrough.",
+            "An opening is a hole in a selected floor whose column holds no part at all. Its walls are followed at the cutter's radius, as a pocket's are, so corners keep that radius; run a smaller cutter after it to sharpen them. Openings narrower than the cutter are left, for a smaller one. Round holes are openings too, but Drilling makes them faster.",
+            Some(Operation(Strategy::Pocket)),
         ),
         (_, "angle_a" | "angle_b") => (
             "Indexed position of the primary or secondary rotary axis, in degrees. The axis is positioned before cutting and held fixed during the cut.",
@@ -2114,12 +2157,27 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "probe_plate") => (
-            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Leave it empty without a plate.",
+            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Used when the project's material is not a metal; on a metal the plate's lead goes on the stock and the tool touches it. Leave it empty without a plate.",
+            "",
+            None,
+        ),
+        (_, "pins") => (
+            "The fixture plate's dowel pins, as drilled, in the plate's own X Y (mm), pin 1 first: \"0 0; 120 0\" for two pins 120 mm apart along X. Pin 1 is the reference pin, pin 2 gives the turn. Leave it empty without pins.",
+            "The plate is taken as square to the machine's X and Y: Record the pins' place on the Control page measures how far off it is. A setup that sits on the pins gets its X and Y work offset from pin 1's recorded place.",
+            None,
+        ),
+        (_, "pin_diameter") => (
+            "The pins' diameter, in mm: measure it. The holes a part drops over them by must be this to 0.2 mm over: a wider hole leaves the part free to move. The checks keep tools clear of a pin-sized box per pin.",
+            "",
+            None,
+        ),
+        (_, "pin_height") => (
+            "How far the pins stand above the plate, in mm: measure it. The part's holes for them must be at least this deep, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
             "",
             None,
         ),
         (_, "probe_tip") => (
-            "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the probe clipped onto conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
+            "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the plate's lead on conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
             "",
             None,
         ),
@@ -2341,6 +2399,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "holder") => (
             "Maximum holder diameter in mm. The holder is wider than the cutter and needs its own clearance around walls and fixtures.",
             "",
+            Some(Tool),
+        ),
+        (_, "tip_angle") => (
+            "A chamfer mill's included point angle in degrees, 90 when left empty. Match a countersink's angle: an 82° countersink needs an 82° cutter.",
+            "Drilling with a chamfer mill plunges its point into each detected opening until the cone is as wide as the opening at its rim, so a countersink comes out at the CAD's size. Bottom offset raises the plunge (a narrower chamfer); a negative one lowers it (a wider one).",
             Some(Tool),
         ),
         _ => (
@@ -3859,6 +3922,7 @@ mod tests {
             MoveOp(1),
             PickMode,
             BoxFromFace,
+            PickPinHoles,
             Generate,
             GenerateAll,
             DuplicateSetup,

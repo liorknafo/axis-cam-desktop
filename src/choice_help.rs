@@ -118,10 +118,34 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("cycle", "Counterboring") => {
             diagram = Some(Diagram::DrillCycle(3));
             (
-                "Feed to the target, pause for the selected Dwell time at the bottom, then retract. The preview uses cylindrical removal with the saved tool diameter; it does not model a drill-point cone.",
+                "Feed to the target, pause for the selected Dwell time at the bottom, then retract. The preview removes the drill's flutes and its 118° point, or a chamfer mill's cone.",
                 "",
             )
         }
+        ("on_pins", "Yes") => (
+            "The part drops over the machine's fixture pins by holes in it, so its place and turn are known: the pins give this setup's X and Y work offset (Set X Y from the pins on the Control page), with no probing. Z is still touched off on the stock. The pins are kept clear of as workholding; the vise or clamps still hold the part down.",
+            "Cycle Start waits until X and Y are referenced from pin 1 since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
+        ),
+        ("on_pins", "No") => (
+            "The part does not sit on the fixture pins: its X and Y work zero is touched off or probed on the stock.",
+            "",
+        ),
+        ("tabs", "No") => (
+            "The contour goes all the way round at every level. Where it cuts through the stock's bottom the part comes free of the stock around it, and can be thrown by the cutter: leave a skin with Bottom offset, or turn tabs on.",
+            "",
+        ),
+        ("tabs", "Yes") => (
+            "Leave tabs: short bridges of material across the cut at its bottom that keep the part joined to the stock around it after the contour goes through, so the cutter cannot throw it. They only hold where stock is left beyond the cut: leave more beside the part than the stock to leave, the tool's diameter and a 2 mm wall.",
+            "Generate refuses tabs that would join the part to no stock. Below the tabs' top the tool rises over each tab and plunges back down after it; the levels above go round in full. The tabs stay on the part: cut or file them off by hand afterwards.",
+        ),
+        ("openings", "Leave") => (
+            "Clear the selected floors only. Holes through a floor are cleared over at the floor's height and left for another operation.",
+            "",
+        ),
+        ("openings", "Cut through") => (
+            "Clear the selected floors, then cut each hole through them that nothing of the part covers or underlies down to where its walls end, plus Breakthrough. Openings narrower than the cutter are left for a smaller one.",
+            "Each opening's walls keep the cutter's radius in their corners, as a pocket's do. The extra depth goes into the stock under the part; modelled vise jaws and clamps are checked, parallels and the table are not.",
+        ),
         ("through", "Yes") => (
             "Extend the drill target below the bottom of each hole that goes through the part by Breakthrough. A selected hole that is blind is refused, since the part goes on under its bottom: set Through to No, or use the diameter filter to drill only the holes that go through.",
             "That extra travel is included in the preview, and modelled vise jaws and clamps are checked as boxes with a clearance gap; the material, parallels or the table underneath are not collision checked.",
@@ -376,11 +400,11 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("type", "Drill") => (
-            "A hole-making tool used by Drilling. The preview uses cylindrical removal at the saved diameter and does not model a conical point. The tool must fit the detected bore.",
+            "A hole-making tool used by Drilling. The preview removes its flutes' cylinder over a 118° point, with the programmed tip at the point. The tool must fit the detected bore.",
             "",
         ),
         ("type", "Chamfer mill") => (
-            "A tapered cutter intended for chamfers. Its library entry is saved; an imported chamfer toolpath/cutter kernel is not implemented.",
+            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. Chamfers along edges are not generated.",
             "",
         ),
         ("ramp", "Helix") => (

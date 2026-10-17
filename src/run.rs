@@ -279,6 +279,7 @@ impl Run {
                 p.offset
             )),
         }
+        e.extend(pin_problems(c, setup, p));
         if limits.iter().all(Option::is_some) && unset.is_empty() {
             let span = extents(&p.blocks);
             for (a, limit) in limits.iter().enumerate() {
@@ -719,6 +720,52 @@ pub fn busy(state: Option<&State>) -> bool {
     )
 }
 
+/// Why a setup that sits on the pins (`Checked::pins`) cannot start on
+/// `c` yet: the connected machine's pins are not the setup's, their place
+/// is not recorded, X and Y are not referenced from pin 1 since the last
+/// E-stop, or the work offset is not the one the pins give. None for any
+/// other setup.
+fn pin_problems(c: &Connection, setup: &crate::model::Setup, p: &Checked) -> Vec<String> {
+    let Some(on) = &p.pins else {
+        return vec![];
+    };
+    let pins = match &c.pins {
+        Ok(Some(pins)) => pins,
+        _ => {
+            return vec![
+                "This setup sits on the pins, but the connected machine has no fixture pins in the Machine library.".into(),
+            ];
+        }
+    };
+    let mut e = vec![];
+    if !(crate::control::pins_settings(&setup.machine.p)
+        .ok()
+        .flatten())
+    .is_some_and(|own| own.same_pins(pins))
+    {
+        e.push("This setup's snapshot of the machine has other fixture pins than the Machine library: use Assign to current setup there, then check the setup again.".into());
+    }
+    let Some(at) = pins.reference else {
+        e.push(
+            "The pins' place is not recorded: Record the pins' place under Position first.".into(),
+        );
+        return e;
+    };
+    if !c.pin_referenced {
+        e.push("X and Y are not referenced from pin 1 since the machine was connected or E-stopped: Reference X Y from pin 1 under Position first.".into());
+        return e;
+    }
+    let want = [0, 1].map(|a| at[a] - on.pin1[a] as f64);
+    let s = &c.snapshot;
+    if (0..2).any(|a| (s.work_offset[a] - want[a]).abs() > 1e-3) {
+        e.push(format!(
+            "The X/Y work offset of {} is not the one the pins give, machine X {:.3} Y {:.3}: press Set X Y from the pins under Work zero on the stock.",
+            p.offset, want[0], want[1]
+        ));
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +828,7 @@ mod tests {
             probe: Ok([crate::post::At::Mid; 2]),
             probe_from: vec![],
             holds: vec![],
+            pins: None,
         }
     }
 

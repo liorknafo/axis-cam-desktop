@@ -43,6 +43,20 @@ pub enum CutterShape {
     /// A drill: flat flutes over a 118° point, the cone `POINT_RISE` gives,
     /// with the programmed tip at its apex.
     Drill,
+    /// A chamfer mill: a cone of this included angle, in tenths of a degree,
+    /// from its pointed tip up to its diameter.
+    Chamfer(u16),
+}
+impl CutterShape {
+    /// How far a pointed cutter's cone rises per mm from its axis: a drill's
+    /// 118° point or a chamfer mill's angle; None for flat and ball ends.
+    pub fn rise(self) -> Option<f32> {
+        match self {
+            CutterShape::Drill => Some(POINT_RISE),
+            CutterShape::Chamfer(tenths) => Some(1. / (f32::from(tenths) / 20.).to_radians().tan()),
+            CutterShape::Flat | CutterShape::Ball => None,
+        }
+    }
 }
 /// The rise of a 118° drill point's cone per mm from the drill's axis, tan
 /// 31°: what `cam::holes` takes a blind hole's floor to be.
@@ -498,7 +512,7 @@ impl StockGrid {
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
                         a[2] + contact * dz + radius - (radius * radius - d).max(0.).sqrt()
-                    } else if shape == CutterShape::Drill {
+                    } else if let Some(rise) = shape.rise() {
                         // The cone's lowest point over the covered interval:
                         // where the tip's descent balances the cone's rise,
                         // or an end of the interval when the move is steeper
@@ -514,7 +528,7 @@ impl StockGrid {
                             if dz < 0. { 1. } else { 0. }
                         } else {
                             let half = ((radius * radius - perp).max(0.) / length).sqrt();
-                            let cone = POINT_RISE * POINT_RISE * length;
+                            let cone = rise * rise * length;
                             let t = if cone > dz * dz {
                                 projection
                                     - dz * perp.sqrt() / (length.sqrt() * (cone - dz * dz).sqrt())
@@ -527,7 +541,7 @@ impl StockGrid {
                         };
                         let d = (point[0] - a[0] - contact * (b[0] - a[0])).powi(2)
                             + (point[1] - a[1] - contact * (b[1] - a[1])).powi(2);
-                        a[2] + contact * dz + POINT_RISE * d.sqrt()
+                        a[2] + contact * dz + rise * d.sqrt()
                     } else if length < 1e-10 {
                         a[2].min(b[2])
                     } else {

@@ -589,6 +589,26 @@ pub fn boxes(
         }
     })
 }
+/// The fixture pins a setup sits on (`post::on_pins`), as holding boxes
+/// round `stock`, the box it starts from: a pin-sized box per pin from the
+/// stock's bottom up to the pin's height, so that the 3D view draws them
+/// and a move into one is refused as a jaw's is. They stand in holes in the
+/// part; the vise or clamps still hold it down. None without pins.
+pub fn pin_boxes(on: Option<&crate::post::OnPins>, stock: Bounds) -> Vec<HoldBox> {
+    let Some(on) = on else {
+        return vec![];
+    };
+    let r = on.diameter / 2.;
+    (on.places.iter().enumerate())
+        .map(|(i, c)| HoldBox {
+            label: format!("fixture pin {}", i + 1),
+            bounds: Bounds {
+                min: [c[0] - r, c[1] - r, stock.min[2]],
+                max: [c[0] + r, c[1] + r, stock.min[2] + on.height],
+            },
+        })
+        .collect()
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub label: String,

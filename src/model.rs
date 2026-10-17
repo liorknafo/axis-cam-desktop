@@ -364,6 +364,11 @@ impl Machine {
         {
             e.push("Choose the machine's UC100 profile file.".into())
         }
+        e.extend(
+            crate::control::pins_settings(&self.p)
+                .err()
+                .unwrap_or_default(),
+        );
         e
     }
     pub fn fill_post_defaults(&mut self) {
@@ -413,7 +418,20 @@ impl Tool {
         if num(&self.p, "stickout") < num(&self.p, "length") {
             e.push("Stickout must be at least the flute length.".into())
         }
+        if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
+            e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
+        }
         e
+    }
+    /// A chamfer mill's included tip angle in degrees (90 when not saved),
+    /// None when it is outside 20–160°.
+    pub fn tip_angle(&self) -> Option<f32> {
+        let angle = if self.p.contains_key("tip_angle") {
+            num(&self.p, "tip_angle")?
+        } else {
+            90.
+        };
+        (20. ..=160.).contains(&angle).then_some(angle)
     }
     /// Controller tool number (T#), when it is a whole number 1–9999.
     pub fn number(&self) -> Option<u32> {
@@ -443,10 +461,28 @@ pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
 pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// What a Pocket does with the holes through its floor that nothing of the
+/// part covers or underlies: clears over them at the floor's height, or
+/// cuts them through, Breakthrough past the bottom of their walls.
+pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
+/// Whether an outside Contour leaves holding tabs: bridges of material
+/// across its cut, near its bottom, that keep the part joined to the stock
+/// around it when the cut goes through.
+pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
+/// The tab settings an operation starts with, and takes when tabs are
+/// turned on in a project saved before them: tabs on each outline, each
+/// one's width at its narrowest (mm) and its thickness (mm).
+pub const TAB_DEFAULTS: [(&str, &str); 3] = [
+    ("tab_count", "4"),
+    ("tab_width", "6"),
+    ("tab_height", "1.5"),
+];
 pub fn pocket_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
     p.get(key).map(String::as_str).unwrap_or(match key {
         "pocket_milling" => "Climb",
         "pocket_entry" => POCKET_ENTRIES[0],
+        "openings" => POCKET_OPENINGS[0],
+        "tabs" => CONTOUR_TABS[0],
         _ => "",
     })
 }
@@ -463,6 +499,8 @@ pub fn pocket_setting_issues(p: &Fields) -> Vec<String> {
             pocket_setting(p, "pocket_entry"),
             POCKET_ENTRIES,
         ),
+        ("openings", pocket_setting(p, "openings"), POCKET_OPENINGS),
+        ("tabs", pocket_setting(p, "tabs"), CONTOUR_TABS),
         (
             "spindle_rotation",
             facing_setting(p, "spindle_rotation"),
@@ -628,7 +666,9 @@ impl Operation {
             ("lean_angle", "0"),
             ("collision", "Retract and relink"),
             ("pattern", "Parallel"),
+            ("tabs", CONTOUR_TABS[0]),
         ]);
+        p.extend(TAB_DEFAULTS.map(|(k, v)| (k.to_string(), v.to_string())));
         if s == Strategy::Drill {
             p.insert("rpm".into(), "2400".into());
             p.insert("feed".into(), "280".into());
@@ -756,8 +796,13 @@ impl Operation {
         let tool = tools.iter().find(|t| t.id == self.tool);
         if let Some(t) = tool {
             e.extend(t.issues());
-            if self.strategy == Strategy::Drill && get(&t.p, "type") != "Drill" {
-                e.push("Choose a drill for a drilling cycle.".into())
+            if self.strategy == Strategy::Drill
+                && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
+            {
+                e.push(
+                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle."
+                        .into(),
+                )
             }
             if !manual::fits(get(&t.p, "machines"), m) {
                 e.push(format!("{} is not on {}.", t.name(), m.name()))
@@ -873,6 +918,14 @@ impl Operation {
                 if num(&self.p, "finish_passes").is_some_and(|x| x.fract() != 0.) {
                     e.push("Finishing passes must be a whole number.".into())
                 }
+            }
+            if s == Strategy::Contour && pocket_setting(&self.p, "tabs") == CONTOUR_TABS[1] {
+                bounded(&self.p, "tab_count", 1., 50., &mut e);
+                if num(&self.p, "tab_count").is_some_and(|x| x.fract() != 0.) {
+                    e.push("Tab count must be a whole number.".into())
+                }
+                positive(&self.p, "tab_width", &mut e);
+                positive(&self.p, "tab_height", &mut e)
             }
             if matches!(s, Strategy::Adaptive | Strategy::Pocket)
                 && get(&self.p, "ramp") != "Plunge"
@@ -1007,6 +1060,10 @@ impl Setup {
             finite(&self.p, k, &mut e)
         }
         nonnegative(&self.p, "clearance", &mut e);
+        // The machine's own issues say what is wrong with the pins.
+        if crate::control::pins_settings(&self.machine.p).is_ok() {
+            e.extend(crate::post::pins_issue(self));
+        }
         e
     }
 }
@@ -1653,6 +1710,37 @@ impl Document {
         }
         changed
     }
+    /// The operations that cut with tool `id`, as "Setup · Operation".
+    pub fn tool_users(&self, id: &str) -> Vec<String> {
+        self.setups
+            .iter()
+            .flat_map(|s| {
+                s.operations
+                    .iter()
+                    .filter(|o| o.tool == id)
+                    .map(move |o| format!("{} · {}", s.name(), o.name()))
+            })
+            .collect()
+    }
+    /// Why tool `id` cannot be deleted: the operations that use it, the
+    /// first five named so the note stays a line or two.
+    pub fn tool_in_use_note(&self, id: &str) -> Option<String> {
+        const NAMED: usize = 5;
+        let users = self.tool_users(id);
+        let list = match users.len() {
+            0 => return None,
+            1 => users[0].clone(),
+            n if n <= NAMED => format!("{n} operations: {}", users.join(", ")),
+            n => format!(
+                "{n} operations: {} and {} more",
+                users[..NAMED].join(", "),
+                n - NAMED
+            ),
+        };
+        Some(format!(
+            "Used by {list}. Assign another tool to them before deleting this one."
+        ))
+    }
     pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
         let Some(n) = tool.number() else {
             return vec![format!(
@@ -1914,7 +2002,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 39] = [
+const OPERATION_FIELDS: [&str; 42] = [
     "name",
     "x_min",
     "x_max",
@@ -1954,6 +2042,9 @@ const OPERATION_FIELDS: [&str; 39] = [
     "minimum_radius",
     "ramp_angle",
     "lead_in",
+    "tab_count",
+    "tab_width",
+    "tab_height",
 ];
 /// The operation editor's text field a check's message is about, by its key,
 /// so the editor can show the message at the field. The messages of
