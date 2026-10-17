@@ -983,6 +983,39 @@ fn legend<'a>() -> Element<'a, Message> {
     .into()
 }
 
+/// The DRO's compensation sides as words: "comp X − · Y +".
+fn comp_words(comp: [i8; 2]) -> String {
+    let sides: Vec<String> = (0..2)
+        .filter(|&k| comp[k] != 0)
+        .map(|k| format!("{} {}", AXES[k], if comp[k] > 0 { "+" } else { "−" }))
+        .collect();
+    format!("comp {}", sides.join(" · "))
+}
+/// What to set in the DRO for a tool: its diameter and the compensation
+/// sides, drawn; or a warning that the readouts are centres.
+fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Message>> {
+    if comp == [0, 0] {
+        return vec![warn_chip("DRO comp off: centres")];
+    }
+    vec![
+        label("Enter in the DRO"),
+        readout(
+            Readout {
+                order: None,
+                lead: None,
+                axis: "Ø".into(),
+                value: dro(diameter),
+                lock: None,
+                tags: vec!["tool diameter".into(), comp_words(comp)],
+                lit: Lit::Now,
+                big: false,
+            },
+            None,
+        ),
+        canvas(CompPicture(comp)).width(Fill).height(height).into(),
+    ]
+}
+
 /// What the page needs at hand for a step.
 struct Page<'a> {
     app: &'a App,
@@ -1437,30 +1470,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 .operations
                 .get(*op)
                 .is_some_and(|o| o.strategy == Strategy::Drill);
-            let mut right = column![chips(vec![
+            let right = column![chips(vec![
                 chip(p.named(tool, *diameter)),
                 chip(format!("{} rpm", rpm.round()))
-            ]),];
-            if *comp == [0, 0] {
-                right = right.push(warn_chip("DRO comp off: centres"));
-            } else {
-                right = right
-                    .push(label("Enter in the DRO"))
-                    .push(readout(
-                        Readout {
-                            order: None,
-                            lead: None,
-                            axis: "Ø".into(),
-                            value: dro(*diameter),
-                            lock: None,
-                            tags: vec!["tool diameter".into()],
-                            lit: Lit::Now,
-                            big: false,
-                        },
-                        None,
-                    ))
-                    .push(canvas(CompPicture(*comp)).width(Fill).height(110));
-            }
+            ]),]
+            .extend(dro_tool(*diameter, *comp, 110.));
             let left = canvas(ToolPicture {
                 diameter: *diameter,
                 rpm: *rpm,
@@ -1569,6 +1583,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             tool: id,
             rpm,
             diameter,
+            comp,
             axis,
             side,
             to,
@@ -1641,33 +1656,33 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             .into();
             let names = [["left", "right"], ["front", "back"]];
             let edge = get(&p.setup.machine.p, "dro_comp") == "Yes";
-            let right = column![
-                chips(vec![
-                    chip(p.named(id, *diameter)),
-                    chip(format!("{} rpm", rpm.round())),
-                    chip(format!("down to Z {}", dro(*down_to)))
-                ]),
-                readout(
-                    Readout {
-                        order: None,
-                        lead: None,
-                        axis: AXES[k].into(),
-                        value: dro(*shown),
-                        lock: None,
-                        tags: vec![
-                            format!("{} side to", names[k][usize::from(sd > 0.)]),
-                            format!(
-                                "{} mm off · {}",
-                                dro(*remove),
-                                if edge { "edge" } else { "centre" }
-                            )
-                        ],
-                        lit: Lit::Now,
-                        big: true
-                    },
-                    None
-                ),
-            ];
+            let right = column![chips(vec![
+                chip(p.named(id, *diameter)),
+                chip(format!("{} rpm", rpm.round())),
+                chip(format!("down to Z {}", dro(*down_to)))
+            ]),]
+            .extend(dro_tool(*diameter, *comp, 80.))
+            .push(label("Cut the side to"))
+            .push(readout(
+                Readout {
+                    order: None,
+                    lead: None,
+                    axis: AXES[k].into(),
+                    value: dro(*shown),
+                    lock: None,
+                    tags: vec![
+                        format!("{} side to", names[k][usize::from(sd > 0.)]),
+                        format!(
+                            "{} mm off · {}",
+                            dro(*remove),
+                            if edge { "edge" } else { "centre" }
+                        ),
+                    ],
+                    lit: Lit::Now,
+                    big: true,
+                },
+                None,
+            ));
             (
                 "Square".into(),
                 "the only screen: one side to a number",
@@ -2169,6 +2184,38 @@ pub(crate) mod tests {
             "{t:?}"
         );
     }
+    /// The job with the stock's +X side squared 1 mm first (step 3).
+    fn squared(dro: &str) -> App {
+        let mut a = app_with(dro, |doc| {
+            let mill = doc.tools[3].id.clone();
+            let b = [123., 500., -500., 500., 0., -30.];
+            let square =
+                crate::guide::tests::boxed("Square right side", &mill, b, &[("allowance", "0")]);
+            doc.setups[0].operations.insert(1, square);
+        });
+        assert!(matches!(guide(&a).steps[3], Step::Square { .. }));
+        send(&mut a, GuideAction::Go(3));
+        a
+    }
+    #[test]
+    fn the_square_step_shows_the_dro_diameter_and_comp_side() {
+        let t = texts(&squared("Yes"));
+        for want in [
+            "ENTER IN THE DRO",
+            "Ø",
+            "25.00",
+            "comp X −",
+            "123.00",
+            "right side to",
+        ] {
+            assert!(t.iter().any(|s| s.contains(want)), "{want} in {t:?}");
+        }
+        // Without compensation: the centre, and no diameter to enter.
+        let t = texts(&squared("No"));
+        assert!(t.iter().any(|s| s == "DRO comp off: centres"), "{t:?}");
+        assert!(t.iter().any(|s| s == "135.50"), "{t:?}");
+        assert!(!t.iter().any(|s| s.contains("comp X")), "{t:?}");
+    }
     #[test]
     fn a_pass_shows_its_number_and_its_readouts_in_order() {
         let mut a = app("Yes");
@@ -2373,14 +2420,7 @@ pub(crate) mod tests {
             at(&mut a, step, item);
             render(&a, (1280, 800), &dir.join(format!("{name}.png")));
         }
-        let mut a = app_with("Yes", |doc| {
-            let mill = doc.tools[3].id.clone();
-            let b = [123., 500., -500., 500., 0., -30.];
-            let square =
-                crate::guide::tests::boxed("Square right side", &mill, b, &[("allowance", "0")]);
-            doc.setups[0].operations.insert(1, square);
-        });
-        at(&mut a, 3, 0);
+        let a = squared("Yes");
         render(&a, (1280, 800), &dir.join("04-square.png"));
         // In a vise on the manual mill: the jaws in the pictures.
         let mut a = app_with("Yes", |doc| {

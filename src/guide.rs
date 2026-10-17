@@ -86,12 +86,15 @@ pub enum Step {
     /// one row wide): cut the stock's `side` (−1 or +1) of `axis` to `to`
     /// (the wall as cut, with its allowance), which the DRO reads as `shown`
     /// (the edge with compensation, else the centre), taking off `remove`,
-    /// down to `down_to` (the floor as cut).
+    /// down to `down_to` (the floor as cut). With the DRO's compensation on,
+    /// enter `diameter` and set `axis` to its side in `comp` (toward the
+    /// wall; the other axis 0); all 0 with it off.
     Square {
         op: usize,
         tool: String,
         rpm: f32,
         diameter: f32,
+        comp: [i8; 2],
         axis: usize,
         side: i8,
         to: f32,
@@ -452,6 +455,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             tool: tool.into(),
                             rpm,
                             diameter,
+                            comp: std::array::from_fn(|k| if k == axis { comp[k] } else { 0 }),
                             axis,
                             side,
                             to: wall - zero[axis],
@@ -756,6 +760,7 @@ pub(crate) mod tests {
             assert_eq!(kinds(&guide, guide.sections[2].steps.clone()), ["Square"]);
             let Step::Square {
                 op,
+                comp,
                 axis,
                 side,
                 to,
@@ -769,6 +774,10 @@ pub(crate) mod tests {
                 panic!("{:?}", guide.steps[3])
             };
             assert_eq!((*op, *axis, *side, *diameter), (1, 0, 1, 25.));
+            // The DRO's compensation reads the edge on the wall's side: the
+            // wall is on −X of the tool, cutting the stock's +X side.
+            let want = if dro == "Yes" { [-1, 0] } else { [0, 0] };
+            assert_eq!(*comp, want);
             close(*to, 123.);
             close(*shown, 123. + readout);
             close(*remove, 1.);
