@@ -1610,6 +1610,35 @@ impl App {
         self.project_dirty = true;
         self.last_edit = Instant::now();
     }
+    /// Keeps what the Control page found for the rotary unit of machine
+    /// `id` (LIO-186): its centreline probed, marked measured, or the mark
+    /// gone stale; in its draft too if it is being edited. Like the pins'
+    /// place it is a measurement: no setup's check is made out of date.
+    fn keep_rotary(&mut self, id: &str, keep: control::RotaryKeep) {
+        let keep = |m: &mut Machine| {
+            if m.id != id {
+                return;
+            }
+            match keep {
+                control::RotaryKeep::Centreline([y, z]) => {
+                    m.p.insert("a_centre_y".into(), format!("{y:.3}"));
+                    m.p.insert("a_centre_z".into(), format!("{z:.3}"));
+                    m.p.insert(control::CENTRE_MARK.into(), control::MEASURED.into());
+                }
+                control::RotaryKeep::Stale(why)
+                    if get(&m.p, control::CENTRE_MARK) == control::MEASURED =>
+                {
+                    m.p.insert(control::CENTRE_MARK.into(), format!("stale after {why}"));
+                }
+                control::RotaryKeep::Stale(_) => {}
+            }
+        };
+        self.doc.machines.iter_mut().for_each(keep);
+        keep(&mut self.machine_draft);
+        self.dirty = true;
+        self.project_dirty = true;
+        self.last_edit = Instant::now();
+    }
     fn touch(&mut self) {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
@@ -3945,9 +3974,20 @@ impl App {
                 let errors = self.machine_draft.issues();
                 if errors.is_empty() {
                     let mut m = self.machine_draft.clone();
+                    // A centreline typed over the probed one is no longer
+                    // the measurement.
+                    let saved = self.doc.machines.iter().find(|x| x.id == m.id);
+                    if saved.is_some_and(|x| {
+                        ["a_centre_y", "a_centre_z"]
+                            .iter()
+                            .any(|k| get(&x.p, k) != get(&m.p, k))
+                    }) {
+                        m.p.remove(control::CENTRE_MARK);
+                    }
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
                         c.pins = control::pins_settings(&m.p);
+                        c.rotary = control::Rotary::of(&m);
                     }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
@@ -4571,6 +4611,11 @@ impl App {
                     .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
                 {
                     self.record_pins(&id, at);
+                }
+                if let Some((id, keep)) = (self.control.as_mut())
+                    .and_then(|c| Some((c.machine_id.clone(), c.rotary_keep.take()?)))
+                {
+                    self.keep_rotary(&id, keep);
                 }
                 if self.status == LOCKED && !self.locked() {
                     self.status.clear();
