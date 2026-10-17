@@ -366,6 +366,55 @@ mod tests {
         );
     }
     #[test]
+    fn a_project_with_index_rotary_axis_as_a_label_loads_unchanged() {
+        // Before LIO-188 "Index rotary axis" only recorded a label: the
+        // setup had its own rotation, translation and probed origin.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexed-label.axis.json");
+        let mut doc = Document::sample();
+        let mut later = doc.setups[0].clone();
+        later.id = "later".into();
+        for (k, v) in [
+            ("name", "Side"),
+            ("reposition", "Index rotary axis"),
+            ("rx", "90"),
+            ("ty", "4"),
+            ("origin", "Stock top front-left"),
+            ("offset", "G55"),
+        ] {
+            later.p.insert(k.into(), v.into());
+        }
+        doc.setups.push(later);
+        doc.sync_stock_sources();
+        let text = serde_json::to_string(&serde_json::to_value(&doc).unwrap()).unwrap();
+        assert!(!text.contains("a_angles"));
+        fs::write(&path, &text).unwrap();
+        let mut loaded = load(&path).unwrap();
+        loaded.sync_stock_sources();
+        let mesh = crate::mesh::sample();
+        loaded.sync_turns(Some(&mesh));
+        for (a, b) in loaded.setups.iter().zip(&doc.setups) {
+            assert_eq!(a.p, b.p);
+            assert_eq!(a.turn, None);
+        }
+        let setup = &loaded.setups[1];
+        assert!(!crate::indexed::is_indexed(setup) && crate::indexed::is_label_only(setup));
+        let (a, b) = (
+            crate::volume::Frame::new(setup, &mesh),
+            crate::volume::Frame::new(&doc.setups[1], &mesh),
+        );
+        assert_eq!(a.map([1., 2., 3.]), b.map([1., 2., 3.]));
+        assert_eq!(
+            crate::stock::Placement::new(&mesh, Some(setup)).bounds,
+            crate::stock::Placement::new(&mesh, Some(&doc.setups[1])).bounds
+        );
+        // Saved again, its setups are as they were.
+        assert_eq!(
+            serde_json::to_value(&loaded.setups).unwrap(),
+            serde_json::to_value(&doc.setups).unwrap()
+        );
+    }
+    #[test]
     fn legacy_relative_dimensions_are_preserved_and_new_offsets_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stock.axis.json");

@@ -2304,7 +2304,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "origin") => (
-            "Work zero for this setup's G-code and runs: a spot on the top or bottom of the stock this setup starts from, or the part file's own origin. The probe on the Control page finds exactly this point; the editor says where it is touched off and whether it is still on the stock.",
+            "Work zero for this setup's G-code and runs: a spot on the top or bottom of the stock this setup starts from, or the part file's own origin; with A, the A centreline at the stock's end or the chuck's face. The probe on the Control page finds exactly this point; the editor says where it is touched off and whether it is still on the stock.",
             "Work zero for this setup's G-code and runs: a corner, the middle of an edge or the centre of the stock's top or bottom, on the stock this setup starts from (what earlier setups leave, turned with it), or the part file's own origin.",
             Some(Orientation),
         ),
@@ -2389,8 +2389,13 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "reposition") => (
-            "Action needed before this setup: initial loading, reclamping and probing, rotary indexing, or changing the fixture. Included in the setup sheet.",
-            "",
+            "Action needed before this setup: initial loading, reclamping and probing, indexing the rotary A axis, or changing the fixture. Included in the setup sheet.",
+            "Index rotary axis turns the stock about A in the setup before's clamping: the setup keeps that setup's work zero and lists its A angles. The other actions only describe the setup.",
+            Some(Orientation),
+        ),
+        (_, "a_angles") => (
+            "The A angles this indexed setup turns the stock to, in degrees: one (90), or several for the same operations at each (0, 90, 180, 270). Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck looking along +X, +Y up to +Z at A90.",
+            "Each angle must be inside the machine's A range. The stock turns about the A centreline in the clamping of the setup before, so the work zero stays where that setup has it.",
             Some(Orientation),
         ),
         (_, "notes") => (
@@ -3900,7 +3905,13 @@ mod tests {
         }
         let fallbacks: Vec<(&str, Vec<&str>)> = vec![
             ("offset", vec!["G54", "G55", "G56", "G57", "G58", "G59"]),
-            ("origin", crate::post::ORIGINS.to_vec()),
+            (
+                "origin",
+                (crate::post::ORIGINS.iter())
+                    .chain(&crate::indexed::ORIGINS)
+                    .copied()
+                    .collect(),
+            ),
             (
                 "controller",
                 vec![

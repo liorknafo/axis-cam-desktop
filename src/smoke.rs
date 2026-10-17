@@ -3812,6 +3812,78 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("3-job-view.png"));
     }
+    /// The setups list, the Job view and the setup editor with setup 2
+    /// indexed on A (LIO-188): `cargo test render_the_indexed_setup --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn render_the_indexed_setup() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/indexed-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let mut m = Machine::new(4);
+        for (k, v) in [
+            ("a_chuck_diameter", "200"),
+            ("a_grip_max", "150"),
+            ("a_fit_diameter", "150"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        for s in &mut doc.setups {
+            s.machine = m.clone();
+        }
+        doc.machines = vec![m];
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "110"),
+            ("stock_length", "200"),
+            ("holding", "Chuck"),
+            ("chuck_stickout", "170"),
+            ("origin", crate::indexed::ORIGINS[0]),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        let low = crate::stock::resolve(&doc.setups[0], Some(&mesh))
+            .unwrap()
+            .part
+            .unwrap();
+        doc.setups[0]
+            .p
+            .insert("tz".into(), (35. - low.min[2]).to_string());
+        doc.settle_holding(0);
+        let mut later = doc.setups[0].duplicate("G55");
+        later.p.insert("name".into(), "Side flats".into());
+        later
+            .p
+            .insert("reposition".into(), crate::indexed::ACTION.into());
+        later
+            .p
+            .insert(crate::indexed::ANGLES.into(), "90, 180, -90".into());
+        doc.setups.push(later);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.touch();
+        assert_eq!(a.doc.setups[1].turn.map(|t| t.a), Some(90.));
+        a.page = Page::Work;
+        a.selected = None;
+        a.stock = true;
+        // Tall enough for the Holding step's A angles and their warning.
+        let size = iced::Size::new(1600., 1500.);
+        for (si, step, name) in [
+            (1, "Holding", "1-indexed-holding.png"),
+            (1, "Work zero", "2-indexed-zero.png"),
+            (0, "Work zero", "3-setup-1-zero.png"),
+        ] {
+            let _ = a.update(Message::SelectSetup(si));
+            let _ = a.update(Message::SetupStep(step));
+            let _ = a.view();
+            render_png(&a, size, &out.join(name));
+        }
+    }
     #[test]
     #[ignore]
     fn render_the_fixture_pins() {

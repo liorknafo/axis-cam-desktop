@@ -201,15 +201,24 @@ fn along(s: Bounds, k: usize, at: At) -> f32 {
     }
 }
 /// Program zero in the setup's plan coordinates (mm). A stock-based zero
-/// is a point of `stock`, the box the setup starts from.
+/// is a point of `stock`, the box the setup starts from. An indexed
+/// setup's is its base's, on the box its base starts from: A turning the
+/// stock does not move it (`indexed`).
 pub fn datum(setup: &Setup, stock: Bounds, mesh: &Mesh) -> Result<[f32; 3], String> {
     let origin = get(&setup.p, "origin");
+    let (stock, axis) = match setup.turn {
+        Some(t) => (t.stock, t.axis),
+        None => (stock, crate::indexed::axis_of(stock)),
+    };
+    if let Some(zero) = crate::indexed::rotary_datum(setup, origin, stock, axis) {
+        return zero;
+    }
     if let Some((xy, top)) = stock_zero(origin) {
         let z = if top { stock.max[2] } else { stock.min[2] };
         return Ok([along(stock, 0, xy[0]), along(stock, 1, xy[1]), z]);
     }
     match origin {
-        "Model origin" => Ok(Placement::new(mesh, Some(setup))
+        "Model origin" => Ok(Placement::unturned(mesh, Some(setup))
             .transform(mesh.origin)
             .map(|v| v / mesh.display_scale())),
         other => Err(format!(
@@ -716,6 +725,8 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         w.note(&format!(
             "Work zero: {origin} in {offset}. X0 Y0 are unchanged from program 1."
         ));
+    } else if let Some(words) = crate::indexed::zero_words(origin) {
+        w.wrapped("Work zero: ", &format!("{origin} in {offset}. {words}"));
     } else if let Some(spots) = touch_off_spots(origin, h.stock) {
         // Front-left's sentence runs on over a second line.
         w.wrapped(
@@ -2594,6 +2605,15 @@ fn checked_with(
     let setup = &doc.setups[si];
     if crate::manual::is_manual(&setup.machine) {
         return Ok(vec![]);
+    }
+    // The post does not command A yet: an indexed setup's program would cut
+    // its turned stock at whatever A the machine is at.
+    if crate::indexed::is_indexed(setup) {
+        return Err(vec![format!(
+            "{}: {}",
+            setup.name(),
+            crate::indexed::NOT_POSTED
+        )]);
     }
     let offset = get(&setup.p, "offset").to_string();
     let walk = walk(doc, mesh, si, sims, settings)?;
@@ -5579,6 +5599,25 @@ M2
         // A vise cannot hold the bar.
         hold(&mut doc, "Vise", &[("vise_grip", "8")]);
         assert!(doc.holding_issues(0, Some(&mesh))[0].contains("round bar"));
+    }
+    #[test]
+    fn an_indexed_setup_is_not_exported() {
+        use crate::indexed::{ACTION, ANGLES, NOT_POSTED};
+        let (mut doc, mesh) = pocket_job();
+        assert!(post_job(&doc, &mesh).ready());
+        let mut later = doc.setups[0].duplicate("G55");
+        later.p.insert("reposition".into(), ACTION.into());
+        later.p.insert(ANGLES.into(), "90".into());
+        doc.setups.push(later);
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        let posted = post_job(&doc, &mesh);
+        assert!(!posted.ready());
+        // Setup 1 still has its program; the indexed setup is refused.
+        assert!(posted.setups[0].result.is_ok());
+        let refused = errors(&posted);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].ends_with(NOT_POSTED), "{refused:?}");
     }
     #[test]
     fn workholding_over_the_toolpath_refuses_the_setup_and_clear_workholding_exports() {

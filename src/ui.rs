@@ -1438,6 +1438,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                     .size(12)
                     .wrapping(Wrapping::None)
                 ]
+                // The setup's A angle, on a line of its own: a list of them
+                // is long.
+                .push(crate::indexed::label(s).map(|a| muted(a).size(12).wrapping(Wrapping::Word)))
                 .spacing(2)
             )
             .width(Fill)
@@ -1858,9 +1861,12 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     Some(s) => Element::from(
                         row![
                             muted(format!(
-                                "{} / {} / Work zero:",
+                                "{} / {} / {}Work zero:",
                                 get(&s.p, "offset"),
                                 app.doc.holding_label(s),
+                                crate::indexed::label(s)
+                                    .map(|a| format!("{a} / "))
+                                    .unwrap_or_default(),
                             )),
                             button(text(format!("{} · Change", get(&s.p, "origin"))).size(12))
                                 .padding([2, 6])
@@ -2953,7 +2959,8 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
         "Machine" => s.machine.issues().is_empty(),
         "Work zero" => {
             !get(&s.p, "offset").is_empty()
-                && crate::post::references(get(&s.p, "origin")).is_some()
+                && (crate::post::references(get(&s.p, "origin")).is_some()
+                    || crate::indexed::ORIGINS.contains(&get(&s.p, "origin")))
                 && crate::post::pins_issue(s).is_none()
                 && !app
                     .current_ready()
@@ -3027,8 +3034,10 @@ fn setup_editor(app: &App) -> Panel<'_> {
         _ => setup_machine(app, c),
     };
     // Pinned under the body: the checks and the setup's actions.
+    let mut issues = s.issues();
+    issues.extend(app.doc.index_issues(app.doc.index()));
     let mut foot = column![
-        warnings(s.issues()),
+        warnings(issues),
         secondary("Duplicate setup", Message::DuplicateSetup).width(Fill),
         row![
             secondary("Move up", Message::MoveSetup(-1)),
@@ -3078,6 +3087,14 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &s.p;
     let t = Target::Setup;
     let origin = get(p, "origin");
+    if let Some(base) = app.doc.index_base(app.doc.index()) {
+        return c.push(section("Work zero")).push(note(format!(
+            "{origin} in {}, as setup {} ({}) has it: A turns the stock about the A centreline and leaves the work zero where it is, so nothing is probed again.",
+            get(p, "offset"),
+            base + 1,
+            app.doc.setups[base].name()
+        )));
+    }
     let zero = crate::post::stock_zero(origin);
     let model = origin == "Model origin";
     // A spot keeps the face picked, the top for Model origin.
@@ -3150,6 +3167,7 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
             "On the stock, seen from above (back at the top, front toward you):"
         }))
         .push(grid)
+        .push(rotary_zeros(s, origin))
         .push(choice(
             p,
             "offset",
@@ -3159,6 +3177,37 @@ fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
         ))
         .push(pins_block(app, s))
         .push(zero_note(app))
+}
+/// The Work zero step's zeros on the A axis (`indexed::ORIGINS`), on a
+/// machine with one, and how the chosen one is found.
+fn rotary_zeros<'a>(s: &Setup, origin: &str) -> Element<'a, Message> {
+    if !s.machine.has_a() {
+        return column![].into();
+    }
+    let set = |v: &str| Some(Message::Edit(Target::Setup, "origin", v.into()));
+    let mut c = column![
+        muted("On the A axis: Y0 Z0 on the A centreline, X0 at"),
+        row![
+            act_sized(
+                "Stock end",
+                set(crate::indexed::ORIGINS[0]),
+                origin == crate::indexed::ORIGINS[0],
+                Some(Length::FillPortion(1))
+            ),
+            act_sized(
+                "Chuck face",
+                set(crate::indexed::ORIGINS[1]),
+                origin == crate::indexed::ORIGINS[1],
+                Some(Length::FillPortion(1))
+            ),
+        ]
+        .spacing(4)
+    ]
+    .spacing(4);
+    if let Some(words) = crate::indexed::zero_words(origin) {
+        c = c.push(muted(words));
+    }
+    c.into()
 }
 /// The Work zero step's fixture pins: whether the setup sits on its
 /// machine's pins, the part's holes chosen to drop over them (one button
@@ -3331,7 +3380,10 @@ fn zero_note(app: &App) -> Element<'_, Message> {
             "Model origin is the part file's own 0,0,0. A probe finds it from the stock this setup starts from ({from}): {}. By hand, the program header locates it from the part.",
             crate::post::probe_spots(refs, stock)
         ),
-        _ => "Choose a work zero.".into(),
+        _ => match crate::indexed::zero_words(origin) {
+            Some(words) => format!("On the stock this setup starts from ({from}): {words}"),
+            None => "Choose a work zero.".into(),
+        },
     }];
     if let Some(refs) = refs {
         lines.push(format!(
@@ -3488,6 +3540,14 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
 fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &app.doc.setup().p;
     let t = Target::Setup;
+    if let Some(base) = app.doc.index_base(app.doc.index()) {
+        return c.push(section("Part position")).push(note(format!(
+            "Placed as setup {} ({}) places it, turned about the A centreline to {}: A turns the stock in that clamping, with no re-clamp. To place this setup yourself, choose Reclamp and probe origin under Holding.",
+            base + 1,
+            app.doc.setups[base].name(),
+            crate::indexed::label(app.doc.setup()).unwrap_or_default()
+        )));
+    }
     let mut c = c.push(section("Part position")).push(
         row![
             secondary("Flip X 180°", Message::Flip("rx")),
@@ -3510,9 +3570,22 @@ fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Messag
 fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &app.doc.setup().p;
     let t = Target::Setup;
+    let si = app.doc.index();
     let mut c = c.push(section("Workholding"));
-    for control in holding_controls(app) {
-        c = c.push(control);
+    match app.doc.index_base(si) {
+        Some(base) => {
+            c = c.push(note(format!(
+                "Held as setup {} ({}) holds it: {}. A turns the stock in that clamping, so it is not re-clamped or probed again.",
+                base + 1,
+                app.doc.setups[base].name(),
+                app.doc.holding_label(&app.doc.setups[base])
+            )))
+        }
+        None => {
+            for control in holding_controls(app) {
+                c = c.push(control);
+            }
+        }
     }
     // What follows is recorded for the operator and checked by nothing, so
     // it sits under its own heading, apart from the checked workholding.
@@ -3530,9 +3603,31 @@ fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
                 "Change fixture",
             ],
             t,
-        ))
-        .push(field(p, "notes", "Setup instructions", t));
-    c
+        ));
+    let s = app.doc.setup();
+    if crate::indexed::is_indexed(s) {
+        c = c
+            .push(field(p, crate::indexed::ANGLES, "A angles · degrees", t))
+            .push(muted(
+                "One angle, or several for the same operations (0, 90, 180, -90). Positive A turns the part clockwise seen from the chuck along +X (the right-hand rule about +X): +Y up to +Z at A90.",
+            ));
+        let wrong = crate::indexed::issues(s);
+        if !wrong.is_empty() {
+            c = c.push(caution("A angles", wrong));
+        }
+        let warned = app.doc.index_warnings(si);
+        if !warned.is_empty() {
+            c = c.push(caution("Not ready to index", warned));
+        }
+        c = c.push(muted(
+            "Not exported or run yet: programs do not command A. Its frame, work zero and A angles are kept for when they do.",
+        ));
+    } else if crate::indexed::is_label_only(s) {
+        c = c.push(note(
+            "Saved before indexing turned the stock: this setup keeps its own placement and work zero. Choose Index rotary axis again to turn the stock about A in the clamping before it.",
+        ));
+    }
+    c.push(field(p, "notes", "Setup instructions", t))
 }
 /// An item of a pick list: what is sent when it is chosen, and what it says.
 #[derive(Clone, PartialEq)]
@@ -5086,6 +5181,8 @@ fn control(app: &App) -> Element<'_, Message> {
                 "Job",
                 column![
                     container(view).height(360),
+                    (app.doc.active_setup().and_then(crate::indexed::label))
+                        .map(|a| muted(format!("{} at {a}", app.doc.setup().name()))),
                     muted("Drag to orbit · right-drag to pan · scroll to zoom. The machine's tool is red while a tool run cuts, and the stock is cut away where it goes."),
                     uncut_line(app).map(muted),
                     uncut_legend(app)
@@ -5777,7 +5874,14 @@ pub(crate) fn run_strip<'a>(
         for (si, x) in setups {
             let picked = c.run.as_ref().is_some_and(|r| r.setup == si);
             pick = pick.push(act(
-                format!("{}. {}", si + 1, x.name()),
+                format!(
+                    "{}. {}{}",
+                    si + 1,
+                    x.name(),
+                    crate::indexed::label(x)
+                        .map(|a| format!(" · {a}"))
+                        .unwrap_or_default()
+                ),
                 msg(!c.setup_locked(), R::Setup(si)),
                 picked,
             ));

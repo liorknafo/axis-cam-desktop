@@ -10,6 +10,7 @@ mod forces;
 mod guide;
 mod help;
 mod holding;
+mod indexed;
 mod look;
 mod machine_view;
 mod manual;
@@ -1198,6 +1199,7 @@ impl App {
         if !doc.sample_model {
             doc.sync_stock_sources();
         }
+        doc.sync_turns(None);
         let imported_mesh = None;
         let icons: Vec<_> = [
             include_bytes!("../assets/op-0.svg").as_slice(),
@@ -1407,6 +1409,7 @@ impl App {
             self.doc.sync_stock_sources();
         }
         self.imported_mesh = None;
+        self.sync_turns();
         self.import_error = None;
         self.project_path = path;
         self.project_dirty = self.project_path.is_none();
@@ -1639,10 +1642,23 @@ impl App {
         self.project_dirty = true;
         self.last_edit = Instant::now();
     }
+    /// Works out how A turns each indexed setup (`Document::sync_turns`),
+    /// with the part when it is there.
+    fn sync_turns(&mut self) {
+        let mesh = if self.doc.file.is_some() {
+            self.imported_mesh.as_ref()
+        } else if self.doc.sample_model {
+            Some(&self.sample_mesh)
+        } else {
+            None
+        };
+        self.doc.sync_turns(mesh);
+    }
     fn touch(&mut self) {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
+        self.sync_turns();
         self.audit_report.clear();
         self.invalidate_post();
         // A running plan and a preview describe the job as it was.
@@ -3121,6 +3137,17 @@ impl App {
                         return Task::none();
                     }
                     let holder = get(&self.doc.setup().p, "holder").to_string();
+                    // Index rotary axis turns the stock about A at the angles
+                    // the setup lists; another action takes them away.
+                    if k == "reposition" {
+                        let p = &mut self.doc.setup_mut().p;
+                        if v == indexed::ACTION {
+                            p.entry(indexed::ANGLES.into())
+                                .or_insert_with(|| indexed::DEFAULT_ANGLES.into());
+                        } else {
+                            p.remove(indexed::ANGLES);
+                        }
+                    }
                     self.doc.setup_mut().p.insert(k.into(), v);
                     if matches!(k, "holding" | "holder") {
                         self.doc.settle_holding(self.doc.index());
@@ -3565,10 +3592,9 @@ impl App {
                     .setup_mut()
                     .p
                     .insert(axis.into(), if axis == "ry" { "90" } else { "180" }.into());
-                self.doc
-                    .setup_mut()
-                    .p
-                    .insert("reposition".into(), "Reclamp and probe origin".into());
+                let p = &mut self.doc.setup_mut().p;
+                p.insert("reposition".into(), "Reclamp and probe origin".into());
+                p.remove(indexed::ANGLES);
                 self.touch();
             }
             Message::AssignMachine(id) => {
@@ -4345,6 +4371,7 @@ impl App {
                 match result {
                     Ok(mesh) => {
                         self.imported_mesh = Some(mesh);
+                        self.sync_turns();
                         self.undo = None;
                         self.invalidate_post();
                         self.status = "Saved model geometry restored.".into();

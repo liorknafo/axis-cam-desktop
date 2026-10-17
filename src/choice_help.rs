@@ -275,6 +275,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Program zero is the imported file's own 0,0,0, placed with this setup's rotation and translation. With the probe, Probe corner on the Control page finds it from the front-left corner of the stock top, set off from it as the program has it. Check that the point can be located on the machine before choosing it.",
             "The LinuxCNC program lists the part's box in work coordinates and, while no earlier setup has cut it, the stock top's Z, to touch off on a part wall or that stock top.",
         ),
+        ("origin", "A axis at stock end") => (
+            "For work on the rotary A axis: Y0 Z0 on the A centreline, X0 at the stock's free (+X) end face. The Control page's Rotary A calibration measures the centreline and finds A zero on a flat; touch off X0 on the end face. A turns the stock about this zero, so an indexed setup keeps it.",
+            "The machine's rotary geometry gives where the centreline is; while it is assumed (not probed) or has gone stale, indexed setups say so.",
+        ),
+        ("origin", "A axis at chuck face") => (
+            "For work on the rotary A axis: Y0 Z0 on the A centreline, X0 on the chuck's face. Needs the stock held in the chuck (Modelled workholding). A turns the stock about this zero, so an indexed setup keeps it.",
+            "The face is where the jaws' back is, the stick-out and the jaw length in from the stock's free end; Y0 Z0 and A0 come from the Control page's Rotary A calibration.",
+        ),
         ("post_tool_length", "Tool table (G43 H#)") => (
             "Write T# M6, then G43 H# after each tool change. LinuxCNC applies the length stored for that tool number, so measure every tool into its tool table first.",
             "",
@@ -332,12 +340,12 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("reposition", "Reclamp and probe origin") => (
-            "Document a manual flip or reclamping followed by probing. Set the new rotation/translation separately. Earlier removed material is retained across the setup change.",
+            "Document a manual flip or reclamping followed by probing. Set the new rotation/translation separately. Earlier removed material is retained across the setup change. Setups indexed on A after it turn the stock in this new clamping.",
             "",
         ),
         ("reposition", "Index rotary axis") => (
-            "Record rotary indexing before this setup. The label does not command a rotary move or solve machine angles. Use placement fields to preview orientation; indexed machine kinematics remain pending.",
-            "",
+            "A turns the stock in the clamping of the setup before it: no re-clamp, no re-probing. This setup's frame is that one's turned about the A centreline by each A angle listed, and it keeps that setup's work zero, offset, machine and chuck.",
+            "List one angle (90) or several for the same operations (0, 90, 180, -90). Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck along +X. Needs a machine with A around X. A work zero on the A axis has Y0 Z0 on the centreline the Control page's Rotary A calibration measures; while it is assumed or stale, the setup says so. Programs do not command A yet: an indexed setup is not exported or run.",
         ),
         ("reposition", "Change fixture") => (
             "Document moving the part to different workholding. Set the new placement and locating instructions. Stock remains the result of earlier enabled operations.",
