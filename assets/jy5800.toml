@@ -5,6 +5,11 @@
 # No coolant, enable, or charge-pump output is guessed here.
 # Measured axis checks below permit Reset/motion; spindle direction, RPM,
 # hardware E-stop power cutoff and power/USB-loss behavior remain unverified.
+# A 4th, rotary A axis (degrees) is NOT in this profile: the rotary is not
+# wired yet. When it is, add it from Control > Setup > Add the A axis (pins 8
+# and 9); the form keeps these comments, unticks pinout_verified and
+# steps_per_unit_verified below, and Reset stays refused until A's pins are
+# checked and its steps per degree are calibrated there.
 
 [controller]
 serial = "CD9090D3"
@@ -17,6 +22,8 @@ required = true
 # confirmed by ruler-measured moves in both directions (operator). Every
 # move ran with no enable or charge-pump output configured, which is the
 # positive confirmation that this machine's drives need neither.
+# pinout_verified and steps_per_unit_verified cover EVERY axis in the file:
+# adding A from the form unticks both until A is checked.
 pinout_verified = true
 estop_verified = true
 drive_enable_verified = true
