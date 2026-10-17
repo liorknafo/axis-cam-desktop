@@ -4241,7 +4241,11 @@ fn machines(app: &App) -> Element<'_, Message> {
             "Machine library",
             "Saved locally. Each setup keeps a snapshot of its assigned profile."
         ),
-        primary("+ New machine profile", Message::NewMachine),
+        row![
+            primary("+ New machine profile", Message::NewMachine),
+            secondary("+ Jingyan CNC4030 + rotary", Message::AddRotaryMachine)
+        ]
+        .spacing(8),
         space().height(5)
     ]
     .spacing(18);
@@ -4500,6 +4504,15 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     ] {
                         form = form.push(field(p, k, l, t));
                     }
+                }
+                if m.has_a() {
+                    form = form
+                        .push(bold("Rotary unit", 15))
+                        .push(note("Where the A axis sits and how big its chuck and tailstock are, all in mm in machine coordinates (Z is zero at the top and negative down). New values are ASSUMED for a 100 mm 3-jaw chuck on a NEMA23 rotary unit and still to be measured: calibration will replace them."));
+                    for (k, l, _) in crate::model::ROTARY_GEOMETRY {
+                        form = form.push(field(p, k, l, t));
+                    }
+                    form = form.push(warnings(m.rotary_issues()));
                 }
             } else {
                 form = form.push(note(

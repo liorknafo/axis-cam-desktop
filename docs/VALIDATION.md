@@ -1000,3 +1000,12 @@ On the Run panel every tool run started at its first operation: operations alrea
 - Pictures: `render_a_run_started_at_a_chosen_operation` (ignored; `cargo test -- --ignored`) draws the window headless on tiny-skia: the Pocket chosen before the touch-off, the Pocket being cut, and the Drilling chosen with the corner work zero whose surface the check cannot tell.
 - Linux, 17 October 2026, rebased on main (114f4c9): `cargo test --locked -- --test-threads=6` gave **1146 passed, 0 failed, 6 ignored** in 564 seconds; `cargo clippy --locked --all-targets -- -D warnings` and `cargo fmt --check` are clean.
 - Not validated: on the real JY5800.
+
+## A 4-axis Jingyan CNC4030 with the rotary unit's geometry (LIO-184, 17 October 2026)
+
+The Machine library could save 4 axes but not where the rotary sits; the owner's machine is 3-axis and the run checked only X, Y and Z against the profile.
+
+- `rotary_unit::*` (`model.rs`): a 4-axis "A table around X" machine starts with the 15 geometry fields of `ROTARY_GEOMETRY` (mm, all assumed) and has no issues; they round-trip through the saved JSON and are mm whatever the machine's units; a machine file saved without them loads, reports no geometry and no issues, and gets the defaults when edited (an existing value is kept); a 3-axis or B-axis machine has none and bad values on it are not asked about. Validation: sizes must be above zero (the smallest grip zero or more), the centreline inside the Y and Z travel (Z from −travel to 0), the chuck face and tailstock inside X, the tailstock beyond the chuck, the grip range ordered and within the chuck, and the part length not longer than the chuck-to-tailstock distance.
+- `the_rotary_machine_is_a_4_axis_on_a_profile_with_the_a_axis_and_the_owners_stays_3_axis` (`control.rs`): "Jingyan CNC4030 + rotary" has no issues, its profile (`jy5800.toml` plus `[axes.a]`, −180 to 180 degrees) loads and passes the driver's checks, X, Y and Z soft-limit spans match its travel, and the owner's machine and its profile file are unchanged and have no A axis.
+- `run::tests::a_range_that_matches_…`, `…differs_from_the_profiles_a_soft_limits_is_refused`, `a_machine_with_an_a_axis_on_a_profile_without_one_is_refused`, `a_machine_without_an_a_axis_is_not_asked_about_a`: A is checked in Cycle Start's problems (`run::a_problems`) with both ends of the range; the XYZ checks are unchanged.
+- Not validated: the form in the window, the library button on screen, and anything on the real machine. The geometry and the profile's A axis are assumed, not measured.

@@ -221,6 +221,64 @@ const HANDED_OVER: [&str; 17] = [
     "clearance",
 ];
 
+/// A rotary unit's geometry on a machine with an A axis (LIO-184): the
+/// `p` key, the form's label and the default, all in mm. EVERY DEFAULT IS
+/// ASSUMED, for a 100 mm 3-jaw chuck on a NEMA23 rotary unit at the left end
+/// of a Jingyan CNC4030's table, and still to be measured (calibration,
+/// LIO-186). Machine files saved before these fields existed lack the keys
+/// and still load: the geometry is then not recorded (`Machine::rotary_unit`
+/// is None) and is not checked, until the machine is edited (which fills
+/// these defaults in, `Machine::fill_rotary_defaults`).
+pub const ROTARY_GEOMETRY: [(&str, &str, &str); 15] = [
+    ("a_centre_y", "A centreline in machine Y · mm", "140"),
+    ("a_centre_z", "A centreline in machine Z · mm", "-40"),
+    ("a_chuck_x", "Chuck face in machine X · mm", "20"),
+    (
+        "a_centre_height",
+        "Centre height above the table · mm",
+        "70",
+    ),
+    ("a_chuck_diameter", "Chuck diameter · mm", "100"),
+    ("a_jaw_length", "Jaw length · mm", "25"),
+    ("a_grip_min", "Smallest part the jaws grip · mm", "5"),
+    ("a_grip_max", "Largest part the jaws grip · mm", "80"),
+    ("a_tail_width", "Tailstock body width (Y) · mm", "60"),
+    ("a_tail_height", "Tailstock body height (Z) · mm", "80"),
+    ("a_tail_length", "Tailstock body length (X) · mm", "90"),
+    ("a_tail_travel", "Tailstock travel · mm", "30"),
+    ("a_tail_x", "Tailstock centre in machine X · mm", "330"),
+    (
+        "a_fit_diameter",
+        "Largest part diameter under the gantry · mm",
+        "80",
+    ),
+    (
+        "a_fit_length",
+        "Longest part between chuck and tailstock · mm",
+        "250",
+    ),
+];
+
+/// The rotary unit's geometry, mm, as `Machine::rotary_unit` reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RotaryUnit {
+    pub centre_y: f32,
+    pub centre_z: f32,
+    pub chuck_x: f32,
+    pub centre_height: f32,
+    pub chuck_diameter: f32,
+    pub jaw_length: f32,
+    pub grip_min: f32,
+    pub grip_max: f32,
+    pub tail_width: f32,
+    pub tail_height: f32,
+    pub tail_length: f32,
+    pub tail_travel: f32,
+    pub tail_x: f32,
+    pub fit_diameter: f32,
+    pub fit_length: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Machine {
     pub id: String,
@@ -296,17 +354,127 @@ impl Machine {
             );
             p.insert("pivot_z".into(), "120".into());
         }
-        Self {
+        let mut m = Self {
             id: id(),
             version: 1,
             p,
-        }
+        };
+        m.fill_rotary_defaults();
+        m
     }
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
     pub fn axes(&self) -> u8 {
         get(&self.p, "axes").parse().unwrap_or(3)
+    }
+    /// Whether the machine has an A axis on its table, turning about X: the
+    /// 4-axis "A table around X". The rotary unit's geometry applies to it.
+    pub fn has_a(&self) -> bool {
+        self.axes() == 4 && get(&self.p, "arrangement").starts_with('A')
+    }
+    /// The rotary unit's geometry; None without an A axis, or when a field
+    /// is missing (a file saved before they existed) or not a number.
+    pub fn rotary_unit(&self) -> Option<RotaryUnit> {
+        if !self.has_a() {
+            return None;
+        }
+        let v = |i: usize| num(&self.p, ROTARY_GEOMETRY[i].0);
+        Some(RotaryUnit {
+            centre_y: v(0)?,
+            centre_z: v(1)?,
+            chuck_x: v(2)?,
+            centre_height: v(3)?,
+            chuck_diameter: v(4)?,
+            jaw_length: v(5)?,
+            grip_min: v(6)?,
+            grip_max: v(7)?,
+            tail_width: v(8)?,
+            tail_height: v(9)?,
+            tail_length: v(10)?,
+            tail_travel: v(11)?,
+            tail_x: v(12)?,
+            fit_diameter: v(13)?,
+            fit_length: v(14)?,
+        })
+    }
+    /// What is wrong with the rotary unit's geometry. Nothing is checked
+    /// while no field has been given (an older file): the geometry is not
+    /// recorded then.
+    pub fn rotary_issues(&self) -> Vec<String> {
+        let mut e = vec![];
+        let p = &self.p;
+        if ROTARY_GEOMETRY
+            .iter()
+            .all(|(k, _, _)| get(p, k).trim().is_empty())
+        {
+            return e;
+        }
+        // The form's label without its unit.
+        let name = |k: &str| {
+            let label = ROTARY_GEOMETRY.iter().find(|g| g.0 == k).map_or(k, |g| g.1);
+            label.split(" · ").next().unwrap_or(label).to_string()
+        };
+        for (k, _, _) in ROTARY_GEOMETRY {
+            let ok = match k {
+                "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => num(p, k).is_some(),
+                "a_grip_min" => num(p, k).is_some_and(|n| n >= 0.),
+                _ => num(p, k).is_some_and(|n| n > 0.),
+            };
+            if !ok {
+                e.push(format!(
+                    "{} must be {}.",
+                    name(k),
+                    match k {
+                        "a_grip_min" => "zero or more",
+                        "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => "a number",
+                        _ => "greater than zero",
+                    }
+                ))
+            }
+        }
+        // Machine Z is zero at the top and negative down, as in the UC100
+        // profile: the centreline is somewhere in the Z travel below it.
+        let [x, y, z] = ["x", "y", "z"].map(|k| crate::post_check::machine_mm(self, k));
+        for (k, lo, hi) in [
+            ("a_centre_y", 0., y),
+            ("a_centre_z", -z, 0.),
+            ("a_chuck_x", 0., x),
+            ("a_tail_x", 0., x),
+        ] {
+            if num(p, k).is_some_and(|n| !(lo..=hi).contains(&n)) {
+                e.push(format!(
+                    "{} must be inside the machine's travel, from {lo} to {hi} mm.",
+                    name(k)
+                ))
+            }
+        }
+        let Some(u) = self.rotary_unit() else {
+            return e;
+        };
+        if u.grip_max <= u.grip_min {
+            e.push(format!(
+                "{} must be greater than {}.",
+                name("a_grip_max"),
+                name("a_grip_min")
+            ))
+        }
+        if u.grip_max > u.chuck_diameter {
+            e.push(format!(
+                "{} cannot be wider than the chuck.",
+                name("a_grip_max")
+            ))
+        }
+        if u.tail_x <= u.chuck_x {
+            e.push("The tailstock must be at a larger machine X than the chuck face.".into())
+        } else if u.fit_length > u.tail_x - u.chuck_x {
+            e.push(format!(
+                "{} cannot be longer than the {} mm between the chuck face and the tailstock.",
+                name("a_fit_length"),
+                u.tail_x - u.chuck_x
+            ))
+        }
+        e
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
@@ -352,6 +520,9 @@ impl Machine {
                 finite(&self.p, k, &mut e)
             }
         }
+        if self.has_a() {
+            e.extend(self.rotary_issues());
+        }
         if self.axes() == 5 {
             range(&self.p, "rotary2_min", "rotary2_max", &mut e);
             for k in ["pivot2_x", "pivot2_y", "pivot2_z"] {
@@ -370,6 +541,16 @@ impl Machine {
                 .unwrap_or_default(),
         );
         e
+    }
+    /// Gives a machine with an A axis the assumed rotary geometry it lacks
+    /// (`ROTARY_GEOMETRY`), when it is edited or turned into one; the values
+    /// it has are kept.
+    pub fn fill_rotary_defaults(&mut self) {
+        if self.has_a() {
+            for (key, _, value) in ROTARY_GEOMETRY {
+                self.p.entry(key.into()).or_insert_with(|| value.into());
+            }
+        }
     }
     pub fn fill_post_defaults(&mut self) {
         // The plate's thickness and the tip's diameter have no default to fill in.
@@ -3955,5 +4136,145 @@ mod manual_setups {
                 Some(k)
             );
         }
+    }
+}
+#[cfg(test)]
+mod rotary_unit {
+    use super::*;
+
+    #[test]
+    fn a_4_axis_machine_starts_with_the_assumed_geometry_and_no_issues() {
+        let m = Machine::new(4);
+        assert!(m.has_a());
+        assert_eq!(m.issues(), Vec::<String>::new());
+        let u = m.rotary_unit().unwrap();
+        assert_eq!(
+            (u.chuck_diameter, u.centre_height, u.fit_diameter, u.tail_x),
+            (100., 70., 80., 330.)
+        );
+        for (key, _, value) in ROTARY_GEOMETRY {
+            assert_eq!(get(&m.p, key), value);
+        }
+    }
+
+    #[test]
+    fn the_geometry_is_saved_in_mm_and_comes_back_from_a_file() {
+        let mut m = Machine::new(4);
+        m.p.insert("a_chuck_diameter".into(), "125".into());
+        m.p.insert("a_grip_max".into(), "110".into());
+        let back: Machine = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.p, m.p);
+        assert_eq!(back.rotary_unit(), m.rotary_unit());
+        assert_eq!(back.rotary_unit().unwrap().chuck_diameter, 125.);
+        // Inches change the travel's unit, not the geometry's.
+        let mut inch = back;
+        inch.p.insert("units".into(), "inch".into());
+        assert_eq!(inch.rotary_unit().unwrap().chuck_diameter, 125.);
+    }
+
+    #[test]
+    fn a_machine_file_saved_before_the_geometry_existed_still_loads() {
+        let old = r#"{"id":"m1","version":3,"p":{"name":"Rotary Mill","axes":"4",
+            "mode":"Indexed (3+1)","arrangement":"A table around X","x":"390","y":"280","z":"55",
+            "units":"mm","controller":"LinuxCNC","rpm":"12000","feed":"5000",
+            "rotary_min":"-180","rotary_max":"180","pivot_x":"0","pivot_y":"0","pivot_z":"120"}}"#;
+        let mut m: Machine = serde_json::from_str(old).unwrap();
+        assert!(m.has_a());
+        // Not recorded and not complained about; editing fills in the assumed values.
+        assert_eq!(m.rotary_unit(), None);
+        assert_eq!(m.issues(), Vec::<String>::new());
+        m.fill_rotary_defaults();
+        assert_eq!(m.rotary_unit(), Machine::new(4).rotary_unit());
+        // A value it had is kept.
+        let mut kept = m.clone();
+        kept.p.insert("a_chuck_diameter".into(), "125".into());
+        kept.fill_rotary_defaults();
+        assert_eq!(get(&kept.p, "a_chuck_diameter"), "125");
+        // A library file with such a machine loads whole.
+        let doc: Document =
+            serde_json::from_str(&serde_json::to_string(&Document::default()).unwrap()).unwrap();
+        assert!(doc.machines.is_empty());
+    }
+
+    #[test]
+    fn only_a_4_axis_table_around_x_has_the_geometry() {
+        let mut three = Machine::new(3);
+        three.fill_rotary_defaults();
+        assert!(!three.has_a() && three.rotary_unit().is_none());
+        assert!(!three.p.contains_key("a_chuck_diameter"));
+        let mut b = Machine::new(4);
+        b.p.insert("arrangement".into(), "B table around Y".into());
+        assert!(!b.has_a() && b.rotary_unit().is_none());
+        // Bad geometry is not asked about on a machine without an A axis.
+        b.p.insert("a_chuck_diameter".into(), "-1".into());
+        assert!(b.issues().is_empty());
+    }
+
+    #[test]
+    fn the_geometry_is_validated() {
+        let issues = |edits: &[(&str, &str)]| {
+            // The Jingyan's travel.
+            let mut m = Machine::new(4);
+            for (k, v) in [("x", "390"), ("y", "280"), ("z", "55")] {
+                m.p.insert(k.into(), v.into());
+            }
+            for (k, v) in edits {
+                m.p.insert((*k).into(), (*v).into());
+            }
+            m.issues()
+        };
+        for (edits, expected) in [
+            (
+                &[("a_chuck_diameter", "0")][..],
+                "Chuck diameter must be greater than zero.",
+            ),
+            (
+                &[("a_jaw_length", "abc")],
+                "Jaw length must be greater than zero.",
+            ),
+            (
+                &[("a_tail_travel", "-5")],
+                "Tailstock travel must be greater than zero.",
+            ),
+            (
+                &[("a_grip_min", "-1")],
+                "Smallest part the jaws grip must be zero or more.",
+            ),
+            (
+                &[("a_centre_y", "300")],
+                "A centreline in machine Y must be inside the machine's travel, from 0 to 280 mm.",
+            ),
+            (
+                &[("a_centre_z", "10")],
+                "A centreline in machine Z must be inside the machine's travel, from -55 to 0 mm.",
+            ),
+            (
+                &[("a_centre_z", "-60")],
+                "A centreline in machine Z must be inside the machine's travel, from -55 to 0 mm.",
+            ),
+            (
+                &[("a_grip_max", "4")],
+                "Largest part the jaws grip must be greater than Smallest part the jaws grip.",
+            ),
+            (
+                &[("a_grip_max", "120")],
+                "Largest part the jaws grip cannot be wider than the chuck.",
+            ),
+            (
+                &[("a_tail_x", "10")],
+                "The tailstock must be at a larger machine X than the chuck face.",
+            ),
+            (
+                &[("a_fit_length", "400")],
+                "Longest part between chuck and tailstock cannot be longer than the 310 mm between the chuck face and the tailstock.",
+            ),
+        ] {
+            let found = issues(edits);
+            // A chuck of no size also leaves the jaws wider than it.
+            assert_eq!(found.first(), Some(&expected.to_string()), "{edits:?}");
+            assert!(found.len() <= 2, "{found:?}");
+        }
+        // The centreline may sit on the edges of the travel.
+        assert!(issues(&[("a_centre_y", "280"), ("a_centre_z", "-55")]).is_empty());
     }
 }

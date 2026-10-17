@@ -344,7 +344,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("mode", "Indexed (3+1)") => (
-            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. Automatic index-angle solving and machine motion are not implemented.",
+            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. The rotary unit's place and chuck and tailstock sizes are saved with the machine (Rotary unit); automatic index-angle solving and machine motion are not implemented.",
             "",
         ),
         ("mode", "Indexed (3+2)") => (
@@ -556,7 +556,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 "Save {value} as the intended controller family for planning. Only LinuxCNC output is implemented, so G-code export is refused for this machine."
             )),
             "arrangement" => plain(format!(
-                "Save the {value} rotary layout. {} A rotates about X, B about Y, and C about Z. This records the machine configuration; inverse kinematics are not implemented.",
+                "Save the {value} rotary layout. {} A rotates about X, B about Y, and C about Z. This records the machine configuration, and for an A table around X the rotary unit's place and size under Rotary unit; inverse kinematics are not implemented.",
                 if value.contains("head-head") {
                     "Both rotary axes are on the spindle head."
                 } else if value.contains("head-table") {

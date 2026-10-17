@@ -1042,6 +1042,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Create a reusable machine profile in five steps: identity, travel, kinematics, controller and review.",
             "",
         ),
+        AddRotaryMachine => (
+            "Add the Jingyan CNC4030 with a rotary unit on its table to the Machine library: 4 axes with A about X, on a copy of the JY5800 UC100 profile with an A axis. Its rotary unit's place, chuck and tailstock sizes are assumed for a 100 mm 3-jaw chuck on a NEMA23 rotary unit and still to be measured. The 3-axis Jingyan CNC4030 stays as it is.",
+            "",
+        ),
         AddSetup => (
             "Add another machining position with its own machine, stock, work offset and operations. Use a new setup when you reclamp, flip or reorient the part. Without a setup, choose or configure your machine first.",
             "",
@@ -2363,6 +2367,45 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Location of this rotary axis pivot in the machine coordinate frame, using the selected machine units. Accurate measured pivots will be required by the future kinematic solver.",
             "",
             Some(Orientation),
+        ),
+        (Target::Machine, k) if k.starts_with("a_") => (
+            match k {
+                "a_centre_y" => {
+                    "Where the A axis' centreline runs in machine Y, in mm from the machine's Y zero. It must be inside the Y travel. Assumed until measured."
+                }
+                "a_centre_z" => {
+                    "Where the A axis' centreline runs in machine Z, in mm (zero is the top of the Z travel, so this is negative). It must be inside the Z travel. Assumed until measured."
+                }
+                "a_chuck_x" => {
+                    "Machine X of the chuck's face, where a part starts, in mm. Assumed until measured."
+                }
+                "a_centre_height" => {
+                    "Height of the A centreline above the table, in mm. Assumed until measured."
+                }
+                "a_chuck_diameter" => "The chuck's outside diameter, in mm.",
+                "a_jaw_length" => {
+                    "How far the jaws reach out from the chuck face, in mm: a part is gripped over this length."
+                }
+                "a_grip_min" => "The smallest part diameter the jaws grip, in mm.",
+                "a_grip_max" => {
+                    "The largest part diameter the jaws grip, in mm. It cannot be more than the chuck diameter."
+                }
+                "a_tail_width" => "Width of the tailstock body across Y, in mm.",
+                "a_tail_height" => "Height of the tailstock body in Z, in mm.",
+                "a_tail_length" => "Length of the tailstock body along X, in mm.",
+                "a_tail_travel" => "How far the tailstock's centre moves in or out, in mm.",
+                "a_tail_x" => {
+                    "Machine X of the tailstock's centre point, in mm. It must be farther along X than the chuck face."
+                }
+                "a_fit_diameter" => {
+                    "The largest part diameter that fits under the gantry with the machine's Z travel (55 mm, assumed), in mm."
+                }
+                _ => {
+                    "The longest part that fits between the chuck face and the tailstock, in mm. It cannot be more than the distance between them."
+                }
+            },
+            "Every default is assumed, for a 100 mm 3-jaw chuck on a NEMA23 rotary unit, and still to be measured; calibration will fill in measured numbers.",
+            None,
         ),
         (_, "controller") => (
             "Controller family. LinuxCNC has a 3-axis postprocessor; other controllers are saved for planning and cannot export G-code yet.",
@@ -3906,6 +3949,7 @@ mod tests {
             SaveProject,
             RunOnMachine(0),
             NewMachine,
+            AddRotaryMachine,
             AddSetup,
             AddManualSetup,
             ToolMachine("m".into(), true),

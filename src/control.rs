@@ -148,6 +148,65 @@ pub fn owners_machine(dir: &Path) -> std::io::Result<Machine> {
     Ok(m)
 }
 
+/// The A axis added to the owner's JY5800 profile for the machine with the
+/// rotary unit (LIO-184): the profile's own text, `[axes.a]` after it. The
+/// pins are the driver's free step/dir pair 8 and 9 and the rest is the
+/// driver's sample A axis: ASSUMED, none of it wired or measured yet.
+const ROTARY_AXIS: &str = "
+[axes.a]
+# ASSUMED (LIO-184), NOT WIRED OR MEASURED: pins 8 and 9 are the driver's free
+# step/dir pair, 44.444 steps per degree is its sample A axis (16000 per turn)
+# and the speeds are its sample's. Measure all of them on the rotary unit
+# (LIO-186) and correct them. The soft limits are the machine's rotary range
+# in AXIS CAM, -180 to 180 degrees.
+steps_per_unit = 44.444
+max_velocity = 3600
+acceleration = 360
+step = { pin = 8, active_low = true }
+dir = { pin = 9, active_low = false }
+reversed = false
+soft_min = -180.0
+soft_max = 180.0
+";
+
+/// The owner's UC100 profile with the rotary unit's A axis: `jy5800.toml`
+/// and `[axes.a]`.
+pub fn rotary_profile() -> String {
+    format!("{}{ROTARY_AXIS}", include_str!("../assets/jy5800.toml"))
+}
+
+/// The Jingyan CNC4030 with a rotary unit on the table (LIO-184): the owner's
+/// machine as 4-axis "Indexed (3+1)", A about X, on its own copy of the JY5800
+/// profile with `[axes.a]`, `jy5800-rotary.toml` in `dir` (kept if it is
+/// there). The rotary geometry is the assumed default of `ROTARY_GEOMETRY`.
+/// The owner's 3-axis machine stays what it is.
+pub fn rotary_machine(dir: &Path) -> std::io::Result<Machine> {
+    let path = dir.join("jy5800-rotary.toml");
+    if !path.exists() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, rotary_profile())?;
+    }
+    let mut m = Machine::new(4);
+    for (key, value) in [
+        ("name", "Jingyan CNC4030 + rotary"),
+        ("controller", "UC100"),
+        ("x", "390"),
+        ("y", "280"),
+        ("z", "55"),
+        ("rpm", "24000"),
+        ("feed", "1000"),
+    ] {
+        m.p.insert(key.into(), value.into());
+    }
+    // The pivot is the centreline Machine::new left at its own guess.
+    for (key, from) in [("pivot_y", "a_centre_y"), ("pivot_z", "a_centre_z")] {
+        let value = get(&m.p, from).to_string();
+        m.p.insert(key.into(), value);
+    }
+    m.p.insert("uc100_profile".into(), path.display().to_string());
+    Ok(m)
+}
+
 /// A UC100 machine's probe settings (Machine library): mm and mm/min.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Probe {
@@ -4805,5 +4864,44 @@ probe = { pin = 13, active_low = true }
         // Declaring X another way is not from the pin.
         c.act(Action::MachineZero(Some(0)));
         assert!(!c.pin_referenced);
+    }
+}
+#[cfg(test)]
+mod rotary_machine_tests {
+    use super::*;
+
+    #[test]
+    fn the_rotary_machine_is_a_4_axis_on_a_profile_with_the_a_axis_and_the_owners_stays_3_axis() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = owners_machine(dir.path()).unwrap();
+        assert_eq!((owner.axes(), get(&owner.p, "mode")), (3, "3-axis"));
+        assert!(owner.rotary_unit().is_none());
+        let a = rotary_machine(dir.path()).unwrap();
+        assert_eq!(a.name(), "Jingyan CNC4030 + rotary");
+        assert!(a.has_a() && a.issues().is_empty(), "{:?}", a.issues());
+        assert_eq!(get(&a.p, "arrangement"), "A table around X");
+        // Its own profile file, the owner's left alone.
+        assert_ne!(get(&a.p, "uc100_profile"), get(&owner.p, "uc100_profile"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("jy5800.toml")).unwrap(),
+            include_str!("../assets/jy5800.toml")
+        );
+        let cfg = profile(&a).unwrap();
+        let soft = |i| {
+            let x = cfg.axes.get(i).unwrap();
+            (x.soft_min.unwrap(), x.soft_max.unwrap())
+        };
+        assert_eq!(soft(3), (-180., 180.));
+        for (i, k) in ["x", "y", "z"].into_iter().enumerate() {
+            let (lo, hi) = soft(i);
+            assert_eq!(hi - lo, num_f(&a, k), "{k}");
+        }
+        assert!(profile(&owner).unwrap().axes.get(3).is_none());
+        // The pivot is the A centreline.
+        assert_eq!(get(&a.p, "pivot_y"), get(&a.p, "a_centre_y"));
+    }
+
+    fn num_f(m: &Machine, k: &str) -> f64 {
+        get(&m.p, k).parse().unwrap()
     }
 }
