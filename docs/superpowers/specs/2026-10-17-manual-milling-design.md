@@ -70,7 +70,7 @@ The generator in `src/cam.rs` makes every move change exactly one of X, Y and Z:
 
 - Passes run along the box's longer side. Between passes the tool steps across by `stepover`. Z steps down by `stepdown` until it reaches `z_bottom`.
 - Each pass is **conventional milling**: with the spindle turning clockwise (M3), the uncut material stays on the left of the feed direction (on the right would be climb). A pass returns to the start off the cut rather than cutting back the other way. Backlash on a hand-fed mill can pull the cutter into a climb cut.
-- Z goes down outside the stock when the pass starts at an open side. A box closed at both ends of its passes (a pocket or a closed slot) plunges straight down at a quarter of the feed, which needs a centre-cutting end mill; the Pass screen draws the plunge.
+- Z goes down outside the stock when the pass starts at an open side. A box closed at both ends of its passes (a pocket or a closed slot) plunges straight down at a quarter of the feed once per level, at its first row, which needs a centre-cutting end mill; the Pass screen warns of it. Later rows on the level back off the cut wall 0.2 mm (never into the allowance), return along the cleared row and feed across into the next row, one axis at a time.
 - **Drill** is reused: on a manual machine its moves are split the same way (Z up, then X, then Y, then Z down), so the holes also need one axis at a time.
 
 Strategies other than Box and Drill are refused on a manual setup (problem at stage `structure`), and Box is refused on a CNC setup in phase 1.

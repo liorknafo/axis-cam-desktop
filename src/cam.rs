@@ -677,31 +677,54 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     let top = crate::rest::start(setup, cut, lo[2], s.max[2], 0.);
     b.plan.rest_top = (top < s.max[2] - 0.0001).then_some(top);
     let levels = steps(top, lo[2], down);
-    // 5. Each row: up, along, across, down, a pause to set the axes, one feed, up.
+    // 5. Each row: up, along, across, down, a pause to set the axes, one
+    // feed, up. A row that starts inside the stock does not go up between
+    // rows of a level: one plunge at the level's first row; after each
+    // pass the tool backs off the wall it just cut (at most 0.2 mm, never
+    // past the stock to leave), returns along the cleared row and feeds
+    // across into the next row.
     let pause = num(&setup.machine.p, "pass_time")
         .filter(|t| *t >= 0.)
         .unwrap_or(0.);
     let rapid = b.rapid;
+    // The room behind a row, away from the uncut material, before the cut's
+    // edge on that side: unbounded when that side is open.
+    let behind = usize::from(toward < 0.);
+    let room = |row: f32| match open[c][behind] {
+        true => f32::INFINITY,
+        false => ((row - toward * r) - [lo[c], hi[c]][behind]) * toward,
+    };
     for &z in &levels {
-        for &row in &rows {
+        for (i, &row) in rows.iter().enumerate() {
             let mut at = b.pos;
-            at[2] = b.retract;
-            b.push(at, Motion::Rapid, false, rapid)?;
-            at[p] = start;
-            b.push(at, Motion::Rapid, false, rapid)?;
-            at[c] = row;
-            b.push(at, Motion::Rapid, false, rapid)?;
-            at[2] = z;
-            if outside {
+            if i > 0 && !outside {
+                at[c] -= toward * room(at[c]).clamp(0., 0.2);
                 b.push(at, Motion::Rapid, false, rapid)?;
+                at[p] = start;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[c] = row;
+                b.push(at, Motion::Feed, false, b.feed)?;
             } else {
-                b.push(at, Motion::Feed, false, b.feed * 0.25)?;
+                at[2] = b.retract;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[p] = start;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[c] = row;
+                b.push(at, Motion::Rapid, false, rapid)?;
+                at[2] = z;
+                if outside {
+                    b.push(at, Motion::Rapid, false, rapid)?;
+                } else {
+                    b.push(at, Motion::Feed, false, b.feed * 0.25)?;
+                }
             }
             b.dwell(pause);
             at[p] = end;
             b.push(at, Motion::Feed, true, b.feed)?;
-            at[2] = b.retract;
-            b.push(at, Motion::Rapid, false, rapid)?;
+            if outside || i + 1 == rows.len() {
+                at[2] = b.retract;
+                b.push(at, Motion::Rapid, false, rapid)?;
+            }
         }
     }
     b.plan.milling_direction = "Conventional";
@@ -2473,6 +2496,95 @@ pub(crate) mod tests {
         // The floor is closed: 5 mm down less the allowance.
         assert!(cuts.iter().all(|m| (m.to[2] - 35.5).abs() < 1e-4));
         assert_eq!(plan.target, 35.5);
+    }
+    /// The tool's edge of every move of `plan` below the stock's top (Z 40)
+    /// stays inside `lo`..`hi` on X and Y (the box less its allowance) and
+    /// above `lo[2]`.
+    fn assert_inside(plan: &Plan, lo: [f32; 3], hi: [f32; 3]) {
+        for m in plan.moves.iter().filter(|m| m.from[2].min(m.to[2]) < 40.) {
+            for q in [m.from, m.to] {
+                for k in 0..2 {
+                    assert!(q[k] - 12.5 >= lo[k] - 1e-4, "{k} {m:?}");
+                    assert!(q[k] + 12.5 <= hi[k] + 1e-4, "{k} {m:?}");
+                }
+                assert!(q[2] >= lo[2] - 1e-4, "{m:?}");
+            }
+        }
+    }
+    #[test]
+    fn a_closed_pocket_plunges_once_per_level_and_feeds_across_between_rows() {
+        // X −50..50, Y −30..30, 6 mm deep in levels of 2, 0.5 left on every
+        // side and the floor: three rows (Y −17, 0, 17) on three levels.
+        let fields = [("stepdown", "2"), ("allowance", "0.5")];
+        let plan = boxed_plan([-50., 50., -30., 30., 0., -6.], &fields).unwrap();
+        assert_inside(&plan, [-49.5, -29.5, 34.5], [49.5, 29.5, 40.]);
+        let down: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.to[2] < m.from[2] && m.to[2] < 40.)
+            .collect();
+        assert_eq!(plan.levels, 3);
+        assert_eq!(down.len(), 3, "{down:?}");
+        let rows = cuts(&plan);
+        assert_eq!(rows.len(), 9);
+        for (level, d) in down.iter().enumerate() {
+            // At a quarter feed, onto the level, where its first row starts.
+            assert!(d.motion == Motion::Feed && d.feed == 30., "{d:?}");
+            let first = rows[level * 3];
+            assert_eq!(d.to, first.from);
+        }
+        // Between rows: off the wall 0.2 mm (a rapid), back along the row
+        // at the hand rapid, then a cutting feed across, a pause, the pass.
+        // The first row lies on the −Y wall's allowance: no room behind it,
+        // so it goes back along its own cut.
+        for pair in rows.windows(2).filter(|w| w[0].to[2] == w[1].to[2]) {
+            let mut between: Vec<&Move> = (plan.moves.iter())
+                .filter(|m| m.start >= pair[0].end && m.end <= pair[1].start)
+                .collect();
+            let first = (pair[0].to[1] + 17.).abs() < 1e-4;
+            let kinds: Vec<Motion> = between.iter().map(|m| m.motion).collect();
+            assert_eq!(
+                kinds,
+                [Motion::Rapid, Motion::Rapid, Motion::Feed, Motion::Dwell][usize::from(first)..],
+                "{between:?}"
+            );
+            if first {
+                between.insert(0, pair[0]);
+            }
+            let (off, back, across) = (between[0], between[1], between[2]);
+            let backed = if first { 0. } else { 0.2 };
+            assert!(
+                (off.to[1] - (pair[0].to[1] - backed)).abs() < 1e-4,
+                "{off:?}"
+            );
+            assert_eq!(back.feed, 1500.);
+            assert_eq!(back.to[0], pair[1].from[0]);
+            assert!(back.to[2] == pair[0].to[2] && back.from[1] == back.to[1]);
+            assert!(across.to[1] > across.from[1] && across.feed == 120.);
+            assert_eq!(across.to, pair[1].from);
+        }
+        assert_eq!(assert_conventional(&plan).len(), 6);
+        // The first row's cross side is closed with nothing behind it: it
+        // goes back along its own cut, not into the wall's allowance.
+        let fields = [("stepdown", "6"), ("allowance", "0")];
+        let plan = boxed_plan([-50., 50., -30., 30., 0., -6.], &fields).unwrap();
+        assert_inside(&plan, [-50., -30., 34.], [50., 30., 40.]);
+        let first = cuts(&plan)[0];
+        let next = (plan.moves.iter())
+            .find(|m| m.start >= first.end && m.motion != Motion::Dwell)
+            .unwrap();
+        assert!(
+            next.from[1] == next.to[1] && next.to[0] < next.from[0],
+            "{next:?}"
+        );
+        // A step closed at both X ends, open on −Y: off the open side
+        // without limit, once per level.
+        let fields = [("stepdown", "5"), ("allowance", "0.5")];
+        let plan = boxed_plan([-50., 50., -100., 15.5, 0., -5.], &fields).unwrap();
+        assert_inside(&plan, [-49.5, -100., 35.5], [49.5, 15., 40.]);
+        let plunges = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed && m.to[2] < m.from[2])
+            .count();
+        assert_eq!((plunges, plan.levels), (1, 1));
+        assert!(assert_conventional(&plan).len() >= 2);
     }
     #[test]
     fn a_closed_pocket_plunges_at_a_quarter_feed_onto_its_floor_and_allowance() {

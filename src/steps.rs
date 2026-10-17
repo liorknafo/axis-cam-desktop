@@ -2153,7 +2153,11 @@ fn pass<'a>(
     .spacing(6)
     .into();
     // The numbers, in order.
-    let mut last: [Option<f32>; 3] = [None; 3];
+    // Where the tool is before the first number: where the last pass left it.
+    let mut last: [Option<f32>; 3] = match index {
+        1 => [None; 3],
+        _ => ends(g, op, index - 1).1.map(Some),
+    };
     let mut rows = vec![];
     let n = targets.len();
     for (i, t) in targets.iter().enumerate() {
@@ -2176,6 +2180,15 @@ fn pass<'a>(
                 mm((z - t.centre).abs()),
                 if t.centre < z { "down" } else { "up" }
             ));
+            if t.feed {
+                tags.push("plunge".into());
+            }
+        } else if t.feed {
+            tags.push("feed, cuts".into());
+        } else if let Some(v) = last[t.axis]
+            && (v - t.centre).abs() < 1.
+        {
+            tags.push("off the wall".into());
         }
         if t.edge {
             let arrows = [["←", "→"], ["↓", "↑"], ["", ""]];
@@ -2210,6 +2223,9 @@ fn pass<'a>(
         chip(format!("{} rpm", rpm.round())),
         chip(format!("{} mm/min", feed.round())),
     ];
+    if targets.iter().any(|t| t.axis == 2 && t.feed) {
+        c.push(warn_chip("plunges: centre-cutting end mill"));
+    }
     if turns > 0. {
         let period = 60. / turns;
         let since = p
@@ -2533,6 +2549,32 @@ pub(crate) mod tests {
         assert_eq!(a.guide_item, 1);
     }
     #[test]
+    fn a_pass_that_plunges_warns_of_a_centre_cutting_end_mill() {
+        let mut a = app_with("Yes", crate::guide::tests::close_the_step);
+        let g = guide(&a);
+        let passes: Vec<usize> = (g.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Pass { op: 1, .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let warning = "plunges: centre-cutting end mill";
+        for (n, i) in passes.into_iter().enumerate() {
+            send(&mut a, GuideAction::Go(i));
+            let t = texts(&a);
+            assert_eq!(t.iter().any(|s| s == warning), n % 2 == 0, "{n} {t:?}");
+            if n % 2 == 1 {
+                assert!(t.iter().any(|s| s.contains("feed, cuts")), "{t:?}");
+                assert!(t.iter().any(|s| s.contains("off the wall")), "{t:?}");
+            }
+        }
+        // The open-ended Step drops outside the stock: no warning.
+        let mut a = app("Yes");
+        let first = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Pass { .. }))
+            .unwrap();
+        send(&mut a, GuideAction::Go(first));
+        assert!(!texts(&a).iter().any(|s| s == warning));
+    }
+    #[test]
     fn next_and_back_move_the_place_and_it_is_saved_without_an_undo_step() {
         let mut a = app("Yes");
         assert_eq!(place(&a), 0);
@@ -2727,5 +2769,14 @@ pub(crate) mod tests {
             .unwrap();
         at(&mut a, comp, 0);
         render(&a, (1280, 800), &dir.join("12-comp.png"));
+        // A step closed at both X ends: a plunge, then feeds across.
+        let mut a = app_with("Yes", crate::guide::tests::close_the_step);
+        let first = (a.guide_at().unwrap().0.guide.steps.iter())
+            .position(|s| matches!(s, Step::Pass { .. }))
+            .unwrap();
+        at(&mut a, first, 3);
+        render(&a, (1280, 800), &dir.join("13-pass-plunge.png"));
+        at(&mut a, first + 1, 2);
+        render(&a, (1280, 800), &dir.join("14-pass-across.png"));
     }
 }

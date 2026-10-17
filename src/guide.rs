@@ -29,6 +29,9 @@ pub struct Target {
     pub shown: f32,
     /// `shown` is the tool edge.
     pub edge: bool,
+    /// The move there cuts: a feed (a plunge, a feed across into the next
+    /// row, the pass), not a rapid.
+    pub feed: bool,
     /// The axes to lock: on the cut, the two that do not move; on a move
     /// that sets an axis for the last time before the cut, that axis.
     pub lock: [bool; 3],
@@ -211,13 +214,13 @@ fn moved(m: &Move) -> Result<usize, String> {
         _ => Err("A move on the manual mill changes more than one axis.".into()),
     }
 }
-/// The targets of `legs` (axis, stock-frame end), the last of them the cut,
-/// as the DRO shows them.
-fn targets(legs: &[(usize, f32)], zero: [f32; 3], comp: [i8; 2], r: f32) -> Vec<Target> {
+/// The targets of `legs` (axis, stock-frame end, a feed), the last of them
+/// the cut, as the DRO shows them.
+fn targets(legs: &[(usize, f32, bool)], zero: [f32; 3], comp: [i8; 2], r: f32) -> Vec<Target> {
     let last = legs.len() - 1;
     let cut = legs[last].0;
     (legs.iter().enumerate())
-        .map(|(i, &(axis, at))| {
+        .map(|(i, &(axis, at, feed))| {
             let centre = at - zero[axis];
             let side = comp.get(axis).copied().unwrap_or(0);
             let lock = std::array::from_fn(|k| match i == last {
@@ -230,6 +233,7 @@ fn targets(legs: &[(usize, f32)], zero: [f32; 3], comp: [i8; 2], r: f32) -> Vec<
                 centre,
                 shown: centre + f32::from(side) * r,
                 edge: side != 0,
+                feed,
                 lock,
             }
         })
@@ -263,7 +267,7 @@ fn passes(
     let (mut steps, mut earlier, mut legs) = (vec![], vec![], vec![]);
     for m in plan.moves.iter().filter(|m| m.motion != Motion::Dwell) {
         let axis = moved(m)?;
-        legs.push((axis, m.to[axis]));
+        legs.push((axis, m.to[axis], m.motion == Motion::Feed));
         if !m.cutting_pass {
             continue;
         }
@@ -271,9 +275,9 @@ fn passes(
             // Where the tool is before the first pass is not known: the axes
             // the plan does not move from its start are set before the plunge.
             let before = &legs[..legs.len() - 1];
-            let missing: Vec<(usize, f32)> = (0..3)
+            let missing: Vec<(usize, f32, bool)> = (0..3)
                 .filter(|&k| before.iter().all(|l| l.0 != k))
-                .map(|k| (k, m.from[k]))
+                .map(|k| (k, m.from[k], false))
                 .collect();
             let at = before
                 .iter()
@@ -1115,6 +1119,55 @@ pub(crate) mod tests {
                 "{h:?}"
             );
         }
+    }
+    /// The job's Step closed at both X ends (X 20..100): its passes start
+    /// inside the stock.
+    pub(crate) fn close_the_step(doc: &mut Document) {
+        let mill = doc.tools[3].id.clone();
+        doc.setups[0].operations[1] = boxed(
+            "Step",
+            &mill,
+            [20., 100., -500., 15.5, 0., -12.],
+            &[("stepdown", "5")],
+        );
+    }
+    #[test]
+    fn a_closed_step_plunges_once_per_level_and_feeds_across_to_its_rows() {
+        let (mut doc, mesh) = job("Yes");
+        close_the_step(&mut doc);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let passes: Vec<&Vec<Target>> = (guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Pass { op: 1, targets, .. } => Some(targets),
+                _ => None,
+            })
+            .collect();
+        // Two rows (Y 0 and 2.5) on two levels.
+        assert_eq!(passes.len(), 4);
+        for (i, targets) in passes.iter().enumerate() {
+            let (cut, setting) = targets.split_last().unwrap();
+            assert!(cut.feed && cut.axis == 0);
+            let plunges = setting.iter().filter(|t| t.axis == 2 && t.feed).count();
+            let across = setting.iter().filter(|t| t.axis == 1 && t.feed).count();
+            // The first row of a level plunges; the second feeds across.
+            assert_eq!(
+                (plunges, across),
+                [(1, 0), (0, 1)][i % 2],
+                "{i} {targets:?}"
+            );
+            if i % 2 == 1 {
+                // Off the wall 0.2 mm on −Y, back along X, across into the row.
+                let axes: Vec<(usize, bool)> = setting.iter().map(|t| (t.axis, t.feed)).collect();
+                assert_eq!(axes, [(1, false), (0, false), (1, true)]);
+                close(setting[0].centre, -0.2);
+                close(setting[2].centre, 2.5);
+            }
+        }
+        // Feeds along +X with the wall on +Y on the left: conventional.
+        let plan = &guide.done[1].plan;
+        let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
+        assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
+        assert!(simulation::uncut_sides(&rows).iter().all(|s| *s > 0.));
     }
     #[test]
     fn a_change_of_sides_alone_is_a_comp_step() {
