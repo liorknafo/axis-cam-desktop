@@ -216,6 +216,7 @@ impl App {
                 121 => "97-machine-run-panel".into(),
                 122 => "98-machine-setup".into(),
                 123 => "99-machine-work-zero".into(),
+                124 => "100-manual-steps".into(),
                 _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
             })
     }
@@ -1274,6 +1275,12 @@ impl App {
                     Message::Machine(crate::control::Action::WorkText(0, "-5".into())),
                 ]
             }
+            // MACHINE on a setup of the manual mill put first: its Steps
+            // page, with the CNC still connected.
+            124 => {
+                self.smoke_manual_setup();
+                vec![Message::Page(Page::Control)]
+            }
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.disconnect_machine();
@@ -1288,6 +1295,10 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
+            124 => {
+                let line = self.smoke_manual_check();
+                eprintln!("Screen 100: {line}");
+            }
             // The machine drawn under the work zero, in view.
             120 => {
                 return iced::widget::operation::scroll_to(
@@ -1389,6 +1400,64 @@ impl App {
             return Task::batch([top("inspector"), top("planner-result"), top("control")]);
         }
         Task::none()
+    }
+    /// Screen 100's job: a manual mill in the library with a Ø25 end mill
+    /// that fits it, and a setup on it put first that faces 2 mm off the
+    /// whole top, made the active setup.
+    pub(crate) fn smoke_manual_setup(&mut self) {
+        use crate::model::{BOX_FIELDS, Operation, Strategy, Tool};
+        let machine = crate::manual::defaults();
+        let mut mill = Tool::new("End mill 25", "Flat end mill", "25");
+        for (k, v) in [
+            ("length", "60"),
+            ("stickout", "65"),
+            ("machines", &machine.id),
+        ] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let mut face = Operation::new(Strategy::Box, mill.id.clone());
+        face.p.insert("name".into(), "Face".into());
+        for (k, v) in BOX_FIELDS
+            .iter()
+            .zip(["-500", "500", "-500", "500", "0", "-2"])
+        {
+            face.p.insert((*k).into(), v.into());
+        }
+        face.p.insert("allowance".into(), "0".into());
+        crate::manual::snap(&machine, &mut face.p);
+        self.doc.machines.push(machine);
+        self.doc.tools.push(mill);
+        self.doc.add_manual_setup().expect("a manual setup");
+        self.doc.setups[0].operations = vec![face];
+        self.doc.active = self.doc.setups[0].id.clone();
+    }
+    /// What screen 100 shows: the Steps page on the manual setup, its
+    /// guide built (set up, the face, the hand-over) at its first step.
+    pub(crate) fn smoke_manual_check(&self) -> String {
+        use crate::guide::Step;
+        assert!(self.steps_page(), "the Steps page");
+        let (shown, at) = self.guide_at().unwrap_or_else(|| {
+            panic!(
+                "the guide: {:?}",
+                self.current_guide().map(|r| r.as_ref().err())
+            )
+        });
+        let g = &shown.guide;
+        let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Set up", "Face", "Hand over"]);
+        assert_eq!(at, 0);
+        assert!(matches!(g.steps[0], Step::Hold { .. }), "{:?}", g.steps[0]);
+        let Some(Step::Face { to, remove, .. }) =
+            g.steps.iter().find(|s| matches!(s, Step::Face { .. }))
+        else {
+            panic!("no Face step: {:?}", g.steps)
+        };
+        assert!((to + 2.).abs() < 1e-3 && *remove > 0., "{to} {remove}");
+        format!(
+            "{} steps, face to Z {to:.2}, {remove:.2} mm off, ~{:.0} min",
+            g.steps.len(),
+            g.minutes.ceil()
+        )
     }
     /// What the planner's pictures are drawn from: the imported part as the
     /// planner reads it.
@@ -3573,6 +3642,53 @@ flood = { pin = 8 }
         assert!(a.live_tool().is_none() && !a.locked() && a.status.is_empty());
         let _ = a.update(Message::Play);
         assert!(a.playing);
+    }
+
+    #[test]
+    fn screen_100_shows_the_steps_of_a_manual_setup_put_first() {
+        let mut a = imported_app();
+        a.smoke_manual_setup();
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        a.smoke_manual_check();
+        let texts = page_texts(&a);
+        for want in ["Big mill", "Set up", "Face", "Hold"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+    }
+
+    #[test]
+    fn the_steps_page_works_while_the_cnc_jogs() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        tick_until(&mut a, 2.0, "the jog", |s| s.state == Some(State::Jog));
+        assert!(a.locked());
+        // The manual setup of the guide's job, its steps built.
+        let manual = crate::steps::tests::app("Yes");
+        a.doc = manual.doc.clone();
+        a.imported_mesh = manual.imported_mesh.clone();
+        a.guide = manual.guide.clone();
+        a.status.clear();
+        let _ = a.update(Message::Page(Page::Control));
+        assert!(a.steps_page() && a.guide_at().is_some());
+        let _ = a.update(Message::Guide(crate::GuideAction::Next));
+        let _ = a.update(Message::Guide(crate::GuideAction::Section(2)));
+        assert_ne!(a.status, crate::LOCKED);
+        assert_eq!(
+            a.guide_at().unwrap().1,
+            a.guide_at().unwrap().0.guide.sections[2].steps.start
+        );
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "Tool"), "{texts:?}");
+        // The way back to the CNC works too.
+        let _ = a.update(Message::Guide(crate::GuideAction::Open(1)));
+        assert!(!a.steps_page() && a.doc.active == a.doc.setups[1].id);
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     #[test]

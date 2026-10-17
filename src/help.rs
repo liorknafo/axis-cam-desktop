@@ -1399,6 +1399,7 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         Machine(a) => machine_help(a),
         Run(a) => run_help(a),
+        Guide(a) => guide_help(a),
         ControlSetup(false) => ("Jog, zero and run the machine.", ""),
         ControlSetup(true) => (
             "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm.",
@@ -1543,6 +1544,32 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Simulated only: rapid the tool tip up to the top of Z, over where this setup is touched off on the simulator's block, and down onto it. Then the button beside it sets the work zero, as touching off on real stock would.",
             "",
         ),
+    }
+}
+
+/// What a button of a manual setup's Steps page does.
+fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
+    use crate::GuideAction::*;
+    match a {
+        Next => (
+            "This step is done: show the next one. The place is saved with the project, so you can stop and come back.",
+            "",
+        ),
+        Back => ("Show the step before.", ""),
+        Go(_) => ("Show this pass.", ""),
+        Section(_) => (
+            "Jump to this section: where you left it, else its first step.",
+            "",
+        ),
+        Reached(_) => (
+            "The DRO reads this number: light the next one. The app does not read the DRO.",
+            "",
+        ),
+        Open(_) => (
+            "Open this setup in MACHINE: a setup on the manual mill shows its steps, with the DRO numbers to move to, whether or not the CNC is connected.",
+            "",
+        ),
+        Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
     }
 }
 
@@ -3955,6 +3982,16 @@ mod tests {
             Run::CoolantOff,
         ] {
             messages.push(Message::Run(a));
+        }
+        for a in [
+            crate::GuideAction::Next,
+            crate::GuideAction::Back,
+            crate::GuideAction::Go(0),
+            crate::GuideAction::Section(0),
+            crate::GuideAction::Reached(0),
+            crate::GuideAction::Open(0),
+        ] {
+            messages.push(Message::Guide(a));
         }
         commands.extend(messages.into_iter().map(|m| ("x".to_string(), m)));
         let mut cards: Vec<(String, Help)> = commands

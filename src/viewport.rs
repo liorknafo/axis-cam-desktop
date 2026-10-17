@@ -1402,12 +1402,12 @@ pub(crate) fn box_triangles(
 /// are shown at, for smooth edges.
 pub(crate) const PICTURE: (u32, u32) = (128, 96);
 /// A still picture of stock, `triangles` in a setup's frame, seen as the 3D
-/// view first shows a setup and filling the frame; clear around it. None
-/// without a triangle.
+/// view first shows a setup and filling the frame of `size` pixels
+/// (`PICTURE` for the browser's); clear around it. None without a triangle.
 pub(crate) fn stock_picture(
     triangles: &[([[f32; 3]; 3], [u8; 4])],
+    (w, h): (u32, u32),
 ) -> Option<iced::widget::image::Handle> {
-    let (w, h) = PICTURE;
     let mut all = crate::mesh::Bounds {
         min: [f32::INFINITY; 3],
         max: [f32::NEG_INFINITY; 3],

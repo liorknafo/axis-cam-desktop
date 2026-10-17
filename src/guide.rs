@@ -525,13 +525,13 @@ pub fn place(doc: &Document, guide: &Guide) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{BOX_FIELDS, Operation, Tool};
 
     /// A Box named `name` cutting `b` (x_min, x_max, y_min, y_max, z_top,
     /// z_bottom, work frame) with the tool `tool`.
-    fn boxed(name: &str, tool: &str, b: [f32; 6], fields: &[(&str, &str)]) -> Operation {
+    pub(crate) fn boxed(name: &str, tool: &str, b: [f32; 6], fields: &[(&str, &str)]) -> Operation {
         let mut op = Operation::new(Strategy::Box, tool.into());
         op.p.insert("name".into(), name.into());
         for (k, v) in BOX_FIELDS.iter().zip(b) {
@@ -549,7 +549,7 @@ mod tests {
     /// wall at Y 15.5 with 0.5 left, down to −12 in levels of at most 5)
     /// with a Ø25 end mill, and Holes (a Ø4 drill in the top's four Ø6.6
     /// through holes).
-    fn job(dro: &str) -> (Document, Mesh) {
+    pub(crate) fn job(dro: &str) -> (Document, Mesh) {
         let (mut doc, mesh) = crate::post::fixture::job();
         let mut machine = manual::defaults();
         machine.p.insert("dro_comp".into(), dro.into());

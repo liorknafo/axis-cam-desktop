@@ -18,26 +18,26 @@ use iced::{
         pick_list, row, rule, scrollable, slider, space, svg, text, text::Wrapping, text_input,
     },
 };
-const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
+pub(crate) const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
 /// Secondary text. At least 4.5:1 on every surface below
 /// (`muted_text_meets_contrast_on_every_surface`).
-const MUTED: Color = Color::from_rgb(0.30, 0.37, 0.44);
-const BLUE: Color = Color::from_rgb(0.13, 0.42, 0.71);
-const LINE: Color = Color::from_rgb(0.85, 0.88, 0.91);
-const BG: Color = Color::from_rgb(0.95, 0.96, 0.975);
+pub(crate) const MUTED: Color = Color::from_rgb(0.30, 0.37, 0.44);
+pub(crate) const BLUE: Color = Color::from_rgb(0.13, 0.42, 0.71);
+pub(crate) const LINE: Color = Color::from_rgb(0.85, 0.88, 0.91);
+pub(crate) const BG: Color = Color::from_rgb(0.95, 0.96, 0.975);
 // The fills that MUTED text is drawn on besides white panels and BG.
 const SELECTED_ROW: Color = Color::from_rgb8(218, 235, 249);
 const ACTIVE_TILE: Color = Color::from_rgb8(223, 237, 249);
 const SETUP_ROW: Color = Color::from_rgb8(230, 239, 248);
 const HOVER_ROW: Color = Color::from_rgb8(239, 244, 249);
-const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
+pub(crate) const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
 /// The opacity of an icon whose command is unavailable.
 const DIMMED: f32 = 0.45;
 /// The label of an unavailable command: lighter than `MUTED`, so it reads as
 /// greyed out beside its neighbours, and still 3:1 on white.
 const DIMMED_TEXT: Color = Color::from_rgb8(128, 140, 152);
 /// The amber of a warning: its box, its heading and its text.
-const WARNING: [Color; 3] = [
+pub(crate) const WARNING: [Color; 3] = [
     Color::from_rgb8(255, 247, 232),
     Color::from_rgb8(166, 101, 32),
     Color::from_rgb8(141, 90, 39),
@@ -108,7 +108,7 @@ fn flat(active: bool, status: button::Status) -> button::Style {
 const BUTTON_PAD: u16 = 8;
 /// The edge of an outlined button: darker than `LINE`, so the button is seen
 /// as one on a white panel.
-const BUTTON_EDGE: Color = Color::from_rgb8(190, 201, 212);
+pub(crate) const BUTTON_EDGE: Color = Color::from_rgb8(190, 201, 212);
 /// The edge of a button that deletes.
 const DANGER_EDGE: Color = Color::from_rgb8(226, 172, 172);
 /// A command beside other content: white with a border, so it reads as a
@@ -248,7 +248,7 @@ fn switcher(app: &App) -> Element<'_, Message> {
         widget::tooltip::Position::Right,
     )
 }
-fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
+pub(crate) fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
     let label = label.into();
     let action = msg.clone();
     let b = button(text(label.clone()).size(13))
@@ -1450,6 +1450,15 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(12))
                     .padding([0, 16]),
             );
+            if manual::is_manual(&s.machine) {
+                tree = tree.push(
+                    container(
+                        secondary("Steps ▶", Message::Guide(crate::GuideAction::Open(si)))
+                            .width(Fill),
+                    )
+                    .padding([0, 10]),
+                );
+            }
             let checks = app.current_ready();
             for (i, o) in s.operations.iter().enumerate() {
                 let selected = app.selected == Some(i) && app.page == Page::Work;
@@ -1734,7 +1743,7 @@ pub(crate) fn stock_picture(app: &App, si: usize, end: bool) -> Option<widget::i
             crate::viewport::JAWS,
         ));
     }
-    let picture = crate::viewport::stock_picture(&triangles)?;
+    let picture = crate::viewport::stock_picture(&triangles, crate::viewport::PICTURE)?;
     // ponytail: two per setup, so all are kept until there are many.
     if drawn.len() > 64 {
         drawn.clear();
@@ -4501,6 +4510,11 @@ pub(crate) fn limits_off_warning(
 fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
+    // A setup on the manual mill shows its steps, with or without the CNC
+    // connected.
+    if app.steps_page() {
+        return crate::steps::view(app);
+    }
     let target = app.control_target();
     let mut left = column![bold("Machine", 18)].spacing(10);
     let machines: Vec<&Machine> = app
