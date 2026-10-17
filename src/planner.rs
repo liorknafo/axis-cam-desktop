@@ -257,7 +257,7 @@ THE PART REPORT
 - A floor's `max_cutter_diameter` is the largest flat cutter, up to 50 mm, that has somewhere to cut on it: everything of the part above the floor keeps the cutter out, but past an edge where the part falls away below the floor (a ledge, a notch through a wall) the cutter may stand over the lower area, so such a floor takes a large cutter. A floor's `openings` are the holes through it, of any shape, with nothing of the part over or under them (cut-outs through a plate), each with its box, its `depth` from the floor down to where its walls end, and the largest flat cutter that fits inside it (`max_cutter_diameter`). A plane's `holes` give the largest drill that fits (`diameter`, a bore's nominal size: a drill of exactly that diameter fits), the opening diameter (`opening_diameter`, larger at a counterbore), the depth and whether the hole goes through.
 - `freeform_area` is the visible area that is neither horizontal nor vertical; only Parallel finishing follows it.
 - `truncated` true means the orientation has more planes or holes than are listed; only listed surfaces can be used.
-- `workholding`, when present, is setup 1's modelled vise or clamps, with its `number` in `workholding_library` (see WORKHOLDING).
+- `workholding`, when present, is setup 1's modelled vise or clamps, with its `number` in `workholding_library`, or its chuck (see WORKHOLDING).
 - `workholding_library` lists the vises and clamps you may choose from, by `number`, with their sizes (see PLANNING THE HOLDING).
 
 STRATEGIES (the only six)
@@ -271,7 +271,8 @@ STRATEGIES (the only six)
 - Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. It cuts that height ÷ `stepdown` layers, at most 300, but its moves (about layers × the outline's points) usually reach the move limit first: on a part of about 120 × 80 mm keep `stepdown` at or above about 0.5 mm (see RULES).
 
 WORKHOLDING
-- `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock) or `Clamps`. `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
+- `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock), `Clamps` or `Chuck`. `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
+- A `Chuck` holds the stock on the machine's rotary A axis, along X, by its -X end: `chuck` gives its `jaws` (3 or 4), its `chuck_diameter`, the `jaw_length`, the `gripped_length` of stock in the jaws, the `stickout` beyond them towards +X, the `bar_diameter` of a round bar, where the `tailstock` is and the `a_angle` every operation runs at (0: indexed angles are not planned). Its `boxes` are the chuck body, each jaw, the rotary head, the tailstock's centre, quill and body when it is on the table, and the stock gripped in the jaws: no tool may come within `gap` of the gripped stock either, so cut only the stick-out, from its +X end to `gap` plus the tool's radius short of the jaws.
 - The boxes are keep-out zones. The program grows each box by `gap` mm on every side and refuses any move, rapids and retracts included, that brings the cutter or the tool holder within `gap` of a box. A refused move comes back as a problem with the stage `workholding`, by setup and operation. Parallels, bolts, the table and the machine body are not checked.
 - The later setups (every setup after the first) are held by the library entry their `holder` names, or by setup 1's own entry when it is null (see PLANNING THE HOLDING). That entry is laid out by the program once it has generated the setup's toolpaths: it picks the sides and positions that keep them clearest of those toolpaths, and the preview shows the result. What still comes within `gap` of it is reported with the stage `workholding` too.
 - Keep the plan clear of the boxes. Do not face or contour where a clamp sits over the stock edge, and do not let a tool work beside a jaw below the jaws' top. Keep outside contours above the jaws' top by giving them a `bottom_offset` greater than the jaw's z1 plus `gap`, and finish the walls below from the setup turned over, whose vise can grip the walls finished above (see PLANNING THE HOLDING); or move them to a setup where the sides are free.
@@ -1250,6 +1251,7 @@ pub(crate) fn view_after(
         bounds: volume.bounds,
         frame: volume.frame,
         cuts: volume.cuts.clone(),
+        round: volume.round,
         detail,
     }
     .build()

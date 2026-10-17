@@ -980,6 +980,7 @@ pub fn op_pictures(
             bounds: volume.bounds,
             frame: volume.frame,
             cuts: volume.cuts.clone(),
+            round: volume.round,
             detail: crate::stock_surface::Detail::Draft,
         }
         .build()

@@ -8,6 +8,9 @@ use crate::simulation::Plan;
 use serde::{Deserialize, Serialize};
 
 pub const KINDS: [&str; 2] = ["Vise", "Clamp"];
+/// A setup's modelled workholding: none, a vise or clamps from the library,
+/// or the chuck on the machine's rotary A axis (`chuck`).
+pub const CHOICES: [&str; 4] = ["None", "Vise", "Clamps", "Chuck"];
 const NOTE: &str = "Measure yours: these are typical sizes.";
 /// How far below the stock bottom a vise jaw is modelled to reach.
 const JAW_DEPTH: f32 = 100.;
@@ -218,7 +221,8 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
     let p = &setup.p;
     let holder = get(p, "holder").to_string();
     match get(p, "holding") {
-        "" | "None" => Ok(Layout::None),
+        // The chuck is modelled by `chuck`, apart from the library's.
+        "" | "None" | "Chuck" => Ok(Layout::None),
         "Vise" => {
             let grip = number(get(p, "vise_grip"))
                 .filter(|g| *g > 0.)
@@ -279,7 +283,21 @@ pub fn check_clamps(setup: &Setup, text: &str) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldBox {
     pub label: String,
+    /// What the checks keep the tool out of.
     pub bounds: Bounds,
+    /// What the 3D view draws for it.
+    pub shape: Shape,
+}
+/// How a holding box is drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Shape {
+    /// As its box.
+    #[default]
+    Box,
+    /// As a turned solid (a chuck's), which its box holds.
+    Prism(std::sync::Arc<crate::chuck::Prism>),
+    /// Not at all: a keep-out the checks alone use.
+    Hidden,
 }
 /// What a setup's workholding holds, in mm in the setup's frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -551,6 +569,7 @@ pub fn boxes(
                     (min[along], max[along]) = (c - w / 2., c + w / 2.);
                     (min[2], max[2]) = (z0, z1);
                     HoldBox {
+                        shape: Default::default(),
                         label: format!("vise jaw on {sign}{}", if *axis_y { "Y" } else { "X" }),
                         bounds: Bounds { min, max },
                     }
@@ -581,6 +600,7 @@ pub fn boxes(
                     (min[along], max[along]) = (c - w / 2., c + w / 2.);
                     (min[2], max[2]) = (stock.max[2], stock.max[2] + h);
                     HoldBox {
+                        shape: Default::default(),
                         label: format!("clamp on {} (offset {})", side.label(), mm(offset)),
                         bounds: Bounds { min, max },
                     }
@@ -601,6 +621,7 @@ pub fn pin_boxes(on: Option<&crate::post::OnPins>, stock: Bounds) -> Vec<HoldBox
     let r = on.diameter / 2.;
     (on.places.iter().enumerate())
         .map(|(i, c)| HoldBox {
+            shape: Default::default(),
             label: format!("fixture pin {}", i + 1),
             bounds: Bounds {
                 min: [c[0] - r, c[1] - r, stock.min[2]],
@@ -850,14 +871,19 @@ pub fn plane_message(
 }
 /// The boxes as the 3D view draws them: nothing lower than the bottom of
 /// `stock`. The jaws are modelled far below it for the check, which keeps
-/// them whole.
+/// them whole. A chuck's turned solids are drawn whole, and what the checks
+/// alone use (`Shape::Hidden`) not at all.
 pub fn shown(boxes: &[HoldBox], stock: Bounds) -> Vec<HoldBox> {
     boxes
         .iter()
+        .filter(|b| b.shape != Shape::Hidden)
         .map(|b| {
             let mut bounds = b.bounds;
-            bounds.min[2] = bounds.min[2].max(stock.min[2]);
+            if b.shape == Shape::Box {
+                bounds.min[2] = bounds.min[2].max(stock.min[2]);
+            }
             HoldBox {
+                shape: b.shape.clone(),
                 label: b.label.clone(),
                 bounds,
             }

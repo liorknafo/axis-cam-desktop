@@ -1813,8 +1813,8 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Setup, "holding") => (
-            "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap that every move is checked against, and its hold is checked against each operation's cutting force. None models nothing.",
-            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description.",
+            "The workholding to model for this setup: a Vise, with its jaws on two opposite sides of the stock, Clamps placed around it, or a Chuck on the A axis. Each is kept as boxes with a clearance gap that every move is checked against, and its hold is checked against each operation's cutting force. None models nothing.",
+            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. Chuck models the chuck on the machine's rotary A axis from its rotary unit's sizes: the chuck body, its jaws (turning with A), the rotary head, the tailstock and the stock gripped in the jaws, each as the box round it with the gap, at A0 for today's operations; the grip left after earlier cuts, the stock turning or sliding in the jaws and its stick-out bending under each cut are checked too.",
             None,
         ),
         (Target::Setup, "holder") => (
@@ -2274,6 +2274,31 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "stock_type") => (
             "Relative size box adds independent offsets to the six sides of the part's bounding box after setup rotation. Fixed size box uses explicit X, Y and Z dimensions. Values for each mode are kept when switching.",
+            "",
+            None,
+        ),
+        (_, "stock_diameter" | "stock_length") => (
+            "The round bar's diameter and its length along setup X, in mm. It is centred on X and Y and stands on Z=0, like a fixed box; the jaws grip its -X end.",
+            "",
+            None,
+        ),
+        (Target::Setup, "chuck_jaws") => (
+            "The chuck on the A axis: 3-jaw for round stock, 4-jaw for a box or round stock. Its diameter, jaw length and grip range are the machine's rotary unit's.",
+            "",
+            None,
+        ),
+        (Target::Setup, "chuck_stickout") => (
+            "How far the stock reaches out of the jaws towards the tailstock, in mm. The jaws grip the rest up to their length: at least half of it must be gripped.",
+            "The stick-out places the stock in the chuck: the jaws' front is the stick-out from the stock's +X end, the chuck's face a jaw length behind it. A longer stick-out bends more under the cut.",
+            None,
+        ),
+        (Target::Setup, "chuck_jaw_angle") => (
+            "Where jaw 1 points at A0, in degrees from straight up, turning as +A does. 0 puts it on top. A 4-jaw chuck on a box needs 0, 90, 180 or 270.",
+            "",
+            None,
+        ),
+        (Target::Setup, "chuck_tailstock") => (
+            "Where the machine's tailstock is: drawn back, its centre in the stock's end, or off the table.",
             "",
             None,
         ),
@@ -3865,7 +3890,7 @@ mod tests {
                 ],
             ),
             ("speed", vec!["0.5", "1", "120"]),
-            ("holding", vec!["None", "Vise", "Clamps"]),
+            ("holding", crate::holding::CHOICES.to_vec()),
             ("group", crate::material::GROUPS.to_vec()),
         ];
         for (key, values) in fallbacks {

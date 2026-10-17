@@ -157,6 +157,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             bounds: v.bounds,
             frame: v.frame,
             cuts: v.cuts.clone(),
+            round: v.round,
             detail: crate::stock_surface::Detail::Draft,
         }
         .build();

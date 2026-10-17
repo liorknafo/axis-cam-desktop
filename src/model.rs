@@ -189,8 +189,8 @@ pub const FEATURES: [&str; 9] = [
     "Hole 4 · Ø8",
 ];
 
-/// The keys of a setup's vise or clamps.
-const HOLDING: [&str; 7] = [
+/// The keys of a setup's vise, clamps or chuck.
+const HOLDING: [&str; 11] = [
     "holding",
     "holder",
     "holding_gap",
@@ -198,6 +198,10 @@ const HOLDING: [&str; 7] = [
     "vise_offset",
     "vise_grip",
     "clamps",
+    "chuck_jaws",
+    "chuck_stickout",
+    "chuck_tailstock",
+    "chuck_jaw_angle",
 ];
 /// The setup keys a manual setup put first takes from the old first setup,
 /// besides its stock: orientation, zero, offset and holding.
@@ -1597,6 +1601,22 @@ impl Document {
     pub fn holder(&self, id: &str) -> Option<&crate::holding::Holder> {
         self.workholding.iter().find(|h| h.id == id)
     }
+    /// The chuck of `setup` round `stock`, the box it starts from (mm, its
+    /// frame): a round bar when setup 1's stock is one and `setup` faces as
+    /// setup 1 does, else the box (`chuck::rig`).
+    pub fn chuck_rig(
+        &self,
+        setup: &Setup,
+        stock: crate::mesh::Bounds,
+    ) -> Result<crate::chuck::Rig, String> {
+        let round = self.setups.first().is_some_and(|first| {
+            crate::stock::round_bar(first)
+                && ["rx", "ry", "rz"]
+                    .iter()
+                    .all(|k| num(&first.p, k).unwrap_or(0.) == num(&setup.p, k).unwrap_or(0.))
+        });
+        crate::chuck::rig(setup, stock, round)
+    }
     /// Why `holder` cannot be saved to the library: another entry has its
     /// name (ignoring case).
     pub fn holder_name_issues(&self, holder: &crate::holding::Holder) -> Vec<String> {
@@ -1714,6 +1734,29 @@ impl Document {
             "Clamps" => "Clamp",
             _ => "",
         };
+        // A vise or clamps close on flat sides, which a round bar has not.
+        let round = self.setups.first().is_some_and(crate::stock::round_bar);
+        if round && !kind.is_empty() {
+            return vec![format!(
+                "A round bar is held in the chuck: a {} is modelled on flat sides. Choose Chuck, or a box stock.",
+                kind.to_lowercase()
+            )];
+        }
+        if crate::chuck::holds(s) {
+            let mut issues = vec![];
+            if let Err(error) = crate::holding::gap(s) {
+                issues.push(error);
+            }
+            if let Some(held) = held() {
+                match self.chuck_rig(s, held.stock) {
+                    Ok(rig) => issues.extend(rig.issues()),
+                    Err(error) => issues.push(error),
+                }
+            } else if s.machine.rotary_unit().is_none() {
+                issues.push(crate::chuck::NO_UNIT.into());
+            }
+            return issues;
+        }
         let id = get(&s.p, "holder");
         let entry = self.holder(id);
         let mut issues = vec![];
@@ -1782,6 +1825,11 @@ impl Document {
         {
             return Err(issue);
         }
+        if crate::chuck::holds(setup) {
+            // Today's operations all run at A0 (`chuck::Rig::hits_at` at any
+            // other angle).
+            return Ok(self.chuck_rig(setup, held.stock)?.boxes(0.));
+        }
         let layout = crate::holding::layout(setup)?;
         match self.holder(get(&setup.p, "holder")) {
             Some(entry) => crate::holding::boxes(&layout, entry, held),
@@ -1794,6 +1842,16 @@ impl Document {
     /// `holding_issues` says.
     pub fn holding_text(&self, setup: &Setup) -> Option<String> {
         use crate::holding::{Layout, refusal, sentence};
+        if crate::chuck::holds(setup) {
+            // Without the part a later setup's stock is not known: then the
+            // chuck is named without what it grips.
+            let gap = crate::holding::gap(setup).ok()?;
+            let i = self.setups.iter().position(|s| s.id == setup.id)?;
+            return Some(match self.setup_stock(i, None) {
+                Some(stock) => self.chuck_rig(setup, stock).ok()?.sentence(gap),
+                None => format!("{}, gap {gap} mm.", self.holding_label(setup)),
+            });
+        }
         let layout = crate::holding::layout(setup).ok()?;
         let entry = self.holder(get(&setup.p, "holder"))?;
         (layout != Layout::None && refusal(&layout, entry).is_none())
@@ -1808,6 +1866,16 @@ impl Document {
             self.holder(get(&setup.p, "holder"))
                 .map_or(kind.to_string(), |h| h.name().to_string())
         };
+        if crate::chuck::holds(setup) {
+            return format!(
+                "{} chuck on A",
+                if get(&setup.p, "chuck_jaws") == "4-jaw" {
+                    "4-jaw"
+                } else {
+                    "3-jaw"
+                }
+            );
+        }
         match layout(setup) {
             Ok(Layout::None) => fixture_note(setup).map_or("No workholding modelled".into(), |n| {
                 format!("{n}, not modelled")
@@ -1827,6 +1895,18 @@ impl Document {
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
+            "Chuck" => {
+                let p = &mut self.setups[setup].p;
+                for (k, v) in crate::chuck::DEFAULTS {
+                    if get(p, k).trim().is_empty() {
+                        p.insert(k.into(), v.into());
+                    }
+                }
+                if get(p, "holding_gap").trim().is_empty() {
+                    p.insert("holding_gap".into(), "2".into());
+                }
+                return;
+            }
             _ => return,
         };
         let mine = self

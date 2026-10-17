@@ -182,6 +182,8 @@ impl Cut {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub bounds: Bounds,
+    /// The round bar the stock is inside its box (`Volume::round`).
+    pub round: Option<crate::stock::Round>,
     pub frame: Frame,
     pub cuts: Arc<Vec<Cut>>,
     pub detail: Detail,
@@ -203,10 +205,14 @@ fn balanced_union(trees: &mut [Tree]) -> Tree {
 impl Snapshot {
     fn field(&self) -> Tree {
         let p = [Tree::x(), Tree::y(), Tree::z()];
-        let box_field = (0..3).fold(Tree::from(f32::NEG_INFINITY), |t, k| {
+        let mut box_field = (0..3).fold(Tree::from(f32::NEG_INFINITY), |t, k| {
             t.max(self.bounds.min[k] - p[k].clone())
                 .max(p[k].clone() - self.bounds.max[k])
         });
+        if let Some(bar) = self.round {
+            let (y, z) = (p[1].clone() - bar.axis[0], p[2].clone() - bar.axis[1]);
+            box_field = box_field.max((y.square() + z.square()).sqrt() - bar.radius);
+        }
         if self.cuts.is_empty() {
             return box_field;
         }
@@ -263,8 +269,44 @@ mod tests {
             &mesh,
         )
     }
+    /// A round bar's stock has no material outside the bar: its voxels
+    /// there are empty and its surface keeps inside it, touching it.
+    #[test]
+    fn a_round_bar_stock_is_meshed_and_counted_inside_the_bar() {
+        let bounds = Bounds {
+            min: [-30., -10., 0.],
+            max: [30., 10., 20.],
+        };
+        let bar = crate::stock::Round {
+            axis: [0., 10.],
+            radius: 10.,
+        };
+        let v = crate::volume::Volume::new(bounds, frame()).rounded(Some(bar));
+        let share = v.remaining as f32 / v.occupied.len() as f32;
+        // π/4 of the box, within the voxels' rounding.
+        assert!(
+            (share - std::f32::consts::FRAC_PI_4).abs() < 0.03,
+            "{share}"
+        );
+        let mesh = Snapshot {
+            round: v.round,
+            bounds,
+            frame: frame(),
+            cuts: Arc::new(vec![]),
+            detail: Detail::Draft,
+        }
+        .build()
+        .unwrap();
+        let r = mesh
+            .vertices
+            .iter()
+            .map(|p| (p[1] - 0.).hypot(p[2] - 10.))
+            .fold(0f32, f32::max);
+        assert!((r - 10.).abs() <= mesh.cell_mm, "{r}");
+    }
     fn snapshot(cuts: Vec<Cut>, detail: Detail) -> Snapshot {
         Snapshot {
+            round: None,
             bounds: Bounds {
                 min: [-10., -10., 0.],
                 max: [10., 10., 10.],

@@ -13,8 +13,39 @@ pub const OFFSETS: [(&str, &str); 6] = [
     ("stock_bottom", "Bottom (−Z)"),
     ("stock_top", "Top (+Z)"),
 ];
+/// The stock modes of the first setup.
+pub const MODES: [&str; 3] = ["Relative size box", "Fixed size box", "Round bar"];
 pub fn relative(setup: &Setup) -> bool {
     get(&setup.p, "stock_type") == "Relative size box"
+}
+/// Whether the setup's stock is a round bar: a cylinder along X of
+/// `stock_diameter` and `stock_length`, centred on X and Y and standing on Z0
+/// like a fixed box, the box round it being the stock's box everywhere.
+pub fn round_bar(setup: &Setup) -> bool {
+    get(&setup.p, "stock_type") == "Round bar"
+}
+/// The round bar a first setup's `stock` box holds, in its frame: its axis
+/// (Y, Z) and radius. None for a box.
+pub fn round(setup: &Setup, stock: Bounds) -> Option<Round> {
+    round_bar(setup).then(|| Round {
+        axis: [
+            (stock.min[1] + stock.max[1]) / 2.,
+            (stock.min[2] + stock.max[2]) / 2.,
+        ],
+        radius: (stock.max[1] - stock.min[1]).min(stock.max[2] - stock.min[2]) / 2.,
+    })
+}
+/// A round bar along X: its axis's Y and Z and its radius, mm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Round {
+    pub axis: [f32; 2],
+    pub radius: f32,
+}
+impl Round {
+    /// Whether `p` (the bar's frame) lies inside it, ignoring its ends.
+    pub fn contains(self, p: [f32; 3]) -> bool {
+        (p[1] - self.axis[0]).hypot(p[2] - self.axis[1]) <= self.radius
+    }
 }
 pub fn parameter_issues(setup: &Setup) -> Vec<String> {
     if relative(setup) {
@@ -25,6 +56,15 @@ pub fn parameter_issues(setup: &Setup) -> Vec<String> {
                 format!("{label} stock offset must be a finite number of 0 mm or more.")
             })
             .collect()
+    } else if round_bar(setup) {
+        [
+            ("stock_diameter", "Bar diameter"),
+            ("stock_length", "Bar length"),
+        ]
+        .iter()
+        .filter(|&(key, _)| !num(&setup.p, key).is_some_and(|v| v > 0.))
+        .map(|(_, label)| format!("{label} must be a finite number greater than zero."))
+        .collect()
     } else if get(&setup.p, "stock_type") == "Fixed size box" {
         ["stock_x", "stock_y", "stock_z"]
             .iter()
@@ -93,6 +133,12 @@ pub fn resolve(setup: &Setup, mesh: Option<&Mesh>) -> Result<ResolvedStock, Stri
             stock.max[axis] += num(&setup.p, OFFSETS[axis * 2 + 1].0).unwrap();
         }
         stock
+    } else if round_bar(setup) {
+        let [d, l] = ["stock_diameter", "stock_length"].map(|k| num(&setup.p, k).unwrap());
+        Bounds {
+            min: [-l / 2., -d / 2., 0.],
+            max: [l / 2., d / 2., d],
+        }
     } else {
         let [x, y, z] = ["stock_x", "stock_y", "stock_z"].map(|k| num(&setup.p, k).unwrap());
         Bounds {
@@ -125,6 +171,13 @@ pub fn sheet_description(setup: &Setup, mesh: Option<&Mesh>) -> String {
             text += &format!("- {label}: {} mm\n", get(&setup.p, key));
         }
         text += "\n";
+    }
+    if round_bar(setup) {
+        text += &format!(
+            "Round bar along X: Ø{} × {} mm\n\n",
+            get(&setup.p, "stock_diameter"),
+            get(&setup.p, "stock_length")
+        );
     }
     match resolve(setup, mesh) {
         Ok(result) => {
@@ -240,6 +293,38 @@ mod tests {
         );
         s.p.insert("stock_x".into(), "".into());
         assert!(resolve(&s, Some(&mesh)).is_err());
+    }
+    #[test]
+    fn a_round_bar_is_its_box_along_x_and_its_sizes_must_be_positive() {
+        let mut s = Setup::new(Machine::new(3), "G54");
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "30"),
+            ("stock_length", "120"),
+        ] {
+            s.p.insert(k.into(), v.into());
+        }
+        assert!(round_bar(&s) && parameter_issues(&s).is_empty());
+        let stock = resolve(&s, None).unwrap().stock;
+        close(stock.min, [-60., -15., 0.]);
+        close(stock.max, [60., 15., 30.]);
+        let bar = round(&s, stock).unwrap();
+        assert_eq!((bar.axis, bar.radius), ([0., 15.], 15.));
+        assert!(bar.contains([0., 10., 25.]) && !bar.contains([0., 14., 29.]));
+        assert!(sheet_description(&s, None).contains("Round bar along X: Ø30 × 120 mm"));
+        for (key, bad) in [
+            ("stock_diameter", "0"),
+            ("stock_length", "-3"),
+            ("stock_diameter", "x"),
+        ] {
+            let mut t = s.clone();
+            t.p.insert(key.into(), bad.into());
+            assert_eq!(parameter_issues(&t).len(), 1, "{key} {bad}");
+            assert!(resolve(&t, None).is_err());
+        }
+        // A box is no bar.
+        s.p.insert("stock_type".into(), "Fixed size box".into());
+        assert_eq!(round(&s, stock), None);
     }
     #[test]
     fn sheet_uses_relative_dimensions_and_all_six_offsets() {

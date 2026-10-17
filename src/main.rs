@@ -2,6 +2,7 @@ mod analysis;
 mod cam;
 mod choice_diagram;
 mod choice_help;
+mod chuck;
 mod control;
 #[cfg(test)]
 mod fake_openai;
@@ -493,7 +494,7 @@ pub struct SetupHolding {
 }
 /// Setup settings that decide how the setup is held and nothing the earlier
 /// setups' cuts leave behind: an edit of one keeps the stock worked out.
-const HOLDING_KEYS: [&str; 7] = [
+const HOLDING_KEYS: [&str; 11] = [
     "holding",
     "holder",
     "vise_axis",
@@ -501,6 +502,10 @@ const HOLDING_KEYS: [&str; 7] = [
     "vise_grip",
     "clamps",
     "holding_gap",
+    "chuck_jaws",
+    "chuck_stickout",
+    "chuck_tailstock",
+    "chuck_jaw_angle",
 ];
 /// What `cam::holes` answers for the Drill editor's list.
 pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
@@ -631,6 +636,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
             bounds: volume.bounds,
             frame: volume.frame,
             cuts: volume.cuts.clone(),
+            round: volume.round,
             detail: stock_surface::Detail::Draft,
         }
         .build();
@@ -680,6 +686,24 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
                 .map(|v| holding::Bands::new(v, frame, part));
             let held = holding::held_by(doc, setup, stock, bands.as_ref());
             let (mut problems, mut margins) = (vec![], vec![]);
+            if chuck::holds(setup)
+                && doc.holding_issues_with(si, Some(held)).is_empty()
+                && let Ok(rig) = doc.chuck_rig(setup, held.stock)
+            {
+                let removed = before.as_deref().map(|v| rest::Removed::new(v, frame));
+                problems.extend(rig.grip_issue(removed.as_ref()));
+                let bites = left.bites.get(si).into_iter().flatten();
+                let bites = bites.map(|(oi, b)| (*oi, b.as_slice()));
+                if problems.is_empty() {
+                    for (oi, margin) in forces::chuck_margins(doc, si, bites, &rig) {
+                        let name = setup.operations[oi].name();
+                        margins.push(forces::chuck_line(name, margin.as_ref()));
+                        if let Some(m) = margin {
+                            problems.extend(forces::chuck_issues(name, &m));
+                        }
+                    }
+                }
+            }
             if let (Some(layout), Some(holder)) = (layout, doc.holder(get(&setup.p, "holder")))
                 && doc.holding_issues_with(si, Some(held)).is_empty()
             {
@@ -1978,6 +2002,7 @@ impl App {
             bounds: volume.bounds,
             frame: volume.frame,
             cuts: volume.cuts.clone(),
+            round: volume.round,
             detail: self.stock_detail,
         };
         let seconds = sim.seconds;

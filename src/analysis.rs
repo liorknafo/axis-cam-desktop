@@ -112,7 +112,7 @@ fn library_report(doc: &Document) -> Vec<LibraryEntry> {
 /// and clearance gap are told: never the library entry's name or notes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkholdingReport {
-    /// "Vise" or "Clamps".
+    /// "Vise", "Clamps" or "Chuck".
     pub kind: &'static str,
     /// The `workholding_library` number of setup 1's entry, which a later
     /// setup's `holder` of null shares; absent when setup 1 has no entry.
@@ -128,6 +128,28 @@ pub struct WorkholdingReport {
     /// when none reaches above the stock top.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clearance_above_stock_top: Option<f32>,
+    /// The chuck on the rotary A axis, for "Chuck".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chuck: Option<ChuckReport>,
+}
+/// Setup 1's chuck (`chuck::Rig`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChuckReport {
+    /// 3 or 4.
+    pub jaws: usize,
+    pub chuck_diameter: f32,
+    pub jaw_length: f32,
+    /// How long the jaws grip the stock.
+    pub gripped_length: f32,
+    /// How far the stock reaches out of the jaws, towards +X.
+    pub stickout: f32,
+    /// The stock's diameter when it is a round bar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_diameter: Option<f32>,
+    /// "Retracted", "Supports the stock" or "Off the table".
+    pub tailstock: String,
+    /// The A angle every operation runs at.
+    pub a_angle: f32,
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MachineReport {
@@ -1175,7 +1197,12 @@ fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str
     if let Some(problem) = holding_problem(doc, Some(mesh)) {
         return Err(problem);
     }
-    Ok((setup1, first, Volume::new(stock, Frame::new(setup1, mesh))))
+    let round = crate::stock::round(setup1, stock);
+    Ok((
+        setup1,
+        first,
+        Volume::new(stock, Frame::new(setup1, mesh)).rounded(round),
+    ))
 }
 /// The whole report, or the first reason planning cannot start. The part must
 /// be a closed solid: no open edges, an enclosed volume, and vertical rays (in
@@ -1235,11 +1262,38 @@ fn workholding_report(
     let kind = match get(&setup1.p, "holding") {
         "Vise" => "Vise",
         "Clamps" => "Clamps",
+        "Chuck" => "Chuck",
         _ => return Ok(None),
     };
     let resolved = crate::stock::resolve(setup1, Some(mesh))?;
     let (stock, corner) = (resolved.stock, resolved.part.map_or([0.; 3], |p| p.min));
     let boxes = doc.holding_boxes(setup1, crate::holding::Gripped::whole(stock))?;
+    let chuck = match kind {
+        "Chuck" => {
+            let rig = doc.chuck_rig(setup1, stock)?;
+            Some(ChuckReport {
+                jaws: rig.jaws,
+                chuck_diameter: r2(rig.unit.chuck_diameter),
+                jaw_length: r2(rig.unit.jaw_length),
+                gripped_length: r2(rig.grip()),
+                stickout: r2(rig.stickout),
+                bar_diameter: rig.round.then(|| r2(2. * rig.inner)),
+                tailstock: match rig.tail {
+                    crate::chuck::Tail::Off => "Off the table",
+                    crate::chuck::Tail::Retracted(_) => "Retracted",
+                    crate::chuck::Tail::Supports(_) => "Supports the stock",
+                }
+                .into(),
+                a_angle: 0.,
+            })
+        }
+        _ => None,
+    };
+    // A chuck's boxes are all keep-out zones, the stock in its jaws too.
+    let boxes = match chuck {
+        Some(_) => boxes,
+        None => crate::holding::shown(&boxes, stock),
+    };
     let gap = crate::holding::gap(setup1)?;
     let top = boxes
         .iter()
@@ -1249,7 +1303,7 @@ fn workholding_report(
     Ok(Some(WorkholdingReport {
         kind,
         number: own_entry(doc, setup1),
-        boxes: crate::holding::shown(&boxes, stock)
+        boxes: boxes
             .iter()
             .map(|b| {
                 let from_corner = |p: [f32; 3]| [0, 1, 2].map(|k| r2(p[k] - corner[k]));
@@ -1260,6 +1314,7 @@ fn workholding_report(
             .collect(),
         gap: r2(gap),
         clearance_above_stock_top: (needed > 0.).then(|| up2(needed)),
+        chuck,
     }))
 }
 fn describe(
@@ -1414,6 +1469,7 @@ pub(crate) mod tests {
             boxes: vec![],
             gap: 2.,
             clearance_above_stock_top: None,
+            chuck: None,
         };
         let json = serde_json::to_string(&none).unwrap();
         assert!(!json.contains("number"), "{json}");
