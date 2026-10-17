@@ -1091,7 +1091,10 @@ impl<'a> Viewport<'a> {
                 // on the screen and shorter as it turns towards the viewer.
                 let end = at(d.map(|v| v / scale));
                 let k = 22. / p.scale;
-                (Point::new(o.x + (end.x - o.x) * k, o.y + (end.y - o.y) * k), c)
+                (
+                    Point::new(o.x + (end.x - o.x) * k, o.y + (end.y - o.y) * k),
+                    c,
+                )
             });
             for (end, _) in arms {
                 line(&mut frame, &[o, end], halo, 5.);

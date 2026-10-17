@@ -1,3 +1,4 @@
+use crate::manual;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -267,8 +268,24 @@ impl Machine {
         if self.name().trim().is_empty() {
             e.push("Give the machine a name.".into())
         }
-        for k in ["x", "y", "z", "rpm", "feed"] {
+        let manual = manual::is_manual(self);
+        for k in ["x", "y", "z"] {
             positive(&self.p, k, &mut e)
+        }
+        if manual {
+            if manual::gears(self).is_empty() {
+                e.push("Speeds must be positive rpm, comma-separated, or a range min-max.".into())
+            }
+            for k in ["hand_feed", "hand_rapid", "turn_x", "turn_y", "turn_z"] {
+                positive(&self.p, k, &mut e)
+            }
+            for k in ["pass_time", "tool_time", "move_time"] {
+                nonnegative(&self.p, k, &mut e)
+            }
+        } else {
+            for k in ["rpm", "feed"] {
+                positive(&self.p, k, &mut e)
+            }
         }
         // Optional: empty takes `forces::SPINDLE_POWER`.
         if !get(&self.p, "power").trim().is_empty() {
@@ -289,7 +306,9 @@ impl Machine {
                 finite(&self.p, k, &mut e)
             }
         }
-        if get(&self.p, "controller") == "UC100" && get(&self.p, "uc100_profile").trim().is_empty()
+        if !manual
+            && get(&self.p, "controller") == "UC100"
+            && get(&self.p, "uc100_profile").trim().is_empty()
         {
             e.push("Choose the machine's UC100 profile file.".into())
         }

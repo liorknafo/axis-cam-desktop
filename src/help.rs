@@ -2062,6 +2062,56 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             None,
         ),
+        (Target::Machine, "kind") => (
+            "CNC runs G-code. Manual is a hand-operated mill with a DRO: no G-code, no Run, and its setups are shown as steps on the MACHINE page.",
+            "",
+            None,
+        ),
+        (_, "speeds") => (
+            "The spindle speeds the gearbox has, in rpm, comma-separated. A range such as 100-2000 means a variable drive. The rpm of a manual operation must be one of them.",
+            "",
+            None,
+        ),
+        (_, "hand_feed") => (
+            "The fastest feed you can turn steadily by hand, in mm/min. No manual operation feeds faster.",
+            "",
+            None,
+        ),
+        (_, "hand_rapid") => (
+            "How fast you move an axis off the cut by hand, in mm/min. It sets the time of the moves between cuts.",
+            "",
+            None,
+        ),
+        (_, "turn_x" | "turn_y" | "turn_z") => (
+            "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
+            "",
+            None,
+        ),
+        (_, "dro_comp") => (
+            "Yes when the DRO has tool-radius compensation, so it reads the tool's edge instead of its centre.",
+            "",
+            None,
+        ),
+        (_, "pass_time") => (
+            "Seconds to reset, set and lock the axes for one pass. It adds to the setup's minutes.",
+            "",
+            None,
+        ),
+        (_, "tool_time") => (
+            "Minutes to change a tool and pick up the zero again. It adds to the setup's minutes.",
+            "",
+            None,
+        ),
+        (_, "move_time") => (
+            "Minutes to move the stock between this machine and another. The plan adds it each time the stock changes machine.",
+            "",
+            None,
+        ),
+        (_, "machines") => (
+            "The machines that hold this entry. None checked means every CNC machine and no manual machine.",
+            "",
+            None,
+        ),
         (_, "origin") => (
             "Work zero for this setup's G-code and runs: a spot on the top or bottom of the stock this setup starts from, or the part file's own origin. The probe on the Control page finds exactly this point; the editor says where it is touched off and whether it is still on the stock.",
             "Work zero for this setup's G-code and runs: a corner, the middle of an edge or the centre of the stock's top or bottom, on the stock this setup starts from (what earlier setups leave, turned with it), or the part file's own origin.",

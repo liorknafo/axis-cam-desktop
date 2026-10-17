@@ -10,6 +10,7 @@ mod help;
 mod holding;
 mod look;
 mod machine_view;
+mod manual;
 mod material;
 mod mesh;
 mod model;
