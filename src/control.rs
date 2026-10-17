@@ -152,7 +152,7 @@ pub fn owners_machine(dir: &Path) -> std::io::Result<Machine> {
 /// rotary unit (LIO-184): the profile's own text, `[axes.a]` after it. The
 /// pins are the driver's free step/dir pair 8 and 9 and the rest is the
 /// driver's sample A axis: ASSUMED, none of it wired or measured yet.
-const ROTARY_AXIS: &str = "
+pub(crate) const ROTARY_AXIS: &str = "
 [axes.a]
 # ASSUMED (LIO-184), NOT WIRED OR MEASURED: pins 8 and 9 are the driver's free
 # step/dir pair, 44.444 steps per degree is its sample A axis (16000 per turn)
@@ -170,8 +170,24 @@ soft_max = 180.0
 ";
 
 /// The owner's UC100 profile with the rotary unit's A axis: `jy5800.toml`
-/// and `[axes.a]`.
+/// and `[axes.a]`, added the way the Setup form adds it (LIO-183): the
+/// pinout and steps-per-unit checks of `[commissioning]` were made on X, Y
+/// and Z, so they are unticked, and Reset stays refused until A's pins and
+/// steps per degree are checked in the form.
 pub fn rotary_profile() -> String {
+    let mut d = crate::setup::Draft::from_text(
+        String::new(),
+        "jy5800-rotary.toml".into(),
+        include_str!("../assets/jy5800.toml").into(),
+    )
+    .expect("the shipped profile is TOML");
+    d.edit(crate::setup::Edit::AddAxis("a".into()));
+    d.to_text()
+}
+
+/// `rotary_profile` before it unticked the checks: a copy left unedited on
+/// disk is replaced, since it would let A move on assumed values.
+fn rotary_profile_ungated() -> String {
     format!("{}{ROTARY_AXIS}", include_str!("../assets/jy5800.toml"))
 }
 
@@ -182,6 +198,9 @@ pub fn rotary_profile() -> String {
 /// The owner's 3-axis machine stays what it is.
 pub fn rotary_machine(dir: &Path) -> std::io::Result<Machine> {
     let path = dir.join("jy5800-rotary.toml");
+    if std::fs::read_to_string(&path).is_ok_and(|t| t == rotary_profile_ungated()) {
+        std::fs::remove_file(&path)?;
+    }
     if !path.exists() {
         std::fs::create_dir_all(dir)?;
         std::fs::write(&path, rotary_profile())?;

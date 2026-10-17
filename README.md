@@ -701,12 +701,18 @@ the commissioning work that needed the driver's egui app or a text editor:
 - **Outputs**: each output pin's level and role; **High**, **Low** and
   **Release** for a wiring test while Idle, never on pins the controller
   drives itself. E-stop releases every forced pin.
-- **Calibrate steps per mm**: pick an axis and a travel, **Move**, measure
+- **Calibrate steps per mm** (per degree for A): pick an axis and a travel, **Move**, measure
   how far the carriage really went, and **Use in profile**.
 - **Audit**: the driver's report on the profile as edited.
 
-Adding or removing an axis, motion tuning and the tool table are still edits
-of the file.
+**Add the A axis** puts a rotary axis in degrees (steps per °, °/s, °/s², soft
+limits in °) on pins 8 and 9 into the profile, **Remove the A axis** takes it
+out, and a pin another role uses is refused. Adding A unticks the pinout and
+steps-per-unit checks, so Reset (and with it every move) is refused until
+A's pins and steps per degree are checked; the "Jingyan CNC4030 + rotary"
+machine's profile starts that way, its A values assumed. Calibrating A turns
+it 90° or 360° and takes the angle you measured. Motion tuning and the tool
+table are still edits of the file.
 
 ### Running a setup
 

@@ -1417,7 +1417,7 @@ pub fn command(m: &Message, label: String) -> Help {
         Guide(a) => guide_help(a),
         ControlSetup(false) => ("Jog, zero and run the machine.", ""),
         ControlSetup(true) => (
-            "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm.",
+            "Edit the machine's UC100 profile, watch its inputs, test its outputs and calibrate steps per mm (per degree for A).",
             "",
         ),
         Setup(crate::setup::Msg::Save) => (
@@ -1425,7 +1425,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         Setup(crate::setup::Msg::UseCalibration) => (
-            "Put this steps per mm in the profile below. Save to use it.",
+            "Put this steps per mm (per degree for the A axis) in the profile below. Save to use it.",
             "",
         ),
         Setup(crate::setup::Msg::Revert) => (
@@ -1482,7 +1482,9 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         TestOutput(_, None) => ("Release the pin: the machine drives it again.", ""),
         CalAxis(_) => ("Calibrate this axis.", ""),
-        CalDistance(_) | CalMeasured(_) => ("Travel in mm.", ""),
+        CalDistance(_) | CalMeasured(_) => {
+            ("Travel in mm; for the A axis, the angle in degrees.", "")
+        }
         CalMove => (
             "Move the axis by the commanded travel at the jog speed, counting its step pulses. Soft limits apply.",
             "",
