@@ -1575,6 +1575,34 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Set the X and Y work offset of the active work system to the one the pins give this setup: pin 1's recorded machine place less where pin 1 stands in the setup's work coordinates. Exact, with no probing. Z is touched off as for any setup.",
             "",
         ),
+        BarText(_) => (
+            "The diameter of the bar or stock in the chuck, in mm, measured with a micrometer. The centreline is the top's height less half of it, and A zero lifts the tip this much over the centreline, plus 5 mm, before A turns.",
+            "",
+        ),
+        SpacingText(_) => (
+            "How far apart along Y Find A zero touches the flat, in mm, half either side of the tip. Wider is more exact; both touches must land on the flat, not past its edges.",
+            "",
+        ),
+        Calibrate(crate::control::Calibrate::Centreline) => (
+            "Find A's centreline in machine Y and Z from a test bar in the chuck: both sides and the top at A and at A + 180°, whose means cancel the bar's runout. The tip lifts 5 mm over the bar before A turns. Save it to keep it in the machine.",
+            "An error of e mm in the centreline puts a feature cut at A 180° off by 2e. Every move down beside the bar is a probe move that stops on contact; A turns only in a move of its own, with the tip up clear and the probe touching nothing. Z is the probe tip's, with this probe in the spindle.",
+        ),
+        Calibrate(crate::control::Calibrate::Alignment) => (
+            "Probe the bar again near the tailstock, as near the chuck, and say how far the centreline runs off machine X between the two. Over 0.05 mm, square the rotary unit or line up the tailstock.",
+            "",
+        ),
+        Calibrate(crate::control::Calibrate::AZero) => (
+            "Level a flat on the stock or a jaw face: touch it at two points along Y, lift clear, turn A by the slope found and again until they are level, then zero A there in the active work system.",
+            "It needs the centreline (probed or measured) and the stock's diameter, to lift the tip clear of the stock before A turns. The flat must start within 20° of level.",
+        ),
+        SaveCentreline => (
+            "Keep the centreline just probed near the chuck in the machine's rotary unit geometry, marked measured. It says when the largest part on that centreline leaves no room to retract over it.",
+            "",
+        ),
+        Remounted => (
+            "The rotary unit was taken off the table and put back: its measured centreline is marked stale until it is probed again. Every E-stop does the same, as the machine position it is in is lost.",
+            "",
+        ),
     }
 }
 
@@ -1688,6 +1716,14 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         }
         (Target::Machine, "mdi_line") => {
             let (body, more) = machine_help(&crate::control::Action::MdiText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "rotary_bar") => {
+            let (body, more) = machine_help(&crate::control::Action::BarText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "rotary_spacing") => {
+            let (body, more) = machine_help(&crate::control::Action::SpacingText(String::new()));
             (body, more, None)
         }
         (Target::Machine, "work_set") => {
@@ -2400,7 +2436,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (Target::Machine, k) if k.starts_with("a_") => (
             match k {
                 "a_centre_y" => {
-                    "Where the A axis' centreline runs in machine Y, in mm from the machine's Y zero. It must be inside the Y travel. Assumed until measured."
+                    "Where the A axis' centreline runs in machine Y, in mm from the machine's Y zero. It must be inside the Y travel. Assumed until measured: the Control page's Rotary A panel probes it and saves it as measured."
                 }
                 "a_centre_z" => {
                     "Where the A axis' centreline runs in machine Z, in mm (zero is the top of the Z travel, so this is negative). It must be inside the Z travel. Assumed until measured."
@@ -4116,6 +4152,13 @@ mod tests {
             Ctl::ProbeFeature(crate::control::Feature::Bore),
             Ctl::TouchOff,
             Ctl::ToSimZero,
+            Ctl::BarText(String::new()),
+            Ctl::SpacingText(String::new()),
+            Ctl::Calibrate(crate::control::Calibrate::Centreline),
+            Ctl::Calibrate(crate::control::Calibrate::Alignment),
+            Ctl::Calibrate(crate::control::Calibrate::AZero),
+            Ctl::SaveCentreline,
+            Ctl::Remounted,
         ] {
             messages.push(Machine(a));
         }
