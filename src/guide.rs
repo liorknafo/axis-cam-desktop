@@ -57,14 +57,17 @@ pub enum Step {
         touch: [f32; 3],
         finder: f32,
     },
-    /// Put in the tool `tool` (an id) at `rpm`; with the DRO's compensation
-    /// on, enter `diameter` and set X and Y to `comp` (0 off: centres).
+    /// Put in the tool `tool` (an id) at `rpm`, touch the stock's top with
+    /// it and set Z to `top` (the top before the operation, work Z); with
+    /// the DRO's compensation on, enter `diameter` and set X and Y to
+    /// `comp` (0 off: centres).
     Tool {
         op: usize,
         tool: String,
         rpm: f32,
         diameter: f32,
         comp: [i8; 2],
+        top: f32,
     },
     /// Same tool: only the compensation sides change.
     Comp { op: usize, comp: [i8; 2] },
@@ -81,12 +84,14 @@ pub enum Step {
         turns_per_minute: f32,
     },
     /// A facing Box (open on all four sides): face the top down to `to`,
-    /// taking off `remove`; the user plans the passes.
+    /// taking off `remove`; the user plans the passes. The tool picks up Z
+    /// on the top first, set to `top`, as on a Tool step.
     Face {
         op: usize,
         tool: String,
         rpm: f32,
         diameter: f32,
+        top: f32,
         remove: f32,
         to: f32,
     },
@@ -96,13 +101,15 @@ pub enum Step {
     /// (the edge with compensation, else the centre), taking off `remove`,
     /// down to `down_to` (the floor as cut). With the DRO's compensation on,
     /// enter `diameter` and set `axis` to its side in `comp` (toward the
-    /// wall; the other axis 0); all 0 with it off.
+    /// wall; the other axis 0); all 0 with it off. The tool picks up Z on
+    /// the top first, set to `top`, as on a Tool step.
     Square {
         op: usize,
         tool: String,
         rpm: f32,
         diameter: f32,
         comp: [i8; 2],
+        top: f32,
         axis: usize,
         side: i8,
         to: f32,
@@ -418,6 +425,9 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         let mut count = 0;
         // The stock before this operation.
         let earlier = done_ops.last().map_or(&before, |d: &Done| &d.after);
+        let left = simulation::leftover_box(earlier, setup, mesh);
+        // Where a new tool picks up Z: the highest top left.
+        let top = left.max[2] - zero[2];
         let mut sides = |comp: [i8; 2], steps: &mut Vec<Step>| {
             let new = (set.as_ref())
                 .is_some_and(|&(t, s, c)| t == tool && s == rpm && c.is_some_and(|c| c != comp));
@@ -429,6 +439,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     rpm,
                     diameter,
                     comp,
+                    top,
                 },
             });
             set = Some((tool, rpm, Some(comp)));
@@ -447,6 +458,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             tool: tool.into(),
                             rpm,
                             diameter,
+                            top,
                             remove: plan.rest_top.unwrap_or(stock.max[2]) - plan.target,
                             to: plan.target - zero[2],
                         });
@@ -463,13 +475,13 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                             false => centres.fold(f32::NEG_INFINITY, f32::max),
                         };
                         let wall = centre - f32::from(side) * r;
-                        let left = simulation::leftover_box(earlier, setup, mesh);
                         steps.push(Step::Square {
                             op: oi,
                             tool: tool.into(),
                             rpm,
                             diameter,
                             comp: std::array::from_fn(|k| if k == axis { comp[k] } else { 0 }),
+                            top,
                             axis,
                             side,
                             to: wall - zero[axis],
@@ -736,6 +748,7 @@ pub(crate) mod tests {
             tool,
             rpm,
             diameter,
+            top,
             remove,
             to,
         } = &guide.steps[2]
@@ -748,9 +761,40 @@ pub(crate) mod tests {
         );
         close(*to, -2.);
         close(*remove, 2.);
+        // The first tool picks up Z on the untouched top.
+        close(*top, 0.);
         assert_eq!(guide.steps[12], Step::HandOver { next: Some(1) });
         // The Step's floor is closed: not a squaring Box.
         assert!(matches!(guide.steps[3], Step::Tool { op: 1, .. }));
+    }
+    #[test]
+    fn every_new_tool_picks_up_z_on_the_top_left_before_its_operation() {
+        let (doc, mesh) = job("Yes");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        // After the 2 mm face, the Step's mill and the Holes' drill touch a
+        // top 2 mm down.
+        let tops: Vec<(usize, f32)> = (guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Tool { op, top, .. } | Step::Face { op, top, .. } => Some((*op, *top)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tops.len(), 3, "{tops:?}");
+        for ((op, top), want) in tops.into_iter().zip([(0, 0.), (1, -2.), (2, -2.)]) {
+            assert_eq!(op, want.0);
+            assert!((top - want.1).abs() < 0.01, "{op} {top}");
+        }
+        // A square after the face picks up on it too.
+        let (mut doc, mesh) = job("Yes");
+        let mill = doc.tools[3].id.clone();
+        let b = [123., 500., -500., 500., 0., -30.];
+        let square = boxed("Square", &mill, b, &[("allowance", "0")]);
+        doc.setups[0].operations.insert(1, square);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Step::Square { top, .. } = &guide.steps[3] else {
+            panic!("{:?}", guide.steps[3])
+        };
+        assert!((top + 2.).abs() < 0.01, "{top}");
     }
     #[test]
     fn the_zero_takes_the_edge_finders_radius_off_each_face_it_touches() {

@@ -423,9 +423,9 @@ The page is split into sections: **Set up** (Hold, Zero), one section per cuttin
 | --- | --- |
 | Hold | The stock in the vise or clamps, which face is up, the jaws, the size |
 | Zero | The corner to pick up with the edge finder (DRO compensation off): the face each of X and Y is touched on and the number to set there, the zero less or plus the finder's radius ("touch the left face → set X −5.00" with a Ø10 finder), and Z set on the top |
-| Tool | The tool drawn to scale, the gear, and with compensation on the diameter to enter and the sides to set (a Comp screen follows when only the sides change) |
-| Face | The whole facing on one screen: tool, gear, how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
-| Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
+| Tool | The tool drawn to scale, the gear, the Z pick-up ("touch the top → set Z −2.00": the top the operations before left, in work Z), and with compensation on the diameter to enter and the sides to set (a Comp screen follows when only the sides change) |
+| Face | The whole facing on one screen: tool, gear, the Z pick-up, how much comes off and the Z to face down to. You plan the passes and stepdown yourself, so it has no Pass or Check screen |
+| Square | A thin slab along one wall (one closed X or Y side, at most one tool radius wide) on one screen: tool, gear, the Z pick-up, with compensation on the diameter to enter and the side to set (toward the wall), the X or Y to cut that side to, how much comes off and the Z to go down to. No Pass or Check screen |
 | Pass | One pass: top and front views, the band it removes, the tool where it starts and an arrow to where it stops, what earlier passes removed, and the DRO numbers |
 | Holes | The top view with every hole numbered, the current one lit, and its X, Y and the Z to drill to |
 | Check | The stock after the operation next to the one before, and the allowance left |

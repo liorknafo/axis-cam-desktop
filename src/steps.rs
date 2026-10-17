@@ -1021,6 +1021,26 @@ fn dro_tool<'a>(diameter: f32, comp: [i8; 2], height: f32) -> Vec<Element<'a, Me
     ]
 }
 
+/// A new tool picks up Z: touch the top and set Z to `top`.
+fn pick_up<'a>(top: f32) -> [Element<'a, Message>; 2] {
+    [
+        label("Pick up Z with the tool"),
+        readout(
+            Readout {
+                order: None,
+                lead: Some("touch the top → set".into()),
+                axis: "Z".into(),
+                value: dro(top),
+                lock: None,
+                tags: vec![],
+                lit: Lit::Next,
+                big: false,
+            },
+            None,
+        ),
+    ]
+}
+
 /// What the page needs at hand for a step.
 struct Page<'a> {
     app: &'a App,
@@ -1480,6 +1500,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             rpm,
             diameter,
             comp,
+            top,
         } => {
             let drill = p
                 .setup
@@ -1490,6 +1511,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(p.named(tool, *diameter)),
                 chip(format!("{} rpm", rpm.round()))
             ]),]
+            .extend(pick_up(*top))
             .extend(dro_tool(*diameter, *comp, 110.));
             let left = canvas(ToolPicture {
                 diameter: *diameter,
@@ -1534,6 +1556,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             tool: id,
             rpm,
             diameter,
+            top,
             remove,
             to,
         } => {
@@ -1567,26 +1590,26 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             ]
             .spacing(6)
             .into();
-            let right = column![
-                chips(vec![
-                    chip(p.named(id, *diameter)),
-                    chip(format!("{} rpm", rpm.round()))
-                ]),
-                readout(
-                    Readout {
-                        order: None,
-                        lead: Some("Face to".into()),
-                        axis: "Z".into(),
-                        value: dro(*to),
-                        lock: None,
-                        tags: vec![format!("{} mm off", dro(*remove))],
-                        lit: Lit::Now,
-                        big: true
-                    },
-                    None
-                ),
-                muted("Your passes, your stepdown.").size(13),
-            ];
+            let right = column![chips(vec![
+                chip(p.named(id, *diameter)),
+                chip(format!("{} rpm", rpm.round()))
+            ]),]
+            .extend(pick_up(*top))
+            .push(label("Face down to"))
+            .push(readout(
+                Readout {
+                    order: None,
+                    lead: Some("Face to".into()),
+                    axis: "Z".into(),
+                    value: dro(*to),
+                    lock: None,
+                    tags: vec![format!("{} mm off", dro(*remove))],
+                    lit: Lit::Now,
+                    big: true,
+                },
+                None,
+            ))
+            .push(muted("Your passes, your stepdown.").size(13));
             (
                 "Face".into(),
                 "the only screen: tool and depth",
@@ -1600,6 +1623,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             rpm,
             diameter,
             comp,
+            top,
             axis,
             side,
             to,
@@ -1677,7 +1701,8 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 chip(format!("{} rpm", rpm.round())),
                 chip(format!("down to Z {}", dro(*down_to)))
             ]),]
-            .extend(dro_tool(*diameter, *comp, 80.))
+            .extend(pick_up(*top))
+            .extend(dro_tool(*diameter, *comp, 70.))
             .push(label("Cut the side to"))
             .push(readout(
                 Readout {
@@ -2174,6 +2199,11 @@ pub(crate) mod tests {
     fn send(a: &mut App, action: GuideAction) {
         let _ = a.update(Message::Guide(action));
     }
+    /// The two texts after `lead`: the axis and the number.
+    fn after(t: &[String], lead: &str) -> Vec<String> {
+        let i = (t.iter().position(|s| s == lead)).unwrap_or_else(|| panic!("{lead} in {t:?}"));
+        t[i + 1..i + 3].to_vec()
+    }
     #[test]
     fn the_face_step_shows_the_tool_the_gear_and_the_depth_and_no_passes() {
         let mut a = app("Yes");
@@ -2199,6 +2229,27 @@ pub(crate) mod tests {
                 .any(|s| s.starts_with("Move in this order") || s == "Pass done ▶"),
             "{t:?}"
         );
+        // The face's tool picks up Z on the top first.
+        assert_eq!(after(&t, "touch the top → set"), ["Z", "0.00"]);
+    }
+    #[test]
+    fn a_new_tool_picks_up_z_on_the_top_the_operations_before_left() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let tools: Vec<usize> = (g.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, Step::Tool { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // The Step's mill and the Holes' drill, after the 2 mm face.
+        assert_eq!(tools.len(), 2);
+        for i in tools {
+            send(&mut a, GuideAction::Go(i));
+            let t = texts(&a);
+            assert!(t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
+            assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
+        }
+        let t = texts(&squared("Yes"));
+        assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
     }
     /// The job with the stock's +X side squared 1 mm first (step 3).
     fn squared(dro: &str) -> App {
@@ -2247,13 +2298,9 @@ pub(crate) mod tests {
             assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
         }
         // Each number follows its touch: X −5, Y −5, Z 0.
-        let after = |lead: &str| {
-            let i = t.iter().position(|s| s == lead).unwrap();
-            t[i + 1..i + 3].to_vec()
-        };
-        assert_eq!(after("touch the left face → set"), ["X", "−5.00"]);
-        assert_eq!(after("touch the front face → set"), ["Y", "−5.00"]);
-        assert_eq!(after("touch the top → set"), ["Z", "0.00"]);
+        assert_eq!(after(&t, "touch the left face → set"), ["X", "−5.00"]);
+        assert_eq!(after(&t, "touch the front face → set"), ["Y", "−5.00"]);
+        assert_eq!(after(&t, "touch the top → set"), ["Z", "0.00"]);
     }
     #[test]
     fn a_pass_shows_its_number_and_its_readouts_in_order() {
