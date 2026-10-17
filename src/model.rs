@@ -394,11 +394,24 @@ pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 /// part covers or underlies: clears over them at the floor's height, or
 /// cuts them through, Breakthrough past the bottom of their walls.
 pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
+/// Whether an outside Contour leaves holding tabs: bridges of material
+/// across its cut, near its bottom, that keep the part joined to the stock
+/// around it when the cut goes through.
+pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
+/// The tab settings an operation starts with, and takes when tabs are
+/// turned on in a project saved before them: tabs on each outline, each
+/// one's width at its narrowest (mm) and its thickness (mm).
+pub const TAB_DEFAULTS: [(&str, &str); 3] = [
+    ("tab_count", "4"),
+    ("tab_width", "6"),
+    ("tab_height", "1.5"),
+];
 pub fn pocket_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
     p.get(key).map(String::as_str).unwrap_or(match key {
         "pocket_milling" => "Climb",
         "pocket_entry" => POCKET_ENTRIES[0],
         "openings" => POCKET_OPENINGS[0],
+        "tabs" => CONTOUR_TABS[0],
         _ => "",
     })
 }
@@ -416,6 +429,7 @@ pub fn pocket_setting_issues(p: &Fields) -> Vec<String> {
             POCKET_ENTRIES,
         ),
         ("openings", pocket_setting(p, "openings"), POCKET_OPENINGS),
+        ("tabs", pocket_setting(p, "tabs"), CONTOUR_TABS),
         (
             "spindle_rotation",
             facing_setting(p, "spindle_rotation"),
@@ -581,7 +595,9 @@ impl Operation {
             ("lean_angle", "0"),
             ("collision", "Retract and relink"),
             ("pattern", "Parallel"),
+            ("tabs", CONTOUR_TABS[0]),
         ]);
+        p.extend(TAB_DEFAULTS.map(|(k, v)| (k.to_string(), v.to_string())));
         if s == Strategy::Drill {
             p.insert("rpm".into(), "2400".into());
             p.insert("feed".into(), "280".into());
@@ -766,6 +782,14 @@ impl Operation {
                 if num(&self.p, "finish_passes").is_some_and(|x| x.fract() != 0.) {
                     e.push("Finishing passes must be a whole number.".into())
                 }
+            }
+            if s == Strategy::Contour && pocket_setting(&self.p, "tabs") == CONTOUR_TABS[1] {
+                bounded(&self.p, "tab_count", 1., 50., &mut e);
+                if num(&self.p, "tab_count").is_some_and(|x| x.fract() != 0.) {
+                    e.push("Tab count must be a whole number.".into())
+                }
+                positive(&self.p, "tab_width", &mut e);
+                positive(&self.p, "tab_height", &mut e)
             }
             if matches!(s, Strategy::Adaptive | Strategy::Pocket)
                 && get(&self.p, "ramp") != "Plunge"
@@ -1784,7 +1808,7 @@ fn label(k: &str) -> String {
 }
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 33] = [
+const OPERATION_FIELDS: [&str; 36] = [
     "name",
     "hole_diameter",
     "rpm",
@@ -1818,6 +1842,9 @@ const OPERATION_FIELDS: [&str; 33] = [
     "minimum_radius",
     "ramp_angle",
     "lead_in",
+    "tab_count",
+    "tab_width",
+    "tab_height",
 ];
 /// The operation editor's text field a check's message is about, by its key,
 /// so the editor can show the message at the field. The messages of

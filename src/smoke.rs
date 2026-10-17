@@ -10070,6 +10070,83 @@ flood = { pin = 8 }
         assert_eq!(a.page, Page::Audit);
     }
     #[test]
+    fn a_contour_through_the_stock_bottom_warns_until_it_leaves_tabs() {
+        let mut a = imported_app();
+        // The Contour alone, on fresh stock.
+        for o in &mut a.doc.setup_mut().operations {
+            o.enabled = false;
+        }
+        let _ = a.update(Message::AddOp(Strategy::Contour));
+        let contour = (a.doc.setup().operations.iter())
+            .rposition(|o| o.strategy == Strategy::Contour)
+            .unwrap();
+        let _ = a.update(Message::SelectOp(contour));
+        let _ = a.update(Message::Edit(Target::Setup, "stock_bottom", "0".into()));
+        // A tool that reaches down the whole part.
+        let tool = a.operation().unwrap().tool.clone();
+        let tool = a.doc.tools.iter_mut().find(|t| t.id == tool).unwrap();
+        tool.p.insert("length".into(), "80".into());
+        tool.p.insert("stickout".into(), "90".into());
+        // A project saved before tabs: none of their settings.
+        for key in ["tabs", "tab_count", "tab_width", "tab_height"] {
+            a.operation_mut().unwrap().p.remove(key);
+        }
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        let loose = |a: &App| {
+            crate::ui::op_checks(a)
+                .into_iter()
+                .find(|c| c.text.contains("the part comes loose"))
+        };
+        let warning = loose(&a).unwrap_or_else(|| panic!("{:?}", crate::ui::op_checks(&a)));
+        assert_eq!((warning.error, warning.key), (false, Some("bottom")));
+        let _ = a.update(Message::Tab("Heights".into()));
+        let texts = page_texts(&a);
+        assert!(texts.contains(&"Holding tabs".to_string()), "{texts:?}");
+        assert!(!texts.contains(&"Tab width · mm".to_string()), "{texts:?}");
+        // Turning tabs on fills in their sizes and drops the old plan.
+        let _ = a.update(Message::Edit(Target::Operation, "tabs", "Yes".into()));
+        assert!(a.simulation.is_none());
+        let p = &a.operation().unwrap().p;
+        for (key, value) in crate::model::TAB_DEFAULTS {
+            assert_eq!(get(p, key), value);
+        }
+        let texts = page_texts(&a);
+        for label in ["Tabs on each outline", "Tab width · mm", "Tab height · mm"] {
+            assert!(texts.contains(&label.to_string()), "{label}: {texts:?}");
+        }
+        // The import leaves 5 mm of stock beside the part, less than the
+        // Ø10 cut: the tabs would join the part to nothing.
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_none());
+        assert!(
+            a.status.contains("4 of 4 tabs join the part to no stock")
+                && a.status.contains("at least 12.4 mm"),
+            "{}",
+            a.status
+        );
+        for key in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            let _ = a.update(Message::Edit(Target::Setup, key, "15".into()));
+        }
+        let _ = a.update(Message::Generate);
+        let plan = &a
+            .active_simulation()
+            .unwrap_or_else(|| panic!("{}", a.status))
+            .plan;
+        let rises = (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[..2] == m.to[..2] && m.to[2] > m.from[2])
+            .count();
+        assert!(rises >= 4, "{rises}");
+        assert!(loose(&a).is_none());
+        // A bad size is an error at its field, on Heights.
+        let _ = a.update(Message::Edit(Target::Operation, "tab_count", "0".into()));
+        let error = (crate::ui::op_checks(&a).into_iter())
+            .find(|c| c.key == Some("tab_count"))
+            .unwrap_or_else(|| panic!("{:?}", crate::ui::op_checks(&a)));
+        assert!(error.error);
+        assert_eq!(crate::ui::issue_tab(&error.text), Some("Heights"));
+    }
+    #[test]
     fn stock_mesher_rejects_stale_results_after_rewind_edit_and_detail_change() {
         let mut a = imported_app();
         let mesh = a.imported_mesh.as_ref().unwrap();

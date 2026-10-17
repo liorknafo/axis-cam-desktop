@@ -2726,6 +2726,12 @@ impl App {
             Message::Edit(target, k, v) => match target {
                 Target::Operation => {
                     if let Some(o) = self.operation_mut() {
+                        // A project saved before tabs has no sizes for them.
+                        if k == "tabs" {
+                            for (key, value) in model::TAB_DEFAULTS {
+                                o.p.entry(key.into()).or_insert_with(|| value.into());
+                            }
+                        }
                         o.p.insert(k.into(), v);
                     }
                     self.touch()
