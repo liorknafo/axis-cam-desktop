@@ -231,6 +231,22 @@ pub fn pushes(
         })
         .collect()
 }
+/// The depth of cut, mm, that 70 % of `machine`'s spindle power (`power`,
+/// else `SPINDLE_POWER`) takes at `width` mm across and `feed` mm/min in
+/// `material` (kc1.1 of its group, `KC`): P = kc × ap × width × feed ÷ 60 000.
+/// At most the Ø`diameter` tool's diameter.
+pub fn power_stepdown(
+    machine: &Machine,
+    material: Option<&Material>,
+    diameter: f32,
+    width: f32,
+    feed: f32,
+) -> f32 {
+    let power = num(&machine.p, "power")
+        .filter(|p| *p > 0.)
+        .unwrap_or(SPINDLE_POWER);
+    (0.7 * power * 60_000. / (kc(material).0 * width * feed)).min(diameter)
+}
 /// How the stock would give way.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Way {
@@ -591,6 +607,19 @@ mod tests {
     }
     fn starter(kind: &str) -> Holder {
         starters().into_iter().find(|h| h.kind() == kind).unwrap()
+    }
+    #[test]
+    fn power_stepdown_is_what_seventy_percent_of_the_spindle_takes() {
+        let mut machine = Machine::new(3);
+        machine.p.remove("power");
+        // 0.7 × 800 W × 60 000 ÷ (1700 N/mm² × 17.5 mm × 120 mm/min).
+        let ap = power_stepdown(&machine, None, 25., 17.5, 120.);
+        assert!((ap - 9.4118).abs() < 0.001, "{ap}");
+        // Half the width or feed, twice the depth, up to the diameter.
+        assert!((power_stepdown(&machine, None, 25., 8.75, 120.) - 2. * ap).abs() < 0.001);
+        assert_eq!(power_stepdown(&machine, None, 10., 8.75, 120.), 10.);
+        machine.p.insert("power".into(), "1600".into());
+        assert!((power_stepdown(&machine, None, 25., 17.5, 120.) - 2. * ap).abs() < 0.001);
     }
     #[test]
     fn a_slot_pushes_with_the_stock_it_removes_up_to_what_the_spindle_drives() {
