@@ -40,6 +40,7 @@ impl Strategy {
         matches!(
             self,
             Self::Face
+                | Self::Adaptive
                 | Self::Pocket
                 | Self::Contour
                 | Self::Drill
@@ -49,7 +50,10 @@ impl Strategy {
         )
     }
     pub fn needs_surfaces(self) -> bool {
-        matches!(self, Self::Face | Self::Pocket | Self::Drill)
+        matches!(
+            self,
+            Self::Face | Self::Adaptive | Self::Pocket | Self::Drill
+        )
     }
     pub fn availability(self) -> &'static str {
         match self {
@@ -62,7 +66,7 @@ impl Strategy {
             Self::Parallel => "Available · sampled vertical flat/ball cutter surface finishing",
             Self::Waterline => "Available · constant-Z contours with a vertical flat cutter",
             Self::Adaptive => {
-                "Unavailable · engagement-controlled adaptive kernel is not implemented"
+                "Available · planar pocket with islands, cleared at a controlled radial engagement"
             }
             Self::Scallop => "Unavailable · constant surface-spacing kernel is not implemented",
             Self::Indexed => {
@@ -461,6 +465,9 @@ pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
 pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// How Adaptive clearing enters material it cannot reach from the side
+/// (its `ramp` setting).
+pub const ADAPTIVE_ENTRIES: [&str; 2] = ["Helix", "Plunge"];
 /// What a Pocket does with the holes through its floor that nothing of the
 /// part covers or underlies: clears over them at the floor's height, or
 /// cuts them through, Breakthrough past the bottom of their walls.
@@ -773,7 +780,7 @@ impl Operation {
         if self.strategy == Strategy::Face {
             e.extend(facing_setting_issues(&self.p));
         }
-        if self.strategy == Strategy::Pocket {
+        if matches!(self.strategy, Strategy::Pocket | Strategy::Adaptive) {
             e.extend(pocket_setting_issues(&self.p));
             nonnegative(&self.p, "axial_allowance", &mut e);
         }
@@ -865,7 +872,7 @@ impl Operation {
                 nonnegative(&self.p, "breakthrough", &mut e)
             }
         } else {
-            if s == Strategy::Parallel || !s.imported_preview() {
+            if matches!(s, Strategy::Parallel | Strategy::Adaptive) || !s.imported_preview() {
                 positive(&self.p, "tolerance", &mut e);
             }
             nonnegative(&self.p, "allowance", &mut e);

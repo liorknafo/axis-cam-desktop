@@ -1,3 +1,4 @@
+mod adaptive;
 mod analysis;
 mod cam;
 mod choice_diagram;

@@ -130,6 +130,9 @@ pub fn generate(
     if operation.strategy == Strategy::Pocket {
         return crate::pocket::generate(setup, operation, tool, mesh);
     }
+    if operation.strategy == Strategy::Adaptive {
+        return crate::adaptive::generate(setup, operation, tool, mesh);
+    }
     if operation.strategy != Strategy::Face {
         return crate::cam::generate(setup, operation, tool, mesh);
     }
