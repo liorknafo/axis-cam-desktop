@@ -300,6 +300,7 @@
   - `Comp { op, comp }`
   - `Pass { op, index, of, targets: Vec<Target>, cut: Bounds, earlier: Vec<Bounds>, never: Limits, turns_per_minute: f32 }`
   - `Face { op, tool, rpm, diameter, remove: f32, to: f32 }` (`to` is the final top Z in work coordinates, `remove` the material taken off)
+  - `Square { op, tool, rpm, diameter, axis: usize, side: i8, to: f32, shown: f32, remove: f32, down_to: f32 }` (`to` is the wall's coordinate in work coordinates, `shown` the readout: the edge with `dro_comp` on, else the centre)
   - `Holes { op, holes: Vec<[f32; 2]>, depth }`
   - `Check { op }`
   - `HandOver { next: Option<usize> }`
@@ -309,6 +310,7 @@
   1. Hold, then Zero;
   2. then per operation:
      - a **facing** Box (open on all four X/Y sides) is one Face step and nothing else: no Tool, Pass or Check steps (user decision, 17 October 2026: facing needs only the tool and the depth to cut to);
+     - a **squaring** Box (exactly one closed X/Y side and no closed floor) is one Square step and nothing else (user decision, 17 October 2026);
      - any other operation: Tool when the tool or the operation changes (Comp instead when only the compensation sides change), then one Pass per Box row and level (or Holes for Drill), then Check;
   3. HandOver last.
 - **Targets** come straight from the plan's one-axis moves before each cutting Feed: the rapids and the plunge, then the cut. `centre` is the move's end in work coordinates, and `shown` is the readout:
@@ -326,6 +328,7 @@
   - **step list:**
     - the kinds in order (Hold, Zero, Face, Tool, Pass…, Check, Tool, Holes, Check, HandOver), with exactly one step for the facing operation;
     - the Face step's `to` is the face Box's floor (−2.00) and `remove` is 2.00;
+    - a squaring Box on +X (wall at 119, 1 mm off, down to −30) is one Square step with `to` 119, `remove` 1 and `down_to` −30, and with `dro_comp` on its readout is the edge (119.00); the front step (closed floor) is not a squaring Box;
     - `HandOver.next` is the CNC setup;
   - **targets:**
     - each Pass's targets replay the plan's moves exactly (applying them in order from the previous position reaches the cut's end);
@@ -371,6 +374,7 @@
       - the DRO zero marker and the axis arrows;
       - the `never` lines in red;
     - or, for Hold, Check and HandOver, the 3D `stock_picture` of the volume at 480 × 320;
+    - for Square: the top view with the slab and the wall, the tool beside it; on the right the tool chip, the gear, "down to Z …" and one large readout "X 119.00" with "1.00 mm off";
     - for Face: the top view with the faced area and the front view with the stock top and the final top; on the right only the tool chip, the gear and one large readout "Face to Z −2.00" with "2.00 mm off";
     - a small legend.
   - **Right:**
