@@ -5530,7 +5530,8 @@ fn control(app: &App) -> Element<'_, Message> {
     if let Some(note) = probe_note(c) {
         probe = probe.push(note);
     }
-    if let Some((lo, hi)) = c.block {
+    // The test bar on A stands where the block would (Rotary A).
+    if let Some((lo, hi)) = c.block.filter(|_| c.sim_bar().is_none()) {
         probe = probe.push(muted(format!(
             "Simulated: a block at machine X {:.0}…{:.0}, Y {:.0}…{:.0}, its top at Z {:.3}, stands for the stock{}.",
             lo[0],
@@ -5656,18 +5657,21 @@ fn control(app: &App) -> Element<'_, Message> {
     // the spindle.
     main = main
         .push(row![position, jog_panel].spacing(12))
-        .push(work_panel)
-        .push(
-            row![
-                model,
-                column![
-                    machine_panel("Spindle and coolant", spindle),
-                    machine_panel("Overrides", overrides)
-                ]
-                .spacing(12)
+        .push(work_panel);
+    if let Some(rotary) = rotary_panel(c) {
+        main = main.push(rotary);
+    }
+    main = main.push(
+        row![
+            model,
+            column![
+                machine_panel("Spindle and coolant", spindle),
+                machine_panel("Overrides", overrides)
             ]
-            .spacing(12),
-        );
+            .spacing(12)
+        ]
+        .spacing(12),
+    );
     let send =
         (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
     main = main.push(machine_panel(
@@ -6586,6 +6590,124 @@ fn pin_block<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>>
         }));
     }
     Some(col.into())
+}
+/// The Rotary A panel on a machine with the rotary unit (LIO-186): how the
+/// A centreline was found, the calibration probes, Save the centreline and
+/// Rotary unit remounted, why a probe cannot start and how the last ended.
+fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
+    use crate::control::{Action, Calibrate};
+    let rot = c.rotary.as_ref().filter(|_| c.axis(3))?;
+    let (green, amber) = (
+        Color::from_rgb8(39, 130, 93),
+        Color::from_rgb8(166, 101, 32),
+    );
+    let (y, z) = (rot.unit.centre_y, rot.unit.centre_z);
+    let state = if rot.measured() {
+        text(format!(
+            "Centreline measured: machine Y {y:.3}, Z {z:.3}. Probe it again after the rotary unit is moved."
+        ))
+        .size(12)
+        .color(green)
+    } else if rot.mark.starts_with("stale") {
+        text(format!(
+            "The measured centreline (machine Y {y:.3}, Z {z:.3}) is {}: probe it again before cutting on A.",
+            rot.mark
+        ))
+        .size(12)
+        .color(amber)
+    } else {
+        text(format!(
+            "The centreline is ASSUMED, machine Y {y:.3}, Z {z:.3}: probe it before cutting on A. An error of e mm puts a feature cut at A 180° off by 2e."
+        ))
+        .size(12)
+        .color(amber)
+    };
+    let field = |value: &str, hint: &'a str, key: &str, label: &str, on: fn(String) -> Action| {
+        help::field(
+            text_input(hint, value)
+                .on_input(move |v| Message::Machine(on(v)))
+                .width(90)
+                .padding([7, 9])
+                .size(13),
+            key,
+            label,
+            Target::Machine,
+        )
+    };
+    let fields = row![
+        muted("Bar or stock Ø"),
+        field(
+            &c.bar_text,
+            "mm",
+            "rotary_bar",
+            "Bar or stock diameter · mm",
+            Action::BarText
+        ),
+        muted("Touch spacing"),
+        field(
+            &c.spacing_text,
+            "mm",
+            "rotary_spacing",
+            "Touch spacing · mm",
+            Action::SpacingText
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let probe = |what: Calibrate| {
+        act(
+            what.label(),
+            c.calibrate_blocked(what)
+                .is_none()
+                .then_some(Message::Machine(Action::Calibrate(what))),
+            c.calibrating() == Some(what),
+        )
+    };
+    let idle = c.calibrating().is_none();
+    let buttons = row![
+        probe(Calibrate::Centreline),
+        probe(Calibrate::Alignment),
+        probe(Calibrate::AZero),
+        act(
+            "Save the centreline",
+            (idle && c.centre.is_some() && !c.centre_saved)
+                .then_some(Message::Machine(Action::SaveCentreline)),
+            false
+        ),
+        act(
+            "Rotary unit remounted",
+            (idle && rot.measured()).then_some(Message::Machine(Action::Remounted)),
+            false
+        ),
+    ]
+    .spacing(6);
+    let how = match c.calibrating() {
+        Some(what) => format!("{} E-stop stops it.", what.how()),
+        None => match c.calibrate_blocked(Calibrate::Centreline) {
+            Some(why) => format!("{} {why}", Calibrate::Centreline.how()),
+            None => Calibrate::Centreline.how(),
+        },
+    };
+    let mut col = column![state, fields, buttons, muted(how)].spacing(8);
+    if let Some((ok, said)) = &c.rotary_said {
+        col = col.push(
+            text(said.clone())
+                .size(12)
+                .color(if *ok { green } else { amber }),
+        );
+    }
+    if let Some(bar) = c.sim_bar() {
+        let r = c.bar_diameter().unwrap_or_default() / 2.;
+        let x = bar.x[0] + crate::control::CHUCK_GAP + 5.;
+        let top = z as f64 + r + 3.;
+        col = col.push(muted(format!(
+            "Simulated: a Ø{} mm test bar is in the chuck, from X {:.0} to {:.0}, on an A axis a little off the assumed one, with a 1 mm deep flat on top at about A −45°; the simulator's block is off the table meanwhile. The MDI line G53 G0 X{x:.1} Y{y:.1} Z{top:.1} puts the tip about 3 mm over it near the chuck.",
+            2. * r,
+            bar.x[0],
+            bar.x[1],
+        )));
+    }
+    Some(machine_panel("Rotary A", col))
 }
 const HOME_NOTE: &str = "Home references every axis on its switch. Every E-stop clears the machine position: home again after one.";
 const MACHINE_ZERO_NOTE: &str = "Every E-stop clears the machine position: set it again after one. Without home switches, jog X to its left end, Y to its front end (gantry toward you) and Z to the top, then Set machine zero here. Keep the last position takes the position AXIS CAM saved at the last disconnect: only if nothing moved the machine since.";
