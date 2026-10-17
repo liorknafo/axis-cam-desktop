@@ -2664,7 +2664,7 @@ flood = { pin = 8 }
         use crate::ui::work_zero_steps;
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
-        // No probe input, like the JY5800 profile.
+        // No probe input.
         let mut a = run_app(dir.path());
         idle(&mut a);
         check_run(&mut a, 0);

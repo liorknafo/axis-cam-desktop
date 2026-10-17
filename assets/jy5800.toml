@@ -78,6 +78,11 @@ soft_max = 0.0
 # Confirmed by raw input transitions and operator screen observation.
 # This verifies the handheld signal, not the separate mushroom's power cutoff.
 estop = { pin = 10, active_low = true }
+# AUTO-CHECK posts (red signal, black common), 2026-10-17: shorting them
+# pulls pin 13 LOW, opening them returns it HIGH (14 raw transitions, no
+# other pin moved). Contact bounce of a few ms was seen. Probing motion,
+# trip position and overtravel remain unverified.
+probe = { pin = 13, active_low = true }
 
 [outputs]
 # LOW caused rotation in PC PWM; setting pin 16 HIGH stopped it, confirmed
