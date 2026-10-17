@@ -397,6 +397,24 @@ fn plane_of<'a>(orientation: &'a OrientationReport, surfaces: &[usize]) -> Optio
         .iter()
         .find(|p| !surfaces.is_empty() && surfaces.iter().all(|id| p.surfaces.contains(id)))
 }
+/// The floor planes of `orientation` that hold `surfaces`, when every one
+/// of them is on a floor plane.
+fn floors_of<'a>(
+    orientation: &'a OrientationReport,
+    surfaces: &[usize],
+) -> Option<Vec<&'a PlaneReport>> {
+    let mut planes: Vec<&PlaneReport> = vec![];
+    for id in surfaces {
+        let plane = orientation
+            .planes
+            .iter()
+            .find(|p| p.kind == "floor" && p.surfaces.contains(id))?;
+        if !planes.iter().any(|p| std::ptr::eq(*p, plane)) {
+            planes.push(plane);
+        }
+    }
+    (!planes.is_empty()).then_some(planes)
+}
 /// Checks an operation of setup `si` (from 0) and builds it. Returns what is
 /// wrong instead when the tool, surfaces or choices do not fit the strategy.
 fn operation(
@@ -517,7 +535,7 @@ fn operation(
     let kind = get(&tool.p, "type");
     let suits = match strategy {
         Strategy::Face => ["Flat end mill", "Face mill"].contains(&kind),
-        Strategy::Drill => kind == "Drill",
+        Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
         _ => kind == "Flat end mill",
     };
@@ -538,6 +556,30 @@ fn operation(
             "Drilling needs the surfaces of one plane with holes in orientation {}.",
             orientation.up
         )),
+        // A Pocket clears each of the floor planes it names to its own depth.
+        Strategy::Pocket => match floors_of(orientation, &ids) {
+            None => wrong.push(format!(
+                "Pocket needs the surfaces of one or more floor planes in orientation {}.",
+                orientation.up
+            )),
+            Some(planes) => {
+                let diameter = num(&tool.p, "diameter").unwrap_or(0.);
+                let fit = planes
+                    .iter()
+                    .map(|pl| pl.max_cutter_diameter.unwrap_or(f32::INFINITY))
+                    .fold(0., f32::max);
+                if diameter > fit {
+                    wrong.push(format!(
+                        "T{} (diameter {diameter} mm) does not fit {}; the largest cutter that fits is {fit} mm.",
+                        p.tool,
+                        if planes.len() == 1 { "this floor" } else { "any of these floors" }
+                    ));
+                }
+                if p.through == Some(true) && planes.iter().all(|pl| pl.openings.is_empty()) {
+                    wrong.push("through is true, but none of these floors has openings that go through the part. Set through to false.".into());
+                }
+            }
+        },
         _ if floor => match plane.filter(|pl| pl.kind == "floor") {
             None => wrong.push(format!(
                 "{} needs the surfaces of one floor plane in orientation {}.",
@@ -660,6 +702,10 @@ fn operation(
         Strategy::Pocket => {
             set("boundary", "Selected geometry".into());
             set("containment", "Tool inside boundary".into());
+            set(
+                "openings",
+                crate::model::POCKET_OPENINGS[usize::from(p.through == Some(true))].into(),
+            );
         }
         Strategy::Contour if inside => {
             set("boundary", "Selected geometry".into());
@@ -1622,14 +1668,15 @@ pub(crate) mod tests {
         );
         refused(
             &|p| p.setups[0].operations[1].surfaces = p.setups[0].operations[0].surfaces.clone(),
-            "Pocket needs the surfaces of one floor plane",
+            "Pocket needs the surfaces of one or more floor planes",
         );
         refused(
             &|p| p.setups[0].operations[1].surfaces = p.setups[1].operations[1].surfaces.clone(),
-            "1/Some(2): Pocket needs the surfaces of one floor plane in orientation +Z",
+            "1/Some(2): Pocket needs the surfaces of one or more floor planes in orientation +Z",
         );
+        // The Ø10 cutter fits the Ø11 counterbores, not the 8 mm deep floor.
         refused(
-            &|p| p.setups[0].operations[1].surfaces = ids(&report, "+Z", 6.),
+            &|p| p.setups[0].operations[1].surfaces = ids(&report, "+Z", 8.),
             "does not fit this floor; the largest cutter that fits is",
         );
         refused(
@@ -1642,7 +1689,7 @@ pub(crate) mod tests {
         );
         refused(
             &|p| p.setups[0].operations[1].surfaces.push(999_999),
-            "Pocket needs the surfaces of one floor plane",
+            "Pocket needs the surfaces of one or more floor planes",
         );
         let mut many = good(&report);
         many.setups = vec![many.setups[0].clone(); 7];

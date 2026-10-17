@@ -757,8 +757,12 @@ pub fn surface_hole(
 }
 fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;
-    if get(&tool.p, "type") != "Drill" {
-        return Err("Choose a drill for a drilling cycle.".into());
+    // A chamfer mill countersinks each opening rather than drilling it.
+    let chamfer = get(&tool.p, "type") == "Chamfer mill";
+    if get(&tool.p, "type") != "Drill" && !chamfer {
+        return Err(
+            "Choose a drill, or a chamfer mill to countersink, for a drilling cycle.".into(),
+        );
     }
     let mut holes = holes(setup, op, mesh)?;
     let filter = if op.p.contains_key("hole_diameter") {
@@ -800,7 +804,7 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // Breakthrough is travel past the exit of a hole that goes through the
     // part. Under a blind hole's bottom is the part, so such a hole is
     // refused rather than drilled into, as the planner's plans are.
-    let through = get(&op.p, "through") == "Yes";
+    let through = get(&op.p, "through") == "Yes" && !chamfer;
     let breakthrough = if through {
         number(op, "breakthrough")?
     } else {
@@ -811,8 +815,18 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     }
     b.plan.milling_direction = "Drilling · axial feed";
     // The sweep is the drill's shape: its 118° point under its flutes, so
-    // that a blind hole's drill-point floor is left as it is (#155).
-    b.plan.shape = CutterShape::Drill;
+    // that a blind hole's drill-point floor is left as it is (#155); a
+    // chamfer mill's is the cone of its tip angle.
+    b.plan.shape = if chamfer {
+        let angle = tool
+            .tip_angle()
+            .ok_or("Enter a chamfer mill tip angle from 20° to 160°.")?;
+        b.plan.milling_direction = "Countersinking · axial feed";
+        CutterShape::Chamfer((angle * 10.).round() as u16)
+    } else {
+        CutterShape::Drill
+    };
+    let rise = b.plan.shape.rise().unwrap_or(0.);
     if !["Optimize travel", "By X then Y"].contains(&get(&op.p, "hole_order")) {
         return Err("Choose a valid hole order.".into());
     }
@@ -836,7 +850,14 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // The drill may be as wide as the bore at its tessellation's vertices,
         // which its chords lie a sagitta inside, and 0.01 over that: the part
         // report rounds the bore to 0.01 and the planner's drill is that size.
-        if b.plan.radius * 2. > h.diameter + 2. * h.sagitta + 0.01 {
+        if chamfer && b.plan.radius * 2. < h.opening - 2. * h.sagitta - 0.01 {
+            return Err(format!(
+                "The Ø{:.2} chamfer mill is narrower than an opening Ø{:.2} it would countersink. Choose a wider one or a diameter filter.",
+                b.plan.radius * 2.,
+                h.opening
+            ));
+        }
+        if !chamfer && b.plan.radius * 2. > h.diameter + 2. * h.sagitta + 0.01 {
             return Err(format!(
                 "The Ø{:.2} drill exceeds an opening Ø{:.2}. Choose a smaller drill or a diameter filter.",
                 b.plan.radius * 2.,
@@ -850,7 +871,12 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             ));
         }
         let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
-        let target = h.bottom + number(op, "bottom")? - breakthrough;
+        // A chamfer mill's cone is as wide as the opening at its rim.
+        let target = if chamfer {
+            h.top - h.opening / 2. * rise + number(op, "bottom")?
+        } else {
+            h.bottom + number(op, "bottom")? - breakthrough
+        };
         if target >= h.top
             || target < h.bottom - breakthrough - 0.001
             || target < b.plan.stock.min[2] - breakthrough - 0.001
@@ -1684,6 +1710,50 @@ pub(crate) mod tests {
             generate(&setup, &op, &tool, &mesh)
                 .unwrap_err()
                 .contains("filter")
+        );
+    }
+    #[test]
+    fn a_chamfer_mill_countersinks_each_opening_to_its_diameter_at_the_rim() {
+        let mesh = hole_part();
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        let rim = found[0].top;
+        tool.p.insert("type".into(), "Chamfer mill".into());
+        tool.p.insert("diameter".into(), "12".into());
+        for (angle, rise) in [("90", 1.), ("82", 1. / 41f32.to_radians().tan())] {
+            tool.p.insert("tip_angle".into(), angle.into());
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            // The cone is as wide as the Ø8 opening at the rim.
+            assert!(
+                (rim - plan.target - found[0].opening / 2. * rise).abs() < 0.001,
+                "{angle}"
+            );
+            assert_eq!(
+                plan.shape,
+                CutterShape::Chamfer(angle.parse::<u16>().unwrap() * 10)
+            );
+            assert_plan(plan);
+        }
+        // Bottom offset raises it for a narrower chamfer; Through adds nothing.
+        op.p.insert("bottom".into(), "1".into());
+        op.p.insert("through".into(), "Yes".into());
+        let raised = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((rim - raised.target - (found[0].opening / 2. * 1.150_368 - 1.)).abs() < 0.001);
+        // Narrower than the opening it cannot make it; no angle, no cutter.
+        tool.p.insert("diameter".into(), "6".into());
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap_err()
+                .contains("narrower")
+        );
+        tool.p.insert("diameter".into(), "12".into());
+        tool.p.insert("tip_angle".into(), "5".into());
+        assert!(!tool.issues().is_empty());
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap_err()
+                .contains("tip angle")
         );
     }
     #[test]

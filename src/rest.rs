@@ -333,6 +333,69 @@ impl RestStock {
             removal: removal_boxes(volume, current),
         }
     }
+    /// The stock box's XY extent in the current frame, mm: outside it no
+    /// stock ever was.
+    pub fn extent(&self) -> Bounds {
+        self.extent
+    }
+    /// Outlines in XY (current frame, mm) of the earlier constant-height flat
+    /// sweeps that reach `near` and whose cylinders span every height from
+    /// `low` to `high`: between those heights the material inside each is
+    /// gone. A sweep counts in any setup's frame where its tool axis is
+    /// vertical, pointing up or down. Each outline is a capsule with its
+    /// vertices on the cylinder, its chords at most `CHORD` inside it, so the
+    /// outlines never claim more than was cut.
+    pub fn cleared(&self, near: Bounds, low: f32, high: f32) -> Vec<Vec<(f64, f64)>> {
+        const CHORD: f32 = 0.01;
+        let mut out = vec![];
+        for capsule in &self.cuts {
+            let b = capsule.bounds;
+            if (0..2).any(|k| b.max[k] < near.min[k] || b.min[k] > near.max[k])
+                || b.min[2] > low + 0.001
+                || b.max[2] < high - 0.001
+            {
+                continue;
+            }
+            let cut = &capsule.cut;
+            let a = transfer(cut.a, cut.frame, self.current);
+            let e = transfer(cut.b, cut.frame, self.current);
+            let up = transfer(
+                [cut.a[0], cut.a[1], cut.a[2] + cut.flute],
+                cut.frame,
+                self.current,
+            );
+            // Only a vertical axis sweeps a capsule in this frame's XY.
+            if (up[0] - a[0]).abs() > 0.001
+                || (up[1] - a[1]).abs() > 0.001
+                || (e[2] - a[2]).abs() > 0.001
+            {
+                continue;
+            }
+            let r = cut.radius;
+            if r <= CHORD {
+                continue;
+            }
+            let steps = (std::f32::consts::PI / (1. - CHORD / r).acos())
+                .ceil()
+                .max(8.) as usize;
+            let heading = (e[1] - a[1]).atan2(e[0] - a[0]);
+            let mut outline = Vec::with_capacity(2 * steps + 2);
+            for (centre, from) in [
+                (e, heading - std::f32::consts::FRAC_PI_2),
+                (a, heading + std::f32::consts::FRAC_PI_2),
+            ] {
+                for i in 0..=steps {
+                    let angle = from + std::f32::consts::PI * i as f32 / steps as f32;
+                    outline.push((
+                        (centre[0] + r * angle.cos()) as f64,
+                        (centre[1] + r * angle.sin()) as f64,
+                    ));
+                }
+            }
+            out.push(outline);
+        }
+        out
+    }
     /// Whether `region` lies wholly beside the stock box, where no stock ever was.
     pub fn beside(&self, region: Bounds) -> bool {
         (0..2).any(|k| region.max[k] <= self.extent.min[k] || region.min[k] >= self.extent.max[k])
@@ -368,7 +431,16 @@ impl RestStock {
         candidates.extend([target, original]);
         candidates.sort_by(f32::total_cmp);
         candidates.dedup();
-        let ids: Vec<_> = (0..self.cuts.len()).collect();
+        // Only cuts that reach the region can cover any of it: the others
+        // would spend the work budget of a job with many cuts for nothing.
+        let ids: Vec<_> = (0..self.cuts.len())
+            .filter(|&i| {
+                let c = self.cuts[i].bounds;
+                (0..2).all(|k| c.max[k] >= region.min[k] && c.min[k] <= region.max[k])
+                    && c.max[2] >= target
+                    && c.min[2] <= region.max[2]
+            })
+            .collect();
         let (mut lo, mut hi) = (0, candidates.len() - 1);
         let mut budget = BUDGET;
         while lo < hi && budget > 0 {
@@ -849,6 +921,47 @@ mod tests {
                 (0, 0),
             );
         }
+    }
+    #[test]
+    fn cleared_outlines_the_flat_sweeps_spanning_the_heights_in_either_frame() {
+        let (mut v, f, _, s, mesh) = fixture();
+        // Tip at 2, flute 6: the sweep spans 2 to 8.
+        v.cut(
+            [-5., 0., 2.],
+            [5., 0., 2.],
+            2.,
+            6.,
+            CutterShape::Flat,
+            f,
+            (0, 0),
+        );
+        let rest = RestStock::new(&v, f);
+        let near = Bounds {
+            min: [-20., -20., 0.],
+            max: [20., 20., 20.],
+        };
+        let outline = &rest.cleared(near, 3., 7.)[0];
+        // Every vertex on the capsule, so its chords lie inside it.
+        for &(x, y) in outline {
+            let d = (x.abs() - 5.).max(0.).hypot(y);
+            assert!((d - 2.).abs() < 0.001, "{x} {y}");
+        }
+        assert!(rest.cleared(near, 1., 7.).is_empty());
+        assert!(rest.cleared(near, 3., 9.).is_empty());
+        let far = Bounds {
+            min: [10., 10., 0.],
+            max: [20., 20., 20.],
+        };
+        assert!(rest.cleared(far, 3., 7.).is_empty());
+        // Seen from a setup turned over the sweep spans its mirror heights.
+        let mut turned = s.clone();
+        turned.p.insert("rx".into(), "180".into());
+        let g = Frame::new(&turned, &mesh);
+        let from_below = RestStock::new(&v, g);
+        let z = [2., 8.].map(|h| f.transfer([0., 0., h], g)[2]);
+        let (low, high) = (z[0].min(z[1]), z[0].max(z[1]));
+        assert_eq!(from_below.cleared(near, low + 0.5, high - 0.5).len(), 1);
+        assert!(from_below.cleared(near, low - 0.5, high).is_empty());
     }
     #[test]
     fn removal_boxes_start_at_the_tool_tip() {
