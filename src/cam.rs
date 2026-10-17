@@ -559,14 +559,20 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     if !(down > 0. && down <= b.plan.flute_length) {
         return Err("Use a stepdown within the flute length.".into());
     }
-    // `from`, then every `by` toward `to` (`way` ±1), the last exactly `to`.
-    let steps = |from: f32, to: f32, by: f32, way: f32| {
-        let mut at: Vec<f32> = (0..LIMIT)
-            .map(|i| from + i as f32 * by * way)
-            .take_while(|v| (to - v) * way > ON)
-            .collect();
-        at.push(to);
-        at
+    // Equal steps of at most `by` from `from` (left out) to exactly `to`.
+    let steps = |from: f32, to: f32, by: f32| -> Vec<f32> {
+        let n = ((to - from).abs() / by - 0.0001)
+            .ceil()
+            .clamp(1., LIMIT as f32) as usize;
+        (1..=n)
+            .map(|i| {
+                if i == n {
+                    to
+                } else {
+                    from + (to - from) * i as f32 / n as f32
+                }
+            })
+            .collect()
     };
     // 4. Rows from the open side (else −) toward the closed side (else +).
     let side = open(c);
@@ -583,7 +589,11 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     if (last - first) * toward < -ON && side == [false, false] {
         return Err("The box is narrower than the tool after the stock to leave.".into());
     }
-    let rows = steps(first, last, width, toward);
+    let rows = if (last - first) * toward > ON {
+        [vec![first], steps(first, last, width)].concat()
+    } else {
+        vec![last]
+    };
     // The uncut material (toward) on the right of the feed: right of +X is −Y, right of +Y is +X.
     let forward = if p == 0 { -toward } else { toward };
     let ends = open(p);
@@ -638,7 +648,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     // says: the flutes take all of it, so no level is deeper than `stepdown`.
     let top = crate::rest::start(setup, cut, lo[2], s.max[2], 0.);
     b.plan.rest_top = (top < s.max[2] - 0.0001).then_some(top);
-    let levels = steps(top - down, lo[2], down, -1.);
+    let levels = steps(top, lo[2], down);
     // 5. Each row: up, along, across, down, a pause to set the axes, one feed, up.
     let pause = num(&setup.machine.p, "pass_time")
         .filter(|t| *t >= 0.)
@@ -2351,8 +2361,9 @@ pub(crate) mod tests {
         assert_eq!(plan.milling_direction, "Conventional");
         assert!(plan.spindle_clockwise);
         let rows: Vec<f32> = cuts(&plan).iter().map(|m| m.to[1]).collect();
-        // From the − side's face to the + side's, every row's tool inside Y ± the radius.
-        assert_eq!((rows[0], rows[rows.len() - 1]), (-40., 40.));
+        // From the − side's face to the + side's in five equal steps of
+        // 16 (at most 17.5), every row's tool inside Y ± the radius.
+        assert_eq!(rows, [-40., -24., -8., 8., 24., 40.]);
         assert!(
             rows.windows(2)
                 .all(|w| w[1] > w[0] && w[1] - w[0] <= 17.5 + 1e-4)
@@ -2377,6 +2388,14 @@ pub(crate) mod tests {
         let edges: Vec<f32> = cuts.iter().map(|m| m.to[1] + 12.5).collect();
         assert!(edges.iter().all(|e| *e <= 15. + 1e-4), "{edges:?}");
         assert!((edges[edges.len() - 1] - 15.).abs() < 1e-4);
+        // From the open face at −40 to 2.5 in three equal steps.
+        let rows: Vec<f32> = cuts.iter().map(|m| m.to[1]).collect();
+        for (row, want) in rows
+            .iter()
+            .zip([-40., -40. + 42.5 / 3., 2.5 - 42.5 / 3., 2.5])
+        {
+            assert!((row - want).abs() < 1e-4, "{rows:?}");
+        }
         // Rows step toward +Y (the uncut material), so they feed along −X.
         assert!(
             cuts.windows(2)
@@ -2423,24 +2442,77 @@ pub(crate) mod tests {
         };
         let deep = [-100., 100., -100., 100., 0., -9.5];
         let plan = boxed_plan(deep, &[("allowance", "0"), ("stepdown", "2.5")]).unwrap();
-        assert_eq!(levels(&plan), [-2.5, -5., -7.5, -9.5]);
+        // Equal steps of at most 2.5: four of 2.375, the last on the floor.
+        assert_eq!(levels(&plan), [-2.375, -4.75, -7.125, -9.5]);
         assert_eq!(plan.levels, 4);
+        // The closed floor keeps 0.5: four of 2.25 down to −9.
         let plan = boxed_plan(deep, &[("stepdown", "2.5")]).unwrap();
-        assert_eq!(levels(&plan), [-2.5, -5., -7.5, -9.]);
-        // Automatic: what the 800 W spindle takes at 17.5 mm wide, here
-        // below the flute length and the diameter.
+        assert_eq!(levels(&plan), [-2.25, -4.5, -6.75, -9.]);
+        // Automatic: what the 800 W spindle takes at 17.5 mm wide (9.41 mm),
+        // here below the flute length and the diameter, so two of 4.75.
+        let auto = crate::forces::power_stepdown(&crate::manual::defaults(), None, 25., 17.5, 120.);
+        assert!(auto > 4.75 && auto <= 25. && auto <= 40., "{auto}");
         let plan = boxed_plan(deep, &[("allowance", "0")]).unwrap();
-        let auto = -levels(&plan)[0];
-        assert!(auto > 0. && auto <= 25. && auto <= 40., "{auto}");
-        assert!((auto - 9.412).abs() < 0.01, "{auto}");
-        // Capped at short flutes.
+        assert_eq!(levels(&plan), [-4.75, -9.5]);
+        // Capped at 4 mm flutes: three of 9.5 / 3.
         let (setup, mut op, mut tool) = big_mill(deep);
         tool.p.insert("length".into(), "4".into());
         op.p.insert("allowance".into(), "0".into());
         let plan = generate(&setup, &op, &tool, &block()).unwrap();
-        assert_eq!(levels(&plan), [-4., -8., -9.5]);
+        let z = levels(&plan);
+        assert_eq!((z.len(), z[2]), (3, -9.5));
+        assert!(
+            (z[0] + 9.5 / 3.).abs() < 1e-4 && (z[1] + 19. / 3.).abs() < 1e-4,
+            "{z:?}"
+        );
         op.p.insert("stepdown".into(), "5".into());
         assert!(generate(&setup, &op, &tool, &block()).is_err());
+    }
+    /// Steps between levels (from the top) and between rows: none under half
+    /// of the stepdown or the stepover, and none over it, unless it is the
+    /// only one.
+    #[test]
+    fn box_levels_and_rows_are_never_thin() {
+        for b in [
+            [-100., 100., -100., 100., 0., -9.5],
+            [-100., 100., -100., 15.5, 0., -5.3],
+            [-100., 100., -31., 100., 0., -12.],
+            [-55., -15., 12., 38., 0., -2.],
+        ] {
+            for (down, over) in [("1.7", "30"), ("2.5", "50"), ("3", "70"), ("4.1", "100")] {
+                let fields = [("stepdown", down), ("stepover", over)];
+                let plan = boxed_plan(b, &fields).unwrap();
+                let (down, width) = (
+                    down.parse::<f32>().unwrap(),
+                    over.parse::<f32>().unwrap() / 4.,
+                );
+                let mut z = vec![40.];
+                z.extend(cuts(&plan).iter().map(|m| m.to[2]));
+                z.dedup();
+                let mut levels = z.windows(2).map(|w| w[0] - w[1]).collect::<Vec<_>>();
+                let rows: Vec<f32> = cuts(&plan)
+                    .iter()
+                    .take_while(|m| m.to[2] == z[1])
+                    .map(|m| m.to[1])
+                    .collect();
+                let mut across = rows
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .collect::<Vec<_>>();
+                for (steps, by) in [(&mut levels, down), (&mut across, width)] {
+                    assert!(
+                        steps.iter().all(|s| *s <= by + 1e-4),
+                        "{b:?} {steps:?} {by}"
+                    );
+                    if steps.len() > 1 {
+                        assert!(
+                            steps.iter().all(|s| *s >= by / 2. - 1e-4),
+                            "{b:?} {steps:?} {by}"
+                        );
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn a_box_into_the_part_is_refused() {
