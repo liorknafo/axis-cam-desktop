@@ -1591,6 +1591,10 @@ pub struct Document {
     /// The step each manual setup's guide is at, by setup id (`guide::place`).
     #[serde(default)]
     pub guide: BTreeMap<String, usize>,
+    /// What the user measured at a lathe guide's Measure and Zero steps, mm
+    /// (a diameter), keyed by setup id and step (`guide::measure_key`).
+    #[serde(default)]
+    pub measured: BTreeMap<String, f32>,
 }
 impl Default for Document {
     fn default() -> Self {
@@ -1609,6 +1613,7 @@ impl Default for Document {
             setups: vec![],
             active: String::new(),
             guide: BTreeMap::new(),
+            measured: BTreeMap::new(),
         }
     }
 }

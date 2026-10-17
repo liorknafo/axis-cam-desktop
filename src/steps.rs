@@ -1992,6 +1992,12 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 right,
             )
         }
+        Step::Lathe(step) => (
+            step.title().into(),
+            "the dials",
+            space().into(),
+            column![chips(step.lines().into_iter().map(chip).collect())],
+        ),
         Step::HandOver { next: to } => {
             let last = p.shown.pictures.len() - 1;
             let mut c = vec![chip(format!("manual ~{} min", g.minutes.ceil()))];
