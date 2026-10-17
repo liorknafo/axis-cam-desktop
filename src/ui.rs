@@ -5265,11 +5265,7 @@ fn control(app: &App) -> Element<'_, Message> {
     );
     let mut probe = probe;
     // The setup's own work zero, from the spot picked.
-    let spots = c
-        .run_program()
-        .ok()
-        .map(|p| p.probe_from.as_slice())
-        .unwrap_or_default();
+    let spots = c.probe_spots();
     let setup_probe: Element<_> = match c.edges_setup() {
         Err(why) => muted(why).into(),
         Ok((refs, p)) => {
@@ -5643,8 +5639,12 @@ pub(crate) fn run_strip<'a>(
     let count = programs.len();
     // The tool run Cycle Start starts: the list marks it "next" below.
     if !running && let Some(p) = programs.get(run.next) {
+        let from = match p.ops.get(run.from).filter(|_| run.from > 0) {
+            Some(o) => format!(", from its operation {}: {}", run.from + 1, o.name),
+            None => String::new(),
+        };
         body = body.push(muted(format!(
-            "Next tool run: {} of {count}, T{} {}",
+            "Next tool run: {} of {count}, T{} {}{from}",
             run.next + 1,
             p.ops[0].tool,
             p.ops[0].tool_name
@@ -5675,6 +5675,7 @@ pub(crate) fn run_strip<'a>(
     ));
     if let Some((p, op, block)) = run.progress(s.current_line) {
         let i = run.running.as_ref().map_or(0, |r| r.index);
+        let blocks = run.running_blocks().map_or(1, <[_]>::len);
         body = body
             .push(
                 text(format!(
@@ -5684,14 +5685,11 @@ pub(crate) fn run_strip<'a>(
                     p.ops.len(),
                     p.ops[op].name,
                     block + 1,
-                    p.blocks.len()
+                    blocks
                 ))
                 .size(13),
             )
-            .push(widget::progress_bar(
-                0.0..=p.blocks.len() as f32,
-                block as f32 + 1.,
-            ));
+            .push(widget::progress_bar(0.0..=blocks as f32, block as f32 + 1.));
     } else if !problems.is_empty() && !crate::run::busy(state) {
         body = body.push(caution("Before Cycle Start", problems));
         let off = run.coolant_off(c, &app.doc);
@@ -5733,7 +5731,7 @@ pub(crate) fn run_panel<'a>(
     let mut body = column![].spacing(10);
     let count = programs.len();
     body = body.push(muted(
-        "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green.",
+        "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green. Start here makes Cycle Start begin with that operation, those before it taken as cut.",
     ));
     // Operations are numbered through the setup, across its tool runs.
     let mut number = 0;
@@ -5744,6 +5742,8 @@ pub(crate) fn run_panel<'a>(
             "done"
         } else if i == run.next {
             "next"
+        } else if i < run.next {
+            "skipped"
         } else {
             ""
         };
@@ -5769,14 +5769,18 @@ pub(crate) fn run_panel<'a>(
             .align_y(Alignment::Center),
         );
         let mut cards = row![].spacing(8);
-        for ((o, &oi), stage) in p
+        for (k, ((o, &oi), stage)) in p
             .ops
             .iter()
             .zip(&p.indexes)
             .zip(run.stages(i, s.current_line))
+            .enumerate()
         {
             number += 1;
-            cards = cards.push(op_card(number, o, run.picture(oi), stage));
+            use crate::run::Stage;
+            let start = (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing())
+                .then_some(msg(!running, R::From(i, k)));
+            cards = cards.push(op_card(number, o, run.picture(oi), stage, start));
         }
         body = body.push(cards.wrap().vertical_spacing(8));
     }
@@ -5865,8 +5869,10 @@ pub(crate) fn run_panel<'a>(
                 false,
             ));
         }
+        let blocked = c.partway_blocked();
         buttons = buttons.push(match c.touch_off() {
-            Some((_, work)) if pins => act(
+            _ if blocked.is_some() => act("Zero Z on the stock top", None, false),
+            Some((_, work)) if pins || run.partway() => act(
                 format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
                 manual.then_some(Message::Machine(Action::TouchOff)),
                 false,
@@ -5882,6 +5888,13 @@ pub(crate) fn run_panel<'a>(
                 false,
             ),
         });
+        if run.partway() {
+            buttons = buttons.push(act(
+                "Keep this work zero",
+                (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),
+                run.zeroed,
+            ));
+        }
         if let Err(why) = checked {
             buttons = buttons.push(muted(why));
         }
@@ -5897,12 +5910,15 @@ const OP_CARD_PICTURE: (f32, f32) = (150., 112.5);
 /// One operation of a tool run in the Tool runs panel, the `n`th the setup
 /// cuts: the picture of the stock it leaves (a blank while that is worked
 /// out), its name, strategy and tool, and its `stage`. The one being cut is
-/// framed in blue, those done in green.
+/// framed in blue, those done in green, those skipped greyed. With `start`,
+/// a Start here button that makes it the one Cycle Start begins with
+/// (greyed while that message is None).
 fn op_card<'a>(
     n: usize,
     o: &'a crate::post::OpState,
     picture: Option<&widget::image::Handle>,
     stage: crate::run::Stage,
+    start: Option<Option<Message>>,
 ) -> Element<'a, Message> {
     use crate::run::Stage;
     let (w, h) = OP_CARD_PICTURE;
@@ -5921,9 +5937,10 @@ fn op_card<'a>(
         Stage::Done => ("✓ Done", DONE),
         Stage::Cutting => ("▶ Cutting now", CUTTING),
         Stage::Next => ("Next: Cycle Start cuts it", CUTTING),
+        Stage::Skipped => ("Skipped: taken as cut", MUTED),
         Stage::ToCome => ("To come", MUTED),
     };
-    let card = column![
+    let mut card = column![
         picture,
         row![
             bold(format!("{n}."), 12),
@@ -5942,6 +5959,9 @@ fn op_card<'a>(
     ]
     .spacing(4)
     .width(w);
+    if let Some(start) = start {
+        card = card.push(act("Start here", start, false));
+    }
     container(card)
         .padding(8)
         .style(move |_| {
@@ -5949,6 +5969,7 @@ fn op_card<'a>(
                 Stage::Cutting => (SELECTED_ROW, CUTTING, 2.),
                 Stage::Done => (Color::from_rgb8(243, 249, 245), DONE, 1.),
                 Stage::Next => (Color::WHITE, CUTTING, 1.),
+                Stage::Skipped => (Color::from_rgb8(241, 243, 245), LINE, 1.),
                 Stage::ToCome => (Color::WHITE, LINE, 1.),
             };
             container::Style {
@@ -5992,9 +6013,44 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     });
     let checks =
         "The checks above then say whether every tool run fits the soft limits from there.";
+    let blocked = c.partway_blocked();
     if let Some(on) = &p.pins {
         steps.truncate(1);
         steps.extend(pin_steps(c, p, on));
+        if let Some(why) = &blocked {
+            steps.pop();
+            steps.push(format!(
+                "4. {why} Set Z by hand on a surface whose height you know (Set under Work zero)."
+            ));
+        }
+    } else if let Some(why) = &blocked {
+        steps.push(format!(
+            "3. {why} Zero Z on the stock top and Probe Z are off: set Z by hand on a surface whose height you know (Set under Work zero), or from a recorded reference (Set Z from reference)."
+        ));
+    } else if let (true, Some((_, work)), Some(refs)) = (
+        run.partway(),
+        c.touch_off(),
+        crate::post::references(&p.origin),
+    ) {
+        // Z alone: X and Y are those the operations before the start were
+        // cut with, which a tip jogged by eye would not find again.
+        let on = if work[2] < (p.stock.max[2] - p.datum[2]) as f64 - 1e-4 {
+            "the floor there"
+        } else {
+            "the stock top"
+        };
+        let spot = match crate::control::probe_spot(refs).as_str() {
+            "its centre" => "the centre".to_string(),
+            spot => spot.to_string(),
+        };
+        steps.push(format!(
+            "3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on {on}."
+        ));
+        steps.push(format!(
+            "4. Set Z{}: that point becomes Z{}. X and Y stay as they are: they must be those the operations before the start were cut with (the stock not moved since), or probed from a spot they left. {checks}",
+            crate::post::exact_mm(work[2] as f32),
+            crate::post::exact_mm(work[2] as f32)
+        ));
     } else {
         match (c.touch_off(), crate::post::references(&p.origin)) {
             (Some((_, work)), Some(refs)) => {
@@ -6054,6 +6110,9 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
             (Err(why), Err(_)) | (Ok(_), Err(why)) => why,
         });
     }
+    if run.partway() {
+        steps.splice(1..1, partway_steps(run));
+    }
     if let (Some((lo, hi)), Some(z), Some(at)) = (c.block, c.sim_zero(), c.sim_touch()) {
         let touched = if (0..3).all(|k| (at[k] - z[k]).abs() < 1e-6) {
             String::new()
@@ -6069,6 +6128,67 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         ));
     }
     Some(steps)
+}
+/// What Work zero on the stock says first of a run that starts partway
+/// (`run::Run::partway`): where it starts, which operations it takes as
+/// cut and the tool to load, what they cut where the work zero is found,
+/// and that Cycle Start waits for the work zero to be set for that stock or
+/// kept (Keep this work zero).
+fn partway_steps(run: &crate::run::Run) -> Vec<String> {
+    use crate::post::Partly;
+    let Some(programs) = run.checked() else {
+        return vec![];
+    };
+    let Some(p) = programs.get(run.next) else {
+        return vec![];
+    };
+    let o = &p.ops[run.from.min(p.ops.len() - 1)];
+    let skipped: Vec<&str> = programs[..run.next]
+        .iter()
+        .flat_map(|p| &p.ops)
+        .chain(&p.ops[..run.from])
+        .map(|o| o.name.as_str())
+        .collect();
+    let mut steps = vec![format!(
+        "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load T{} {} and set the work zero on the stock they left.",
+        o.name,
+        run.next + 1,
+        skipped.join(", "),
+        if skipped.len() == 1 { "it" } else { "them" },
+        o.tool,
+        o.tool_name
+    )];
+    let datum = p.datum[2];
+    // Where the check cannot tell the surface, step 3 says so.
+    match run.partly() {
+        Some(partly) if partly.cut.is_empty() && partly.surface.is_some() => steps.push(
+            "They did not cut the stock where the work zero is found: find it as before them."
+                .into(),
+        ),
+        Some(Partly {
+            cut,
+            surface: Some(z),
+            probe_from,
+            ..
+        }) => steps.push(format!(
+            "They cut the stock's {}: the stock top's touch-off spot is now the floor they left, at Z{} (the stock top was Z{}), and the touch-off below sets Z on it.{}",
+            cut.join(", "),
+            crate::post::exact_mm(z - datum),
+            crate::post::exact_mm(p.stock.max[2] - datum),
+            if probe_from.iter().any(|(_, ok)| ok.is_ok()) {
+                " Probe from only the spots they left."
+            } else {
+                ""
+            }
+        )),
+        _ => {}
+    }
+    steps.push(if run.zeroed {
+        "The work zero is set for this start.".into()
+    } else {
+        "Cycle Start waits until the work zero is set below after this start was chosen, or until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or you set Z by hand on a surface they left.".into()
+    });
+    steps
 }
 /// Work zero on the stock for a setup that sits on the fixture pins `on`:
 /// X and Y referenced from pin 1, its work system, X Y set from the pins,

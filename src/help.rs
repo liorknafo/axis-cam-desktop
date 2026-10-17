@@ -1609,6 +1609,14 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "",
         ),
         Next(_) => ("Make this tool run the next one Cycle Start runs.", ""),
+        From(..) => (
+            "Make Cycle Start begin with this operation: those before it are taken as cut, and nothing of them is sent. Its tool run starts as after a tool change, with this operation's spindle speed and coolant, across at the clearance plane and down.",
+            "Before the setup's first Cycle Start, set the work zero on the stock the operations before it leave, or keep it: Cycle Start waits for that.",
+        ),
+        KeepZero => (
+            "Keep the work zero as it is for a run that starts partway: it is still the one the operations taken as cut were cut with (the stock has not moved since), or you set Z by hand on a surface they left.",
+            "",
+        ),
         CycleStart => (
             "Run the next tool run: its moves at the current work zero, checked against the soft limits first. The tool first rises or drops to the clearance plane where it stands, so leave it where a straight vertical move is safe.",
             "",

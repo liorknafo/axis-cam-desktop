@@ -5,7 +5,7 @@
 use crate::control::Connection;
 use crate::mesh::Mesh;
 use crate::model::Document;
-use crate::post::{Block, Checked, Kind, OFFSETS, PostSettings, clearance_plane, extents};
+use crate::post::{Block, Checked, Kind, OFFSETS, Partly, PostSettings, clearance_plane, extents};
 use std::sync::Arc;
 use uc100::controller::{Command, State};
 use uc100::gcode::{Action as Do, Located, Spindle};
@@ -19,8 +19,15 @@ pub enum Action {
     Setup(usize),
     /// Check the setup again after the project changed, keeping the progress.
     Check,
-    /// Make this tool run (index) the next one.
+    /// Make this tool run (index) the next one, from its first operation.
     Next(usize),
+    /// Make operation `k` (index in its program) of tool run `i` the one
+    /// Cycle Start begins with: those before it are taken as cut.
+    From(usize, usize),
+    /// The work zero is right for the stock a run that starts partway
+    /// leaves (`Run::partway`): the one those operations were cut with, or
+    /// one set by hand on a surface they left.
+    KeepZero,
     CycleStart,
     Hold,
     Resume,
@@ -42,6 +49,8 @@ pub enum Action {
 /// The tool run the machine is cutting.
 pub struct Running {
     pub index: usize,
+    /// The operation (index in its program) it started at.
+    pub from: usize,
     /// The driver's outcome count before it started: the next outcome is its.
     seq: u64,
     /// The work offset it was lowered with.
@@ -82,6 +91,13 @@ pub struct Run {
     pub stale: bool,
     /// The tool run Cycle Start starts.
     pub next: usize,
+    /// The operation of it (index in its program) Cycle Start starts at:
+    /// those before it are taken as cut.
+    pub from: usize,
+    /// The work zero was set for the stock the start leaves since it was
+    /// chosen, or kept (`Action::KeepZero`): what a run that starts partway
+    /// waits for (`partway`).
+    pub zeroed: bool,
     pub done: Vec<bool>,
     pub running: Option<Running>,
     /// The work system and X/Y work offset when the first tool run started:
@@ -117,6 +133,8 @@ impl Run {
             epoch,
             stale: false,
             next: 0,
+            from: 0,
+            zeroed: false,
             done: vec![],
             running: None,
             xy: None,
@@ -164,11 +182,24 @@ impl Run {
         programs: Arc<Result<Vec<Checked>, Vec<String>>>,
         left: Option<Arc<Left>>,
     ) {
+        // The start stays on its operation only when its tool run still has
+        // the same operations; the work zero is set for it again.
+        let ops = |p: Option<&Checked>| p.map(|p| (p.indexes.clone(), p.ops.clone()));
+        let before = ops(self.checked().and_then(|c| c.get(self.next)));
         let count = programs.as_ref().as_ref().map_or(0, Vec::len);
         if self.done.len() != count {
             self.done = vec![false; count];
             self.next = 0;
         }
+        let after = ops(programs
+            .as_ref()
+            .as_ref()
+            .ok()
+            .and_then(|c| c.get(self.next)));
+        if before.is_none() || before != after {
+            self.from = 0;
+        }
+        self.zeroed = false;
         self.programs = Some(programs);
         self.left = left.filter(|_| self.checked().is_some());
         self.pictures.clear();
@@ -203,6 +234,7 @@ impl Run {
         if o.ok {
             self.done[r.index] = true;
             self.next = r.index + 1;
+            self.from = 0;
         } else if o.message.contains(NOT_STARTED) {
             let Before {
                 xy,
@@ -237,6 +269,25 @@ impl Run {
         let mut e = vec![];
         if self.stale {
             e.push("The project changed since the setup was checked. Check it again.".into());
+        }
+        let from = self.from.min(p.ops.len() - 1);
+        let blocks = match p.from(from) {
+            Ok(blocks) => Some(blocks),
+            Err(why) => {
+                e.extend(why);
+                None
+            }
+        };
+        let first = &p.ops[from];
+        if self.partway() {
+            match self.partly() {
+                None => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
+                Some(_) if !self.zeroed => e.push(format!(
+                    "This run starts at {}, after operations taken as cut: set the work zero on the stock they left under Work zero on the stock below, or press Keep this work zero there if it is still the one they were cut with.",
+                    first.name
+                )),
+                Some(_) => {}
+            }
         }
         if !c.idle() {
             e.push("The machine is not Idle.".into());
@@ -300,8 +351,11 @@ impl Run {
             )),
         }
         e.extend(pin_problems(c, setup, p));
-        if limits.iter().all(Option::is_some) && unset.is_empty() {
-            let span = extents(&p.blocks);
+        if let Some(blocks) = blocks
+            && limits.iter().all(Option::is_some)
+            && unset.is_empty()
+        {
+            let span = extents(blocks);
             for (a, limit) in limits.iter().enumerate() {
                 let (lo, hi) = limit.unwrap();
                 let at = |v: f32| v as f64 - p.datum[a] as f64 + s.work_offset[a];
@@ -314,7 +368,7 @@ impl Run {
                 }
             }
         }
-        e.extend(output_problems(&c.config.outputs, &p.ops));
+        e.extend(output_problems(&c.config.outputs, &p.ops[from..]));
         // A spindle left running by hand the other way: the driver E-stops a
         // reversal, so it must be stopped first. Running the tool run's way
         // it stays, as the program sets its rpm.
@@ -326,13 +380,13 @@ impl Run {
             }
         };
         if let Some(turning @ (Spindle::Cw | Spindle::Ccw)) = s.spindle
-            && (turning == Spindle::Cw) != p.ops[0].clockwise
+            && (turning == Spindle::Cw) != first.clockwise
         {
             e.push(format!(
                 "The spindle is running {}, but tool run {} starts it {}. Stop it first (Stop under Spindle): the driver E-stops a reversal.",
                 way(turning == Spindle::Cw),
                 self.next + 1,
-                way(p.ops[0].clockwise)
+                way(first.clockwise)
             ));
         }
         if let Some((wcs, xy)) = self.xy
@@ -406,12 +460,16 @@ impl Run {
         let programs = self.checked()?;
         let (count, p) = (programs.len(), &programs[self.next]);
         let s = &c.snapshot;
-        let actions = lower(p, s.work_offset, s.machine_pos);
+        let actions = lower(p, self.from, s.work_offset, s.machine_pos).ok()?;
         let tool = p.ops[0].tool_id.clone();
         let zero = (p.origin.clone(), p.datum);
-        let name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
+        let mut name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
+        if self.from > 0 {
+            name += &format!(" from {}", p.ops[self.from].name);
+        }
         self.running = Some(Running {
             index: self.next,
+            from: self.from,
             seq: s.program_outcome.as_ref().map_or(0, |o| o.seq),
             offset: s.work_offset,
             before: Before {
@@ -436,10 +494,54 @@ impl Run {
     /// The running tool run's program and where in it the machine is: the
     /// operation (index in the program) and the block being cut.
     pub fn progress(&self, line: Option<u32>) -> Option<(&Checked, usize, usize)> {
-        let p = self.checked()?.get(self.running.as_ref()?.index)?;
-        let block = (line.unwrap_or(1).max(1) as usize - 1).min(p.blocks.len() - 1);
-        let op = p.blocks[..=block].iter().rev().find_map(op_of).unwrap_or(0);
+        let r = self.running.as_ref()?;
+        let p = self.checked()?.get(r.index)?;
+        let blocks = self.running_blocks()?;
+        let block = (line.unwrap_or(1).max(1) as usize - 1).min(blocks.len() - 1);
+        let op = blocks[..=block]
+            .iter()
+            .rev()
+            .find_map(op_of)
+            .unwrap_or(r.from);
         Some((p, op, block))
+    }
+
+    /// The blocks the running tool run was lowered from: its program from
+    /// the operation it started at.
+    pub fn running_blocks(&self) -> Option<&[Block]> {
+        let r = self.running.as_ref()?;
+        self.checked()?.get(r.index)?.from(r.from).ok()
+    }
+
+    /// The run starts partway through the setup before any of its tool runs
+    /// started: at a later tool run or operation than the first, those
+    /// before taken as cut. Its work zero is set on the stock they leave
+    /// (`partly`), and Cycle Start waits for it (`zeroed`).
+    pub fn partway(&self) -> bool {
+        !self.started() && self.checked().is_some() && (self.next, self.from) != (0, 0)
+    }
+
+    /// What a run that starts partway finds of the work zero (`partway`,
+    /// `Checked::partly`). None when it does not start partway, or the
+    /// check did not work it out.
+    pub fn partly(&self) -> Option<&Partly> {
+        if !self.partway() {
+            return None;
+        }
+        self.checked()?.get(self.next)?.partly.get(self.from)
+    }
+
+    /// Makes operation `k` of tool run `i` the one Cycle Start starts at:
+    /// the work zero is set for the stock it starts from again.
+    pub fn start_at(&mut self, i: usize, k: usize) {
+        let ops = self
+            .checked()
+            .and_then(|c| c.get(i))
+            .map_or(0, |p| p.ops.len());
+        if self.running.is_none() && k < ops {
+            (self.next, self.from) = (i, k);
+            self.zeroed = false;
+        }
     }
 }
 
@@ -449,31 +551,45 @@ pub enum Stage {
     Done,
     /// The machine is cutting it.
     Cutting,
-    /// Cycle Start starts it: the first of the tool run marked next.
+    /// Cycle Start starts it: the operation chosen in the tool run marked
+    /// next, its first unless another was chosen.
     Next,
+    /// Before the start: taken as cut, and not sent.
+    Skipped,
     ToCome,
 }
 
 impl Run {
     /// Where each operation of tool run `i` stands, the machine being at
     /// program line `line`: while it runs, those before the one it cuts are
-    /// done; otherwise all are once the tool run is.
+    /// done, those before the one it started at skipped. Otherwise the next
+    /// tool run's are skipped before its start (done if it was), its start
+    /// is next and the rest to come; another's are done once it is, and
+    /// skipped when it comes before the next.
     pub fn stages(&self, i: usize, line: Option<u32>) -> Vec<Stage> {
         let Some(p) = self.checked().and_then(|c| c.get(i)) else {
             return vec![];
         };
+        let running = self.running.as_ref().filter(|r| r.index == i);
         let cutting = self
             .progress(line)
-            .filter(|_| self.running.as_ref().is_some_and(|r| r.index == i))
+            .filter(|_| running.is_some())
             .map(|(_, op, _)| op);
+        let from = running.map_or(self.from, |r| r.from);
         let done = self.done.get(i) == Some(&true);
         (0..p.ops.len())
             .map(|k| match cutting {
+                Some(_) if k < from => Stage::Skipped,
                 Some(op) if k < op => Stage::Done,
                 Some(op) if k == op => Stage::Cutting,
                 Some(_) => Stage::ToCome,
+                // A tool run picked again after it was done is cut again.
+                None if i == self.next && k < from && done => Stage::Done,
+                None if i == self.next && k < from => Stage::Skipped,
+                None if i == self.next && k == from => Stage::Next,
+                None if i == self.next => Stage::ToCome,
                 None if done => Stage::Done,
-                None if i == self.next && k == 0 => Stage::Next,
+                None if i < self.next => Stage::Skipped,
                 None => Stage::ToCome,
             })
             .collect()
@@ -534,7 +650,7 @@ pub fn check(doc: &Document, mesh: &Mesh, si: usize) -> (Result<Vec<Checked>, Ve
         return (Err(vec![NO_PART.into()]), Left::default());
     }
     let (sims, left) = simulated_with(doc, mesh, si);
-    let programs = crate::post::checked(doc, mesh, si, &sims, PostSettings::for_uc100);
+    let programs = crate::post::checked_to_start(doc, mesh, si, &sims, PostSettings::for_uc100);
     (programs, left)
 }
 
@@ -760,8 +876,19 @@ pub(crate) fn plan_problems(
 /// offset), feeds mm/min become mm/s. `start` is the machine position when
 /// Cycle Start is pressed: the first retract moves Z alone there, and A, B
 /// and C stay where they are. Each action's line is its block's index + 1.
-pub fn lower(p: &Checked, offset: [f64; 6], start: [f64; 6]) -> Vec<Located> {
-    let plane = clearance_plane(&p.blocks);
+///
+/// `k` is the operation (index in the program) it starts at: from a later
+/// one than the first it is lowered from that operation's own program
+/// (`Checked::from`), with its safe start and nothing of the operations
+/// before it, each action's line its block's index there + 1.
+pub fn lower(
+    p: &Checked,
+    k: usize,
+    offset: [f64; 6],
+    start: [f64; 6],
+) -> Result<Vec<Located>, Vec<String>> {
+    let blocks = p.from(k)?;
+    let plane = clearance_plane(blocks);
     let machine = |q: [f32; 3]| -> [f64; 6] {
         let mut m = start;
         for k in 0..3 {
@@ -773,7 +900,7 @@ pub fn lower(p: &Checked, offset: [f64; 6], start: [f64; 6]) -> Vec<Located> {
     let mut out = vec![];
     let mut at = start;
     let (mut spindle, mut coolant) = (false, (false, false));
-    for (i, block) in p.blocks.iter().enumerate() {
+    for (i, block) in blocks.iter().enumerate() {
         let line = i as u32 + 1;
         let mut actions = vec![];
         match block {
@@ -848,7 +975,7 @@ pub fn lower(p: &Checked, offset: [f64; 6], start: [f64; 6]) -> Vec<Located> {
         }
         out.extend(actions.into_iter().map(|action| Located { line, action }));
     }
-    out
+    Ok(out)
 }
 
 /// A move to `to`, unless the tool is there already.
@@ -977,6 +1104,8 @@ mod tests {
             probe_from: vec![],
             holds: vec![],
             pins: None,
+            starts: vec![],
+            partly: vec![],
         }
     }
 
@@ -1020,7 +1149,7 @@ mod tests {
             },
         ];
         let p = checked(ops, &[&first, &second]);
-        let located = lower(&p, [0.; 6], [0.; 6]);
+        let located = lower(&p, 0, [0.; 6], [0.; 6]).unwrap();
         let actions: Vec<Do> = located.iter().map(|l| l.action.clone()).collect();
         let off = Do::Spindle {
             state: Spindle::Off,
@@ -1063,7 +1192,7 @@ mod tests {
         // Work zero (the stock top centre, plan Z10) at machine X100 Y50 Z-30.
         let offset = [100., 50., -30., 0., 0., 0.];
         let start = [7., 8., -2., 0., 0., 45.];
-        let actions = lower(&p, offset, start);
+        let actions = lower(&p, 0, offset, start).unwrap();
         // Plan times are f32: a dwell is its seconds to a few µs.
         let found: Vec<Do> = actions
             .iter()
@@ -1132,9 +1261,12 @@ mod tests {
             epoch: 0,
             stale: false,
             next: 0,
+            from: 0,
+            zeroed: false,
             done: vec![false],
             running: Some(Running {
                 index: 0,
+                from: 0,
                 seq: 0,
                 offset: [0.; 6],
                 before: Before {
