@@ -89,6 +89,16 @@ impl PostSettings {
             Self::from_machine(m)
         }
     }
+    /// The settings a setup's holding is walked with: a run's or export's
+    /// (`for_machine`), but a manual mill makes no G-code, so its controller
+    /// and post settings do not count.
+    pub fn for_holding(m: &Machine) -> Result<Self, Vec<String>> {
+        if crate::manual::is_manual(m) {
+            Ok(Self::read(m))
+        } else {
+            Self::for_machine(m)
+        }
+    }
     fn read(m: &Machine) -> Self {
         let value = |k: &str| post_setting(&m.p, k).trim().parse::<f32>().unwrap_or(0.);
         Self {
@@ -1939,30 +1949,44 @@ impl Walk<'_> {
 /// `sequence` results, in every program (`prepare` stops at the first program
 /// with any problem, and before them all at a stock the workholding cannot
 /// hold), each once: the messages are those of `prepare`, or of a UC100
-/// run's check for a UC100 machine (`PostSettings::for_machine`). Empty when
-/// the setup cannot be walked, which `prepare` reports.
+/// run's check for a UC100 machine (`PostSettings::for_machine`). When the
+/// setup cannot be walked, one setup-wide line says its holding was not
+/// checked and why (`not_checked`).
 pub(crate) fn held(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Vec<Held> {
-    held_walked(doc, mesh, si, sims).unwrap_or_default()
+    held_walked(doc, mesh, si, sims).unwrap_or_else(|errors| {
+        vec![Held {
+            operation: None,
+            message: not_checked(&errors),
+        }]
+    })
 }
-/// `held`, or None when the setup cannot be walked (its programs cannot be
-/// made), so that nothing of its workholding was checked.
+/// What says that a setup's holding was not checked, from why it cannot be
+/// walked: "Holding not checked: <the first reason>."
+pub(crate) fn not_checked(errors: &[String]) -> String {
+    let why = errors
+        .first()
+        .map_or("its programs cannot be made", |e| e.trim_end_matches('.'));
+    format!("Holding not checked: {why}.")
+}
+/// `held`, or why the setup cannot be walked (its programs cannot be made),
+/// so that nothing of its workholding was checked.
 pub(crate) fn held_walked(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
-) -> Option<Vec<Held>> {
-    let walk = walk(doc, mesh, si, sims, PostSettings::for_machine).ok()?;
+) -> Result<Vec<Held>, Vec<String>> {
+    let walk = walk(doc, mesh, si, sims, PostSettings::for_holding)?;
     let held = gripped(doc, mesh, si, &walk);
     let boxes = match holding_boxes(doc, si, held) {
         Ok(boxes) => boxes,
         Err(message) => {
-            return Some(vec![Held {
+            return Ok(vec![Held {
                 operation: None,
                 message,
             }]);
@@ -1981,7 +2005,7 @@ pub(crate) fn held_walked(
     }
     // Nothing to hold against: no program need be walked.
     if boxes.is_empty() {
-        return Some(found);
+        return Ok(found);
     }
     // Every program of a touch-off setup starts the same way: what two of
     // them say alike (the clearance plane's problem) is said once.
@@ -1993,7 +2017,7 @@ pub(crate) fn held_walked(
             }
         }
     }
-    Some(found)
+    Ok(found)
 }
 /// One program of a setup that passed every check: its blocks and what they
 /// were made from.
@@ -4657,8 +4681,14 @@ M2
             }]
         );
         assert_eq!(errors(&post_job(&doc, &mesh)), [found[0].message.as_str()]);
-        // A setup export cannot walk has nothing to hold against.
-        assert!(held(&doc, &mesh, 0, &[]).is_empty());
+        // A setup export cannot walk: its holding was not checked, and why.
+        assert_eq!(
+            held(&doc, &mesh, 0, &[]),
+            [Held {
+                operation: None,
+                message: "Holding not checked: This setup has no enabled operations. Add one or remove the setup.".into()
+            }]
+        );
     }
     #[test]
     fn the_pocket_holds_in_a_vise_gripping_8_mm_and_tips_the_stock_out_of_a_1_mm_grip() {

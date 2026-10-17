@@ -421,7 +421,7 @@ fn workholding(
             (oi, Ok(sim))
         })
         .collect();
-    if let Some(found) = crate::post::held_walked(job, mesh, si, &sims) {
+    if let Ok(found) = crate::post::held_walked(job, mesh, si, &sims) {
         return found
             .into_iter()
             .map(|h| (h.operation, h.message))

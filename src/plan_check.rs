@@ -2726,10 +2726,16 @@ mod tests {
             .machine
             .p
             .insert("controller".into(), "Mach3".into());
+        // The CNC setup is refused, and its holding, which could not be
+        // walked, is said not to be checked.
         let refused = stages(&check_built(&job, &mesh, &report));
-        assert!(
-            refused.len() == 1 && refused[0].starts_with("export 2/None: "),
-            "{refused:?}"
+        let why = "Workshop Mill uses the Mach3 controller. Only the LinuxCNC postprocessor is implemented";
+        assert_eq!(
+            refused,
+            [
+                format!("export 2/None: {why}."),
+                format!("workholding 2/None: Holding not checked: {why}.")
+            ]
         );
     }
 }

@@ -391,7 +391,7 @@ These are placeholders until you enter your machine's numbers. On save the machi
 
 ### Tools and vises are marked per machine
 
-A tool and a library vise or clamp set have a check box for each machine that holds them. With none checked, the entry fits every CNC machine and no manual machine, so existing tools and vises keep working on the CNC and do not show on the manual mill. An operation whose tool does not fit its setup's machine has an operation issue, and the plan check stops on it. The vise picker lists only holders that fit the setup's machine. A setup whose vise or clamps do not fit its machine has a workholding problem ("100 mm machine vise is not on Manual Mill.").
+A tool and a library vise or clamp set have a check box for each machine that holds them. With none checked, the entry fits every CNC machine and no manual machine, so existing tools and vises keep working on the CNC and do not show on the manual mill. An operation whose tool does not fit its setup's machine has an operation issue, and the plan check stops on it. The vise picker lists only holders that fit the setup's machine. A setup whose vise or clamps do not fit its machine has a workholding problem ("100 mm machine vise is not on Manual Mill."). A setup whose programs cannot be made (a tool without a number, a controller with no postprocessor) cannot have its holding checked; the plan check lists "Holding not checked: <why>." as a workholding problem and the simulation panel lists it with the setup's problems, rather than saying nothing. A manual mill makes no G-code, so its controller and post settings do not stop its holding from being checked.
 
 ### + Add manual setup
 
