@@ -291,7 +291,7 @@
 - `src/model.rs`: `Document.guide: BTreeMap<String, usize>`, `#[serde(default)]` (setup id → step index).
 
 **Produces:**
-- `guide::Guide { setup: usize, steps: Vec<Step>, minutes: f32 }`.
+- `guide::Guide { setup: usize, steps: Vec<Step>, sections: Vec<Section>, minutes: f32 }`, with `Section { name: String, op: Option<usize>, steps: std::ops::Range<usize>, count: usize, minutes: f32 }`: one section per enabled operation (user decision, 17 October 2026), plus "Set up" (Hold, Zero) first and "Hand over" last, with `op` None for those two.
 - `guide::build(doc, mesh, si) -> Result<Guide, String>` runs `simulation::sequence_with` up to the end of setup `si`. It keeps the stock box before the setup, each operation's `Plan` and the volume before and after each operation (for the pictures).
 - `Step` is an enum:
   - `Hold { stock, holding }`
@@ -322,6 +322,7 @@
 - `Document.guide[setup.id]` is the saved place. `guide::place(doc, si) -> usize` clamps it to the steps.
 
 - [ ] Write tests (the Task 4 block, a manual setup with Face 2 mm, Step on −Y, and Drill × 4, followed by a CNC setup):
+  - **sections:** Set up, Face, Step, Holes, Hand over; their ranges cover every step once, in order; each operation's section holds exactly its Tool/Comp, Pass or Holes, and Check steps (the Face section holds its one Face step); `count` is 4 passes and 4 holes;
   - **step list:**
     - the kinds in order (Hold, Zero, Face, Tool, Pass…, Check, Tool, Holes, Check, HandOver), with exactly one step for the facing operation;
     - the Face step's `to` is the face Box's floor (−2.00) and `remove` is 2.00;
@@ -346,7 +347,7 @@
   - a new `steps(app)` view and a `StepDrawing` canvas program.
 - `src/main.rs`:
   - `App.guide: Option<(u64, Result<Guide, String>)>`, keyed by a fingerprint of the setups, operations, tools and mesh, built by a background task like the leftover-stock cache;
-  - messages `Message::Guide(GuideAction)` with `Next`, `Back`, `Go(usize)` and `Built(..)`;
+  - messages `Message::Guide(GuideAction)` with `Next`, `Back`, `Go(usize)`, `Section(usize)` (jump to the section's first unfinished step) and `Built(..)`;
   - `while_locked`.
 - `src/viewport.rs`: `stock_picture` takes a size (default 128 × 96 for today's callers).
 - `src/help.rs`.
@@ -357,7 +358,8 @@
   - Its left column lists the manual setups; selecting one sets `doc.active`.
   - A manual setup's card in MANUFACTURE has a "Steps" button that opens MACHINE on it.
 - **Layout** (the mockup in the conversation of 17 October):
-  - A step bar on top with one pill per step, done ✓, the current one highlighted, and "→ CNC setup N" last.
+  - A **section bar** on top: one entry per section with its name and progress ("Front step · pass 2/4"), done sections ticked, the current one highlighted, and "→ CNC setup N" last; tapping one sends `GuideAction::Section`.
+  - The current section's header: its name, tool, count and minutes. Finished sections fold up to their header. The last screen of a section has "Section done ▶".
   - **Left:**
     - the top view and the front view, drawn by `StepDrawing` with `canvas::Cache`:
       - the leftover stock rectangle;
@@ -386,6 +388,7 @@
   - the Face step shows the tool, the gear and "Face to Z −2.00", and no pass boxes;
   - the page shows "Pass 1 of N" and the readouts' numbers for the first pass of the step operation;
   - Next and Back move the place and keep it after a save and load;
+  - tapping a section in the bar jumps to its first unfinished step, and the bar shows each section's progress;
   - the page shows with no controller and while `app.locked()`;
   - a CNC setup still shows today's MACHINE page.
 - [ ] Add smoke step 124, `"100-manual-steps"`, which opens the Steps page on a manual setup and checks its texts.

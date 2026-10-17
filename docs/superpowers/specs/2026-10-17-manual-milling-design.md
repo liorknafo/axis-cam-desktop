@@ -12,6 +12,7 @@ Date: 17 October 2026. Branch: `t3/manual-milling-planning` (from `main` f85235d
 ## Decisions made by the user
 
 - Facing needs **no sub-steps**: only the tool and the depth to cut to (17 October 2026).
+- The guide is split into **one section per cutting operation** (17 October 2026).
 - The big mill is manual with a DRO. The DRO has **tool-radius compensation**.
 - **No power feed** on any axis: every cut is fed by hand.
 - The big mill does **everything that needs only one axis moving at a time**. Anything more complicated goes to the CNC.
@@ -102,6 +103,15 @@ A manual setup in MACHINE shows a **Steps** page instead of Run. It works with n
 | Holes | Top view with every hole numbered, the current hole highlighted, its X and Y, and the depth on the quill or Z |
 | Check | 3D view of the stock after the operation, next to the previous one, with the main sizes |
 | Hand over | The stock as it leaves, and the next setup it goes to ("→ CNC setup 1"), with its 3D view |
+
+### Sections
+
+The guide is split into **one section per cutting operation**, between a **Set up** section (Hold, Zero) and a **Hand over** section:
+
+- A section bar on top replaces a bar of single screens. It has one entry per section with its name and progress ("Front step · pass 2/4"), done sections ticked, and "→ CNC setup N" last. Tapping a section jumps to its first unfinished screen.
+- Each section header shows the operation's name, tool, count (passes or holes) and minutes.
+- A section starts with its Tool screen (or Comp screen) when the tool or the compensation side changes, and ends with its Check screen. Facing is one screen and nothing else (see Face above).
+- The last screen's button is "Section done". The user can stop after any section and come back to the next one later; finished sections fold up to their header.
 
 ### The Pass screen
 
