@@ -1246,14 +1246,9 @@ pub(crate) fn view_after(
     let mut sim = crate::simulation::prepare(job, mesh, si, oi).ok()?;
     sim.seek(1.);
     let volume = sim.volume.as_ref()?;
-    let surface = crate::stock_surface::Snapshot {
-        bounds: volume.bounds,
-        frame: volume.frame,
-        cuts: volume.cuts.clone(),
-        detail,
-    }
-    .build()
-    .ok()?;
+    let surface = crate::stock_surface::Snapshot::of(volume, detail)
+        .build()
+        .ok()?;
     sim.stock_surface = Some(std::sync::Arc::new(surface));
     sim.stock_surface_version = volume.version;
     sim.stock_surface_detail = detail;

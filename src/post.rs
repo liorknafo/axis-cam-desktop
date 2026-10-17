@@ -1767,6 +1767,10 @@ pub fn undrilled_pins(
                 .cuts
                 .iter()
                 .filter_map(|cut| {
+                    // A lathe's ring is not a hole a pin goes in.
+                    if cut.shape == crate::simulation::CutterShape::Revolve {
+                        return None;
+                    }
                     let [a, b] = [cut.a, cut.b].map(|p| cut.frame.transfer(p, frame));
                     let vertical = (0..2).all(|k| (a[k] - b[k]).abs() < 0.01);
                     let off = (a[0] - c[0]).hypot(a[1] - c[1]);

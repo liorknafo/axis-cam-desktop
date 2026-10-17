@@ -2977,12 +2977,15 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
 /// Whether the part reaches outside the setup's fixed stock box.
 fn outside_fixed_stock(s: &Setup, resolved: &crate::stock::ResolvedStock) -> bool {
     !crate::stock::relative(s)
-        && resolved.part.is_some_and(|part| {
+        && get(&s.p, "stock_type") != "Relative round bar"
+        && (resolved.part.is_some_and(|part| {
             (0..3).any(|i| {
                 part.min[i] < resolved.stock.min[i] - 0.001
                     || part.max[i] > resolved.stock.max[i] + 0.001
             })
-        })
+        }) || resolved
+            .part_radius
+            .is_some_and(|r| r > crate::stock::bar(resolved.stock).1 + 0.001))
 }
 fn setup_editor(app: &App) -> Panel<'_> {
     let s = app.doc.setup();
@@ -3367,10 +3370,36 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
             p,
             "stock_type",
             "Initial stock mode",
-            &["Relative size box", "Fixed size box"],
+            &[
+                "Relative size box",
+                "Fixed size box",
+                "Round bar",
+                "Relative round bar",
+            ],
             t,
         ));
-        if crate::stock::relative(s) {
+        let round = crate::stock::is_round(s);
+        if get(p, "stock_type") == "Relative round bar" {
+            c = c.push(muted("Extra material round the part · mm"));
+            c = c.push(field(p, "stock_radial", "Radial · mm", t));
+            c = c.push(
+                row![
+                    container(field(p, "stock_top", "Top (+Z) · mm", t))
+                        .width(Length::FillPortion(1)),
+                    container(field(p, "stock_bottom", "Bottom (−Z) · mm", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10),
+            );
+            c = c.push(muted("Bar along setup Z, on X 0 Y 0."));
+        } else if round {
+            for (k, l) in [
+                ("stock_diameter", "Bar Ø · mm"),
+                ("stock_length", "Length · mm"),
+            ] {
+                c = c.push(field(p, k, l, t));
+            }
+        } else if crate::stock::relative(s) {
             c = c.push(muted("Extra material from each side of the part · mm"));
             for pair in [
                 [
@@ -3408,18 +3437,28 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
         }
         match crate::stock::resolve(s, app.part_mesh()) {
             Ok(resolved) => {
-                let mut summary = column![
-                    bold("Resulting stock · X × Y × Z", 12),
-                    text(crate::stock::dimensions_text(resolved.stock.dimensions()))
-                        .size(14)
-                        .color(BLUE)
-                ]
-                .spacing(6);
+                let (title, size) = if round {
+                    (
+                        "Resulting stock · Ø × length",
+                        crate::stock::bar_text(resolved.stock),
+                    )
+                } else {
+                    (
+                        "Resulting stock · X × Y × Z",
+                        crate::stock::dimensions_text(resolved.stock.dimensions()),
+                    )
+                };
+                let mut summary =
+                    column![bold(title, 12), text(size).size(14).color(BLUE)].spacing(6);
                 if let Some(part) = resolved.part {
                     summary = summary.push(muted(format!(
                         "Part: {}",
                         crate::stock::dimensions_text(part.dimensions())
                     )));
+                }
+                if let Some(r) = resolved.part_radius {
+                    summary =
+                        summary.push(muted(format!("Part Ø round the axis: {:.3} mm", 2. * r)));
                 }
                 c = c.push(
                     container(summary)
@@ -3428,7 +3467,11 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                         .style(panel_style),
                 );
                 if outside_fixed_stock(s, &resolved) {
-                    c = c.push(note("The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."));
+                    c = c.push(note(if round {
+                        "The part extends outside this bar. Increase its size, adjust placement, or choose Relative round bar."
+                    } else {
+                        "The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."
+                    }));
                 }
             }
             Err(error) => c = c.push(note(error)),

@@ -13,11 +13,72 @@ pub const OFFSETS: [(&str, &str); 6] = [
     ("stock_bottom", "Bottom (−Z)"),
     ("stock_top", "Top (+Z)"),
 ];
+/// The offsets of a relative round bar: radial, then along the setup's Z.
+pub const ROUND_OFFSETS: [(&str, &str); 3] = [
+    ("stock_radial", "Radial"),
+    ("stock_bottom", "Bottom (−Z)"),
+    ("stock_top", "Top (+Z)"),
+];
 pub fn relative(setup: &Setup) -> bool {
     get(&setup.p, "stock_type") == "Relative size box"
 }
+/// Whether the setup's stock is a round bar along its Z axis, X = Y = 0:
+/// "Round bar" (`stock_diameter` × `stock_length`) or "Relative round bar"
+/// (`stock_radial` round the part, `stock_top` and `stock_bottom` along
+/// the axis). Its bounds are the bar's box (`bar`).
+pub fn is_round(setup: &Setup) -> bool {
+    matches!(
+        get(&setup.p, "stock_type"),
+        "Round bar" | "Relative round bar"
+    )
+}
+fn relative_round(setup: &Setup) -> bool {
+    get(&setup.p, "stock_type") == "Relative round bar"
+}
+/// The axis (X, Y) and radius of the round bar whose box is `bounds`: the
+/// cylinder along Z in the middle of the box, as wide as its narrower side.
+pub fn bar(bounds: Bounds) -> ([f32; 2], f32) {
+    let d = bounds.dimensions();
+    (
+        [
+            (bounds.min[0] + bounds.max[0]) / 2.,
+            (bounds.min[1] + bounds.max[1]) / 2.,
+        ],
+        d[0].min(d[1]) / 2.,
+    )
+}
+/// The part's largest distance from `setup`'s Z axis (X = Y = 0), in mm.
+pub fn part_radius(setup: &Setup, mesh: &Mesh) -> f32 {
+    let placement = Placement::new(mesh, Some(setup));
+    let scale = mesh.display_scale();
+    mesh.faces
+        .iter()
+        .flat_map(|f| &f.points)
+        .map(|&p| {
+            let q = placement.transform(p);
+            q[0].hypot(q[1]) / scale
+        })
+        .fold(0., f32::max)
+}
 pub fn parameter_issues(setup: &Setup) -> Vec<String> {
-    if relative(setup) {
+    if relative_round(setup) {
+        ROUND_OFFSETS
+            .iter()
+            .filter(|&(key, _label)| !num(&setup.p, key).is_some_and(|v| v >= 0.))
+            .map(|(_key, label)| {
+                format!("{label} stock offset must be a finite number of 0 mm or more.")
+            })
+            .collect()
+    } else if get(&setup.p, "stock_type") == "Round bar" {
+        [
+            ("stock_diameter", "Bar diameter"),
+            ("stock_length", "Bar length"),
+        ]
+        .iter()
+        .filter(|&(key, _label)| !num(&setup.p, key).is_some_and(|v| v > 0.))
+        .map(|(_key, label)| format!("{label} must be a finite number greater than zero."))
+        .collect()
+    } else if relative(setup) {
         OFFSETS
             .iter()
             .filter(|&(key, _label)| !num(&setup.p, key).is_some_and(|v| v >= 0.))
@@ -70,6 +131,9 @@ pub struct ResolvedStock {
     pub part: Option<Bounds>,
     pub stock: Bounds,
     pub display_scale: f32,
+    /// For a round bar, the part's largest distance from the bar's axis
+    /// (`part_radius`), when the part is known.
+    pub part_radius: Option<f32>,
 }
 pub fn resolve(setup: &Setup, mesh: Option<&Mesh>) -> Result<ResolvedStock, String> {
     if let Some(error) = parameter_issues(setup).into_iter().next() {
@@ -83,8 +147,24 @@ pub fn resolve(setup: &Setup, mesh: Option<&Mesh>) -> Result<ResolvedStock, Stri
     }
     let scale = mesh.map(Mesh::display_scale).unwrap_or(1.);
     let part = mesh.map(|m| Placement::new(m, Some(setup)).bounds.scaled(1. / scale));
+    let part_radius = mesh
+        .filter(|_| is_round(setup))
+        .map(|m| part_radius(setup, m));
     let stock = if let Some(bounds) = setup.preview_stock {
         bounds
+    } else if relative_round(setup) {
+        let part = part.ok_or("Load the part to calculate relative stock dimensions.")?;
+        let r = part_radius.unwrap() + num(&setup.p, "stock_radial").unwrap();
+        Bounds {
+            min: [-r, -r, part.min[2] - num(&setup.p, "stock_bottom").unwrap()],
+            max: [r, r, part.max[2] + num(&setup.p, "stock_top").unwrap()],
+        }
+    } else if get(&setup.p, "stock_type") == "Round bar" {
+        let [d, l] = ["stock_diameter", "stock_length"].map(|k| num(&setup.p, k).unwrap());
+        Bounds {
+            min: [-d / 2., -d / 2., 0.],
+            max: [d / 2., d / 2., l],
+        }
     } else if relative(setup) {
         let part = part.ok_or("Load the part to calculate relative stock dimensions.")?;
         let mut stock = part;
@@ -112,10 +192,19 @@ pub fn resolve(setup: &Setup, mesh: Option<&Mesh>) -> Result<ResolvedStock, Stri
         part,
         stock,
         display_scale: scale,
+        part_radius,
     })
 }
 pub fn dimensions_text(d: [f32; 3]) -> String {
     format!("{:.3} × {:.3} × {:.3} mm", d[0], d[1], d[2])
+}
+/// A round bar's size from its box: "Ø50.000 × 100.000 mm".
+pub fn bar_text(stock: Bounds) -> String {
+    format!(
+        "Ø{:.3} × {:.3} mm",
+        2. * bar(stock).1,
+        stock.dimensions()[2]
+    )
 }
 pub fn sheet_description(setup: &Setup, mesh: Option<&Mesh>) -> String {
     let mut text = format!("Stock mode: {}\n\n", get(&setup.p, "stock_type"));
@@ -125,8 +214,17 @@ pub fn sheet_description(setup: &Setup, mesh: Option<&Mesh>) -> String {
             text += &format!("- {label}: {} mm\n", get(&setup.p, key));
         }
         text += "\n";
+    } else if relative_round(setup) {
+        text += "Round bar offsets from the part, round the setup Z axis and along it:\n\n";
+        for (key, label) in ROUND_OFFSETS {
+            text += &format!("- {label}: {} mm\n", get(&setup.p, key));
+        }
+        text += "\n";
     }
     match resolve(setup, mesh) {
+        Ok(result) if is_round(setup) && setup.preview_stock.is_none() => {
+            text += &format!("Round bar Ø × length: {}", bar_text(result.stock))
+        }
         Ok(result) => {
             text += &format!(
                 "Stock X × Y × Z: {}",
@@ -240,6 +338,64 @@ mod tests {
         );
         s.p.insert("stock_x".into(), "".into());
         assert!(resolve(&s, Some(&mesh)).is_err());
+    }
+    #[test]
+    fn a_round_bar_resolves_to_its_box_on_the_setup_axis() {
+        let mesh = fixture();
+        let mut s = Setup::new(Machine::new(3), "G54");
+        assert!(!is_round(&s));
+        assert_eq!(resolve(&s, Some(&mesh)).unwrap().part_radius, None);
+        s.p.insert("stock_type".into(), "Round bar".into());
+        assert!(is_round(&s));
+        // Ø50 × 100 by default, from Z 0 up, on X 0 Y 0.
+        let bar_stock = resolve(&s, None).unwrap().stock;
+        close(bar_stock.min, [-25., -25., 0.]);
+        close(bar_stock.max, [25., 25., 100.]);
+        assert_eq!(bar(bar_stock), ([0., 0.], 25.));
+        assert_eq!(bar_text(bar_stock), "Ø50.000 × 100.000 mm");
+        assert!(parameter_issues(&s).is_empty());
+        for (key, bad) in [("stock_diameter", "0"), ("stock_length", "-1")] {
+            let mut wrong = s.clone();
+            wrong.p.insert(key.into(), bad.into());
+            assert!(resolve(&wrong, None).is_err());
+            assert_eq!(parameter_issues(&wrong).len(), 1);
+        }
+        // The fixture is a 120 × 80 × 40 block, its corners rounded, centred
+        // on the axis: no point of it lies further than √(60² + 40²) from it.
+        let resolved = resolve(&s, Some(&mesh)).unwrap();
+        let corner = resolved.part_radius.unwrap();
+        assert!(
+            corner > 60. && corner < 60f32.hypot(40.) + 0.001,
+            "{corner}"
+        );
+        let placed = Placement::new(&mesh, Some(&s));
+        let farthest = (mesh.faces.iter().flat_map(|f| &f.points))
+            .map(|p| {
+                let q = placed.transform(*p);
+                q[0].hypot(q[1]) / mesh.display_scale()
+            })
+            .fold(0., f32::max);
+        assert!((farthest - corner).abs() < 0.001);
+        s.p.insert("stock_type".into(), "Relative round bar".into());
+        assert!(is_round(&s));
+        for (key, value) in [
+            ("stock_radial", "2"),
+            ("stock_top", "5"),
+            ("stock_bottom", "1"),
+        ] {
+            s.p.insert(key.into(), value.into());
+        }
+        let resolved = resolve(&s, Some(&mesh)).unwrap();
+        let part = resolved.part.unwrap();
+        let r = corner + 2.;
+        close(resolved.stock.min, [-r, -r, part.min[2] - 1.]);
+        close(resolved.stock.max, [r, r, part.max[2] + 5.]);
+        assert!(resolve(&s, None).err().unwrap().contains("Load the part"));
+        s.p.insert("stock_radial".into(), "-1".into());
+        assert!(parameter_issues(&s)[0].starts_with("Radial"));
+        s.p.insert("stock_radial".into(), "2".into());
+        let text = sheet_description(&s, Some(&mesh));
+        assert!(text.contains("Radial: 2 mm") && text.contains("Round bar Ø × length: Ø"));
     }
     #[test]
     fn sheet_uses_relative_dimensions_and_all_six_offsets() {

@@ -2375,7 +2375,22 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (_, "stock_type") => (
-            "Relative size box adds independent offsets to the six sides of the part's bounding box after setup rotation. Fixed size box uses explicit X, Y and Z dimensions. Values for each mode are kept when switching.",
+            "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe. Values are kept when switching.",
+            "",
+            None,
+        ),
+        (_, "stock_diameter") => (
+            "Round bar diameter, mm. The bar lies along the setup Z axis, centred on X 0 Y 0.",
+            "",
+            None,
+        ),
+        (_, "stock_length") => (
+            "Round bar length along the setup Z axis, mm, from Z 0 up.",
+            "",
+            None,
+        ),
+        (_, "stock_radial") => (
+            "Extra material round the part, mm: the bar's radius is the part's largest distance from the setup Z axis plus this. 0 touches the part.",
             "",
             None,
         ),

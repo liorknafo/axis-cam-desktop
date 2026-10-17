@@ -617,13 +617,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         if surfaces.iter().any(|(v, _)| Arc::ptr_eq(v, volume)) {
             continue;
         }
-        let surface = stock_surface::Snapshot {
-            bounds: volume.bounds,
-            frame: volume.frame,
-            cuts: volume.cuts.clone(),
-            detail: stock_surface::Detail::Draft,
-        }
-        .build();
+        let surface = stock_surface::Snapshot::of(volume, stock_surface::Detail::Draft).build();
         if let Ok(surface) = surface {
             surfaces.push((volume.clone(), Arc::new(surface)));
         }
@@ -1940,12 +1934,7 @@ impl App {
         }
         let sim = self.active_simulation().unwrap();
         let volume = sim.volume.as_ref().unwrap();
-        let snapshot = stock_surface::Snapshot {
-            bounds: volume.bounds,
-            frame: volume.frame,
-            cuts: volume.cuts.clone(),
-            detail: self.stock_detail,
-        };
+        let snapshot = stock_surface::Snapshot::of(volume, self.stock_detail);
         let seconds = sim.seconds;
         self.stock_mesh_job = Some(key.clone());
         self.stock_mesh_started = Some(Instant::now());

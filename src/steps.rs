@@ -153,13 +153,8 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
     };
     let held = solid(&jaws);
     let picture = |v: &crate::volume::Volume, box_: Bounds, held: &[_]| {
-        let surface = crate::stock_surface::Snapshot {
-            bounds: v.bounds,
-            frame: v.frame,
-            cuts: v.cuts.clone(),
-            detail: crate::stock_surface::Detail::Draft,
-        }
-        .build();
+        let surface =
+            crate::stock_surface::Snapshot::of(v, crate::stock_surface::Detail::Draft).build();
         let mut triangles: Vec<_> = match &surface {
             Ok(s) => viewport::stock_triangles(v, s, frame).collect(),
             Err(_) => viewport::box_triangles(box_.translated(zero), viewport::BLOCK),

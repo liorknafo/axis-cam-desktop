@@ -243,6 +243,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Build the blank from the placed part bounds plus six independent offsets. Top adds material only above the part; Right adds material only on +X. Offsets follow setup rotation and translation. The first setup defines the blank for the whole job.",
             "",
         ),
+        ("stock_type", "Round bar") => (
+            "A round bar of the entered diameter and length along the setup Z axis, centred on X 0 Y 0, from Z 0 up. The simulation starts from the cylinder; lathe cuts turn it.",
+            "",
+        ),
+        ("stock_type", "Relative round bar") => (
+            "A round bar along the setup Z axis, on X 0 Y 0: the part's largest distance from the axis plus Radial, and Top and Bottom past its ends.",
+            "",
+        ),
         ("stock_type", "Fixed size box") => (
             "Use the entered overall X, Y and Z stock dimensions. The preview centers it in X/Y with its bottom at Z=0. The box can be smaller than the part, which is reported. Relative offsets are retained for switching back.",
             "",

@@ -610,14 +610,10 @@ pub fn op_pictures(
         .flat_map(|b| crate::viewport::box_triangles(*b, crate::viewport::JAWS))
         .collect();
     let picture = |volume: &crate::volume::Volume| {
-        let surface = crate::stock_surface::Snapshot {
-            bounds: volume.bounds,
-            frame: volume.frame,
-            cuts: volume.cuts.clone(),
-            detail: crate::stock_surface::Detail::Draft,
-        }
-        .build()
-        .ok()?;
+        let surface =
+            crate::stock_surface::Snapshot::of(volume, crate::stock_surface::Detail::Draft)
+                .build()
+                .ok()?;
         let mut triangles: Vec<_> =
             crate::viewport::stock_triangles(volume, &surface, frame).collect();
         triangles.extend(holding.iter().cloned());

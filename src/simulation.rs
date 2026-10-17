@@ -46,6 +46,10 @@ pub enum CutterShape {
     /// A chamfer mill: a cone of this included angle, in tenths of a degree,
     /// from its pointed tip up to its diameter.
     Chamfer(u16),
+    /// A lathe cut: the ring `volume::Volume::revolve` makes, every point of
+    /// the cut's frame whose Z lies between `a[0]` and `b[0]` and whose
+    /// distance from its Z axis lies between `a[1]` and `b[1]`.
+    Revolve,
 }
 impl CutterShape {
     /// How far a pointed cutter's cone rises per mm from its axis: a drill's
@@ -54,7 +58,7 @@ impl CutterShape {
         match self {
             CutterShape::Drill => Some(POINT_RISE),
             CutterShape::Chamfer(tenths) => Some(1. / (f32::from(tenths) / 20.).to_radians().tan()),
-            CutterShape::Flat | CutterShape::Ball => None,
+            CutterShape::Flat | CutterShape::Ball | CutterShape::Revolve => None,
         }
     }
 }
@@ -761,7 +765,7 @@ pub fn sequence_walk(
             setup.preview_stock = starts;
         } else if blocked.is_none() {
             match stock::resolve(&setup, Some(mesh)) {
-                Ok(s) => volume = Some(Volume::new(s.stock, frame)),
+                Ok(s) => volume = Some(Volume::stock(s.stock, frame, stock::is_round(&setup))),
                 Err(error) => blocked = Some(format!("{}: {error}", setup.name())),
             }
         }
