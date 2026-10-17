@@ -1285,7 +1285,7 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         RestSource(_) => (
             "Choose the earlier operation whose remaining material should guide rest machining. Earlier cuts automatically lower the cutting start when the area above it is fully cleared. Selecting isolated leftover regions for rest machining is not implemented.",
-            "",
+            "Imported Pocket and Adaptive clearing ignore the source: they cut only where earlier operations left material.",
         ),
         Export("sheet") => (
             "Save a Markdown setup sheet with machine, workholding, repositioning instructions and operation parameters.",
@@ -1861,7 +1861,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "pocket_milling") => (
             "Climb or Conventional relative to the remaining material. Reverses contour, waterline and pocket loops while retaining spindle rotation. CW climb runs counterclockwise around an internal wall and clockwise around an outside profile; CCW reverses these directions. Entry and full-width engagement can include both modes.",
-            "",
+            "In Adaptive clearing, which side of the cutter the material is kept on: with a clockwise spindle, Climb keeps it on the right.",
             Some(MillingDirection),
         ),
         (_, "pocket_entry") => (
@@ -1885,7 +1885,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "boundary") => (
-            "Defines the region that should contain machining: selected geometry, stock outline or model outline. Facing uses rectangular extents. Pocket follows the selected floor. Contour and finishing use the imported model silhouette.",
+            "Defines the region that should contain machining: selected geometry, stock outline or model outline. Facing uses rectangular extents. Pocket and Adaptive clearing follow the selected floor. Contour and finishing use the imported model silhouette.",
             "",
             Some(Operation(Strategy::Contour)),
         ),
@@ -1935,12 +1935,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "breakthrough") => (
-            "Additional travel past the exit, in mm: of a hole that goes through, for a drill (never under a blind hole), or of a Pocket's openings cut through, below where their walls end. The real required distance also depends on drill-point geometry.",
+            "Additional travel past the exit, in mm: of a hole that goes through, for a drill (never under a blind hole), or of a Pocket's or Adaptive clearing's openings cut through, below where their walls end. The real required distance also depends on drill-point geometry.",
             "",
             Some(Operation(Strategy::Drill)),
         ),
         (_, "openings") => (
-            "Holes in the selected floors with nothing of the part over or under them, such as switch cut-outs in a plate: Leave clears over them at the floor's height, Cut through also cuts each down to where its walls end, plus Breakthrough.",
+            "Holes in the selected floors with nothing of the part over or under them, such as switch cut-outs in a plate: Leave clears over them at the floor's height, Cut through also cuts each down to where its walls end, plus Breakthrough. Pocket and Adaptive clearing share this setting.",
             "An opening is a hole in a selected floor whose column holds no part at all. Its walls are followed at the cutter's radius, as a pocket's are, so corners keep that radius; run a smaller cutter after it to sharpen them. Openings narrower than the cutter are left, for a smaller one. Round holes are openings too, but Drilling makes them faster.",
             Some(Operation(Strategy::Pocket)),
         ),
@@ -2010,12 +2010,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "ramp") => (
-            "How the cutter enters material: a helix, back-and-forth ramp, straight plunge, or profile ramp. Match the entry to the cutter's cutting capabilities.",
+            "How the cutter enters material. Adaptive clearing on an imported part enters with a Helix or a Plunge where it cannot reach the material from the side; the sample also records a back-and-forth or profile ramp. Match the entry to the cutter's cutting capabilities.",
             "",
             Some(Ramp),
         ),
         (_, "ramp_angle") => (
-            "Slope of the entry move in degrees relative to the horizontal plane. A smaller angle takes a longer distance to reach cutting depth.",
+            "Slope of the entry move in degrees relative to the horizontal plane. A smaller angle takes a longer distance to reach cutting depth. Adaptive clearing's helix takes 0.1° to 15°.",
             "",
             Some(Ramp),
         ),
@@ -2070,12 +2070,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Stepover),
         ),
         (_, "optimal_load") => (
-            "Target radial engagement for adaptive clearing, in mm. It controls how much of the cutter's side is engaged, rather than its full diameter.",
+            "Target radial engagement for adaptive clearing, in mm: how much of the cutter's side is cutting at once, from 2% to 50% of the tool diameter. The path sweeps in open areas and loops into corners and along walls to hold it, so the stepdown can be deep, often the full flute length.",
             "",
             Some(Operation(Strategy::Adaptive)),
         ),
         (_, "minimum_radius") => (
-            "Smallest allowed radius of the cutting path, in mm. Larger radii can soften abrupt direction changes, where the geometry allows.",
+            "Smallest radius the path may turn in open material, in mm, from 0 to the tool radius. Larger radii soften direction changes. At a wall, or to avoid overloading the cutter, the path turns as sharply as it must.",
             "",
             Some(Operation(Strategy::Adaptive)),
         ),
@@ -2120,12 +2120,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Allowance),
         ),
         (_, "tolerance") => (
-            "Requested maximum toolpath approximation deviation, in mm. A smaller value can require more path segments. It is not a guarantee of finished-part accuracy.",
+            "Requested maximum toolpath approximation deviation, in mm: in Adaptive clearing, how far the path's straight segments may stray from the computed path. A smaller value can require more path segments. It is not a guarantee of finished-part accuracy.",
             "",
             None,
         ),
         (_, "rest") => (
-            "Target material remaining from an earlier operation, often with a smaller tool. Select the previous operation as the source; remaining-stock calculation is not connected.",
+            "Target material remaining from an earlier operation, often with a smaller tool. Select the previous operation as the source; remaining-stock calculation is not connected. Adaptive clearing on an imported part needs no setting: like Pocket, it cuts only where earlier operations and setups left material.",
             "",
             Some(Operation(Strategy::Adaptive)),
         ),

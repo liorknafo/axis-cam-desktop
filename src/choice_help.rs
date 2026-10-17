@@ -163,7 +163,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("boundary", "Selected geometry") => (
-            "Use the regions selected on the current imported part. Facing uses their XY bounding rectangle. Pocket and Inside Contour use selected recessed floor boundaries and preserve islands. Select geometry appropriate to this operation.",
+            "Use the regions selected on the current imported part. Facing uses their XY bounding rectangle. Pocket, Adaptive clearing and Inside Contour use selected recessed floor boundaries and preserve islands. Select geometry appropriate to this operation.",
             "",
         ),
         ("boundary", "Stock silhouette") => (
@@ -408,24 +408,24 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("ramp", "Helix") => (
-            "Record a circular descending entry. This sample-only preference is not an imported helix generator; imported Pocket offers Profile ramp or Plunge.",
+            "Descend in a circle at the ramp angle (0.1° to 15°) where Adaptive clearing cannot reach the material from the side. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Imported Pocket does not use this setting: it offers Profile ramp or Plunge in Contour entry.",
             "",
         ),
         ("ramp", "Zigzag") => (
-            "Record a back-and-forth descending entry. This illustrative preference is not implemented in imported Pocket generation.",
+            "Record a back-and-forth descending entry. This illustrative preference is not implemented for imported parts: Adaptive clearing enters with a Helix or a Plunge.",
             "",
         ),
         ("ramp", "Plunge") => {
             diagram = Some(Diagram::Entry(false));
             (
-                "Record a straight vertical entry requiring a plunge-capable cutter. Imported Pocket uses its separate Contour entry setting.",
+                "Feed straight down where Adaptive clearing cannot reach the material from the side. This needs a plunge-capable cutter. Imported Pocket uses its separate Contour entry setting.",
                 "",
             )
         }
         ("ramp", "Profile") => {
             diagram = Some(Diagram::Entry(true));
             (
-                "Record a descending entry along a contour. Imported Pocket's implemented Profile ramp is selected in Contour entry.",
+                "Record a descending entry along a contour. This sample preference is not implemented for imported Adaptive clearing, which enters with a Helix or a Plunge; imported Pocket's Profile ramp is selected in Contour entry.",
                 "",
             )
         }
@@ -438,7 +438,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("rest", "Yes") => (
-            "Record the intention to machine material remaining from an earlier operation. Fully cleared top layers are skipped automatically. This saved preference does not yet isolate leftover islands or corners; other air cuts can remain.",
+            "Record the intention to machine material remaining from an earlier operation. Fully cleared top layers are skipped automatically. This saved preference does not yet isolate leftover islands or corners; other air cuts can remain. Imported Pocket and Adaptive clearing need no setting: they cut only where earlier operations left material.",
             "",
         ),
         ("rest", "No") => (

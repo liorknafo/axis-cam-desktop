@@ -160,7 +160,8 @@ impl Cells {
             ((p.1 - self.y0) / self.h).floor() as isize,
         )
     }
-    /// The cells `x0..=x1` (mm) of row `j` holds, if any.
+    /// The first and last cell of a row whose centres lie from `lo` to
+    /// `hi` (mm across), if any.
     fn run(&self, lo: f64, hi: f64) -> Option<(usize, usize)> {
         let i0 = ((lo - self.x0) / self.h - 0.5).ceil().max(0.);
         let i1 = ((hi - self.x0) / self.h - 0.5)
@@ -240,6 +241,80 @@ impl Cells {
     }
 }
 
+/// The edges of a region, bucketed on a coarse grid, to tell quickly
+/// whether a short segment crosses one.
+struct Edges {
+    x0: f64,
+    y0: f64,
+    size: f64,
+    nx: usize,
+    ny: usize,
+    buckets: Vec<Vec<(P, P)>>,
+}
+impl Edges {
+    fn new(region: &[Polygon], size: f64) -> Self {
+        let (mut lo, mut hi) = (
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        );
+        for p in region.iter().flatten() {
+            lo = (lo.0.min(p.0), lo.1.min(p.1));
+            hi = (hi.0.max(p.0), hi.1.max(p.1));
+        }
+        let nx = (((hi.0 - lo.0) / size).ceil() as usize).max(1);
+        let ny = (((hi.1 - lo.1) / size).ceil() as usize).max(1);
+        let mut edges = Self {
+            x0: lo.0,
+            y0: lo.1,
+            size,
+            nx,
+            ny,
+            buckets: vec![vec![]; nx * ny],
+        };
+        for path in region {
+            for (a, b) in path
+                .iter()
+                .zip(path.iter().cycle().skip(1))
+                .take(path.len())
+            {
+                let ((i0, j0), (i1, j1)) = edges.span(*a, *b);
+                for j in j0..=j1 {
+                    for i in i0..=i1 {
+                        edges.buckets[j * nx + i].push((*a, *b));
+                    }
+                }
+            }
+        }
+        edges
+    }
+    /// The buckets the box round `a` and `b` overlaps, first and last.
+    fn span(&self, a: P, b: P) -> ((usize, usize), (usize, usize)) {
+        let at =
+            |v: f64, o: f64, n: usize| (((v - o) / self.size).floor().max(0.) as usize).min(n - 1);
+        (
+            (
+                at(a.0.min(b.0), self.x0, self.nx),
+                at(a.1.min(b.1), self.y0, self.ny),
+            ),
+            (
+                at(a.0.max(b.0), self.x0, self.nx),
+                at(a.1.max(b.1), self.y0, self.ny),
+            ),
+        )
+    }
+    /// Whether the segment `a`–`b` crosses or touches an edge.
+    fn crosses(&self, a: P, b: P) -> bool {
+        let ((i0, j0), (i1, j1)) = self.span(a, b);
+        (j0..=j1).any(|j| {
+            (i0..=i1).any(|i| {
+                self.buckets[j * self.nx + i]
+                    .iter()
+                    .any(|&(c, d)| pocket::meets(a, b, c, d))
+            })
+        })
+    }
+}
+
 /// The exact Euclidean distance, in cells, from each cell's centre to the
 /// nearest centre of a cell `seed` holds (Felzenszwalb and Huttenlocher's
 /// two passes of the lower envelope of parabolas).
@@ -308,7 +383,8 @@ fn distances(cells: &Cells, seed: impl Fn(usize, usize) -> bool) -> Vec<f32> {
 enum Lift {
     /// At depth, through what is already cut.
     Stay,
-    /// Up to just over the level before, across inside the pocket and down.
+    /// Up to just over the level before, across inside the pocket (at the
+    /// feed below the stock top) and down.
     Low,
     /// Up to clearance, across and down.
     High,
@@ -353,6 +429,8 @@ struct Walk {
     cells: Cells,
     /// Where the tool centre may stand: well inside the allowed region.
     allowed: Bits,
+    /// The edges of the exact allowed region, which no step may cross.
+    edges: Edges,
     /// The material the walker must clear: more than the load inside what
     /// the walls' pass reaches, so that pass takes at most the load.
     inner: Bits,
@@ -438,7 +516,7 @@ impl Level<'_> {
     /// its radial engagement on a straight cut. Infinite where `q` is not
     /// allowed.
     fn engagement(&self, p: P, q: P) -> f64 {
-        if !self.ok(q) {
+        if !self.ok(q) || self.walk.edges.crosses(p, q) {
             return f64::INFINITY;
         }
         let h = self.walk.cells.h;
@@ -798,13 +876,13 @@ impl Level<'_> {
                 );
                 self.count(q, q, clear) == 0
             });
-            if free && pocket::inside(exact, self.at) && !pocket::crosses(exact, self.at, to) {
+            if free && pocket::inside(exact, self.at) && !w.edges.crosses(self.at, to) {
                 return Lift::Stay;
             }
         }
         if pocket::inside(exact, self.at)
             && pocket::inside(exact, to)
-            && !pocket::crosses(exact, self.at, to)
+            && !w.edges.crosses(self.at, to)
         {
             Lift::Low
         } else {
@@ -890,13 +968,12 @@ impl Level<'_> {
         }
         for wall in walls {
             let (_, start, edge) = pocket::nearest(wall, self.at);
-            let path = pocket::begun(wall, start, edge);
+            let mut points = pocket::begun(wall, start, edge);
+            points.push(start);
             self.link(start, exact, false, &mut first);
-            for pair in path.windows(2) {
+            for pair in points.windows(2) {
                 self.remove(pair[0], pair[1]);
             }
-            let mut points = path;
-            points.push(start);
             self.events.push(Event::Cut(points));
             self.at = start;
         }
@@ -1159,9 +1236,16 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             .into();
         let mut inner = cells.raster(&inner);
         inner.and(&within);
+        // Clear of every wall and island, half the margin outside where
+        // the tool centre may go, so a loop on that limit is still inside.
+        let exact: Vec<Polygon> = walkable
+            .inflate(margin / 2., JoinType::Round, EndType::Polygon, 2.)
+            .into();
+        let edges = Edges::new(&exact, 2. * r);
         let walk = Walk {
             cells,
             allowed,
+            edges,
             inner,
             room,
             r,
@@ -1185,11 +1269,6 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                 wall.reverse();
             }
         }
-        // Clear of every wall and island, half the margin outside where
-        // the tool centre may go, so a loop on that limit is still inside.
-        let exact: Vec<Polygon> = walkable
-            .inflate(margin / 2., JoinType::Round, EndType::Polygon, 2.)
-            .into();
         let near = pocket::envelope(&centres, job.radius);
         let area = (hi.0 - lo.0) * (hi.1 - lo.1);
         let budget = (20. * area / (load * walk.delta)) as usize + 20_000;
@@ -1236,6 +1315,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                 &mut out,
                 &level_walk.events,
                 &exact,
+                &walk.edges,
                 Heights {
                     z,
                     previous: previous_z,
@@ -1308,9 +1388,9 @@ struct Feeds {
     slope: f32,
 }
 /// Whether the move from `a` to `b` at depth keeps the tool centre inside
-/// `exact`.
-fn within(exact: &[Polygon], a: P, b: P) -> bool {
-    pocket::inside(exact, a) && pocket::inside(exact, b) && !pocket::crosses(exact, a, b)
+/// `exact` (its edges `edges`).
+fn within(exact: &[Polygon], edges: &Edges, a: P, b: P) -> bool {
+    pocket::inside(exact, a) && !edges.crosses(a, b)
 }
 const OUTSIDE: &str = "Adaptive clearing found a move that would leave the pocket's allowed region. Report this part; use Pocket meanwhile.";
 /// A level's events as moves at its heights.
@@ -1318,6 +1398,7 @@ fn emit(
     out: &mut Motions,
     events: &[Event],
     exact: &[Polygon],
+    edges: &Edges,
     h: Heights,
     f: Feeds,
     tolerance: f64,
@@ -1334,7 +1415,7 @@ fn emit(
                 let from = (out.at[0] as f64, out.at[1] as f64);
                 match lift {
                     Lift::Stay => {
-                        if !within(exact, from, *to) {
+                        if !within(exact, edges, from, *to) {
                             return Err(OUTSIDE.into());
                         }
                         out.push(point(*to, h.z), Motion::Feed, f.feed, false)?;
@@ -1347,7 +1428,14 @@ fn emit(
                         };
                         let up = [out.at[0], out.at[1], travel.max(out.at[2])];
                         out.push(up, Motion::Rapid, 6000., false)?;
-                        out.push(point(*to, up[2]), Motion::Rapid, 6000., false)?;
+                        // Below the stock top the tool goes sideways at the
+                        // feed, never at rapid.
+                        let across = if up[2] < out.plan.stock.max[2] {
+                            (Motion::Feed, f.feed)
+                        } else {
+                            (Motion::Rapid, 6000.)
+                        };
+                        out.push(point(*to, up[2]), across.0, across.1, false)?;
                         out.push(point(*to, h.entry), Motion::Rapid, 6000., false)?;
                         if !above {
                             let rate = if *slow { f.feed * 0.25 } else { f.feed };
@@ -1393,8 +1481,12 @@ fn emit(
             }
             Event::Cut(path) => {
                 let path = simplify(path, tolerance);
+                // The path starts inside; no step of it crosses an edge.
+                if !pocket::inside(exact, path[0]) {
+                    return Err(OUTSIDE.into());
+                }
                 for pair in path.windows(2) {
-                    if !within(exact, pair[0], pair[1]) {
+                    if edges.crosses(pair[0], pair[1]) {
                         return Err(OUTSIDE.into());
                     }
                 }
@@ -1687,6 +1779,76 @@ mod tests {
         eprintln!(
             "pocket 10% {}; engagement p99 {:.3} most {:.3}",
             stats(&pocket),
+            quantile(&e, 0.99),
+            quantile(&e, 1.)
+        );
+    }
+    /// Writes /tmp/adaptive-totem.png, the keyboard case plate's path
+    /// coloured by engagement: for looking at.
+    #[test]
+    #[ignore]
+    fn picture_the_totem_case() {
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        let (setup, mut op, mut tool, _) = ring();
+        tool.p.insert("diameter".into(), "3".into());
+        for (k, v) in [
+            ("optimal_load", "0.45"),
+            ("stepdown", "7"),
+            ("allowance", "0.3"),
+            ("axial_allowance", "0.2"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
+        let (id, _) = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.normal[2] > 0.999999
+                    && placement.transform(s.center)[2] < top - 0.1
+                    && placement.transform(s.center)[2] > bottom + 0.1
+            })
+            .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            .unwrap();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![id],
+        });
+        let started = std::time::Instant::now();
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let took = started.elapsed();
+        // The tool never reaches the part, so all of the stock may count
+        // as material.
+        let b = plan.stock;
+        let solid = move |p: P| {
+            p.0 > b.min[0] as f64
+                && p.0 < b.max[0] as f64
+                && p.1 > b.min[1] as f64
+                && p.1 < b.max[1] as f64
+        };
+        picture(&plan, 0.45, solid, "/tmp/adaptive-totem.png");
+        let e = engagements(&plan, 0.1, solid);
+        let all = engagements_all(&plan, solid);
+        let worst = (0..all.len())
+            .filter(|&i| plan.moves[i].cutting_pass && plan.moves[i].from[2] == plan.moves[i].to[2])
+            .max_by(|&a, &b| all[a].total_cmp(&all[b]))
+            .unwrap();
+        for m in &plan.moves[worst.saturating_sub(2)..worst + 2] {
+            eprintln!(
+                "  {:?} -> {:?} cut {} e {:.3}",
+                m.from, m.to, m.cutting_pass, all[worst]
+            );
+        }
+        eprintln!(
+            "{} moves, {:.0} s, in {took:?}; engagement p99 {:.3} most {:.3}",
+            plan.moves.len(),
+            plan.duration,
             quantile(&e, 0.99),
             quantile(&e, 1.)
         );
@@ -1990,6 +2152,143 @@ mod tests {
         for m in rest.moves.iter().filter(|m| m.cutting_pass) {
             assert!(corner(&m.to) || wall(&m.to), "{:?}", m.to);
         }
+    }
+    #[test]
+    fn the_totem_keyboard_case_plate_clears_in_one_level_without_touching_the_part() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        // A Ø3 flat end mill at a 0.45 mm load, the whole 6.85 mm in one
+        // level, 0.3 mm radial and 0.2 mm axial stock to leave.
+        let (setup, mut op, mut tool, _) = ring();
+        tool.p.insert("diameter".into(), "3".into());
+        for (k, v) in [
+            ("optimal_load", "0.45"),
+            ("stepdown", "7"),
+            ("allowance", "0.3"),
+            ("axial_allowance", "0.2"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
+        let (id, _) = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.normal[2] > 0.999999
+                    && placement.transform(s.center)[2] < top - 0.1
+                    && placement.transform(s.center)[2] > bottom + 0.1
+            })
+            .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            .unwrap();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![id],
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 1);
+        // No feed move brings the cutter nearer the part than the radial
+        // stock to leave: every 0.25 mm of each, against what of every face
+        // of the part stands above the floor.
+        let faces: Vec<Polygon> = mesh
+            .faces
+            .iter()
+            .map(|f| {
+                let points: Vec<[f32; 3]> = f
+                    .points
+                    .iter()
+                    .map(|p| placement.transform(*p).map(|v| v / scale))
+                    .collect();
+                pocket::above(&points, plan.target + 0.01)
+            })
+            .filter(|p| p.len() >= 2)
+            .collect();
+        let cell = 5.;
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+        for (i, face) in faces.iter().enumerate() {
+            let (x0, x1) = face
+                .iter()
+                .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+            let (y0, y1) = face
+                .iter()
+                .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+            for gx in (x0 / cell).floor() as i64..=(x1 / cell).floor() as i64 {
+                for gy in (y0 / cell).floor() as i64..=(y1 / cell).floor() as i64 {
+                    grid.entry((gx, gy)).or_default().push(i);
+                }
+            }
+        }
+        let clear = (plan.radius + 0.3) as f64;
+        let mut checked = 0;
+        for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            let length = (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
+            let pieces = (length / 0.25).ceil().max(1.) as usize;
+            for k in 0..=pieces {
+                let p = m.at(m.start + (m.end - m.start) * k as f32 / pieces as f32);
+                if p[2] >= plan.stock.max[2] {
+                    continue;
+                }
+                let xy = (p[0] as f64, p[1] as f64);
+                let (gx, gy) = ((xy.0 / cell).floor() as i64, (xy.1 / cell).floor() as i64);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for &i in grid.get(&(gx + dx, gy + dy)).into_iter().flatten() {
+                            let face = &faces[i];
+                            let d = if pocket::inside(&[face.clone()], xy) {
+                                0.
+                            } else {
+                                pocket::nearest(face, xy).0
+                            };
+                            assert!(d >= clear - 0.001, "{d} from a face at {p:?}");
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
+        let mut sim = Simulation::new(plan);
+        sim.seek(1.);
+        assert!(sim.stock.removed_volume() > 10_000.);
+    }
+    #[test]
+    fn the_example_blocks_pocket_cleared_adaptively_posts_and_replays_exactly() {
+        // The fixture job's Face, then its Pocket as an Adaptive clearing
+        // with the Ø10 at a 2 mm load, in two levels.
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let setup = &mut doc.setups[0];
+        setup.operations.truncate(2);
+        let op = &mut setup.operations[1];
+        op.strategy = Strategy::Adaptive;
+        op.p.insert("name".into(), Strategy::Adaptive.name().into());
+        op.p.insert("optimal_load".into(), "2".into());
+        op.p.insert("stepdown".into(), "8".into());
+        let job = crate::post::post_job(&doc, &mesh);
+        let errors: Vec<String> = job
+            .errors
+            .iter()
+            .cloned()
+            .chain(
+                job.setups
+                    .iter()
+                    .filter_map(|s| s.result.as_ref().err())
+                    .flatten()
+                    .cloned(),
+            )
+            .collect();
+        assert!(job.ready(), "{errors:?}");
+        let program = &job.setups[0].result.as_ref().unwrap()[0];
+        assert_eq!(program.operations.len(), 2);
+        assert!(program.text.contains("Adaptive clearing"));
+        assert!(program.lines > 500, "{} lines", program.lines);
     }
     #[test]
     fn settings_out_of_range_are_refused_with_their_limits() {

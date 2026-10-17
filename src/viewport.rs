@@ -2614,6 +2614,13 @@ mod tests {
         let mut d = crate::model::Document::sample();
         d.setup_mut().p.insert("rz".into(), "90".into());
         d.setup_mut().p.insert("tx".into(), "15".into());
+        // An operation that cannot pick on an imported part (the sample's
+        // second, an Adaptive clearing, can now).
+        let tool = d.tools[0].id.clone();
+        d.setup_mut()
+            .operations
+            .push(Operation::new(Strategy::Scallop, tool));
+        let unavailable = d.setup().operations.len() - 1;
         let mut v = Viewport {
             setup: Some(d.setup()),
             operation: Some(&d.setup().operations[0]),
@@ -2639,7 +2646,7 @@ mod tests {
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);
         assert_eq!(v.picked(bounds, v.projector(bounds).p(point)), Some(1));
-        v.operation = Some(&d.setup().operations[1]);
+        v.operation = Some(&d.setup().operations[unavailable]);
         assert_eq!(v.picked(bounds, v.projector(bounds).p(point)), None);
         v.operation = Some(&d.setup().operations[0]);
         v.picking = false;

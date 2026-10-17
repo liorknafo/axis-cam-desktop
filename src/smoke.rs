@@ -3738,6 +3738,47 @@ flood = { pin = 8 }
     /// setup's Work zero step before and after its holes are chosen for the
     /// pins, setup 1's Drill of those holes, and the Control page's Run steps
     /// before and after X Y from the pins. Not a check: run it with
+    /// The example block's pocket cleared adaptively, its editor tabs and
+    /// the stock it leaves drawn to $AXIS_RENDER_DIR (/tmp/adaptive-renders):
+    /// for looking at, with --ignored.
+    #[test]
+    #[ignore]
+    fn render_an_adaptive_clearing() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/adaptive-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            op.strategy = Strategy::Adaptive;
+            op.p.insert("name".into(), Strategy::Adaptive.name().into());
+            op.p.insert("optimal_load".into(), "1.5".into());
+            op.p.insert("stepdown".into(), "12".into());
+            op.p.insert("feed".into(), "1500".into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let size = iced::Size::new(1600., 1100.);
+        for tab in ["Geometry", "Heights", "Passes", "Linking"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            let _ = a.view();
+            render_png(
+                &a,
+                size,
+                &out.join(format!("tab-{}.png", tab.to_lowercase())),
+            );
+        }
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        let _ = a.update(Message::Scrub(0.5));
+        render_png(&a, size, &out.join("halfway.png"));
+        let _ = a.update(Message::Scrub(1.));
+        render_png(&a, size, &out.join("done.png"));
+        eprintln!("{}", a.status);
+    }
+
     /// --ignored.
     #[test]
     #[ignore]
@@ -10865,7 +10906,7 @@ flood = { pin = 8 }
         assert!(a.playing);
         let _ = a.update(Message::Tab("Geometry".into()));
         assert!(!a.playing && a.simulation.is_none());
-        let _ = a.update(Message::AddOp(Strategy::Adaptive));
+        let _ = a.update(Message::AddOp(Strategy::Scallop));
         let _ = a.update(Message::Play);
         assert!(!a.playing && !a.playback_ready() && a.selected.is_none());
         assert_eq!(a.page, Page::Audit);
@@ -11246,7 +11287,7 @@ flood = { pin = 8 }
                 .all(|o| o.geometry.is_empty() && o.surfaces.is_none())
         );
         let count = a.doc.setup().operations.len();
-        let _ = a.update(Message::AddOp(Strategy::Adaptive));
+        let _ = a.update(Message::AddOp(Strategy::Scallop));
         assert_eq!(a.doc.setup().operations.len(), count);
         assert!(!a.picking && !a.is_sample());
         assert!(a.selected.is_none());

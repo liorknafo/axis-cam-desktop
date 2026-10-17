@@ -50,7 +50,7 @@ fn positive(tool: &Tool, key: &str) -> Result<f32, String> {
         .ok_or_else(|| format!("Enter a positive tool {key}."))
 }
 /// Clip a triangle to the half-space above the floor before projecting it.
-fn above(points: &[[f32; 3]], z: f32) -> Polygon {
+pub(crate) fn above(points: &[[f32; 3]], z: f32) -> Polygon {
     let mut result = Vec::new();
     for (a, b) in points
         .iter()
@@ -88,6 +88,15 @@ pub(crate) fn inside(region: &[Polygon], p: (f64, f64)) -> bool {
 }
 /// Whether the segment `a`–`b` crosses or touches an edge of `region`.
 pub(crate) fn crosses(region: &[Polygon], a: (f64, f64), b: (f64, f64)) -> bool {
+    region.iter().any(|path| {
+        path.iter()
+            .zip(path.iter().cycle().skip(1))
+            .take(path.len())
+            .any(|(&c, &d)| meets(a, b, c, d))
+    })
+}
+/// Whether the segments `a`–`b` and `c`–`d` cross or touch.
+pub(crate) fn meets(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
     let turn = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
         (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
     };
@@ -95,20 +104,13 @@ pub(crate) fn crosses(region: &[Polygon], a: (f64, f64), b: (f64, f64)) -> bool 
     let between = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
         r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
     };
-    region.iter().any(|path| {
-        path.iter()
-            .zip(path.iter().cycle().skip(1))
-            .take(path.len())
-            .any(|(&c, &d)| {
-                let (d1, d2) = (turn(c, d, a), turn(c, d, b));
-                let (d3, d4) = (turn(a, b, c), turn(a, b, d));
-                (d1 * d2 < 0. && d3 * d4 < 0.)
-                    || (d1 == 0. && between(c, d, a))
-                    || (d2 == 0. && between(c, d, b))
-                    || (d3 == 0. && between(a, b, c))
-                    || (d4 == 0. && between(a, b, d))
-            })
-    })
+    let (d1, d2) = (turn(c, d, a), turn(c, d, b));
+    let (d3, d4) = (turn(a, b, c), turn(a, b, d));
+    (d1 * d2 < 0. && d3 * d4 < 0.)
+        || (d1 == 0. && between(c, d, a))
+        || (d2 == 0. && between(c, d, b))
+        || (d3 == 0. && between(a, b, c))
+        || (d4 == 0. && between(a, b, d))
 }
 /// The point of the closed `path` nearest `p`: its distance, the point, and
 /// the edge it lies on (from vertex `edge` to the next).

@@ -1838,7 +1838,8 @@ impl App {
         self.selected
             .and_then(|i| {
                 self.doc.setup().operations.get(i).map(|o| {
-                    let mut issues = o.issues(
+                    let mut issues = o.issues_in(
+                        self.is_sample(),
                         &self.doc.setup().machine,
                         &self.doc.tools,
                         &self.doc.setup().operations[..i],

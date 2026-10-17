@@ -2284,7 +2284,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -2351,6 +2351,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         }
                     }
                     c = c.push(note(match o.strategy {
+                        Strategy::Adaptive => "Adaptive clearing works on the same geometry as Pocket: the selected recessed flat floors, with the walls and islands of the part. Vertical access only; overhanging geometry is rejected. The path keeps the cutter's side load near the optimal load, so it can take a deep stepdown. It inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
@@ -2395,13 +2396,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if !app.is_sample() && o.strategy == Strategy::Face {
                 c = c.push(note("Facing preview covers the XY bounding rectangle of the selected surfaces, model or stock. It includes holes and gaps within that rectangle. Containment and radial allowance adjust the cutter-center limits."));
             }
-            if app.is_sample() || matches!(o.strategy, Strategy::Face | Strategy::Pocket) {
+            if app.is_sample()
+                || matches!(
+                    o.strategy,
+                    Strategy::Face | Strategy::Adaptive | Strategy::Pocket
+                )
+            {
                 c = c
                     .push(choice(
                         p,
                         "boundary",
                         "Machining boundary",
-                        if o.strategy == Strategy::Pocket && !app.is_sample() {
+                        if matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket)
+                            && !app.is_sample()
+                        {
                             &["Selected geometry"]
                         } else {
                             &["Selected geometry", "Stock silhouette", "Model silhouette"]
@@ -2412,7 +2420,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         p,
                         "containment",
                         "Tool containment",
-                        if o.strategy == Strategy::Pocket && !app.is_sample() {
+                        if matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket)
+                            && !app.is_sample()
+                        {
                             &["Tool inside boundary"]
                         } else {
                             &[
@@ -2472,6 +2482,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
             } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
+            } else if !app.is_sample() && o.strategy == Strategy::Adaptive {
+                "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
             } else if !app.is_sample() && o.strategy == Strategy::Pocket {
                 "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
             } else if !app.is_sample() && o.strategy==Strategy::Contour && get(p,"boundary")=="Selected geometry" {
@@ -2515,7 +2527,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         .push(checks.field(p, "tab_height", "Tab height · mm"));
                 }
             }
-            if !app.is_sample() && o.strategy == Strategy::Pocket {
+            if !app.is_sample() && matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket) {
                 c = c.push(choice_value(
                     p,
                     pocket_setting(p, "openings"),
@@ -2663,6 +2675,21 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
             c = c.push(note(fixture_note(app, Note::Entry)));
         }
+        "Linking" if !app.is_sample() && o.strategy == Strategy::Adaptive => {
+            c = c.push(choice_value(
+                p,
+                get(p, "ramp"),
+                "ramp",
+                "Entry",
+                &ADAPTIVE_ENTRIES,
+                t,
+            ));
+            if get(p, "ramp") == ADAPTIVE_ENTRIES[0] {
+                c = c.push(checks.field(p, "ramp_angle", "Helix ramp angle · degrees"));
+            }
+            c = c.push(note("Where the cutter cannot come in from the side it enters the material with a Helix at the ramp angle, or a straight Plunge that needs a plunge-capable cutter. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Between passes the tool stays down through cleared area where the move is short; otherwise it lifts just above the level before (inside the pocket) or to clearance."));
+            c = c.push(note(fixtures(Note::Pocket, modelled(app))));
+        }
         "Linking" if !app.is_sample() && o.strategy.imported_preview() => {
             c = c.push(note(fixture_note(app, Note::Separate)));
         }
@@ -2805,6 +2832,11 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             .push(muted(format!("Spindle: {} · set in Tool", facing_setting(p,"spindle_rotation"))).size(12))
             .push(note("Climb / Conventional changes the direction around walls and islands. Offset contours clear from the interior outward, with a retract between loops."));
     }
+    if s == Strategy::Adaptive && !app.is_sample() {
+        c = c.push(choice_value(p, pocket_setting(p,"pocket_milling"), "pocket_milling", "Milling direction", &FACING_MILLING, t))
+            .push(muted(format!("Spindle: {} · set in Tool", facing_setting(p,"spindle_rotation"))).size(12))
+            .push(note("Climb / Conventional sets which way the cutter goes round walls and islands, and which side of the cutter the material is kept on. With a clockwise spindle, Climb keeps the material on the right. In open areas the path sweeps and loops to hold the load."));
+    }
     if s == Strategy::Face && !app.is_sample() {
         c = c.push(choice_value(
             p,
@@ -2918,7 +2950,10 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
     } else {
         c = c.push(checks.field(p, "tolerance", "Tolerance · mm"));
     }
-    if matches!(s, Strategy::Adaptive | Strategy::Scallop) {
+    if s == Strategy::Adaptive && !app.is_sample() {
+        c = c.push(note("Optimal load is the side load the path holds (2% to 50% of the tool diameter), so the stepdown can be deep, often the full flute length. Minimum cutting radius keeps turns in open material no tighter than that radius; at a wall it turns as sharply as it must. Tolerance is how far the path's straight segments may stray from the computed path. Each level ends with one pass round the walls and islands at the radial stock to leave. Rest machining is automatic: it cuts only where earlier operations and setups left material, so a smaller cutter after a larger one cleans up the corners."));
+    }
+    if s == Strategy::Scallop || (s == Strategy::Adaptive && app.is_sample()) {
         c = c.push(choice(p, "rest", "Rest machining", &["No", "Yes"], t));
         if get(p, "rest") == "Yes" {
             c = c.push(muted("Stock remaining after"));
@@ -7037,6 +7072,20 @@ pub(crate) fn operation_lines(
             push(stepdown);
             push(stepover);
             bottom.into_iter().for_each(&mut push);
+        }
+        Strategy::Adaptive => {
+            push(stepdown);
+            push(format!("optimal load {} mm", n(value("optimal_load"))));
+            push(format!("minimum radius {} mm", n(value("minimum_radius"))));
+            [radial, axial, bottom]
+                .into_iter()
+                .flatten()
+                .for_each(&mut push);
+            push(if get(p, "ramp") == ADAPTIVE_ENTRIES[1] {
+                "entry Plunge".into()
+            } else {
+                format!("entry Helix at {}°", n(value("ramp_angle")))
+            });
         }
         Strategy::Pocket => {
             push(stepdown);
