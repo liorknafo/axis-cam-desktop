@@ -4712,6 +4712,90 @@ flood = { pin = 8 }
         work_offset(&a, [195., 140., -20.]);
     }
 
+    /// The Control page's 3D view shows the stock a run cuts, where the
+    /// machine's tool has gone and not ahead of it; MANUFACTURE keeps the
+    /// planned view, and picking the start again drops the carve (LIO-181).
+    #[test]
+    fn a_run_cuts_the_stock_where_the_machines_tool_goes() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        a.page = Page::Control;
+        // Nothing is shown before the tool moves: the view keeps the part.
+        assert!(a.live_stock().is_none());
+        let start = (run_of(&a).before.iter())
+            .find(|b| b.op == 0)
+            .expect("the stock before the facing")
+            .stock
+            .clone();
+        let top = start.bounds.max[2];
+        assert!(
+            start.heights.iter().all(|h| (h - top).abs() < 1e-3),
+            "uncut"
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 20.0, "a cut into the stock", |r| {
+            r.carving
+                .as_ref()
+                .is_some_and(|c| c.stock.heights.iter().any(|h| *h < top - 0.05))
+        });
+        // The passes go along X, stepping over in +Y: nothing past the tool
+        // in Y is cut while it faces, though the driver's line runs ahead.
+        let mut seen = 0;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while run_of(&a).done.first() != Some(&true) {
+            assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
+            assert!(
+                std::time::Instant::now() < end,
+                "the facing tool run did not end"
+            );
+            let _ = a.update(Message::Tick);
+            let (Some((tip, radius, _)), Some((g, _))) = (a.live_tool(), a.live_stock()) else {
+                continue;
+            };
+            if tip[2] > top {
+                continue;
+            }
+            seen += 1;
+            for y in 0..g.ny {
+                let cy = g.bounds.min[1] + (y as f32 + 0.5) * g.dy;
+                if cy > tip[1] + radius + 2. * g.dy {
+                    let row = &g.heights[y * g.nx..(y + 1) * g.nx];
+                    assert!(
+                        row.iter().all(|h| (h - top).abs() < 1e-3),
+                        "Y {cy} cut, tool at {tip:?}"
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(seen > 3, "{seen}");
+        // MANUFACTURE keeps its planned view.
+        a.page = Page::Work;
+        assert!(a.live_stock().is_none());
+        a.page = Page::Control;
+        let _ = a.view();
+        // The facing tool run done, its passes have cut the whole top, every
+        // pass however late the ticks came.
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let faced = a.live_stock().unwrap().0;
+        assert!(
+            faced.heights.iter().all(|h| *h < top - 0.05),
+            "{:?}",
+            faced.heights
+        );
+        // Jogging between tool runs cuts nothing; the carve is kept.
+        let kept = faced.heights.clone();
+        mdi(&mut a, "G0 X5 Y5 Z-5");
+        assert_eq!(a.live_stock().unwrap().0.heights, kept);
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        assert!(run_of(&a).carving.is_none() && a.live_stock().is_none());
+    }
+
     #[test]
     fn the_3d_view_shows_the_machine_and_planning_waits_for_it() {
         use crate::run::Action as R;
