@@ -917,14 +917,20 @@ mod tests {
     #[test]
     fn the_setup_names_the_chuck_and_lists_its_problems() {
         let mut doc = crate::model::Document::default();
-        doc.setups = vec![setup(&[("chuck_tailstock", "Retracted"), ("holding_gap", "2")])];
+        doc.setups = vec![setup(&[
+            ("chuck_tailstock", "Retracted"),
+            ("holding_gap", "2"),
+        ])];
         let s = &doc.setups[0];
         assert_eq!(doc.holding_label(s), "3-jaw chuck on A");
         assert_eq!(
             doc.holding_text(s).unwrap(),
             "3-jaw chuck on A, Ø100 mm, gripping 25 mm of the Ø30 mm bar, 40 mm out of the jaws, tailstock drawn back, gap 2 mm."
         );
-        assert!(doc.setup_sheet(None).contains("Workholding: 3-jaw chuck on A, Ø100 mm"));
+        assert!(
+            doc.setup_sheet(None)
+                .contains("Workholding: 3-jaw chuck on A, Ø100 mm")
+        );
         assert!(doc.holding_issues(0, None).is_empty());
         // The drawn jaws and bodies are what is checked; the gripped stock
         // is checked and not drawn.
@@ -932,9 +938,15 @@ mod tests {
         assert_eq!(boxes, rig_of(s).boxes(0.));
         let shown = crate::holding::shown(&boxes, stock(s));
         assert_eq!(shown.len(), boxes.len() - 1);
-        assert!(shown.iter().all(|b| b.label != "stock gripped in the chuck jaws"));
+        assert!(
+            shown
+                .iter()
+                .all(|b| b.label != "stock gripped in the chuck jaws")
+        );
         // Too little in the jaws, a bad gap.
-        doc.setups[0].p.insert("chuck_stickout".into(), "110".into());
+        doc.setups[0]
+            .p
+            .insert("chuck_stickout".into(), "110".into());
         doc.setups[0].p.insert("holding_gap".into(), "-1".into());
         let issues = doc.holding_issues(0, None);
         assert_eq!(issues.len(), 2, "{issues:?}");
