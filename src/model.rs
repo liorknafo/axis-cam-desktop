@@ -314,10 +314,44 @@ impl Machine {
             e.push("Give the machine a name.".into())
         }
         let manual = manual::is_manual(self);
+        let lathe = crate::lathe::is_lathe(self);
         for k in ["x", "y", "z"] {
             positive(&self.p, k, &mut e)
         }
-        if manual {
+        if lathe {
+            if manual::gears(self).is_empty() {
+                e.push("Speeds must be positive rpm, comma-separated, or a range min-max.".into())
+            }
+            for k in ["swing", "centres"] {
+                positive(&self.p, k, &mut e)
+            }
+            if !["", "Diameter", "Radius"].contains(&get(&self.p, "cross_reads")) {
+                e.push("The cross slide reads Diameter or Radius.".into())
+            }
+            for k in ["cross_turn", "top_turn", "carriage_turn", "quill_turn"] {
+                positive(&self.p, k, &mut e)
+            }
+            for k in ["cross_div", "top_div", "carriage_div", "quill_div"] {
+                positive(&self.p, k, &mut e);
+                if num(&self.p, k).is_some_and(|n| n.fract() != 0.) {
+                    e.push(format!("{} must be a whole number.", label(k)))
+                }
+            }
+            for (k, ok) in [
+                ("feeds", !crate::lathe::feeds(self).is_empty()),
+                ("pitches", !crate::lathe::pitches(self).is_empty()),
+            ] {
+                if !ok {
+                    e.push(format!(
+                        "{} must be positive numbers, comma-separated.",
+                        label(k)
+                    ))
+                }
+            }
+            for k in ["pass_time", "tool_time", "move_time"] {
+                nonnegative(&self.p, k, &mut e)
+            }
+        } else if manual {
             if manual::gears(self).is_empty() {
                 e.push("Speeds must be positive rpm, comma-separated, or a range min-max.".into())
             }
@@ -358,7 +392,7 @@ impl Machine {
                 finite(&self.p, k, &mut e)
             }
         }
-        if !manual
+        if !(manual || lathe)
             && get(&self.p, "controller") == "UC100"
             && get(&self.p, "uc100_profile").trim().is_empty()
         {
@@ -823,7 +857,7 @@ impl Operation {
                 e.push(format!("{} exceeds the saved machine limit.", label(k)));
             }
         }
-        if manual::is_manual(m)
+        if manual::is_hand(m)
             && num(&self.p, "rpm").is_some_and(|rpm| rpm > 0. && !manual::on_gear(m, rpm))
         {
             e.push(format!(
@@ -1874,7 +1908,7 @@ impl Document {
         let mut offsets = HashSet::new();
         for s in &self.setups {
             e.extend(s.issues().into_iter().map(|x| format!("{}: {x}", s.name())));
-            if !crate::manual::is_manual(&s.machine) && !offsets.insert(get(&s.p, "offset")) {
+            if !crate::manual::is_hand(&s.machine) && !offsets.insert(get(&s.p, "offset")) {
                 e.push(format!(
                     "{}: work offset is also used by another setup.",
                     s.name()
@@ -1904,7 +1938,7 @@ impl Document {
         let at = self
             .setups
             .iter()
-            .position(|s| !crate::manual::is_manual(&s.machine))
+            .position(|s| !crate::manual::is_hand(&s.machine))
             .unwrap_or(self.setups.len());
         let mut setup = Setup::new(machine.clone(), &self.next_offset());
         setup.p.insert("name".into(), "Big mill".into());
@@ -1959,9 +1993,14 @@ impl Document {
                 "\n## {} · {}\n\nMachine: {}\n\n{}\n\nOrigin: {}\n\n{}{}Rotation: [{}, {}, {}]°\n\nTranslation: [{}, {}, {}] mm\n\nReposition: {}\n\nRequested fixture clearance (not checked): {}\n\n{}\n\n",
                 setup.name(),
                 get(&setup.p, "offset"),
-                if crate::manual::is_manual(&setup.machine) {
+                if crate::manual::is_hand(&setup.machine) {
+                    let kind = if crate::lathe::is_lathe(&setup.machine) {
+                        "lathe"
+                    } else {
+                        "mill"
+                    };
                     format!(
-                        "{} (manual mill)\n\nManual mill: steps on the MACHINE page",
+                        "{} (manual {kind})\n\nManual {kind}: steps on the MACHINE page",
                         setup.machine.name()
                     )
                 } else {

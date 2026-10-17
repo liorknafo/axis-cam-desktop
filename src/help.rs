@@ -1183,6 +1183,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Say if the DRO compensates the tool radius, and the minutes a pass, a tool change and moving the stock cost on this mill.",
             "",
         ),
+        WizardStep(2) if label.ends_with("Dials & feeds") => (
+            "Say what the cross-slide dial reads, the numbers and divisions of each dial, the power feeds and threads the gearbox cuts, and the minutes a pass, a tool change and moving the stock cost.",
+            "",
+        ),
         WizardStep(3) if label.ends_with("Review") => (
             "Review the profile and resolve configuration issues before saving it to your local machine library.",
             "",
@@ -1192,7 +1196,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         WizardStep(0) => (
-            "Name the machine, choose a CNC or a manual mill, then 3, 4 or 5 axes for a CNC, and the units used by its specification.",
+            "Name the machine, choose a CNC, a manual mill or a manual lathe, then 3, 4 or 5 axes for a CNC, and the units used by its specification.",
             "",
         ),
         WizardStep(1) => (
@@ -2197,7 +2201,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Machine, "kind") => (
-            "CNC runs G-code. Manual is a hand-operated mill with a DRO: no G-code, no Run, and its setups are shown as steps on the MACHINE page.",
+            "CNC runs G-code. Manual is a hand-operated mill with a DRO, Lathe a hand-operated lathe with dials: no G-code, no Run, and their setups are shown as steps on the MACHINE page.",
             "",
             None,
         ),
@@ -2218,6 +2222,41 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "turn_x" | "turn_y" | "turn_z") => (
             "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
+            "",
+            None,
+        ),
+        (_, "swing") => (
+            "The largest diameter the lathe turns over its bed, in mm. A bar or part wider than this is refused.",
+            "",
+            None,
+        ),
+        (_, "centres") => (
+            "The distance between the centres, in mm: the longest work the lathe takes between chuck and tailstock.",
+            "",
+            None,
+        ),
+        (_, "cross_reads") => (
+            "Whether a reading on the cross-slide dial takes that much off the diameter or off the radius. Not known yet: the first lathe setup asks you to cut a test and measure, and saves the answer.",
+            "",
+            None,
+        ),
+        (_, "cross_turn" | "top_turn" | "carriage_turn" | "quill_turn") => (
+            "The numbers the dial goes through in one full turn of the handwheel: what it reads at the index after one turn. The steps use it to say how many turns and what reading.",
+            "",
+            None,
+        ),
+        (_, "cross_div" | "top_div" | "carriage_div" | "quill_div") => (
+            "How many divisions the dial has round its collar, a whole number. A reading is rounded to one division.",
+            "",
+            None,
+        ),
+        (_, "feeds") => (
+            "The carriage power feeds the gearbox has, in mm per revolution, comma-separated. Turning passes use the one nearest 0.1.",
+            "",
+            None,
+        ),
+        (_, "pitches") => (
+            "The thread pitches the gearbox cuts, in mm, comma-separated. A thread operation must use one of them.",
             "",
             None,
         ),

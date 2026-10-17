@@ -55,7 +55,7 @@ impl CheckReport {
     /// operations and tool changes as manual.
     fn add_minutes(&mut self, built: &Document, operations: &[OpResult]) {
         let round = |m: f32| (m * 10.).round() / 10.;
-        let manual = |setup: usize| crate::manual::is_manual(&built.setups[setup - 1].machine);
+        let manual = |setup: usize| crate::manual::is_hand(&built.setups[setup - 1].machine);
         let of = |manual_ops: bool| -> f32 {
             (operations.iter())
                 .filter(|o| manual(o.setup) == manual_ops)
@@ -63,7 +63,7 @@ impl CheckReport {
                 .sum()
         };
         let changes: f32 = (built.setups.iter())
-            .filter(|s| crate::manual::is_manual(&s.machine))
+            .filter(|s| crate::manual::is_hand(&s.machine))
             .map(|s| {
                 crate::manual::tool_changes(s) as f32
                     * crate::model::num(&s.machine.p, "tool_time").unwrap_or(0.)

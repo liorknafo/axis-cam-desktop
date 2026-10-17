@@ -16000,6 +16000,191 @@ flood = { pin = 8 }
         assert_eq!(a.doc.machines.len(), count);
     }
     #[test]
+    fn the_wizard_offers_the_lathe_and_shows_its_own_steps_and_fields() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        shows(&a, &["Machine kind", "Number of axes"]);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        assert!(crate::lathe::is_lathe(&a.machine_draft));
+        assert!(!crate::manual::is_manual(&a.machine_draft));
+        assert_eq!(
+            crate::ui::wizard_steps(&a.machine_draft),
+            ["Identity", "Spindle & travel", "Dials & feeds", "Review"]
+        );
+        shows(
+            &a,
+            &["Machine kind", "2  Spindle & travel", "3  Dials & feeds"],
+        );
+        lacks(&a, &["Number of axes", "3  Manual mill", "3  Kinematics"]);
+        let _ = a.update(Message::WizardStep(1));
+        shows(
+            &a,
+            &[
+                "Spindle power · W",
+                "Spindle speeds · rpm, or a range",
+                "Swing over the bed · mm",
+                "Distance between centres · mm",
+            ],
+        );
+        lacks(
+            &a,
+            &[
+                "X travel",
+                "Hand feed · mm/min",
+                "Maximum spindle speed · rpm",
+                "X per handwheel turn · mm",
+            ],
+        );
+        let _ = a.update(Message::WizardStep(2));
+        shows(
+            &a,
+            &[
+                "Cross-slide dial reads",
+                "Cross slide · dial per turn",
+                "Cross slide · divisions",
+                "Top slide · dial per turn",
+                "Carriage · dial per turn",
+                "Tailstock quill · divisions",
+                "Power feeds · mm per revolution",
+                "Threads the gearbox cuts · mm",
+                "Time per pass · s",
+                "Time per tool change · min",
+                "Time to move the stock to another machine · min",
+                "Manual lathe — no G-code; MACHINE shows the steps.",
+            ],
+        );
+        lacks(&a, &["DRO tool radius compensation", "Motion capability"]);
+        let _ = a.update(Message::WizardStep(9));
+        assert_eq!(a.wizard_step, 3);
+        shows(
+            &a,
+            &[
+                "Review",
+                "Save machine profile",
+                "Manual lathe · speeds 70,110,180,280,450,710,1120,1800 rpm",
+            ],
+        );
+        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::SaveMachine)));
+        // The post and probe fields are on no step.
+        for step in 0..4 {
+            let _ = a.update(Message::WizardStep(step));
+            lacks(
+                &a,
+                &["Spindle start dwell · s", "Touch plate thickness · mm"],
+            );
+        }
+    }
+    #[test]
+    fn choosing_the_lathe_kind_keeps_the_name_and_power_and_the_dial_answer_is_saved() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        for (k, v) in [("name", "Colchester"), ("power", "1500")] {
+            let _ = a.update(Message::Edit(Target::Machine, k, v.into()));
+        }
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        let p = &a.machine_draft.p;
+        assert_eq!(
+            [
+                get(p, "name"),
+                get(p, "power"),
+                get(p, "speeds"),
+                get(p, "cross_reads")
+            ],
+            ["Colchester", "1500", "70,110,180,280,450,710,1120,1800", ""]
+        );
+        // The dial's answer is kept; "Not known yet" empties it again.
+        for (choice, saved) in [
+            ("Radius", "Radius"),
+            ("Not known yet", ""),
+            ("Diameter", "Diameter"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Machine, "cross_reads", choice.into()));
+            assert_eq!(get(&a.machine_draft.p, "cross_reads"), saved);
+        }
+        // Back to a manual mill and a CNC, and to the lathe again.
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        assert!(crate::manual::is_manual(&a.machine_draft));
+        assert_eq!(get(&a.machine_draft.p, "name"), "Colchester");
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        assert!(crate::lathe::is_lathe(&a.machine_draft));
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "CNC".into()));
+        assert!(!crate::manual::is_hand(&a.machine_draft));
+        assert_eq!(crate::ui::wizard_steps(&a.machine_draft).len(), 5);
+    }
+    #[test]
+    fn saving_a_lathe_settles_its_rpm_and_travel_and_refuses_bad_dials_and_the_library_card_says_so()
+     {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        for (k, v) in [
+            ("speeds", "100, 400,2500"),
+            ("swing", "300"),
+            ("centres", "700"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Machine, k, v.into()));
+        }
+        let id = a.machine_draft.id.clone();
+        let _ = a.update(Message::SaveMachine);
+        let saved = a.doc.machines.iter().find(|m| m.id == id).expect("saved");
+        assert_eq!(
+            [get(&saved.p, "rpm"), get(&saved.p, "x"), get(&saved.p, "z")],
+            ["2500", "300", "700"]
+        );
+        assert_eq!(a.page, Page::Machines);
+        shows(&a, &["Manual lathe  ·  no G-code", "Swing  300 × 700 mm"]);
+        // A dial with no divisions is refused.
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        let _ = a.update(Message::Edit(Target::Machine, "carriage_div", "0".into()));
+        let count = a.doc.machines.len();
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(a.doc.machines.len(), count);
+    }
+    #[test]
+    fn a_lathe_setup_is_hand_work_with_no_program_run_offset_or_cnc_minutes() {
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let lathe = crate::lathe::defaults();
+        doc.machines.push(lathe.clone());
+        let cnc_offset = get(&doc.setups[0].p, "offset").to_string();
+        let mut setup = crate::model::Setup::new(lathe, &cnc_offset);
+        setup.p.insert("name".into(), "Turn".into());
+        doc.setups.insert(0, setup);
+        // The same work offset as the CNC setup is no clash for a hand machine.
+        assert!(
+            !doc.issues()
+                .iter()
+                .any(|e| e.contains("work offset is also used")),
+            "{:?}",
+            doc.issues()
+        );
+        // It makes no program, and the run's checks pass it by.
+        assert_eq!(
+            crate::post::checked(&doc, &mesh, 0, &[], crate::post::PostSettings::for_uc100)
+                .map(|p| p.len()),
+            Ok(0)
+        );
+        assert!(crate::run::plan_problems(&doc, &mesh, 0, &[]).is_ok());
+        assert!(crate::post::PostSettings::for_holding(&doc.setups[0].machine).is_ok());
+        // The export's line and the setup sheet name it.
+        assert_eq!(
+            crate::manual::no_gcode_on(&doc.setups[0].machine, "Turn"),
+            "Turn: manual lathe, no G-code — follow the steps on the MACHINE page."
+        );
+        assert!(
+            doc.setup_sheet(None)
+                .contains("Manual lathe: steps on the MACHINE page")
+        );
+        // A mill tool with no machines listed does not fit it.
+        assert!(!crate::manual::fits("", &doc.setups[0].machine));
+        assert!(crate::manual::fits("", &doc.setups[1].machine));
+        assert!(crate::manual::fits(
+            &doc.setups[0].machine.id,
+            &doc.setups[0].machine
+        ));
+    }
+    #[test]
     fn the_tool_editor_has_a_check_box_per_machine_that_edits_machines() {
         let mut a = app();
         with_manual(&mut a);

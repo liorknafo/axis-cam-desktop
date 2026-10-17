@@ -2,7 +2,7 @@ use crate::{
     App, Message, Page, Target,
     help::{self, Help, HelpButton},
     holding::Held,
-    manual,
+    lathe, manual,
     material::SpeedFeed,
     model::*,
     planner::Dropped,
@@ -4279,17 +4279,28 @@ fn machines(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center),
             rule::horizontal(1),
             row![
-                muted(format!(
-                    "Travel  {} × {} × {} {}",
-                    get(&m.p, "x"),
-                    get(&m.p, "y"),
-                    get(&m.p, "z"),
-                    get(&m.p, "units")
-                )),
+                muted(if lathe::is_lathe(m) {
+                    format!(
+                        "Swing  {} × {} {}",
+                        get(&m.p, "swing"),
+                        get(&m.p, "centres"),
+                        get(&m.p, "units")
+                    )
+                } else {
+                    format!(
+                        "Travel  {} × {} × {} {}",
+                        get(&m.p, "x"),
+                        get(&m.p, "y"),
+                        get(&m.p, "z"),
+                        get(&m.p, "units")
+                    )
+                }),
                 space().width(35),
                 muted(format!("Spindle  {} rpm", get(&m.p, "rpm"))),
                 space().width(35),
-                muted(if manual::is_manual(m) {
+                muted(if lathe::is_lathe(m) {
+                    "Manual lathe  ·  no G-code".to_string()
+                } else if manual::is_manual(m) {
                     "Manual mill  ·  no G-code".to_string()
                 } else {
                     format!("Controller  {}", get(&m.p, "controller"))
@@ -4329,9 +4340,12 @@ fn machines(app: &App) -> Element<'_, Message> {
     .into()
 }
 /// The wizard's steps for `m`: a manual mill has no kinematics or controller
-/// to describe, and one step of its own in their place.
+/// to describe, and one step of its own in their place; a manual lathe has two
+/// of its own.
 pub(crate) fn wizard_steps(m: &Machine) -> Vec<&'static str> {
-    if manual::is_manual(m) {
+    if lathe::is_lathe(m) {
+        vec!["Identity", "Spindle & travel", "Dials & feeds", "Review"]
+    } else if manual::is_manual(m) {
         vec!["Identity", "Travel & spindle", "Manual mill", "Review"]
     } else {
         vec![
@@ -4364,17 +4378,19 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .push(field(p, "name", "Machine name", t))
                 .push(choice_value(
                     p,
-                    if manual::is_manual(m) {
+                    if lathe::is_lathe(m) {
+                        "Lathe"
+                    } else if manual::is_manual(m) {
                         "Manual"
                     } else {
                         "CNC"
                     },
                     "kind",
                     "Machine kind",
-                    &["CNC", "Manual"],
+                    &["CNC", "Manual", "Lathe"],
                     t,
                 ));
-            if !manual::is_manual(m) {
+            if !manual::is_hand(m) {
                 form = form.push(choice(p, "axes", "Number of axes", &["3", "4", "5"], t));
             }
             form=form.push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
@@ -4403,6 +4419,66 @@ fn wizard(app: &App) -> Element<'_, Message> {
             {
                 form = form.push(field(p, k, l, t));
             }
+        }
+        "Spindle & travel" => {
+            for (k, l) in [
+                ("power", "Spindle power · W"),
+                ("speeds", "Spindle speeds · rpm, or a range"),
+                ("swing", "Swing over the bed · mm"),
+                ("centres", "Distance between centres · mm"),
+            ] {
+                form = form.push(field(p, k, l, t));
+            }
+        }
+        "Dials & feeds" => {
+            form = form
+                .push(choice_value(
+                    p,
+                    lathe::cross_reads(m).unwrap_or("Not known yet"),
+                    "cross_reads",
+                    "Cross-slide dial reads",
+                    &["Not known yet", "Diameter", "Radius"],
+                    t,
+                ))
+                .push(
+                    row![
+                        field(p, "cross_turn", "Cross slide · dial per turn", t),
+                        field(p, "cross_div", "Cross slide · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(
+                    row![
+                        field(p, "top_turn", "Top slide · dial per turn", t),
+                        field(p, "top_div", "Top slide · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(
+                    row![
+                        field(p, "carriage_turn", "Carriage · dial per turn", t),
+                        field(p, "carriage_div", "Carriage · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(
+                    row![
+                        field(p, "quill_turn", "Tailstock quill · dial per turn", t),
+                        field(p, "quill_div", "Tailstock quill · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(field(p, "feeds", "Power feeds · mm per revolution", t))
+                .push(field(p, "pitches", "Threads the gearbox cuts · mm", t))
+                .push(field(p, "pass_time", "Time per pass · s", t))
+                .push(field(p, "tool_time", "Time per tool change · min", t))
+                .push(field(
+                    p,
+                    "move_time",
+                    "Time to move the stock to another machine · min",
+                    t,
+                ))
+                .push(note("Manual lathe — no G-code; MACHINE shows the steps."));
         }
         "Manual mill" => {
             form = form
@@ -4584,6 +4660,23 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(note("Dowel pins pressed into a plate on the table, square to X and Y, typed in the plate's own coordinates as drilled. A part drops over them by holes in it, so it sits in the same place and turn every time, also after a flip: a setup that sits on the pins (its Work zero step) gets its X and Y work offset from them without probing; Z is still touched off. Pin 1 is the reference pin: its machine place is recorded once on the Control page, and after every E-stop or power cycle Reference X Y from pin 1 makes machine X and Y, every saved work offset and the soft limits hold again."))
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: I/O pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
+        }
+        _ if lathe::is_lathe(m) => {
+            form = form
+                .push(bold(m.name(), 18))
+                .push(muted(format!("Manual lathe · speeds {} rpm", get(p, "speeds"))))
+                .push(muted(format!(
+                    "Swing {} · centres {} {}",
+                    get(p, "swing"),
+                    get(p, "centres"),
+                    get(p, "units")
+                )))
+                .push(muted(match lathe::cross_reads(m) {
+                    Some(reads) => format!("Cross-slide dial reads the {}", reads.to_lowercase()),
+                    None => "Cross-slide dial: checked on the first lathe setup".to_string(),
+                }))
+                .push(warnings(m.issues()))
+                .push(note("Save this profile to your local library. Assign it to a setup, or add a lathe setup, to turn on it."));
         }
         _ if manual::is_manual(m) => {
             form = form
@@ -5576,7 +5669,7 @@ fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
 /// it, except a manual mill's, which have steps instead of a run.
 pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize, &'a Setup)> {
     (doc.setups.iter().enumerate())
-        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_manual(&x.machine))
+        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_hand(&x.machine))
         .collect()
 }
 
@@ -8235,7 +8328,7 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
             let uc100 = (app.doc.setups.get(s.setup))
                 .is_some_and(|x| get(&x.machine.p, "controller") == "UC100");
             let manual =
-                (app.doc.setups.get(s.setup)).is_some_and(|x| crate::manual::is_manual(&x.machine));
+                (app.doc.setups.get(s.setup)).is_some_and(|x| crate::manual::is_hand(&x.machine));
             let card = if manual {
                 NcCard::Manual
             } else if uc100 {
@@ -8312,7 +8405,11 @@ fn post(app: &App) -> Element<'_, Message> {
                             .push(warnings(problems.to_vec()));
                     }
                     NcCard::Manual => {
-                        summary = summary.push(muted(crate::manual::no_gcode(name)));
+                        let line = match app.doc.setups.iter().find(|x| x.name() == *name) {
+                            Some(x) => crate::manual::no_gcode_on(&x.machine, name),
+                            None => crate::manual::no_gcode(name),
+                        };
+                        summary = summary.push(muted(line));
                     }
                     NcCard::Run { problems, setup } => {
                         let mark = if problems.is_empty() { "✓" } else { "!" };

@@ -1323,7 +1323,7 @@ fn setups(app: &App) -> Element<'_, Message> {
     }
     let active = app.doc.index();
     let cnc = (app.doc.setups.iter().enumerate())
-        .filter(|(_, s)| !manual::is_manual(&s.machine))
+        .filter(|(_, s)| !manual::is_hand(&s.machine))
         .min_by_key(|(si, _)| (*si < active, *si));
     if let Some((si, s)) = cnc {
         c = c.push(space().height(8)).push(muted("CNC")).push(

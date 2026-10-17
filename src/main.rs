@@ -9,6 +9,7 @@ mod forces;
 mod guide;
 mod help;
 mod holding;
+mod lathe;
 mod look;
 mod machine_view;
 mod manual;
@@ -3048,6 +3049,9 @@ impl App {
                 Target::Machine => {
                     if k == "kind" {
                         manual::set_kind(&mut self.machine_draft, &v);
+                    } else if k == "cross_reads" && !["Diameter", "Radius"].contains(&v.as_str()) {
+                        // "Not known yet": the dial check will ask.
+                        self.machine_draft.p.insert(k.into(), String::new());
                     } else {
                         self.machine_draft.p.insert(k.into(), v.clone());
                     }
@@ -3704,7 +3708,7 @@ impl App {
                 // sets the work zero of the setup it started with (#165).
                 if si >= self.doc.setups.len()
                     || c.setup_locked()
-                    || manual::is_manual(&self.doc.setups[si].machine)
+                    || manual::is_hand(&self.doc.setups[si].machine)
                 {
                     return Task::none();
                 }
@@ -3804,7 +3808,7 @@ impl App {
                 return self.picture_run();
             }
             Message::SaveMachine => {
-                if manual::is_manual(&self.machine_draft) {
+                if manual::is_hand(&self.machine_draft) {
                     manual::settle(&mut self.machine_draft);
                 }
                 let errors = self.machine_draft.issues();
@@ -5354,8 +5358,11 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         eprintln!("! {e}");
     }
     for setup in &job.setups {
-        if manual::is_manual(&doc.setups[setup.setup].machine) {
-            println!("{}", manual::no_gcode(&setup.name));
+        if manual::is_hand(&doc.setups[setup.setup].machine) {
+            println!(
+                "{}",
+                manual::no_gcode_on(&doc.setups[setup.setup].machine, &setup.name)
+            );
             continue;
         }
         match &setup.result {

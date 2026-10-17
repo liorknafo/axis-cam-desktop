@@ -93,7 +93,7 @@ impl PostSettings {
     /// (`for_machine`), but a manual mill makes no G-code, so its controller
     /// and post settings do not count.
     pub fn for_holding(m: &Machine) -> Result<Self, Vec<String>> {
-        if crate::manual::is_manual(m) {
+        if crate::manual::is_hand(m) {
             Ok(Self::read(m))
         } else {
             Self::for_machine(m)
@@ -2474,7 +2474,7 @@ pub(crate) fn checked(
     settings: Settings,
 ) -> Result<Vec<Checked>, Vec<String>> {
     let setup = &doc.setups[si];
-    if crate::manual::is_manual(&setup.machine) {
+    if crate::manual::is_hand(&setup.machine) {
         return Ok(vec![]);
     }
     let offset = get(&setup.p, "offset").to_string();
