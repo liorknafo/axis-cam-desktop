@@ -1754,6 +1754,8 @@ fn raster_prism(
         look, pixels, part_depth, size, &faces, &edges, ratio, scale, buffers,
     );
 }
+/// An edge between two projected points, each with its depth.
+type Edge = ((Point, f32), (Point, f32));
 /// Composite only the nearest surface of the convex polygons `faces`, each
 /// with its tone; use both surfaces and part depth to draw `edges` visible
 /// or dashed hidden.
@@ -1764,7 +1766,7 @@ fn raster_faces(
     part_depth: &[f32],
     (w, h): (u32, u32),
     faces: &[(Vec<(Point, f32)>, u8)],
-    edges: &[((Point, f32), (Point, f32))],
+    edges: &[Edge],
     ratio: f32,
     scale: f32,
     buffers: &mut SolidBuffers,

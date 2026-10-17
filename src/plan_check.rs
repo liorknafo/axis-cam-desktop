@@ -340,7 +340,7 @@ pub struct PartGrid {
 }
 impl PartGrid {
     /// `geometry` and `stock` must both be in setup 1's frame.
-    pub fn new(stock: &Volume, geometry: &Geometry) -> Self {
+    pub(crate) fn new(stock: &Volume, geometry: &Geometry) -> Self {
         let index = Index::new(geometry);
         let mut inside = vec![false; stock.occupied.len()];
         for y in 0..stock.n[1] {

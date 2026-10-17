@@ -67,9 +67,9 @@ impl Prism {
             max: [f32::NEG_INFINITY; 3],
         };
         for p in self.ends.iter().flatten() {
-            for k in 0..3 {
-                b.min[k] = b.min[k].min(p[k]);
-                b.max[k] = b.max[k].max(p[k]);
+            for (k, v) in p.iter().enumerate() {
+                b.min[k] = b.min[k].min(*v);
+                b.max[k] = b.max[k].max(*v);
             }
         }
         b
@@ -916,11 +916,13 @@ mod tests {
     }
     #[test]
     fn the_setup_names_the_chuck_and_lists_its_problems() {
-        let mut doc = crate::model::Document::default();
-        doc.setups = vec![setup(&[
-            ("chuck_tailstock", "Retracted"),
-            ("holding_gap", "2"),
-        ])];
+        let mut doc = crate::model::Document {
+            setups: vec![setup(&[
+                ("chuck_tailstock", "Retracted"),
+                ("holding_gap", "2"),
+            ])],
+            ..Default::default()
+        };
         let s = &doc.setups[0];
         assert_eq!(doc.holding_label(s), "3-jaw chuck on A");
         assert_eq!(
