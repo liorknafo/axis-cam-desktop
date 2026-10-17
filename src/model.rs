@@ -469,6 +469,10 @@ pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
 /// across its cut, near its bottom, that keep the part joined to the stock
 /// around it when the cut goes through.
 pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
+/// What a Drill makes (`holes`): the round holes of the part's surfaces it
+/// selects, or the holes a later setup drops over the fixture pins by in
+/// the stock's leftover (`pin_points`), as its Work zero step placed them.
+pub const DRILL_HOLES: [&str; 2] = ["Part's holes", "Pin holes"];
 /// The tab settings an operation starts with, and takes when tabs are
 /// turned on in a project saved before them: tabs on each outline, each
 /// one's width at its narrowest (mm) and its thickness (mm).
@@ -726,8 +730,13 @@ impl Operation {
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
+    /// Whether this is a Drill of the pin holes in the stock's leftover
+    /// (`DRILL_HOLES`), which selects no surfaces.
+    pub fn drills_pin_holes(&self) -> bool {
+        self.strategy == Strategy::Drill && get(&self.p, "holes") == DRILL_HOLES[1]
+    }
     pub fn needs_surfaces(&self) -> bool {
-        self.strategy.needs_surfaces()
+        (self.strategy.needs_surfaces() && !self.drills_pin_holes())
             || (self.strategy == Strategy::Contour
                 && get(&self.p, "boundary") == "Selected geometry")
     }
@@ -796,7 +805,14 @@ impl Operation {
         let tool = tools.iter().find(|t| t.id == self.tool);
         if let Some(t) = tool {
             e.extend(t.issues());
-            if self.strategy == Strategy::Drill
+            if self.drills_pin_holes() {
+                if !["Drill", "Flat end mill"].contains(&get(&t.p, "type")) {
+                    e.push(
+                        "Choose a drill, or a flat end mill to mill them, for the pin holes."
+                            .into(),
+                    )
+                }
+            } else if self.strategy == Strategy::Drill
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
             {
                 e.push(
