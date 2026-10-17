@@ -10659,8 +10659,36 @@ flood = { pin = 8 }
     fn tool_in_use_cannot_be_deleted() {
         let mut a = app();
         let tool = a.doc.tools[0].id.clone();
-        let _ = a.update(Message::DeleteTool(tool));
-        assert_eq!(a.doc.tools.len(), 3)
+        let users = a.doc.tool_users(&tool);
+        assert!(!users.is_empty());
+        let _ = a.update(Message::DeleteTool(tool.clone()));
+        assert_eq!(a.doc.tools.len(), 3);
+        // The refusal and the tool editor name the operations that use it.
+        let note = a.doc.tool_in_use_note(&tool).unwrap();
+        for u in &users {
+            assert!(note.contains(u.as_str()), "{note}");
+            assert!(a.status.contains(u.as_str()), "{}", a.status);
+        }
+        let unused = a
+            .doc
+            .tools
+            .iter()
+            .find(|t| a.doc.tool_users(&t.id).is_empty())
+            .map(|t| t.id.clone());
+        if let Some(unused) = unused {
+            assert_eq!(a.doc.tool_in_use_note(&unused), None);
+        }
+        // A tool on many operations names the first five and counts the rest.
+        let op = a.doc.setups[0].operations[0].clone();
+        for _ in 0..7 {
+            let mut o = op.clone();
+            o.tool = tool.clone();
+            a.doc.setups[0].operations.push(o);
+        }
+        let n = a.doc.tool_users(&tool).len();
+        let note = a.doc.tool_in_use_note(&tool).unwrap();
+        assert!(note.contains(&format!("{n} operations: ")), "{note}");
+        assert!(note.contains(&format!(" and {} more.", n - 5)), "{note}");
     }
     #[test]
     fn new_strategy_gets_correct_tabs_and_tool() {

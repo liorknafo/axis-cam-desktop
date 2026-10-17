@@ -1540,6 +1540,37 @@ impl Document {
         }
         changed
     }
+    /// The operations that cut with tool `id`, as "Setup · Operation".
+    pub fn tool_users(&self, id: &str) -> Vec<String> {
+        self.setups
+            .iter()
+            .flat_map(|s| {
+                s.operations
+                    .iter()
+                    .filter(|o| o.tool == id)
+                    .map(move |o| format!("{} · {}", s.name(), o.name()))
+            })
+            .collect()
+    }
+    /// Why tool `id` cannot be deleted: the operations that use it, the
+    /// first five named so the note stays a line or two.
+    pub fn tool_in_use_note(&self, id: &str) -> Option<String> {
+        const NAMED: usize = 5;
+        let users = self.tool_users(id);
+        let list = match users.len() {
+            0 => return None,
+            1 => users[0].clone(),
+            n if n <= NAMED => format!("{n} operations: {}", users.join(", ")),
+            n => format!(
+                "{n} operations: {} and {} more",
+                users[..NAMED].join(", "),
+                n - NAMED
+            ),
+        };
+        Some(format!(
+            "Used by {list}. Assign another tool to them before deleting this one."
+        ))
+    }
     pub fn tool_number_issues(&self, tool: &Tool) -> Vec<String> {
         let Some(n) = tool.number() else {
             return vec![format!(
