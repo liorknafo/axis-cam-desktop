@@ -41,10 +41,25 @@ pub struct Limits {
     pub y: [f32; 2],
     pub z: f32,
 }
+/// A vise as the Hold step draws it: its jaws close across axis `across`
+/// (0 X, 1 Y) and grip `grip` mm of the stock up from `Gripped::bottom`;
+/// its jaw plates are `jaw_height` tall and `jaw_thickness` thick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vise {
+    pub across: usize,
+    pub grip: f32,
+    pub jaw_height: f32,
+    pub jaw_thickness: f32,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
-    /// The stock box the setup starts from and what the vise or clamps hold.
-    Hold { stock: Bounds, holding: Gripped },
+    /// The stock box the setup starts from, what the vise or clamps hold,
+    /// and the vise when it is one.
+    Hold {
+        stock: Bounds,
+        holding: Gripped,
+        vise: Option<Vise>,
+    },
     /// The work zero, `corner` on the DRO, picked up with an edge finder of
     /// diameter `finder` and the DRO's compensation off: X and Y each touch
     /// one face (`approach`: −1 the − face from outside it, +1 the + face; a
@@ -373,6 +388,17 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     let bands = (!before.cuts.is_empty())
         .then(|| crate::holding::Bands::new(&before, frame, simulation::part_box(setup, mesh)));
     let held = crate::holding::held_by(doc, setup, stock, bands.as_ref());
+    let vise = match crate::holding::layout(setup) {
+        Ok(crate::holding::Layout::Vise { axis_y, grip, .. }) => {
+            (doc.holder(get(&setup.p, "holder"))).map(|h| Vise {
+                across: usize::from(axis_y),
+                grip,
+                jaw_height: num(&h.p, "jaw_height").unwrap_or(grip).max(grip),
+                jaw_thickness: num(&h.p, "jaw_thickness").unwrap_or(0.),
+            })
+        }
+        _ => None,
+    };
     let origin = get(&setup.p, "origin");
     let found = crate::post::references(origin)
         .zip(crate::post::touch_point(origin, stock))
@@ -389,6 +415,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 band: work(held.band),
                 bottom: held.bottom - zero[2],
             },
+            vise,
         },
         Step::Zero {
             corner: std::array::from_fn(|k| found.1[k] - zero[k]),
@@ -725,9 +752,15 @@ pub(crate) mod tests {
                 "Holes", "Check", "HandOver"
             ]
         );
-        let Step::Hold { stock, holding } = &guide.steps[0] else {
+        let Step::Hold {
+            stock,
+            holding,
+            vise,
+        } = &guide.steps[0]
+        else {
             panic!()
         };
+        assert_eq!(*vise, None);
         // In work coordinates: the zero on the stock top's front-left corner.
         assert_eq!((stock.min[0], stock.min[1], stock.max[2]), (0., 0., 0.));
         close(stock.max[1], 120.);
@@ -766,6 +799,39 @@ pub(crate) mod tests {
         assert_eq!(guide.steps[12], Step::HandOver { next: Some(1) });
         // The Step's floor is closed: not a squaring Box.
         assert!(matches!(guide.steps[3], Step::Tool { op: 1, .. }));
+    }
+    /// The job in the manual mill's vise, its jaws on the Y sides.
+    pub(crate) fn in_the_vise(doc: &mut Document) {
+        doc.adopt_holders();
+        let mill = doc.setups[0].machine.id.clone();
+        for h in &mut doc.workholding {
+            h.p.insert("machines".into(), mill.clone());
+        }
+        doc.setups[0].p.insert("holding".into(), "Vise".into());
+        doc.setups[0].p.insert("vise_axis".into(), "Y".into());
+        doc.settle_holding(0);
+    }
+    #[test]
+    fn the_hold_step_has_the_vise_its_grip_and_jaw_height() {
+        let (mut doc, mesh) = job("Yes");
+        in_the_vise(&mut doc);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Step::Hold {
+            stock,
+            holding,
+            vise: Some(vise),
+        } = &guide.steps[0]
+        else {
+            panic!("{:?}", guide.steps[0])
+        };
+        let setup = &doc.setups[0];
+        let holder = doc.holder(get(&setup.p, "holder")).unwrap();
+        assert_eq!(vise.across, 1);
+        assert_eq!(Some(vise.grip), num(&setup.p, "vise_grip"));
+        assert_eq!(Some(vise.jaw_height), num(&holder.p, "jaw_height"));
+        assert_eq!(Some(vise.jaw_thickness), num(&holder.p, "jaw_thickness"));
+        assert!(vise.grip > 0. && vise.grip < stock.max[2] - stock.min[2]);
+        assert_eq!(holding.bottom, stock.min[2]);
     }
     #[test]
     fn every_new_tool_picks_up_z_on_the_top_left_before_its_operation() {

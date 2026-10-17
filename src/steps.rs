@@ -44,10 +44,17 @@ pub struct Shown {
     /// The stock box before each operation, then after the last, in work
     /// coordinates (`simulation::leftover_box`).
     boxes: Vec<Bounds>,
-    /// The vise jaws or clamps, in work coordinates.
+    /// The vise jaws or clamps, in work coordinates, from the stock's
+    /// bottom up (`holding::shown`).
     jaws: Vec<Bounds>,
+    /// For the Hold step, in a vise: its jaws at their full height and the
+    /// parallels under the stock, in work coordinates.
+    vise: Vec<Bounds>,
+    parallels: Vec<Bounds>,
     /// The stock in 3D: before the setup, then after each operation.
     pictures: Vec<Option<image::Handle>>,
+    /// The stock in 3D as it starts, in the vise on its parallels.
+    held: Option<image::Handle>,
 }
 /// The normal of a planar polygon (Newell's), not normalised.
 fn normal(p: &[[f32; 3]]) -> [f32; 3] {
@@ -109,11 +116,43 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         }
         _ => vec![],
     };
+    let jaws: Vec<Bounds> = jaws.into_iter().map(work).collect();
+    // In a vise: the jaw plates go down from the grip by their height, and
+    // parallels fill what is under the stock between them.
+    let (vise, parallels) = match &guide.steps[0] {
+        Step::Hold {
+            holding,
+            vise: Some(v),
+            ..
+        } if !jaws.is_empty() => {
+            let tall: Vec<Bounds> = (jaws.iter())
+                .map(|j| Bounds {
+                    min: [j.min[0], j.min[1], j.max[2] - v.jaw_height],
+                    max: j.max,
+                })
+                .collect();
+            let (s, k) = (holding.stock, v.across);
+            let floor = holding.bottom + v.grip - v.jaw_height;
+            let w = ((s.max[k] - s.min[k]) / 4.).min(10.);
+            let bars = [s.min[k] + 2., s.max[k] - 2. - w].map(|a| {
+                let mut b = s;
+                (b.min[k], b.max[k]) = (a, a + w);
+                (b.min[2], b.max[2]) = (floor, s.min[2]);
+                b
+            });
+            let under = floor < s.min[2] - 0.5;
+            (tall, if under { bars.to_vec() } else { vec![] })
+        }
+        _ => (vec![], vec![]),
+    };
     let frame = crate::volume::Frame::new(setup, mesh);
-    let held: Vec<_> = (jaws.iter())
-        .flat_map(|b| viewport::box_triangles(*b, viewport::JAWS))
-        .collect();
-    let picture = |v: &crate::volume::Volume, box_: Bounds| {
+    let solid = |boxes: &[Bounds]| -> Vec<_> {
+        (boxes.iter())
+            .flat_map(|b| viewport::box_triangles(b.translated(zero), viewport::JAWS))
+            .collect()
+    };
+    let held = solid(&jaws);
+    let picture = |v: &crate::volume::Volume, box_: Bounds, held: &[_]| {
         let surface = crate::stock_surface::Snapshot {
             bounds: v.bounds,
             frame: v.frame,
@@ -128,17 +167,25 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         triangles.extend(held.iter().copied());
         viewport::stock_picture(&triangles, PICTURE)
     };
-    let jaws = jaws.into_iter().map(work).collect();
-    let mut pictures = vec![picture(&guide.before, boxes[0])];
+    let mut pictures = vec![picture(&guide.before, boxes[0], &held)];
     for (d, b) in guide.done.iter().zip(&boxes[1..]) {
-        pictures.push(picture(&d.after, *b));
+        pictures.push(picture(&d.after, *b, &held));
     }
+    let held = if vise.is_empty() {
+        pictures[0].clone()
+    } else {
+        let tall = solid(&[&vise[..], &parallels].concat());
+        picture(&guide.before, boxes[0], &tall)
+    };
     Ok(Shown {
         guide,
         part,
         boxes,
         jaws,
+        vise,
+        parallels,
         pictures,
+        held,
     })
 }
 
@@ -494,6 +541,13 @@ enum Shape {
     Hole([f32; 3], f32, usize, Lit),
     /// A word at a point.
     Word([f32; 3], String, Color),
+    /// A solid block, such as a parallel under the stock.
+    Block(Bounds),
+    /// An arrow `mm` long down onto a point, labelled at its tail.
+    Down([f32; 3], f32, String),
+    /// A height from `[0]` down to `[1]`, measured just right of them,
+    /// labelled on its right.
+    Height([f32; 3], [f32; 3], String),
 }
 /// The top view or a side view of a step, drawn once per step
 /// (`canvas::Cache`): the stock box, the part, the jaws, the cuts, the
@@ -535,6 +589,14 @@ impl Drawing<'_> {
                 Shape::Finder(p, _, _) => {
                     grow([p[a] - 12., p[b] - 12.]);
                     grow([p[a] + 12., p[b] + 12.]);
+                }
+                Shape::Down(p, mm, _) => {
+                    grow([p[a], p[b]]);
+                    grow([p[a], p[b] + mm]);
+                }
+                Shape::Block(bx) => {
+                    grow([bx.min[a], bx.min[b]]);
+                    grow([bx.max[a], bx.max[b]]);
                 }
                 _ => {}
             }
@@ -720,6 +782,37 @@ impl Drawing<'_> {
                     );
                 }
                 Shape::Word(q, s, c) => write(f, s.clone(), p3(*q), *c, 13., Align::Left),
+                Shape::Block(bx) => {
+                    let r = rect(bx);
+                    f.fill(&path(r), DONE);
+                    f.stroke(&path(r), stroke(INK, 1.));
+                }
+                Shape::Down(q, mm, s) => {
+                    let mut t = *q;
+                    t[b] += mm;
+                    let (head, tail) = (p3(*q), p3(t));
+                    arrow(f, tail, head, ACCENT, 2.5);
+                    write(
+                        f,
+                        s.clone(),
+                        Point::new(tail.x + 8., tail.y + 6.),
+                        ACCENT,
+                        13.,
+                        Align::Left,
+                    );
+                }
+                Shape::Height(top, bottom, s) => {
+                    let (m, n) = (p3(*top), p3(*bottom));
+                    let x = m.x + 7.;
+                    for y in [m.y, n.y] {
+                        let tick = canvas::Path::line(Point::new(x - 5., y), Point::new(x + 5., y));
+                        f.stroke(&tick, stroke(ACCENT, 1.6));
+                    }
+                    let span = canvas::Path::line(Point::new(x, m.y), Point::new(x, n.y));
+                    f.stroke(&span, stroke(ACCENT, 1.6));
+                    let mid = Point::new(x + 9., (m.y + n.y) / 2.);
+                    write(f, s.clone(), mid, ACCENT, 13., Align::Left);
+                }
             }
         }
         // The work zero and the axes.
@@ -1095,6 +1188,17 @@ impl<'a> Page<'a> {
         shapes: Vec<Shape>,
         height: f32,
     ) -> Element<'a, Message> {
+        self.drawing_with(view, stock, shapes, height, &self.shown.jaws)
+    }
+    /// A drawing with these `jaws`.
+    fn drawing_with(
+        &self,
+        view: usize,
+        stock: Bounds,
+        shapes: Vec<Shape>,
+        height: f32,
+        jaws: &'a [Bounds],
+    ) -> Element<'a, Message> {
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         (self.key, self.at, self.item, view).hash(&mut h);
@@ -1103,15 +1207,22 @@ impl<'a> Page<'a> {
             axes: VIEWS[view],
             stock,
             part: &self.shown.part[view],
-            jaws: &self.shown.jaws,
+            jaws,
             shapes,
         })
         .width(Fill)
         .height(height)
         .into()
     }
-    fn picture(&self, i: usize, (w, h): (f32, f32)) -> Element<'a, Message> {
-        match self.shown.pictures.get(i).cloned().flatten() {
+    fn picture(&self, i: usize, size: (f32, f32)) -> Element<'a, Message> {
+        Self::image(self.shown.pictures.get(i).cloned().flatten(), size)
+    }
+    /// The stock as it starts, in its vise on its parallels.
+    fn held_picture(&self, size: (f32, f32)) -> Element<'a, Message> {
+        Self::image(self.shown.held.clone(), size)
+    }
+    fn image(picture: Option<image::Handle>, (w, h): (f32, f32)) -> Element<'a, Message> {
+        match picture {
             Some(p) => image(p).width(w).height(h).into(),
             None => container(muted("No picture of the stock."))
                 .width(w)
@@ -1387,15 +1498,56 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
         Message::Guide(GuideAction::Next),
     ));
     let (title, sub, left, right): (String, &str, Element<_>, Column<_>) = match &g.steps[p.at] {
-        Step::Hold { stock, .. } => {
+        Step::Hold {
+            stock,
+            holding,
+            vise,
+        } => {
             let d = stock.dimensions();
             let mut c = vec![chip(p.app.doc.holding_label(p.setup)), chip("top face up")];
-            if get(&p.setup.p, "holding") == "Vise" {
-                c.push(chip(format!(
-                    "jaws on the {} sides",
-                    get(&p.setup.p, "vise_axis")
-                )));
+            // Across the jaws, seen from the front or the right: the stock
+            // on its parallels, the jaws at their height and the grip.
+            let view = match vise {
+                Some(v) if v.across == 1 => 2,
+                _ => 1,
+            };
+            let (k, top) = (VIEWS[view][0], stock.max[2]);
+            let height = stock.max[2] - stock.min[2];
+            let mut shapes: Vec<Shape> =
+                p.shown.parallels.iter().map(|b| Shape::Block(*b)).collect();
+            let mut mid = [0.; 3];
+            mid[k] = (stock.min[k] + stock.max[k]) / 2.;
+            mid[2] = top;
+            shapes.push(Shape::Down(
+                mid,
+                (height * 0.4).max(8.),
+                "THIS FACE UP".into(),
+            ));
+            if let Some(v) = vise {
+                let jaw = holding.bottom + v.grip;
+                let (mut a, mut b) = ([0.; 3], [0.; 3]);
+                // Outside the + jaw.
+                let out = stock.max[k] + v.jaw_thickness;
+                (a[k], b[k]) = (out, out);
+                (a[2], b[2]) = (jaw, holding.bottom);
+                shapes.push(Shape::Height(a, b, format!("{} in the jaws", mm(v.grip))));
+                c.push(chip(format!("jaws on the {} sides", AXES[v.across])));
+                c.push(chip(format!("{} in the jaws", mm(v.grip))));
+                let under = holding.bottom + v.grip - v.jaw_height;
+                if !p.shown.parallels.is_empty() {
+                    c.push(chip(format!(
+                        "on parallels {} high",
+                        mm(stock.min[2] - under)
+                    )));
+                }
             }
+            let left = column![
+                p.held_picture((420., 250.)),
+                p.drawing_with(view, *stock, shapes, 200., &p.shown.vise),
+            ]
+            .spacing(6)
+            .align_x(Alignment::Center)
+            .into();
             let right = column![
                 label("Stock as it starts"),
                 chips(c),
@@ -1413,12 +1565,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     None
                 ),
             ];
-            (
-                "Hold".into(),
-                "where it goes in the vise",
-                p.picture(0, (480., 320.)),
-                right,
-            )
+            ("Hold".into(), "where it goes in the vise", left, right)
         }
         Step::Zero {
             approach,
@@ -2265,6 +2412,49 @@ pub(crate) mod tests {
         a
     }
     #[test]
+    fn the_hold_step_draws_the_vise_its_grip_and_parallels() {
+        let a = app_with("Yes", crate::guide::tests::in_the_vise);
+        let shown = a.guide_at().unwrap().0;
+        let Step::Hold {
+            stock,
+            holding,
+            vise: Some(v),
+        } = shown.guide.steps[0]
+        else {
+            panic!()
+        };
+        let t = texts(&a);
+        let grip = format!("{} in the jaws", mm(v.grip));
+        for want in ["jaws on the Y sides", grip.as_str(), "top face up"] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // The jaws reach from the grip down by their height, the parallels
+        // from there up to the stock's bottom, between the jaws.
+        assert_eq!(shown.vise.len(), 2);
+        for j in &shown.vise {
+            close(j.max[2], holding.bottom + v.grip);
+            close(j.max[2] - j.min[2], v.jaw_height);
+        }
+        assert_eq!(shown.parallels.len(), 2);
+        for b in &shown.parallels {
+            close(b.max[2], stock.min[2]);
+            close(b.min[2], holding.bottom + v.grip - v.jaw_height);
+            assert!(b.min[1] > stock.min[1] && b.max[1] < stock.max[1], "{b:?}");
+        }
+        let high = format!(
+            "on parallels {} high",
+            mm(stock.min[2] - shown.parallels[0].min[2])
+        );
+        assert!(t.contains(&high), "{high} in {t:?}");
+        // Without a vise: no jaws, no parallels.
+        let a = app("Yes");
+        let shown = a.guide_at().unwrap().0;
+        assert!(shown.vise.is_empty() && shown.parallels.is_empty());
+    }
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-3, "{a} != {b}");
+    }
+    #[test]
     fn the_square_step_shows_the_dro_diameter_and_comp_side() {
         let t = texts(&squared("Yes"));
         for want in [
@@ -2509,16 +2699,7 @@ pub(crate) mod tests {
         let a = squared("Yes");
         render(&a, (1280, 800), &dir.join("04-square.png"));
         // In a vise on the manual mill: the jaws in the pictures.
-        let mut a = app_with("Yes", |doc| {
-            doc.adopt_holders();
-            let mill = doc.setups[0].machine.id.clone();
-            for h in &mut doc.workholding {
-                h.p.insert("machines".into(), mill.clone());
-            }
-            doc.setups[0].p.insert("holding".into(), "Vise".into());
-            doc.setups[0].p.insert("vise_axis".into(), "Y".into());
-            doc.settle_holding(0);
-        });
+        let mut a = app_with("Yes", crate::guide::tests::in_the_vise);
         let shown = a.guide_at().unwrap().0;
         let Step::Hold { stock, .. } = shown.guide.steps[0] else {
             panic!()
