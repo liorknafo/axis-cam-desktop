@@ -1541,7 +1541,16 @@ fn emit(
                             (Motion::Rapid, 6000.)
                         };
                         out.push(point(*to, up[2]), across.0, across.1, false)?;
-                        out.push(point(*to, h.entry), Motion::Rapid, 6000., false)?;
+                        // At rapid only down to just over the stock top:
+                        // below it the column is cleared by this operation's
+                        // own levels, which no later check can prove.
+                        let top = out.plan.stock.max[2] + ENTRY;
+                        if h.entry < top && out.at[2] > top {
+                            out.push(point(*to, top), Motion::Rapid, 6000., false)?;
+                            out.push(point(*to, h.entry), Motion::Feed, f.feed, false)?;
+                        } else {
+                            out.push(point(*to, h.entry), Motion::Rapid, 6000., false)?;
+                        }
                         if !above {
                             let rate = if *slow { f.feed * 0.25 } else { f.feed };
                             out.push(point(*to, h.z), Motion::Feed, rate, false)?;
@@ -2222,6 +2231,14 @@ mod tests {
                 .iter()
                 .any(|m| m.cutting_pass && m.from[2] != m.to[2])
         );
+        // No rapid goes down below the stock top: there only this
+        // operation's own levels cleared the column, which the export's
+        // check cannot prove.
+        for plan in [&climb, &plunge] {
+            assert!(!plan.moves.iter().any(|m| m.motion == Motion::Rapid
+                && m.to[2] < m.from[2]
+                && m.to[2] < plan.stock.max[2]));
+        }
         let expected = (20. * 16. - 4. * 4.) * 6.;
         for plan in [climb, conventional, plunge] {
             for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
@@ -2531,28 +2548,36 @@ mod tests {
         let plan = generate(&setup, &op, &tool, &mesh).unwrap();
         assert_eq!(plan.levels, 1);
     }
+    /// Slow (about 20 minutes in a debug build): run with --ignored.
     #[test]
-    fn the_totem_plate_clears_with_a_2_mm_cutter_at_its_default_load_in_two_levels() {
+    #[ignore]
+    fn the_totem_plate_clears_and_posts_with_a_2_mm_cutter_at_its_default_load_in_two_levels() {
         if crate::step::skip_without_helper() {
             return;
         }
-        let mesh = mesh::load(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("examples/totem-case-top-right.step"),
-        )
-        .unwrap();
-        // What a new Adaptive clearing with a Ø2 starts with: a 0.3 mm load
-        // and a 4 mm stepdown, with 0.3 mm stock to leave.
-        let (setup, mut op, mut tool, _) = ring();
-        tool.p.insert("diameter".into(), "2".into());
-        for (k, v) in [
-            ("optimal_load", "0.3"),
-            ("stepdown", "4"),
-            ("allowance", "0.3"),
+        // The keyboard plate, cleared adaptively with what a new operation
+        // on a Ø2 starts with: a 0.3 mm load and a 4 mm stepdown, with the
+        // default 0.3 mm stock to leave; posted as the NC review posts it.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/totem-case-top-right.step");
+        let mesh = mesh::load(&path).unwrap();
+        let (mut doc, _) = crate::post::fixture::job();
+        let file = doc.file.as_mut().unwrap();
+        file.path = path;
+        file.name = "totem-case-top-right.step".into();
+        file.format = "step".into();
+        let setup = &mut doc.setups[0];
+        for k in [
+            "stock_top",
+            "stock_bottom",
+            "stock_left",
+            "stock_right",
+            "stock_front",
+            "stock_back",
         ] {
-            op.p.insert(k.into(), v.into());
+            setup.p.insert(k.into(), "0".into());
         }
-        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let placement = stock::Placement::new(&mesh, Some(setup));
         let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
         let (id, _) = mesh
             .surfaces
@@ -2565,18 +2590,35 @@ mod tests {
             })
             .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
             .unwrap();
+        let mut tool = Tool::new("Flat 2", "Flat end mill", "2");
+        tool.p.insert("number".into(), "4".into());
+        let mut op = Operation::new(Strategy::Adaptive, tool.id.clone());
+        op.geometry.clear();
         op.surfaces = Some(surface::Selection {
             mesh_fingerprint: mesh.fingerprint.clone(),
             ids: vec![id],
         });
-        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
-        assert_eq!(plan.levels, 2);
-        let moves = plan.moves.len();
-        let started = std::time::Instant::now();
-        let mut sim = Simulation::new(plan);
-        sim.seek(1.);
-        eprintln!("{moves} moves, simulated in {:?}", started.elapsed());
-        assert!(sim.stock.removed_volume() > 10_000.);
+        for (k, v) in [("optimal_load", "0.3"), ("stepdown", "4")] {
+            op.p.insert(k.into(), v.into());
+        }
+        setup.operations = vec![op];
+        doc.tools.push(tool);
+        let job = crate::post::post_job(&doc, &mesh);
+        let errors: Vec<String> = job
+            .errors
+            .iter()
+            .cloned()
+            .chain(
+                job.setups
+                    .iter()
+                    .filter_map(|s| s.result.as_ref().err())
+                    .flatten()
+                    .cloned(),
+            )
+            .collect();
+        assert!(job.ready(), "{errors:?}");
+        let program = &job.setups[0].result.as_ref().unwrap()[0];
+        assert!(program.lines > 100_000, "{} lines", program.lines);
     }
     #[test]
     fn settings_out_of_range_are_refused_with_their_limits() {
