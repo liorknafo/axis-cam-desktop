@@ -137,11 +137,17 @@ pub fn settle(m: &mut Machine) {
     }
 }
 
-/// Whether a tool or holder with these `machines` ids fits `m`. Empty fits
-/// every CNC machine and no manual machine or lathe.
-pub fn fits(machines: &str, m: &Machine) -> bool {
+/// Whether a tool or holder with these `machines` ids fits `m`. A list fits
+/// the machines it names. Empty fits every CNC machine and no manual machine
+/// or lathe, except for a tool or holder made for a lathe (`lathe_only`: a
+/// lathe tool, a chuck), which then fits lathes and nothing else.
+pub fn fits(machines: &str, lathe_only: bool, m: &Machine) -> bool {
     if machines.trim().is_empty() {
-        return !is_hand(m);
+        return if lathe_only {
+            crate::lathe::is_lathe(m)
+        } else {
+            !is_hand(m)
+        };
     }
     machines.split(',').any(|id| id.trim() == m.id)
 }
@@ -474,17 +480,17 @@ mod tests {
     #[test]
     fn an_empty_machines_list_fits_cnc_machines_only() {
         let (cnc, manual) = (Machine::new(3), defaults());
-        assert!(fits("", &cnc));
-        assert!(fits("  ", &cnc));
-        assert!(!fits("", &manual));
+        assert!(fits("", false, &cnc));
+        assert!(fits("  ", false, &cnc));
+        assert!(!fits("", false, &manual));
     }
     #[test]
     fn a_machines_list_fits_the_named_ids_whatever_their_kind() {
         let (cnc, manual, other) = (Machine::new(3), defaults(), Machine::new(4));
         let list = format!("{}, {}", cnc.id, manual.id);
-        assert!(fits(&list, &cnc));
-        assert!(fits(&list, &manual));
-        assert!(!fits(&list, &other));
+        assert!(fits(&list, false, &cnc));
+        assert!(fits(&list, false, &manual));
+        assert!(!fits(&list, false, &other));
     }
     #[test]
     fn choosing_manual_fills_the_defaults_and_keeps_what_was_entered() {

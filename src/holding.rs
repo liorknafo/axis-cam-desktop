@@ -7,7 +7,7 @@ use crate::model::{Document, Fields, Setup, fields, get, id, num};
 use crate::simulation::Plan;
 use serde::{Deserialize, Serialize};
 
-pub const KINDS: [&str; 2] = ["Vise", "Clamp"];
+pub const KINDS: [&str; 3] = ["Vise", "Clamp", "Chuck"];
 const NOTE: &str = "Measure yours: these are typical sizes.";
 /// How far below the stock bottom a vise jaw is modelled to reach.
 const JAW_DEPTH: f32 = 100.;
@@ -39,17 +39,22 @@ impl Holder {
     }
     /// The numbers that size the entry, by kind.
     pub fn keys(&self) -> &'static [&'static str] {
-        if self.kind() == "Vise" {
-            &[
+        match self.kind() {
+            "Vise" => &[
                 "jaw_width",
                 "jaw_height",
                 "jaw_thickness",
                 "max_opening",
                 "grip",
-            ]
-        } else {
-            &["length", "width", "height", "bite"]
+            ],
+            "Chuck" => &["jaws", "min_grip", "max_grip", "jaw_length", "body"],
+            _ => &["length", "width", "height", "bite"],
         }
+    }
+    /// Whether the entry is on machine `m`: one it lists, else, with no list,
+    /// every CNC machine, or for a chuck every lathe.
+    pub fn fits(&self, m: &crate::model::Machine) -> bool {
+        crate::manual::fits(get(&self.p, "machines"), self.kind() == "Chuck", m)
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
@@ -62,9 +67,13 @@ impl Holder {
             e.push("Notes can be at most 500 characters.".into());
         }
         if !KINDS.contains(&self.kind()) {
-            e.push("Choose Vise or Clamp.".into());
+            e.push("Choose Vise, Clamp or Chuck.".into());
         }
         for k in self.keys() {
+            // A chuck's jaws are 3 or 4, said below.
+            if *k == "jaws" {
+                continue;
+            }
             if !num(&self.p, k).is_some_and(|v| v > 0.) {
                 e.push(format!(
                     "{} must be a positive number.",
@@ -79,6 +88,21 @@ impl Holder {
             e.push(
                 "The clamping force must be a positive number, or empty for a typical one.".into(),
             );
+        }
+        if self.kind() == "Chuck" {
+            if !matches!(num(&self.p, "jaws"), Some(j) if j == 3. || j == 4.) {
+                e.push("A chuck has 3 or 4 jaws.".into());
+            }
+            let (min, max) = (num(&self.p, "min_grip"), num(&self.p, "max_grip"));
+            if min.zip(max).is_some_and(|(a, b)| a >= b) {
+                e.push("The smallest grip must be below the largest.".into());
+            }
+            if max
+                .zip(num(&self.p, "body"))
+                .is_some_and(|(grip, body)| body <= grip)
+            {
+                e.push("The chuck body must be wider than the largest grip.".into());
+            }
         }
         if self.kind() == "Clamp"
             && num(&self.p, "bite")
@@ -114,10 +138,29 @@ pub fn starters() -> Vec<Holder> {
     ] {
         c.p.insert(k.into(), x.into());
     }
-    for h in [&mut v, &mut c] {
+    let chuck = |name, jaws, min, max| {
+        let mut h = Holder::new("Chuck", name);
+        for (k, x) in [
+            ("jaws", jaws),
+            ("min_grip", min),
+            ("max_grip", max),
+            ("jaw_length", "30"),
+            ("body", "160"),
+        ] {
+            h.p.insert(k.into(), x.into());
+        }
+        h
+    };
+    let mut all = vec![
+        v,
+        c,
+        chuck("160 mm 3-jaw chuck", "3", "3", "140"),
+        chuck("160 mm 4-jaw chuck", "4", "6", "150"),
+    ];
+    for h in &mut all {
         h.p.insert("notes".into(), NOTE.into());
     }
-    vec![v, c]
+    all
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -155,6 +198,13 @@ pub enum Layout {
         holder: String,
         clamps: Vec<(Side, f32)>,
         gap: f32,
+    },
+    /// A lathe chuck: `grip` mm of the bar in the jaws, `stickout` mm from
+    /// the jaws to the free end. Not yet checked or drawn as boxes.
+    Chuck {
+        holder: String,
+        grip: f32,
+        stickout: f32,
     },
 }
 /// Encodes clamp positions as stored on the setup ("-X:0;+X:10").
@@ -257,6 +307,18 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
                 holder,
                 clamps,
                 gap: gap(setup)?,
+            })
+        }
+        "Chuck" => {
+            let positive = |key, what| {
+                number(get(p, key))
+                    .filter(|v| *v > 0.)
+                    .ok_or(format!("The chuck {what} must be a positive number."))
+            };
+            Ok(Layout::Chuck {
+                holder,
+                grip: positive("grip", "grip")?,
+                stickout: positive("stickout", "stickout")?,
             })
         }
         other => Err(format!("\"{other}\" is not a workholding choice.")),
@@ -423,6 +485,7 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
         Layout::None => return None,
         Layout::Vise { .. } => "Vise",
         Layout::Clamps { .. } => "Clamp",
+        Layout::Chuck { .. } => "Chuck",
     };
     if holder.kind() != want && KINDS.contains(&holder.kind()) {
         return Some(format!(
@@ -438,6 +501,21 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
             issues.join(" ")
         )
     })
+}
+/// Why `machine` cannot take the workholding a setup chose (its `holding`
+/// key): a lathe holds its bar in a chuck, not a vise or clamps, and a chuck
+/// is for a lathe. None for no workholding.
+pub fn machine_refusal(holding: &str, machine: &crate::model::Machine) -> Option<String> {
+    let lathe = crate::lathe::is_lathe(machine);
+    match holding {
+        "Vise" | "Clamps" if lathe => {
+            Some("A lathe holds the stock in a chuck, not a vise or clamps. Choose a chuck.".into())
+        }
+        "Chuck" if !lathe => {
+            Some("A chuck is for a lathe setup. Choose a vise or clamps for this machine.".into())
+        }
+        _ => None,
+    }
 }
 /// `v` mm for a message: up to two decimals, without trailing zeros.
 fn mm(v: f32) -> String {
@@ -476,7 +554,7 @@ pub fn position_issue(
 ) -> Option<String> {
     let length = held.into().on(layout).dimensions();
     match layout {
-        Layout::None => None,
+        Layout::None | Layout::Chuck { .. } => None,
         Layout::Vise { axis_y, offset, .. } => {
             let along = length[usize::from(!*axis_y)] / 2. + num(&holder.p, "jaw_width")? / 2.;
             (offset.abs() >= along).then(|| {
@@ -527,7 +605,8 @@ pub fn boxes(
         (stock.min[1] + stock.max[1]) / 2.,
     ];
     Ok(match layout {
-        Layout::None => vec![],
+        // The chuck's body is a box only from the chuck checks on.
+        Layout::None | Layout::Chuck { .. } => vec![],
         Layout::Vise {
             axis_y,
             offset,
@@ -791,6 +870,11 @@ pub fn sentence(layout: &Layout, holder: &Holder) -> String {
     let name = holder.name().trim();
     match layout {
         Layout::None => String::new(),
+        Layout::Chuck { grip, stickout, .. } => format!(
+            "{name}, grip {} mm, stickout {} mm.",
+            mm(*grip),
+            mm(*stickout)
+        ),
         Layout::Vise {
             axis_y,
             offset,
@@ -1056,6 +1140,9 @@ pub fn request(setup: &Setup, holder: Option<&Holder>) -> Result<Request, String
     let (kind, vise) = match get(&setup.p, "holding") {
         "Vise" => ("vise", true),
         "Clamps" => ("clamp", false),
+        "Chuck" => {
+            return Err("A chuck has no layout to suggest: set its grip and stickout.".into());
+        }
         _ => return Err("Choose a vise or clamps for this setup first.".into()),
     };
     let gap = gap(setup)?;
@@ -1229,12 +1316,22 @@ pub fn placement(layout: &Layout) -> Vec<(&'static str, String)> {
             ("vise_grip", mm(*grip)),
         ],
         Layout::Clamps { clamps, .. } => vec![("clamps", clamps_text(clamps))],
+        Layout::Chuck { grip, stickout, .. } => {
+            vec![("grip", mm(*grip)), ("stickout", mm(*stickout))]
+        }
     }
 }
 /// Where `layout` puts the jaws or clamps, for a status line.
 fn describe(layout: &Layout) -> String {
     match layout {
         Layout::None => String::new(),
+        Layout::Chuck { grip, stickout, .. } => {
+            format!(
+                "chuck, grip {} mm, stickout {} mm",
+                mm(*grip),
+                mm(*stickout)
+            )
+        }
         Layout::Vise { axis_y, grip, .. } => format!(
             "vise jaws on ±{}, grip {} mm",
             if *axis_y { "Y" } else { "X" },
@@ -1528,7 +1625,8 @@ pub fn holdable(
     };
     let n = setup + 1;
     match layout {
-        Layout::None => {}
+        // The chuck's grip is not checked against earlier cuts yet.
+        Layout::None | Layout::Chuck { .. } => {}
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let axis = if *axis_y { "Y" } else { "X" };
@@ -1719,7 +1817,7 @@ mod tests {
     #[test]
     fn starters_are_valid() {
         let all = starters();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 4);
         for h in &all {
             assert!(h.issues().is_empty(), "{}: {:?}", h.name(), h.issues());
             assert!(get(&h.p, "notes").contains("Measure yours"));
@@ -1730,6 +1828,286 @@ mod tests {
         let mut negative = vise();
         negative.p.insert("jaw_width".into(), "-1".into());
         assert!(!negative.issues().is_empty());
+    }
+    fn chuck(kind: &str) -> Holder {
+        let name = format!("160 mm {kind}-jaw chuck");
+        starters().into_iter().find(|h| h.name() == name).unwrap()
+    }
+    fn lathe_setup(pairs: &[(&str, &str)]) -> Setup {
+        let mut s = setup(pairs);
+        s.machine = crate::lathe::defaults();
+        s
+    }
+    #[test]
+    fn the_chuck_starters_are_3_and_4_jaw_with_measure_yours_notes() {
+        let (three, four) = (chuck("3"), chuck("4"));
+        for (h, jaws, min, max) in [(&three, "3", "3", "140"), (&four, "4", "6", "150")] {
+            assert_eq!(h.kind(), "Chuck");
+            assert!(h.issues().is_empty(), "{}: {:?}", h.name(), h.issues());
+            assert_eq!(
+                [
+                    get(&h.p, "jaws"),
+                    get(&h.p, "min_grip"),
+                    get(&h.p, "max_grip")
+                ],
+                [jaws, min, max]
+            );
+            assert_eq!(get(&h.p, "body"), "160");
+            assert!(get(&h.p, "notes").contains("Measure yours"));
+            assert!(get(&h.p, "machines").is_empty());
+        }
+        assert_eq!(
+            h_keys(&three),
+            ["jaws", "min_grip", "max_grip", "jaw_length", "body"]
+        );
+        assert_eq!(KINDS, ["Vise", "Clamp", "Chuck"]);
+    }
+    fn h_keys(h: &Holder) -> Vec<&'static str> {
+        h.keys().to_vec()
+    }
+    #[test]
+    fn a_chuck_needs_3_or_4_jaws_a_grip_range_a_jaw_length_and_a_body() {
+        let issues = |k: &str, v: &str| {
+            let mut h = chuck("3");
+            h.p.insert(k.into(), v.into());
+            h.issues()
+        };
+        assert!(issues("jaws", "4").is_empty());
+        for bad in ["2", "5", "3.5", "", "x"] {
+            assert!(
+                issues("jaws", bad)
+                    .iter()
+                    .any(|e| e.contains("3 or 4 jaws") || e.contains("jaws")),
+                "{bad}"
+            );
+        }
+        for k in ["min_grip", "max_grip", "jaw_length", "body"] {
+            for bad in ["0", "-5", "", "x"] {
+                assert!(
+                    issues(k, bad)
+                        .iter()
+                        .any(|e| e.contains(&k.replace('_', " "))),
+                    "{k}={bad}"
+                );
+            }
+        }
+        assert!(
+            issues("min_grip", "140")
+                .iter()
+                .any(|e| e.contains("smallest grip"))
+        );
+        assert!(
+            issues("min_grip", "150")
+                .iter()
+                .any(|e| e.contains("smallest grip"))
+        );
+        assert!(
+            issues("max_grip", "2")
+                .iter()
+                .any(|e| e.contains("smallest grip"))
+        );
+        assert!(issues("min_grip", "139").is_empty());
+        assert!(
+            issues("body", "140")
+                .iter()
+                .any(|e| e.contains("wider than the largest grip"))
+        );
+        assert!(issues("body", "141").is_empty());
+        // The kind itself is checked, and a vise is not asked for a chuck's sizes.
+        let mut other = chuck("3");
+        other.p.insert("kind".into(), "Collet".into());
+        assert!(
+            other
+                .issues()
+                .iter()
+                .any(|e| e.contains("Vise, Clamp or Chuck"))
+        );
+        assert!(vise().issues().is_empty());
+    }
+    #[test]
+    fn a_chuck_fits_lathes_only_and_a_vise_or_clamp_does_not_fit_one() {
+        let (lathe, cnc) = (crate::lathe::defaults(), Machine::new(3));
+        let manual = crate::manual::defaults();
+        for h in [chuck("3"), chuck("4")] {
+            assert!(h.fits(&lathe) && !h.fits(&cnc) && !h.fits(&manual));
+        }
+        for h in [vise(), clamp()] {
+            assert!(h.fits(&cnc) && !h.fits(&lathe) && !h.fits(&manual));
+        }
+        let mut listed = chuck("3");
+        listed
+            .p
+            .insert("machines".into(), format!("{},{}", cnc.id, lathe.id));
+        assert!(listed.fits(&lathe) && listed.fits(&cnc));
+    }
+    #[test]
+    fn a_chuck_layout_is_read_from_the_setup_keys() {
+        assert_eq!(
+            layout(&setup(&[
+                ("holding", "Chuck"),
+                ("holder", "c1"),
+                ("grip", "30"),
+                ("stickout", " 45.5 ")
+            ]))
+            .unwrap(),
+            Layout::Chuck {
+                holder: "c1".into(),
+                grip: 30.,
+                stickout: 45.5
+            }
+        );
+        for (grip, stickout, what) in [
+            ("", "40", "grip"),
+            ("0", "40", "grip"),
+            ("x", "40", "grip"),
+            ("30", "", "stickout"),
+            ("30", "-1", "stickout"),
+        ] {
+            assert_eq!(
+                layout(&setup(&[
+                    ("holding", "Chuck"),
+                    ("grip", grip),
+                    ("stickout", stickout)
+                ])),
+                Err(format!("The chuck {what} must be a positive number.")),
+                "{grip:?} {stickout:?}"
+            );
+        }
+        // The placement keys are the setup's own, and are written back as read.
+        let layout = Layout::Chuck {
+            holder: "c1".into(),
+            grip: 30.,
+            stickout: 45.5,
+        };
+        assert_eq!(
+            placement(&layout),
+            vec![("grip", "30".to_string()), ("stickout", "45.5".to_string())]
+        );
+        let mut s = setup(&[("holding", "Chuck")]);
+        assert!(place(&mut s, &layout));
+        assert!(!place(&mut s, &layout));
+        assert_eq!(get(&s.p, "stickout"), "45.5");
+    }
+    #[test]
+    fn the_machine_refuses_the_wrong_kind_of_workholding() {
+        let (lathe, cnc, manual) = (
+            crate::lathe::defaults(),
+            Machine::new(3),
+            crate::manual::defaults(),
+        );
+        let chuck_at = Layout::Chuck {
+            holder: String::new(),
+            grip: 30.,
+            stickout: 50.,
+        };
+        let vise_at = Layout::Vise {
+            holder: String::new(),
+            axis_y: false,
+            offset: 0.,
+            grip: 8.,
+            gap: 2.,
+        };
+        let clamps_at = Layout::Clamps {
+            holder: String::new(),
+            clamps: vec![(Side::MinusX, 0.)],
+            gap: 2.,
+        };
+        assert_eq!(machine_refusal("Chuck", &lathe), None);
+        for wrong in ["Vise", "Clamps"] {
+            assert_eq!(machine_refusal(wrong, &cnc), None);
+            assert_eq!(machine_refusal(wrong, &manual), None);
+            assert!(
+                machine_refusal(wrong, &lathe)
+                    .unwrap()
+                    .contains("chuck, not a vise or clamps")
+            );
+        }
+        for mill in [&cnc, &manual] {
+            assert!(
+                machine_refusal("Chuck", mill)
+                    .unwrap()
+                    .contains("for a lathe setup")
+            );
+        }
+        for m in [&lathe, &cnc] {
+            for none in ["", "None"] {
+                assert_eq!(machine_refusal(none, m), None);
+            }
+        }
+        // And the entry must be of the layout's kind.
+        assert!(
+            refusal(&chuck_at, &vise())
+                .unwrap()
+                .contains("is a vise, not a chuck")
+        );
+        assert!(
+            refusal(&chuck_at, &clamp())
+                .unwrap()
+                .contains("is a clamp, not a chuck")
+        );
+        assert!(
+            refusal(&vise_at, &chuck("3"))
+                .unwrap()
+                .contains("is a chuck, not a vise")
+        );
+        assert!(
+            refusal(&clamps_at, &chuck("4"))
+                .unwrap()
+                .contains("is a chuck, not a clamp")
+        );
+        assert_eq!(refusal(&chuck_at, &chuck("3")), None);
+        let mut broken = chuck("3");
+        broken.p.insert("jaws".into(), "7".into());
+        assert!(
+            refusal(&chuck_at, &broken)
+                .unwrap()
+                .contains("needs fixing")
+        );
+    }
+    #[test]
+    fn every_holding_path_takes_a_chuck_without_applying_vise_logic() {
+        let layout = Layout::Chuck {
+            holder: String::new(),
+            grip: 30.,
+            stickout: 50.,
+        };
+        let three = chuck("3");
+        // No boxes yet, and a wrong entry still refuses.
+        assert_eq!(boxes(&layout, &three, stock()), Ok(vec![]));
+        assert!(boxes(&layout, &vise(), stock()).is_err());
+        assert_eq!(
+            gripped(&layout, &three, stock(), None),
+            Gripped::whole(stock())
+        );
+        assert_eq!(opening_issue(&layout, &three, stock()), None);
+        assert_eq!(position_issue(&layout, &three, stock()), None);
+        assert_eq!(height_issue(&layout, stock()), None);
+        // The sentence and the status line say what it is.
+        assert_eq!(
+            sentence(&layout, &three),
+            "160 mm 3-jaw chuck, grip 30 mm, stickout 50 mm."
+        );
+        assert_eq!(
+            summary(&layout, 0, 0, 0, None),
+            "Suggested: chuck, grip 30 mm, stickout 50 mm. No toolpaths were available to check, so only the stock was considered."
+        );
+        // Not checked against earlier cuts yet, and a wrong entry still refuses.
+        let (v, f, _) = untouched();
+        let removed = Removed::new(&v, f);
+        let names = |_: u16, _: u16| String::new();
+        assert!(holdable(0, &layout, &three, stock(), Some(&removed), &names).is_empty());
+        assert!(holdable(0, &layout, &three, stock(), None, &names).is_empty());
+        let refused = holdable(0, &layout, &vise(), stock(), None, &names);
+        assert!(refused[0].contains("is a vise, not a chuck"), "{refused:?}");
+        assert_eq!(clashes(&[], &[], 2.), 0);
+        // Not a modelled box, and nothing to suggest.
+        let s = lathe_setup(&[("holding", "Chuck"), ("grip", "30"), ("stickout", "50")]);
+        assert!(!modelled(&s));
+        assert_eq!(held([&s]), Held::No);
+        assert!(placed(&s));
+        let asked = request(&s, Some(&three)).err().unwrap();
+        assert!(asked.contains("no layout to suggest"), "{asked}");
+        assert!(boxes(&layout, &three, stock()).unwrap().is_empty());
     }
     #[test]
     fn layouts_are_read_from_the_setup() {

@@ -2968,7 +2968,8 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
             .iter()
             .all(|k| num(&s.p, k).is_some()),
         "Holding" => {
-            matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty()
+            matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                && holding_lines(app).is_empty()
         }
         _ => false,
     }
@@ -3593,6 +3594,15 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
         "Speeds and feeds not checked (export still allowed)"
     }
 }
+/// The workholding a setup can model: a lathe setup a chuck, any other a
+/// vise or clamps.
+pub(crate) fn holding_choices(lathe: bool) -> &'static [&'static str] {
+    if lathe {
+        &["None", "Chuck"]
+    } else {
+        &["None", "Vise", "Clamps"]
+    }
+}
 /// The setup editor's controls for the modelled workholding, above the
 /// fixture description.
 fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
@@ -3602,18 +3612,36 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         "" => "None",
         value => value,
     };
+    let lathe = crate::lathe::is_lathe(&app.doc.setup().machine);
     let mut c: Vec<Element<_>> = vec![
-        muted("The vise or clamps that hold the stock, from the workholding library.").into(),
+        muted(if lathe {
+            "The chuck that holds the bar, from the workholding library."
+        } else {
+            "The vise or clamps that hold the stock, from the workholding library."
+        })
+        .into(),
         choice_value(
             p,
             holding,
             "holding",
             "Modelled workholding",
-            &["None", "Vise", "Clamps"],
+            holding_choices(lathe),
             t,
         ),
     ];
     match holding {
+        "Chuck" => {
+            c.push(holder_picker(app, "Chuck"));
+            c.push(
+                row![
+                    container(field(p, "grip", "Grip · mm", t)).width(Length::FillPortion(1)),
+                    container(field(p, "stickout", "Stickout · mm", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10)
+                .into(),
+            );
+        }
         "Vise" => {
             c.push(holder_picker(app, "Vise"));
             let axes: Vec<Named> = [("X", "X sides"), ("Y", "Y sides")]
@@ -3684,12 +3712,15 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         }
     }
     if holding != "None" {
-        c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
-        c.push(
-            secondary("Suggest layout", Message::SuggestLayout)
-                .width(Fill)
-                .into(),
-        );
+        // A chuck has no clearance gap yet and no layout to suggest.
+        if holding != "Chuck" {
+            c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
+            c.push(
+                secondary("Suggest layout", Message::SuggestLayout)
+                    .width(Fill)
+                    .into(),
+            );
+        }
         let lines = holding_lines(app);
         if !lines.is_empty() {
             let heading = format!(
@@ -3774,10 +3805,12 @@ fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
     c.into()
 }
 /// A check box per library machine for the `machines` of a tool or holder
-/// (`p`): none checked fits every CNC machine.
+/// (`p`): none checked fits every CNC machine, or every lathe for a lathe
+/// tool or a chuck (`lathe`).
 fn machine_boxes<'a>(
     app: &'a App,
     p: &Fields,
+    lathe: bool,
     toggle: fn(String, bool) -> Message,
 ) -> Element<'a, Message> {
     let listed: Vec<&str> = get(p, "machines").split(',').map(str::trim).collect();
@@ -3793,8 +3826,15 @@ fn machine_boxes<'a>(
             widget::tooltip::Position::Right,
         ));
     }
-    c.push(muted("None checked: every CNC machine.").size(12))
-        .into()
+    c.push(
+        muted(if lathe {
+            "None checked: every lathe."
+        } else {
+            "None checked: every CNC machine."
+        })
+        .size(12),
+    )
+    .into()
 }
 /// The library's vises or clamps (`kind`) that fit the active setup's machine.
 pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::holding::Holder> {
@@ -3802,7 +3842,7 @@ pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::ho
     app.doc
         .workholding
         .iter()
-        .filter(|h| h.kind() == kind && manual::fits(get(&h.p, "machines"), machine))
+        .filter(|h| h.kind() == kind && h.fits(machine))
         .collect()
 }
 /// The picker of the library's vises or clamps (`kind`) for the active setup.
@@ -6424,6 +6464,7 @@ fn holder_word(h: &crate::holding::Holder) -> &'static str {
     match h.kind() {
         "Vise" => "vise",
         "Clamp" => "clamp",
+        "Chuck" => "chuck",
         _ => "entry",
     }
 }
@@ -6518,26 +6559,66 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Bull nose end mill",
                 "Face mill",
                 "Drill",
-                "Chamfer mill"
+                "Chamfer mill",
+                "Turning tool",
+                "Boring bar",
+                "Grooving tool",
+                "Parting blade",
+                "Threading tool"
             ],
             t
         )
     ]
     .spacing(14);
-    for (k, l) in [
-        ("number", "Tool number · T"),
-        ("diameter", "Diameter · mm"),
-        ("flutes", "Flutes"),
-        ("length", "Flute length · mm"),
-        ("stickout", "Stickout · mm"),
-        ("holder", "Holder diameter · mm"),
-    ] {
-        form = form.push(field(p, k, l, t));
+    let lathe = crate::lathe::is_tool(get(p, "type"));
+    form = form.push(field(p, "number", "Tool number · T", t));
+    // A lathe tool has no mill diameter, flutes, flute length, stickout or holder.
+    if !lathe {
+        for (k, l) in [
+            ("diameter", "Diameter · mm"),
+            ("flutes", "Flutes"),
+            ("length", "Flute length · mm"),
+            ("stickout", "Stickout · mm"),
+            ("holder", "Holder diameter · mm"),
+        ] {
+            form = form.push(field(p, k, l, t));
+        }
     }
     if get(p, "type") == "Chamfer mill" {
         form = form.push(field(p, "tip_angle", "Tip angle · °", t));
     }
-    form = form.push(machine_boxes(app, p, Message::ToolMachine));
+    match get(p, "type") {
+        "Turning tool" => {
+            form = form
+                .push(choice(p, "hand", "Hand", &crate::lathe::HANDS, t))
+                .push(field(p, "nose_radius", "Nose radius · mm", t))
+                .push(field(p, "lead_angle", "Lead angle · °", t));
+        }
+        "Boring bar" => {
+            form = form
+                .push(field(p, "nose_radius", "Nose radius · mm", t))
+                .push(field(p, "min_bore", "Smallest bore · mm", t))
+                .push(field(p, "reach", "Reach · mm", t));
+        }
+        "Grooving tool" | "Parting blade" => {
+            form = form
+                .push(field(p, "width", "Blade width · mm", t))
+                .push(field(p, "reach", "Deepest plunge · mm", t));
+        }
+        "Threading tool" => {
+            form = form
+                .push(choice(
+                    p,
+                    "thread_angle",
+                    "Thread angle · °",
+                    &["60", "55"],
+                    t,
+                ))
+                .push(field(p, "pitches", "Pitches · mm, min-max", t));
+        }
+        _ => {}
+    }
+    form = form.push(machine_boxes(app, p, lathe, Message::ToolMachine));
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues));
@@ -6654,6 +6735,12 @@ const VISE_FIELDS: [(&str, &str); 6] = [
     ("grip", "Grip height · mm"),
     ("force", "Clamping force · N"),
 ];
+const CHUCK_FIELDS: [(&str, &str); 4] = [
+    ("min_grip", "Smallest grip · Ø mm"),
+    ("max_grip", "Largest grip · Ø mm"),
+    ("jaw_length", "Jaw length · mm"),
+    ("body", "Chuck body · Ø mm"),
+];
 const CLAMP_FIELDS: [(&str, &str); 5] = [
     ("length", "Length · mm"),
     ("width", "Width · mm"),
@@ -6677,6 +6764,12 @@ fn holder_summary(h: &crate::holding::Holder) -> String {
             n("width"),
             n("bite")
         ),
+        "Chuck" => format!(
+            "Chuck · {} jaws · grips Ø{}–Ø{} mm",
+            n("jaws"),
+            n("min_grip"),
+            n("max_grip")
+        ),
         other => other.to_string(),
     }
 }
@@ -6686,7 +6779,8 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         row![
             // Two equal choices: neither is the panel's one filled command.
             secondary("+ New vise", Message::NewHolder("Vise")),
-            secondary("+ New clamp", Message::NewHolder("Clamp"))
+            secondary("+ New clamp", Message::NewHolder("Clamp")),
+            secondary("+ New chuck", Message::NewHolder("Chuck"))
         ]
         .spacing(8)
     ]
@@ -6707,16 +6801,25 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let (title, sizes): (&str, &[(&str, &str)]) = match draft.kind() {
         "Vise" => ("Vise definition", &VISE_FIELDS),
         "Clamp" => ("Clamp definition", &CLAMP_FIELDS),
+        "Chuck" => ("Chuck definition", &CHUCK_FIELDS),
         _ => ("Workholding definition", &[]),
     };
     let mut form = column![bold(title, 21), field(p, "name", "Name", t)].spacing(14);
+    if draft.kind() == "Chuck" {
+        form = form.push(choice(p, "jaws", "Jaws", &["3", "4"], t));
+    }
     for (key, label) in sizes {
         form = form.push(field(p, key, label, t));
     }
     let mut issues = draft.issues();
     issues.extend(app.doc.holder_name_issues(draft));
     form = form
-        .push(machine_boxes(app, p, Message::HolderMachine))
+        .push(machine_boxes(
+            app,
+            p,
+            draft.kind() == "Chuck",
+            Message::HolderMachine,
+        ))
         .push(field(p, "notes", "Notes", t))
         .push(warnings(issues));
     let (save, delete) = holder_labels(draft);
@@ -6730,7 +6833,7 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         column![
             page_header(
                 "Workholding",
-                "Vises and toe clamps your setups can model. The starter entries have typical sizes: measure yours."
+                "Vises, toe clamps and lathe chucks your setups can model. The starter entries have typical sizes: measure yours."
             ),
             row![
                 container(scrollable(list))
@@ -7144,6 +7247,9 @@ fn tool_label(tool: &Tool) -> String {
 }
 /// The line under a tool's name in the library: what the name may not say.
 fn tool_details(tool: &Tool) -> String {
+    if tool.is_lathe() {
+        return get(&tool.p, "type").to_string();
+    }
     format!(
         "{} · Ø{} mm · {}",
         get(&tool.p, "type"),

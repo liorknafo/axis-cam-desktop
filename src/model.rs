@@ -438,10 +438,42 @@ impl Tool {
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
+    /// A lathe tool of type `kind` (one of `lathe::TOOLS`) with the keys of its
+    /// type filled in (`set_type`). It has no mill diameter, flutes, flute
+    /// length, stickout or holder.
+    pub fn lathe(name: &str, kind: &str) -> Self {
+        let mut t = Self {
+            id: id(),
+            p: fields(&[("name", name), ("type", kind)]),
+        };
+        t.set_type(kind);
+        t
+    }
+    /// Whether the tool is a lathe tool (`lathe::is_tool`).
+    pub fn is_lathe(&self) -> bool {
+        crate::lathe::is_tool(get(&self.p, "type"))
+    }
+    /// Whether the tool is on machine `m`: one it lists, else, with no list,
+    /// every CNC machine, or for a lathe tool every lathe.
+    pub fn fits(&self, m: &Machine) -> bool {
+        manual::fits(get(&self.p, "machines"), self.is_lathe(), m)
+    }
+    /// Makes the tool of type `kind`, adding the keys that type needs and the
+    /// tool lacks (a lathe tool's sizes); keys it already has are kept.
+    pub fn set_type(&mut self, kind: &str) {
+        self.p.insert("type".into(), kind.into());
+        for (k, v) in crate::lathe::tool_defaults(kind) {
+            self.p.entry((*k).into()).or_insert_with(|| (*v).into());
+        }
+    }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
         if self.name().trim().is_empty() {
             e.push("Give the tool a name.".into())
+        }
+        if self.is_lathe() {
+            self.lathe_issues(&mut e);
+            return e;
         }
         for k in ["diameter", "flutes", "length", "stickout", "holder"] {
             positive(&self.p, k, &mut e)
@@ -456,6 +488,65 @@ impl Tool {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
         }
         e
+    }
+    /// What a lathe tool's keys must be, by type: a turning tool's `hand`,
+    /// `nose_radius` (0 or more) and `lead_angle` (1–179°, 93 when not
+    /// saved); a boring bar's `nose_radius`, `min_bore` and `reach`; a
+    /// grooving tool's or parting blade's `width` and `reach`; a threading
+    /// tool's `thread_angle` (55 or 60) and `pitches` range. No flutes, mill
+    /// diameter, flute length, stickout or holder.
+    fn lathe_issues(&self, e: &mut Vec<String>) {
+        let p = &self.p;
+        match get(p, "type") {
+            "Turning tool" => {
+                if !crate::lathe::HANDS.contains(&get(p, "hand")) {
+                    e.push("Choose the tool's hand: Right, Left or Neutral.".into())
+                }
+                nonnegative(p, "nose_radius", e);
+                if self.lead_angle().is_none() {
+                    e.push("Enter a lead angle from 1° to 179°.".into())
+                }
+            }
+            "Boring bar" => {
+                nonnegative(p, "nose_radius", e);
+                positive(p, "min_bore", e);
+                positive(p, "reach", e);
+            }
+            "Grooving tool" | "Parting blade" => {
+                positive(p, "width", e);
+                positive(p, "reach", e);
+            }
+            "Threading tool" => {
+                if !num(p, "thread_angle").is_some_and(|a| a == 55. || a == 60.) {
+                    e.push("Thread angle must be 55° or 60°.".into())
+                }
+                if self.thread_pitches().is_none() {
+                    e.push("Pitches must be a range of positive pitches, like 0.5-3.".into())
+                }
+            }
+            _ => {}
+        }
+    }
+    /// A turning tool's lead (approach) angle in degrees (93 when not saved),
+    /// None when it is outside 1–179°.
+    pub fn lead_angle(&self) -> Option<f32> {
+        let angle = if self.p.contains_key("lead_angle") {
+            num(&self.p, "lead_angle")?
+        } else {
+            93.
+        };
+        (1. ..=179.).contains(&angle).then_some(angle)
+    }
+    /// A threading tool's finest and coarsest pitch in mm, from its `pitches`
+    /// ("0.5-3", or one pitch); None unless both are positive and the first
+    /// is not above the second.
+    pub fn thread_pitches(&self) -> Option<(f32, f32)> {
+        let text = get(&self.p, "pitches").trim();
+        let (lo, hi) = text
+            .split_once(['-', '–'])
+            .map_or((text, text), |(a, b)| (a.trim(), b.trim()));
+        let (lo, hi) = (lo.parse::<f32>().ok()?, hi.parse::<f32>().ok()?);
+        (lo.is_finite() && hi.is_finite() && lo > 0. && lo <= hi).then_some((lo, hi))
     }
     /// A chamfer mill's included tip angle in degrees (90 when not saved),
     /// None when it is outside 20–160°.
@@ -838,8 +929,15 @@ impl Operation {
                         .into(),
                 )
             }
-            if !manual::fits(get(&t.p, "machines"), m) {
+            if !t.fits(m) {
                 e.push(format!("{} is not on {}.", t.name(), m.name()))
+            }
+            // Every strategy there is mills; the turning strategy will allow these.
+            if t.is_lathe() {
+                e.push(format!(
+                    "{} is a lathe tool: a milling operation needs a mill tool.",
+                    t.name()
+                ))
             }
         } else {
             e.push("Choose a tool from the library.".into())
@@ -1560,11 +1658,13 @@ impl Document {
         held: impl FnOnce() -> Option<crate::holding::Gripped>,
     ) -> Vec<String> {
         use crate::holding::{
-            DELETED, NOT_SQUARE, height_issue, layout, opening_issue, position_issue, refusal,
+            DELETED, NOT_SQUARE, height_issue, layout, machine_refusal, opening_issue,
+            position_issue, refusal,
         };
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
+            "Chuck" => "Chuck",
             _ => "",
         };
         let id = get(&s.p, "holder");
@@ -1586,7 +1686,7 @@ impl Document {
         }
         if !kind.is_empty()
             && let Some(entry) = entry
-            && !crate::manual::fits(get(&entry.p, "machines"), &s.machine)
+            && !entry.fits(&s.machine)
         {
             issues.push(format!("{} is not on {}.", entry.name(), s.machine.name()));
         }
@@ -1596,12 +1696,16 @@ impl Document {
             .setups
             .first()
             .is_none_or(|first| crate::volume::Frame::setups_square(first, s));
+        issues.extend(machine_refusal(get(&s.p, "holding"), &s.machine));
         match (layout(s), entry) {
             (Err(error), _) => issues.push(error),
             (Ok(layout), Some(entry)) if !kind.is_empty() => {
                 if let Some(refused) = refusal(&layout, entry) {
                     issues.push(refused);
-                } else if square && let Some(held) = held() {
+                } else if square
+                    && kind != "Chuck"
+                    && let Some(held) = held()
+                {
                     issues.extend(opening_issue(&layout, entry, held));
                     issues.extend(position_issue(&layout, entry, held));
                     issues.extend(height_issue(&layout, held.stock));
@@ -1609,7 +1713,8 @@ impl Document {
             }
             _ => {}
         }
-        if !kind.is_empty() && !square {
+        // A chuck sits on the lathe's own axis, not on setup 1's box.
+        if !kind.is_empty() && kind != "Chuck" && !square {
             issues.push(NOT_SQUARE.into());
         }
         issues
@@ -1680,6 +1785,7 @@ impl Document {
         let kind = match get(&s.p, "holding") {
             "Vise" => "Vise",
             "Clamps" => "Clamp",
+            "Chuck" => "Chuck",
             _ => return,
         };
         let mine = self
@@ -1687,13 +1793,25 @@ impl Document {
             .filter(|h| h.kind() == kind);
         let chosen = mine.or_else(|| self.workholding.iter().find(|h| h.kind() == kind));
         let holder = chosen.map(|h| h.id.clone()).unwrap_or_default();
-        let grip = chosen.map(|h| get(&h.p, "grip").to_string());
+        // A vise setup starts at the vise's grip, a chuck setup at the jaws' length.
+        let grip = chosen.map(|h| {
+            get(
+                &h.p,
+                if kind == "Chuck" {
+                    "jaw_length"
+                } else {
+                    "grip"
+                },
+            )
+            .to_string()
+        });
         let p = &mut self.setups[setup].p;
         p.insert("holder".into(), holder);
-        if let Some(grip) = grip.filter(|g| kind == "Vise" && !g.is_empty())
-            && get(p, "vise_grip").trim().is_empty()
+        let key = if kind == "Chuck" { "grip" } else { "vise_grip" };
+        if let Some(grip) = grip.filter(|g| kind != "Clamp" && !g.is_empty())
+            && get(p, key).trim().is_empty()
         {
-            p.insert("vise_grip".into(), grip);
+            p.insert(key.into(), grip);
         }
         if get(p, "holding_gap").trim().is_empty() {
             p.insert("holding_gap".into(), "2".into());
@@ -1945,8 +2063,7 @@ impl Document {
         match (at, self.setups.first()) {
             (0, Some(old)) => {
                 // A vise or clamps not on the manual mill stay behind.
-                let fits = (self.holder(get(&old.p, "holder")))
-                    .is_none_or(|h| crate::manual::fits(get(&h.p, "machines"), machine));
+                let fits = (self.holder(get(&old.p, "holder"))).is_none_or(|h| h.fits(machine));
                 for (k, v) in &old.p {
                     let holding = HOLDING.contains(&k.as_str());
                     if (HANDED_OVER.contains(&k.as_str()) && (fits || !holding))
@@ -2798,17 +2915,291 @@ mod tests {
             .id
             .clone()
     }
+    fn lathe_doc() -> Document {
+        let mut doc = Document::sample();
+        doc.adopt_holders();
+        doc.setups[0].machine = crate::lathe::defaults();
+        doc
+    }
+    #[test]
+    fn each_lathe_tool_type_asks_for_its_own_keys_and_no_mill_ones() {
+        for kind in crate::lathe::TOOLS {
+            let t = Tool::lathe("T", kind);
+            assert!(t.issues().is_empty(), "{kind}: {:?}", t.issues());
+            assert!(t.is_lathe());
+            for k in ["diameter", "flutes", "length", "stickout", "holder"] {
+                assert!(!t.p.contains_key(k), "{kind} has {k}");
+            }
+        }
+        // Keys a mill tool needs are not asked of a lathe tool that still carries them.
+        let mut turning = Tool::new("T", "Turning tool", "0");
+        turning.set_type("Turning tool");
+        turning.p.insert("flutes".into(), "x".into());
+        assert!(turning.issues().is_empty(), "{:?}", turning.issues());
+        let mut nameless = Tool::lathe("  ", "Parting blade");
+        assert_eq!(nameless.issues(), vec!["Give the tool a name.".to_string()]);
+        nameless.p.insert("name".into(), "P".into());
+        assert!(nameless.issues().is_empty());
+        // A drill keeps the mill keys: its diameter means something.
+        let mut drill = Tool::new("D", "Drill", "6");
+        assert!(drill.issues().is_empty());
+        drill.p.insert("diameter".into(), "0".into());
+        assert!(drill.issues().iter().any(|i| i.contains("diameter")));
+    }
+    fn issues_with(kind: &str, pairs: &[(&str, &str)]) -> Vec<String> {
+        let mut t = Tool::lathe("T", kind);
+        for (k, v) in pairs {
+            t.p.insert((*k).into(), (*v).into());
+        }
+        t.issues()
+    }
+    #[test]
+    fn a_turning_tool_needs_a_hand_a_nose_radius_and_a_lead_angle() {
+        for hand in ["Right", "Left", "Neutral"] {
+            assert!(issues_with("Turning tool", &[("hand", hand)]).is_empty());
+        }
+        assert_eq!(issues_with("Turning tool", &[("hand", "Up")]).len(), 1);
+        assert_eq!(issues_with("Turning tool", &[("hand", "")]).len(), 1);
+        assert!(issues_with("Turning tool", &[("nose_radius", "0")]).is_empty());
+        for bad in ["-0.1", "", "x"] {
+            let e = issues_with("Turning tool", &[("nose_radius", bad)]);
+            assert!(e.iter().any(|i| i.contains("nose radius")), "{bad}: {e:?}");
+        }
+        for ok in ["1", "93", "179"] {
+            assert!(issues_with("Turning tool", &[("lead_angle", ok)]).is_empty());
+        }
+        for bad in ["0", "180", "x", ""] {
+            let e = issues_with("Turning tool", &[("lead_angle", bad)]);
+            assert!(e.iter().any(|i| i.contains("lead angle")), "{bad}: {e:?}");
+        }
+        // Not saved: 93, like an old tool without a tip angle.
+        let mut t = Tool::lathe("T", "Turning tool");
+        t.p.remove("lead_angle");
+        assert!(t.issues().is_empty());
+        assert_eq!(t.lead_angle(), Some(93.));
+    }
+    #[test]
+    fn boring_bars_grooving_tools_and_parting_blades_need_their_sizes() {
+        for (kind, keys) in [
+            ("Boring bar", &["min_bore", "reach"][..]),
+            ("Grooving tool", &["width", "reach"]),
+            ("Parting blade", &["width", "reach"]),
+        ] {
+            for k in keys {
+                for bad in ["0", "-1", "", "x"] {
+                    let e = issues_with(kind, &[(k, bad)]);
+                    assert_eq!(e.len(), 1, "{kind} {k}={bad}: {e:?}");
+                    assert!(e[0].contains(&k.replace('_', " ")), "{e:?}");
+                }
+            }
+        }
+        assert!(issues_with("Boring bar", &[("nose_radius", "0")]).is_empty());
+        assert_eq!(issues_with("Boring bar", &[("nose_radius", "-1")]).len(), 1);
+        // A groove tool has no nose radius to ask for.
+        assert!(
+            !Tool::lathe("T", "Grooving tool")
+                .p
+                .contains_key("nose_radius")
+        );
+    }
+    #[test]
+    fn a_threading_tool_has_a_55_or_60_degree_form_and_a_pitch_range() {
+        for ok in ["55", "60"] {
+            assert!(issues_with("Threading tool", &[("thread_angle", ok)]).is_empty());
+        }
+        for bad in ["59", "0", "", "x"] {
+            let e = issues_with("Threading tool", &[("thread_angle", bad)]);
+            assert_eq!(
+                e,
+                vec!["Thread angle must be 55° or 60°.".to_string()],
+                "{bad}"
+            );
+        }
+        for (text, range) in [
+            ("0.5-3", Some((0.5, 3.))),
+            (" 0.5 – 3 ", Some((0.5, 3.))),
+            ("1.5", Some((1.5, 1.5))),
+            ("3-0.5", None),
+            ("0-3", None),
+            ("-3", None),
+            ("", None),
+            ("a-b", None),
+            ("1-2-3", None),
+        ] {
+            let mut t = Tool::lathe("T", "Threading tool");
+            t.p.insert("pitches".into(), text.into());
+            assert_eq!(t.thread_pitches(), range, "{text:?}");
+            assert_eq!(t.issues().is_empty(), range.is_some(), "{text:?}");
+        }
+    }
+    #[test]
+    fn choosing_a_tool_type_adds_its_defaults_and_keeps_what_was_typed() {
+        let mut t = Tool::new("T", "Flat end mill", "6");
+        t.set_type("Boring bar");
+        assert_eq!(get(&t.p, "type"), "Boring bar");
+        assert_eq!(
+            [
+                get(&t.p, "nose_radius"),
+                get(&t.p, "min_bore"),
+                get(&t.p, "reach")
+            ],
+            ["0.4", "12", "40"]
+        );
+        assert!(t.issues().is_empty());
+        t.p.insert("reach".into(), "55".into());
+        t.set_type("Grooving tool");
+        assert_eq!((get(&t.p, "reach"), get(&t.p, "width")), ("55", "3"));
+        // Back to a mill: its own keys are still there and valid.
+        t.set_type("Flat end mill");
+        assert!(t.issues().is_empty(), "{:?}", t.issues());
+        assert!(!t.is_lathe());
+    }
+    #[test]
+    fn a_lathe_tool_fits_lathes_only_unless_it_lists_machines_and_a_mill_tool_is_unchanged() {
+        let (lathe, cnc, mill) = (
+            crate::lathe::defaults(),
+            Machine::new(3),
+            crate::manual::defaults(),
+        );
+        for kind in crate::lathe::TOOLS {
+            let t = Tool::lathe("T", kind);
+            assert!(t.fits(&lathe), "{kind}");
+            assert!(!t.fits(&cnc) && !t.fits(&mill), "{kind}");
+        }
+        let mut listed = Tool::lathe("T", "Turning tool");
+        listed
+            .p
+            .insert("machines".into(), format!("{}, {}", cnc.id, lathe.id));
+        assert!(listed.fits(&lathe) && listed.fits(&cnc) && !listed.fits(&mill));
+        // Mills: an empty list fits CNC machines only, as before; a drill likewise.
+        for kind in ["Flat end mill", "Drill", "Chamfer mill"] {
+            let t = Tool::new("T", kind, "6");
+            assert!(t.fits(&cnc), "{kind}");
+            assert!(!t.fits(&lathe) && !t.fits(&mill), "{kind}");
+        }
+    }
+    #[test]
+    fn a_milling_operation_refuses_a_lathe_tool() {
+        let cnc = Machine::new(3);
+        let mut t = Tool::lathe("Turn", "Turning tool");
+        t.p.insert("machines".into(), cnc.id.clone());
+        let op = Operation::new(Strategy::Face, t.id.clone());
+        let issues = op.issues(&cnc, &[t], &[]);
+        assert!(
+            issues.iter().any(|i| i.contains("Turn is a lathe tool")),
+            "{issues:?}"
+        );
+    }
+    #[test]
+    fn a_chuck_setup_on_a_lathe_is_held_and_vise_or_clamps_are_refused_there() {
+        let mut doc = lathe_doc();
+        let chuck = starter(&doc, "Chuck");
+        doc.setup_mut().p.insert("holding".into(), "Chuck".into());
+        doc.settle_holding(0);
+        // The library's first chuck (the 3-jaw), with the grip at its jaw length.
+        assert_eq!(get(&doc.setup().p, "holder"), chuck);
+        assert_eq!(get(&doc.setup().p, "grip"), "30");
+        // The stickout is the user's to give.
+        assert_eq!(
+            doc.holding_issues(0, None),
+            vec!["The chuck stickout must be a positive number.".to_string()]
+        );
+        doc.setup_mut().p.insert("stickout".into(), "60".into());
+        assert!(doc.holding_issues(0, None).is_empty());
+        assert_eq!(
+            doc.holding_text(doc.setup()).as_deref(),
+            Some("160 mm 3-jaw chuck, grip 30 mm, stickout 60 mm.")
+        );
+        assert_eq!(doc.holding_label(doc.setup()), "160 mm 3-jaw chuck");
+        // No box is modelled for a chuck yet.
+        let stock = crate::mesh::Bounds {
+            min: [-10., -10., 0.],
+            max: [10., 10., 50.],
+        };
+        assert_eq!(doc.holding_boxes(doc.setup(), stock), Ok(vec![]));
+        // A vise or clamps on a lathe.
+        for (holding, kind) in [("Vise", "Vise"), ("Clamps", "Clamp")] {
+            let id = starter(&doc, kind);
+            let setup = doc.setup_mut();
+            setup.p.insert("holding".into(), holding.into());
+            setup.p.insert("holder".into(), id);
+            let issues = doc.holding_issues(0, None);
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.contains("holds the stock in a chuck")),
+                "{holding}: {issues:?}"
+            );
+        }
+        // A vise holder under Chuck.
+        let vise = starter(&doc, "Vise");
+        let setup = doc.setup_mut();
+        setup.p.insert("holding".into(), "Chuck".into());
+        setup.p.insert("holder".into(), vise);
+        let issues = doc.holding_issues(0, None);
+        assert!(
+            issues.iter().any(|i| i.contains("is a vise, not a chuck")),
+            "{issues:?}"
+        );
+    }
+    #[test]
+    fn a_chuck_is_refused_on_a_mill_and_a_chuck_entry_is_not_on_one() {
+        let mut doc = doc_with_holding(&[("holding", "Chuck"), ("grip", "30"), ("stickout", "50")]);
+        let chuck = starter(&doc, "Chuck");
+        doc.setup_mut().p.insert("holder".into(), chuck);
+        let issues = doc.holding_issues(0, None);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("A chuck is for a lathe setup")),
+            "{issues:?}"
+        );
+        assert!(issues.iter().any(|i| i.contains("is not on")), "{issues:?}");
+        // No box either way.
+        assert!(
+            doc.holding_boxes(
+                doc.setup(),
+                crate::mesh::Bounds {
+                    min: [0.; 3],
+                    max: [10.; 3],
+                }
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn the_library_starts_with_a_vise_a_clamp_and_two_chucks_and_an_old_one_gains_none() {
+        let mut doc = Document::default();
+        doc.adopt_holders();
+        let kinds: Vec<&str> = doc.workholding.iter().map(|h| h.kind()).collect();
+        assert_eq!(kinds, ["Vise", "Clamp", "Chuck", "Chuck"]);
+        // A library with entries keeps just them, as for the vise and clamp.
+        let mut old = Document {
+            workholding: crate::holding::starters().into_iter().take(2).collect(),
+            ..Default::default()
+        };
+        old.adopt_holders();
+        assert_eq!(old.workholding.len(), 2);
+    }
     #[test]
     fn adopting_holders_adds_the_starters_only_to_an_empty_library() {
         let mut doc = Document::default();
         assert!(doc.workholding.is_empty());
         doc.adopt_holders();
         let names: Vec<_> = doc.workholding.iter().map(|h| h.name()).collect();
-        assert_eq!(names, ["100 mm machine vise", "Toe clamp 60 mm"]);
+        assert_eq!(
+            names,
+            [
+                "100 mm machine vise",
+                "Toe clamp 60 mm",
+                "160 mm 3-jaw chuck",
+                "160 mm 4-jaw chuck"
+            ]
+        );
         assert!(doc.validate_structure().is_ok());
         // A library the user edited keeps their edits and is not topped up.
         doc.workholding[0].p.insert("name".into(), "My vise".into());
-        doc.workholding.pop();
+        doc.workholding.truncate(1);
         let id = doc.workholding[0].id.clone();
         doc.adopt_holders();
         assert_eq!(doc.workholding.len(), 1);
@@ -3870,7 +4261,7 @@ mod manual_setups {
         assert!(
             d.tools
                 .iter()
-                .all(|t| manual::fits(get(&t.p, "machines"), cnc))
+                .all(|t| manual::fits(get(&t.p, "machines"), false, cnc))
         );
         let mut op = Operation::new(Strategy::Face, d.tools[0].id.clone());
         op.p.insert("rpm".into(), "8000".into());

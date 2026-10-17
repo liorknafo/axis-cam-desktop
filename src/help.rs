@@ -1255,6 +1255,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Create a toe clamp with its length, width, height and bite. It joins the library when you save it. Enter the sizes of your own clamp.",
             "",
         ),
+        NewHolder("Chuck") => (
+            "Create a lathe chuck with its jaw count, the range of diameters it closes on, how deep its jaws reach and its body diameter. It joins the library when you save it. Enter the sizes of your own chuck.",
+            "",
+        ),
         NewHolder(_) => (
             "Create a vise with its jaw sizes, maximum opening and grip. It joins the library when you save it. Enter the sizes of your own vise.",
             "",
@@ -1800,9 +1804,84 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             None,
         ),
+        (Target::Holder, "jaws") => (
+            "How many jaws the chuck has: 3 (self-centring, for round bar) or 4 (independent, for square or off-centre work).",
+            "",
+            None,
+        ),
+        (Target::Holder, "min_grip") => (
+            "The smallest diameter the jaws close on, in mm, with the jaws in their normal position.",
+            "",
+            None,
+        ),
+        (Target::Holder, "max_grip") => (
+            "The largest diameter the jaws close on, in mm. It must be above the smallest grip and below the chuck body.",
+            "",
+            None,
+        ),
+        (Target::Holder, "jaw_length") => (
+            "How deep the jaws reach along the bar, in mm: the most length a setup can hold in them. A setup starts from it.",
+            "",
+            None,
+        ),
+        (Target::Holder, "body") => (
+            "The chuck's outside diameter, in mm. The 160 mm starters are typical: measure yours.",
+            "",
+            None,
+        ),
+        (Target::Setup, "grip") => (
+            "How much of the bar is held in the jaws, in mm. It starts at the chuck's jaw length. Hold at least a third of the diameter.",
+            "",
+            None,
+        ),
+        (Target::Setup, "stickout") => (
+            "How far the bar sticks out of the jaws to its free end, in mm. It must reach the furthest cut from the end.",
+            "",
+            None,
+        ),
+        (Target::Tool, "hand") => (
+            "Which way the turning tool cuts: Right cuts toward the chuck, Left away from it, Neutral either way.",
+            "",
+            None,
+        ),
+        (Target::Tool, "nose_radius") => (
+            "The radius of the insert's tip in mm; 0 is a sharp point. It rounds inside corners and sets the finish.",
+            "",
+            None,
+        ),
+        (Target::Tool, "lead_angle") => (
+            "The angle between the cutting edge and the bar's axis, in degrees; 93 is typical for a turning tool that can also face.",
+            "",
+            None,
+        ),
+        (Target::Tool, "min_bore") => (
+            "The smallest hole the boring bar goes into, in mm.",
+            "",
+            None,
+        ),
+        (Target::Tool, "reach") => (
+            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge.",
+            "",
+            None,
+        ),
+        (Target::Tool, "width") => (
+            "The width of the grooving tool's or parting blade's cutting edge, in mm. A groove is at least this wide.",
+            "",
+            None,
+        ),
+        (Target::Tool, "thread_angle") => (
+            "The included angle of the thread form, in degrees: 60 for metric and unified threads, 55 for Whitworth.",
+            "",
+            None,
+        ),
+        (Target::Tool, "pitches") => (
+            "The finest and coarsest pitch the threading tool cuts, in mm, written like 0.5-3.",
+            "",
+            None,
+        ),
         (Target::Setup, "holding") => (
             "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap that every move is checked against, and its hold is checked against each operation's cutting force. None models nothing.",
-            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description.",
+            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. A lathe setup has a Chuck instead of a Vise or Clamps: its grip and stickout are saved, but nothing is checked or drawn against it yet.",
             None,
         ),
         (Target::Setup, "holder") => (
@@ -2411,7 +2490,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::FiveAxis)),
         ),
         (_, "type") => (
-            "Cutter geometry: flat end mill, ball end mill, drill or face mill. Choose a type suited to the operation.",
+            "Cutter geometry: flat end mill, ball end mill, drill or face mill, or for a lathe a turning tool, boring bar, grooving tool, parting blade or threading tool. Choose a type suited to the operation.",
             "",
             Some(Tool),
         ),
@@ -3323,6 +3402,7 @@ mod tests {
         for message in [
             Message::NewHolder("Vise"),
             Message::NewHolder("Clamp"),
+            Message::NewHolder("Chuck"),
             Message::EditHolder("h".into()),
             Message::SaveHolder,
             Message::DeleteHolder("h".into()),
@@ -3849,7 +3929,7 @@ mod tests {
                 ],
             ),
             ("speed", vec!["0.5", "1", "120"]),
-            ("holding", vec!["None", "Vise", "Clamps"]),
+            ("holding", vec!["None", "Vise", "Clamps", "Chuck"]),
             ("group", crate::material::GROUPS.to_vec()),
         ];
         for (key, values) in fallbacks {
@@ -3987,6 +4067,7 @@ mod tests {
             PickMaterial("m".into()),
             NewHolder("Clamp"),
             NewHolder("Vise"),
+            NewHolder("Chuck"),
             EditHolder("h".into()),
             SaveHolder,
             DeleteHolder("h".into()),

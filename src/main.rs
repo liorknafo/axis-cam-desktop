@@ -3078,7 +3078,12 @@ impl App {
                     }
                 }
                 Target::Tool => {
-                    self.tool_draft.p.insert(k.into(), v);
+                    if k == "type" {
+                        // A lathe type takes its sizes' defaults, as the editor shows them.
+                        self.tool_draft.set_type(&v);
+                    } else {
+                        self.tool_draft.p.insert(k.into(), v);
+                    }
                 }
                 Target::Material => {
                     self.material_draft.p.insert(k.into(), v);
@@ -3104,7 +3109,7 @@ impl App {
                     .tools
                     .iter()
                     .find(|t| {
-                        manual::fits(get(&t.p, "machines"), machine)
+                        t.fits(machine)
                             && if strategy == Strategy::Drill {
                                 get(&t.p, "type") == "Drill"
                             } else if strategy == Strategy::Parallel {
@@ -3991,7 +3996,8 @@ impl App {
             }
             Message::DeleteHolder(id) => {
                 let using = self.doc.setups.iter().find(|s| {
-                    matches!(get(&s.p, "holding"), "Vise" | "Clamps") && get(&s.p, "holder") == id
+                    matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                        && get(&s.p, "holder") == id
                 });
                 if let Some(setup) = using {
                     let name = self.doc.holder(&id).map_or("This entry", |h| h.name());

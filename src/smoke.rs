@@ -7248,7 +7248,12 @@ flood = { pin = 8 }
         let mut a = App::from_workspace(path.clone(), None);
         assert_eq!(
             holders_named(&a.doc),
-            ["100 mm machine vise", "Toe clamp 60 mm"]
+            [
+                "100 mm machine vise",
+                "Toe clamp 60 mm",
+                "160 mm 3-jaw chuck",
+                "160 mm 4-jaw chuck"
+            ]
         );
         assert_eq!(a.holder_draft.id, a.doc.workholding[0].id);
         assert!(a.doc.validate_structure().is_ok());
@@ -7259,6 +7264,10 @@ flood = { pin = 8 }
         edit_holder(&mut a, &[("jaw_width", "125")]);
         let _ = a.update(Message::SaveHolder);
         let _ = a.update(Message::DeleteHolder(clamp));
+        for _ in 0..2 {
+            let chuck = first_of(&a, "Chuck");
+            let _ = a.update(Message::DeleteHolder(chuck));
+        }
         assert_eq!(holders_named(&a.doc), ["100 mm machine vise"]);
         a.dirty = true;
         a.persist();
@@ -7297,7 +7306,7 @@ flood = { pin = 8 }
         // An empty library is given the starters again.
         a.doc.workholding.clear();
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.workholding.len(), 2);
+        assert_eq!(a.doc.workholding.len(), 4);
         assert!(
             a.status.contains("materials and workholding are available"),
             "{}",
@@ -7351,7 +7360,7 @@ flood = { pin = 8 }
             "{status}"
         );
         let (doc, _) = crate::merge_sample(&Document::default());
-        assert_eq!(holders_named(&doc).len(), 2);
+        assert_eq!(holders_named(&doc).len(), 4);
     }
     #[test]
     fn holders_are_created_edited_saved_refused_and_deleted_like_materials() {
@@ -16177,10 +16186,11 @@ flood = { pin = 8 }
                 .contains("Manual lathe: steps on the MACHINE page")
         );
         // A mill tool with no machines listed does not fit it.
-        assert!(!crate::manual::fits("", &doc.setups[0].machine));
-        assert!(crate::manual::fits("", &doc.setups[1].machine));
+        assert!(!crate::manual::fits("", false, &doc.setups[0].machine));
+        assert!(crate::manual::fits("", false, &doc.setups[1].machine));
         assert!(crate::manual::fits(
             &doc.setups[0].machine.id,
+            false,
             &doc.setups[0].machine
         ));
     }
@@ -16207,6 +16217,194 @@ flood = { pin = 8 }
         let _ = a.update(Message::ToolMachine(id, false));
         let _ = a.update(Message::ToolMachine(other, false));
         assert_eq!(get(&a.tool_draft.p, "machines"), "");
+    }
+    #[test]
+    fn the_tool_editor_shows_the_fields_of_each_lathe_tool_type_and_no_mill_ones() {
+        let mut a = app();
+        a.page = Page::Tools;
+        a.tool_draft = a.doc.tools[0].clone();
+        shows(&a, &["Diameter · mm", "Flutes", "Holder diameter · mm"]);
+        lacks(&a, &["Nose radius · mm", "Lead angle · °"]);
+        for (kind, shown, hidden) in [
+            (
+                "Turning tool",
+                &["Hand", "Nose radius · mm", "Lead angle · °"][..],
+                &["Reach · mm"][..],
+            ),
+            (
+                "Boring bar",
+                &["Nose radius · mm", "Smallest bore · mm", "Reach · mm"],
+                &["Hand"],
+            ),
+            (
+                "Grooving tool",
+                &["Blade width · mm", "Deepest plunge · mm"],
+                &["Nose radius · mm"],
+            ),
+            (
+                "Parting blade",
+                &["Blade width · mm", "Deepest plunge · mm"],
+                &["Hand"],
+            ),
+            (
+                "Threading tool",
+                &["Thread angle · °", "Pitches · mm, min-max"],
+                &["Blade width · mm"],
+            ),
+        ] {
+            let _ = a.update(Message::Edit(Target::Tool, "type", kind.into()));
+            assert!(
+                a.tool_draft.issues().is_empty(),
+                "{kind}: {:?}",
+                a.tool_draft.issues()
+            );
+            shows(
+                &a,
+                &["Tool number · T", "Machines", "None checked: every lathe."],
+            );
+            shows(&a, shown);
+            lacks(
+                &a,
+                &[
+                    "Diameter · mm",
+                    "Flutes",
+                    "Flute length · mm",
+                    "Stickout · mm",
+                    "Holder diameter · mm",
+                    "Tip angle · °",
+                ],
+            );
+            lacks(&a, hidden);
+            assert!(a.tool_draft.fits(&crate::lathe::defaults()));
+        }
+        // A bad size is told under the form, and saving is refused.
+        let _ = a.update(Message::Edit(Target::Tool, "nose_radius", "-1".into()));
+        let _ = a.update(Message::Edit(Target::Tool, "type", "Boring bar".into()));
+        let _ = a.update(Message::Edit(Target::Tool, "min_bore", "0".into()));
+        shows(&a, &["• min bore must be greater than zero."]);
+        let before = a.doc.tools.len();
+        let _ = a.update(Message::SaveTool);
+        assert_eq!(a.doc.tools.len(), before);
+        // Back to a mill and its fields.
+        let _ = a.update(Message::Edit(Target::Tool, "type", "Flat end mill".into()));
+        shows(
+            &a,
+            &[
+                "Diameter · mm",
+                "Flutes",
+                "None checked: every CNC machine.",
+            ],
+        );
+        lacks(&a, &["Smallest bore · mm"]);
+    }
+    #[test]
+    fn a_lathe_tool_is_saved_to_the_library_and_listed_by_its_type() {
+        let mut a = app();
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::Edit(Target::Tool, "type", "Threading tool".into()));
+        let _ = a.update(Message::Edit(Target::Tool, "name", "60° thread".into()));
+        let _ = a.update(Message::SaveTool);
+        let saved = a.doc.tools.last().unwrap();
+        assert_eq!(saved.name(), "60° thread");
+        assert!(saved.is_lathe());
+        shows(&a, &["T4 · 60° thread\nThreading tool"]);
+    }
+    #[test]
+    fn the_workholding_editor_has_new_chuck_and_the_chuck_fields() {
+        let mut a = app();
+        a.page = Page::Workholding;
+        a.doc.workholding = crate::holding::starters();
+        shows(&a, &["+ New chuck"]);
+        assert!(
+            crate::ui::probe::clicks(a.view(), WINDOW)
+                .iter()
+                .any(|m| matches!(m, Message::NewHolder("Chuck")))
+        );
+        let _ = a.update(Message::NewHolder("Chuck"));
+        assert_eq!(a.holder_draft.kind(), "Chuck");
+        shows(
+            &a,
+            &["Chuck definition", "Jaws", "None checked: every lathe."],
+        );
+        // The sizes of a chuck, not a vise's.
+        let sent = |a: &App| crate::ui::probe::texts(a.view(), iced::Size::new(1440., 2400.));
+        let seen = sent(&a);
+        for text in [
+            "Smallest grip · Ø mm",
+            "Largest grip · Ø mm",
+            "Jaw length · mm",
+            "Chuck body · Ø mm",
+        ] {
+            assert!(seen.iter().any(|t| t == text), "{text}");
+        }
+        assert!(!seen.iter().any(|t| t == "Jaw width · mm"));
+        // The library lists the starters' chucks by their jaws and range.
+        shows(
+            &a,
+            &[
+                "160 mm 3-jaw chuck\nChuck · 3 jaws · grips Ø3–Ø140 mm",
+                "160 mm 4-jaw chuck\nChuck · 4 jaws · grips Ø6–Ø150 mm",
+            ],
+        );
+        // A new one is not valid until sized, and saving says so.
+        let count = a.doc.workholding.len();
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), count);
+        for (k, v) in [
+            ("jaws", "4"),
+            ("min_grip", "5"),
+            ("max_grip", "100"),
+            ("jaw_length", "25"),
+            ("body", "125"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Holder, k, v.into()));
+        }
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), count + 1);
+    }
+    #[test]
+    fn a_lathe_setup_offers_a_chuck_and_a_mill_setup_a_vise_or_clamps() {
+        assert_eq!(crate::ui::holding_choices(true), ["None", "Chuck"]);
+        assert_eq!(
+            crate::ui::holding_choices(false),
+            ["None", "Vise", "Clamps"]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.update(Message::SetupStep("Holding"));
+        shows(
+            &a,
+            &["The vise or clamps that hold the stock, from the workholding library."],
+        );
+        edit_setup(&mut a, &[("holding", "Vise")]);
+        shows(&a, &["Vise", "Suggest layout", "Jaw offset · mm"]);
+        lacks(&a, &["Stickout · mm"]);
+        // On the lathe: the chuck picker, the grip and stickout, no clearance gap or layout to suggest.
+        a.doc.setup_mut().machine = crate::lathe::defaults();
+        edit_setup(&mut a, &[("holding", "Chuck")]);
+        assert_eq!(get(&a.doc.setup().p, "holder"), first_of(&a, "Chuck"));
+        assert_eq!(get(&a.doc.setup().p, "grip"), "30");
+        shows(
+            &a,
+            &[
+                "The chuck that holds the bar, from the workholding library.",
+                "Chuck",
+                "Grip · mm",
+                "Stickout · mm",
+            ],
+        );
+        lacks(&a, &["Suggest layout", "Jaw offset · mm", "Jaws face"]);
+        shows(&a, &["1 workholding issue"]);
+        edit_setup(&mut a, &[("stickout", "50")]);
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        lacks(&a, &["1 workholding issue"]);
+        // The 3D view and the guide treat it as nothing to draw yet.
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        let _ = a.update(Message::SuggestLayout);
+        assert!(a.status.contains("no layout to suggest"), "{}", a.status);
+        assert_eq!(get(&a.doc.setup().p, "stickout"), "50");
     }
     #[test]
     fn the_holder_editor_has_a_check_box_per_machine_that_edits_machines() {

@@ -32,6 +32,40 @@ impl Slide {
     }
 }
 
+/// The tool types a lathe uses besides drills (held in the tailstock).
+pub const TOOLS: [&str; 5] = [
+    "Turning tool",
+    "Boring bar",
+    "Grooving tool",
+    "Parting blade",
+    "Threading tool",
+];
+
+/// The hands a turning tool has.
+pub const HANDS: [&str; 3] = ["Right", "Left", "Neutral"];
+
+/// Whether `kind` is a lathe tool type (`TOOLS`).
+pub fn is_tool(kind: &str) -> bool {
+    TOOLS.contains(&kind)
+}
+
+/// The keys a tool of type `kind` starts with, and their values: none for a
+/// mill tool or a drill.
+pub fn tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        "Turning tool" => &[
+            ("hand", "Right"),
+            ("nose_radius", "0.4"),
+            ("lead_angle", "93"),
+        ],
+        "Boring bar" => &[("nose_radius", "0.4"), ("min_bore", "12"), ("reach", "40")],
+        "Grooving tool" => &[("width", "3"), ("reach", "15")],
+        "Parting blade" => &[("width", "3"), ("reach", "25")],
+        "Threading tool" => &[("thread_angle", "60"), ("pitches", "0.5-3")],
+        _ => &[],
+    }
+}
+
 /// The manual lathe: `kind` is `Lathe`.
 pub fn is_lathe(m: &Machine) -> bool {
     get(&m.p, "kind") == "Lathe"
