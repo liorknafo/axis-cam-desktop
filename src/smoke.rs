@@ -2409,6 +2409,374 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("3-tool-change.png"));
     }
 
+    /// The operation of a block of a program, if it names one.
+    fn op_of(b: &crate::post::Block) -> Option<usize> {
+        use crate::post::Block;
+        match b {
+            Block::Start { op, .. }
+            | Block::Run { op, .. }
+            | Block::Approach { op, .. }
+            | Block::Descend { op, .. }
+            | Block::Move { op, .. } => Some(*op),
+            _ => None,
+        }
+    }
+
+    /// A run started at the Pocket, the second operation of tool run 1,
+    /// after the Facing was cut: nothing of the Facing is sent, the program
+    /// starts safely (Z up alone, the Pocket's spindle speed and coolant,
+    /// the dwell, across at the clearance plane and down), the cards say
+    /// Skipped and Next, the checks before Cycle Start cover only what runs,
+    /// Z is touched off on the floor the Facing left, and Cycle Start cuts
+    /// from the Pocket on the simulated UC100 (LIO-177).
+    #[test]
+    fn a_run_starts_at_a_chosen_operation_with_a_safe_start_and_nothing_before_it() {
+        use crate::post::Block;
+        use crate::run::{Action as R, Stage::*};
+        use crate::ui::work_zero_steps;
+        use uc100::controller::State;
+        use uc100::gcode::{Action as Do, Spindle};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        // The Facing asks for mist, which the profile has no output for.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("coolant".into(), "Mist".into());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        assert!(has(&a, "Facing: uses mist coolant"), "{:?}", problems(&a));
+        let p = run_of(&a).checked().unwrap()[0].clone();
+        let names: Vec<&str> = p.ops.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Facing", "Pocket", "Contour"]);
+        assert!(p.starts.iter().all(Result::is_ok), "{:?}", p.starts);
+        // The program from the Pocket: the tool change's safe start, then
+        // the same blocks as the whole program, with nothing of the Facing.
+        let from = p.from(1).unwrap();
+        assert!(from.iter().all(|b| op_of(b) != Some(0)));
+        assert!(
+            matches!(
+                from[..8],
+                [
+                    Block::Stop,
+                    Block::Retract,
+                    Block::Start {
+                        op: 1,
+                        change: true
+                    },
+                    Block::Retract,
+                    Block::Run {
+                        op: 1,
+                        spindle: true,
+                        coolant: true
+                    },
+                    Block::Wait { .. },
+                    Block::Approach { op: 1, .. },
+                    Block::Descend { op: 1, .. },
+                ]
+            ),
+            "{:?}",
+            &from[..8]
+        );
+        let of = |blocks: &[Block], op| {
+            let at = blocks
+                .iter()
+                .position(|b| matches!(b, Block::Start { op: k, .. } if *k == op))
+                .unwrap();
+            blocks[at..].to_vec()
+        };
+        // The Pocket's own moves are all there; the whole program's link
+        // from the Facing (up, across and down) is not.
+        let pocket = |blocks: &[Block]| -> Vec<Block> {
+            blocks
+                .iter()
+                .filter(|b| matches!(b, Block::Move { op: 1, .. }))
+                .cloned()
+                .collect()
+        };
+        let (own, whole) = (pocket(from), pocket(&p.blocks));
+        assert!(whole.ends_with(&own) && whole.len() - own.len() <= 3);
+        assert_eq!(of(from, 2), of(&p.blocks, 2));
+        // Lowered where the machine stands: Z up alone to the clearance
+        // plane, the Pocket's spindle and coolant, the dwell, across, down.
+        let s = conn(&a).snapshot.clone();
+        let actions = crate::run::lower(&p, 1, s.work_offset, s.machine_pos).unwrap();
+        let o = &p.ops[1];
+        let high = crate::post::clearance_plane(from) as f64 - p.datum[2] as f64 + s.work_offset[2];
+        let Do::Move {
+            target: up,
+            feed: None,
+        } = actions[0].action
+        else {
+            panic!("{:?}", actions[0])
+        };
+        assert_eq!(up[..2], s.machine_pos[..2]);
+        assert!((up[2] - high).abs() < 1e-9);
+        // Plan times are f32: a dwell is its seconds to a few µs.
+        let rounded = |l: &uc100::gcode::Located| match l.action {
+            Do::Dwell { seconds } => Do::Dwell {
+                seconds: (seconds * 1e3).round() / 1e3,
+            },
+            ref a => a.clone(),
+        };
+        assert_eq!(
+            actions[1..4].iter().map(rounded).collect::<Vec<_>>(),
+            [
+                Do::Spindle {
+                    state: Spindle::Cw,
+                    rpm: o.rpm as f64
+                },
+                Do::Coolant {
+                    flood: o.coolant.1,
+                    mist: o.coolant.0
+                },
+                Do::Dwell { seconds: 0.2 },
+            ]
+        );
+        assert!(o.coolant.1 && !o.coolant.0);
+        let Do::Move {
+            target: over,
+            feed: None,
+        } = actions[4].action
+        else {
+            panic!("{:?}", actions[4])
+        };
+        let Block::Descend { xy, z, .. } = from[7] else {
+            unreachable!()
+        };
+        // Across at the clearance plane to over the Pocket's first point,
+        // then down to it unless it is at the plane.
+        assert!((over[2] - high).abs() < 1e-9);
+        for k in 0..2 {
+            assert!((over[k] - (xy[k] - p.datum[k]) as f64 - s.work_offset[k]).abs() < 1e-4);
+        }
+        let first = (z - p.datum[2]) as f64 + s.work_offset[2];
+        assert!(first <= high + 1e-9);
+        if first < high - 1e-9 {
+            let Do::Move {
+                target: down,
+                feed: None,
+            } = actions[5].action
+            else {
+                panic!("{:?}", actions[5])
+            };
+            assert_eq!(over[..2], down[..2]);
+            assert!((down[2] - first).abs() < 1e-4);
+        }
+        assert!(
+            actions
+                .iter()
+                .all(|l| op_of(&from[l.line as usize - 1]) != Some(0))
+        );
+        // The cards: the Facing skipped, the Pocket next.
+        let line = |a: &App| conn(a).snapshot.current_line;
+        let stages = |a: &App, i| run_of(a).stages(i, line(a));
+        assert_eq!(stages(&a, 0), [Next, ToCome, ToCome]);
+        let _ = a.update(Message::Run(R::From(1, 0)));
+        assert_eq!(stages(&a, 0), [Skipped, Skipped, Skipped]);
+        assert_eq!(stages(&a, 1), [Next]);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        assert_eq!(stages(&a, 0), [Skipped, Next, ToCome]);
+        assert_eq!(stages(&a, 1), [ToCome]);
+        let _ = a.view();
+        // The Facing's mist is not sent, so it is not refused; Cycle Start
+        // waits for the work zero on the stock the Facing left.
+        assert!(!has(&a, "mist"), "{:?}", problems(&a));
+        assert!(
+            has(&a, "after operations taken as cut"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // The Facing took the top down to the part's, 4 mm: Z is touched
+        // off on that floor at the stock top's centre.
+        let partly = run_of(&a).partly().unwrap();
+        assert!(
+            partly.cut.iter().any(|c| c == "top face"),
+            "{:?}",
+            partly.cut
+        );
+        let floor = partly.surface.unwrap() - p.datum[2];
+        assert!((floor + 4.).abs() < 1e-3, "{floor}");
+        let (_, work) = conn(&a).touch_off().unwrap();
+        assert!((work[2] - floor as f64).abs() < 1e-9);
+        // A plate laid anywhere on the top might lie on the Pocket's floor:
+        // Probe Z is off.
+        assert!(
+            conn(&a)
+                .stock_top()
+                .unwrap_err()
+                .contains("Probe Z cannot set Z")
+        );
+        let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains("This run starts at Pocket (tool run 1), taking Facing as cut")
+                && steps.contains("at Z-4 (the stock top was Z0)")
+                && steps.contains("pinches a sheet of paper on the floor there")
+                && steps.contains("4. Set Z-4: that point becomes Z-4. X and Y stay as they are"),
+            "{steps}"
+        );
+        // The stock top was at machine Z-20 (`zeroed`): the tip 4 mm below
+        // it, on the Facing's floor, and over the centre within a few mm by
+        // eye. Set Z-4 there sets Z alone, which stays: X and Y stay too.
+        // (The simulator's block, 47 mm tall with its top at Z-40, would put
+        // the Contour below the soft limits, which Cycle Start refuses.)
+        let offset = conn(&a).snapshot.work_offset;
+        mdi(&mut a, "G0 X3 Y-2 Z-4");
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.work_offset, offset);
+        assert!(run_of(&a).zeroed);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Cycle Start cuts from the Pocket: the job is the program from it.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        assert_eq!(run_of(&a).running_blocks(), Some(from));
+        let mut deadline = Deadline::new(30.);
+        while stages(&a, 0) != [Skipped, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "{:?}", stages(&a, 0));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (_, op, _) = run_of(&a).progress(line(&a)).unwrap();
+        assert_eq!(op, 1);
+        run_until(&mut a, 30.0, "tool run 1 from the Pocket", |r| r.done[0]);
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            ok && message.contains("tool run 1 of 2 from Pocket"),
+            "{message}"
+        );
+        assert_eq!((run_of(&a).next, run_of(&a).from), (1, 0));
+        assert_eq!(stages(&a, 0), [Done, Done, Done]);
+        assert_eq!(stages(&a, 1), [Next]);
+        // Started: the work zero is kept from here, as after any first tool run.
+        assert!(!run_of(&a).partway() && work_zero_steps(&a, conn(&a)).is_none());
+        // The Contour picked again in the tool run done: cut again from it.
+        let _ = a.update(Message::Run(R::From(0, 2)));
+        assert_eq!(stages(&a, 0), [Done, Done, Next]);
+        assert_eq!(stages(&a, 1), [ToCome]);
+    }
+
+    /// A run started at the Drilling with the work zero on the stock top's
+    /// front-left corner, which the Contour cut down in part: the check
+    /// cannot tell one surface there, so Zero Z on the stock top and Probe Z
+    /// are off and touch off nothing, and Cycle Start waits until the work
+    /// zero is kept or set from a reference, for each start chosen (LIO-177).
+    #[test]
+    fn a_partway_start_whose_surface_is_not_known_waits_for_the_work_zero() {
+        use crate::run::Action as R;
+        use crate::ui::work_zero_steps;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        let waits = "after operations taken as cut";
+        assert!(!has(&a, waits) && conn(&a).partway_blocked().is_none());
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(run_of(&a).partway());
+        let blocked = conn(&a).partway_blocked().unwrap();
+        assert!(
+            blocked.contains("cannot tell the surface they left"),
+            "{blocked}"
+        );
+        assert!(conn(&a).touch_off().is_none());
+        assert!(
+            conn(&a)
+                .stock_top()
+                .unwrap_err()
+                .contains("Probe Z cannot set it")
+        );
+        assert!(conn(&a).edges_setup().is_err());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains("taking Facing, Pocket, Contour as cut")
+                && steps.contains("Load T3")
+                && steps.contains("Zero Z on the stock top and Probe Z are off")
+                && !steps.contains("Zero all"),
+            "{steps}"
+        );
+        // Touch off does nothing; Cycle Start waits.
+        let offset = conn(&a).snapshot.work_offset;
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.work_offset, offset);
+        assert!(has(&a, waits), "{:?}", problems(&a));
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // Kept: Cycle Start may start.
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Another start asks again.
+        let _ = a.update(Message::Run(R::From(0, 2)));
+        assert!(has(&a, waits));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(!has(&a, waits));
+        // A check of the setup again asks again, and keeps the start.
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 2));
+        assert!(has(&a, waits));
+        // From the setup's first operation the work zero is found as ever.
+        let _ = a.update(Message::Run(R::Next(0)));
+        assert!(!run_of(&a).partway() && !has(&a, waits));
+    }
+
+    /// Renders the Tool runs panel with an operation chosen to PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/run-from-op): the Pocket chosen
+    /// before Z is touched off on the floor the Facing left, the Pocket
+    /// being cut, and the Drilling chosen with the work zero on a corner
+    /// whose surface the check cannot tell. Not a check: run it with
+    /// --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_run_started_at_a_chosen_operation() {
+        use crate::run::{Action as R, Stage::*};
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/run-from-op".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1600., 1700.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-pocket-chosen.png"));
+        mdi(&mut a, "G0 X0 Y0 Z-4");
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let mut deadline = Deadline::new(30.);
+        while run_of(&a).stages(0, conn(&a).snapshot.current_line) != [Skipped, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-cutting-from-the-pocket.png"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-drilling-chosen-surface-unknown.png"));
+    }
+
     /// The driver refuses a job sent while it is not idle for it: for a few
     /// milliseconds after a work or machine zero it re-anchors its position,
     /// while the app's snapshot still says Idle. Such a Cycle Start ran
@@ -2651,8 +3019,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(Ok(many))));
         assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(12));
         let _ = a.view();
-        // The strip is the same; the ten more tool runs are in the list under it.
-        assert_eq!(counts(&a), (strip, runs + 10));
+        // The strip is the same; the ten more tool runs are in the list under
+        // it, each of one operation: its button and the card's Start here.
+        assert_eq!(counts(&a), (strip, runs + 20));
     }
 
     #[test]

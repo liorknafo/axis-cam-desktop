@@ -809,6 +809,35 @@ panel, at once when that machine is connected, or when you press
    the run panel on screen, not in the Controller configuration view. The
    Run strip shows the tool run, operation and block being cut, and how the
    tool run ended.
+
+   Each tool run in the Tool runs panel shows its operations as cards, each
+   with a picture of the stock it leaves and where it stands. **Start here**
+   on a card makes Cycle Start begin with that operation, in any tool run,
+   for operations already cut in an earlier session or before a Stop or
+   E-stop (LIO-177): the operations before it say "Skipped: taken as cut"
+   and the card "Next: Cycle Start cuts it". Nothing of the skipped
+   operations is sent: the tool run starts as after a tool change, with Z up
+   to the clearance plane where the tool stands, the spindle and coolant as
+   that operation sets them, the start dwell, then across at the clearance
+   plane and down, and that program is checked as the whole one is (rapids
+   into the stock the earlier operations leave, holder, jaws and clamps).
+   The checks before Cycle Start (soft limits, spindle and coolant outputs)
+   cover only what is sent. Before the setup's first tool run starts this
+   way, Work zero on the stock names the operations taken as cut and the
+   tool to load, and finds the work zero on the stock they leave: where they
+   cut the stock top's touch-off spot, and as far around it as that tool
+   reaches, down to one flat floor the check knows (a facing pass), the
+   touch-off button sets Z alone on that floor (**Set Z-4** after a 4 mm
+   facing pass): X and Y stay those the operations were cut with, which a
+   tip jogged by eye would not find again. Where the check cannot tell the
+   surface they left, it is off; Probe Z is off once they cut into the top
+   anywhere, since the plate may lie elsewhere on it; and probes from the
+   stock-top spots run only where those operations left the stock. Cycle
+   Start waits until the work zero is set this way after the start was
+   chosen, set from a recorded reference, or **Keep this work zero** is
+   pressed (it is still the one those operations were cut with, or Z was
+   set by hand on a surface they left); each new start, and each new check
+   of the setup, asks again.
 4. Between tool runs with different tools, the Tool runs panel gives the
    steps: the last one ended with the spindle and coolant off at the setup's
    clearance plane. Touch the old tool
