@@ -130,6 +130,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "The part does not sit on the fixture pins: its X and Y work zero is touched off or probed on the stock.",
             "",
         ),
+        ("tabs", "No") => (
+            "The contour goes all the way round at every level. Where it cuts through the stock's bottom the part comes free of the stock around it, and can be thrown by the cutter: leave a skin with Bottom offset, or turn tabs on.",
+            "",
+        ),
+        ("tabs", "Yes") => (
+            "Leave tabs: short bridges of material across the cut at its bottom that keep the part joined to the stock around it after the contour goes through, so the cutter cannot throw it. They only hold where stock is left beyond the cut: leave more beside the part than the stock to leave, the tool's diameter and a 2 mm wall.",
+            "Generate refuses tabs that would join the part to no stock. Below the tabs' top the tool rises over each tab and plunges back down after it; the levels above go round in full. The tabs stay on the part: cut or file them off by hand afterwards.",
+        ),
         ("openings", "Leave") => (
             "Clear the selected floors only. Holes through a floor are cleared over at the floor's height and left for another operation.",
             "",

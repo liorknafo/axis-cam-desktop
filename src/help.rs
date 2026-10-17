@@ -1840,6 +1840,21 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Offsets),
         ),
+        (_, "tab_count") => (
+            "How many tabs an outside Contour leaves on each outline it goes around, spaced evenly along it, the first half a spacing from where the cut starts. Two or three hold a small part; use more on a long or thin one, so it cannot bend into the cutter.",
+            "",
+            Some(Operation(Strategy::Contour)),
+        ),
+        (_, "tab_width") => (
+            "Each tab's width at its narrowest, midway across the cut, in mm. Over each tab the tool's centre rises along this width plus its diameter; its round end leaves the tab wider toward the part's wall and the stock's, by up to that diameter.",
+            "",
+            Some(Operation(Strategy::Contour)),
+        ),
+        (_, "tab_height") => (
+            "How thick each tab is, in mm: over the tabs the cut stops this far above the stock's bottom, or above the contour's bottom where that is higher. It must be less than the depth the contour cuts.",
+            "A tab holds only where stock is left beyond the cut, so leave more stock beside the part than the stock to leave, the tool's diameter and a 2 mm wall. Levels above the tabs' top go round in full. Below it the tool rises straight up at each tab's start and plunges back down at its end at a quarter of the cutting feed, as it does entering the cut. Cut or file the tabs off after the part is unclamped.",
+            Some(Operation(Strategy::Contour)),
+        ),
         (_, "through") => (
             "Add Breakthrough below the bottom of each hole that goes through the part. A blind hole is refused with Yes, since the part goes on under its bottom. Check the extra depth and the material or fixture underneath.",
             "",

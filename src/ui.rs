@@ -464,6 +464,20 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     {
         checks.extend(problems.into_iter().map(|text| Check::new(text, false)));
     }
+    // A generated outside Contour that goes through the stock's bottom all
+    // the way round leaves the part loose for the cutter to throw.
+    if let Some(o) = app.operation()
+        && o.strategy == Strategy::Contour
+        && get(&o.p, "boundary") == "Model silhouette"
+        && pocket_setting(&o.p, "tabs") == CONTOUR_TABS[0]
+        && let Some(plan) = app.active_simulation().map(|s| &s.plan)
+        && plan.target <= plan.stock.min[2] + 0.001
+    {
+        checks.push(Check::new(
+            "Bottom offset takes the contour through the stock's bottom all the way round: the part comes loose and the cutter can throw it. Turn on Holding tabs, or raise Bottom offset to leave a skin.".into(),
+            false,
+        ));
+    }
     checks
 }
 /// The operation editor's tab a check's message is about: the one with the
@@ -482,7 +496,10 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         }
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
-        Some("clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings") => "Heights",
+        Some(
+            "clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings" | "tab_count"
+            | "tab_width" | "tab_height",
+        ) => "Heights",
         Some(
             "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
             | "lead_angle" | "lean_angle",
@@ -2381,6 +2398,25 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 ("bottom", "Bottom offset · mm"),
             ] {
                 c = c.push(checks.field(p, k, label));
+            }
+            if !app.is_sample()
+                && o.strategy == Strategy::Contour
+                && get(p, "boundary") == "Model silhouette"
+            {
+                c = c.push(choice_value(
+                    p,
+                    pocket_setting(p, "tabs"),
+                    "tabs",
+                    "Holding tabs",
+                    &CONTOUR_TABS,
+                    t,
+                ));
+                if pocket_setting(p, "tabs") == CONTOUR_TABS[1] {
+                    c = c
+                        .push(checks.field(p, "tab_count", "Tabs on each outline"))
+                        .push(checks.field(p, "tab_width", "Tab width · mm"))
+                        .push(checks.field(p, "tab_height", "Tab height · mm"));
+                }
             }
             if !app.is_sample() && o.strategy == Strategy::Pocket {
                 c = c.push(choice_value(
