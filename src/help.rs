@@ -930,6 +930,13 @@ pub fn command(m: &Message, label: String) -> Help {
             &crate::model::Fields::new(),
         );
     }
+    // A hole of the part chosen, or no longer chosen, for the fixture pins.
+    if let Edit(Target::Setup, "pin_holes", _) = m {
+        return Help::text(
+            label,
+            "Choose or remove this hole of the part for the fixture pins. Choose one hole per pin, as the part's design has them: round holes it opens on the face this setup sits on, the pins' diameter to 0.2 mm over from their opening on (not counterbored), at least the pins' height deep. Which hole takes which pin follows from the plate, and pin 1's hole gives the X and Y work offset with pin 1's recorded machine place. Drill them in an earlier setup with a Drill operation on the face they open on, or before the job.",
+        );
+    }
     if let StockDetail(detail) = m {
         return crate::choice_help::selected(
             "stock_detail",
@@ -1086,6 +1093,10 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         ClearSurfaces => (
             "Remove this operation's saved surface selections so you can choose new surfaces on the current part.",
+            "",
+        ),
+        PickPinHoles => (
+            "Pick the part's holes for the fixture pins in the 3D view: click inside a hole, on its wall or its end, to choose it or remove it; drag to orbit (turn the view to see under the part, where the holes open), and click Finish picking when done. The holes offered are ringed and numbered as listed.",
             "",
         ),
         PickMode => (
@@ -1461,7 +1472,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         ProbeFeature(_) => (
-            "Probe a feature from where the tip is and set work zero on it in the active coordinate system, without a setup: a surface (Z top), a side (X+, X−, Y+, Y−), an outside corner, or the centre of a bore. The tip's radius is allowed for. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
+            "Probe a feature from where the tip is and set work zero on it in the active coordinate system, without a setup: a surface (Z top), a side (X+, X−, Y+, Y−), an outside corner, or the centre of a bore or of a boss or pin. The tip's radius is allowed for. Anything touched on the way, a miss, Stop or E-stop ends it with nothing set.",
             "",
         ),
         Wcs(_) => (
@@ -1502,6 +1513,18 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         ToSimZero => (
             "Simulated only: rapid the tool tip up to the top of Z, over where this setup is touched off on the simulator's block, and down onto it. Then the button beside it sets the work zero, as touching off on real stock would.",
+            "",
+        ),
+        RecordPins => (
+            "Once, after setting machine zero, and again whenever the plate is moved: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and keep its machine X Y in the machine's profile. Then it flies over the top of Z to where the plate puts pin 2, finds it, and says how far it is off the line from pin 1: over 0.05 mm, square the plate.",
+            "Pin centre touches the pin's top, then probes its sides from −X, +X, −Y and +Y, min(3 mm, half the pin's height) below the top, starting outside it by the pin's and the tip's diameters and 1 mm. The tip's radius cancels out.",
+        ),
+        ReferencePins => (
+            "After every E-stop or power cycle, or at the start of a session: with the part off the pins and the probe a few mm above the middle of pin 1, find pin 1's centre and declare machine X and Y so that it is where it was recorded. Pin 1 acts as the machine's home for X and Y: every saved G54–G59 offset, the soft limits and the pins' place hold again. Z still gets its machine zero at the top of travel.",
+            "X and Y need no machine position first: they are declared where they show, the probe moves only a few mm from where the tip is, and then they are declared again from the pin. Z needs one, as the probe moves it.",
+        ),
+        PinZero => (
+            "Set the X and Y work offset of the active work system to the one the pins give this setup: pin 1's recorded machine place less where pin 1 stands in the setup's work coordinates. Exact, with no probing. Z is touched off as for any setup.",
             "",
         ),
     }
@@ -2044,6 +2067,21 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "probe_plate") => (
             "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Leave it empty without a plate.",
+            "",
+            None,
+        ),
+        (_, "pins") => (
+            "The fixture plate's dowel pins, as drilled, in the plate's own X Y (mm), pin 1 first: \"0 0; 120 0\" for two pins 120 mm apart along X. Pin 1 is the reference pin, pin 2 gives the turn. Leave it empty without pins.",
+            "The plate is taken as square to the machine's X and Y: Record the pins' place on the Control page measures how far off it is. A setup that sits on the pins gets its X and Y work offset from pin 1's recorded place.",
+            None,
+        ),
+        (_, "pin_diameter") => (
+            "The pins' diameter, in mm: measure it. The holes a part drops over them by must be this to 0.2 mm over: a wider hole leaves the part free to move. The checks keep tools clear of a pin-sized box per pin.",
+            "",
+            None,
+        ),
+        (_, "pin_height") => (
+            "How far the pins stand above the plate, in mm: measure it. The part's holes for them must be at least this deep, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
             "",
             None,
         ),
@@ -3723,6 +3761,7 @@ mod tests {
             MoveOp(-1),
             MoveOp(1),
             PickMode,
+            PickPinHoles,
             Generate,
             GenerateAll,
             DuplicateSetup,

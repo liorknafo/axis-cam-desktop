@@ -172,6 +172,14 @@ The zero must be on material that is there. Once the background check of the act
 - **The work zero is not on the stock** when earlier setups have cut a spot it is touched off on, or the stock under a zero on the bottom, or when the stock is not square to the setup. The message names the spot and the work zeros still on the stock ("Later: earlier setups have cut the stock's top face at its centre, so the Stock top center work zero is no longer on the stock. Choose one that is, Stock top front-left, …, or Model origin for this setup."). Export and Run refuse the setup, and the Machine step keeps its ○.
 - **No probe finds this work zero** when a vise jaw or clamp stands where the probe would go down beside a side or onto the top's spot (the column out to 10 mm from the side, up to the height the probe travels at: 10 mm above the top, or above the tallest jaw or clamp when one stands higher), or reaches that height under the probe's way between two faces, or when the stock-top corner Model origin is found from was cut. The setup can still run: touch the zero off by hand.
 
+#### Fixture pins
+
+Dowel pins pressed into a plate on the table locate a part by holes in it, so it sits in the same place and turn every time, also after a flip, and X and Y need no probing. In the Machine library, on the machine's UC100 step, **Fixture pins** takes the pins as drilled in the plate's own X Y ("0 0; 120 0", pin 1 first: the reference pin), their **diameter** and their **height** above the plate; pin 1's machine place is recorded on the Control page, never typed. The plate is taken as square to X and Y, and Record the pins' place measures how far off it is. A setup's Machine step snapshot carries the pins, so use **Assign to current setup** after editing them.
+
+The holes are part of the part's design: model them in the CAD as the pins need them. In a setup's Work zero step, **Sits on the fixture pins** (Yes) lists under **Pin holes** every round hole the part opens on its bottom in this setup (the face it sits on), each with its diameter, its place in work coordinates and its depth; click the holes that drop over the pins, one per pin, to choose them (click again to remove one, or **Clear the pin holes**). Which hole takes which pin follows from the plate: pin 1 goes into the chosen hole from which the plate, square to X and Y, puts every other pin into another chosen one (within 0.05 mm), and the step names each hole's pin and lists the pins in work coordinates. The setup's X and Y work offset is then pin 1's recorded machine place less pin 1's hole in work coordinates; Z is still touched off on the stock as the work zero says, and the probes stay available to check the part's place. The choice is kept as the holes' places in the part's own frame, so it follows a change of the setup's rotation or translation while the holes are still on its bottom. The checks refuse the setup when its machine has no pins or they do not read, no hole is chosen or not one per pin, a chosen hole is no longer a round hole on its bottom (another part, or the setup turned onto a side), the holes are not where the plate's pins stand, or a hole is smaller than the pins, more than 0.2 mm wider from its opening on (a counterbore leaves the part free to move) or, blind, less deep than the pins are tall. They warn ("Pin holes"), without refusing, when no earlier setup drills them: a hole counts when an earlier straight cut along this setup's Z covers the pin with its full diameter (above a drill's point) from the setup's bottom up to the pin's height, carried into this setup's frame, and is at most 0.2 mm wider than the pin: a pocket or a larger hole the pin stands in does not locate the part. They may have been made off the machine. The pins are workholding, whatever holds the part down: a pin-sized box per pin from the stock's bottom up to the pin height, drawn in the 3D view with the jaws or clamps, and export, the plan check and a run refuse a move into one as into a jaw.
+
+An ordinary **Drill** operation in an earlier setup drills the holes, from the face the later setup sits on: select that face and the holes are found in the part as any others, with a drill of the pins' diameter to 0.2 mm over. `examples/dowel-block.3mf` (made by `scripts/make-dowel-block.py`) is a 120 × 80 × 20 mm block with two Ø4.1 dowel holes 8 mm deep, 80 mm apart along X, in its top face, for Ø4 pins "0 0; 80 0".
+
 The same point is used everywhere: the program's coordinates (plan point − work zero), the simulation and a run's moves (plan point − work zero + the machine's work offset), the 3D view's **X0 Y0 Z0** marker (drawn on the stock the simulation starts from, or the box the editor knows for the setup), the header's touch-off words, the Run panel's steps and the probe.
 
 Six operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks beyond the vise jaws and clamps a setup models (see **Workholding**) and the five explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
@@ -408,7 +416,14 @@ panel once it is checked. The Work zero panel gives its place and the machine
 model draws it. With a probe input in the profile, the probe input reads
 active while the tool tip is inside it. The simulated probe is a point, so
 with a tip diameter set, Probe corner finds the corner a tip radius inside
-the block's.
+the block's. A machine with fixture pins gets a block of each pin's size from
+the bottom of Z: until their place is recorded they stand in front of the
+stock's block (left of it when they spread further along Y), then where it
+was recorded. They stay put on the table when machine X or Y is declared,
+so a machine zero set in another place leaves them off by that much, as on
+the real machine. A setup that sits on the pins has its block where the pins
+place it, and it is put on them only once X and Y are referenced from pin 1:
+the part is off the pins while they are probed.
 
 Once the machine is Idle, the Control page has everything needed before a job:
 
@@ -515,9 +530,13 @@ Once the machine is Idle, the Control page has everything needed before a job:
   the probe moves; X+ touches a part's left side), an outside corner
   (**Front-left** … **Back-right**: start outside the corner below the top,
   less than 15 mm off both sides; it steps 15 mm along each side, probes the
-  other and comes back) and **Bore centre** (start inside a bore or pocket
+  other and comes back), **Bore centre** (start inside a bore or pocket
   below its top: it probes −X and +X, then −Y and +Y at the middle found,
-  ends on the centre and gives the diameter across Y). The feature found
+  ends on the centre and gives the diameter across Y) and **Boss centre**
+  (start over a boss or pin, above its top: it touches the top, goes out by
+  the maximum probe distance, down 3 mm below the top as a probe move, and
+  probes in from −X and +X, then from −Y and +Y at the middle found; it
+  ends over the centre and gives the size across Y through it). The feature found
   becomes work zero on the axes it sets in the active coordinate system,
   allowing for the tip's radius; the edges and corners return the tip to
   where it started. A probe input missing, the machine not Idle or Z
@@ -526,6 +545,25 @@ Once the machine is Idle, the Control page has everything needed before a job:
   X with an edge finder on its left side, touch its right side and press
   **1/2**; Probe centre finds the setup's with the probe. Each needs a probe input, the probe tip diameter
   (not for Z top), X, Y and Z referenced and the machine Idle.
+- **Fixture pins.** For a machine with fixture pins in the Machine library
+  (see **Fixture pins** below), under Machine zero: **Record the pins'
+  place**, once after setting machine zero and again whenever the plate is
+  moved, and **Reference X Y from pin 1**, after every E-stop or power cycle.
+  Take the part off the pins, jog the probe a few mm above the middle of pin
+  1 and press one. Both find pin 1's centre with **Pin centre**, Boss centre
+  sized for the pins: out past the pin's and the tip's diameters and 1 mm,
+  the sides probed min(3 mm, half the pin's height) below its top; the tip's
+  radius cancels out. Record keeps pin 1's machine X Y in the machine's
+  profile, then flies over the top of Z to where the plate puts pin 2, finds
+  it and says how far it is off the line from pin 1 ("Pin 2 is 0.040 mm off
+  the line in Y over 100.0 mm"), in amber over 0.05 mm: square the plate.
+  Reference declares machine X and Y so that pin 1's centre is where it was
+  recorded, and says by how much they moved: pin 1 is the machine's home for
+  X and Y, so every saved G54–G59 offset, the soft limits and the pins'
+  place hold again. It needs Z with a machine position (machine zero at the
+  top of Z, as before) but not X and Y: they are declared where they show
+  first, and the probe moves only a few mm from where the tip is. An E-stop,
+  a disconnect or declaring X or Y another way clears it.
 - **Spindle and coolant.** CW at an RPM, Stop; CCW only when the profile has a
   direction output; Flood and Mist only for the outputs the profile has.
 - **Overrides.** Feed override 10–200 %; **Override limit switches** when the
@@ -643,6 +681,17 @@ panel, at once when that machine is connected, or when you press
    point and down onto it, so the button puts the work zero on the block. A tool run
    that would leave the soft limits says "Put the work zero on the stock:
    see Work zero on the stock below".
+
+   For a setup that sits on the fixture pins the steps are: X and Y
+   referenced from pin 1 since the last E-stop (or Record the pins' place
+   first, once), the setup's work system active, **Set X Y from the pins**
+   (it sets the X and Y work offset to pin 1's recorded machine place less
+   where pin 1 stands in the setup's work coordinates, exactly, without
+   probing), and Z touched off on the stock: the touch-off button sets only
+   Z there (**Set Z…**), or Probe Z. Cycle Start waits until X and Y are
+   referenced from pin 1 and the work offset is the one the pins give, and
+   when the setup's snapshot of the machine has other pins than the Machine
+   library.
 3. **Cycle Start** turns the tool run into the driver's actions at the
    current work zero (plan point − work zero + work offset, feeds in mm/s)
    and sends them as one job; the driver checks the soft limits again before

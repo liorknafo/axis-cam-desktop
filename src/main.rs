@@ -154,6 +154,10 @@ pub enum Message {
     Surface(usize),
     ClearSurfaces,
     PickMode,
+    /// "Pick holes on the part" (and "Finish picking") in the Work zero step.
+    PickPinHoles,
+    /// A click on the part's surface while picking the pin holes.
+    PinHoleSurface(usize),
     Generate,
     GenerateAll,
     AddSetup,
@@ -445,6 +449,7 @@ const HOLDING_KEYS: [&str; 7] = [
 ];
 /// What `cam::holes` answers for the Drill editor's list.
 pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
+pub(crate) type BottomHoles = Result<Vec<cam::BottomHole>, String>;
 #[cfg(test)]
 thread_local! {
     /// How many times this thread has run `cam::holes` for the Drill editor.
@@ -700,6 +705,9 @@ pub struct App {
     /// The Drill editor's hole list and what it was worked out from
     /// (`App::drill_holes`).
     drill_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<DrillHoles>)>>,
+    /// The round holes the part opens on the current setup's bottom, kept
+    /// as `drill_holes` is (`App::bottom_holes`).
+    bottom_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<BottomHoles>)>>,
     /// The browser's pictures of stock, each drawn once for what it shows
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
@@ -758,6 +766,10 @@ pub struct App {
     pub show_uncut: bool,
     pub paths: bool,
     pub picking: bool,
+    /// "Pick holes on the part" in the Work zero step: a click on the part
+    /// chooses or removes the hole it is in for the fixture pins, while
+    /// that step of a setup on the pins is open (`picking_pin_holes`).
+    pub picking_pins: bool,
     pub playing: bool,
     pub simulation: Option<simulation::Simulation>,
     pub stock_detail: stock_surface::Detail,
@@ -1149,6 +1161,7 @@ impl App {
             ready_job: None,
             holding_note: std::cell::RefCell::new(None),
             drill_holes: std::cell::RefCell::new(None),
+            bottom_holes: std::cell::RefCell::new(None),
             stock_pictures: Default::default(),
             post_epoch: 0,
             settings,
@@ -1181,6 +1194,7 @@ impl App {
             show_uncut: true,
             paths: true,
             picking: false,
+            picking_pins: false,
             playing: false,
             simulation: None,
             stock_detail: Default::default(),
@@ -1366,6 +1380,18 @@ impl App {
     pub fn is_sample(&self) -> bool {
         self.doc.sample_model && self.doc.file.is_none()
     }
+    /// Whether a click on the part picks a hole for the fixture pins: "Pick
+    /// holes on the part" is on, and the Work zero step of a setup on the
+    /// pins is open on an imported part.
+    pub fn picking_pin_holes(&self) -> bool {
+        self.picking_pins
+            && self.page == Page::Work
+            && self.selected.is_none()
+            && self.setup_step == "Work zero"
+            && !self.is_sample()
+            && self.part_mesh().is_some()
+            && self.doc.active_setup().is_some_and(post::sits_on_pins)
+    }
     pub fn can_pick(&self) -> bool {
         self.operation().is_some_and(|o| {
             self.is_sample()
@@ -1455,6 +1481,22 @@ impl App {
         }
         self.status = message;
         changed
+    }
+    /// Keeps pin 1's machine X Y just recorded on the Control page in the
+    /// profile of machine `id`, and in its draft if it is being edited. It
+    /// is a measurement, not a setting: no setup's check depends on it.
+    fn record_pins(&mut self, id: &str, at: [f64; 2]) {
+        let keep = |m: &mut Machine| {
+            if m.id == id {
+                m.p.insert("pin_ref_x".into(), format!("{:.3}", at[0]));
+                m.p.insert("pin_ref_y".into(), format!("{:.3}", at[1]));
+            }
+        };
+        self.doc.machines.iter_mut().for_each(keep);
+        keep(&mut self.machine_draft);
+        self.dirty = true;
+        self.project_dirty = true;
+        self.last_edit = Instant::now();
     }
     fn touch(&mut self) {
         if !self.is_sample() {
@@ -1964,6 +2006,29 @@ impl App {
         #[cfg(test)]
         DRILL_HOLE_RUNS.with(|n| n.set(n.get() + 1));
         let found = std::sync::Arc::new(cam::holes(setup, op, mesh));
+        *kept = Some((key, found.clone()));
+        found
+    }
+    /// The round holes the part opens on the current setup's bottom
+    /// (`cam::bottom_holes`), the holes it can drop over fixture pins by:
+    /// kept until the part or the setup's placement changes, as
+    /// `drill_holes` is.
+    pub(crate) fn bottom_holes(&self, mesh: &mesh::Mesh) -> std::sync::Arc<BottomHoles> {
+        use std::hash::{Hash, Hasher};
+        let setup = self.doc.setup();
+        let mut hasher = std::hash::DefaultHasher::new();
+        mesh.fingerprint.hash(&mut hasher);
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+            get(&setup.p, key).hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let mut kept = self.bottom_holes.borrow_mut();
+        if let Some((k, found)) = kept.as_ref()
+            && *k == key
+        {
+            return found.clone();
+        }
+        let found = std::sync::Arc::new(cam::bottom_holes(setup, mesh));
         *kept = Some((key, found.clone()));
         found
     }
@@ -2875,6 +2940,26 @@ impl App {
                 }
                 self.touch();
             }
+            Message::PickPinHoles => {
+                self.picking_pins = !self.picking_pins;
+                self.picking = false;
+            }
+            Message::PinHoleSurface(n) => {
+                let Some(mesh) = self.part_mesh().filter(|_| self.picking_pin_holes()) else {
+                    return Task::none();
+                };
+                let setup = self.doc.setup();
+                let found = self.bottom_holes(mesh);
+                let Ok(holes) = &*found else {
+                    return Task::none();
+                };
+                let Some(i) = cam::surface_hole(setup, mesh, holes, n) else {
+                    self.status = "That is not in a round hole the part opens on its bottom in this setup: click inside a hole, on its wall or its end.".into();
+                    return Task::none();
+                };
+                let text = post::pin_holes_toggled(setup, mesh, &holes[i]);
+                return self.update(Message::Edit(Target::Setup, "pin_holes", text));
+            }
             Message::PickMode => {
                 self.picking = !self.picking && self.can_pick();
                 if self.picking {
@@ -3360,6 +3445,7 @@ impl App {
                     let mut m = self.machine_draft.clone();
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
+                        c.pins = control::pins_settings(&m.p);
                     }
                     if let Some(i) = self.doc.machines.iter().position(|x| x.id == m.id) {
                         m.version += 1;
@@ -3850,6 +3936,9 @@ impl App {
                     }
                 }
                 viewport::Event::PickSurface(n) => {
+                    if self.picking_pin_holes() {
+                        return self.update(Message::PinHoleSurface(n));
+                    }
                     if self.picking {
                         return self.update(Message::Surface(n));
                     }
@@ -3971,6 +4060,11 @@ impl App {
                             s => format!("Connected to {name}: {}", s.label()),
                         };
                     }
+                }
+                if let Some((id, at)) = (self.control.as_mut())
+                    .and_then(|c| Some((c.machine_id.clone(), c.recorded.take()?)))
+                {
+                    self.record_pins(&id, at);
                 }
                 if self.status == LOCKED && !self.locked() {
                     self.status.clear();

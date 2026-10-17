@@ -34,12 +34,15 @@ impl Frame {
     pub fn setups_square(first: &Setup, later: &Setup) -> bool {
         Self::axes(first).square_to(Self::axes(later))
     }
-    fn map(self, p: [f32; 3]) -> [f32; 3] {
+    /// The point `p` of the part's own frame (its file's coordinates, mm)
+    /// in this setup's.
+    pub fn map(self, p: [f32; 3]) -> [f32; 3] {
         std::array::from_fn(|k| {
             self.shift[k] + (0..3).map(|i| self.basis[i][k] * p[i]).sum::<f32>()
         })
     }
-    fn unmap(self, p: [f32; 3]) -> [f32; 3] {
+    /// The point `p` of this setup's frame in the part's own (`map` back).
+    pub fn unmap(self, p: [f32; 3]) -> [f32; 3] {
         std::array::from_fn(|i| {
             (0..3)
                 .map(|k| (p[k] - self.shift[k]) * self.basis[i][k])

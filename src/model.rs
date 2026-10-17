@@ -293,6 +293,11 @@ impl Machine {
         {
             e.push("Choose the machine's UC100 profile file.".into())
         }
+        e.extend(
+            crate::control::pins_settings(&self.p)
+                .err()
+                .unwrap_or_default(),
+        );
         e
     }
     pub fn fill_post_defaults(&mut self) {
@@ -895,6 +900,10 @@ impl Setup {
             finite(&self.p, k, &mut e)
         }
         nonnegative(&self.p, "clearance", &mut e);
+        // The machine's own issues say what is wrong with the pins.
+        if crate::control::pins_settings(&self.machine.p).is_ok() {
+            e.extend(crate::post::pins_issue(self));
+        }
         e
     }
 }
