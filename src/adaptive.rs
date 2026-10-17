@@ -32,6 +32,8 @@ const MAX_CELLS: f64 = 4_000_000.;
 const DIRECTIONS: usize = 9;
 /// Bisections between the two directions either side of the load.
 const REFINE: usize = 4;
+/// The pieces of a step whose engagement is weighed separately.
+const PIECES: usize = 3;
 /// Engagement over the load at which a settled pass stops rather than step
 /// on: the corner it is going into is left for a pass from elsewhere.
 const OVERLOAD: f64 = 2.;
@@ -55,6 +57,10 @@ const PROMISE: f64 = 2.;
 /// The least share of the load a pass must promise; below it, what is left
 /// is crumbs.
 const CRUMB: f64 = 0.01;
+/// The engagement, over the load, past which a wall pass slows down.
+const WALL_LOAD: f64 = 1.25;
+/// The least share of the feed a wall pass slows to.
+const SLOWEST: f64 = 0.2;
 
 /// A grid of bits, a row of 64-bit words per row of cells.
 #[derive(Clone)]
@@ -411,6 +417,10 @@ enum Event {
     },
     /// Cut through these points at depth, from where the tool is.
     Cut(Vec<P>),
+    /// A pass round a wall through these points at depth, from where the
+    /// tool is, each move at its share of the feed: less where it would
+    /// take more than the load, in a corner.
+    Wall(Vec<P>, Vec<f32>),
 }
 
 /// What the walker's next step is.
@@ -513,14 +523,24 @@ impl Level<'_> {
         self.walk.allowed.get(i, j)
     }
     /// The material the tool removes per mm stepping from `p` to `q`, mm:
-    /// its radial engagement on a straight cut. Infinite where `q` is not
+    /// its radial engagement on a straight cut, the most over any of the
+    /// step's `PIECES` (a step that runs through air and then into the
+    /// material takes all of it at its end). Infinite where `q` is not
     /// allowed.
     fn engagement(&self, p: P, q: P) -> f64 {
         if !self.ok(q) || self.walk.edges.crosses(p, q) {
             return f64::INFINITY;
         }
         let h = self.walk.cells.h;
-        self.count(p, q, self.walk.r) as f64 * h * h / self.walk.delta
+        let (mut before, mut most) = (0, 0);
+        for k in 1..=PIECES {
+            let t = k as f64 / PIECES as f64;
+            let to = (p.0 + t * (q.0 - p.0), p.1 + t * (q.1 - p.1));
+            let upto = self.count(p, to, self.walk.r);
+            most = most.max(upto - before);
+            before = upto;
+        }
+        most as f64 * h * h / (self.walk.delta / PIECES as f64)
     }
     /// The walker's next step from `p` heading `heading`, turning at most
     /// `turn` either way: the turn toward the material that removes the
@@ -968,13 +988,63 @@ impl Level<'_> {
         }
         for wall in walls {
             let (_, start, edge) = pocket::nearest(wall, self.at);
-            let mut points = pocket::begun(wall, start, edge);
-            points.push(start);
-            self.link(start, exact, false, &mut first);
-            for pair in points.windows(2) {
-                self.remove(pair[0], pair[1]);
+            let mut around = pocket::begun(wall, start, edge);
+            around.push(start);
+            // Come down a load and two cells off the wall on the cleared
+            // side and feed onto it, rather than beside what is left.
+            let next = around
+                .iter()
+                .copied()
+                .find(|q| (q.0 - start.0).hypot(q.1 - start.1) > 1e-6);
+            let lead = next.and_then(|q| {
+                let (dx, dy) = (q.0 - start.0, q.1 - start.1);
+                let l = dx.hypot(dy);
+                let off = w.load + 2. * w.cells.h;
+                let p = (
+                    start.0 - w.side * dy / l * off,
+                    start.1 + w.side * dx / l * off,
+                );
+                (self.ok(p) && !w.edges.crosses(p, start)).then_some(p)
+            });
+            let mut points = vec![];
+            if let Some(p) = lead {
+                points.push(p);
             }
-            self.events.push(Event::Cut(points));
+            points.extend(around);
+            self.link(points[0], exact, false, &mut first);
+            // Each move a step long at most, slowed where it takes more
+            // than the load so the cutter removes no more per minute.
+            let mut fine = vec![points[0]];
+            let mut shares = vec![];
+            for pair in points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                let l = (b.0 - a.0).hypot(b.1 - a.1);
+                let n = (l / w.delta).ceil().max(1.) as usize;
+                for k in 1..=n {
+                    let t = k as f64 / n as f64;
+                    let q = (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+                    let from = *fine.last().unwrap();
+                    // The most it takes over any piece of the move.
+                    let length = (q.0 - from.0).hypot(q.1 - from.1).max(1e-9);
+                    let (mut before, mut most) = (0, 0);
+                    for k in 1..=PIECES {
+                        let t = k as f64 / PIECES as f64;
+                        let to = (from.0 + t * (q.0 - from.0), from.1 + t * (q.1 - from.1));
+                        let upto = self.count(from, to, w.r);
+                        most = most.max(upto - before);
+                        before = upto;
+                    }
+                    self.remove(from, q);
+                    let e = most as f64 * w.cells.h * w.cells.h / (length / PIECES as f64);
+                    shares.push(if e > WALL_LOAD * w.load {
+                        (WALL_LOAD * w.load / e).max(SLOWEST) as f32
+                    } else {
+                        1.
+                    });
+                    fine.push(q);
+                }
+            }
+            self.events.push(Event::Wall(fine, shares));
             self.at = start;
         }
         Ok(true)
@@ -1387,6 +1457,11 @@ struct Feeds {
     feed: f32,
     slope: f32,
 }
+/// Whether `path` starts inside `exact` and no step of it crosses one of
+/// its edges (`edges`).
+fn inside(exact: &[Polygon], edges: &Edges, path: &[P]) -> bool {
+    pocket::inside(exact, path[0]) && path.windows(2).all(|w| !edges.crosses(w[0], w[1]))
+}
 /// Whether the move from `a` to `b` at depth keeps the tool centre inside
 /// `exact` (its edges `edges`).
 fn within(exact: &[Polygon], edges: &Edges, a: P, b: P) -> bool {
@@ -1480,18 +1555,26 @@ fn emit(
                 }
             }
             Event::Cut(path) => {
-                let path = simplify(path, tolerance);
-                // The path starts inside; no step of it crosses an edge.
-                if !pocket::inside(exact, path[0]) {
+                // Simplified where that stays inside, else as walked.
+                let short = simplify(path, tolerance);
+                let path = if inside(exact, edges, &short) {
+                    &short
+                } else {
+                    path
+                };
+                if !inside(exact, edges, path) {
                     return Err(OUTSIDE.into());
-                }
-                for pair in path.windows(2) {
-                    if edges.crosses(pair[0], pair[1]) {
-                        return Err(OUTSIDE.into());
-                    }
                 }
                 for p in path.iter().skip(1) {
                     out.push(point(*p, h.z), Motion::Feed, f.feed, true)?;
+                }
+            }
+            Event::Wall(path, shares) => {
+                if !inside(exact, edges, path) {
+                    return Err(OUTSIDE.into());
+                }
+                for (p, share) in path.iter().skip(1).zip(shares) {
+                    out.push(point(*p, h.z), Motion::Feed, f.feed * share, true)?;
                 }
             }
         }
@@ -1591,8 +1674,15 @@ mod tests {
             && dx * dx + dy * dy >= radius * radius - 0.001
     }
     /// Of `engagements_all`, those of the horizontal cutting moves at least
-    /// `shortest` long.
+    /// `shortest` long, each scaled by its share of the full feed: what the
+    /// cutter takes per minute, as a load at the full feed.
     fn engagements(plan: &Plan, shortest: f32, solid: impl Fn(P) -> bool) -> Vec<f32> {
+        let full = plan
+            .moves
+            .iter()
+            .filter(|m| m.cutting_pass)
+            .map(|m| m.feed)
+            .fold(0., f32::max);
         engagements_all(plan, solid)
             .into_iter()
             .zip(&plan.moves)
@@ -1601,7 +1691,7 @@ mod tests {
                     && m.from[2] == m.to[2]
                     && (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]) >= shortest
             })
-            .map(|(e, _)| e)
+            .map(|(e, m)| e * m.feed / full)
             .collect()
     }
     /// A top view of `plan`'s moves at its lowest level, written to `file`:
@@ -1670,8 +1760,9 @@ mod tests {
         enc.write_header().unwrap().write_image_data(&rgb).unwrap();
     }
     /// The radial engagement of every move of `plan` (mm removed per mm of
-    /// travel, 0 for rapids), its moves replayed, level by level, on a fine
-    /// grid of the material `solid` says each level starts with.
+    /// travel, the most over any 0.05 mm of it; 0 for rapids), its moves
+    /// replayed, level by level, on a fine grid of the material `solid` says
+    /// each level starts with.
     fn engagements_all(plan: &Plan, solid: impl Fn(P) -> bool) -> Vec<f32> {
         let h = 0.02;
         let cells = Cells {
@@ -1723,12 +1814,23 @@ mod tests {
                 (m.from[0] as f64, m.from[1] as f64),
                 (m.to[0] as f64, m.to[1] as f64),
             );
-            let mut n = 0;
-            cells.capsule(a, b, plan.radius as f64, |j, i0, i1| {
-                n += material.clear(j, i0, i1)
-            });
-            let length = ((b.0 - a.0).hypot(b.1 - a.1) as f32).max(1e-6);
-            out.push(n as f32 * (h * h) as f32 / length);
+            // The worst of each 0.05 mm of the move, not its mean.
+            let length = (b.0 - a.0).hypot(b.1 - a.1);
+            let pieces = (length / 0.05).ceil().max(1.) as usize;
+            let mut worst = 0f32;
+            let mut from = a;
+            for k in 1..=pieces {
+                let t = k as f64 / pieces as f64;
+                let to = (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+                let mut n = 0;
+                cells.capsule(from, to, plan.radius as f64, |j, i0, i1| {
+                    n += material.clear(j, i0, i1)
+                });
+                let piece = ((to.0 - from.0).hypot(to.1 - from.1) as f32).max(1e-6);
+                worst = worst.max(n as f32 * (h * h) as f32 / piece);
+                from = to;
+            }
+            out.push(worst);
         }
         out
     }
@@ -1738,12 +1840,16 @@ mod tests {
     #[ignore]
     fn picture_the_ring() {
         let (setup, mut op, tool, mesh) = ring();
-        op.p.insert("optimal_load".into(), "0.2".into());
+        let load: f32 = std::env::var("LOAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.2);
+        op.p.insert("optimal_load".into(), load.to_string());
         let started = std::time::Instant::now();
         let plan = crate::simulation::generate(&setup, &op, &tool, &mesh).unwrap();
         let took = started.elapsed();
         let solid = |p: P| p.0.abs() < 10. && p.1.abs() < 8. && !(p.0.abs() < 2. && p.1.abs() < 2.);
-        picture(&plan, 0.2, solid, "/tmp/adaptive-ring.png");
+        picture(&plan, load, solid, "/tmp/adaptive-ring.png");
         let e = engagements(&plan, 0.1, solid);
         let stats = |plan: &Plan| {
             let cut: f32 = plan
@@ -1770,6 +1876,36 @@ mod tests {
             quantile(&e, 0.99),
             quantile(&e, 1.)
         );
+        let all = engagements_all(&plan, solid);
+        let (mut first, mut second, mut later, mut slowed) = (0, 0, 0, 0);
+        for (i, m) in plan.moves.iter().enumerate() {
+            if !(m.cutting_pass && m.from[2] == m.to[2] && all[i] > 2. * load) {
+                continue;
+            }
+            if m.feed < 999. {
+                slowed += 1;
+            } else if !plan.moves[i - 1].cutting_pass {
+                first += 1;
+            } else if !plan.moves[i - 2].cutting_pass {
+                second += 1;
+            } else {
+                later += 1;
+            }
+        }
+        eprintln!(
+            "over 2x: first move {first}, second {second}, later {later}, wall (slowed) {slowed}"
+        );
+        let worst = (1..plan.moves.len())
+            .filter(|&i| plan.moves[i].cutting_pass && plan.moves[i].from[2] == plan.moves[i].to[2])
+            .max_by(|&a, &b| all[a].total_cmp(&all[b]))
+            .unwrap();
+        for k in worst.saturating_sub(3)..worst + 2 {
+            let m = &plan.moves[k];
+            eprintln!(
+                "  {k}: {:?} -> {:?} {:?} cut {} feed {} e {:.3}",
+                m.from, m.to, m.motion, m.cutting_pass, m.feed, all[k]
+            );
+        }
         let mut pocket = op.clone();
         pocket.strategy = Strategy::Pocket;
         pocket.p.insert("stepover".into(), "10".into());
@@ -1970,7 +2106,7 @@ mod tests {
         assert!(e.len() > 100, "{} moves", e.len());
         let (p95, max) = (quantile(&e, 0.95), quantile(&e, 1.));
         assert!(p95 <= 1.5 * load, "95th percentile {p95}");
-        assert!(max <= 2.6 * load, "most {max}");
+        assert!(max <= 2.5 * load, "most {max}");
         // Most of the path cuts near the load.
         let near = e
             .iter()
@@ -2148,7 +2284,8 @@ mod tests {
                 .iter()
                 .any(|c: &(f32, f32)| (p[0] - c.0).hypot(p[1] - c.1) < 4.)
         };
-        let wall = |p: &[f32; 3]| (p[0].abs() - 9.).abs() < 0.01 || (p[1].abs() - 7.).abs() < 0.01;
+        let wall =
+            |p: &[f32; 3]| (p[0].abs() - 8.98).abs() < 0.01 || (p[1].abs() - 6.98).abs() < 0.01;
         for m in rest.moves.iter().filter(|m| m.cutting_pass) {
             assert!(corner(&m.to) || wall(&m.to), "{:?}", m.to);
         }
@@ -2289,6 +2426,80 @@ mod tests {
         assert_eq!(program.operations.len(), 2);
         assert!(program.text.contains("Adaptive clearing"));
         assert!(program.lines > 500, "{} lines", program.lines);
+    }
+    #[test]
+    fn a_notch_in_a_wall_of_any_width_clears_and_its_corners_are_slowed() {
+        // The 20 × 16 mm pocket with a notch 3 mm deep into its right wall.
+        for width in [1.5, 2.5, 3., 4., 5.5, 7.] {
+            let mut tris = vec![];
+            let half = width / 2.;
+            quad(&mut tris, -10., -8., 10., 8., 0.);
+            quad(&mut tris, 10., -half, 13., half, 0.);
+            for (x, y, xx, yy) in [
+                (-15., -12., 15., -8.),
+                (-15., 8., 15., 12.),
+                (-15., -8., -10., 8.),
+                (10., -8., 15., -half),
+                (10., half, 15., 8.),
+                (13., -half, 15., half),
+            ] {
+                quad(&mut tris, x, y, xx, yy, 6.);
+            }
+            quad(&mut tris, -15., -12., 15., 12., -4.);
+            let (setup, op, tool, mesh) = part(tris, &[0.], 2.);
+            let plan =
+                generate(&setup, &op, &tool, &mesh).unwrap_or_else(|e| panic!("{width}: {e}"));
+            let solid = |p: P| {
+                (p.0.abs() < 10. && p.1.abs() < 8.)
+                    || (p.0 >= 10. && p.0 < 13. && p.1.abs() < half as f64)
+            };
+            let e = engagements(&plan, 0., solid);
+            let most = quantile(&e, 1.);
+            // A notch narrower than twice the cutter is slotted (a slot is
+            // twice the radius); elsewhere no move takes more than two and
+            // a half times the load in any 0.05 mm, at its feed.
+            let limit = if width <= 4. { 2. } else { 2.5 * 0.4 };
+            assert!(most <= limit + 0.01, "{width}: most {most}");
+        }
+    }
+    #[test]
+    fn the_totem_keyboard_case_plate_clears_with_a_2_mm_cutter_too() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        let (setup, mut op, mut tool, _) = ring();
+        tool.p.insert("diameter".into(), "2".into());
+        for (k, v) in [
+            ("optimal_load", "0.5"),
+            ("stepdown", "7"),
+            ("allowance", "0.3"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
+        let (id, _) = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.normal[2] > 0.999999
+                    && placement.transform(s.center)[2] < top - 0.1
+                    && placement.transform(s.center)[2] > bottom + 0.1
+            })
+            .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            .unwrap();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![id],
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 1);
     }
     #[test]
     fn settings_out_of_range_are_refused_with_their_limits() {

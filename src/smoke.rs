@@ -3733,11 +3733,6 @@ flood = { pin = 8 }
         assert_eq!(pick(&mut a, wall), 1);
     }
 
-    /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
-    /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
-    /// setup's Work zero step before and after its holes are chosen for the
-    /// pins, setup 1's Drill of those holes, and the Control page's Run steps
-    /// before and after X Y from the pins. Not a check: run it with
     /// The example block's pocket cleared adaptively, its editor tabs and
     /// the stock it leaves drawn to $AXIS_RENDER_DIR (/tmp/adaptive-renders):
     /// for looking at, with --ignored.
@@ -3772,13 +3767,40 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Generate);
         assert!(a.simulation.is_some(), "{}", a.status);
-        let _ = a.update(Message::Scrub(0.5));
-        render_png(&a, size, &out.join("halfway.png"));
-        let _ = a.update(Message::Scrub(1.));
-        render_png(&a, size, &out.join("done.png"));
+        // The stock surface, built in line rather than in the background.
+        let mesh = |a: &mut App| {
+            a.stock_mesh_job = None;
+            let key = a.stock_mesh_key().expect("a simulation with stock");
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let snapshot = crate::stock_surface::Snapshot {
+                bounds: volume.bounds,
+                frame: volume.frame,
+                cuts: volume.cuts.clone(),
+                detail: a.stock_detail,
+            };
+            let seconds = sim.seconds;
+            let result = snapshot.build().map(std::sync::Arc::new);
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        for (at, name) in [(0.5, "halfway.png"), (1., "done.png")] {
+            let _ = a.update(Message::Scrub(at));
+            mesh(&mut a);
+            render_png(&a, size, &out.join(name));
+        }
         eprintln!("{}", a.status);
     }
 
+    /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
+    /// setup's Work zero step before and after its holes are chosen for the
+    /// pins, setup 1's Drill of those holes, and the Control page's Run steps
+    /// before and after X Y from the pins. Not a check: run it with
     /// --ignored.
     #[test]
     #[ignore]

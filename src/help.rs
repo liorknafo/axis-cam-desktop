@@ -2070,7 +2070,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Stepover),
         ),
         (_, "optimal_load") => (
-            "Target radial engagement for adaptive clearing, in mm: how much of the cutter's side is cutting at once, from 2% to 50% of the tool diameter. The path sweeps in open areas and loops into corners and along walls to hold it, so the stepdown can be deep, often the full flute length.",
+            "Target radial engagement for adaptive clearing, in mm: how much of the cutter's side is cutting at once, from 2% to 50% of the tool diameter. The path sweeps in open areas and loops into corners and along walls to hold it, so the stepdown can be deeper than for Pocket; a new operation starts at 15% of the diameter and a stepdown of two diameters.",
             "",
             Some(Operation(Strategy::Adaptive)),
         ),
