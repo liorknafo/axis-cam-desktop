@@ -32,6 +32,9 @@ const HOVER_ROW: Color = Color::from_rgb8(239, 244, 249);
 const HOVER_BUTTON: Color = Color::from_rgb8(235, 240, 246);
 /// The opacity of an icon whose command is unavailable.
 const DIMMED: f32 = 0.45;
+/// The label of an unavailable command: lighter than `MUTED`, so it reads as
+/// greyed out beside its neighbours, and still 3:1 on white.
+const DIMMED_TEXT: Color = Color::from_rgb8(128, 140, 152);
 /// The amber of a warning: its box, its heading and its text.
 const WARNING: [Color; 3] = [
     Color::from_rgb8(255, 247, 232),
@@ -98,6 +101,60 @@ fn flat(active: bool, status: button::Status) -> button::Style {
         },
         ..Default::default()
     }
+}
+/// The top and bottom padding of a filled or outlined button: the same, so
+/// one stands as tall as the other.
+const BUTTON_PAD: u16 = 8;
+/// The edge of an outlined button: darker than `LINE`, so the button is seen
+/// as one on a white panel.
+const BUTTON_EDGE: Color = Color::from_rgb8(190, 201, 212);
+/// The edge of a button that deletes.
+const DANGER_EDGE: Color = Color::from_rgb8(226, 172, 172);
+/// A command beside other content: white with a border, so it reads as a
+/// button and not as a label. `btn` stays flat for tabs, tiles and list rows,
+/// `primary` is the one filled command of a region.
+pub(crate) fn secondary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
+    outlined_btn(label.into(), msg, false)
+}
+/// A command that deletes or discards: red text and edge, red tint under the
+/// pointer, so it is not mistaken for its safe neighbours.
+pub(crate) fn danger<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
+    outlined_btn(label.into(), msg, true)
+}
+fn outlined_btn<'a>(label: String, msg: Message, deletes: bool) -> HelpButton<'a> {
+    let action = msg.clone();
+    // The text and height of `primary`'s, so the two line up in a row.
+    let b = button(text(label.clone()).size(13))
+        .on_press(msg)
+        .padding([BUTTON_PAD, 12])
+        .style(move |_, status| outlined(deletes, status));
+    HelpButton::new(b, &action, label)
+}
+fn outlined(deletes: bool, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let (ink, edge, hover) = if deletes {
+        (ERROR[1], DANGER_EDGE, ERROR[0])
+    } else {
+        (INK, BUTTON_EDGE, HOVER_BUTTON)
+    };
+    button::Style {
+        background: Some(if hovered { hover } else { Color::WHITE }.into()),
+        text_color: ink,
+        border: Border {
+            color: if hovered && deletes { ERROR[1] } else { edge },
+            width: 1.,
+            radius: 4.into(),
+        },
+        ..Default::default()
+    }
+}
+/// A drop-down list drawn like a text field (`field_style`): Iced's own fill
+/// for it is the tint of a disabled control.
+pub(crate) fn choice_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let mut style = pick_list::default(theme, status);
+    style.background = theme.extended_palette().background.base.color.into();
+    style.border.radius = 4.into();
+    style
 }
 /// A toolbar button with its icon over the label, like Fusion 360's.
 fn tool_btn<'a>(icon: &'static [u8], label: &str, msg: Message, active: bool) -> HelpButton<'a> {
@@ -169,6 +226,7 @@ fn switcher(app: &App) -> Element<'_, Message> {
         )
         .font(font)
         .text_size(14)
+        .style(choice_style)
         .padding([7, 12])
         .into()
     };
@@ -194,7 +252,7 @@ fn primary<'a>(label: impl Into<String>, msg: Message) -> HelpButton<'a> {
     let action = msg.clone();
     let b = button(text(label.clone()).size(13))
         .on_press(msg)
-        .padding([9, 14])
+        .padding([BUTTON_PAD, 14])
         .style(|_, status| button::Style {
             background: Some(
                 if matches!(status, button::Status::Hovered) {
@@ -302,6 +360,7 @@ fn choice_value<'a>(
             .width(Fill)
             .padding([7, 9])
             .text_size(13)
+            .style(choice_style)
         ]
         .spacing(5),
         crate::choice_help::selected(key, label, value, target, p),
@@ -554,6 +613,62 @@ fn icon<'a>(app: &App, s: Strategy, size: f32) -> widget::Svg<'a> {
     svg(app.icons[s.index()].clone()).width(size).height(size)
 }
 
+/// The footer's status: the whole sentences that fit one line
+/// (`STATUS_CHARS`), all of it in the hover card, and greyed
+/// (`DIMMED_TEXT`) on another page than the one it was set on, where it
+/// tells of an earlier event.
+fn status_line(app: &App) -> Element<'_, Message> {
+    let full = app.status.trim();
+    let first = leading_sentences(full, STATUS_CHARS);
+    let line = text(if first.len() < full.len() {
+        format!("{first} …")
+    } else {
+        first.to_string()
+    })
+    .size(12)
+    .wrapping(Wrapping::None)
+    .color(if app.status_page == app.page {
+        INK
+    } else {
+        DIMMED_TEXT
+    });
+    let line = container(line).width(Fill).clip(true);
+    if first.len() < full.len() {
+        help::wrap(
+            line,
+            Help::text("Status", full),
+            widget::tooltip::Position::Top,
+        )
+    } else {
+        line.into()
+    }
+}
+/// The characters of status the footer shows on one line at the smallest
+/// window, where its 12 px text leaves room for about 140.
+const STATUS_CHARS: usize = 120;
+/// The leading whole sentences of `s` within `limit` characters, and at least
+/// the first. A sentence ends at a full stop, question or exclamation mark
+/// followed by a space ("33.4 min" does not end one), so an error's reason
+/// after "Import failed." stays in sight when it is short.
+fn leading_sentences(s: &str, limit: usize) -> &str {
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        if matches!(c, '.' | '?' | '!') && s[i + 1..].starts_with(' ') {
+            if s[..=i].chars().count() > limit && end < s.len() {
+                break;
+            }
+            end = i + 1;
+            if s[..=i].chars().count() > limit {
+                break;
+            }
+        }
+    }
+    if s.chars().count() <= limit {
+        s
+    } else {
+        &s[..end]
+    }
+}
 /// The header's line on the automatic save of the workspace.
 pub fn workspace_note(app: &App) -> String {
     match (&app.save_error, app.dirty) {
@@ -720,10 +835,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
     let foot = container(
         row![
-            text(&app.status).size(12).width(Fill),
-            text("mm  |  Bounded mesh previews · LinuxCNC 3-axis post")
-                .size(12)
-                .color(MUTED)
+            status_line(app),
+            // What the open workspace works with: MACHINE drives the UC100,
+            // MANUFACTURE previews and posts.
+            text(if app.page == Page::Control {
+                "mm  |  UC100 machine control"
+            } else {
+                "mm  |  Bounded mesh previews · LinuxCNC 3-axis post"
+            })
+            .size(12)
+            .color(MUTED)
         ]
         .spacing(15)
         .align_y(Alignment::Center),
@@ -771,11 +892,11 @@ fn start_screen(app: &App) -> Element<'_, Message> {
         text("Create a blank project, open saved work, or explore the example when you want a guided tour.").size(16),
         space().height(12),
         primary("+ New blank project", Message::NewProject),
-        btn("Open a saved project…", Message::OpenProject, false),
+        secondary("Open a saved project…", Message::OpenProject),
         space().height(12),
         rule::horizontal(1),
         muted("LEARN THE WORKFLOW"),
-        btn("Explore example project", Message::OpenSample, false),
+        secondary("Explore example project", Message::OpenSample),
         muted("The example includes a housing, sample machines and operations.")
     ].spacing(14).width(Fill);
     let mut recent = column![bold("Continue where you left off", 20)].spacing(16);
@@ -798,27 +919,29 @@ fn start_screen(app: &App) -> Element<'_, Message> {
                     ),
                 ))
                 .push(muted(format!(
-                    "{} setups · {} operations",
-                    app.doc.setups.len(),
-                    app.doc
-                        .setups
-                        .iter()
-                        .map(|s| s.operations.len())
-                        .sum::<usize>()
+                    "{} · {}",
+                    plural(app.doc.setups.len(), "setup"),
+                    plural(
+                        app.doc
+                            .setups
+                            .iter()
+                            .map(|s| s.operations.len())
+                            .sum::<usize>(),
+                        "operation"
+                    )
                 )))
                 .push(primary("Continue project", Message::ResumeProject));
     } else {
         recent = recent.push(muted("There is no project to resume yet. Your new project starts with no model, setups or operations."));
     }
     recent = recent.push(rule::horizontal(1)).push(muted("REUSABLE LIBRARIES"))
-        .push(muted(format!("{} saved machines · {} saved tools",app.doc.machines.len(),app.doc.tools.len())))
+        .push(muted(format!("{} · {}",plural(app.doc.machines.len(),"saved machine"),plural(app.doc.tools.len(),"saved tool"))))
         .push(note("New projects keep your saved libraries. The previous project is archived before you start again."));
-    recent = recent.push(btn("Browse project history…", Message::OpenHistory, false));
+    recent = recent.push(secondary("Browse project history…", Message::OpenHistory));
     if app.last_archived.is_some() {
-        recent = recent.push(btn(
+        recent = recent.push(secondary(
             "Recover previous project",
             Message::RecoverPrevious,
-            false,
         ));
     }
     container(
@@ -849,14 +972,13 @@ fn blank_project(app: &App) -> Element<'_, Message> {
         text("2   Configure a machine and create the first setup.").size(14),
         text("3   Set stock and workholding, then add tools and operations.").size(14),
         space().height(12),
-        row![btn("New machine profile",Message::NewMachine,false),btn("Saved machines",Message::Page(Page::Machines),false),btn("Tool library",Message::Page(Page::Tools),false)].spacing(8),
+        row![secondary("New machine profile",Message::NewMachine),secondary("Saved machines",Message::Page(Page::Machines)),secondary("Tool library",Message::Page(Page::Tools))].spacing(8),
         note("No sample geometry, setups or operations have been added. Saved machines, tools, materials and workholding are available when you need them.")
     ].spacing(13).max_width(730);
     if app.last_archived.is_some() {
-        body = body.push(btn(
+        body = body.push(secondary(
             "Recover previous project",
             Message::RecoverPrevious,
-            false,
         ));
     }
     container(scrollable(
@@ -874,7 +996,7 @@ fn first_setup(app: &App) -> Panel<'_> {
         body: column![
             text("Your model is ready to view. Choose the machine and workholding for its first machining position.").size(14),
             primary("Create first setup",Message::AddSetup).width(Fill),
-            btn(if app.doc.machines.is_empty() {"New machine profile"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)},false).width(Fill),
+            secondary(if app.doc.machines.is_empty() {"New machine profile"} else {"Open machine library"},if app.doc.machines.is_empty(){Message::NewMachine}else{Message::Page(Page::Machines)}).width(Fill),
             note("Each setup starts with zero operations. Add another setup when the part needs to be flipped, indexed or reclamped.")
         ].spacing(18).into(),
         foot: None,
@@ -904,18 +1026,22 @@ fn ribbon(app: &App) -> Element<'_, Message> {
             let s = *s;
             let available = app.is_sample() || s.imported_preview();
             // An unavailable strategy is dimmed: the icon at low opacity and
-            // the label in the muted colour, with its reason in the hover help.
+            // the label in a light grey, with its reason in the hover help.
             let glyph = icon(app, s, 29.).opacity(if available { 1. } else { DIMMED });
-            let label = text(if available {
-                s.short().to_string()
-            } else {
-                format!("{} · —", s.short())
-            })
-            .size(12);
+            // Greyed like a disabled command, with no mark that reads as
+            // part of the name.
+            let label = text(s.short()).size(12);
             let tile = button(
-                column![glyph, if available { label } else { label.color(MUTED) }]
-                    .spacing(4)
-                    .align_x(Alignment::Center),
+                column![
+                    glyph,
+                    if available {
+                        label
+                    } else {
+                        label.color(DIMMED_TEXT)
+                    }
+                ]
+                .spacing(4)
+                .align_x(Alignment::Center),
             )
             .padding([5, 5])
             .on_press(if available {
@@ -1216,7 +1342,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
         row![
             bold("BROWSER", 12),
             space().width(Fill),
-            muted(format!("{} setups", app.doc.setups.len())),
+            muted(plural(app.doc.setups.len(), "setup")),
             fold(app, Side::Browser)
         ]
         .spacing(6)
@@ -1357,7 +1483,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
     }
     tree = tree
         .push(space().height(6))
-        .push(btn("+ Add setup", Message::AddSetup, false).width(Fill));
+        .push(secondary("+ Add setup", Message::AddSetup).width(Fill));
     let footer = column![
         rule::horizontal(1),
         muted("PROJECT UNITS"),
@@ -1613,17 +1739,25 @@ fn workspace(app: &App) -> Element<'_, Message> {
         row![
             column![
                 bold(s.map(|s| s.name()).unwrap_or("Imported model"), 15),
-                muted(
-                    s.map(|s| format!(
-                        "{} / {} / {}",
-                        get(&s.p, "offset"),
-                        app.doc.holding_label(s),
-                        get(&s.p, "origin")
-                    ))
-                    .unwrap_or_else(|| {
-                        "Create your first machining setup when you are ready.".into()
-                    })
-                )
+                match s {
+                    // The work zero, one click from its step.
+                    Some(s) => Element::from(
+                        row![
+                            muted(format!(
+                                "{} / {} / Work zero:",
+                                get(&s.p, "offset"),
+                                app.doc.holding_label(s),
+                            )),
+                            button(text(format!("{} · Change", get(&s.p, "origin"))).size(12))
+                                .padding([2, 6])
+                                .on_press(Message::SetupStep("Work zero"))
+                                .style(|_, status| flat(false, status)),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center)
+                    ),
+                    None => muted("Create your first machining setup when you are ready.").into(),
+                }
             ]
             .spacing(3),
             space().width(Fill),
@@ -1639,7 +1773,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
     )
     .padding([12, 14]);
     let scene = scene(app).unwrap_or_else(|| {
-        container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),btn("Start screen",Message::Page(Page::Home),false)].spacing(20).max_width(380)).center(Fill).into()
+        container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
     });
     let detail = if app.is_sample() {
         "Sample housing · selectable demo geometry".to_string()
@@ -1758,7 +1892,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             btn("Restart", Message::Scrub(0.), false),
             help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
             muted(format!("{:03}%", (app.progress * 100.) as u32)),
-            help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
+            help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).style(choice_style).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
         if let Some(sim) = app.active_simulation() {
@@ -1809,9 +1943,10 @@ fn workspace(app: &App) -> Element<'_, Message> {
             .spacing(10)
             .align_y(Alignment::Center);
         if imported_facing {
-            empty = empty.push(primary("Generate & play", Message::Play));
+            // The inspector's Generate is the region's filled command.
+            empty = empty.push(secondary("Generate & play", Message::Play));
         } else if app.is_sample() && app.operation().is_some_and(|o| o.enabled) {
-            empty = empty.push(btn("Generate sample preview", Message::Generate, false));
+            empty = empty.push(secondary("Generate sample preview", Message::Generate));
         }
         playback = playback.push(empty);
     }
@@ -1987,7 +2122,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             for tool in &app.doc.tools {
                 c = c.push(
                     btn(
-                        format!("{}  ·  Ø{} mm", tool.name(), get(&tool.p, "diameter")),
+                        tool_label(tool),
                         Message::SetOpTool(tool.id.clone()),
                         o.tool == tool.id,
                     )
@@ -1995,7 +2130,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 );
             }
             c = c
-                .push(btn("Open tool library", Message::Page(Page::Tools), false))
+                .push(secondary("Open tool library", Message::Page(Page::Tools)))
                 .push(section("Feeds & speeds"))
                 .push(checks.field(p, "rpm", "Spindle speed · rpm"));
             if o.strategy.imported_preview() && !app.is_sample() {
@@ -2053,7 +2188,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     }
                     let selection = o.surfaces.as_ref();
                     let count = selection.map_or(0, |s| s.ids.len());
-                    c = c.push(muted(format!("{count} surface(s) selected")));
+                    c = c.push(muted(format!("{} selected", plural(count, "surface"))));
                     if let (Some(selected), Some(mesh)) = (selection, &app.imported_mesh)
                         && selected.matches(mesh)
                     {
@@ -2076,11 +2211,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         }
                     }
                     if selection.is_some() {
-                        c = c.push(btn(
-                            "Clear surface selection",
-                            Message::ClearSurfaces,
-                            false,
-                        ));
+                        c = c.push(secondary("Clear surface selection", Message::ClearSurfaces));
                     }
                     if o.strategy == Strategy::Drill {
                         c = c.push(checks.field(
@@ -2141,7 +2272,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         )
                         .width(Fill),
                     )
-                    .push(muted(format!("{} feature(s) selected", o.geometry.len())));
+                    .push(muted(format!(
+                        "{} selected",
+                        plural(o.geometry.len(), "feature")
+                    )));
             } else {
                 c = c.push(note("Import a part before selecting geometry."));
             }
@@ -2340,7 +2474,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if pocket_setting(p, "pocket_entry") == "Profile ramp" {
                 c = c.push(checks.field(p, "ramp_angle", "Ramp angle · degrees"));
             }
-            c = c.push(note("Profile ramp descends around each closed contour at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. All transfers between contours retract to clearance; no sideways shortcut crosses an island."));
+            c = c.push(note("Profile ramp descends around the contour it enters at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. Between contours the tool stays down: it follows the contour just cut, then steps across at most 1.5 stepovers along a line clear of every wall and island; otherwise it retracts to clearance and enters again."));
             c = c.push(note(fixture_note(app, Note::Pocket)));
         }
         "Linking" if !app.is_sample() && o.strategy == Strategy::Face => {
@@ -2395,39 +2529,55 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     if let Some((heading, lines)) = holding_warning(app) {
         foot = foot.push(caution(heading, lines));
     }
-    foot = foot
-        .push(
-            primary(
-                if app.is_sample() {
-                    "Generate sample preview"
-                } else if o.strategy.imported_preview() {
-                    "Generate operation preview"
-                } else {
-                    "Unavailable · see Operation support"
-                },
-                Message::Generate,
-            )
-            .width(Fill),
+    foot = foot.push(
+        primary(
+            if app.is_sample() {
+                "Generate sample preview"
+            } else if o.strategy.imported_preview() {
+                "Generate operation preview"
+            } else {
+                "Unavailable · see Operation support"
+            },
+            Message::Generate,
         )
+        .width(Fill),
+    );
+    foot = if app.confirm_delete_op {
+        // Asked in the place of the commands, as a setup's Delete is
+        // (`setup_editor`).
+        foot.push(note(format!(
+            "Delete {}? Later rest-machining operations that start from it lose that reference.",
+            o.name()
+        )))
         .push(
             row![
-                btn("Duplicate", Message::DuplicateOp, false),
-                btn(
+                secondary("Cancel", Message::ConfirmDeleteOp(false)),
+                danger("Delete operation", Message::ConfirmDeleteOp(true))
+            ]
+            .spacing(6),
+        )
+    } else {
+        foot.push(
+            row![
+                secondary("Duplicate", Message::DuplicateOp),
+                secondary(
                     if o.enabled { "Suppress" } else { "Enable" },
                     Message::ToggleOp,
-                    false
                 ),
-                btn("Delete", Message::RemoveOp, false)
+                space().width(Fill),
+                // Apart from the safe commands, at the end of the row.
+                danger("Delete…", Message::AskRemoveOp)
             ]
-            .spacing(1),
+            .spacing(6),
         )
         .push(
             row![
-                btn("Move up", Message::MoveOp(-1), false),
-                btn("Move down", Message::MoveOp(1), false)
+                secondary("Move up", Message::MoveOp(-1)),
+                secondary("Move down", Message::MoveOp(1))
             ]
-            .spacing(5),
-        );
+            .spacing(6),
+        )
+    };
     Panel {
         head: head.into(),
         body: c.into(),
@@ -2620,14 +2770,15 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
     c.into()
 }
 /// The setup editor's steps, one tab each, in order.
-pub(crate) const SETUP_STEPS: [&str; 4] = ["Machine", "Stock", "Position", "Holding"];
+pub(crate) const SETUP_STEPS: [&str; 5] = ["Machine", "Stock", "Position", "Holding", "Work zero"];
 /// Whether the active setup's `step` needs nothing more: its tab's ✓, else ○.
 pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
     let s = app.doc.setup();
     match step {
-        "Machine" => {
-            s.machine.issues().is_empty()
-                && !get(&s.p, "offset").is_empty()
+        "Machine" => s.machine.issues().is_empty(),
+        "Work zero" => {
+            !get(&s.p, "offset").is_empty()
+                && crate::post::references(get(&s.p, "origin")).is_some()
                 && !app
                     .current_ready()
                     .and_then(|r| r.zero.as_ref())
@@ -2641,7 +2792,10 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
         "Position" => ["rx", "ry", "rz", "tx", "ty", "tz"]
             .iter()
             .all(|k| num(&s.p, k).is_some()),
-        _ => matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty(),
+        "Holding" => {
+            matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty()
+        }
+        _ => false,
     }
 }
 /// Whether the part reaches outside the setup's fixed stock box.
@@ -2692,23 +2846,24 @@ fn setup_editor(app: &App) -> Panel<'_> {
         "Stock" => setup_stock(app, c),
         "Position" => setup_position(app, c),
         "Holding" => setup_holding(app, c),
+        "Work zero" => setup_zero(app, c),
         _ => setup_machine(app, c),
     };
     // Pinned under the body: the checks and the setup's actions.
     let mut foot = column![
         warnings(s.issues()),
-        btn("Duplicate setup", Message::DuplicateSetup, false).width(Fill),
+        secondary("Duplicate setup", Message::DuplicateSetup).width(Fill),
         row![
-            btn("Move up", Message::MoveSetup(-1), false),
-            btn("Move down", Message::MoveSetup(1), false)
+            secondary("Move up", Message::MoveSetup(-1)),
+            secondary("Move down", Message::MoveSetup(1))
         ]
         .spacing(5)
     ]
     .spacing(12);
     if app.confirm_delete_setup {
-        foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![btn("Cancel",Message::ConfirmDeleteSetup(false),false),primary("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
+        foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![secondary("Cancel",Message::ConfirmDeleteSetup(false)),danger("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
     } else {
-        foot = foot.push(btn("Delete setup…", Message::RemoveSetup, false).width(Fill));
+        foot = foot.push(danger("Delete setup…", Message::RemoveSetup).width(Fill));
     }
     Panel {
         head: head.into(),
@@ -2718,9 +2873,7 @@ fn setup_editor(app: &App) -> Panel<'_> {
 }
 fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let s = app.doc.setup();
-    let p = &s.p;
-    let t = Target::Setup;
-    c.push(section("Machine & coordinate system"))
+    c.push(section("Machine"))
         .push(
             btn(
                 format!(
@@ -2734,18 +2887,97 @@ fn setup_machine<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             )
             .width(Fill),
         )
+        .push(muted(
+            "The work zero and its offset (G54–G59) are in the Work zero step.",
+        ))
+}
+/// The setup editor's Work zero step: where the program's X0 Y0 Z0 is, on
+/// the stock's top or bottom at a corner, an edge's middle or the centre
+/// (picked on a grid of the stock seen from above), or Model origin; and the
+/// work offset it is kept in.
+fn setup_zero<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
+    use crate::post::At::{Max, Mid, Min};
+    let s = app.doc.setup();
+    let p = &s.p;
+    let t = Target::Setup;
+    let origin = get(p, "origin");
+    let zero = crate::post::stock_zero(origin);
+    let model = origin == "Model origin";
+    // A spot keeps the face picked, the top for Model origin.
+    let top = zero.is_none_or(|(_, top)| top);
+    let set = |v: String| Some(Message::Edit(t, "origin", v));
+    let spot_name = |refs: [crate::post::At; 2]| {
+        crate::post::SPOTS
+            .iter()
+            .find(|(_, r)| *r == refs)
+            .map_or("center", |(name, _)| name)
+    };
+    let at = |refs, top: bool| {
+        format!(
+            "Stock {} {}",
+            if top { "top" } else { "bottom" },
+            spot_name(refs)
+        )
+    };
+    let xy = zero.map_or([Mid, Mid], |(xy, _)| xy);
+    let faces = row![
+        act_sized(
+            "Stock top",
+            set(at(xy, true)),
+            zero.is_some() && top,
+            Some(Length::FillPortion(1))
+        ),
+        act_sized(
+            "Stock bottom",
+            set(at(xy, false)),
+            zero.is_some() && !top,
+            Some(Length::FillPortion(1))
+        ),
+        act_sized(
+            "Model origin",
+            set("Model origin".into()),
+            model,
+            Some(Length::FillPortion(1))
+        ),
+    ]
+    .spacing(4);
+    let label = |refs: [crate::post::At; 2]| match refs {
+        [Mid, Mid] => "Centre".to_string(),
+        _ => {
+            let s = spot_name(refs);
+            s[..1].to_uppercase() + &s[1..]
+        }
+    };
+    let mut grid = column![].spacing(4);
+    for y in [Max, Mid, Min] {
+        let mut line = row![].spacing(4);
+        for x in [Min, Mid, Max] {
+            let refs = [x, y];
+            line = line.push(act_sized(
+                label(refs),
+                set(at(refs, top)),
+                zero.is_some_and(|(xy, _)| xy == refs),
+                Some(Length::FillPortion(1)),
+            ));
+        }
+        grid = grid.push(line);
+    }
+    c.push(section("Work zero"))
+        .push(muted(
+            "Where the program's X0 Y0 Z0 is: the point you touch off or probe on the machine. The 3D view marks it with a cross.",
+        ))
+        .push(faces)
+        .push(muted(if model {
+            "Model origin is the part file's own 0,0,0. Pick a spot below to put the zero on the stock instead."
+        } else {
+            "On the stock, seen from above (back at the top, front toward you):"
+        }))
+        .push(grid)
         .push(choice(
             p,
             "offset",
             "Work offset",
             &["G54", "G55", "G56", "G57", "G58", "G59"],
-            t,
-        ))
-        .push(choice(
-            p,
-            "origin",
-            "Work coordinate origin",
-            &crate::post::ORIGINS,
             t,
         ))
         .push(zero_note(app))
@@ -2786,7 +3018,7 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     }];
     if let Some(refs) = refs {
         lines.push(format!(
-            "On the Control page, {} sets exactly this work zero.",
+            "On the Control page, {} sets exactly this work zero, probed from its own spot or, under Probe from, from another corner, edge middle or the centre a probe can reach.",
             crate::control::probe_name(refs)
         ));
     }
@@ -2908,8 +3140,8 @@ fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Messag
     let t = Target::Setup;
     let mut c = c.push(section("Part position")).push(
         row![
-            btn("Flip X 180°", Message::Flip("rx"), false),
-            btn("Side Y 90°", Message::Flip("ry"), false)
+            secondary("Flip X 180°", Message::Flip("rx")),
+            secondary("Side Y 90°", Message::Flip("ry"))
         ]
         .spacing(4),
     );
@@ -2982,17 +3214,16 @@ fn material_picker(app: &App) -> Element<'_, Message> {
                 .placeholder("Choose a material")
                 .width(Fill)
                 .padding([7, 9])
-                .text_size(13),
+                .text_size(13).style(choice_style),
             Help::text(
                 "Project material",
-                "Material from the library. Its cutting data are used to check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
+                "Material from the library. Choosing it sets each operation's speed and feed (drilling aside) from its cutting data, for the operation's tool and machine. The data also check speeds and feeds; its name, group, hardness, notes and cutting data are sent to the AI planner."
             ),
             widget::tooltip::Position::Left
         ),
-        btn(
+        secondary(
             "Open material library",
             Message::Page(Page::Materials),
-            false
         )
         .width(Fill)
     ]
@@ -3083,6 +3314,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                     .width(Fill)
                     .padding([7, 9])
                     .text_size(13)
+                    .style(choice_style)
                 ]
                 .spacing(5),
                 "vise_axis",
@@ -3133,7 +3365,7 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
     if holding != "None" {
         c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
         c.push(
-            btn("Suggest layout", Message::SuggestLayout, false)
+            secondary("Suggest layout", Message::SuggestLayout)
                 .width(Fill)
                 .into(),
         );
@@ -3159,13 +3391,9 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         c.push(muted(note).into());
     }
     c.push(
-        btn(
-            "Open workholding library",
-            Message::Page(Page::Workholding),
-            false,
-        )
-        .width(Fill)
-        .into(),
+        secondary("Open workholding library", Message::Page(Page::Workholding))
+            .width(Fill)
+            .into(),
     );
     c
 }
@@ -3193,7 +3421,8 @@ fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
             pick_list(sides.clone(), Some(side.clone()), edit(0))
                 .width(Length::FillPortion(1))
                 .padding([7, 9])
-                .text_size(13),
+                .text_size(13)
+                .style(choice_style),
             text_input("0", offset)
                 .on_input(edit(1))
                 .width(Length::FillPortion(1))
@@ -3212,14 +3441,14 @@ fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
         if rows.len() > 1 {
             let mut rest = rows.clone();
             rest.remove(i);
-            line = line.push(btn("Remove", Message::SetClamps(rows_text(&rest)), false));
+            line = line.push(danger("Remove", Message::SetClamps(rows_text(&rest))));
         }
         c = c.push(line);
     }
     if rows.len() < MAX_CLAMPS {
         let mut more = rows.clone();
         more.push([Side::ALL[rows.len() % 4].label().into(), "0".into()]);
-        c = c.push(btn(ADD_CLAMP, Message::SetClamps(rows_text(&more)), false).width(Fill));
+        c = c.push(secondary(ADD_CLAMP, Message::SetClamps(rows_text(&more))).width(Fill));
     }
     c.into()
 }
@@ -3249,6 +3478,7 @@ fn holder_picker<'a>(app: &'a App, kind: &'static str) -> Element<'a, Message> {
             .width(Fill)
             .padding([7, 9])
             .text_size(13)
+            .style(choice_style)
         ]
         .spacing(5),
         "holder",
@@ -3630,7 +3860,7 @@ fn page_header<'a>(title: &str, subtitle: &str) -> Element<'a, Message> {
     row![
         column![bold(title, 26), muted(subtitle)].spacing(5),
         space().width(Fill),
-        btn("← Back to machining", Message::Page(Page::Work), false)
+        secondary("← Back to machining", Message::Page(Page::Work))
     ]
     .align_y(Alignment::Center)
     .into()
@@ -3651,25 +3881,30 @@ fn machines(app: &App) -> Element<'_, Message> {
             row![
                 column![
                     bold(m.name(), 18),
-                    muted(format!(
-                        "{}-axis  ·  {}  ·  Profile v{}",
-                        m.axes(),
-                        get(&m.p, "mode"),
-                        m.version
-                    ))
+                    muted({
+                        // A 3-axis machine's mode is "3-axis" again.
+                        let axes = format!("{}-axis", m.axes());
+                        match get(&m.p, "mode") {
+                            mode if mode == axes => format!("{axes}  ·  Profile v{}", m.version),
+                            mode => format!("{axes}  ·  {mode}  ·  Profile v{}", m.version),
+                        }
+                    })
                 ]
                 .spacing(5),
                 space().width(Fill),
-                btn("Edit profile", Message::EditMachine(id.clone()), false),
-                btn("Remove", Message::DeleteMachine(id.clone()), false),
-                primary(
+                secondary("Edit profile", Message::EditMachine(id.clone())),
+                // One per card: outlined, so the page's one filled
+                // command stays New machine profile.
+                secondary(
                     if app.doc.active_setup().is_some() {
                         "Assign to current setup"
                     } else {
                         "Create first setup"
                     },
-                    Message::AssignMachine(id)
-                )
+                    Message::AssignMachine(id.clone())
+                ),
+                // Apart from the safe commands, at the end of the row.
+                danger("Remove", Message::DeleteMachine(id))
             ]
             .spacing(10)
             .align_y(Alignment::Center),
@@ -3710,11 +3945,15 @@ fn machines(app: &App) -> Element<'_, Message> {
             "Your machine library is empty. Use New machine profile to add your own specification.",
         ));
     }
-    container(scrollable(c))
-        .padding(28)
-        .width(Fill)
-        .height(Fill)
-        .into()
+    // The cards and the header's Back clear of the scrollbar, which would
+    // draw over their right edges.
+    container(scrollable(
+        c.padding(iced::Padding::ZERO.right(SCROLLBAR_GUTTER)),
+    ))
+    .padding(28)
+    .width(Fill)
+    .height(Fill)
+    .into()
 }
 fn wizard(app: &App) -> Element<'_, Message> {
     let m = &app.machine_draft;
@@ -3864,7 +4103,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                         .push(
                             row![
                                 field(p, "uc100_profile", "UC100 profile file", t),
-                                btn("Browse…", Message::BrowseUc100Profile, false)
+                                secondary("Browse…", Message::BrowseUc100Profile)
                             ]
                             .spacing(8)
                             .align_y(Alignment::End),
@@ -3902,15 +4141,14 @@ fn wizard(app: &App) -> Element<'_, Message> {
         }
     }
     let mut actions = row![
-        btn("Cancel", Message::Page(Page::Machines), false),
+        secondary("Cancel", Message::Page(Page::Machines)),
         space().width(Fill)
     ]
     .spacing(8);
     if app.wizard_step > 0 {
-        actions = actions.push(btn(
+        actions = actions.push(secondary(
             "Previous",
             Message::WizardStep(app.wizard_step - 1),
-            false,
         ));
     }
     actions = actions.push(if app.wizard_step < 4 {
@@ -3969,8 +4207,25 @@ pub(crate) fn act<'a>(
     msg: Option<Message>,
     on: bool,
 ) -> Element<'a, Message> {
+    act_sized(label, msg, on, None)
+}
+
+/// `act`, `width` px wide with its label centred, for a grid of buttons
+/// whose columns line up.
+pub(crate) fn act_sized<'a>(
+    label: impl Into<String>,
+    msg: Option<Message>,
+    on: bool,
+    width: Option<Length>,
+) -> Element<'a, Message> {
     let label = label.into();
-    let b = button(text(label.clone()).size(12))
+    let face = text(label.clone()).size(12);
+    let face = match width {
+        Some(_) => face.width(Fill).align_x(Alignment::Center),
+        None => face,
+    };
+    let b = button(face)
+        .width(width.unwrap_or(Length::Shrink))
         .padding([7, 12])
         .on_press_maybe(msg.clone())
         .style(move |_, status| {
@@ -4105,7 +4360,7 @@ fn control(app: &App) -> Element<'_, Message> {
         )));
         // The profile is read only while disconnected, not on every 33 ms tick.
         left = match &app.control {
-            Some(_) => left.push(btn("Disconnect", Message::Disconnect, false)),
+            Some(_) => left.push(secondary("Disconnect", Message::Disconnect)),
             None => match crate::control::profile(m) {
                 Ok(_) => left.push(primary("Connect", Message::Connect)),
                 Err(e) => left.push(warnings(vec![e])),
@@ -4114,7 +4369,7 @@ fn control(app: &App) -> Element<'_, Message> {
     } else if app.control.is_some() {
         // The machine left the library while connected: the connection is
         // still live and still ends here.
-        left = left.push(btn("Disconnect", Message::Disconnect, false));
+        left = left.push(secondary("Disconnect", Message::Disconnect));
     }
     let Some(c) = &app.control else {
         let main: Element<_> = if app.machine_setup {
@@ -4424,15 +4679,69 @@ fn control(app: &App) -> Element<'_, Message> {
         ],
     );
     let manual = |a: Action| c.manual().then_some(Message::Machine(a));
-    let mut zeros = row![].spacing(6);
+    // A milling machine's DRO: each axis's work position with Zero, ½ and
+    // a value to set it to.
+    let mut dro = column![].spacing(6);
     for &a in &enabled {
-        zeros = zeros.push(act(
-            format!("Zero {}", AXES[a]),
-            manual(Action::WorkZero(Some(a))),
+        dro = dro.push(
+            row![
+                bold(AXES[a], 18).width(24),
+                // Right-aligned so the decimal points line up, as on a DRO.
+                text(format!("{:.3}", s.work_pos[a]))
+                    .size(22)
+                    .font(Font {
+                        weight: iced::font::Weight::Bold,
+                        ..Font::MONOSPACE
+                    })
+                    .width(140)
+                    .align_x(Alignment::End),
+                space().width(12),
+                act(
+                    format!("Zero {}", AXES[a]),
+                    manual(Action::WorkZero(Some(a))),
+                    false
+                ),
+                act("1/2", manual(Action::WorkHalf(a)), false),
+                help::field(
+                    text_input("Value", &c.presets[a])
+                        .on_input(move |v| Message::Machine(Action::WorkText(a, v)))
+                        .on_submit_maybe(
+                            (c.manual() && c.preset(a).is_some())
+                                .then_some(Message::Machine(Action::WorkSet(a)))
+                        )
+                        .width(80)
+                        .padding([7, 9])
+                        .size(13),
+                    "work_set",
+                    &format!("Set {} · mm", AXES[a]),
+                    Target::Machine
+                ),
+                act(
+                    format!("Set {}", AXES[a]),
+                    manual(Action::WorkSet(a)).filter(|_| c.preset(a).is_some()),
+                    false
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    let mut zeros = row![act("Zero all", manual(Action::WorkZero(None)), false)]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    if c.axis(0) && c.axis(1) {
+        let to = c.to_work_xy();
+        // A move, apart from the buttons that only set offsets.
+        zeros = zeros.push(space().width(18)).push(act(
+            "Go to X0 Y0",
+            to.is_ok().then_some(Message::Machine(Action::ToWorkXY)),
             false,
         ));
+        zeros = zeros.push(muted(match (to, c.manual()) {
+            (Err(why), true) => why,
+            _ => "Rapid at the current Z: lift Z clear of the part first.".into(),
+        }));
     }
-    zeros = zeros.push(act("Zero all", manual(Action::WorkZero(None)), false));
     let mut systems = row![].spacing(4);
     for i in 0..6 {
         systems = systems.push(act(
@@ -4441,18 +4750,30 @@ fn control(app: &App) -> Element<'_, Message> {
             s.active_wcs == i,
         ));
     }
+    // What stops every probe, said once under the heading; each button
+    // below says only what stops it alone.
+    let global = c.probe_ready(&[2]).filter(|_| !c.probing());
+    let own_why = |why: Option<String>| why.filter(|w| Some(w) != global.as_ref());
     let blocked = c.probe_z_blocked();
     // The stock top's work Z the plate lies on.
     let top = c.stock_top().unwrap_or_default();
-    let mut probe = column![
+    let mut probe = column![bold("Probe", 13)].spacing(10);
+    if let Some(why) = &global {
+        probe = probe.push(
+            text(why.clone())
+                .size(12)
+                .color(Color::from_rgb8(166, 101, 32)),
+        );
+    }
+    let probe = probe.push(
         row![
             act(
                 "Probe Z",
                 blocked.is_none().then_some(Message::Machine(Action::ProbeZ)),
-                c.probing() && !c.edging()
+                c.probing() && !c.edging() && c.feature().is_none()
             ),
-            muted(match (&blocked, &c.probe) {
-                (Some(why), _) if !c.probing() => why.clone(),
+            muted(match (own_why(blocked.clone()), &c.probe) {
+                (Some(why), _) if !c.probing() => why,
                 (_, Ok(p)) => format!(
                     "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
                     p.feed,
@@ -4465,10 +4786,17 @@ fn control(app: &App) -> Element<'_, Message> {
             })
         ]
         .spacing(8)
-        .align_y(Alignment::Center)
-    ];
-    probe = probe.push(match c.edges_setup() {
-        Err(why) => Element::from(muted(why)),
+        .align_y(Alignment::Center),
+    );
+    let mut probe = probe;
+    // The setup's own work zero, from the spot picked.
+    let spots = c
+        .run_program()
+        .ok()
+        .map(|p| p.probe_from.as_slice())
+        .unwrap_or_default();
+    let setup_probe: Element<_> = match c.edges_setup() {
+        Err(why) => muted(why).into(),
         Ok((refs, p)) => {
             let blocked = c.edges_blocked();
             let name = crate::control::probe_name(refs);
@@ -4478,18 +4806,31 @@ fn control(app: &App) -> Element<'_, Message> {
                     blocked.is_none().then_some(Message::Machine(Action::ProbeEdges)),
                     c.edging()
                 ),
-                muted(match (&blocked, &c.probe) {
-                    (Some(why), _) if !c.edging() => why.clone(),
-                    (_, Ok(pr)) => format!(
-                        "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero there.",
-                        crate::control::probe_spot(refs),
-                        crate::post::touch_off_spots(&p.origin, p.stock).unwrap_or_else(|| format!(
-                            "{}, and puts X0 Y0 Z0 on Model origin from them",
-                            crate::post::probe_spots(refs, p.stock)
-                        )),
-                        pr.tip.unwrap_or_default(),
-                        pr.feed
-                    ),
+                muted(match (own_why(blocked.clone()), &c.probe) {
+                    (Some(why), _) if !c.edging() => why,
+                    (_, Ok(pr)) => {
+                        let own = crate::post::references(&p.origin) == Some(refs)
+                            && crate::post::stock_zero(&p.origin).is_some();
+                        format!(
+                            "Jog the probe above the stock top, over {}, and press {name}: it touches off {}, allowing for the {} mm tip, at {} mm/min, and sets the X, Y and Z work zero on {}{}.",
+                            crate::control::probe_spot(refs),
+                            crate::post::probe_spots(refs, p.stock),
+                            pr.tip.unwrap_or_default(),
+                            pr.feed,
+                            p.origin,
+                            if own {
+                                String::new()
+                            } else {
+                                let size = p.stock.dimensions();
+                                format!(
+                                    ", placed from there by the setup's {} × {} × {} mm stock: measure the stock first",
+                                    crate::post::exact_mm(size[0]),
+                                    crate::post::exact_mm(size[1]),
+                                    crate::post::exact_mm(size[2])
+                                )
+                            }
+                        )
+                    }
                     _ => String::new(),
                 })
             ]
@@ -4497,7 +4838,52 @@ fn control(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center)
             .into()
         }
-    });
+    };
+    let mut setup_col = column![bold("Setup work zero, from its stock", 12)].spacing(8);
+    if !spots.is_empty() {
+        setup_col = setup_col.push(probe_from_grid(c, spots));
+    }
+    probe = probe.push(setup_col.push(setup_probe));
+    // Features found where the tip is, without a setup.
+    let feature = |f: crate::control::Feature| {
+        act(
+            f.label(),
+            c.feature_blocked(f)
+                .is_none()
+                .then_some(Message::Machine(Action::ProbeFeature(f))),
+            c.feature() == Some(f),
+        )
+    };
+    use crate::control::Feature;
+    let corners = column![
+        row![feature(Feature::CORNERS[0]), feature(Feature::CORNERS[1])].spacing(4),
+        row![feature(Feature::CORNERS[2]), feature(Feature::CORNERS[3])].spacing(4),
+    ]
+    .spacing(4);
+    let mut edges = row![].spacing(4);
+    for f in Feature::EDGES {
+        edges = edges.push(feature(f));
+    }
+    let features = row![
+        column![muted("Surface"), feature(Feature::Top)].spacing(4),
+        column![muted("Edge, probing toward"), edges].spacing(4),
+        column![muted("Outside corner, seen from above"), corners].spacing(4),
+        column![muted("Inside"), feature(Feature::Bore)].spacing(4),
+    ]
+    .spacing(18);
+    let why = own_why(c.feature_blocked(Feature::Bore)).filter(|_| !c.probing());
+    probe = probe.push(
+        column![
+            bold("Feature at the tip, no setup needed", 12),
+            features,
+            muted(match (why, c.feature()) {
+                (_, Some(f)) => f.how(),
+                (Some(why), None) => why,
+                (None, None) => "Put the tip as each button's card says and press it: the surface, side, corner or centre found becomes work zero in the active work system, on the axes it sets.".into(),
+            }),
+        ]
+        .spacing(8),
+    );
     if let Some(note) = probe_note(c) {
         probe = probe.push(note);
     }
@@ -4519,11 +4905,13 @@ fn control(app: &App) -> Element<'_, Message> {
     let work_panel = machine_panel(
         &format!("Work zero (G{})", 54 + s.active_wcs),
         column![
+            dro,
             zeros,
             systems,
             muted(
-                "Zero makes the current position work zero in the active coordinate system. G54 to G59 each keep their own; they change only while Idle."
+                "Zero makes the current position work zero in the active coordinate system; 1/2 halves the position shown, Set gives it the value typed. For the middle of a part by hand, zero X with an edge finder on its left side, touch its right side and press 1/2 on X. G54 to G59 each keep their own; they change only while Idle."
             ),
+            rule::horizontal(1),
             probe
         ],
     );
@@ -4620,20 +5008,23 @@ fn control(app: &App) -> Element<'_, Message> {
         );
         overrides = overrides.push(muted("To drive off a limit switch that tripped. It turns itself off a second after no switch is active."));
     }
-    // Jog beside the position, so both fit without scrolling; the model
-    // beside the work zero and the spindle.
-    main = main.push(row![position, jog_panel].spacing(12)).push(
-        row![
-            model,
-            column![
-                work_panel,
-                machine_panel("Spindle and coolant", spindle),
-                machine_panel("Overrides", overrides)
+    // Jog beside the position, so both fit without scrolling; the work zero
+    // under them across the page, as a DRO under the jog; the model beside
+    // the spindle.
+    main = main
+        .push(row![position, jog_panel].spacing(12))
+        .push(work_panel)
+        .push(
+            row![
+                model,
+                column![
+                    machine_panel("Spindle and coolant", spindle),
+                    machine_panel("Overrides", overrides)
+                ]
+                .spacing(12)
             ]
-            .spacing(12)
-        ]
-        .spacing(12),
-    );
+            .spacing(12),
+        );
     let send =
         (c.manual() && !c.mdi.trim().is_empty()).then_some(Message::Machine(Action::MdiSend));
     main = main.push(machine_panel(
@@ -5090,6 +5481,74 @@ fn touch_label(work: [f64; 3]) -> String {
         format!("Set {}", work_words(work))
     }
 }
+/// The stock-top spots Probe corner, Probe edge or Probe centre can find
+/// the setup's work zero from, laid out as the top is seen from above (back
+/// at the top): a spot with a jaw or clamp in its way, or cut by an earlier
+/// setup, is greyed out, and the reason shows under the grid.
+fn probe_from_grid<'a>(
+    c: &'a crate::control::Connection,
+    spots: &'a [([crate::post::At; 2], Result<(), String>)],
+) -> Element<'a, Message> {
+    use crate::control::Action;
+    use crate::post::At::{Max, Mid, Min};
+    let program = c.run_program().ok();
+    // The zero's own spot, reachable or not: the one a jaw may stand at.
+    let own = program.and_then(|p| crate::post::references(&p.origin));
+    let model = program.is_some_and(|p| crate::post::stock_zero(&p.origin).is_none());
+    let reachable = |refs| spots.iter().any(|(r, ok)| *r == refs && ok.is_ok());
+    // What Probe corner will probe from: none lit when no spot it may use.
+    let picked = c
+        .probe_spot
+        .filter(|&r| reachable(r))
+        .or(own.filter(|&r| reachable(r)));
+    let name = |refs: [crate::post::At; 2]| match refs {
+        [Mid, Mid] => "Centre".to_string(),
+        [Mid, _] | [_, Mid] => {
+            let k = usize::from(refs[0] == Mid);
+            let s = crate::post::ENDS[k][usize::from(refs[k] == Max)];
+            s[..1].to_uppercase() + &s[1..]
+        }
+        _ => {
+            let s = crate::post::corner_name(refs);
+            s[..1].to_uppercase() + &s[1..]
+        }
+    };
+    let mut grid = column![].spacing(4);
+    for y in [Max, Mid, Min] {
+        let mut line = row![].spacing(4);
+        for x in [Min, Mid, Max] {
+            let refs = [x, y];
+            let ok = reachable(refs);
+            // Model origin is set off from its spot, not on it.
+            let label = match (Some(refs) == own, model) {
+                (true, false) => format!("{} (zero)", name(refs)),
+                (true, true) => format!("{} (default)", name(refs)),
+                _ => name(refs),
+            };
+            let pick = if Some(refs) == own { None } else { Some(refs) };
+            line = line.push(act_sized(
+                label,
+                (ok && !c.probing()).then_some(Message::Machine(Action::ProbeFrom(pick))),
+                picked == Some(refs),
+                Some(Length::Fixed(150.)),
+            ));
+        }
+        grid = grid.push(line);
+    }
+    let mut out = column![
+        muted("Probe from (the stock top seen from above, back at the top)"),
+        grid
+    ]
+    .spacing(6);
+    let refused: Vec<String> = spots
+        .iter()
+        .filter_map(|(r, ok)| ok.as_ref().err().map(|why| format!("{}: {why}", name(*r))))
+        .collect();
+    if !refused.is_empty() {
+        out = out.push(muted(refused.join(" ")));
+    }
+    out.into()
+}
 /// How the last probe ended, or that one is under way.
 fn probe_note<'a>(c: &crate::control::Connection) -> Option<Element<'a, Message>> {
     if c.probing() {
@@ -5209,11 +5668,10 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
         list = list.push(
             btn(
                 format!(
-                    "T{} · {}\n{} · Ø{} mm",
+                    "T{} · {}\n{}",
                     get(&t.p, "number"),
                     t.name(),
-                    get(&t.p, "type"),
-                    get(&t.p, "diameter")
+                    tool_details(t)
                 ),
                 Message::EditTool(t.id.clone()),
                 app.tool_draft.id == t.id,
@@ -5265,10 +5723,9 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
             app.resume_label().unwrap_or("Save tool".into()),
             Message::SaveTool,
         ),
-        btn(
+        danger(
             "Delete tool",
             Message::DeleteTool(app.tool_draft.id.clone()),
-            false,
         ),
     );
     container(column![page_header("Tools","Cutter dimensions are stored in millimeters. Tool edits invalidate generated previews."),row![container(scrollable(list)).padding(20).width(320).height(Fill).style(panel_style),editor].spacing(20).height(Fill)].spacing(24)).padding(28).height(Fill).into()
@@ -5334,10 +5791,9 @@ pub(crate) fn materials(app: &App) -> Element<'_, Message> {
         form,
         material_unsaved(app),
         primary("Save material", Message::SaveMaterial),
-        btn(
+        danger(
             "Delete material",
             Message::DeleteMaterial(app.material_draft.id.clone()),
-            false,
         ),
     );
     container(
@@ -5401,8 +5857,9 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let mut list = column![
         bold("Workholding library", 17),
         row![
-            primary("+ New vise", Message::NewHolder("Vise")),
-            primary("+ New clamp", Message::NewHolder("Clamp"))
+            // Two equal choices: neither is the panel's one filled command.
+            secondary("+ New vise", Message::NewHolder("Vise")),
+            secondary("+ New clamp", Message::NewHolder("Clamp"))
         ]
         .spacing(8)
     ]
@@ -5439,7 +5896,7 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         form,
         holder_unsaved(app),
         primary(save, Message::SaveHolder),
-        btn(delete, Message::DeleteHolder(draft.id.clone()), false),
+        danger(delete, Message::DeleteHolder(draft.id.clone())),
     );
     container(
         column![
@@ -5487,7 +5944,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
         Account::SigningIn => {
             c = c
                 .push(muted("Waiting for sign-in in your browser…"))
-                .push(btn("Cancel", Message::SignInCancel, false));
+                .push(secondary("Cancel", Message::SignInCancel));
         }
         Account::SignedIn {
             name,
@@ -5520,7 +5977,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                 c = c.push(
                     row![
                         muted("Using ChatGPT plan"),
-                        btn("Manage usage", manage(), false)
+                        secondary("Manage usage", manage())
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -5532,7 +5989,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                             app.settings.model
                         )));
                     }
-                    c = c.push(btn("Load models", Message::LoadModels, false).width(Fill));
+                    c = c.push(secondary("Load models", Message::LoadModels).width(Fill));
                 } else {
                     c = c.push(
                         column![
@@ -5545,6 +6002,7 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                             .width(Fill)
                             .padding([7, 9])
                             .text_size(13)
+                            .style(choice_style)
                         ]
                         .spacing(5),
                     );
@@ -5553,14 +6011,14 @@ fn account_panel(app: &App) -> Element<'_, Message> {
                     c = if app.account_busy {
                         c.push(muted("Checking the connection…"))
                     } else {
-                        c.push(btn("Check connection", Message::CheckConnection, false).width(Fill))
+                        c.push(secondary("Check connection", Message::CheckConnection).width(Fill))
                     };
                 }
             }
             if note_above {
                 c = c.push(note(app.account_note.clone()));
             }
-            c = c.push(btn("Sign out", Message::SignOut, false).width(Fill));
+            c = c.push(secondary("Sign out", Message::SignOut).width(Fill));
         }
     }
     if app.usage_limit {
@@ -5662,7 +6120,7 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
         ));
     }
     if app.undo.is_some() {
-        c = c.push(btn("Undo applied plan", Message::UndoPlan, false).width(Fill));
+        c = c.push(secondary("Undo applied plan", Message::UndoPlan).width(Fill));
     }
     c.into()
 }
@@ -5844,6 +6302,25 @@ pub(crate) fn preview_totals(outcome: &crate::planner::Outcome) -> Vec<String> {
         lines.push(format!("A follow-up request failed: {}", error.message()));
     }
     lines
+}
+/// A tool in a list: its name, with its diameter when the name does not
+/// already give it ("Flat end mill · Ø10", not "… Ø10 · Ø10 mm").
+fn tool_label(tool: &Tool) -> String {
+    let name = tool.name();
+    if name.contains('Ø') {
+        name.to_string()
+    } else {
+        format!("{name} · Ø{} mm", get(&tool.p, "diameter"))
+    }
+}
+/// The line under a tool's name in the library: what the name may not say.
+fn tool_details(tool: &Tool) -> String {
+    format!(
+        "{} · Ø{} mm · {}",
+        get(&tool.p, "type"),
+        get(&tool.p, "diameter"),
+        plural(get(&tool.p, "flutes").trim().parse().unwrap_or(0), "flute")
+    )
 }
 /// "1 setup", "2 setups".
 pub(crate) fn plural(n: usize, word: &str) -> String {
@@ -6178,7 +6655,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
     let actions = || {
         row![
             primary("Apply plan", Message::ApplyPlan),
-            btn("Discard", Message::DiscardPlan, false)
+            danger("Discard", Message::DiscardPlan)
         ]
         .spacing(10)
     };
@@ -6688,7 +7165,7 @@ fn enlarged_view<'a>(app: &App) -> Option<Element<'a, Message>> {
                 row![
                     bold("The picture at full size", 15),
                     space().width(Fill),
-                    btn("Close", Message::PlanPicture(picture), false)
+                    secondary("Close", Message::PlanPicture(picture))
                 ]
                 .align_y(Alignment::Center),
                 muted(shown.line.clone()),
@@ -6742,7 +7219,7 @@ fn running_view(app: &App, stage: crate::planner::Progress) -> Element<'_, Messa
         bold(running_text(app, stage), 20),
         muted(format!("{elapsed:.0} s since the run started")),
         muted("This can take a few minutes. Nothing changes until you apply a plan."),
-        btn("Cancel", Message::PlanCancel, false)
+        secondary("Cancel", Message::PlanCancel)
     ]
     .spacing(10);
     let pictures = app
@@ -6827,7 +7304,7 @@ fn plan_result(app: &App) -> Element<'_, Message> {
             c = c.push(
                 row![
                     primary("Try again", Message::Plan),
-                    btn("Dismiss", Message::DiscardPlan, false)
+                    secondary("Dismiss", Message::DiscardPlan)
                 ]
                 .spacing(10),
             );
@@ -7048,6 +7525,7 @@ fn post(app: &App) -> Element<'_, Message> {
         ));
     }
     let mut code = column![].spacing(18);
+    let mut shown = 0;
     match &app.post {
         None => {
             summary = summary.push(muted(if app.post_busy {
@@ -7076,6 +7554,7 @@ fn post(app: &App) -> Element<'_, Message> {
                                 ]
                                 .spacing(4),
                             );
+                            shown += 1;
                             code = code.push(
                                 text(crate::post::preview(&program.text, 120))
                                     .font(Font::MONOSPACE)
@@ -7119,8 +7598,20 @@ fn post(app: &App) -> Element<'_, Message> {
         }))
     };
     summary = summary
-        .push(btn("Export setup sheet (.md)", Message::Export("sheet"), false).width(Fill))
-        .push(btn("Save complete project (.json)", Message::SaveProject, false).width(Fill));
+        .push(secondary("Export setup sheet (.md)", Message::Export("sheet")).width(Fill))
+        .push(secondary("Save complete project (.json)", Message::SaveProject).width(Fill));
+    if shown == 0 {
+        // An empty dark pane reads as a failed load: say what will be here.
+        code = code.push(
+            text(if app.post_busy {
+                "Writing the programs…"
+            } else {
+                "Each setup's G-code appears here once its checks pass."
+            })
+            .size(13)
+            .color(Color::from_rgb8(150, 176, 190)),
+        );
+    }
     let code = container(scrollable(code).height(Fill))
         .padding(22)
         .width(Fill)
@@ -7169,7 +7660,7 @@ fn audit_row(status: button::Status) -> button::Style {
     }
 }
 fn operation_audit(app: &App) -> Element<'_, Message> {
-    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),btn("Back to machining",Message::Page(Page::Work),false)].spacing(12)].spacing(14).max_width(1020);
+    let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),secondary("Back to machining",Message::Page(Page::Work))].spacing(12)].spacing(14).max_width(1020);
     for (i, row) in app.audit_report.iter().enumerate() {
         let where_ = match issue_tab(&row.detail) {
             Some(tab) => format!(
@@ -7441,6 +7932,32 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_keeps_whole_sentences_within_its_line() {
+        use super::leading_sentences;
+        // "33.4 min" does not end a sentence.
+        let s = "Facing preview ready: 5 levels, 33.4 min estimated. Inherits stock after 0 earlier operations across setups.";
+        assert_eq!(
+            leading_sentences(s, 60),
+            "Facing preview ready: 5 levels, 33.4 min estimated."
+        );
+        // A short first sentence keeps the reason after it.
+        let s = "Import failed. The file is not a STEP file. Pick another.";
+        assert_eq!(
+            leading_sentences(s, 45),
+            "Import failed. The file is not a STEP file."
+        );
+        // Text that fits, or one long sentence, stays whole.
+        assert_eq!(leading_sentences(s, 200), s);
+        assert_eq!(
+            leading_sentences("No full stop here", 5),
+            "No full stop here"
+        );
+        assert_eq!(
+            leading_sentences("Too long a first one. Second.", 5),
+            "Too long a first one."
+        );
+    }
+    #[test]
     fn muted_text_meets_contrast_on_every_surface() {
         use super::*;
         let surfaces = [
@@ -7460,6 +7977,9 @@ mod tests {
         assert!(low.is_empty(), "muted text below 4.5:1 on {low:?}");
         // It stays secondary: lighter than the body ink.
         assert!(luminance(rgb(MUTED)) > luminance(rgb(INK)));
+        // A greyed label is lighter still, and readable on its white tile.
+        assert!(luminance(rgb(DIMMED_TEXT)) > luminance(rgb(MUTED)));
+        assert!(contrast(rgb(DIMMED_TEXT), rgb(Color::WHITE)) >= 3.);
     }
 
     /// Every colour a toolbar tile's glyph is drawn in, against the tile.

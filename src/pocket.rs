@@ -14,6 +14,13 @@ use clipper2::{EndType, FillRule, JoinType, Milli, Paths, difference, intersect,
 
 type Polygon = Vec<(f64, f64)>;
 type Region = Paths<Milli>;
+/// A loop to cut and, when the tool reaches it at depth from the loop
+/// before, the points it feeds through to its start (`step`).
+type Loop = (Polygon, Option<Vec<(f64, f64)>>);
+/// A zone's offset loops (outermost first), where its tool may step over at
+/// depth, its first cutting height, its target and whether it is what
+/// earlier cuts left.
+type Planned = (Vec<Vec<Polygon>>, Vec<Polygon>, f32, f32, bool);
 const MAX_MOVES: usize = 30_000;
 /// How far above the level before, mm, a loop's rapid descent stops below
 /// the first level.
@@ -62,6 +69,250 @@ fn above(points: &[[f32; 3]], z: f32) -> Polygon {
         }
     }
     result
+}
+/// Whether `p` is inside `region` (even-odd over all its paths).
+fn inside(region: &[Polygon], p: (f64, f64)) -> bool {
+    let mut odd = false;
+    for path in region {
+        for (a, b) in path
+            .iter()
+            .zip(path.iter().cycle().skip(1))
+            .take(path.len())
+        {
+            if (a.1 > p.1) != (b.1 > p.1) && p.0 < a.0 + (p.1 - a.1) / (b.1 - a.1) * (b.0 - a.0) {
+                odd = !odd;
+            }
+        }
+    }
+    odd
+}
+/// Whether the segment `a`–`b` crosses or touches an edge of `region`.
+fn crosses(region: &[Polygon], a: (f64, f64), b: (f64, f64)) -> bool {
+    let turn = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+    };
+    // `r`, on the line through `p` and `q`, lies between them.
+    let between = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+        r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
+    };
+    region.iter().any(|path| {
+        path.iter()
+            .zip(path.iter().cycle().skip(1))
+            .take(path.len())
+            .any(|(&c, &d)| {
+                let (d1, d2) = (turn(c, d, a), turn(c, d, b));
+                let (d3, d4) = (turn(a, b, c), turn(a, b, d));
+                (d1 * d2 < 0. && d3 * d4 < 0.)
+                    || (d1 == 0. && between(c, d, a))
+                    || (d2 == 0. && between(c, d, b))
+                    || (d3 == 0. && between(a, b, c))
+                    || (d4 == 0. && between(a, b, d))
+            })
+    })
+}
+/// The point of the closed `path` nearest `p`: its distance, the point, and
+/// the edge it lies on (from vertex `edge` to the next).
+fn nearest(path: &[(f64, f64)], p: (f64, f64)) -> (f64, (f64, f64), usize) {
+    let n = path.len();
+    let mut best = (f64::INFINITY, p, 0);
+    for i in 0..n {
+        let (c, d) = (path[i], path[(i + 1) % n]);
+        let (dx, dy) = (d.0 - c.0, d.1 - c.1);
+        let length = dx * dx + dy * dy;
+        let t = if length > 0. {
+            (((p.0 - c.0) * dx + (p.1 - c.1) * dy) / length).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let q = (c.0 + t * dx, c.1 + t * dy);
+        let distance = (q.0 - p.0).hypot(q.1 - p.1);
+        if distance < best.0 {
+            best = (distance, q, i);
+        }
+    }
+    best
+}
+/// The closed `path` begun at `at`, a point on its edge `edge`.
+fn begun(path: &[(f64, f64)], at: (f64, f64), edge: usize) -> Polygon {
+    let n = path.len();
+    let mut out = vec![at];
+    out.extend((1..=n).map(|k| path[(edge + k) % n]));
+    out
+}
+/// How the tool gets from the end of the loop `from`, just cut, to the loop
+/// `to` without leaving the depth: along `from`, whose cut floor it is
+/// already on, either way round, to the point nearest `to`, then one step
+/// no longer than `reach` along a line inside `allowed` that touches none of
+/// its edges. The shortest such way: the points to feed through, the last
+/// `to`'s start, and `to` begun there. None when there is none.
+fn step(
+    from: &[(f64, f64)],
+    to: &[(f64, f64)],
+    reach: f64,
+    allowed: &[Polygon],
+) -> Option<(Vec<(f64, f64)>, Polygon)> {
+    let n = from.len();
+    // Distance along `from` from its start to each vertex.
+    let mut along = vec![0.];
+    for i in 0..n {
+        let (c, d) = (from[i], from[(i + 1) % n]);
+        along.push(along[i] + (d.0 - c.0).hypot(d.1 - c.1));
+    }
+    let around = along[n];
+    // Pairs of a point on `from` (on its edge) and one on `to` (on its
+    // edge): each vertex with the nearest point of the other loop.
+    let mut pairs = vec![];
+    for (i, &p) in from.iter().enumerate() {
+        let (d, q, e) = nearest(to, p);
+        pairs.push((d, p, i, q, e));
+    }
+    for (j, &q) in to.iter().enumerate() {
+        let (d, p, e) = nearest(from, q);
+        pairs.push((d, p, e, q, j));
+    }
+    let mut ways: Vec<_> = pairs
+        .into_iter()
+        .filter(|w| w.0 <= reach)
+        .map(|(d, p, e, q, f)| {
+            let s = along[e] + (p.0 - from[e].0).hypot(p.1 - from[e].1);
+            let forward = s <= around - s;
+            (s.min(around - s) + d, forward, p, e, q, f)
+        })
+        .collect();
+    ways.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (_, forward, p, e, q, f) = ways
+        .into_iter()
+        .find(|w| inside(allowed, w.2) && !crosses(allowed, w.2, w.4))?;
+    let mut points: Vec<(f64, f64)> = if forward {
+        from[1..=e].to_vec()
+    } else {
+        from[e + 1..].iter().rev().copied().collect()
+    };
+    points.extend([p, q]);
+    Some((points, begun(to, q, f)))
+}
+/// The least distance between the closed paths `a` and `b`.
+fn gap(a: &[(f64, f64)], b: &[(f64, f64)]) -> f64 {
+    let to = |p: (f64, f64), path: &[(f64, f64)]| {
+        path.iter()
+            .zip(path.iter().cycle().skip(1))
+            .take(path.len())
+            .map(|(&c, &d)| {
+                let (dx, dy) = (d.0 - c.0, d.1 - c.1);
+                let length = dx * dx + dy * dy;
+                let t = if length > 0. {
+                    (((p.0 - c.0) * dx + (p.1 - c.1) * dy) / length).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                (c.0 + t * dx - p.0).hypot(c.1 + t * dy - p.1)
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let one = a.iter().map(|&p| to(p, b)).fold(f64::INFINITY, f64::min);
+    b.iter().map(|&p| to(p, a)).fold(one, f64::min)
+}
+/// The loops of `rings` (outermost first) in cutting order, each with how
+/// the tool reaches it at depth from the loop before (`step`), None where it
+/// retracts and enters again. A loop waits for every loop of the next ring
+/// inward within `reach` of it, so it cuts beside cleared floor. Of the
+/// loops ready, the next is the one the tool reaches at depth by the
+/// shortest way; else the deepest, nearest. Each outermost loop is then cut
+/// `finish` times more.
+fn ordered(rings: Vec<Vec<Polygon>>, finish: usize, reach: f64, allowed: &[Polygon]) -> Vec<Loop> {
+    let paths: Vec<(usize, Polygon)> = rings
+        .into_iter()
+        .enumerate()
+        .flat_map(|(ring, paths)| paths.into_iter().map(move |p| (ring, p)))
+        .collect();
+    let bounds: Vec<[f64; 4]> = paths
+        .iter()
+        .map(|(_, p)| {
+            p.iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |b, q| [b[0].min(q.0), b[1].min(q.1), b[2].max(q.0), b[3].max(q.1)],
+            )
+        })
+        .collect();
+    let close = |a: [f64; 4], b: [f64; 4]| {
+        a[0] - reach <= b[2] && b[0] - reach <= a[2] && a[1] - reach <= b[3] && b[1] - reach <= a[3]
+    };
+    let waits: Vec<Vec<usize>> = (0..paths.len())
+        .map(|i| {
+            (0..paths.len())
+                .filter(|&j| {
+                    paths[j].0 == paths[i].0 + 1
+                        && close(bounds[i], bounds[j])
+                        && gap(&paths[i].1, &paths[j].1) <= reach
+                })
+                .collect()
+        })
+        .collect();
+    let mut done = vec![false; paths.len()];
+    let mut out: Vec<Loop> = vec![];
+    // The loop just cut and its bounds.
+    let mut last: Option<(Polygon, [f64; 4])> = None;
+    while done.iter().any(|d| !d) {
+        let ready: Vec<usize> = (0..paths.len())
+            .filter(|&i| !done[i] && waits[i].iter().all(|&j| done[j]))
+            .collect();
+        let way = last.as_ref().and_then(|(from, around)| {
+            ready
+                .iter()
+                .filter(|&&i| close(*around, bounds[i]))
+                .filter_map(|&i| {
+                    let (points, path) = step(from, &paths[i].1, reach, allowed)?;
+                    let length: f64 = std::iter::once(from[0])
+                        .chain(points.iter().copied())
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+                        .sum();
+                    Some((length, i, points, path))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+        });
+        let (i, path, points) = match way {
+            Some((_, i, points, path)) => (i, path, Some(points)),
+            None => {
+                let here = last.as_ref().map(|(p, _)| p[0]);
+                let distance = |i: usize| {
+                    here.map_or(0., |h| {
+                        paths[i]
+                            .1
+                            .iter()
+                            .map(|q| (q.0 - h.0).hypot(q.1 - h.1))
+                            .fold(f64::INFINITY, f64::min)
+                    })
+                };
+                // `ready` is never empty: the deepest loops wait for none.
+                let i = *ready
+                    .iter()
+                    .min_by(|&&a, &&b| {
+                        paths[b]
+                            .0
+                            .cmp(&paths[a].0)
+                            .then(distance(a).total_cmp(&distance(b)))
+                    })
+                    .unwrap();
+                (i, paths[i].1.clone(), None)
+            }
+        };
+        done[i] = true;
+        out.push((path.clone(), points));
+        if paths[i].0 == 0 {
+            for _ in 0..finish {
+                out.push((path.clone(), Some(vec![])));
+            }
+        }
+        last = Some((path, bounds[i]));
+    }
+    out
 }
 fn push(
     plan: &mut Plan,
@@ -398,23 +649,13 @@ fn components(region: &Region) -> Vec<Region> {
         // The smallest outline holding the hole's first point.
         if let Some(piece) = pieces
             .iter_mut()
-            .filter(|piece| inside(&piece[0], hole[0]))
+            .filter(|piece| inside(&piece[..1], hole[0]))
             .min_by(|a, b| area(&a[0]).total_cmp(&area(&b[0])))
         {
             piece.push(hole);
         }
     }
     pieces.into_iter().map(Paths::from).collect()
-}
-/// Whether `q` is inside the closed outline `p` (even-odd).
-fn inside(p: &Polygon, q: (f64, f64)) -> bool {
-    let mut odd = false;
-    for (a, b) in p.iter().zip(p.iter().cycle().skip(1)).take(p.len()) {
-        if (a.1 > q.1) != (b.1 > q.1) && q.0 < a.0 + (q.1 - a.1) * (b.0 - a.0) / (b.1 - a.1) {
-            odd = !odd;
-        }
-    }
-    odd
 }
 /// One region a pocket clears: where the tool centre may go, from the
 /// height its material starts at down to its target.
@@ -705,9 +946,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             _ => pieces.push((zone, false)),
         }
     }
-    // Each zone's offset loops, its first cutting height, its target and
-    // whether it is what earlier cuts left.
-    let mut planned: Vec<(Vec<Vec<Polygon>>, f32, f32, bool)> = vec![];
+    let mut planned: Vec<Planned> = vec![];
     for (zone, trimmed) in pieces {
         let cutting_top = start(&zone, &zone.centres.at(0.)?);
         let mut rings: Vec<Vec<Polygon>> = Vec::new();
@@ -725,7 +964,10 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             rings.push(paths.into());
         }
         if !rings.is_empty() {
-            planned.push((rings, cutting_top, zone.target, trimmed));
+            // Clear of every wall and island, half the margin outside the
+            // loops' own limit, so a loop on that limit is still inside it.
+            let allowed = zone.centres.at(-(margin as f64) / 2.)?.into();
+            planned.push((rings, allowed, cutting_top, zone.target, trimmed));
         }
     }
     if planned.is_empty() {
@@ -733,11 +975,10 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     }
     let mut segments = 0usize;
     let mut total_levels = 0usize;
-    for (rings, cutting_top, target, _) in &planned {
+    for (rings, _, cutting_top, target, _) in &planned {
         let levels = ((cutting_top - target - 0.0001) / stepdown).ceil().max(1.) as usize;
         total_levels += levels;
-        let loops: usize = rings.iter().flatten().map(|p| p.len() + 5).sum::<usize>()
-            + rings[0].iter().map(|p| p.len() + 5).sum::<usize>() * finish as usize;
+        let loops: usize = rings.iter().flatten().map(|p| p.len() + 5).sum();
         segments = segments.saturating_add(loops.saturating_mul(levels));
     }
     if total_levels > 1000 || segments > MAX_MOVES {
@@ -747,7 +988,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
     let highest = planned
         .iter()
-        .map(|p| p.1)
+        .map(|p| p.2)
         .fold(f32::NEG_INFINITY, f32::max);
     let mut plan = Plan {
         shape: crate::simulation::CutterShape::Flat,
@@ -762,7 +1003,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         holder_radius,
         display_scale: scale,
         duration: 0.,
-        target: planned.iter().map(|p| p.2).fold(f32::INFINITY, f32::min),
+        target: planned.iter().map(|p| p.3).fold(f32::INFINITY, f32::min),
         levels: total_levels,
         rest_top: (highest < top - 0.0001).then_some(highest),
         spindle_clockwise: clockwise,
@@ -770,21 +1011,17 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     };
     let first = planned[0].0[0][0][0];
     let mut position = [first.0 as f32, first.1 as f32, clearance];
-    for (mut rings, cutting_top, target, trimmed) in planned {
+    let reach = stepover as f64 * 1.5;
+    for (mut rings, allowed, cutting_top, target, trimmed) in planned {
         // Clipper outer boundaries are CCW and islands CW (free area on left).
         // CW climb keeps remaining material on the right of cutter travel.
         if clockwise != climb {
+            // Each loop keeps its start, so both directions cut in one order.
             for p in rings.iter_mut().flatten() {
-                p.reverse();
+                p[1..].reverse();
             }
         }
-        let finishing = rings[0].clone();
-        let loops: Vec<_> = rings
-            .into_iter()
-            .rev()
-            .flatten()
-            .chain((0..finish as usize).flat_map(|_| finishing.clone()))
-            .collect();
+        let loops = ordered(rings, finish as usize, reach, &allowed);
         // Every zone comes down where the highest begins: an opening's
         // column was cleared by this pocket's floor zone, which the export's
         // check of rapids cannot see.
@@ -800,60 +1037,86 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             } else {
                 (previous_z + ENTRY).min(approach)
             };
-            for path in &loops {
+            for (i, (path, way)) in loops.iter().enumerate() {
                 let start = [path[0].0 as f32, path[0].1 as f32];
-                push(
-                    &mut plan,
-                    &mut position,
-                    [start[0], start[1], clearance],
-                    Motion::Rapid,
-                    6000.,
-                    false,
-                )?;
-                push(
-                    &mut plan,
-                    &mut position,
-                    [start[0], start[1], entry],
-                    Motion::Rapid,
-                    6000.,
-                    false,
-                )?;
-                // A ramp that would wind round its loop more than
-                // `RAMP_LAPS` times plunges instead: a loop that small is a
-                // narrow strip or corner. In what earlier cuts left (a rest
-                // pass's corners) little of the cutter meets material, and
-                // more than `REST_RAMP_LAPS` laps plunge there.
-                let length: f32 = path
-                    .iter()
-                    .zip(path.iter().cycle().skip(1))
-                    .map(|(a, b)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() as f32)
-                    .sum();
-                let laps = (previous_z - z) / (length * ramp_slope).max(1e-6);
-                let ramp = ramp && laps <= if trimmed { REST_RAMP_LAPS } else { RAMP_LAPS };
-                push(
-                    &mut plan,
-                    &mut position,
-                    [start[0], start[1], if ramp { previous_z } else { z }],
-                    Motion::Feed,
-                    feed * 0.25,
-                    false,
-                )?;
-                if ramp {
-                    while position[2] > z + 0.00001 {
-                        for point in path.iter().skip(1).chain(std::iter::once(&path[0])) {
-                            let xy = [point.0 as f32, point.1 as f32];
-                            let distance = ((xy[0] - position[0]).powi(2)
-                                + (xy[1] - position[1]).powi(2))
-                            .sqrt();
-                            let next_z = (position[2] - distance * ramp_slope).max(z);
-                            push(
-                                &mut plan,
-                                &mut position,
-                                [xy[0], xy[1], next_z],
-                                Motion::Feed,
-                                feed * 0.25,
-                                true,
-                            )?;
+                if let Some(points) = way {
+                    // To the next loop at depth: along the floor just cut, then
+                    // a short step clear of every wall and island (`step`). The
+                    // step takes up to the cutter's whole front edge, so it feeds
+                    // as an entry does.
+                    for (k, point) in points.iter().enumerate() {
+                        let rate = if k + 1 == points.len() {
+                            feed * 0.25
+                        } else {
+                            feed
+                        };
+                        push(
+                            &mut plan,
+                            &mut position,
+                            [point.0 as f32, point.1 as f32, z],
+                            Motion::Feed,
+                            rate,
+                            false,
+                        )?;
+                    }
+                } else {
+                    if i > 0 {
+                        let above = [position[0], position[1], clearance];
+                        push(&mut plan, &mut position, above, Motion::Rapid, 6000., false)?;
+                    }
+                    push(
+                        &mut plan,
+                        &mut position,
+                        [start[0], start[1], clearance],
+                        Motion::Rapid,
+                        6000.,
+                        false,
+                    )?;
+                    push(
+                        &mut plan,
+                        &mut position,
+                        [start[0], start[1], entry],
+                        Motion::Rapid,
+                        6000.,
+                        false,
+                    )?;
+                    // A ramp that would wind round its loop more than
+                    // `RAMP_LAPS` times plunges instead: a loop that small is a
+                    // narrow strip or corner. In what earlier cuts left (a rest
+                    // pass's corners) little of the cutter meets material, and
+                    // more than `REST_RAMP_LAPS` laps plunge there.
+                    let length: f32 = path
+                        .iter()
+                        .zip(path.iter().cycle().skip(1))
+                        .map(|(a, b)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() as f32)
+                        .sum();
+                    let laps = (previous_z - z) / (length * ramp_slope).max(1e-6);
+                    let ramp = ramp && laps <= if trimmed { REST_RAMP_LAPS } else { RAMP_LAPS };
+                    push(
+                        &mut plan,
+                        &mut position,
+                        [start[0], start[1], if ramp { previous_z } else { z }],
+                        Motion::Feed,
+                        feed * 0.25,
+                        false,
+                    )?;
+                    if ramp {
+                        while position[2] > z + 0.00001 {
+                            for point in path.iter().skip(1).chain(std::iter::once(&path[0])) {
+                                let xy = [point.0 as f32, point.1 as f32];
+                                let distance = ((xy[0] - position[0]).powi(2)
+                                    + (xy[1] - position[1]).powi(2))
+                                .sqrt();
+                                let next_z = (position[2] - distance * ramp_slope).max(z);
+                                push(
+                                    &mut plan,
+                                    &mut position,
+                                    [xy[0], xy[1], next_z],
+                                    Motion::Feed,
+                                    feed * 0.25,
+                                    true,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -867,15 +1130,9 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                         true,
                     )?;
                 }
-                push(
-                    &mut plan,
-                    &mut position,
-                    [start[0], start[1], clearance],
-                    Motion::Rapid,
-                    6000.,
-                    false,
-                )?;
             }
+            let above = [position[0], position[1], clearance];
+            push(&mut plan, &mut position, above, Motion::Rapid, 6000., false)?;
         }
     }
     if plan.moves.is_empty() || !plan.duration.is_finite() {
@@ -1059,6 +1316,234 @@ mod tests {
                 expected = Some(sim.stock.heights.clone());
             }
         }
+    }
+    /// The moves that step over between loops at depth: feed moves that
+    /// are not part of a loop and stay at one height.
+    fn links(plan: &Plan) -> Vec<&Move> {
+        plan.moves
+            .iter()
+            .filter(|m| m.motion == Motion::Feed && !m.cutting_pass && m.from[2] == m.to[2])
+            .collect()
+    }
+    /// The entries: feed moves down that are not part of a loop.
+    fn entries(plan: &Plan) -> usize {
+        plan.moves
+            .iter()
+            .filter(|m| m.motion == Motion::Feed && !m.cutting_pass && m.to[2] < m.from[2])
+            .count()
+    }
+    #[test]
+    fn a_profile_ramp_steps_over_at_depth_clear_of_the_walls_and_the_island() {
+        let (setup, mut op, tool, mesh) = fixture();
+        op.p.insert("pocket_entry".into(), "Profile ramp".into());
+        op.p.insert("finish_passes".into(), "1".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let loops = loops(&plan).len();
+        let steps = links(&plan);
+        // Each level ramps in where it can, then steps from ring to ring
+        // (and into the finish pass) without leaving the floor.
+        assert!(!steps.is_empty());
+        assert!(entries(&plan) + steps.len() >= loops, "{loops} loops");
+        assert!(
+            entries(&plan) < loops / 2,
+            "{} entries, {loops} loops",
+            entries(&plan)
+        );
+        for m in &steps {
+            assert!(m.to[2] < plan.stock.max[2]);
+        }
+        for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            for i in 0..=20 {
+                let p = m.at(m.start + (m.end - m.start) * i as f32 / 20.);
+                assert!(
+                    p[0].abs() + plan.radius <= 10. + 0.001
+                        && p[1].abs() + plan.radius <= 8. + 0.001,
+                    "{p:?}"
+                );
+                let dx = (p[0].abs() - 2.).max(0.);
+                let dy = (p[1].abs() - 2.).max(0.);
+                assert!(
+                    dx * dx + dy * dy >= plan.radius * plan.radius - 0.001,
+                    "{p:?}"
+                );
+            }
+        }
+        let mut sim = Simulation::new(plan);
+        sim.seek(1.);
+        let expected = (20. * 16. - 4. * 4.) * 6.;
+        assert!((sim.stock.removed_volume() - expected).abs() / expected < 0.04);
+    }
+    #[test]
+    fn a_plate_of_square_islands_ramps_in_at_2_degrees_without_ramping_every_ring() {
+        // A 70 × 70 mm floor 6 mm down with a 3 × 3 grid of 14 mm square
+        // islands 5 mm apart, as a keyboard plate's switch holes stand
+        // before they are cut through.
+        let mut tris = Vec::new();
+        let cells = [-24.5_f32, -5.5, 13.5];
+        // Floor: every cell of the grid lines not covered by an island.
+        let edges: Vec<f32> = {
+            let mut e = vec![-35_f32];
+            for c in cells {
+                e.extend([c, c + 14.]);
+            }
+            e.push(35.);
+            e
+        };
+        for (i, w) in edges.windows(2).enumerate() {
+            for (j, h) in edges.windows(2).enumerate() {
+                let island = i % 2 == 1 && j % 2 == 1;
+                quad(
+                    &mut tris,
+                    w[0],
+                    h[0],
+                    w[1],
+                    h[1],
+                    if island { 6. } else { 0. },
+                );
+            }
+        }
+        for (x, y, xx, yy) in [
+            (-40., -40., 40., -35.),
+            (-40., 35., 40., 40.),
+            (-40., -35., -35., 35.),
+            (35., -35., 40., 35.),
+        ] {
+            quad(&mut tris, x, y, xx, yy, 6.);
+        }
+        quad(&mut tris, -40., -40., 40., 40., -4.);
+        let mesh = mesh::normalize(tris).unwrap();
+        let (setup, mut op, mut tool, _) = fixture();
+        tool.p.insert("diameter".into(), "3".into());
+        // The floor: the faces looking up between the bottom and the top.
+        let heights: Vec<f32> = mesh.surfaces.iter().map(|s| s.center[2]).collect();
+        let (bottom, top) = heights
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &z| {
+                (a.min(z), b.max(z))
+            });
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: mesh
+                .surfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    s.normal[2] > 0.99 && s.center[2] > bottom + 0.001 && s.center[2] < top - 0.001
+                })
+                .map(|(i, _)| i)
+                .collect(),
+        });
+        for (k, v) in [
+            ("pocket_entry", "Profile ramp"),
+            ("ramp_angle", "2"),
+            ("stepdown", "2"),
+            ("allowance", "0.3"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.levels, 3);
+        let loops = loops(&plan).len();
+        // Not an entry for every loop: the tool stays down from loop to loop
+        // and enters again only for the small loops where the webs cross and
+        // in the corners, each the deepest of its spot.
+        assert!(
+            entries(&plan) * 3 < loops * 2,
+            "{} entries, {loops} loops",
+            entries(&plan)
+        );
+        assert!(!links(&plan).is_empty());
+        let mut sim = Simulation::new(plan);
+        sim.seek(1.);
+        // The middle of each island still stands at the stock top.
+        for c in cells {
+            for d in cells {
+                let x = ((c + 7. - sim.stock.bounds.min[0]) / sim.stock.dx) as usize;
+                let y = ((d + 7. - sim.stock.bounds.min[1]) / sim.stock.dy) as usize;
+                assert_eq!(
+                    sim.stock.heights[y * sim.stock.nx + x],
+                    sim.stock.bounds.max[2]
+                );
+            }
+        }
+    }
+    #[test]
+    fn the_tool_stays_down_by_the_shortest_way_clear_of_islands_or_not_at_all() {
+        let square = |x: f64, y: f64, size: f64| -> Polygon {
+            vec![(x, y), (x + size, y), (x + size, y + size), (x, y + size)]
+        };
+        let open = vec![square(-5., -5., 20.)];
+        // Just cut: a 10 mm square loop that began, and so ended, at (10, 5).
+        let cut = begun(&square(0., 0., 10.), (10., 5.), 1);
+        assert_eq!(cut, [(10., 5.), (10., 10.), (0., 10.), (0., 0.), (10., 0.)]);
+        // A small loop off its (0, 0) corner: back along the cut floor the
+        // short way (15 mm, not 25), then one step to the loop's nearest point.
+        let corner = square(-1.5, -1.5, 1.);
+        let (points, path) = step(&cut, &corner, 1.5, &open).unwrap();
+        assert_eq!(points, [(10., 0.), (0., 0.), (-0.5, -0.5)]);
+        assert_eq!(path[0], (-0.5, -0.5));
+        assert_eq!(path.len(), 5);
+        // Too far for one step.
+        assert!(step(&cut, &square(-4., -4., 1.), 1.5, &open).is_none());
+        // A no-go area (wound clockwise) on the short way: it goes round
+        // another way, or not at all when every way is blocked.
+        let mut island = square(-0.3, -0.3, 0.2);
+        island.reverse();
+        let blocked = vec![open[0].clone(), island];
+        assert!(crosses(&blocked, (0., 0.), (-0.5, -0.5)));
+        if let Some((points, _)) = step(&cut, &corner, 1.5, &blocked) {
+            let n = points.len();
+            assert!(!crosses(&blocked, points[n - 2], points[n - 1]));
+        }
+        let mut moat = square(-1.45, -1.45, 1.4);
+        moat.reverse();
+        assert!(step(&cut, &corner, 1.5, &[open[0].clone(), moat]).is_none());
+        // Leaving the allowed area.
+        assert!(step(&cut, &corner, 1.5, &[square(0., 0., 10.)]).is_none());
+    }
+    #[test]
+    fn inner_rings_come_before_the_ring_around_them() {
+        let square = |x: f64, y: f64, size: f64| -> Polygon {
+            vec![(x, y), (x + size, y), (x + size, y + size), (x, y + size)]
+        };
+        // Two separate areas, each with an inner ring; the second also
+        // has an island path.
+        let mut island = square(42., 2., 2.);
+        island.reverse();
+        let rings = vec![
+            vec![square(0., 0., 10.), square(30., -5., 20.), island.clone()],
+            vec![square(1., 1., 8.), square(31., -4., 18.)],
+        ];
+        let open = vec![square(-100., -100., 200.)];
+        let order: Vec<Polygon> = ordered(rings, 1, 1.5, &open)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        // A loop the tool steps over to starts elsewhere: compare as sets.
+        let at = |p: &Polygon| {
+            let mut p = p.clone();
+            p.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            order
+                .iter()
+                .position(|q| {
+                    let mut q: Polygon = q.iter().copied().filter(|v| p.contains(v)).collect();
+                    q.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    q.dedup();
+                    q == p
+                })
+                .unwrap()
+        };
+        assert!(at(&square(1., 1., 8.)) < at(&square(0., 0., 10.)));
+        assert!(at(&square(31., -4., 18.)) < at(&square(30., -5., 20.)));
+        assert!(at(&square(31., -4., 18.)) < at(&island));
+        // Each area is finished before the next begins, its outermost paths
+        // repeated once for the finish pass.
+        assert_eq!(order.len(), 5 + 3);
+        let first: Vec<_> = order.iter().map(|p| p[0].0 < 20.).collect();
+        assert!(
+            first.windows(2).filter(|w| w[0] != w[1]).count() == 1,
+            "{order:?}"
+        );
     }
     #[test]
     fn profile_ramp_obeys_angle_and_rewind_matches_incremental_playback() {
@@ -1438,6 +1923,133 @@ mod tests {
             .moves
             .len()
         );
+    }
+    /// The 2D distance from `p` to the polygon `poly`: 0 inside it.
+    fn distance_to(poly: &[(f64, f64)], p: (f64, f64)) -> f64 {
+        if inside(&[poly.to_vec()], p) {
+            return 0.;
+        }
+        nearest(poly, p).0
+    }
+    #[test]
+    fn the_totem_keyboard_case_top_pockets_at_2_degrees_without_touching_the_part() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        // The job its user runs: a Ø3 flat end mill, 40 % stepover, 2 mm
+        // stepdown, a 2° profile ramp, 0.3 mm radial and 0.2 mm axial
+        // allowance and a finish pass, down to the plate between the keys.
+        let (setup, mut op, mut tool, _) = fixture();
+        tool.p.insert("diameter".into(), "3".into());
+        for (k, v) in [
+            ("pocket_entry", "Profile ramp"),
+            ("ramp_angle", "2"),
+            ("stepover", "40"),
+            ("stepdown", "2"),
+            ("allowance", "0.3"),
+            ("axial_allowance", "0.2"),
+            ("finish_passes", "1"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
+        let (id, floor) = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.normal[2] > 0.999999
+                    && placement.transform(s.center)[2] < top - 0.1
+                    && placement.transform(s.center)[2] > bottom + 0.1
+            })
+            .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            .unwrap();
+        let depth = (top - placement.transform(floor.center)[2]) / scale;
+        assert!((depth - 6.85).abs() < 0.01, "{depth}");
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![id],
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        // It used to ramp into every ring at every level: over the limit.
+        assert!(plan.moves.len() < 20_000, "{} moves", plan.moves.len());
+        assert_eq!(plan.levels, 4);
+        let loops = loops(&plan).len();
+        // Entries only where a loop is the deepest of its spot (11 of 19
+        // loops a level), not one for every loop.
+        assert!(
+            entries(&plan) * 3 < loops * 2,
+            "{} entries, {loops} loops",
+            entries(&plan)
+        );
+        // No feed move brings the cutter nearer the part than the radial
+        // allowance: every 0.25 mm of each, against what of every face of
+        // the part stands above it.
+        let faces: Vec<Polygon> = mesh
+            .faces
+            .iter()
+            .map(|f| {
+                let points: Vec<[f32; 3]> = f
+                    .points
+                    .iter()
+                    .map(|p| placement.transform(*p).map(|v| v / scale))
+                    .collect();
+                above(&points, plan.target + 0.01)
+            })
+            .filter(|p| p.len() >= 2)
+            .collect();
+        // Faces by 5 mm cell of their bounds, to look up those near a point.
+        let cell = 5.;
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+        for (i, face) in faces.iter().enumerate() {
+            let (x0, x1) = face
+                .iter()
+                .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+            let (y0, y1) = face
+                .iter()
+                .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+            for gx in (x0 / cell).floor() as i64..=(x1 / cell).floor() as i64 {
+                for gy in (y0 / cell).floor() as i64..=(y1 / cell).floor() as i64 {
+                    grid.entry((gx, gy)).or_default().push(i);
+                }
+            }
+        }
+        let clear = (plan.radius + 0.3) as f64;
+        let mut checked = 0;
+        for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
+            let length = (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]);
+            let pieces = (length / 0.25).ceil().max(1.) as usize;
+            for k in 0..=pieces {
+                let p = m.at(m.start + (m.end - m.start) * k as f32 / pieces as f32);
+                if p[2] >= plan.stock.max[2] {
+                    continue;
+                }
+                let xy = (p[0] as f64, p[1] as f64);
+                let (gx, gy) = ((xy.0 / cell).floor() as i64, (xy.1 / cell).floor() as i64);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for &i in grid.get(&(gx + dx, gy + dy)).into_iter().flatten() {
+                            let face = &faces[i];
+                            let d = distance_to(face, xy);
+                            assert!(d >= clear - 0.001, "{d} from a face at {p:?}");
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
+        // And it clears the plate between the keys.
+        let mut sim = Simulation::new(plan);
+        sim.seek(1.);
+        assert!(sim.stock.removed_volume() > 10_000.);
     }
     #[test]
     fn actual_step_and_3mf_pocket_with_boss_generate_and_leave_the_boss() {

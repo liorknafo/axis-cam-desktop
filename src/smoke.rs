@@ -215,6 +215,7 @@ impl App {
                 120 => "96-machine-idle".into(),
                 121 => "97-machine-run-panel".into(),
                 122 => "98-machine-setup".into(),
+                123 => "99-machine-work-zero".into(),
                 _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
             })
     }
@@ -1260,6 +1261,19 @@ impl App {
             }
             // The Setup view: the profile of the connected machine.
             122 => vec![Message::ControlSetup(true)],
+            // Back on the Control page, the work zero under the jog: each
+            // axis's DRO line with Zero, ½ and Set, a value typed for X, and
+            // the probes. No setup picked: the one of screen 97 cannot run,
+            // and the fixed Run strip listing why leaves little of the page.
+            123 => {
+                if let Some(c) = &mut self.control {
+                    c.run = None;
+                }
+                vec![
+                    Message::ControlSetup(false),
+                    Message::Machine(crate::control::Action::WorkText(0, "-5".into())),
+                ]
+            }
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.disconnect_machine();
@@ -1274,11 +1288,18 @@ impl App {
             self.paths = false;
         }
         match self.smoke_step {
-            // The machine drawn under the position table, in view.
+            // The machine drawn under the work zero, in view.
             120 => {
                 return iced::widget::operation::scroll_to(
                     "control",
-                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 430. },
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 970. },
+                );
+            }
+            // The work zero under the position table and the jog.
+            123 => {
+                return iced::widget::operation::scroll_to(
+                    "control",
+                    iced::widget::scrollable::AbsoluteOffset { x: 0., y: 420. },
                 );
             }
             116 => {
@@ -3024,6 +3045,173 @@ flood = { pin = 8 }
         work_offset(&a, corner);
     }
 
+    /// A front-left zero probed from the back-right corner, as when a jaw
+    /// stands at the front-left: the probe touches the top and the +X and +Y
+    /// sides there and puts the zero on the front-left corner by the
+    /// setup's stock size, which the simulator's block has.
+    #[test]
+    fn the_setups_zero_is_probed_from_the_corner_picked() {
+        use crate::control::Action;
+        use crate::post::At::{Max, Min};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        let spots = run_of(&a).checked().unwrap()[0].probe_from.clone();
+        assert_eq!(spots.len(), 9);
+        assert!(spots.iter().all(|(_, ok)| ok.is_ok()), "{spots:?}");
+        // The zero's own spot is the default; picking it again is None.
+        assert_eq!(conn(&a).edges_setup().unwrap().0, [Min, Min]);
+        let _ = a.update(Message::Machine(Action::ProbeFrom(Some([Max, Max]))));
+        assert_eq!(conn(&a).edges_setup().unwrap().0, [Max, Max]);
+        let _ = a.view();
+        let (lo, hi) = conn(&a).block.unwrap();
+        // The simulator's probe is a point: allowing for the 4 mm tip puts
+        // each side it finds 2 mm inside the block's.
+        let corner = [lo[0] + 2., lo[1] + 2., -40.];
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-30", hi[0] - 4., hi[1] - 4.),
+        );
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        assert!(
+            message.contains("Work zero set on Stock top front-left")
+                && message.contains("placed from the back-right corner"),
+            "{message}"
+        );
+        tick_until(&mut a, 5.0, "work zero", |s| s.work_offset[2] < -39.);
+        // The back-right corner, also 2 mm inside, less the stock's size.
+        work_offset(&a, [corner[0] - 4., corner[1] - 4., -40.]);
+        // A new setup picked to run starts from its own spot again.
+        check_run(&mut a, 0);
+        assert_eq!(conn(&a).probe_spot, None);
+    }
+
+    /// The probing screen's features on the simulator's block, from where
+    /// the tip is put: the top, a side and an outside corner, each setting
+    /// work zero on what it found and leaving the other axes alone.
+    #[test]
+    fn a_feature_is_probed_where_the_tip_is_and_becomes_work_zero() {
+        use crate::control::{Action, Feature};
+        use crate::post::At::Min;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), None);
+        let (lo, hi) = conn(&a).block.unwrap();
+        let mid = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.];
+        let probe = |a: &mut App, f: Feature| {
+            assert_eq!(conn(a).feature_blocked(f), None);
+            let _ = a.update(Message::Machine(Action::ProbeFeature(f)));
+            assert!(a.locked() && conn(a).feature() == Some(f));
+            let _ = a.view();
+            let (ok, message) = probed(a);
+            assert!(ok, "{message}");
+            // The work offset is set, then the tip moves back.
+            tick_for(a, 100);
+            tick_until(a, 5.0, "back where it started", |s| {
+                s.state == Some(State::Idle)
+            });
+            message
+        };
+        // Z top: Z0 on the block's top, X and Y as they were.
+        let before = conn(&a).snapshot.work_offset;
+        mdi(&mut a, &format!("G53 G0 X{} Y{} Z-30", mid[0], mid[1]));
+        let message = probe(&mut a, Feature::Top);
+        assert!(message.contains("Z0 set on the surface"), "{message}");
+        work_offset(&a, [before[0], before[1], -40.]);
+        // X+ from left of the block, 5 mm below its top.
+        mdi(&mut a, &format!("G53 G0 X{} Y{}", lo[0] - 8., mid[1]));
+        mdi(&mut a, "G53 G0 Z-45");
+        let message = probe(&mut a, Feature::Edge(0, true));
+        assert!(message.contains("X0 set on the left side"), "{message}");
+        work_offset(&a, [lo[0] + 2., before[1], -40.]);
+        assert!((conn(&a).snapshot.machine_pos[0] - (lo[0] - 8.)).abs() < 0.01);
+        // X− from right of the block: X0 on its right side.
+        // Over the block, not through it.
+        let over = |a: &mut App, x: f64, y: f64| {
+            mdi(a, "G53 G0 Z-30");
+            mdi(a, &format!("G53 G0 X{x} Y{y}"));
+            mdi(a, "G53 G0 Z-45");
+        };
+        over(&mut a, hi[0] + 8., mid[1]);
+        let message = probe(&mut a, Feature::Edge(0, false));
+        assert!(message.contains("X0 set on the right side"), "{message}");
+        work_offset(&a, [hi[0] - 2., before[1], -40.]);
+        // Outside the front-left corner, 5 mm off both sides.
+        over(&mut a, lo[0] - 5., lo[1] - 5.);
+        let message = probe(&mut a, Feature::Corner([Min, Min]));
+        assert!(message.contains("on the front-left corner"), "{message}");
+        work_offset(&a, [lo[0] + 2., lo[1] + 2., -40.]);
+        let s = &conn(&a).snapshot;
+        assert!(
+            (s.machine_pos[0] - (lo[0] - 5.)).abs() < 0.01,
+            "{:?}",
+            s.machine_pos
+        );
+        assert!(
+            (s.machine_pos[1] - (lo[1] - 5.)).abs() < 0.01,
+            "{:?}",
+            s.machine_pos
+        );
+        // Started in front of the block but not left of it, the corner's
+        // step along Y runs into it: nothing is set.
+        over(&mut a, lo[0] + 5., lo[1] - 5.);
+        let before = conn(&a).snapshot.work_offset;
+        let _ = a.update(Message::Machine(Action::ProbeFeature(Feature::Corner([
+            Min, Min,
+        ]))));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.contains("stepping along the side"),
+            "{message}"
+        );
+        assert_eq!(conn(&a).snapshot.work_offset, before);
+    }
+
+    /// A milling machine DRO's ½, Set and Go to X0 Y0.
+    #[test]
+    fn half_set_and_go_to_x0_y0_work_as_on_a_dro() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        // Zeroed at machine X195: 40 mm to the right reads X40, ½ makes it X20.
+        mdi(&mut a, "G0 X40 Y-12");
+        let _ = a.update(Message::Machine(Action::WorkHalf(0)));
+        tick_until(&mut a, 2.0, "X halved", |s| {
+            (s.work_pos[0] - 20.).abs() < 1e-3
+        });
+        assert!((conn(&a).snapshot.work_pos[1] - -12.).abs() < 1e-3);
+        assert!((conn(&a).snapshot.machine_pos[0] - 235.).abs() < 1e-3);
+        // Set Y to −5 where the tool is; a field that is no number sets nothing.
+        let _ = a.update(Message::Machine(Action::WorkText(1, "abc".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(1)));
+        tick_for(&mut a, 20);
+        assert!((conn(&a).snapshot.work_pos[1] - -12.).abs() < 1e-3);
+        let _ = a.update(Message::Machine(Action::WorkText(1, " -5 ".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(1)));
+        tick_until(&mut a, 2.0, "Y set", |s| (s.work_pos[1] - -5.).abs() < 1e-3);
+        let _ = a.view();
+        // Go to X0 Y0: X and Y move, Z stays.
+        let z = conn(&a).snapshot.machine_pos[2];
+        assert_eq!(conn(&a).to_work_xy(), Ok(()));
+        let _ = a.update(Message::Machine(Action::ToWorkXY));
+        tick_until(&mut a, 5.0, "at X0 Y0", |s| {
+            s.state == Some(State::Idle) && s.work_pos[..2].iter().all(|v| v.abs() < 1e-3)
+        });
+        assert!((conn(&a).snapshot.machine_pos[2] - z).abs() < 1e-6);
+        // In E-stop none of them does anything.
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
+        let _ = a.update(Message::Machine(Action::WorkText(0, "7".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(0)));
+        let _ = a.update(Message::Machine(Action::WorkHalf(1)));
+        tick_for(&mut a, 50);
+        assert!(conn(&a).snapshot.work_pos[0].abs() < 1e-3);
+        assert!(conn(&a).to_work_xy().is_err());
+    }
+
     /// Picking another setup in the Run strip while a probe is under way
     /// is refused, in the handler and on the buttons (`setup_locked`): the
     /// probe sets the work zero of the setup it started with, on that
@@ -4120,6 +4308,7 @@ flood = { pin = 8 }
         for (key, command) in [
             ("control_rpm", Ctl::Rpm(String::new())),
             ("mdi_line", Ctl::MdiText(String::new())),
+            ("work_set", Ctl::WorkText(0, String::new())),
         ] {
             let tag = tags
                 .iter()
@@ -4934,6 +5123,49 @@ flood = { pin = 8 }
         }
     }
 
+    /// The operation editor's Delete asks first, as a setup's does: Cancel
+    /// keeps the operation, another selection closes the question, and
+    /// Delete operation removes it. The question shows in place of the
+    /// editor's commands, and the footer knows the page its status is from.
+    #[test]
+    fn deleting_an_operation_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("w.json"), None);
+        let _ = a.update(Message::OpenSample);
+        let _ = a.update(Message::SelectOp(0));
+        let count = a.doc.setup().operations.len();
+        let _ = a.update(Message::AskRemoveOp);
+        assert!(a.confirm_delete_op);
+        let _ = a.view();
+        let _ = a.update(Message::ConfirmDeleteOp(false));
+        assert!(!a.confirm_delete_op);
+        assert_eq!(a.doc.setup().operations.len(), count);
+        let _ = a.update(Message::AskRemoveOp);
+        let _ = a.update(Message::SelectOp(1));
+        assert!(
+            !a.confirm_delete_op,
+            "another operation closes the question"
+        );
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::AskRemoveOp);
+        let _ = a.update(Message::ConfirmDeleteOp(true));
+        assert!(!a.confirm_delete_op);
+        assert_eq!(a.doc.setup().operations.len(), count - 1);
+        // A status belongs to the page it was set on: one that a page change
+        // leaves as it was is an earlier page's.
+        let _ = a.update(Message::Page(Page::Work));
+        assert_eq!(a.status_page, Page::Work);
+        let before = a.status.clone();
+        let _ = a.update(Message::Page(Page::Tools));
+        let expected = if a.status == before {
+            Page::Work
+        } else {
+            Page::Tools
+        };
+        assert_eq!(a.status_page, expected);
+        let _ = a.view();
+    }
+
     #[test]
     fn the_machine_workspace_goes_back_to_the_manufacture_page_left() {
         let dir = tempfile::tempdir().unwrap();
@@ -5296,7 +5528,7 @@ flood = { pin = 8 }
         crate::storage::save(&project, &legacy).unwrap();
         let (doc, notes) = crate::storage::load_reporting(&project).unwrap();
         assert_eq!(notes, [linked]);
-        assert_eq!(doc.materials.len(), 15);
+        assert_eq!(doc.materials.len(), 22);
         assert_eq!(doc.selected_material().unwrap().name(), "Brass C360");
         // Open: the status carries the note.
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
@@ -5359,7 +5591,7 @@ flood = { pin = 8 }
             b.status,
             "Choose New project, Open, or Continue your previous project."
         );
-        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 16));
+        assert_eq!((b.doc.material_id, b.doc.materials.len()), (id, 23));
         assert!(!b.dirty);
         // A workspace that needed no migration starts clean, and so does a blank one.
         let c = App::from_workspace(path, None);
@@ -5433,13 +5665,13 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         // A blank workspace starts with the starter materials.
-        assert_eq!(a.doc.materials.len(), 15);
+        assert_eq!(a.doc.materials.len(), 22);
         let user = crate::material::Material::new("Titanium Gr5");
         assert!(user.issues().is_empty());
         let titanium = user.id.clone();
         a.doc.materials.push(user);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 16);
+        assert_eq!(a.doc.materials.len(), 23);
         assert!(a.doc.material_id.is_empty() && a.doc.material.is_empty());
         // The user's own copy of a starter, renamed in another case and
         // edited, is kept; no starter is added next to it.
@@ -5461,8 +5693,8 @@ flood = { pin = 8 }
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(names.len(), 16);
-        assert_eq!(unique.len(), 16, "{names:?}");
+        assert_eq!(names.len(), 23);
+        assert_eq!(unique.len(), 23, "{names:?}");
         assert!(a.doc.materials.iter().any(|m| m.id == titanium));
         assert_eq!(a.doc.material_id, mine);
         assert_eq!(
@@ -5480,15 +5712,15 @@ flood = { pin = 8 }
         );
         // Opening it again, and a new project, add nothing more.
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 16);
+        assert_eq!(a.doc.materials.len(), 23);
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 16);
+        assert_eq!(a.doc.materials.len(), 23);
         assert!(a.doc.material_id.is_empty());
         // An example opened from a library without the user's edits links
         // its material to the starter.
         let mut fresh = App::from_workspace(dir.path().join("other").join("workspace.json"), None);
         let _ = fresh.update(Message::OpenSample);
-        assert_eq!(fresh.doc.materials.len(), 15);
+        assert_eq!(fresh.doc.materials.len(), 22);
         assert_eq!(
             fresh.doc.selected_material().unwrap().name(),
             "Aluminium 6061-T6"
@@ -5510,7 +5742,7 @@ flood = { pin = 8 }
                 Material::new(" édelstahl 304 "),
                 Material::new(" aluminium 6061-t6 "),
             ],
-            starter_materials: 2,
+            starter_materials: crate::material::STARTER_SET,
             ..Document::default()
         };
         let (doc, status) = crate::merge_sample(&user);
@@ -5529,11 +5761,11 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 6061-T6");
-        assert_eq!(a.doc.materials.len(), 14);
+        assert_eq!(a.doc.materials.len(), 21);
         let _ = a.update(Message::OpenSample);
         // The deleted starter is not brought back with its data: the example's
         // material is added to the library without cutting data, and says so.
-        assert_eq!(a.doc.materials.len(), 15);
+        assert_eq!(a.doc.materials.len(), 22);
         let selected = a.doc.selected_material().unwrap();
         assert_eq!(selected.name(), "Aluminium 6061-T6");
         assert!(selected.cutting_data().is_none());
@@ -5545,7 +5777,7 @@ flood = { pin = 8 }
         // New project and a second Explore example keep that entry once.
         let _ = a.update(Message::NewProject);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 15);
+        assert_eq!(a.doc.materials.len(), 22);
         assert!(a.status.contains("linked to the library"), "{}", a.status);
     }
     #[test]
@@ -5554,9 +5786,9 @@ flood = { pin = 8 }
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.doc.materials.retain(|m| m.name() != "Aluminium 5052-H32");
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.materials.len(), 14);
+        assert_eq!(a.doc.materials.len(), 21);
         let _ = a.update(Message::OpenSample);
-        assert_eq!(a.doc.materials.len(), 14);
+        assert_eq!(a.doc.materials.len(), 21);
         assert!(
             !a.doc
                 .materials
@@ -5771,7 +6003,15 @@ flood = { pin = 8 }
         assert_eq!(a.doc.material_id, other);
         assert!(matches!(a.planner, crate::Planner::Idle));
         assert!(a.project_dirty);
-        assert_eq!(a.status, "Planning stopped because the job changed.");
+        // What the new material did to the speeds and feeds comes first.
+        assert!(
+            a.status
+                .starts_with("Speeds and feeds set for Aluminium 7075-T6: ")
+                && a.status
+                    .ends_with(" Planning stopped because the job changed."),
+            "{}",
+            a.status
+        );
     }
     #[test]
     fn the_material_note_has_three_outcomes() {
@@ -5794,6 +6034,71 @@ flood = { pin = 8 }
             material_note(&doc).as_deref(),
             Some("No material is chosen: speeds and feeds are not checked.")
         );
+    }
+    #[test]
+    fn picking_a_material_sets_every_operations_speed_and_feed_and_says_so() {
+        use crate::material::SpeedFeed;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = planning_app(&dir);
+        let pine = a
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Pine")
+            .unwrap()
+            .id
+            .clone();
+        let before: Vec<_> = a.doc.setups[0]
+            .operations
+            .iter()
+            .map(|o| get(&o.p, "rpm").to_string())
+            .collect();
+        let _ = a.update(Message::PickMaterial(pine.clone()));
+        assert_eq!(a.doc.material, "Pine");
+        assert!(a.dirty);
+        assert!(
+            a.status
+                .starts_with("Speeds and feeds set for Pine: Top / "),
+            "{}",
+            a.status
+        );
+        // Every operation but the drilling now suits pine, and the line names
+        // each one changed. The drilling keeps its own, and the line says so.
+        assert!(
+            a.status.ends_with(" A drilling operation keeps its speed and feed outside the data: set a drill's by hand, the library has no drill data."),
+            "{}",
+            a.status
+        );
+        for setup in &a.doc.setups {
+            for (o, old) in setup.operations.iter().zip(&before) {
+                if o.strategy == crate::model::Strategy::Drill {
+                    assert_eq!(get(&o.p, "rpm"), old);
+                    continue;
+                }
+                assert!(
+                    matches!(a.doc.speed_feed(setup, o), Some(SpeedFeed::InRange { .. })),
+                    "{}: {:?}",
+                    o.name(),
+                    a.doc.speed_feed(setup, o)
+                );
+                let rpm = get(&o.p, "rpm");
+                if rpm != old {
+                    assert!(
+                        a.status.contains(&format!(
+                            "{} / {} {old} → {rpm} rpm",
+                            setup.name(),
+                            o.name()
+                        )),
+                        "{}",
+                        a.status
+                    );
+                }
+            }
+        }
+        // Picking it again is no change and says nothing new.
+        a.status = "unchanged".into();
+        let _ = a.update(Message::PickMaterial(pine));
+        assert_eq!(a.status, "unchanged");
     }
     #[test]
     fn speeds_and_feeds_outside_the_materials_data_warn_and_never_block_export() {
@@ -7042,6 +7347,57 @@ flood = { pin = 8 }
         // The tool editor, its Save under the scrolling fields, builds too.
         let _ = a.update(Message::NewTool);
         let _ = a.view();
+    }
+    /// The work zero has a step of its own: the heading's link opens it
+    /// from an operation, the faces and the grid of the stock seen from
+    /// above set the origin, and the work offset is chosen there too.
+    #[test]
+    fn the_work_zero_step_picks_the_zero_on_a_grid_of_the_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        let origin = |a: &App| get(&a.doc.setup().p, "origin").to_string();
+        let _ = a.update(Message::SelectOp(0));
+        assert!(a.selected.is_some());
+        // The heading's "· Change" link.
+        let _ = a.update(Message::SetupStep("Work zero"));
+        assert_eq!((a.setup_step, a.selected), ("Work zero", None));
+        let _ = a.view();
+        assert!(
+            crate::ui::setup_step_done(&a, "Work zero"),
+            "{}",
+            origin(&a)
+        );
+        // What the grid's back-right button and the Stock bottom button send.
+        let _ = a.update(Message::Edit(
+            Target::Setup,
+            "origin",
+            "Stock top back-right".into(),
+        ));
+        let _ = a.view();
+        let _ = a.update(Message::Edit(
+            Target::Setup,
+            "origin",
+            "Stock bottom back-right".into(),
+        ));
+        assert_eq!(origin(&a), "Stock bottom back-right");
+        let _ = a.update(Message::Edit(
+            Target::Setup,
+            "origin",
+            "Model origin".into(),
+        ));
+        let _ = a.view();
+        // A zero that is no work zero leaves the step undone.
+        a.doc
+            .setup_mut()
+            .p
+            .insert("origin".into(), "Somewhere".into());
+        assert!(!crate::ui::setup_step_done(&a, "Work zero"));
+        // The buttons' cards say what each zero is.
+        let card = crate::help::command(
+            &Message::Edit(Target::Setup, "origin", "Stock top front-left".into()),
+            "Front-left".into(),
+        );
+        assert!(!card.body.is_empty());
     }
     #[test]
     fn the_workholding_page_and_the_setup_editor_build_in_each_state() {
@@ -11408,6 +11764,12 @@ flood = { pin = 8 }
     fn held_in_a_vise(proposal: &mut crate::proposal::Proposal) {
         let contour = proposal.setups[0].operations.remove(2);
         assert_eq!(contour.strategy, "Contour");
+        // The pocket's first loop past the boss slots the narrow corridor
+        // beside it at the full feed: 2 mm deep, that could tip the stock
+        // out of the vise's shallow grip (×1.8 against ×2).
+        let pocket = &mut proposal.setups[0].operations[1];
+        assert_eq!(pocket.strategy, "Pocket");
+        pocket.stepdown = Some(1.);
     }
     /// `apply_checked_plan` of the good plan as `edit` changes it.
     fn apply_checked_plan_of(a: &mut App, edit: impl FnOnce(&mut crate::proposal::Proposal)) {

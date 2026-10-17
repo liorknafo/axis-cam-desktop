@@ -1007,10 +1007,13 @@ impl Default for Document {
 impl Document {
     pub fn sample() -> Self {
         let machines = vec![Machine::new(3), Machine::new(4), Machine::new(5)];
+        let mut drill = Tool::new("Twist drill · Ø8", "Drill", "8");
+        // A twist drill has two flutes, not an end mill's three.
+        drill.p.insert("flutes".into(), "2".into());
         let tools = vec![
             Tool::new("Flat end mill · Ø10", "Flat end mill", "10"),
             Tool::new("Ball end mill · Ø6", "Ball end mill", "6"),
-            Tool::new("Twist drill · Ø8", "Drill", "8"),
+            drill,
         ];
         let mut s = Setup::new(machines[0].clone(), "G54");
         for (key, value) in [
@@ -1089,6 +1092,103 @@ impl Document {
         self.material = name;
         true
     }
+    /// Gives every operation the speed and feed `material::recommend` gives
+    /// for the selected material, its tool and its setup's machine, whatever
+    /// it had: the same material always gives the same speeds. Drilling
+    /// operations keep theirs (it would give them an end mill's chip load),
+    /// and so do those it cannot give one: without a tool, whose tool has no
+    /// diameter or flutes, or whose machine has no maximum spindle speed or
+    /// feed. Returns what changed, old to new, and why any was not set, for
+    /// the status; nothing without a material or an operation.
+    pub fn fit_speeds(&mut self) -> String {
+        use crate::material::SpeedFeed;
+        let Some(material) = self.selected_material().cloned() else {
+            return String::new();
+        };
+        let name = crate::proposal::clip(material.name(), crate::material::NAME_LIMIT);
+        if material.cutting_data().is_none() {
+            return format!("{name} has no cutting data: speeds and feeds are unchanged.");
+        }
+        let mut changes = vec![];
+        let (mut same, mut drills) = (0, 0);
+        // Why operations could not be set, each with how many.
+        let mut skipped: Vec<(String, usize)> = vec![];
+        for si in 0..self.setups.len() {
+            for oi in 0..self.setups[si].operations.len() {
+                let (setup, op) = (&self.setups[si], &self.setups[si].operations[oi]);
+                // The chip loads are an end mill's per tooth; a drill's feed
+                // is per revolution, which the library has no data for.
+                if op.strategy == Strategy::Drill {
+                    if !matches!(self.speed_feed(setup, op), Some(SpeedFeed::InRange { .. })) {
+                        drills += 1;
+                    }
+                    continue;
+                }
+                let recommended = match self.tools.iter().find(|t| t.id == op.tool) {
+                    Some(tool) => crate::material::recommend(&material, tool, &setup.machine),
+                    None => Err("The operation has no tool.".into()),
+                };
+                let (rpm, feed) = match recommended {
+                    Ok(speeds) => speeds,
+                    Err(why) => {
+                        match skipped.iter_mut().find(|(w, _)| *w == why) {
+                            Some((_, n)) => *n += 1,
+                            None => skipped.push((why, 1)),
+                        }
+                        continue;
+                    }
+                };
+                let label = format!("{} / {}", setup.name(), op.name());
+                let op = &mut self.setups[si].operations[oi];
+                let mut said = vec![];
+                for (key, value, unit) in [("rpm", rpm, "rpm"), ("feed", feed, "mm/min")] {
+                    let old = get(&op.p, key).trim().to_string();
+                    let new = value.to_string();
+                    if old != new {
+                        let old = if old.is_empty() { "none" } else { &old };
+                        said.push(format!("{old} → {new} {unit}"));
+                        op.p.insert(key.into(), new);
+                    }
+                }
+                if said.is_empty() {
+                    same += 1;
+                } else {
+                    changes.push(format!("{label} {}", said.join(", ")));
+                }
+            }
+        }
+        let unset: usize = skipped.iter().map(|(_, n)| n).sum();
+        if changes.is_empty() && same + unset + drills == 0 {
+            return String::new();
+        }
+        let mut said = match (changes.is_empty(), unset + drills) {
+            (true, 0) => format!("Every operation already runs at {name}'s speed and feed."),
+            (true, _) => format!("No speed or feed changed for {name}."),
+            (false, _) => format!("Speeds and feeds set for {name}: {}.", changes.join("; ")),
+        };
+        for (why, n) in skipped {
+            let who = match n {
+                1 => "1 operation".to_string(),
+                n => format!("{n} operations"),
+            };
+            let mut why = why.chars();
+            let first = why
+                .next()
+                .map(|c| c.to_lowercase().to_string())
+                .unwrap_or_default();
+            said.push_str(&format!(" {who} not set: {first}{}", why.as_str()));
+        }
+        if drills > 0 {
+            let who = match drills {
+                1 => "A drilling operation keeps its".to_string(),
+                n => format!("{n} drilling operations keep their"),
+            };
+            said.push_str(&format!(
+                " {who} speed and feed outside the data: set a drill's by hand, the library has no drill data."
+            ));
+        }
+        said
+    }
     /// Gives a document with an empty library the starter materials, brings an
     /// older library up to the current starter set once, and links a legacy
     /// material name to the library. Returns the note to show, if any.
@@ -1096,10 +1196,11 @@ impl Document {
         let shown = |name: &str| crate::proposal::clip(name, crate::material::NAME_LIMIT);
         if self.materials.is_empty() {
             self.materials = crate::material::starters();
-        } else if self.starter_materials < 2 {
+        } else {
+            let missing = crate::material::added_since(self.starter_materials);
             for m in crate::material::starters()
                 .into_iter()
-                .filter(|m| crate::material::ADDED_IN_SET_2.contains(&m.name()))
+                .filter(|m| missing.contains(&m.name()))
             {
                 if !self
                     .materials
@@ -2034,7 +2135,7 @@ mod tests {
             ..Default::default()
         };
         let note = doc.adopt_materials().unwrap();
-        assert_eq!(doc.materials.len(), 15);
+        assert_eq!(doc.materials.len(), 22);
         assert!(note.contains("linked to the library"), "{note}");
         assert_eq!(doc.selected_material().unwrap().name(), "Aluminium 6061-T6");
         assert_eq!(doc.material, "Aluminium 6061-T6");
@@ -2042,7 +2143,7 @@ mod tests {
             doc.adopt_materials().is_none(),
             "a second call changes nothing"
         );
-        assert_eq!(doc.materials.len(), 15);
+        assert_eq!(doc.materials.len(), 22);
 
         let mut odd = Document {
             material: "Inconel 718".into(),
@@ -2050,12 +2151,12 @@ mod tests {
         };
         let note = odd.adopt_materials().unwrap();
         assert!(note.contains("without cutting data"), "{note}");
-        assert_eq!(odd.materials.len(), 16);
+        assert_eq!(odd.materials.len(), 23);
         assert!(odd.selected_material().unwrap().cutting_data().is_none());
 
         let mut none = Document::default();
         assert!(none.adopt_materials().is_none());
-        assert_eq!(none.materials.len(), 15);
+        assert_eq!(none.materials.len(), 22);
         assert!(none.material_id.is_empty());
 
         let mut stale = none.clone();
@@ -2116,7 +2217,7 @@ mod tests {
         let mut doc = Document {
             materials: vec![Material::new("Édelstahl 1.4301")],
             material: "  édelstahl 1.4301 ".into(),
-            starter_materials: 2,
+            starter_materials: crate::material::STARTER_SET,
             ..Default::default()
         };
         let note = doc.adopt_materials().unwrap();
@@ -2162,7 +2263,7 @@ mod tests {
         use crate::material::Material;
         let mut doc = Document {
             materials: vec![Material::new("Titanium Gr5")],
-            starter_materials: 2,
+            starter_materials: crate::material::STARTER_SET,
             ..Default::default()
         };
         assert!(doc.adopt_materials().is_none());
@@ -2193,8 +2294,9 @@ mod tests {
         };
         assert!(doc.adopt_materials().is_none());
         let names: Vec<_> = doc.materials.iter().map(|m| m.name().to_string()).collect();
-        assert_eq!(names.len(), 7, "{names:?}");
+        assert_eq!(names.len(), 14, "{names:?}");
         assert!(names.contains(&"Aluminium 6082-T6".to_string()));
+        assert!(names.contains(&"Walnut".to_string()));
         assert!(!names.contains(&"Aluminium 6061-T6".to_string()));
         assert_eq!(doc.starter_materials, crate::material::STARTER_SET);
         // Deleted after the addition: it does not come back.
@@ -2218,10 +2320,161 @@ mod tests {
                 .count(),
             1
         );
-        // An empty library gets all fifteen and the current set.
+        // An empty library gets all twenty-two and the current set.
         let mut empty = Document::default();
         empty.adopt_materials();
-        assert_eq!((empty.materials.len(), empty.starter_materials), (15, 2));
+        assert_eq!((empty.materials.len(), empty.starter_materials), (22, 3));
+    }
+    #[test]
+    fn choosing_a_material_sets_every_operations_speed_and_feed() {
+        let mut router = Machine::new(3);
+        router.p.insert("rpm".into(), "24000".into());
+        router.p.insert("feed".into(), "1000".into());
+        let tool = Tool::new("Flat 3", "Flat end mill", "3");
+        let mut setup = Setup::new(router, "G54");
+        let op = |name: &str, tool: &str, rpm: &str| {
+            let mut o = Operation::new(Strategy::Contour, tool.into());
+            o.p.insert("name".into(), name.into());
+            o.p.insert("rpm".into(), rpm.into());
+            o.p.insert("feed".into(), "1000".into());
+            o
+        };
+        setup.operations = vec![
+            op("Facing", &tool.id, "12000"),
+            op("Contour", &tool.id, "8000"),
+            op("Loose", "", "8000"),
+        ];
+        let mut doc = Document {
+            tools: vec![tool],
+            setups: vec![setup],
+            ..Default::default()
+        };
+        doc.adopt_materials();
+        // No material chosen: nothing is said or changed.
+        assert_eq!(doc.fit_speeds(), "");
+        let pine = doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Pine")
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&pine));
+        // Both get pine's speed, whatever they had: at this router's 1000
+        // mm/min the least surface speed, for the thickest chip. The
+        // operation without a tool is left alone.
+        let loose = "1 operation not set: the operation has no tool.";
+        assert_eq!(
+            doc.fit_speeds(),
+            format!(
+                "Speeds and feeds set for Pine: Top side / Facing 12000 → 10611 rpm; Top side / Contour 8000 → 10611 rpm. {loose}"
+            )
+        );
+        let rpm = |doc: &Document, i: usize| get(&doc.setups[0].operations[i].p, "rpm").to_string();
+        assert_eq!(
+            [rpm(&doc, 0), rpm(&doc, 1), rpm(&doc, 2)],
+            ["10611", "10611", "8000"]
+        );
+        assert_eq!(
+            doc.fit_speeds(),
+            format!("No speed or feed changed for Pine. {loose}")
+        );
+        doc.setups[0].operations.pop();
+        assert_eq!(
+            doc.fit_speeds(),
+            "Every operation already runs at Pine's speed and feed."
+        );
+        // The same material always gives the same speeds, whatever came
+        // before it: pine, acrylic, pine.
+        let acrylic = doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Acrylic (PMMA)")
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&acrylic));
+        assert!(
+            doc.fit_speeds()
+                .starts_with("Speeds and feeds set for Acrylic (PMMA): ")
+        );
+        assert_ne!(rpm(&doc, 0), "10611");
+        assert!(doc.select_material(&pine));
+        doc.fit_speeds();
+        assert_eq!([rpm(&doc, 0), rpm(&doc, 1)], ["10611", "10611"]);
+        // Aluminium wants a slower spindle and, at it, more feed than the
+        // machine gives: both operations change.
+        let alu = doc
+            .materials
+            .iter()
+            .find(|m| m.name() == "Aluminium 6061-T6")
+            .unwrap()
+            .id
+            .clone();
+        assert!(doc.select_material(&alu));
+        let said = doc.fit_speeds();
+        assert!(
+            said.starts_with(
+                "Speeds and feeds set for Aluminium 6061-T6: Top side / Facing 10611 → "
+            ),
+            "{said}"
+        );
+        assert!(said.contains("; Top side / Contour 10611 → "), "{said}");
+        for o in &doc.setups[0].operations {
+            assert!(
+                matches!(
+                    doc.speed_feed(&doc.setups[0], o),
+                    Some(crate::material::SpeedFeed::InRange { .. })
+                ),
+                "{:?}",
+                o.p
+            );
+        }
+        // A material without cutting data changes nothing.
+        let mut bare = crate::material::Material::new("Bare");
+        bare.p.insert("group".into(), "Other".into());
+        let bare_id = bare.id.clone();
+        doc.materials.push(bare);
+        assert!(doc.select_material(&bare_id));
+        let speeds = |doc: &Document| -> Vec<_> {
+            doc.setups[0]
+                .operations
+                .iter()
+                .map(|o| (get(&o.p, "rpm").to_string(), get(&o.p, "feed").to_string()))
+                .collect()
+        };
+        let before = speeds(&doc);
+        assert_eq!(
+            doc.fit_speeds(),
+            "Bare has no cutting data: speeds and feeds are unchanged."
+        );
+        assert_eq!(speeds(&doc), before);
+    }
+    #[test]
+    fn a_library_given_the_alloys_gets_only_the_woods_once() {
+        let mut doc = Document {
+            materials: vec![crate::material::Material::new("My alloy")],
+            starter_materials: 2,
+            ..Document::default()
+        };
+        assert!(doc.adopt_materials().is_none());
+        let names: Vec<_> = doc.materials.iter().map(|m| m.name()).collect();
+        assert_eq!(names[0], "My alloy");
+        assert_eq!(names[1..], crate::material::ADDED_IN_SET_3);
+        assert_eq!(doc.starter_materials, 3);
+        // Deleted after the addition: it does not come back.
+        doc.materials.retain(|m| m.name() != "Cherry");
+        doc.adopt_materials();
+        assert_eq!(doc.materials.len(), 7);
+        // The user's own spelling of a wood is kept, not doubled.
+        let mut mine = Document {
+            materials: vec![crate::material::Material::new("oak")],
+            starter_materials: 2,
+            ..Document::default()
+        };
+        mine.adopt_materials();
+        assert_eq!(mine.materials.len(), 7);
+        assert_eq!(mine.materials[0].name(), "oak");
     }
     fn doc_with_holding(pairs: &[(&str, &str)]) -> Document {
         let mut doc = Document::sample();

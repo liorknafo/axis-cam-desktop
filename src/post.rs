@@ -149,7 +149,7 @@ pub const ORIGINS: [&str; 19] = [
 ];
 /// The spots of the stock's top or bottom a work zero names, with where
 /// each lies along X and Y.
-const SPOTS: [(&str, [At; 2]); 9] = [
+pub(crate) const SPOTS: [(&str, [At; 2]); 9] = [
     ("center", [At::Mid, At::Mid]),
     ("front-left", [At::Min, At::Min]),
     ("front", [At::Mid, At::Min]),
@@ -203,7 +203,7 @@ pub fn datum(setup: &Setup, stock: Bounds, mesh: &Mesh) -> Result<[f32; 3], Stri
             .transform(mesh.origin)
             .map(|v| v / mesh.display_scale())),
         other => Err(format!(
-            "\"{other}\" is not a work zero: choose one under Work coordinate origin."
+            "\"{other}\" is not a work zero: choose one in the setup editor's Work zero step."
         )),
     }
 }
@@ -1620,11 +1620,51 @@ pub(crate) fn zero_check(
         refused: vec![],
         probe: match in_the_way(stock, refs, boxes) {
             Some(blocked) => Err(format!(
-                "A probe cannot find this work zero: {blocked}. Touch it off by hand, or choose a work zero whose spots are clear of the workholding."
+                "A probe cannot find this work zero: {blocked}. Probe it from another spot of the stock top on the Control page (Probe from), touch it off by hand, or choose a work zero whose spots are clear of the workholding."
             )),
             None => Ok(refs),
         },
     }
+}
+/// The stock-top spots a probe can find a setup's work zero from
+/// (`SPOTS`: the corners, the middles of the edges and the centre), each
+/// with why it cannot: a jaw or clamp in its way (`in_the_way`), or a face
+/// it is touched on that earlier setups cut (`stock_zero_cut`). The zero
+/// stays where the program has it: one probed from another spot is placed
+/// from there by the stock's size. Empty for a zero no probe finds.
+pub(crate) fn probe_from(
+    setup: &Setup,
+    stock: Bounds,
+    first: &Simulation,
+    boxes: &[crate::holding::HoldBox],
+) -> Vec<([At; 2], Result<(), String>)> {
+    if references(get(&setup.p, "origin")).is_none() {
+        return vec![];
+    }
+    SPOTS
+        .iter()
+        .map(|&(_, refs)| {
+            let why = match (&first.initial_volume, first.frame) {
+                (Some(volume), Some(frame)) if !volume.frame.square_to(frame) => Some(
+                    "the stock was defined in an orientation that is not square to this setup"
+                        .to_string(),
+                ),
+                (Some(volume), Some(frame)) => {
+                    let cut = stock_zero_cut(stock, volume, frame, refs, false);
+                    (!cut.is_empty())
+                        .then(|| format!("earlier setups have cut the stock's {}", listed(&cut)))
+                }
+                _ => None,
+            }
+            .or_else(|| in_the_way(stock, refs, boxes));
+            (
+                refs,
+                why.map_or(Ok(()), |why| {
+                    Err(format!("{}{}.", why[..1].to_uppercase(), &why[1..]))
+                }),
+            )
+        })
+        .collect()
 }
 /// `zero_check` of setup `si` from its `sequence` results, as a run or
 /// export checks it with its workholding (`checked`). None when the setup
@@ -1976,6 +2016,9 @@ pub struct Checked {
     /// The faces a probe touches to find the work zero, or why no probe
     /// does (`ZeroCheck::probe`).
     pub probe: Result<[At; 2], String>,
+    /// The stock-top spots a probe can find the work zero from instead,
+    /// each with why it cannot (`probe_from`).
+    pub probe_from: Vec<([At; 2], Result<(), String>)>,
     /// The setup's jaws or clamps as that was checked with them
     /// (`holding_boxes`, plan mm): the probe travels over the tallest
     /// (`probe_height`, `control::Edges`).
@@ -2056,6 +2099,7 @@ pub(crate) fn checked(
         return Err(found.refused);
     }
     let located = model_zero(setup, mesh, simulations[0]);
+    let probe_from = probe_from(setup, stock, simulations[0], &boxes);
     let count = groups.len();
     let mut out = vec![];
     for (i, g) in groups.iter().enumerate() {
@@ -2085,6 +2129,7 @@ pub(crate) fn checked(
             part: (!settings.tool_table).then(|| (i + 1, count, group_ops[0].tool)),
             located,
             probe: found.probe.clone(),
+            probe_from: probe_from.clone(),
             holds: boxes.clone(),
         });
     }

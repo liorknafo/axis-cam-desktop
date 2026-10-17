@@ -217,7 +217,7 @@ mod tests {
             material,
             ["The project material \"Aluminium 6061-T6\" was linked to the library."]
         );
-        assert_eq!(doc.materials.len(), 15);
+        assert_eq!(doc.materials.len(), 22);
         assert!(doc.selected_material().unwrap().cutting_data().is_some());
     }
     #[test]
@@ -227,7 +227,7 @@ mod tests {
         let mut doc = Document::default();
         doc.adopt_materials();
         save(&path, &doc).unwrap();
-        assert_eq!(load(&path).unwrap().materials.len(), 15);
+        assert_eq!(load(&path).unwrap().materials.len(), 22);
         let first = doc.materials[0].id.clone();
         doc.materials[1].id = first;
         save(&path, &doc).unwrap();

@@ -1265,7 +1265,7 @@ mod tests {
         );
         assert!(
             found.iter().any(|m| m.starts_with(
-                "cutting data 2/Some(1): Chip load 0.004 mm per tooth is below Aluminium 6061-T6's 0.030–0.080 mm"
+                "cutting data 2/Some(1): Chip load 0.0042 mm per tooth is below Aluminium 6061-T6's 0.030–0.080 mm"
             )),
             "{found:?}"
         );
@@ -1292,7 +1292,7 @@ mod tests {
         assert_eq!(
             stages(&check),
             vec![
-                "cutting data 1/Some(4): Chip load 0.008 mm per tooth is below Aluminium 6061-T6's 0.020–0.050 mm for a Ø4 mm tool."
+                "cutting data 1/Some(4): Chip load 0.0078 mm per tooth is below Aluminium 6061-T6's 0.020–0.050 mm for a Ø4 mm tool."
             ]
         );
     }
@@ -1777,8 +1777,9 @@ mod tests {
         let tool = thin_drill(&mut job);
         let drill = &mut job.setups[0].operations[3];
         drill.tool = tool;
-        // 0.02 mm per tooth at 12000 rpm: inside the material's band for a Ø1 tool.
-        drill.p.insert("feed".into(), "720".into());
+        // 0.0067 mm per tooth at 12000 rpm: inside the 0.003–0.010 mm a Ø1
+        // tool takes (a third of the band's).
+        drill.p.insert("feed".into(), "240".into());
         drill_through(drill, "6", "25");
         let found = stages(&check_built(&job, &mesh, &report));
         assert_eq!(
@@ -1980,9 +1981,11 @@ mod tests {
                 .map(|p| p.message)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(run_at(&mut job, "24000", "960"), Vec::<String>::new());
+        // 320 mm/min with two flutes is 0.0067 mm a tooth, inside the
+        // 0.003–0.010 mm a Ø1 takes (a third of the band's).
+        assert_eq!(run_at(&mut job, "24000", "320"), Vec::<String>::new());
         // Below the maximum the speed is still refused.
-        let found = run_at(&mut job, "20000", "800");
+        let found = run_at(&mut job, "20000", "260");
         assert!(!found.is_empty(), "{found:?}");
         assert!(
             found
@@ -2294,7 +2297,7 @@ mod tests {
             vec![
                 "workholding 1/Some(1): Face by planner: the tool hits the clamp on -X (offset 0) at X-67.0 Y-15.7 Z-2.0 (within the 2 mm gap).",
                 "workholding 1/Some(1): Face by planner: the tool hits the clamp on +X (offset 0) at X67.0 Y-15.7 Z-2.0 (within the 2 mm gap).",
-                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-6.0 (within the 2 mm gap).",
+                "workholding 1/Some(3): Contour by planner: the tool hits the clamp on -X (offset 0) at X-45.0 Y-12.9 Z15.0 (within the 2 mm gap).",
                 "workholding 1/Some(3): Contour by planner: the holder hits the clamp on -X (offset 0) at X-65.1 Y-10.0 Z-38.0 (within the 2 mm gap).",
                 "workholding 1/Some(3): Contour by planner: the tool hits the clamp on +X (offset 0) at X65.1 Y10.0 Z-6.0 (within the 2 mm gap).",
                 "workholding 1/Some(3): Contour by planner: the holder hits the clamp on +X (offset 0) at X65.1 Y10.0 Z-38.0 (within the 2 mm gap).",
@@ -2648,7 +2651,11 @@ mod totem {
             .flat_map(|p| p.surfaces.clone())
             .collect();
         let (top, well) = (at("+Z", 0.), at("+Z", 6.85));
-        let cut = |strategy: &str, tool: u32, surfaces: &[usize], feed: f32, edit: &dyn Fn(&mut crate::proposal::ProposedOp)| {
+        let cut = |strategy: &str,
+                   tool: u32,
+                   surfaces: &[usize],
+                   feed: f32,
+                   edit: &dyn Fn(&mut crate::proposal::ProposedOp)| {
             let mut o = op(strategy, tool, surfaces.to_vec());
             (o.rpm, o.feed, o.coolant) = (12000., feed, "Mist".into());
             edit(&mut o);
@@ -2695,7 +2702,7 @@ mod totem {
                             rest(0.5)(o);
                         }),
                         // R0.5 corners in the 13.8 mm switch cut-outs.
-                        cut("Pocket", 5, &well, 400., &|o| {
+                        cut("Pocket", 5, &well, 300., &|o| {
                             through(o);
                             rest(0.5)(o);
                         }),
@@ -2704,7 +2711,9 @@ mod totem {
                             o.peck = Some(1.);
                         }),
                         cut("Drill", 7, &top, 800., &|_| {}),
-                        cut("Pocket", 6, &at("+Z", 0.5), 400., &|o| o.stepdown = Some(0.1)),
+                        cut("Pocket", 6, &at("+Z", 0.5), 150., &|o| {
+                            o.stepdown = Some(0.1)
+                        }),
                         // Down to 2 mm over the part's bottom: the skin under
                         // the outline holds the part in its frame for setup 2.
                         cut("Contour", 1, &[], 1000., &|o| {
@@ -2725,7 +2734,7 @@ mod totem {
                         cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),
                         cut("Pocket", 2, &underside, 700., &rest(1.)),
                         cut("Pocket", 3, &underside, 500., &rest(1.)),
-                        cut("Pocket", 5, &underside, 400., &rest(0.5)),
+                        cut("Pocket", 5, &underside, 300., &rest(0.5)),
                         // Last, it cuts the skin and frees the part.
                         cut("Contour", 2, &[], 700., &outline(0.)),
                     ],

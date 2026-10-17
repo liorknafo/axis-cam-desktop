@@ -144,6 +144,10 @@ pub enum Message {
     AddOp(Strategy),
     DuplicateOp,
     RemoveOp,
+    /// The operation editor's Delete: asks before `RemoveOp`, as a setup's
+    /// Delete does (`ConfirmDeleteSetup`).
+    AskRemoveOp,
+    ConfirmDeleteOp(bool),
     MoveOp(isize),
     ToggleOp,
     Feature(usize),
@@ -668,6 +672,9 @@ pub struct App {
     /// The setup editor's step shown (`ui::SETUP_STEPS`).
     pub setup_step: &'static str,
     pub status: String,
+    /// The page the status line was last set on: on another page it is an
+    /// earlier event's, and the footer shows it as such.
+    pub status_page: Page,
     pub audit_report: Vec<AuditRow>,
     /// The field whose help the F1 key pinned (`ui::view` draws it), and
     /// whether its card is open to its More… text and its animation paused.
@@ -810,6 +817,8 @@ pub struct App {
     pub plan_camera: viewport::Camera,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
+    /// The operation editor asks before deleting the selected operation.
+    pub confirm_delete_op: bool,
     /// An action that sent the user to a page to make what it needs first
     /// (Face to the Tool library), and that page: saving there carries the
     /// action out; leaving the page drops it.
@@ -1203,6 +1212,8 @@ impl App {
             plan_dropped: None,
             undo: None,
             confirm_delete_setup: false,
+            confirm_delete_op: false,
+            status_page: Page::Home,
             pending: None,
             icons,
             closing: None,
@@ -2410,6 +2421,7 @@ impl App {
         self.progress = 0.;
         self.simulation = None;
         self.confirm_delete_setup = false;
+        self.confirm_delete_op = false;
     }
     /// Carries out the pending action, once its page has saved what the
     /// action needed.
@@ -2429,7 +2441,12 @@ impl App {
     }
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
+        let (selected, page) = (self.selected, self.page);
         let task = self.handle(message);
+        // Another operation or page closes the delete question.
+        if self.selected != selected || self.page != page {
+            self.confirm_delete_op = false;
+        }
         if self
             .pending
             .as_ref()
@@ -2445,6 +2462,9 @@ impl App {
             } else {
                 dropped.into()
             };
+        }
+        if self.status != before {
+            self.status_page = self.page;
         }
         task
     }
@@ -2464,6 +2484,8 @@ impl App {
                     | Message::AddOp(_)
                     | Message::DuplicateOp
                     | Message::RemoveOp
+                    | Message::AskRemoveOp
+                    | Message::ConfirmDeleteOp(_)
                     | Message::MoveOp(_)
                     | Message::Generate
                     | Message::GenerateAll
@@ -2619,7 +2641,14 @@ impl App {
                     return self.update(Message::SelectOp(0));
                 }
             }
-            Message::SetupStep(step) => self.setup_step = step,
+            // A step tab, or the workspace heading's link to the work zero:
+            // the setup editor opens on that step.
+            Message::SetupStep(step) => {
+                if self.selected.is_some() || self.page != Page::Work {
+                    let _ = self.update(Message::SetupEditor);
+                }
+                self.setup_step = step;
+            }
             Message::Tab(t) => {
                 self.picking = t == "Geometry" && self.can_pick();
                 if self.picking {
@@ -2772,6 +2801,13 @@ impl App {
                         Some(i.min(self.doc.setup().operations.len() - 1))
                     };
                     self.touch()
+                }
+            }
+            Message::AskRemoveOp => self.confirm_delete_op = self.selected.is_some(),
+            Message::ConfirmDeleteOp(yes) => {
+                self.confirm_delete_op = false;
+                if yes {
+                    return self.handle(Message::RemoveOp);
                 }
             }
             Message::MoveOp(d) => {
@@ -3245,6 +3281,8 @@ impl App {
                 }
                 self.run_epoch += 1;
                 c.run = Some(run::Run::new(&self.doc, si, self.run_epoch));
+                // A spot picked to probe from was for the setup before.
+                c.probe_spot = None;
                 // The setup picked to run is the one the 3D views show.
                 if self.doc.setups[si].id != self.doc.active {
                     self.doc.active = self.doc.setups[si].id.clone();
@@ -3454,6 +3492,10 @@ impl App {
             Message::PickMaterial(id) => {
                 // A pick_list repeats the chosen item; that is not a change.
                 if self.doc.material_id != id && self.doc.select_material(&id) {
+                    let said = self.doc.fit_speeds();
+                    if !said.is_empty() {
+                        self.status = said;
+                    }
                     self.touch()
                 }
             }
