@@ -154,6 +154,7 @@ pub enum Message {
     Feature(usize),
     Surface(usize),
     ClearSurfaces,
+    BoxFromFace,
     PickMode,
     Generate,
     GenerateAll,
@@ -1378,7 +1379,7 @@ impl App {
         self.operation().is_some_and(|o| {
             self.is_sample()
                 || (self.doc.file.is_some()
-                    && o.needs_surfaces()
+                    && (o.needs_surfaces() || o.strategy == Strategy::Box)
                     && o.strategy.imported_preview()
                     && self.imported_mesh.is_some())
         })
@@ -2877,9 +2878,12 @@ impl App {
                         selected.mesh_fingerprint = fingerprint;
                         selected.ids.clear();
                     }
-                    if selected.ids.contains(&n) {
-                        selected.ids.retain(|id| *id != n);
-                    } else {
+                    let had = selected.ids.contains(&n);
+                    // A Box takes one face: a click replaces the one before.
+                    if had || o.strategy == Strategy::Box {
+                        selected.ids.clear();
+                    }
+                    if !had {
                         selected.ids.push(n);
                     }
                     o.geometry.clear();
@@ -2899,7 +2903,39 @@ impl App {
                     self.simulation = None;
                     self.progress = 0.;
                 }
-                self.tab = "Geometry".into();
+                // A Box is picked on its own tab.
+                if self.operation().is_none_or(|o| o.strategy != Strategy::Box) {
+                    self.tab = "Geometry".into();
+                }
+            }
+            Message::BoxFromFace => {
+                let found = (|| {
+                    let mesh = self.part_mesh().ok_or("Load the part first.")?;
+                    let selection = self
+                        .operation()
+                        .filter(|o| o.strategy == Strategy::Box)
+                        .ok_or("Select a Box operation first.")?
+                        .surfaces
+                        .as_ref()
+                        .ok_or(manual::ONE_FACE)?;
+                    let stock = self
+                        .known_stock(self.doc.index())
+                        .0
+                        .ok_or("The stock is not known yet.")?;
+                    manual::box_from_face(self.doc.setup(), mesh, selection, stock)
+                })();
+                match found {
+                    Ok(block) => {
+                        if let Some(o) = self.operation_mut() {
+                            for (k, v) in model::BOX_FIELDS.into_iter().zip(block) {
+                                o.p.insert(k.into(), v.to_string());
+                            }
+                        }
+                        self.touch();
+                        self.status = "Box filled from the selected face.".into();
+                    }
+                    Err(error) => self.status = error,
+                }
             }
             Message::Generate => {
                 let mut issues = self.doc.setup().issues();

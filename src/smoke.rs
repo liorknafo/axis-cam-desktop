@@ -15223,4 +15223,86 @@ flood = { pin = 8 }
             assert_eq!(crate::ui::issue_tab(issue), tab, "{issue}");
         }
     }
+    #[test]
+    fn the_box_tab_fills_its_fields_from_the_picked_face() {
+        let mut a = imported_app();
+        with_big_cutter(&mut a);
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        let _ = a.update(Message::AddOp(Strategy::Box));
+        let _ = a.update(Message::Tab("Box".into()));
+        shows(
+            &a,
+            &["From the part", "From selected face", "0 faces selected"],
+        );
+        assert!(
+            crate::ui::probe::clicks(a.view(), iced::Size::new(WINDOW.width, 2400.))
+                .iter()
+                .any(|m| matches!(m, Message::BoxFromFace))
+        );
+        let fields = |a: &App| -> Vec<String> {
+            crate::model::BOX_FIELDS
+                .iter()
+                .map(|k| get(&a.operation().unwrap().p, k).to_string())
+                .collect()
+        };
+        let before = fields(&a);
+        // No face yet: the message, and the fields stay.
+        let _ = a.update(Message::BoxFromFace);
+        assert_eq!(a.status, crate::manual::ONE_FACE);
+        assert_eq!(fields(&a), before);
+        // Picking stays on the Box tab, and a click replaces the face before it.
+        let _ = a.update(Message::PickMode);
+        assert!(a.picking && a.tab == "Box");
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let top = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2] > 0.99999)
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let chamfer = mesh
+            .surfaces
+            .iter()
+            .position(|s| s.normal[2] > 0.5 && s.normal[2] < 0.9)
+            .unwrap();
+        let picked = |a: &App| {
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .unwrap()
+                .ids
+                .clone()
+        };
+        let _ = a.update(Message::Surface(chamfer));
+        let _ = a.update(Message::Surface(top));
+        assert_eq!(picked(&a), vec![top]);
+        shows(&a, &["1 face selected"]);
+        // The block's top, under 10 mm of stock: the whole stock above it.
+        let _ = a.update(Message::BoxFromFace);
+        let stock = a.known_stock(0).0.unwrap();
+        let zero = crate::post::datum(a.doc.setup(), stock, a.part_mesh().unwrap()).unwrap();
+        let whole: Vec<String> = [
+            stock.min[0] - zero[0],
+            stock.max[0] - zero[0],
+            stock.min[1] - zero[1],
+            stock.max[1] - zero[1],
+            0.,
+            -10.,
+        ]
+        .map(|v| format!("{}", (v * 1000.).round() / 1000.))
+        .to_vec();
+        assert_eq!(fields(&a), whole);
+        assert_eq!(a.status, "Box filled from the selected face.");
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        // A slanted face is refused, and the fields stay.
+        let _ = a.update(Message::Surface(chamfer));
+        let _ = a.update(Message::BoxFromFace);
+        assert_eq!(a.status, crate::manual::ONE_FACE);
+        assert_eq!(fields(&a), whole);
+    }
 }

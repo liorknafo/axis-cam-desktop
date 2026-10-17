@@ -2374,6 +2374,26 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             ] {
                 c = c.push(row![checks.field(p, a.0, a.1), checks.field(p, b.0, b.1)].spacing(9));
             }
+            if app.part_mesh().is_some() && !app.is_sample() {
+                let count = o.surfaces.as_ref().map_or(0, |s| s.ids.len());
+                c = c
+                    .push(section("From the part"))
+                    .push(note("Pick one flat face: a floor facing up, or a wall facing sideways. Drag to orbit, then click Finish picking."))
+                    .push(
+                        btn(
+                            if app.picking {
+                                "Finish picking"
+                            } else {
+                                "Select face on part"
+                            },
+                            Message::PickMode,
+                            app.picking,
+                        )
+                        .width(Fill),
+                    )
+                    .push(muted(format!("{} selected", plural(count, "face"))))
+                    .push(secondary("From selected face", Message::BoxFromFace).width(Fill));
+            }
         }
         "Heights" => {
             c = c.push(note(if o.strategy == Strategy::Box {

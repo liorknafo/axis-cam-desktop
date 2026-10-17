@@ -1111,6 +1111,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Remove this operation's saved surface selections so you can choose new surfaces on the current part.",
             "",
         ),
+        BoxFromFace => (
+            "Fill the six Box fields from the part face selected on this operation: a floor facing up, or a wall facing sideways. A floor is grown to the stock's edge or the next part material above it. A wall is cut from the wall out to the stock's edge. The numbers are in the setup's frame from the work zero.",
+            "",
+        ),
         PickMode => (
             "Select geometry on the current part. Click a surface to toggle it, drag to orbit, and click Finish picking when done. Imported Facing/Pocket selections are connected planar mesh regions, not exact CAD faces.",
             "",
@@ -3822,6 +3826,7 @@ mod tests {
             MoveOp(-1),
             MoveOp(1),
             PickMode,
+            BoxFromFace,
             Generate,
             GenerateAll,
             DuplicateSetup,
