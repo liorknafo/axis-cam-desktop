@@ -1,4 +1,4 @@
-use crate::model::{Fields, Machine, get, num};
+use crate::model::{Document, Fields, Machine, Setup, get, num};
 
 const TURNS: [&str; 3] = ["turn_x", "turn_y", "turn_z"];
 
@@ -146,6 +146,40 @@ pub fn toggle(machines: &str, id: &str, on: bool) -> String {
     ids.join(",")
 }
 
+/// The changes of tool between the enabled operations of a manual setup,
+/// counting the first tool.
+pub fn tool_changes(setup: &Setup) -> usize {
+    let mut last = None;
+    setup
+        .operations
+        .iter()
+        .filter(|o| o.enabled)
+        .filter(|o| last.replace(&o.tool) != Some(&o.tool))
+        .count()
+}
+
+/// The minutes the stock spends moving between machines: for each pair of
+/// consecutive setups on different machines, the `move_time` of the manual
+/// machine in the pair (the longer when both are), 0 when neither is manual.
+pub fn move_minutes(doc: &Document) -> f32 {
+    doc.setups
+        .windows(2)
+        .filter(|w| w[0].machine.id != w[1].machine.id)
+        .map(|w| {
+            w.iter()
+                .map(|s| &s.machine)
+                .filter(|m| is_manual(m))
+                .map(|m| num(&m.p, "move_time").unwrap_or(0.))
+                .fold(0., f32::max)
+        })
+        .sum()
+}
+
+/// The export's line for a manual setup, which has no program.
+pub fn no_gcode(setup: &str) -> String {
+    format!("{setup}: manual mill, no G-code — follow the steps on the MACHINE page.")
+}
+
 /// Why a strategy is dimmed on a setup of the manual mill.
 pub const ONE_AXIS: &str = "The big mill cuts one axis at a time.";
 /// Why Box is dimmed on a setup of a CNC machine.
@@ -154,7 +188,7 @@ pub const BOX_ON_CNC: &str = "Box runs on a manual mill.";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::fields;
+    use crate::model::{Operation, Strategy, fields};
     fn with(m: &mut Machine, k: &str, v: &str) {
         m.p.insert(k.into(), v.into());
     }
@@ -345,5 +379,51 @@ mod tests {
         assert!(m.issues().is_empty());
         with(&mut m, "controller", "UC100");
         assert_eq!(m.issues().len(), 1);
+    }
+    fn setup_of(m: &Machine, tools: &[(&str, bool)]) -> Setup {
+        let mut setup = Setup::new(m.clone(), "G54");
+        setup.operations = tools
+            .iter()
+            .map(|(tool, on)| {
+                let mut op = Operation::new(Strategy::Box, (*tool).into());
+                op.enabled = *on;
+                op
+            })
+            .collect();
+        setup
+    }
+    #[test]
+    fn tool_changes_count_the_first_tool_and_each_change_of_enabled_operations() {
+        let m = defaults();
+        let count = |tools: &[(&str, bool)]| tool_changes(&setup_of(&m, tools));
+        assert_eq!(count(&[]), 0);
+        assert_eq!(count(&[("a", true)]), 1);
+        assert_eq!(count(&[("a", true), ("a", true)]), 1);
+        assert_eq!(count(&[("a", true), ("b", true), ("a", true)]), 3);
+        // A disabled operation neither brings a tool nor splits a run.
+        assert_eq!(count(&[("a", true), ("b", false), ("a", true)]), 1);
+        assert_eq!(count(&[("a", false), ("b", true)]), 1);
+    }
+    #[test]
+    fn the_stock_moves_between_machines_cost_the_manual_mills_move_time() {
+        let (big, cnc) = (defaults(), Machine::new(3));
+        let doc = |machines: &[&Machine]| Document {
+            setups: machines.iter().map(|m| setup_of(m, &[])).collect(),
+            ..Default::default()
+        };
+        // Manual, CNC, manual, CNC: the stock moves three times.
+        assert_eq!(move_minutes(&doc(&[&big, &cnc, &big, &cnc])), 30.);
+        assert_eq!(move_minutes(&doc(&[&big, &big, &cnc, &cnc])), 10.);
+        assert_eq!(move_minutes(&doc(&[&cnc, &cnc])), 0.);
+        assert_eq!(move_minutes(&doc(&[&big])), 0.);
+        assert_eq!(move_minutes(&doc(&[])), 0.);
+        // Two CNC machines: no manual machine in the pair.
+        assert_eq!(move_minutes(&doc(&[&cnc, &Machine::new(3)])), 0.);
+        let mut slow = big.clone();
+        slow.id = "slow".into();
+        slow.p.insert("move_time".into(), "25".into());
+        assert_eq!(move_minutes(&doc(&[&slow, &cnc, &big])), 25. + 10.);
+        // Between two manual machines: the longer.
+        assert_eq!(move_minutes(&doc(&[&slow, &big])), 25.);
     }
 }

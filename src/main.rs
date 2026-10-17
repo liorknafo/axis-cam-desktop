@@ -3303,7 +3303,10 @@ impl App {
                 };
                 // Not while a tool run or a probe is under way: the probe
                 // sets the work zero of the setup it started with (#165).
-                if si >= self.doc.setups.len() || c.setup_locked() {
+                if si >= self.doc.setups.len()
+                    || c.setup_locked()
+                    || manual::is_manual(&self.doc.setups[si].machine)
+                {
                     return Task::none();
                 }
                 self.run_epoch += 1;
@@ -4864,8 +4867,11 @@ fn check_plan(args: &[String]) -> Result<(String, String, bool), String> {
     let (check, _) = plan_check::check(&doc, &mesh, &report, &proposal);
     let json = serde_json::to_string_pretty(&check).map_err(|e| e.to_string())?;
     let summary = if check.passed {
+        let split = check
+            .split_line()
+            .map_or(String::new(), |l| format!(" ({l})"));
         format!(
-            "The plan passes every check: {}, {} min.",
+            "The plan passes every check: {}, {} min{split}.",
             ui::plural(check.operations.len(), "operation"),
             check.total_minutes
         )
@@ -4913,6 +4919,10 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         eprintln!("! {e}");
     }
     for setup in &job.setups {
+        if manual::is_manual(&doc.setups[setup.setup].machine) {
+            println!("{}", manual::no_gcode(&setup.name));
+            continue;
+        }
         match &setup.result {
             Ok(programs) => programs
                 .iter()

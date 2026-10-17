@@ -5244,6 +5244,14 @@ fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
     }
 }
 
+/// The setups the Run strip lists for machine `machine_id`: those that use
+/// it, except a manual mill's, which have steps instead of a run.
+pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize, &'a Setup)> {
+    (doc.setups.iter().enumerate())
+        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_manual(&x.machine))
+        .collect()
+}
+
 /// The Run strip: the setup of this machine run tool run by tool run, with
 /// Cycle Start, Hold, Resume and Stop, fixed above the part of the Control
 /// page that scrolls, so they never scroll out of sight below the tool-run
@@ -5262,13 +5270,7 @@ pub(crate) fn run_strip<'a>(
     let running = c.run.as_ref().is_some_and(|r| r.running.is_some());
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let mut body = column![].spacing(10);
-    let setups: Vec<(usize, &Setup)> = app
-        .doc
-        .setups
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.machine.id == c.machine_id)
-        .collect();
+    let setups = run_setups(&app.doc, &c.machine_id);
     if setups.is_empty() {
         body = body.push(muted("No setup uses this machine. In MANUFACTURE, choose it as a setup's machine (Assign to current setup) to run that setup here."));
     } else {
@@ -6445,6 +6447,7 @@ pub(crate) fn preview_totals(outcome: &crate::planner::Outcome) -> Vec<String> {
         check.total_minutes,
         plural(outcome.requests, "model request"),
     )];
+    lines.extend(check.split_line());
     if let Some(error) = &outcome.note {
         lines.push(format!("A follow-up request failed: {}", error.message()));
     }
@@ -7567,6 +7570,8 @@ pub(crate) enum NcCard<'a> {
         problems: &'a [String],
         setup: usize,
     },
+    /// A manual mill's setup: no program, its steps are on the MACHINE page.
+    Manual,
 }
 /// The NC review page, before it is drawn: its words and its setups' cards.
 pub(crate) struct NcPage<'a> {
@@ -7586,7 +7591,7 @@ impl NcPage<'_> {
     pub(crate) fn problems(&self) -> Vec<&str> {
         let cards = self.cards.iter().flat_map(|(_, card)| match card {
             NcCard::Refused(p) | NcCard::Run { problems: p, .. } => p.iter(),
-            NcCard::Programs(_) => [].iter(),
+            NcCard::Programs(_) | NcCard::Manual => [].iter(),
         });
         self.errors
             .iter()
@@ -7642,7 +7647,11 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
         for s in &job.setups {
             let uc100 = (app.doc.setups.get(s.setup))
                 .is_some_and(|x| get(&x.machine.p, "controller") == "UC100");
-            let card = if uc100 {
+            let manual =
+                (app.doc.setups.get(s.setup)).is_some_and(|x| crate::manual::is_manual(&x.machine));
+            let card = if manual {
+                NcCard::Manual
+            } else if uc100 {
                 NcCard::Run {
                     problems: match &s.run {
                         Some(Err(problems)) => problems,
@@ -7714,6 +7723,9 @@ fn post(app: &App) -> Element<'_, Message> {
                         summary = summary
                             .push(bold(format!("!  {name}"), 13))
                             .push(warnings(problems.to_vec()));
+                    }
+                    NcCard::Manual => {
+                        summary = summary.push(muted(crate::manual::no_gcode(name)));
                     }
                     NcCard::Run { problems, setup } => {
                         let mark = if problems.is_empty() { "✓" } else { "!" };
@@ -8194,5 +8206,34 @@ mod tests {
             scan(&root.join(path), &mut hits);
         }
         assert!(hits.is_empty(), "mojibake found:\n{}", hits.join("\n"));
+    }
+
+    #[test]
+    fn the_run_strip_lists_no_manual_setup() {
+        use crate::model::{Document, Machine, Setup};
+        let (cnc, big) = (Machine::new(3), crate::manual::defaults());
+        let doc = Document {
+            setups: vec![
+                Setup::new(big.clone(), "G54"),
+                Setup::new(cnc.clone(), "G55"),
+                Setup::new(cnc.clone(), "G56"),
+            ],
+            ..Default::default()
+        };
+        let listed = |id: &str| -> Vec<usize> {
+            super::run_setups(&doc, id)
+                .iter()
+                .map(|(si, _)| *si)
+                .collect()
+        };
+        assert_eq!(listed(&cnc.id), vec![1, 2]);
+        assert!(listed(&big.id).is_empty());
+        // Even a manual mill that claims the UC100 controller.
+        let mut clash = doc.clone();
+        clash.setups[0]
+            .machine
+            .p
+            .insert("controller".into(), "UC100".into());
+        assert!(super::run_setups(&clash, &big.id).is_empty());
     }
 }

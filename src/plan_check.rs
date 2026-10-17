@@ -28,6 +28,15 @@ pub struct CheckReport {
     pub operations: Vec<OpResult>,
     pub coverage: Option<Coverage>,
     pub total_minutes: f32,
+    /// What `total_minutes` is made of: the minutes at the manual mill (its
+    /// operations and tool changes), at the CNC, and moving the stock between
+    /// machines. Not sent to the model.
+    #[serde(skip)]
+    pub manual_minutes: f32,
+    #[serde(skip)]
+    pub cnc_minutes: f32,
+    #[serde(skip)]
+    pub move_minutes: f32,
     /// The stock before each setup, as far as the simulation got: none after
     /// an operation that could not be generated, nor when the job was not
     /// built.
@@ -38,6 +47,44 @@ pub struct CheckReport {
     /// (`post::model_zero`). Not sent to the model.
     #[serde(skip)]
     pub zeros: Vec<Option<(Bounds, Option<f32>)>>,
+}
+impl CheckReport {
+    /// Sets the minutes from the operations that generated: `total_minutes`
+    /// is theirs, plus the manual setups' tool changes and the moves of the
+    /// stock between machines; the split counts the manual setups'
+    /// operations and tool changes as manual.
+    fn add_minutes(&mut self, built: &Document, operations: &[OpResult]) {
+        let round = |m: f32| (m * 10.).round() / 10.;
+        let manual = |setup: usize| crate::manual::is_manual(&built.setups[setup - 1].machine);
+        let of = |manual_ops: bool| -> f32 {
+            (operations.iter())
+                .filter(|o| manual(o.setup) == manual_ops)
+                .map(|o| o.minutes)
+                .sum()
+        };
+        let changes: f32 = (built.setups.iter())
+            .filter(|s| crate::manual::is_manual(&s.machine))
+            .map(|s| {
+                crate::manual::tool_changes(s) as f32
+                    * crate::model::num(&s.machine.p, "tool_time").unwrap_or(0.)
+            })
+            .sum();
+        let moves = crate::manual::move_minutes(built);
+        self.manual_minutes = round(of(true) + changes);
+        self.cnc_minutes = round(of(false));
+        self.move_minutes = round(moves);
+        self.total_minutes = round(of(true) + of(false) + changes + moves);
+    }
+    /// "Manual 18 min · CNC 42 min · moving 10 min", for a job that has a
+    /// manual setup; None for a job on CNC machines alone.
+    pub fn split_line(&self) -> Option<String> {
+        (self.manual_minutes > 0. || self.move_minutes > 0.).then(|| {
+            format!(
+                "Manual {:.0} min · CNC {:.0} min · moving {:.0} min",
+                self.manual_minutes, self.cnc_minutes, self.move_minutes
+            )
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OpResult {
@@ -710,6 +757,9 @@ pub fn evaluate_full(
                 operations: vec![],
                 coverage: None,
                 total_minutes: 0.,
+                manual_minutes: 0.,
+                cnc_minutes: 0.,
+                move_minutes: 0.,
                 stocks: vec![],
                 zeros: vec![],
             },
@@ -838,6 +888,9 @@ fn run(
         operations: vec![],
         coverage: None,
         total_minutes: 0.,
+        manual_minutes: 0.,
+        cnc_minutes: 0.,
+        move_minutes: 0.,
         stocks: vec![],
         zeros: vec![],
     };
@@ -943,7 +996,7 @@ fn run(
         .into_iter()
         .map(|i| candidates[i].clone());
     let last = last.into_inner();
-    out.total_minutes = (operations.iter().map(|o| o.minutes).sum::<f32>() * 10.).round() / 10.;
+    out.add_minutes(built, &operations);
     out.operations = operations;
     out.problems = problems;
     let mut laid = None;
@@ -2554,6 +2607,129 @@ mod tests {
         assert_eq!(
             stages(&check_built(&job, &mesh, &report)),
             vec!["workholding 1/None: Top: The workholding entry was deleted; choose another."]
+        );
+    }
+    /// `good_job` with the manual mill's setup in front, whose Box takes a
+    /// 2 mm notch off a corner of the stock top, clear of everything else.
+    fn with_manual() -> (Document, Mesh, PartReport) {
+        let (mut job, mesh, report) = good_job();
+        crate::post::fixture::with_manual_setup(&mut job, [-500., 34., -500., 34., 0., -2.]);
+        (job, mesh, report)
+    }
+    #[test]
+    fn a_manual_setup_has_no_export_problem_and_its_minutes_are_counted_apart() {
+        let (plain, mesh, report) = good_job();
+        let plain = check_built(&plain, &mesh, &report);
+        assert!(plain.passed, "{:?}", stages(&plain));
+        assert_eq!((plain.manual_minutes, plain.move_minutes), (0., 0.));
+        assert_eq!(plain.split_line(), None);
+        let (job, mesh, report) = with_manual();
+        let check = check_built(&job, &mesh, &report);
+        assert!(check.passed, "{:?}", stages(&check));
+        assert_eq!(check.operations.len(), plain.operations.len() + 1);
+        let notch = &check.operations[0];
+        assert_eq!((notch.setup, notch.operation), (1, 1));
+        assert!(notch.minutes > 0.);
+        // The notch's minutes and its one tool change (3 min), the CNC's own
+        // minutes as before, and the stock moving once (10 min).
+        assert!((check.manual_minutes - (notch.minutes + 3.)).abs() < 0.11);
+        assert!((check.cnc_minutes - plain.total_minutes).abs() < 0.11);
+        assert_eq!(check.move_minutes, 10.);
+        let sum = check.manual_minutes + check.cnc_minutes + check.move_minutes;
+        assert!((check.total_minutes - sum).abs() < 0.11);
+        let line = check.split_line().unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "Manual {:.0} min · CNC {:.0} min · moving 10 min",
+                check.manual_minutes, check.cnc_minutes
+            )
+        );
+        // What the model is sent keeps its shape.
+        let json = serde_json::to_value(&check).unwrap();
+        for key in ["manual_minutes", "cnc_minutes", "move_minutes"] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
+        assert!(json["total_minutes"].as_f64().unwrap() > 0.);
+    }
+    #[test]
+    fn a_manual_setup_still_gets_its_generation_and_holding_problems() {
+        // A box above the stock leaves nothing to cut.
+        let (mut job, mesh, report) = with_manual();
+        job.setups[0].operations[0]
+            .p
+            .insert("z_top".into(), "50".into());
+        job.setups[0].operations[0]
+            .p
+            .insert("z_bottom".into(), "40".into());
+        let found = stages(&check_built(&job, &mesh, &report));
+        assert!(
+            found[0].starts_with("generation 1/Some(1): The box leaves nothing to cut"),
+            "{found:?}"
+        );
+        // The later setups cannot inherit its stock; nothing is about export.
+        assert!(
+            found.iter().all(|f| f.starts_with("generation ")),
+            "{found:?}"
+        );
+        // A hole drilled by hand through the stock's bottom is a gouge.
+        let (mut job, mesh, report) = with_manual();
+        let mut drill = job.setups[1].operations[3].clone();
+        let mut tool = Tool::new("Drill 6.6", "Drill", "6.6");
+        for (k, v) in [
+            ("length", "60"),
+            ("stickout", "65"),
+            ("number", "10"),
+            ("machines", job.setups[0].machine.id.as_str()),
+        ] {
+            tool.p.insert(k.into(), v.into());
+        }
+        drill.tool = tool.id.clone();
+        drill.id = "hand-drill".into();
+        drill.p.insert("rpm".into(), "1600".into());
+        drill.p.insert("feed".into(), "100".into());
+        drill_through(&mut drill, "6.6", "15");
+        job.tools.push(tool);
+        job.setups[0].operations = vec![drill];
+        let found = stages(&check_built(&job, &mesh, &report));
+        assert!(
+            found.iter().any(|f| f.starts_with(
+                "gouge 1/Some(1): The tool goes 12.00 mm below the bottom of the stock"
+            )),
+            "{found:?}"
+        );
+        assert!(found.iter().all(|f| !f.starts_with("export")), "{found:?}");
+        // Its workholding is checked as any setup's, and export says nothing.
+        let (mut job, mesh, report) = with_manual();
+        job.setups[0].p.insert("holding".into(), "Clamps".into());
+        job.setups[0].p.insert("clamps".into(), "-X:0".into());
+        job.setups[0].p.insert("holder".into(), "gone".into());
+        assert_eq!(
+            stages(&check_built(&job, &mesh, &report)),
+            vec![
+                "workholding 1/None: Big mill: The workholding entry was deleted; choose another."
+            ]
+        );
+    }
+    #[test]
+    fn a_manual_setup_is_not_held_to_the_post_settings() {
+        // Export would refuse a machine of another controller; a manual mill
+        // is not exported.
+        let (mut job, mesh, report) = with_manual();
+        job.setups[0]
+            .machine
+            .p
+            .insert("controller".into(), "Mach3".into());
+        let found = check_built(&job, &mesh, &report);
+        assert!(found.passed, "{:?}", stages(&found));
+        job.setups[1]
+            .machine
+            .p
+            .insert("controller".into(), "Mach3".into());
+        let refused = stages(&check_built(&job, &mesh, &report));
+        assert!(
+            refused.len() == 1 && refused[0].starts_with("export 2/None: "),
+            "{refused:?}"
         );
     }
 }

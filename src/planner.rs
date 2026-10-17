@@ -2276,6 +2276,9 @@ pub(crate) mod tests {
                     operations: vec![],
                     coverage: None,
                     total_minutes: 0.,
+                    manual_minutes: 0.,
+                    cnc_minutes: 0.,
+                    move_minutes: 0.,
                     zeros: vec![],
                     stocks: vec![],
                 };
@@ -2322,6 +2325,9 @@ pub(crate) mod tests {
                     operations: vec![],
                     coverage: None,
                     total_minutes: 0.,
+                    manual_minutes: 0.,
+                    cnc_minutes: 0.,
+                    move_minutes: 0.,
                     zeros: vec![],
                     stocks: vec![],
                 };
@@ -3593,6 +3599,9 @@ pub(crate) mod tests {
                     operations: vec![],
                     coverage: None,
                     total_minutes: 0.,
+                    manual_minutes: 0.,
+                    cnc_minutes: 0.,
+                    move_minutes: 0.,
                     zeros: vec![],
                     stocks: vec![],
                 };

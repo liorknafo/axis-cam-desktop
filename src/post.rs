@@ -2067,7 +2067,10 @@ pub(crate) fn prepare(
 }
 /// Check one setup from its `sequence` results (enabled operations only), as
 /// export does, with the post settings `settings` makes of its machine: its
-/// programs, one, or one per run of the same tool in touch-off mode.
+/// programs, one, or one per run of the same tool in touch-off mode. A setup
+/// of a manual machine has no program: none, and no settings error. Every
+/// export, post and run goes through here (`held` does not: it still checks
+/// the workholding of a manual setup).
 pub(crate) fn checked(
     doc: &Document,
     mesh: &Mesh,
@@ -2076,6 +2079,9 @@ pub(crate) fn checked(
     settings: Settings,
 ) -> Result<Vec<Checked>, Vec<String>> {
     let setup = &doc.setups[si];
+    if crate::manual::is_manual(&setup.machine) {
+        return Ok(vec![]);
+    }
     let offset = get(&setup.p, "offset").to_string();
     let walk = walk(doc, mesh, si, sims, settings)?;
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
@@ -2415,6 +2421,37 @@ pub(crate) mod fixture {
         });
         doc.sync_stock_sources();
         (doc, mesh)
+    }
+    /// `doc` with the manual mill's setup in front (`add_manual_setup`), whose
+    /// one Box cuts `b` (x_min, x_max, y_min, y_max, z_top, z_bottom) from
+    /// the stock top's front-left corner, leaving nothing.
+    pub fn with_manual_setup(doc: &mut Document, b: [f32; 6]) {
+        let machine = crate::manual::defaults();
+        // A Ø32 at the top gear cuts aluminium at 161 m/min; one flute makes
+        // the hand feed a chip load of 0.094 mm.
+        let mut tool = Tool::new("End mill 32", "Flat end mill", "32");
+        for (k, v) in [
+            ("length", "40"),
+            ("stickout", "60"),
+            ("flutes", "1"),
+            ("number", "9"),
+            ("machines", &machine.id),
+        ] {
+            tool.p.insert(k.into(), v.into());
+        }
+        let mut cut = Operation::new(Strategy::Box, tool.id.clone());
+        for (k, v) in BOX_FIELDS.iter().zip(b) {
+            cut.p.insert((*k).into(), v.to_string());
+        }
+        cut.p.insert("allowance".into(), "0".into());
+        cut.p.insert("rpm".into(), "1600".into());
+        doc.machines.push(machine);
+        doc.tools.push(tool);
+        doc.add_manual_setup().unwrap();
+        doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        doc.setups[0].operations = vec![cut];
     }
     /// Facing and Pocket on G54, then the part flipped about X and faced on G55.
     pub fn flipped_job() -> (Document, Mesh) {
@@ -5378,5 +5415,44 @@ M2
         let text = &setup_texts(&post_job(&job, &mesh), 1)[0];
         assert!(text.contains(" Stock top Z3.000.)\n"), "{text}");
         assert!(!text.contains(CUT), "{text}");
+    }
+    #[test]
+    fn a_manual_setup_makes_no_program_and_leaves_the_cnc_programs_as_they_were() {
+        let (plain, mesh) = fixture::job();
+        let mut doc = plain.clone();
+        // A notch in the stock's corner that the CNC setup's cuts do not reach.
+        fixture::with_manual_setup(&mut doc, [-500., 34., -500., 34., 0., -2.]);
+        assert_eq!(doc.setups.len(), 2);
+        let cut = simulated(&doc, &mesh);
+        let plan = &cut[0][0].1.as_ref().unwrap().plan;
+        assert!(plan.moves.iter().any(|m| m.cutting_pass));
+        let (before, after) = (post_job(&plain, &mesh), post_job(&doc, &mesh));
+        assert!(before.ready(), "{:?}", errors(&before));
+        assert!(after.ready(), "{:?}", errors(&after));
+        let manual = &after.setups[0];
+        assert!(manual.result.as_ref().unwrap().is_empty());
+        assert!(manual.run.is_none() && manual.passes());
+        // The CNC setup is setup 2 now: its number is the only difference.
+        let (was, now) = (&before.setups[0], &after.setups[1]);
+        let (was, now) = (was.result.as_ref().unwrap(), now.result.as_ref().unwrap());
+        assert_eq!(was.len(), now.len());
+        for (a, b) in was.iter().zip(now) {
+            assert_eq!(a.text, b.text.replacen("Setup 2:", "Setup 1:", 1));
+            assert_eq!(a.file_name, b.file_name.replacen(" - 2 ", " - 1 ", 1));
+            assert_eq!((&a.tools, &a.operations), (&b.tools, &b.operations));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (_, count) = write_job(&after, dir.path()).unwrap();
+        assert_eq!(count, was.len());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), count);
+    }
+    #[test]
+    fn a_job_of_manual_setups_alone_has_nothing_to_export() {
+        let (mut doc, mesh) = fixture::job();
+        fixture::with_manual_setup(&mut doc, [-500., 500., -500., 500., 0., -2.]);
+        doc.setups.truncate(1);
+        let job = post_job(&doc, &mesh);
+        assert!(job.setups[0].passes() && job.errors.is_empty());
+        assert!(!job.ready());
     }
 }

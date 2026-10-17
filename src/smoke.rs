@@ -2654,6 +2654,29 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).snapshot.estop_reason, None);
     }
 
+    /// A manual mill's setup has steps, not a run: the Run strip does not list
+    /// it, even on a machine it shares with the connected one, and picking it
+    /// by message does nothing.
+    #[test]
+    fn the_run_strip_lists_no_manual_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        let name = a.doc.setups[0].name().to_string();
+        let mut hand = crate::manual::defaults();
+        hand.id = conn(&a).machine_id.clone();
+        let mut setup = crate::model::Setup::new(hand, "G55");
+        setup.p.insert("name".into(), "Hand mill".into());
+        a.doc.setups.push(setup);
+        let texts = page_texts(&a);
+        assert!(texts.contains(&format!("1. {name}")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Hand mill")), "{texts:?}");
+        let _ = a.update(Message::Run(crate::run::Action::Setup(1)));
+        assert!(conn(&a).run.is_none());
+        let _ = a.update(Message::Run(crate::run::Action::Setup(0)));
+        assert_eq!(run_of(&a).setup, 0);
+    }
+
     /// The blind review's dead end (LIO-140): machine zero where the machine
     /// starts puts every tool run outside the soft limits. The errors point to
     /// Work zero on the stock, which says where the simulator's block is;
@@ -5294,6 +5317,27 @@ flood = { pin = 8 }
         assert_eq!(refused.problems().len(), 1);
         assert!(refused.run_buttons().is_empty());
         let _ = b.view();
+    }
+    /// The NC page lists a manual mill's setup with the line that says it has
+    /// no G-code, and exports the CNC setup's program beside it.
+    #[test]
+    fn the_nc_page_says_a_manual_setup_has_no_gcode() {
+        use crate::ui::{NcCard, nc_page};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        crate::post::fixture::with_manual_setup(&mut doc, [-500., 34., -500., 34., 0., -2.]);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.update(Message::Page(Page::Post));
+        let page = nc_page(&a);
+        assert!(page.ready && page.problems().is_empty());
+        assert!(matches!(page.cards[0].1, NcCard::Manual));
+        assert!(matches!(page.cards[1].1, NcCard::Programs(_)));
+        let line = "Big mill: manual mill, no G-code — follow the steps on the MACHINE page.";
+        assert_eq!(crate::manual::no_gcode("Big mill"), line);
+        assert!(page_texts(&a).iter().any(|t| t == line));
     }
     #[test]
     fn first_launch_and_empty_project_roundtrip() {

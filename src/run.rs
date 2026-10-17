@@ -584,6 +584,9 @@ pub(crate) fn plan_problems(
     si: usize,
     sims: &[(usize, Result<crate::simulation::Simulation, String>)],
 ) -> Result<(), Vec<String>> {
+    if crate::manual::is_manual(&doc.setups[si].machine) {
+        return Ok(());
+    }
     let programs = crate::post::checked(doc, mesh, si, sims, PostSettings::for_uc100)?;
     let config = crate::control::profile(&doc.setups[si].machine).map_err(|e| vec![e])?;
     let e: Vec<String> = programs
