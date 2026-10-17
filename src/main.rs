@@ -2508,6 +2508,12 @@ impl App {
         let before = self.status.clone();
         let (selected, page) = (self.selected, self.page);
         let task = self.handle(message);
+        // The probes follow the project's material: the touch plate on stock
+        // that does not conduct, the plate's lead on stock that does.
+        if let Some(c) = &mut self.control {
+            c.material =
+                (self.doc.selected_material()).map(|m| (m.name().to_string(), m.conducts()));
+        }
         // Another operation or page closes the delete question.
         if self.selected != selected || self.page != page {
             self.confirm_delete_op = false;

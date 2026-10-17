@@ -12,6 +12,9 @@ pub const GROUPS: [&str; 7] = [
     "Wood and composite",
     "Other",
 ];
+/// The groups whose stock conducts: the metals. With the touch plate's lead
+/// on such stock, the probe trips when the tool touches it, without a plate.
+pub const CONDUCTIVE: [&str; 4] = ["Aluminium", "Steel", "Stainless steel", "Brass and copper"];
 /// Chip-load bands: key prefix and the largest tool diameter (mm) in the band.
 pub const BANDS: [(&str, f32); 5] = [
     ("fz3", 3.),
@@ -112,6 +115,10 @@ impl Material {
     }
     pub fn name(&self) -> &str {
         get(&self.p, "name")
+    }
+    /// Whether stock of this material conducts (`CONDUCTIVE`).
+    pub fn conducts(&self) -> bool {
+        CONDUCTIVE.contains(&get(&self.p, "group"))
     }
     fn positive(&self, key: &str) -> Option<f32> {
         num(&self.p, key).filter(|v| *v > 0.)

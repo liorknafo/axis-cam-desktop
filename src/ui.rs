@@ -5028,8 +5028,20 @@ fn control(app: &App) -> Element<'_, Message> {
             ),
             muted(match (own_why(blocked.clone()), &c.probe) {
                 (Some(why), _) if !c.probing() => why,
+                (_, Ok(p)) if c.direct() => format!(
+                    "{} conducts: no plate. The clip stays on the tool and the plate's lead goes on bare metal of the stock; touch the tool to the stock by hand first and see the probe input go active. Feeds down at {} mm/min, up to {} mm. Work Z where the tool touches the stock top becomes {}, then the tool lifts {} mm.",
+                    c.material.as_ref().map_or("The stock", |(name, _)| name.as_str()),
+                    p.feed,
+                    p.distance,
+                    crate::post::exact_mm(top as f32),
+                    p.retract
+                ),
                 (_, Ok(p)) => format!(
-                    "Touch plate on the stock top under the tool, probe clipped on: feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
+                    "{}: touch plate on the stock top under the tool, the clip on the tool. Feeds down at {} mm/min, up to {} mm. Work Z at the plate's top becomes {} mm, the stock top Z {}, then the tool lifts {} mm.",
+                    match &c.material {
+                        Some((name, _)) => format!("{name} does not conduct"),
+                        None => "No material chosen".into(),
+                    },
                     p.feed,
                     p.distance,
                     crate::post::exact_mm((top + p.plate.unwrap_or_default()) as f32),
@@ -5586,7 +5598,11 @@ pub(crate) fn run_panel<'a>(
                         msg(probe && run.reference.is_some(), R::ProbeFromReference),
                         false
                     ),
-                    muted("The same with the touch plate on the reference surface."),
+                    muted(if c.direct() {
+                        "The same with the plate's lead on the reference surface, which the tool touches."
+                    } else {
+                        "The same with the touch plate on the reference surface."
+                    }),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -5712,16 +5728,29 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         }
     }
     if c.config.inputs.probe.is_some() && p.pins.is_none() {
+        // On stock that does not conduct the probe touches only the plate:
+        // Probe Z sets Z, and X and Y are zeroed by hand.
+        let probe_z = |top: f64| {
+            format!(
+                "{}, Probe Z under Work zero sets Z{}.",
+                if c.direct() {
+                    "With the plate's lead on the stock"
+                } else {
+                    "With the touch plate on the stock top"
+                },
+                crate::post::exact_mm(top as f32)
+            )
+        };
         steps.push(match (c.edges_setup(), c.stock_top()) {
-            (Ok((refs, _)), _) => format!(
-                "With the probe clipped on, {} under Work zero does 3 and 4.",
+            (Ok((refs, _)), _) if c.sides_blocked().is_none() => format!(
+                "With the plate's lead on the stock and the clip on the tool, {} under Work zero does 3 and 4.",
                 crate::control::probe_name(refs)
             ),
-            (Err(why), Ok(top)) => format!(
-                "{why} With the touch plate on the stock top, Probe Z under Work zero sets Z{}.",
-                crate::post::exact_mm(top as f32)
-            ),
-            (Err(why), Err(_)) => why,
+            (Ok(_), Ok(top)) => {
+                format!("{} {}", c.sides_blocked().unwrap_or_default(), probe_z(top))
+            }
+            (Err(why), Ok(top)) => format!("{why} {}", probe_z(top)),
+            (Err(why), Err(_)) | (Ok(_), Err(why)) => why,
         });
     }
     if let (Some((lo, hi)), Some(z), Some(at)) = (c.block, c.sim_zero(), c.sim_touch()) {

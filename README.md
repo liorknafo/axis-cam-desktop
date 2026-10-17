@@ -484,7 +484,7 @@ Once the machine is Idle, the Control page has everything needed before a job:
   has it (LIO-166): **Probe corner** for a corner of the top or bottom and for
   Model origin (found from the front-left corner), **Probe edge** for the
   middle of an edge, **Probe centre** for the centre. With a touch probe in
-  the spindle (or a tool, with the probe clipped onto conductive stock), set
+  the spindle (or a tool, the plate's lead on conductive stock), set
   the **probe tip diameter** in the Machine library, select the setup's work
   system, jog the probe above the stock top over where Z0 is touched off and
   press the button. It touches the top, then the sides the zero is found
@@ -545,6 +545,20 @@ Once the machine is Idle, the Control page has everything needed before a job:
   X with an edge finder on its left side, touch its right side and press
   **1/2**; Probe centre finds the setup's with the probe. Each needs a probe input, the probe tip diameter
   (not for Z top), X, Y and Z referenced and the machine Idle.
+- **The project's material decides plate or stock.** A touch plate kit
+  has two leads: the clip, which always stays on the tool, and the plate's
+  lead. The probe trips when the tool touches whatever the plate's lead is
+  on, so that must conduct. On a metal (the Aluminium, Steel, Stainless steel
+  and Brass and copper groups of the material library) the plate's lead goes
+  on the stock instead of the plate, clipped or pressed onto bare metal such
+  as a sawn edge: **Probe Z** and **Probe reference** touch the stock itself
+  and add no plate, and the stock's sides can be probed. Before probing,
+  touch the tool to the stock by hand and see the probe input go active. On
+  wood, plastic, Other or with no material chosen they touch the **touch
+  plate** on it and add its thickness, and Probe corner, Probe edge, Probe
+  centre and the features at the tip are refused, saying to zero X and Y by
+  hand. Anodised or painted metal does not conduct on its face: the tool must
+  touch bare metal, such as a spot sanded clean.
 - **Fixture pins.** For a machine with fixture pins in the Machine library
   (see **Fixture pins** below), under Machine zero: **Record the pins'
   place**, once after setting machine zero and again whenever the plate is

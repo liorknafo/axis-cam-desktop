@@ -316,6 +316,9 @@ pub enum Touch {
 struct Probing {
     touch: Touch,
     probe: Probe,
+    /// The touch plate's thickness; None when the tool touches the stock
+    /// itself (`Connection::direct`).
+    plate: Option<f64>,
     /// Machine Z it probes down to.
     target: f64,
     /// The driver's program outcome and probe result counts before it
@@ -1282,8 +1285,8 @@ pub enum Action {
     CalDistance(String),
     CalMeasured(String),
     CalMove,
-    /// Probe Z down onto the touch plate on the stock top: work Z there is
-    /// the plate's thickness.
+    /// Probe Z down onto the stock top: work Z there is the stock top's,
+    /// plus the touch plate's thickness on stock that does not conduct.
     ProbeZ,
     /// Probe corner, Probe edge or Probe centre: the X, Y and Z work zero
     /// of the setup picked in the Run panel, from its stock.
@@ -1398,6 +1401,9 @@ pub struct Connection {
     pub calibration: Calibration,
     /// The machine's probe settings, or what is wrong with them.
     pub probe: Result<Probe, Vec<String>>,
+    /// The project's material as the probes see it: its name and whether
+    /// it conducts (`Material::conducts`). None without a material.
+    pub material: Option<(String, bool)>,
     probing: Option<Probing>,
     edges: Option<Edges>,
     /// The stock-top spot picked to probe the setup's work zero from
@@ -1502,6 +1508,7 @@ impl Connection {
                 start: None,
             },
             probe: probe_settings(&m.p),
+            material: None,
             probing: None,
             edges: None,
             probe_spot: None,
@@ -2088,10 +2095,35 @@ impl Connection {
         self.probe_blocked().or_else(|| self.stock_top().err())
     }
 
-    /// Why a touch-plate probe cannot start now; None when it can.
+    /// Whether a probe straight down touches the stock itself, the plate's
+    /// lead on it and the clip on the tool: the project's material conducts.
+    /// Otherwise the tool touches a touch plate lying on it.
+    pub fn direct(&self) -> bool {
+        self.material
+            .as_ref()
+            .is_some_and(|(_, conducts)| *conducts)
+    }
+
+    /// Why the probe cannot touch the stock's sides, with the plate's lead
+    /// on the stock: the project's material does not conduct, or there is none.
+    /// X and Y are zeroed by hand then.
+    pub fn sides_blocked(&self) -> Option<String> {
+        match &self.material {
+            Some((_, true)) => None,
+            Some((name, false)) => Some(format!(
+                "{name} does not conduct, so the probe cannot touch the stock: probe Z on the touch plate and zero X and Y by hand."
+            )),
+            None => Some(
+                "The project has no material: choose a metal one to probe the stock, or probe Z on the touch plate and zero X and Y by hand."
+                    .into(),
+            ),
+        }
+    }
+
+    /// Why a probe straight down cannot start now; None when it can.
     pub fn probe_blocked(&self) -> Option<String> {
         self.probe_ready(&[2]).or_else(|| match &self.probe {
-            Ok(Probe { plate: None, .. }) => Some(
+            Ok(Probe { plate: None, .. }) if !self.direct() => Some(
                 "Touch plate thickness is not set: measure the plate and set it in the Machine library."
                     .into(),
             ),
@@ -2146,6 +2178,7 @@ impl Connection {
         self.probing = Some(Probing {
             touch,
             probe,
+            plate: probe.plate.filter(|_| !self.direct()),
             target: target[2],
             seq: self.seq(),
         });
@@ -2170,14 +2203,19 @@ impl Connection {
             self.probed = Some((
                 false,
                 format!(
-                    "No contact down to machine Z {:.3}. Check the plate and the probe's clip, jog closer and probe again.",
-                    p.target
+                    "No contact down to machine Z {:.3}. Check {}, jog closer and probe again.",
+                    p.target,
+                    if p.plate.is_some() {
+                        "the plate and the probe's clip"
+                    } else {
+                        "the plate's lead on bare metal of the stock and the clip on the tool"
+                    }
                 ),
             ));
             return;
         };
         let s = &self.snapshot;
-        let (now, plate) = (s.machine_pos[2], p.probe.plate.unwrap_or_default());
+        let (now, plate) = (s.machine_pos[2], p.plate.unwrap_or_default());
         let message = match p.touch {
             Touch::Reference => {
                 // The surface under the plate, at today's work offset.
@@ -2185,7 +2223,14 @@ impl Connection {
                 if let Some(run) = &mut self.run {
                     run.reference = Some(surface);
                 }
-                format!("Reference surface recorded: Z {surface:.3} under the {plate} mm plate.")
+                match p.plate {
+                    Some(plate) => format!(
+                        "Reference surface recorded: Z {surface:.3} under the {plate} mm plate."
+                    ),
+                    None => {
+                        format!("Reference surface recorded: Z {surface:.3}, touched directly.")
+                    }
+                }
             }
             Touch::WorkZ(at) | Touch::FromReference(at) => {
                 self.send(Command::SetWork {
@@ -2195,10 +2240,13 @@ impl Connection {
                 if let Some(run) = &mut self.run {
                     run.touched = true;
                 }
-                format!(
-                    "Work Z set: the plate's top is Z {:.3}, the surface under it Z {at:.3}.",
-                    at + plate
-                )
+                match p.plate {
+                    Some(_) => format!(
+                        "Work Z set: the plate's top is Z {:.3}, the surface under it Z {at:.3}.",
+                        at + plate
+                    ),
+                    None => format!("Work Z set: the surface touched is Z {at:.3}."),
+                }
             }
         };
         let top = self.config.axes.get(2).and_then(|z| z.soft_max);
@@ -2285,6 +2333,7 @@ impl Connection {
     /// Why probing feature `f` cannot start now; None when it can.
     pub fn feature_blocked(&self, f: Feature) -> Option<String> {
         self.probe_ready(f.moves())
+            .or_else(|| self.sides_blocked())
             .or_else(|| match (&self.probe, f) {
                 (
                     Ok(Probe { tip: None, .. }),
@@ -2617,7 +2666,10 @@ impl Connection {
             Ok(x) => x,
             Err(why) => return Some(why),
         };
-        if let Some(why) = self.probe_ready(&[0, 1, 2]) {
+        if let Some(why) = self
+            .probe_ready(&[0, 1, 2])
+            .or_else(|| self.sides_blocked())
+        {
             return Some(why);
         }
         if let Ok(Probe { tip: None, .. }) = self.probe {

@@ -2664,7 +2664,7 @@ flood = { pin = 8 }
         use crate::ui::work_zero_steps;
         use uc100::controller::State;
         let dir = tempfile::tempdir().unwrap();
-        // No probe input, like the JY5800 profile.
+        // No probe input.
         let mut a = run_app(dir.path());
         idle(&mut a);
         check_run(&mut a, 0);
@@ -3260,6 +3260,24 @@ flood = { pin = 8 }
         }
     }
 
+    /// The project's material is the first starter of `group`: on a metal
+    /// the plate's lead goes on the stock, which the probes then touch.
+    fn material(a: &mut App, group: &str) {
+        let m = crate::material::starters()
+            .into_iter()
+            .find(|m| get(&m.p, "group") == group)
+            .expect("a starter of the group");
+        let id = match a.doc.materials.iter().find(|x| x.name() == m.name()) {
+            Some(x) => x.id.clone(),
+            None => {
+                let id = m.id.clone();
+                a.doc.materials.push(m);
+                id
+            }
+        };
+        assert!(a.doc.select_material(&id));
+    }
+
     /// Ticks until the probe or probing routine has ended; how it ended.
     fn probed(a: &mut App) -> (bool, String) {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -3336,6 +3354,80 @@ flood = { pin = 8 }
         );
         assert!((s.work_pos[2] - 15.).abs() < 0.06, "{:?}", s.work_pos);
         assert!(!a.locked());
+    }
+
+    /// On a metal the plate's lead goes on the stock and the tool touches
+    /// it: Probe Z needs no plate and adds none. On wood it waits for one.
+    #[test]
+    fn probe_z_on_metal_touches_the_stock_without_the_plate() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        let m = a.doc.machines.last_mut().unwrap();
+        m.p.insert("probe_feed".into(), "1000".into());
+        a.page = Page::Control;
+        material(&mut a, "Wood and composite");
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::MachineZero(None)));
+        tick_until(&mut a, 3.0, "machine zero", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        assert!(
+            blocked(&a).starts_with("Touch plate thickness is not set"),
+            "{}",
+            blocked(&a)
+        );
+        material(&mut a, "Aluminium");
+        let _ = a.update(Message::Tick);
+        assert_eq!(blocked(&a), "");
+        let _ = a.view();
+        // From Z -30: contact at the block's top, Z -40, which becomes the
+        // stock top's Z 0 with no plate; then the tool lifts 5 mm.
+        mdi(&mut a, "G0 X195 Y140 Z-30");
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            ok && message.ends_with("Work Z set: the surface touched is Z 0.000."),
+            "{message}"
+        );
+        tick_until(&mut a, 3.0, "the retract", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[2] - -35.).abs() < 0.06
+        });
+        let s = &conn(&a).snapshot;
+        assert!(
+            (s.work_offset[2] - -40.).abs() < 0.06,
+            "{:?}",
+            s.work_offset
+        );
+        assert!((s.work_pos[2] - 5.).abs() < 0.06, "{:?}", s.work_pos);
+    }
+
+    /// Pictures of the Control page's probes on wood and on aluminium, for
+    /// a look: `cargo test render_the_probes_by_material -- --ignored`,
+    /// written to `AXIS_RENDER_DIR` (default /tmp/probe-renders).
+    #[test]
+    #[ignore]
+    fn render_the_probes_by_material() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/probe-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top front-left"));
+        plate(&mut a, "100");
+        let id = a.doc.machines[0].id.clone();
+        if let Some(c) = a.control.as_mut().filter(|c| c.machine_id == id) {
+            c.probe = crate::control::probe_settings(&a.doc.machines[0].p);
+        }
+        for (group, file) in [
+            ("Wood and composite", "1-wood.png"),
+            ("Aluminium", "2-aluminium.png"),
+        ] {
+            material(&mut a, group);
+            let _ = a.update(Message::Tick);
+            render_png(&a, iced::Size::new(1600., 2400.), &out.join(file));
+        }
     }
 
     #[test]
@@ -3455,6 +3547,7 @@ flood = { pin = 8 }
         for s in &mut a.doc.setups {
             s.machine = m.clone();
         }
+        material(&mut a, "Aluminium");
         if let Some(o) = origin {
             a.doc.setups[0].p.insert("origin".into(), o.into());
         }
@@ -3735,6 +3828,7 @@ flood = { pin = 8 }
         a.doc.setups[0]
             .p
             .insert("origin".into(), "Stock top front-left".into());
+        material(&mut a, "Aluminium");
         // A second setup on the same machine: a copy of the first.
         let _ = a.update(Message::DuplicateSetup);
         assert_eq!(a.doc.setups.len(), 2);
@@ -3841,6 +3935,7 @@ flood = { pin = 8 }
         a.doc.setups[0]
             .p
             .insert("origin".into(), "Stock bottom back".into());
+        material(&mut a, "Aluminium");
         zeroed(&mut a);
         check_run(&mut a, 0);
         let (lo, hi) = conn(&a).block.unwrap();
@@ -3922,6 +4017,23 @@ flood = { pin = 8 }
         check_run(&mut a, 0);
         let refs = conn(&a).edges_setup().map(|(refs, _)| refs);
         assert_eq!(refs, Ok([crate::post::At::Min; 2]));
+        // Without a material, and on wood, the plate's lead has no stock to
+        // go on: X and Y are zeroed by hand, and every feature says so too.
+        let why = edges_blocked(&a);
+        assert!(why.starts_with("The project has no material"), "{why}");
+        material(&mut a, "Wood and composite");
+        let _ = a.update(Message::Tick);
+        let why = edges_blocked(&a);
+        assert!(
+            why.ends_with("does not conduct, so the probe cannot touch the stock: probe Z on the touch plate and zero X and Y by hand."),
+            "{why}"
+        );
+        for f in [crate::control::Feature::Top, crate::control::Feature::Bore] {
+            assert_eq!(conn(&a).feature_blocked(f).as_deref(), Some(why.as_str()));
+        }
+        let _ = a.view();
+        material(&mut a, "Aluminium");
+        let _ = a.update(Message::Tick);
         let why = edges_blocked(&a);
         assert!(why.contains("Probe tip diameter is not set"), "{why}");
         let _ = a.view();

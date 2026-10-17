@@ -1500,7 +1500,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "",
         ),
         ProbeZ => (
-            "With the touch plate on the stock top under the tool and the probe clipped on, feed Z down until the tool touches the plate, up to the maximum probe distance. Work Z at the contact becomes the stock top's Z plus the plate's thickness, then the tool lifts. Without contact nothing is set.",
+            "With the touch plate on the stock top under the tool and the clip on the tool, feed Z down until the tool touches the plate, at most the maximum probe distance. Work Z there becomes the stock top's Z plus the plate's thickness; the tool lifts. On a metal project the plate's lead goes on the stock: no thickness. Without contact nothing is set.",
             "The stock top's Z is the program's for the setup picked in the Run panel (Z 0, or the stock's height for a work zero on the bottom), and Z 0 without one.",
         ),
         ProbeEdges => (
@@ -2081,7 +2081,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "probe_plate") => (
-            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Leave it empty without a plate.",
+            "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Used when the project's material is not a metal; on a metal the plate's lead goes on the stock and the tool touches it. Leave it empty without a plate.",
             "",
             None,
         ),
@@ -2101,7 +2101,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "probe_tip") => (
-            "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the probe clipped onto conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
+            "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the plate's lead on conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
             "",
             None,
         ),
