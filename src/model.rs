@@ -1079,6 +1079,9 @@ pub struct Document {
     pub tools: Vec<Tool>,
     pub setups: Vec<Setup>,
     pub active: String,
+    /// The step each manual setup's guide is at, by setup id (`guide::place`).
+    #[serde(default)]
+    pub guide: BTreeMap<String, usize>,
 }
 impl Default for Document {
     fn default() -> Self {
@@ -1096,6 +1099,7 @@ impl Default for Document {
             tools: vec![],
             setups: vec![],
             active: String::new(),
+            guide: BTreeMap::new(),
         }
     }
 }

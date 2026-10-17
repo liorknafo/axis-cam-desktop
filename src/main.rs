@@ -6,6 +6,7 @@ mod control;
 #[cfg(test)]
 mod fake_openai;
 mod forces;
+mod guide;
 mod help;
 mod holding;
 mod look;

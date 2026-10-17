@@ -481,6 +481,22 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
 /// How near a box side must be to a stock face to be open, and how far the
 /// cut may touch the part, mm.
 const ON: f32 = 0.001;
+/// A Box's block in the stock frame: its keys (`BOX_FIELDS`, work frame)
+/// moved by the work zero `zero`, as (low corner, high corner).
+pub(crate) fn box_block(op: &Operation, zero: [f32; 3]) -> Result<([f32; 3], [f32; 3]), String> {
+    let [x0, x1, y0, y1, z1, z0] = crate::model::BOX_FIELDS.map(|k| number(op, k));
+    Ok((
+        [x0? + zero[0], y0? + zero[1], z0? + zero[2]],
+        [x1? + zero[0], y1? + zero[1], z1? + zero[2]],
+    ))
+}
+/// Which sides of the block `low`..`high` are open on the stock `s`, as
+/// [low side, high side] per axis: a side on or beyond the stock's face.
+/// The others, and a floor (`[2][0]`) above the stock's bottom, are closed
+/// and keep the allowance; the top keeps none whatever it is.
+pub(crate) fn open_sides(low: [f32; 3], high: [f32; 3], s: &Bounds) -> [[bool; 2]; 3] {
+    std::array::from_fn(|k| [low[k] <= s.min[k] + ON, high[k] >= s.max[k] - ON])
+}
 /// Whether triangle `t` meets box `b`: no separating axis among the box's
 /// faces, the triangle's plane and the nine edge crossings.
 fn meets(t: &[[f32; 3]; 3], b: &Bounds) -> bool {
@@ -526,20 +542,18 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     }
     let (s, r) = (b.plan.stock, b.plan.radius);
     let zero = crate::post::datum(setup, s, mesh)?;
-    let [x0, x1, y0, y1, z1, z0] = crate::model::BOX_FIELDS.map(|k| number(op, k));
-    let low = [x0? + zero[0], y0? + zero[1], z0? + zero[2]];
-    let high = [x1? + zero[0], y1? + zero[1], z1? + zero[2]];
+    let (low, high) = box_block(op, zero)?;
     let allowance = number(op, "allowance")?;
     let stepover = number(op, "stepover")?;
     if (0..3).any(|k| low[k] >= high[k]) || allowance < 0. || !(10. ..=100.).contains(&stepover) {
         return Err("Give the box a positive size, a stock to leave of 0 or more and a stepover of 10–100 %.".into());
     }
     // 1. Open sides, and the cut inside the stock and the allowance.
-    let open = |k: usize| [low[k] <= s.min[k] + ON, high[k] >= s.max[k] - ON];
+    let open = open_sides(low, high, &s);
     let keep = |open: bool| if open { 0. } else { allowance };
-    let lo: [f32; 3] = std::array::from_fn(|k| low[k].max(s.min[k]) + keep(open(k)[0]));
+    let lo: [f32; 3] = std::array::from_fn(|k| low[k].max(s.min[k]) + keep(open[k][0]));
     let hi: [f32; 3] =
-        std::array::from_fn(|k| high[k].min(s.max[k]) - if k == 2 { 0. } else { keep(open(k)[1]) });
+        std::array::from_fn(|k| high[k].min(s.max[k]) - if k == 2 { 0. } else { keep(open[k][1]) });
     if lo[2] >= hi[2] - ON || (0..2).any(|k| lo[k] >= hi[k]) {
         return Err(
             "The box leaves nothing to cut inside the stock and the stock to leave.".into(),
@@ -575,7 +589,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             .collect()
     };
     // 4. Rows from the open side (else −) toward the closed side (else +).
-    let side = open(c);
+    let side = open[c];
     let (first, last) = match side {
         [false, true] => ((hi[c] - width + r).max(hi[c]), lo[c] + r),
         [false, false] => (lo[c] + r, hi[c] - r),
@@ -596,7 +610,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     };
     // The uncut material (toward) on the right of the feed: right of +X is −Y, right of +Y is +X.
     let forward = if p == 0 { -toward } else { toward };
-    let ends = open(p);
+    let ends = open[p];
     let near = [
         if ends[0] {
             s.min[p] - r - 2.
@@ -622,7 +636,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         min: [0., 0., lo[2] + ON],
         max: [0., 0., s.max[2]],
     };
-    for (k, a, z) in [(p, start, end), (c, first, last)] {
+    for (k, a, z) in [(p, start, end), (c, rows[0], rows[rows.len() - 1])] {
         cut.min[k] = (a.min(z) - r).max(s.min[k]) + ON;
         cut.max[k] = (a.max(z) + r).min(s.max[k]) - ON;
     }
@@ -2540,6 +2554,19 @@ pub(crate) mod tests {
             .and_then(|x| x.parse().ok())
             .unwrap_or_else(|| panic!("{error}"));
         assert!((part.max[0] - 0.5..=part.max[0]).contains(&x), "{error}");
+    }
+    #[test]
+    fn a_one_row_square_checks_only_its_row_against_the_part() {
+        // The +X side of a 24 mm wide block round the 20 mm part squared 1
+        // mm, down through the stock's bottom: one row, 1 mm off the part.
+        let (mut setup, mut op, tool) = big_mill([11., 100., -100., 100., 0., -100.]);
+        setup.p.insert("stock_x".into(), "24".into());
+        op.p.insert("allowance".into(), "0".into());
+        let plan = generate(&setup, &op, &tool, &block()).unwrap();
+        assert_single_axis(&plan);
+        assert_eq!(cuts(&plan).len(), plan.levels);
+        assert!(cuts(&plan).iter().all(|m| m.to[0] == 23.5));
+        assert_eq!(plan.target, 0.);
     }
     #[test]
     fn a_single_row_box_takes_its_feeds_rapids_and_pause() {
