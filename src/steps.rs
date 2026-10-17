@@ -106,6 +106,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
                 stock: holding.stock.translated(zero),
                 band: holding.band.translated(zero),
                 bottom: holding.bottom + zero[2],
+                girth: holding.girth,
             };
             (doc.holding_boxes(setup, held))
                 .map(|b| crate::holding::shown(&b, held.stock))

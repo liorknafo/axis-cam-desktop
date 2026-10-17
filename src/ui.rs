@@ -3808,6 +3808,19 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
     match holding {
         "Chuck" => {
             c.push(holder_picker(app, "Chuck"));
+            // Changing the chuck is slow: say so wherever the 4-jaw is on.
+            if app
+                .doc
+                .holder(get(p, "holder"))
+                .is_some_and(|h| h.kind() == "Chuck" && get(&h.p, "jaws") == "4")
+            {
+                c.push(
+                    text(crate::holding::CHANGE_CHUCK)
+                        .size(12)
+                        .color(WARN)
+                        .into(),
+                );
+            }
             c.push(
                 row![
                     container(field(p, "grip", "Grip · mm", t)).width(Length::FillPortion(1)),
@@ -3888,15 +3901,22 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         }
     }
     if holding != "None" {
-        // A chuck has no clearance gap yet and no layout to suggest.
+        // A chuck has no clearance gap to set; Suggest picks its library entry.
         if holding != "Chuck" {
             c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
-            c.push(
-                secondary("Suggest layout", Message::SuggestLayout)
-                    .width(Fill)
-                    .into(),
-            );
         }
+        c.push(
+            secondary(
+                if holding == "Chuck" {
+                    "Suggest chuck"
+                } else {
+                    "Suggest layout"
+                },
+                Message::SuggestLayout,
+            )
+            .width(Fill)
+            .into(),
+        );
         let lines = holding_lines(app);
         if !lines.is_empty() {
             let heading = format!(
@@ -3905,6 +3925,9 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                 if lines.len() == 1 { "" } else { "s" }
             );
             c.push(caution(heading, lines));
+        }
+        for note in holding_warnings(app) {
+            c.push(text(note).size(12).color(WARN).into());
         }
         let margins = holding_margins(app);
         if !margins.is_empty() {
@@ -4355,12 +4378,18 @@ fn holding_note(
     name: &str,
     setup: &Setup,
 ) -> crate::HoldingNote {
+    // A lathe setup has no export to refuse anything.
+    let on_lathe = lathe::is_lathe(&setup.machine);
     let boxes = match app.doc.holding_boxes(setup, held_of(app, plan.stock)) {
         Ok(boxes) => boxes,
         Err(error) => {
             return Some((
-                "Workholding cannot be checked; export will refuse this setup until it is fixed"
-                    .into(),
+                if on_lathe {
+                    "Workholding cannot be checked until it is fixed"
+                } else {
+                    "Workholding cannot be checked; export will refuse this setup until it is fixed"
+                }
+                .into(),
                 vec![error],
             ));
         }
@@ -4371,10 +4400,23 @@ fn holding_note(
     let datum = app
         .part_mesh()
         .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok());
-    let lines: Vec<String> = crate::holding::hits(plan, &boxes, reach)
-        .iter()
-        .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
-        .collect();
+    // A chuck is told what this operation's moves do to it: a cut in the
+    // grip, a move into the body, a stickout short of the cut.
+    let chuck = crate::holding::layout(setup)
+        .ok()
+        .filter(|l| on_lathe && matches!(l, crate::holding::Layout::Chuck { .. }));
+    let lines: Vec<String> = match chuck {
+        Some(layout) => {
+            crate::holding::chuck_problems(&layout, plan.stock, reach, &boxes, &[(0, name, plan)])
+                .into_iter()
+                .map(|(_, line)| line)
+                .collect()
+        }
+        None => crate::holding::hits(plan, &boxes, reach)
+            .iter()
+            .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
+            .collect(),
+    };
     (!lines.is_empty()).then(|| {
         let frame = if datum.is_none() {
             "; coordinates in the setup frame"
@@ -4382,7 +4424,11 @@ fn holding_note(
             ""
         };
         (
-            format!("Too close to the workholding (export will refuse this{frame})"),
+            if on_lathe {
+                "This cut conflicts with the chuck".to_string()
+            } else {
+                format!("Too close to the workholding (export will refuse this{frame})")
+            },
             lines,
         )
     })
@@ -4414,6 +4460,12 @@ pub(crate) fn holding_lines_in(
         .filter(|c| Some(c.held) == held)
         .map(|c| c.problems.clone())
         .unwrap_or_default()
+}
+/// What the active setup's chuck warns of without refusing anything
+/// (`Document::holding_warnings`), for the stock the editor knows.
+pub(crate) fn holding_warnings(app: &App) -> Vec<String> {
+    let si = app.doc.index();
+    app.doc.holding_warnings(si, app.known_held(si))
 }
 /// Each operation's margin against the cutting forces (`forces::line`), as
 /// the setup editor lists it under the workholding's issues: from the
@@ -7670,6 +7722,14 @@ pub(crate) fn modelled(app: &App) -> bool {
         .setups
         .get(app.doc.index())
         .is_some_and(crate::holding::modelled)
+        && holding_lines(app).is_empty()
+}
+/// Whether the active setup's chuck is checked: it holds the bar in one and
+/// there is nothing wrong with how (`holding_lines`).
+pub(crate) fn chuck_modelled(app: &App) -> bool {
+    app.doc
+        .active_setup()
+        .is_some_and(|s| get(&s.p, "holding") == "Chuck")
         && holding_lines(app).is_empty()
 }
 pub(crate) fn fixtures(note: Note, modelled: bool) -> &'static str {

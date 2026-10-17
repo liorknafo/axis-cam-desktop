@@ -429,6 +429,12 @@ pub struct ClampsDraft {
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
+/// What the status of a generated preview ends with on a CNC machine, and on
+/// a hand machine (the manual mill, the lathe), which has no G-code.
+pub(crate) const CNC_NEXT: &str = "Export G-code from the NC review page.";
+pub(crate) const HAND_NEXT: &str = "Follow the steps on the MACHINE page.";
+/// What a lathe preview's status says is checked of a modelled chuck.
+pub(crate) const CHUCK_CHECKED: &str = "this cut is checked against the chuck as a box with a clearance gap (a warning shows if it comes too close); the tailstock, the tool post and the machine body are not.";
 /// The stock each setup of a job starts from once the earlier setups have cut
 /// it, worked out in the background (`App::refresh_left_stock`) for the job
 /// whose fingerprint is `key` (`App::left_key`): one entry per setup, None for
@@ -1489,6 +1495,9 @@ impl App {
     fn suggest_layout(&mut self) -> bool {
         let si = self.doc.index();
         let setup = self.doc.setup();
+        if get(&setup.p, "holding") == "Chuck" {
+            return self.suggest_chuck(si);
+        }
         let request = match holding::request(setup, self.doc.holder(get(&setup.p, "holder"))) {
             Ok(request) => request,
             Err(error) => {
@@ -1551,6 +1560,32 @@ impl App {
             self.touch();
         }
         self.status = message;
+        changed
+    }
+    /// Chooses the chuck of lathe setup `si` from the library
+    /// (`holding::suggest_chuck`): the 3-jaw when the bar in its jaws is
+    /// round and within its range, else the 4-jaw, which the status says to
+    /// change the chuck for. The grip and the stickout are the user's. Never a
+    /// vise. Whether the setup changed (and was marked so).
+    fn suggest_chuck(&mut self, si: usize) -> bool {
+        let setup = &self.doc.setups[si];
+        let Some(held) = self.known_held(si) else {
+            self.status = "No chuck suggested: this setup's stock is not known yet. Check the stock settings.".into();
+            return false;
+        };
+        let (id, status) = match holding::chuck_for(&self.doc, setup, held) {
+            Ok(found) => found,
+            Err(error) => {
+                self.status = error;
+                return false;
+            }
+        };
+        let changed = get(&setup.p, "holder") != id;
+        self.doc.setups[si].p.insert("holder".into(), id);
+        if changed {
+            self.touch();
+        }
+        self.status = status;
         changed
     }
     /// Keeps pin 1's machine X Y just recorded on the Control page in the
@@ -3368,13 +3403,25 @@ impl App {
                     match result {
                         Ok(sim) => {
                             let plan = &sim.plan;
+                            // A hand machine has no program to export, and a lathe
+                            // setup's cut is checked against its chuck.
+                            let next = if manual::is_hand(&self.doc.setup().machine) {
+                                HAND_NEXT
+                            } else {
+                                CNC_NEXT
+                            };
+                            let fixtures = if ui::chuck_modelled(self) {
+                                CHUCK_CHECKED
+                            } else {
+                                ui::fixtures(ui::Note::Preview, ui::modelled(self))
+                            };
                             self.status = format!(
-                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} Export G-code from the NC review page.",
+                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} {next}",
                                 plan.strategy.name(),
                                 plan.levels,
                                 plan.duration / 60.,
                                 sim.preceding,
-                                ui::fixtures(ui::Note::Preview, ui::modelled(self))
+                                fixtures
                             );
                             self.simulation = Some(sim);
                             self.progress = 0.;

@@ -418,6 +418,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 stock: work(held.stock),
                 band: work(held.band),
                 bottom: held.bottom - zero[2],
+                girth: held.girth,
             },
             vise,
         },

@@ -2005,6 +2005,12 @@ impl Document {
             (Ok(layout), Some(entry)) if !kind.is_empty() => {
                 if let Some(refused) = refusal(&layout, entry) {
                     issues.push(refused);
+                } else if kind == "Chuck" {
+                    // Only a chuck on a lathe is checked; the machine's own
+                    // refusal said the rest.
+                    if let Some(held) = held().filter(|_| crate::lathe::is_lathe(&s.machine)) {
+                        issues.extend(self.chuck_issues(s, &layout, entry, held));
+                    }
                 } else if square
                     && kind != "Chuck"
                     && let Some(held) = held()
@@ -2021,6 +2027,60 @@ impl Document {
             issues.push(NOT_SQUARE.into());
         }
         issues
+    }
+    /// What the material in `s`'s chuck is (`held.girth`, else what the
+    /// setup's own stock says: the bar, or the box it starts from).
+    fn chuck_girth(
+        &self,
+        s: &Setup,
+        layout: &crate::holding::Layout,
+        held: crate::holding::Gripped,
+    ) -> Option<crate::holding::Girth> {
+        held.girth.or_else(|| {
+            let first = self.setups.first().is_some_and(|x| x.id == s.id);
+            crate::holding::girth(s, first, layout, held.stock, None)
+        })
+    }
+    /// The refusals of a chuck holding the stock `held` of lathe setup `s`
+    /// (`holding::chuck_issues`): the numbers alone, without toolpaths.
+    fn chuck_issues(
+        &self,
+        s: &Setup,
+        layout: &crate::holding::Layout,
+        holder: &crate::holding::Holder,
+        held: crate::holding::Gripped,
+    ) -> Vec<String> {
+        let Some(girth) = self.chuck_girth(s, layout, held) else {
+            return vec![];
+        };
+        let swing = num(&s.machine.p, "swing").filter(|v| *v > 0.);
+        crate::holding::chuck_issues(layout, holder, girth, held.stock.dimensions()[2], swing)
+    }
+    /// What is not wrong with setup `setup`'s chuck but worth a look
+    /// (`holding::chuck_warnings`: "Long and thin"), for the stock `held` the
+    /// caller tells, as `holding_issues_with` takes it. A warning never
+    /// refuses: nothing waits on it. None without a chuck on a lathe that
+    /// reads, or without a stock.
+    pub fn holding_warnings(
+        &self,
+        setup: usize,
+        held: Option<crate::holding::Gripped>,
+    ) -> Vec<String> {
+        let Some(s) = self.setups.get(setup) else {
+            return vec![];
+        };
+        let (Ok(layout), Some(held)) = (crate::holding::layout(s), held) else {
+            return vec![];
+        };
+        if !matches!(layout, crate::holding::Layout::Chuck { .. })
+            || !crate::lathe::is_lathe(&s.machine)
+        {
+            return vec![];
+        }
+        match self.chuck_girth(s, &layout, held) {
+            Some(girth) => crate::holding::chuck_warnings(&layout, girth),
+            None => vec![],
+        }
     }
     /// The jaws or clamps of `setup` round `held`, the stock it starts from
     /// and the band its vise closes on (in the setup's frame, mm), without
@@ -2470,6 +2530,13 @@ impl Document {
                 self.holding_issues(i, mesh)
                     .first()
                     .map(|issue| format!("Workholding problem: {issue}\n\n")),
+                self.holding_warnings(
+                    i,
+                    self.setup_stock(i, mesh)
+                        .map(crate::holding::Gripped::whole),
+                )
+                .first()
+                .map(|note| format!("Workholding note: {note}\n\n")),
             ]
             .into_iter()
             .flatten()
@@ -3518,12 +3585,25 @@ mod tests {
             Some("160 mm 3-jaw chuck, grip 30 mm, stickout 60 mm.")
         );
         assert_eq!(doc.holding_label(doc.setup()), "160 mm 3-jaw chuck");
-        // No box is modelled for a chuck yet.
+        // The chuck's body is the one box, behind the jaws' end: a 160 mm
+        // body, 40 mm deep, 60 mm below the free end of a Ø20 × 100 bar.
         let stock = crate::mesh::Bounds {
             min: [-10., -10., 0.],
-            max: [10., 10., 50.],
+            max: [10., 10., 100.],
         };
-        assert_eq!(doc.holding_boxes(doc.setup(), stock), Ok(vec![]));
+        doc.setup_mut()
+            .p
+            .insert("stock_type".into(), "Round bar".into());
+        let boxes = doc.holding_boxes(doc.setup(), stock).unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].label, "chuck body");
+        assert_eq!(
+            boxes[0].bounds,
+            crate::mesh::Bounds {
+                min: [-80., -80., 0.],
+                max: [80., 80., 40.],
+            }
+        );
         // A vise or clamps on a lathe.
         for (holding, kind) in [("Vise", "Vise"), ("Clamps", "Clamp")] {
             let id = starter(&doc, kind);
@@ -3548,6 +3628,100 @@ mod tests {
             issues.iter().any(|i| i.contains("is a vise, not a chuck")),
             "{issues:?}"
         );
+    }
+    /// The lathe document with a chuck setup of `holding` keys on a
+    /// stock_type, and a Ø50.2 × `length` bar's box.
+    fn chucked_doc(stock_type: &str, grip: &str, stickout: &str) -> Document {
+        let mut doc = lathe_doc();
+        let chuck = starter(&doc, "Chuck");
+        let p = &mut doc.setup_mut().p;
+        for (k, v) in [
+            ("holding", "Chuck"),
+            ("holder", chuck.as_str()),
+            ("stock_type", stock_type),
+            ("grip", grip),
+            ("stickout", stickout),
+        ] {
+            p.insert(k.into(), v.into());
+        }
+        doc
+    }
+    fn bar_box(diameter: f32, length: f32) -> crate::holding::Gripped {
+        crate::mesh::Bounds {
+            min: [-diameter / 2., -diameter / 2., 0.],
+            max: [diameter / 2., diameter / 2., length],
+        }
+        .into()
+    }
+    #[test]
+    fn a_chuck_setup_is_checked_against_the_bar_it_holds_as_the_editor_and_the_export_see_it() {
+        use crate::holding::{LONG_THIN, THREE_JAW_ROUND};
+        let doc = chucked_doc("Round bar", "30", "70");
+        let issues = |doc: &Document, held| doc.holding_issues_with(0, Some(held));
+        // A Ø50 round bar in the 3-jaw: nothing wrong, nothing to warn of.
+        assert!(issues(&doc, bar_box(50., 100.)).is_empty());
+        assert!(doc.holding_warnings(0, Some(bar_box(50., 100.))).is_empty());
+        // The stock is not known: nothing is said.
+        assert!(doc.holding_issues_with(0, None).is_empty());
+        // A square bar is refused by the 3-jaw, in the editor and by `holding_boxes`.
+        let square = chucked_doc("Fixed size box", "30", "70");
+        assert_eq!(issues(&square, bar_box(50., 100.)), [THREE_JAW_ROUND]);
+        assert_eq!(
+            square.holding_boxes(square.setup(), bar_box(50., 100.)),
+            Err(THREE_JAW_ROUND.to_string())
+        );
+        // The 4-jaw holds it, across its corners (Ø70.7).
+        let mut four = square.clone();
+        let id = four
+            .workholding
+            .iter()
+            .find(|h| h.kind() == "Chuck" && get(&h.p, "jaws") == "4")
+            .unwrap()
+            .id
+            .clone();
+        four.setup_mut().p.insert("holder".into(), id);
+        assert!(issues(&four, bar_box(50., 100.)).is_empty());
+        assert!(four.holding_boxes(four.setup(), bar_box(50., 100.)).is_ok());
+        // Each of the numbers: the grip, the stickout and the length.
+        let short = chucked_doc("Round bar", "10", "70");
+        assert_eq!(
+            issues(&short, bar_box(50., 100.)),
+            ["The grip is 10 mm; the jaws need at least a third of the Ø50 mm bar, 16.67 mm."]
+        );
+        let long = chucked_doc("Round bar", "30", "80");
+        assert_eq!(
+            issues(&long, bar_box(50., 100.)),
+            ["The grip, 30 mm, and the stickout, 80 mm, come to more than the 100 mm bar."]
+        );
+        let wide = chucked_doc("Round bar", "30", "70");
+        let found = issues(&wide, bar_box(260., 100.));
+        assert!(
+            found.iter().any(|f| f.contains("lathe swings Ø250 mm")),
+            "{found:?}"
+        );
+        // A bar this thin for this stickout is a warning, and still held.
+        let thin = chucked_doc("Round bar", "30", "210");
+        assert!(issues(&thin, bar_box(50., 300.)).is_empty());
+        assert_eq!(
+            thin.holding_warnings(0, Some(bar_box(50., 300.))),
+            [LONG_THIN]
+        );
+        assert!(thin.holding_boxes(thin.setup(), bar_box(50., 300.)).is_ok());
+        assert!(
+            thin.holding_warnings(5, Some(bar_box(50., 300.)))
+                .is_empty()
+        );
+        // What the earlier setups left in the jaws tells instead of the box.
+        let turned = chucked_doc("Fixed size box", "30", "70");
+        let held = crate::holding::Gripped {
+            girth: Some(crate::holding::Girth {
+                grip: 30.,
+                round: true,
+                widest: 70.7,
+            }),
+            ..bar_box(50., 100.)
+        };
+        assert!(issues(&turned, held).is_empty());
     }
     #[test]
     fn a_chuck_is_refused_on_a_mill_and_a_chuck_entry_is_not_on_one() {

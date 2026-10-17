@@ -16381,8 +16381,16 @@ flood = { pin = 8 }
         edit_setup(&mut a, &[("holding", "Vise")]);
         shows(&a, &["Vise", "Suggest layout", "Jaw offset · mm"]);
         lacks(&a, &["Stickout · mm"]);
-        // On the lathe: the chuck picker, the grip and stickout, no clearance gap or layout to suggest.
+        // On the lathe: the chuck picker, the grip and stickout, no clearance gap, and a chuck to suggest.
         a.doc.setup_mut().machine = crate::lathe::defaults();
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Round bar"),
+                ("stock_diameter", "50"),
+                ("stock_length", "100"),
+            ],
+        );
         edit_setup(&mut a, &[("holding", "Chuck")]);
         assert_eq!(get(&a.doc.setup().p, "holder"), first_of(&a, "Chuck"));
         assert_eq!(get(&a.doc.setup().p, "grip"), "30");
@@ -16395,16 +16403,72 @@ flood = { pin = 8 }
                 "Stickout · mm",
             ],
         );
-        lacks(&a, &["Suggest layout", "Jaw offset · mm", "Jaws face"]);
-        shows(&a, &["1 workholding issue"]);
+        lacks(
+            &a,
+            &[
+                "Suggest layout",
+                "Jaw offset · mm",
+                "Jaws face",
+                "4-jaw: change the chuck",
+            ],
+        );
+        shows(&a, &["Suggest chuck", "1 workholding issue"]);
         edit_setup(&mut a, &[("stickout", "50")]);
         assert!(a.doc.holding_issues(0, None).is_empty());
         lacks(&a, &["1 workholding issue"]);
-        // The 3D view and the guide treat it as nothing to draw yet.
+        // The 3D view and the guide have no jaws to draw for it.
         assert!(crate::ui::holding_boxes(&a).is_empty());
+        // Suggest keeps the 3-jaw for a round bar and the grip and stickout the user's.
+        let three = first_of(&a, "Chuck");
         let _ = a.update(Message::SuggestLayout);
-        assert!(a.status.contains("no layout to suggest"), "{}", a.status);
+        assert_eq!(
+            a.status, "Suggested: 160 mm 3-jaw chuck, for a round Ø50 mm bar.",
+            "{}",
+            a.status
+        );
+        assert_eq!(get(&a.doc.setup().p, "holder"), three);
         assert_eq!(get(&a.doc.setup().p, "stickout"), "50");
+        // A square bar needs the 4-jaw: Suggest chooses it and the setup says to change the chuck.
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "50"),
+                ("stock_y", "50"),
+                ("stock_z", "100"),
+            ],
+        );
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            ["A 3-jaw holds round work: use the 4-jaw."]
+        );
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(
+            a.status,
+            "Suggested: 160 mm 4-jaw chuck, for a square Ø70.71 mm bar. 4-jaw: change the chuck."
+        );
+        assert_ne!(get(&a.doc.setup().p, "holder"), three);
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        shows(&a, &["4-jaw: change the chuck"]);
+        // A stickout over 4 diameters of the Ø50 bar is a warning, not an issue.
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Round bar"),
+                ("stock_diameter", "20"),
+                ("stock_length", "300"),
+            ],
+        );
+        let _ = a.update(Message::SuggestLayout);
+        edit_setup(&mut a, &[("grip", "10"), ("stickout", "250")]);
+        assert!(
+            crate::ui::holding_lines(&a).is_empty(),
+            "{:?}",
+            crate::ui::holding_lines(&a)
+        );
+        shows(&a, &["Long and thin: support it or cut it in two setups."]);
+        edit_setup(&mut a, &[("stickout", "70")]);
+        lacks(&a, &["Long and thin: support it or cut it in two setups."]);
     }
     #[test]
     fn the_holder_editor_has_a_check_box_per_machine_that_edits_machines() {
@@ -16784,6 +16848,24 @@ flood = { pin = 8 }
         );
         let sim = a.simulation.as_ref().unwrap();
         assert!(sim.plan.is_lathe() && !sim.plan.rings.is_empty());
+        // A lathe has no G-code to export: the status sends the user to the steps.
+        assert!(
+            a.status.ends_with("Follow the steps on the MACHINE page."),
+            "{}",
+            a.status
+        );
+        assert!(!a.status.contains("Export G-code"), "{}", a.status);
+        // The cut is clear of the chuck, so the preview says nothing of it.
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        // With the jaws 10 mm further out, the same cut is inside the grip.
+        let _ = a.update(Message::Edit(Target::Setup, "stickout", "20".into()));
+        let _ = a.update(Message::Generate);
+        let (heading, lines) = crate::ui::holding_warning(&a).unwrap();
+        assert_eq!(heading, "This cut conflicts with the chuck");
+        assert!(
+            lines[0].ends_with("cuts at Z-30.0, inside the grip: the jaws start at Z-20.0."),
+            "{lines:?}"
+        );
     }
     #[test]
     fn a_lathe_drill_has_a_centre_tab_and_no_hole_selection() {

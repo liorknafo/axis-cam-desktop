@@ -454,7 +454,7 @@ The page is split into sections: **Set up** (Hold, Zero), one section per cuttin
 
 ### Minutes
 
-The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Manual 18 min · CNC 42 min · moving 10 min" beside the total. The Steps page shows the setup's minutes.
+The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min" beside the total (the lathe's and the manual mill's parts only when they have minutes). The Steps page shows the setup's minutes.
 
 ### No G-code
 

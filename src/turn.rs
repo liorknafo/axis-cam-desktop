@@ -19,6 +19,7 @@ use crate::{
     lathe,
     mesh::{Bounds, Mesh},
     model::{Operation, Setup, Strategy, Tool, get, num},
+    rest::Coaxial,
     simulation::{CutterShape, Motion, Move, POINT_RISE, Plan, Ring},
     stock,
 };
@@ -72,6 +73,8 @@ pub struct Material {
     /// The stock box's farthest corner from the axis: every ring cut from
     /// the outside reaches out to it.
     rim: f32,
+    /// The radius of the largest disc about the axis inside the stock box.
+    circle: f32,
     /// The earlier lathe cuts about this axis, `[z0, z1, r0, r1]`.
     rings: Vec<[f32; 4]>,
 }
@@ -88,6 +91,13 @@ impl Material {
     /// it starts as, or the box an earlier setup left, less the lathe cuts
     /// its `preview_remaining` holds about its Z axis.
     pub fn new(setup: &Setup, stock: Bounds) -> Self {
+        let round = stock::is_round(setup) && setup.preview_stock.is_none();
+        let coaxial = setup.preview_remaining.as_ref().map(|rest| rest.coaxial());
+        Self::of(stock, round, coaxial)
+    }
+    /// The material of `stock` (a box, in the setup frame): a round bar when
+    /// `round`, less the lathe cuts `coaxial` holds.
+    pub fn of(stock: Bounds, round: bool, coaxial: Option<&Coaxial>) -> Self {
         let rim = (0..4)
             .map(|mask| {
                 let x = if mask & 1 == 0 {
@@ -104,13 +114,23 @@ impl Material {
             })
             .fold(0., f32::max);
         let mut outer = rim;
-        if stock::is_round(setup) && setup.preview_stock.is_none() {
+        // The largest disc about the axis inside the box: the material is
+        // round (a full disc) only up to there. A bar whose axis is off the
+        // spindle's reaches past it, and so does a bar a mill has flatted.
+        let inside = |lo: f32, hi: f32| {
+            if lo <= 0. && hi >= 0. {
+                (-lo).min(hi)
+            } else {
+                0.
+            }
+        };
+        let circle = inside(stock.min[0], stock.max[0]).min(inside(stock.min[1], stock.max[1]));
+        if round {
             let (centre, radius) = stock::bar(stock);
             outer = outer.min(centre[0].hypot(centre[1]) + radius);
         }
         let mut rings = vec![];
-        if let Some(rest) = &setup.preview_remaining {
-            let coaxial = rest.coaxial();
+        if let Some(coaxial) = coaxial {
             if let Some(bar) = coaxial.bar {
                 outer = outer.min(bar);
             }
@@ -121,8 +141,21 @@ impl Material {
             high: stock.max[2],
             outer,
             rim,
+            circle,
             rings,
         }
+    }
+    /// The widest the material is between `a` and `b` (setup frame Z), as a
+    /// diameter, and whether the section there is round (a full disc to that
+    /// diameter, about the axis): the bar a chuck grips. None where no
+    /// material is left.
+    pub fn girth(&self, a: f32, b: f32) -> Option<(f32, bool)> {
+        let outer = self
+            .sections(a, b)
+            .iter()
+            .map(|s| s.outer)
+            .reduce(f32::max)?;
+        Some((2. * outer, outer <= self.circle + ON))
     }
     /// The material at `z`: (inner, outer) radius, None where none is left.
     /// From the outside in, every ring that reaches the surface without a
@@ -1248,6 +1281,19 @@ pub(crate) mod tests {
             .chain([drill])
             .collect();
         (doc, mesh)
+    }
+    /// `job`'s tools numbered from T1 and the job given a part file, as the
+    /// export-side checks (the plan check, the holding walk) need them.
+    pub(crate) fn numbered(doc: &mut Document) {
+        for (n, tool) in doc.tools.iter_mut().enumerate() {
+            tool.p.insert("number".into(), (n + 1).to_string());
+        }
+        doc.file = Some(crate::model::ModelFile {
+            name: "shaft.stl".into(),
+            path: std::path::PathBuf::from("shaft.stl"),
+            format: "stl".into(),
+            bytes: 0,
+        });
     }
     /// Adds a Turn of `kind` (or a Drill on the centre, "Drill") to the
     /// lathe setup with `fields`, cutting with the job's tool for it.
