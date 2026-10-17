@@ -19,7 +19,7 @@ Date: 17 October 2026. Branch: `t3/manual-milling-planning` (from `main` f85235d
 
 ## Non-goals
 
-Power feed, a DRO connection (the app does not read the DRO), arcs or two axes moving together on the manual mill, a rotary table or dividing head, quill-only drilling depth stops, boring heads, tapping, printing to PDF (phase 1 saves PNG pages), and changing the CNC's G-code output.
+Power feed, a DRO connection (the app does not read the DRO), arcs or two axes moving together on the manual mill, a rotary table or dividing head, quill-only drilling depth stops, boring heads, tapping, printing, and changing the CNC's G-code output.
 
 ## 1. The manual machine
 
@@ -36,9 +36,9 @@ Power feed, a DRO connection (the app does not read the DRO), arcs or two axes m
 | `tool_time` | Minutes to change a tool and pick up the zero again | `3` |
 | `move_time` | Minutes to move the stock between this machine and another | `10` |
 
-The post fields, probe fields, controller and Run do not apply to a manual machine and are hidden on its page. The machine editor shows "Manual mill — no G-code; MACHINE shows the steps."
+On save, `rpm` is set to the highest gear and `feed` to `hand_feed`, so the existing rpm, feed and material checks apply to a manual machine unchanged. The post fields, probe fields, controller and Run do not apply to a manual machine and are hidden on its page. The machine editor shows "Manual mill — no G-code; MACHINE shows the steps."
 
-**Tools.** `Tool.p` gains `machines`: the ids of the machines that hold the tool, comma-separated. Empty means every CNC machine (existing tools keep working on the CNC and do not show on the manual mill). The tool editor shows a check box per machine. An operation whose tool does not fit its setup's machine is a problem at stage `tool`.
+**Tools.** `Tool.p` gains `machines`: the ids of the machines that hold the tool, comma-separated. Empty means every CNC machine (existing tools keep working on the CNC and do not show on the manual mill). The tool editor shows a check box per machine. An operation whose tool does not fit its setup's machine has an operation issue (shown in the editor; the simulation and the plan check stop on it like any other operation issue).
 
 **Workholding.** Library entries gain the same optional `machines` field, with the same rule. The manual mill's vise is usually a different, bigger vise.
 
@@ -56,7 +56,7 @@ The post fields, probe fields, controller and Run do not apply to a manual machi
 | Slot | Open on two opposite ends and the top, at least the tool's diameter wide |
 | Pocket | Open on the top only; its inside corners keep the tool's radius |
 
-Box fields (in the setup's frame, relative to the work zero): `x_min`, `x_max`, `y_min`, `y_max`, `z_top`, `z_bottom`, `allowance` (default 0.5 mm, which is shrunk off every side that touches the part, so the CNC finishes it; 0 makes the manual cut final), `stepover` (default 70 % of the diameter), `stepdown` (default from the forces model and the machine's power, at most the flute length), rpm (snapped to the nearest gear in `speeds`) and feed (at most `hand_feed`).
+Box fields (in the setup's frame, relative to the work zero): `x_min`, `x_max`, `y_min`, `y_max`, `z_top`, `z_bottom`, `allowance` (default 0.5 mm, which is shrunk off every side that touches the part, so the CNC finishes it; 0 makes the manual cut final), `stepover` (default 70 % of the diameter), `stepdown` (empty means automatic: the depth the machine's power can take at that width, rpm and feed, from a new power function next to the forces model, at most the flute length and the diameter), rpm (snapped to the nearest gear in `speeds`) and feed (at most `hand_feed`).
 
 **Pick from the part.** In the operation editor, the user clicks a flat, axis-aligned face of the part (a floor or a wall). The app fills in the box from that face, up to the stock's edge or the next part face in each direction, inside the leftover stock (`RestStock::left`).
 
@@ -66,8 +66,8 @@ The generator in `src/cam.rs` makes every move change exactly one of X, Y and Z:
 
 - Passes run along the box's longer side. Between passes the tool steps across by `stepover`. Z steps down by `stepdown` until it reaches `z_bottom`.
 - Each pass is **conventional milling**: with the spindle turning clockwise (M3), the material stays on the right of the feed direction. A pass returns to the start off the cut rather than cutting back the other way. Backlash on a hand-fed mill can pull the cutter into a climb cut.
-- Z goes down only outside the stock, or inside a pocket after a drilled starter hole (the guide adds a Drill step for it), or with a centre-cutting end mill.
-- **Drill** is reused as it is: X and Y set, then Z only.
+- Z goes down outside the stock when the pass starts at an open side. A box closed at both ends of its passes (a pocket or a closed slot) plunges straight down at a quarter of the feed, which needs a centre-cutting end mill; the Pass screen draws the plunge.
+- **Drill** is reused: on a manual machine its moves are split the same way (Z up, then X, then Y, then Z down), so the holes also need one axis at a time.
 
 Strategies other than Box and Drill are refused on a manual setup (problem at stage `structure`), and Box is refused on a CNC setup in phase 1.
 
@@ -83,7 +83,7 @@ Box and Drill paths go through the existing simulation, so the solid, the leftov
 
 ### Time
 
-The minutes for a manual operation are: cut length ÷ feed + travel off the cut ÷ `hand_rapid` + passes × `pass_time` + tool changes × `tool_time`. The plan's total adds `move_time` each time the stock moves from one machine to another. The setup sheet and the plan check show manual and CNC minutes apart and together.
+The minutes for a manual operation are: cut length ÷ feed + travel off the cut ÷ `hand_rapid` + passes × `pass_time` + tool changes × `tool_time`. The plan's total adds `move_time` each time the stock moves from one machine to another. The plan check shows manual, CNC and moving minutes apart and together, and the Steps page shows the setup's minutes. The setup sheet (which does not simulate) names the machine and says "Manual mill: steps on the MACHINE page".
 
 ## 3. The visual step guide
 
@@ -104,21 +104,22 @@ A manual setup in MACHINE shows a **Steps** page instead of Run. It works with n
 ### The Pass screen
 
 - **Numbers in the order they are moved.** Each target is one large DRO readout with a step number: 1 Z up off the stock, 2 X to the start, 3 Y to the pass, 4 Z down to the depth, 5 feed along the cut to the end. The current target is the bright one. The axes to lock during the cut show a lock.
-- **Edge or centre.** With `dro_comp` on, the readouts show the **tool edge** on the side that cuts, with an arrow for the compensation side, and the tool-centre number small underneath. When the compensation side changes from one pass to the next, the screen says so with the arrow. With `dro_comp` off, the readouts show the tool centre.
+- **Edge or centre.** With `dro_comp` on, the X and Y readouts show the **tool edge**, with the tool-centre number small underneath. The compensation side is fixed per operation and axis (toward the box's closed side on that axis, + when both or neither are closed), so one operation never asks for a change. The Tool step shows the sides to set as arrows, and a Comp step is added when the next operation needs different sides with the same tool. With `dro_comp` off, the readouts show the tool centre.
 - **Feed by hand.** The feed is shown as handwheel turns: "1 turn every 2 s" from `hand_feed` and `turn_x`/`turn_y`, with a dot that blinks once per turn.
 - **Passes.** Small boxes for every pass of the operation: done, now, next.
 - **Never below.** The lowest Z and the closest X/Y the operation reaches are shown as red lines on the views. These are the numbers the user must not pass.
-- Buttons: Back and Pass done. Pass done on the last pass goes to the Check step. The guide remembers its place per setup (saved with the project) so a restart resumes there.
+- Buttons: Back and Pass done. Pass done on the last pass goes to the Check step. The guide remembers its place per setup (saved with the project, without marking the plan changed) so a restart resumes there.
+- The guide works while the CNC runs another job, so both machines can work at once.
 
-### Pages to take to the machine
+### Pages to take to the machine (phase 2)
 
-"Save steps" writes one PNG per step (the same screen, drawn with the tiny-skia renderer used by the gallery render) into a folder chosen by the user.
+"Save steps" writes one PNG per step into a folder chosen by the user. It needs a headless renderer in the app (today only the tests have one), so it comes after the screen itself.
 
 ## 4. Choosing what goes to the big mill
 
 ### Marked by the user (phase 1)
 
-The user adds a setup, picks the manual machine for it, and adds Box and Drill operations. New manual setups are placed before the first CNC setup. They can be moved, for example to face the bottom after a flip.
+"Add manual setup" on the setup list inserts a setup on the manual machine before the first CNC setup. When it becomes the first setup, it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock the manual setup leaves. The user adds Box and Drill operations to it. Manual setups can be moved, for example to face the bottom after a flip.
 
 ### Suggested by the app (phase 2)
 
@@ -140,8 +141,8 @@ The user adds a setup, picks the manual machine for it, and adds Box and Drill o
 
 ## Phases
 
-1. Manual machine, tool and holder fit, the Box strategy, simulation, checks and times, the step guide and the PNG pages. The user marks the manual work.
-2. Bulk boxes and "Suggest manual steps".
+1. Manual machine, tool and holder fit, the Box strategy, simulation, checks and times, and the step guide. The user marks the manual work.
+2. Bulk boxes, "Suggest manual steps" and the PNG pages.
 3. AI planner support.
 
 ## Testing
@@ -151,8 +152,8 @@ The user adds a setup, picks the manual machine for it, and adds Box and Drill o
 - A faced top on the manual mill makes the next CNC setup's leftover stock shorter by the facing depth, and the CNC's rest material excludes the boxes.
 - Checks refuse: a CNC-only strategy on a manual setup, a tool not on that machine, an rpm not in `speeds`, a feed above `hand_feed`, a box outside the travel.
 - Minutes: a known box gives the expected manual time; the total adds `move_time` once per machine change.
-- Guide: the step list for a sample job (hold, zero, tool, passes, check, hand over); edge readouts with `dro_comp` on equal the centre ± the radius on the cutting side; the guide's place survives save and load; "Save steps" writes one PNG per step; gallery renders of each step kind checked by eye.
-- Phase 2: bulk boxes on a stepped block find the steps; boxes are never inside the part inflated by the allowance; the time rule drops a box that saves less than it costs.
+- Guide: the step list for a sample job (hold, zero, tool, passes, check, hand over); edge readouts with `dro_comp` on equal the centre ± the radius on the cutting side; the guide's place survives save and load; gallery renders of each step kind checked by eye.
+- Phase 2: "Save steps" writes one PNG per step; bulk boxes on a stepped block find the steps; boxes are never inside the part inflated by the allowance; the time rule drops a box that saves less than it costs.
 - Phase 3: the schema's `machine`, Box only on manual setups, the user's setup rule, and a real-route run by the user.
 
 ## Open points
