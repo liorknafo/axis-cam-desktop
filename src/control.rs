@@ -3583,22 +3583,19 @@ soft_max = 0.0
         });
     }
 
-    /// A job that indexes A between two X cuts on the simulated UC100 (the
-    /// driver from LIO-182): it ends with A at the commanded 90 degrees and
-    /// X where the second cut ends. Z stays 1 mm under its soft maximum: the
-    /// simulator's counter can end a fraction of a step past a target the
-    /// move reversed into, which trips a limit exactly there.
-    #[test]
-    fn a_job_indexes_a_between_xyz_cuts_on_the_simulator() {
+    /// Runs `actions` as a job on the simulated UC100 with `profile`, after
+    /// Set machine zero sets its first `axes` axes; returns the outcome and
+    /// where the machine ends.
+    fn simulated_job(
+        profile: &str,
+        axes: usize,
+        actions: Vec<Do>,
+    ) -> (uc100::controller::ProgramOutcome, [f64; 6]) {
         let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("rotary.toml");
-        let a = "[axes.a]\nsteps_per_unit = 44.444\nmax_velocity = 3600.0\nacceleration = 360.0\nstep = { pin = 8 }\ndir = { pin = 9 }\n";
-        std::fs::write(&profile, format!("{LIMITED}{a}")).unwrap();
-        let mut c = Connection::open(
-            &uc100(&profile.display().to_string(), "Simulated"),
-            dir.path(),
-        )
-        .unwrap();
+        let path = dir.path().join("profile.toml");
+        std::fs::write(&path, profile).unwrap();
+        let mut c =
+            Connection::open(&uc100(&path.display().to_string(), "Simulated"), dir.path()).unwrap();
         until(&mut c, 3.0, "E-stop after connecting", |s| {
             s.state == Some(State::EStop)
         });
@@ -3606,43 +3603,78 @@ soft_max = 0.0
         until(&mut c, 3.0, "Idle after Reset", |s| {
             s.state == Some(State::Idle)
         });
-        // Set machine zero here sets A with X, Y and Z (LIO-185).
         c.act(Action::MachineZero(None));
-        until(&mut c, 3.0, "X, Y, Z and A set", |s| {
-            s.state == Some(State::Idle) && s.referenced[..4].iter().all(|r| *r)
+        until(&mut c, 3.0, "the axes set", |s| {
+            s.state == Some(State::Idle) && s.referenced[..axes].iter().all(|r| *r)
         });
-        let to = |x: f64, z: f64, a: f64, feed: Option<f64>| Do::Move {
-            target: [x, 10., z, a, 0., 0.],
-            feed,
-        };
         let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-        c.send(job(
-            "A index",
-            vec![
-                to(10., -1., 0., None),
-                to(10., -3., 0., Some(5.)),
-                to(20., -3., 0., Some(10.)),
-                to(20., -1., 0., None),
-                to(20., -1., 90., None),
-                to(20., -3., 90., Some(5.)),
-                to(30., -3., 90., Some(10.)),
-                Do::End,
-            ],
-        ));
+        c.send(job("job", actions));
         until(&mut c, 10.0, "the job's end", |s| {
             s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
         });
         let o = c.snapshot.program_outcome.clone().unwrap();
-        assert!(o.ok, "{} at {:?}", o.message, c.snapshot.machine_pos);
-        until(&mut c, 3.0, "Idle after the job", |s| {
-            s.state == Some(State::Idle)
-        });
-        let at = c.snapshot.machine_pos;
-        assert!((at[3] - 90.).abs() < 0.03, "{at:?}");
-        assert!(
-            (at[0] - 30.).abs() < 1e-3 && (at[2] + 3.).abs() < 1e-3,
-            "{at:?}"
+        if o.ok {
+            until(&mut c, 3.0, "Idle after the job", |s| {
+                s.state == Some(State::Idle)
+            });
+        }
+        (o, c.snapshot.machine_pos)
+    }
+
+    /// The JY5800's Z soft limit is Z 0, where retracts end: a job that
+    /// feeds Z down, cuts and rapids back up to Z 0 exactly finishes on the
+    /// simulated UC100 (LIO-200; it used to end with "Soft limit reached").
+    #[test]
+    fn a_retract_to_the_z_soft_limit_finishes_on_the_simulator() {
+        let to = |x: f64, z: f64, feed: Option<f64>| Do::Move {
+            target: [x, 10., z, 0., 0., 0.],
+            feed,
+        };
+        let (o, at) = simulated_job(
+            LIMITED,
+            3,
+            vec![
+                to(10., 0., None),
+                to(10., -2., Some(5.)),
+                to(20., -2., Some(10.)),
+                to(20., 0., None),
+                to(30., 0., None),
+                Do::End,
+            ],
         );
+        assert!(o.ok, "{} at {at:?}", o.message);
+        assert!((at[0] - 30.).abs() < 1e-3 && at[2].abs() < 1e-3, "{at:?}");
+    }
+
+    /// A job that indexes A between two X cuts on the simulated UC100 (the
+    /// driver from LIO-182): it ends with A at the commanded 90 degrees and
+    /// X where the second cut ends. Z retracts to its soft maximum, Z 0.
+    #[test]
+    fn a_job_indexes_a_between_xyz_cuts_on_the_simulator() {
+        let a = "[axes.a]\nsteps_per_unit = 44.444\nmax_velocity = 3600.0\nacceleration = 360.0\nstep = { pin = 8 }\ndir = { pin = 9 }\n";
+        let to = |x: f64, z: f64, a: f64, feed: Option<f64>| Do::Move {
+            target: [x, 10., z, a, 0., 0.],
+            feed,
+        };
+        // Set machine zero here sets A with X, Y and Z (LIO-185).
+        let (o, at) = simulated_job(
+            &format!("{LIMITED}{a}"),
+            4,
+            vec![
+                to(10., 0., 0., None),
+                to(10., -2., 0., Some(5.)),
+                to(20., -2., 0., Some(10.)),
+                to(20., 0., 0., None),
+                to(20., 0., 90., None),
+                to(20., -2., 90., Some(5.)),
+                to(30., -2., 90., Some(10.)),
+                to(30., 0., 90., None),
+                Do::End,
+            ],
+        );
+        assert!(o.ok, "{} at {at:?}", o.message);
+        assert!((at[3] - 90.).abs() < 0.03, "{at:?}");
+        assert!((at[0] - 30.).abs() < 1e-3 && at[2].abs() < 1e-3, "{at:?}");
     }
 
     #[test]
