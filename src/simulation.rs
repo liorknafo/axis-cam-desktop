@@ -793,7 +793,10 @@ pub fn sequence_walk(
             setup.preview_stock = starts;
         } else if blocked.is_none() {
             match stock::resolve(&setup, Some(mesh)) {
-                Ok(s) => volume = Some(Volume::new(s.stock, frame)),
+                Ok(s) => {
+                    let round = stock::round(&setup, s.stock);
+                    volume = Some(Volume::new(s.stock, frame).rounded(round))
+                }
                 Err(error) => blocked = Some(format!("{}: {error}", setup.name())),
             }
         }

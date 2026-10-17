@@ -650,13 +650,44 @@ impl Viewport<'_> {
             && self.stock_is_known(setup)
             && let Some(stock) = self.resolved_stock()
         {
-            let projected = box_vertices(stock.stock.scaled(stock.display_scale)).map(|v| {
-                let q = p.p(v);
-                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
-            });
-            raster_stock(
-                &mut rgba, &depths, w, h, projected, ratio, p.scale, &mut solid,
-            );
+            if let Some(bar) = stock::round(setup, stock.stock)
+                .filter(|_| crate::model::get(&setup.p, "stock_source") == "fresh")
+            {
+                // A round bar: its turned polygon, corners outside the bar.
+                let sides = 48;
+                let r = bar.radius / (std::f32::consts::PI / sides as f32).cos();
+                let ring = |x: f32| -> Vec<(Point, f32)> {
+                    (0..sides)
+                        .map(|i| {
+                            let t = (i as f32 * 360. / sides as f32).to_radians();
+                            let v = [x, bar.axis[0] + r * t.cos(), bar.axis[1] + r * t.sin()]
+                                .map(|n| n * stock.display_scale);
+                            let q = p.p(v);
+                            (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                        })
+                        .collect()
+                };
+                let (a, b) = (ring(stock.stock.min[0]), ring(stock.stock.max[0]));
+                raster_prism(
+                    &STOCK,
+                    &mut rgba,
+                    &depths,
+                    (w, h),
+                    [&a, &b],
+                    true,
+                    ratio,
+                    p.scale,
+                    &mut solid,
+                );
+            } else {
+                let projected = box_vertices(stock.stock.scaled(stock.display_scale)).map(|v| {
+                    let q = p.p(v);
+                    (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                });
+                raster_stock(
+                    &mut rgba, &depths, w, h, projected, ratio, p.scale, &mut solid,
+                );
+            }
             // Only the planner's pictures mark surfaces (the app passes
             // none, so its view is unchanged): the model asked to see them,
             // so the translucent box must not dim them.
@@ -673,6 +704,34 @@ impl Viewport<'_> {
         if !self.holding.is_empty() {
             let scale = self.mesh.display_scale();
             for hold in &self.holding {
+                let project = |v: [f32; 3]| {
+                    let v = v.map(|n| n * scale);
+                    let q = p.p(v);
+                    (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                };
+                match &hold.shape {
+                    crate::holding::Shape::Hidden => continue,
+                    crate::holding::Shape::Prism(prism) => {
+                        let [a, b] = &prism.ends;
+                        let (a, b): (Vec<_>, Vec<_>) = (
+                            a.iter().map(|v| project(*v)).collect(),
+                            b.iter().map(|v| project(*v)).collect(),
+                        );
+                        raster_prism(
+                            &HOLDING,
+                            &mut rgba,
+                            &depths,
+                            (w, h),
+                            [&a, &b],
+                            prism.smooth,
+                            ratio,
+                            p.scale,
+                            &mut solid,
+                        );
+                        continue;
+                    }
+                    crate::holding::Shape::Box => {}
+                }
                 let projected = box_vertices(hold.bounds.scaled(scale)).map(|v| {
                     let q = p.p(v);
                     (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
@@ -1011,6 +1070,10 @@ impl<'a> Viewport<'a> {
             frame.fill_text(Text {
                 content: if self.simulation.is_none() && !self.stock_is_known(setup) {
                     "Remaining stock · generate preview".into()
+                } else if stock::round_bar(setup)
+                    && crate::model::get(&setup.p, "stock_source") == "fresh"
+                {
+                    format!("Stock  Ø{:.1} × {:.1} mm bar", d[1].min(d[2]), d[0])
                 } else {
                     format!("Stock  {:.1} × {:.1} × {:.1} mm", d[0], d[1], d[2])
                 },
@@ -1420,6 +1483,13 @@ pub(crate) fn stock_triangles<'a>(
                 || source
                     .iter()
                     .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
+        }) || volume.round.is_some_and(|bar| {
+            // A round bar's own surface is the block's too: its points lie
+            // within half a cell of the meshing of it.
+            source.iter().all(|p| {
+                let r = (p[1] - bar.axis[0]).hypot(p[2] - bar.axis[1]);
+                (r - bar.radius).abs() <= surface.cell_mm / 2.
+            })
         });
         (points, shade(&points, if outer { BLOCK } else { CUT }))
     })
@@ -1594,9 +1664,7 @@ fn raster_solid(
     scale: f32,
     buffers: &mut SolidBuffers,
 ) {
-    buffers.reset((w * h) as usize);
-    let SolidBuffers { near, tones } = buffers;
-    for (tone, face) in [
+    let faces: Vec<(Vec<(Point, f32)>, u8)> = [
         [0, 1, 2, 3],
         [4, 5, 6, 7],
         [0, 1, 5, 4],
@@ -1606,9 +1674,108 @@ fn raster_solid(
     ]
     .iter()
     .enumerate()
-    {
-        for tri in [[face[0], face[1], face[2]], [face[0], face[2], face[3]]] {
-            let tri = tri.map(|i| vertices[i]);
+    .map(|(tone, face)| (face.iter().map(|&i| vertices[i]).collect(), tone as u8))
+    .collect();
+    let edges: Vec<_> = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    .iter()
+    .map(|&(a, b)| (vertices[a], vertices[b]))
+    .collect();
+    raster_faces(
+        look,
+        pixels,
+        part_depth,
+        (w, h),
+        &faces,
+        &edges,
+        ratio,
+        scale,
+        buffers,
+    );
+}
+/// A turned solid of a chuck (`chuck::Prism`, projected): `raster_faces` of
+/// its two end polygons and its sides, with the ends' edges and, for a round
+/// one, only the sides' edges on its outline.
+#[allow(clippy::too_many_arguments)]
+fn raster_prism(
+    look: &Look,
+    pixels: &mut [u8],
+    part_depth: &[f32],
+    size: (u32, u32),
+    ends: [&[(Point, f32)]; 2],
+    smooth: bool,
+    ratio: f32,
+    scale: f32,
+    buffers: &mut SolidBuffers,
+) {
+    let n = ends[0].len().min(ends[1].len());
+    if n < 3 {
+        return;
+    }
+    let mut faces: Vec<(Vec<(Point, f32)>, u8)> =
+        vec![(ends[0][..n].to_vec(), 0), (ends[1][..n].to_vec(), 1)];
+    // Whether each side faces the camera, by its winding on the screen.
+    let mut facing = vec![];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let quad = vec![ends[0][i], ends[0][j], ends[1][j], ends[1][i]];
+        let area: f32 = (0..4)
+            .map(|k| {
+                let (a, b) = (quad[k].0, quad[(k + 1) % 4].0);
+                a.x * b.y - b.x * a.y
+            })
+            .sum();
+        facing.push(area > 0.);
+        faces.push((quad, if smooth { 5 } else { 2 + (i % 2) as u8 * 2 }));
+    }
+    let mut edges = vec![];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        edges.push((ends[0][i], ends[0][j]));
+        edges.push((ends[1][i], ends[1][j]));
+        let before = (i + n - 1) % n;
+        if !smooth || facing[i] != facing[before] {
+            edges.push((ends[0][i], ends[1][i]));
+        }
+    }
+    raster_faces(
+        look, pixels, part_depth, size, &faces, &edges, ratio, scale, buffers,
+    );
+}
+/// An edge between two projected points, each with its depth.
+type Edge = ((Point, f32), (Point, f32));
+/// Composite only the nearest surface of the convex polygons `faces`, each
+/// with its tone; use both surfaces and part depth to draw `edges` visible
+/// or dashed hidden.
+#[allow(clippy::too_many_arguments)]
+fn raster_faces(
+    look: &Look,
+    pixels: &mut [u8],
+    part_depth: &[f32],
+    (w, h): (u32, u32),
+    faces: &[(Vec<(Point, f32)>, u8)],
+    edges: &[Edge],
+    ratio: f32,
+    scale: f32,
+    buffers: &mut SolidBuffers,
+) {
+    buffers.reset((w * h) as usize);
+    let SolidBuffers { near, tones } = buffers;
+    for (face, tone) in faces {
+        for k in 1..face.len().saturating_sub(1) {
+            let tri = [face[0], face[k], face[k + 1]];
             let minx = tri
                 .iter()
                 .map(|(p, _)| p.x)
@@ -1640,7 +1807,7 @@ fn raster_solid(
                         && z > near[index]
                     {
                         near[index] = z;
-                        tones[index] = tone as u8;
+                        tones[index] = *tone;
                     }
                 }
             }
@@ -1662,22 +1829,7 @@ fn raster_solid(
             alpha_over(&mut pixels[index * 4..index * 4 + 4], tint, alpha);
         }
     }
-    for (a, b) in [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ] {
-        let (a, za) = vertices[a];
-        let (b, zb) = vertices[b];
+    for &((a, za), (b, zb)) in edges {
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let length_sq = dx * dx + dy * dy;
@@ -2474,6 +2626,7 @@ mod tests {
         let scale = mesh.display_scale();
         // A jaw beyond the stock's +Y side, seen from above.
         let jaw = HoldBox {
+            shape: Default::default(),
             label: "vise jaw on +Y".into(),
             bounds: crate::mesh::Bounds {
                 min: [-60., 60., -20.],
@@ -2537,6 +2690,7 @@ mod tests {
         let scale = mesh.display_scale();
         // A clamp reaching far beyond the stock's +X side.
         let clamp = HoldBox {
+            shape: Default::default(),
             label: "clamp on +X (offset 0)".into(),
             bounds: crate::mesh::Bounds {
                 min: [200., -10., 45.],
@@ -2789,6 +2943,7 @@ mod tests {
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let hold = |min, max| HoldBox {
+            shape: Default::default(),
             label: "box".into(),
             bounds: crate::mesh::Bounds { min, max },
         };

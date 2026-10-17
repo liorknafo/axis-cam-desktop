@@ -3739,6 +3739,79 @@ flood = { pin = 8 }
     /// pins, setup 1's Drill of those holes, and the Control page's Run steps
     /// before and after X Y from the pins. Not a check: run it with
     /// --ignored.
+    /// Renders the setup editor's Stock and Holding steps for the fixture
+    /// block on a Ø110 × 200 mm round bar in a 3-jaw chuck on a 4-axis
+    /// machine (a Ø200 chuck), 170 mm out of the jaws, the tailstock drawn
+    /// back, to $AXIS_RENDER_DIR (/tmp/chuck-renders). Not a check: run it
+    /// with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_chuck() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/chuck-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let mut m = Machine::new(4);
+        for (k, v) in [
+            ("a_chuck_diameter", "200"),
+            ("a_grip_max", "150"),
+            ("a_fit_diameter", "150"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        for s in &mut doc.setups {
+            s.machine = m.clone();
+        }
+        doc.machines = vec![m];
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "110"),
+            ("stock_length", "200"),
+            ("holding", "Chuck"),
+            ("chuck_stickout", "170"),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        // The part on the bar's axis, its top 35 mm under the bar's.
+        let low = crate::stock::resolve(&doc.setups[0], Some(&mesh))
+            .unwrap()
+            .part
+            .unwrap();
+        doc.setups[0]
+            .p
+            .insert("tz".into(), (35. - low.min[2]).to_string());
+        doc.settle_holding(0);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.update(Message::SelectSetup(0));
+        let size = iced::Size::new(1600., 1100.);
+        for (step, name) in [("Stock", "1-stock.png"), ("Holding", "2-holding.png")] {
+            let _ = a.update(Message::SetupStep(step));
+            let _ = a.view();
+            render_png(&a, size, &out.join(name));
+        }
+        // The Job view after the Pocket: the bar cut, its corners never
+        // material.
+        let ops = &a.doc.setups[0].operations;
+        let pocket = ops.iter().position(|o| o.name() == "Pocket").unwrap();
+        let _ = a.update(Message::SelectOp(pocket));
+        a.simulation = crate::planner::view_after(
+            &a.doc,
+            a.part_mesh().unwrap(),
+            0,
+            pocket,
+            crate::stock_surface::Detail::Draft,
+        );
+        assert!(a.simulation.is_some());
+        a.stock = true;
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-job-view.png"));
+    }
     #[test]
     #[ignore]
     fn render_the_fixture_pins() {

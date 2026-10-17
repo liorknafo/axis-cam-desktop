@@ -4401,6 +4401,7 @@ soft_max = 0.0
         let (lo, hi) = ([100., 50., -70.], [224., 134., -30.]);
         let start = [165., 90., -15., 0., 0., 0.];
         let clamp = |proud: f32| HoldBox {
+            shape: Default::default(),
             label: "clamp on +X (offset 0)".into(),
             bounds: Bounds {
                 min: [94., 0., 40.],

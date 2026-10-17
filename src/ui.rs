@@ -1767,7 +1767,7 @@ pub(crate) fn pictured_holding(
     let Some(setup) = app.doc.setups.get(si) else {
         return vec![];
     };
-    let mut jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+    let mut jaws = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps" | "Chuck") {
         let held = app
             .known_held(si)
             .filter(|held| held.stock == stock)
@@ -2969,7 +2969,8 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
             .iter()
             .all(|k| num(&s.p, k).is_some()),
         "Holding" => {
-            matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty()
+            matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                && holding_lines(app).is_empty()
         }
         _ => false,
     }
@@ -3367,10 +3368,23 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
             p,
             "stock_type",
             "Initial stock mode",
-            &["Relative size box", "Fixed size box"],
+            &crate::stock::MODES,
             t,
         ));
-        if crate::stock::relative(s) {
+        if crate::stock::round_bar(s) {
+            c = c.push(
+                row![
+                    container(field(p, "stock_diameter", "Bar diameter · mm", t))
+                        .width(Length::FillPortion(1)),
+                    container(field(p, "stock_length", "Bar length · mm", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10),
+            );
+            c = c.push(muted(
+                "A bar along X, centred on the part's X and Y, standing on Z0. Hold it in the chuck (Workholding).",
+            ));
+        } else if crate::stock::relative(s) {
             c = c.push(muted("Extra material from each side of the part · mm"));
             for pair in [
                 [
@@ -3408,12 +3422,22 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
         }
         match crate::stock::resolve(s, app.part_mesh()) {
             Ok(resolved) => {
-                let mut summary = column![
-                    bold("Resulting stock · X × Y × Z", 12),
-                    text(crate::stock::dimensions_text(resolved.stock.dimensions()))
-                        .size(14)
-                        .color(BLUE)
-                ]
+                let size = resolved.stock.dimensions();
+                let mut summary = if crate::stock::round_bar(s) {
+                    column![
+                        bold("Resulting stock · round bar", 12),
+                        text(format!("Ø{:.3} × {:.3} mm", size[1], size[0]))
+                            .size(14)
+                            .color(BLUE)
+                    ]
+                } else {
+                    column![
+                        bold("Resulting stock · X × Y × Z", 12),
+                        text(crate::stock::dimensions_text(size))
+                            .size(14)
+                            .color(BLUE)
+                    ]
+                }
                 .spacing(6);
                 if let Some(part) = resolved.part {
                     summary = summary.push(muted(format!(
@@ -3428,7 +3452,11 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                         .style(panel_style),
                 );
                 if outside_fixed_stock(s, &resolved) {
-                    c = c.push(note("The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."));
+                    c = c.push(note(if crate::stock::round_bar(s) {
+                        "The part extends outside the box round this bar. Increase its diameter or length, adjust placement, or choose a box."
+                    } else {
+                        "The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."
+                    }));
                 }
             }
             Err(error) => c = c.push(note(error)),
@@ -3604,17 +3632,48 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         value => value,
     };
     let mut c: Vec<Element<_>> = vec![
-        muted("The vise or clamps that hold the stock, from the workholding library.").into(),
+        muted("The vise or clamps that hold the stock, from the workholding library, or the chuck on the machine's rotary A axis.").into(),
         choice_value(
             p,
             holding,
             "holding",
             "Modelled workholding",
-            &["None", "Vise", "Clamps"],
+            &crate::holding::CHOICES,
             t,
         ),
     ];
     match holding {
+        "Chuck" => {
+            c.push(choice(p, "chuck_jaws", "Chuck", &crate::chuck::JAWS, t));
+            c.push(
+                row![
+                    container(field(
+                        p,
+                        "chuck_stickout",
+                        "Stick-out from the jaws · mm",
+                        t
+                    ))
+                    .width(Length::FillPortion(1)),
+                    container(field(p, "chuck_jaw_angle", "Jaw 1 at A0 · ° from up", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10)
+                .into(),
+            );
+            c.push(choice(
+                p,
+                "chuck_tailstock",
+                "Tailstock",
+                &crate::chuck::TAILSTOCK,
+                t,
+            ));
+            c.push(
+                muted(
+                    "The chuck, its jaws, the rotary head and the tailstock are sized from the machine's rotary unit, the jaws' width and height and the bodies' lengths assumed from it, and checked as the boxes round them with the gap, at A0 for today's operations. The stock in the jaws is kept clear too.",
+                )
+                .into(),
+            );
+        }
         "Vise" => {
             c.push(holder_picker(app, "Vise"));
             let axes: Vec<Named> = [("X", "X sides"), ("Y", "Y sides")]
@@ -3686,11 +3745,13 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
     }
     if holding != "None" {
         c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
-        c.push(
-            secondary("Suggest layout", Message::SuggestLayout)
-                .width(Fill)
-                .into(),
-        );
+        if holding != "Chuck" {
+            c.push(
+                secondary("Suggest layout", Message::SuggestLayout)
+                    .width(Fill)
+                    .into(),
+            );
+        }
         let lines = holding_lines(app);
         if !lines.is_empty() {
             let heading = format!(
@@ -3850,7 +3911,7 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
             .active_simulation()
             .map(|sim| sim.plan.stock)
             .or_else(|| app.known_stock(app.doc.index()).0)?;
-        let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+        let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps" | "Chuck") {
             let jaws = app.doc.holding_boxes(setup, held_of(app, stock));
             crate::holding::shown(&jaws.unwrap_or_default(), stock)
         } else {
@@ -7335,6 +7396,11 @@ pub(crate) fn plan_holding_line(job: &crate::model::Document, index: usize) -> O
     } else {
         ", laid out by the app from this setup's toolpaths"
     };
+    if crate::chuck::holds(job.setups.get(index)?) {
+        return Some(format!(
+            "Modelled workholding{by}: {text} The chuck, its jaws, the rotary head, the tailstock and the stock in the jaws are checked as the boxes round them with the gap, at A0; the table and the machine body are not."
+        ));
+    }
     Some(format!(
         "Modelled workholding{by}: {text} Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not."
     ))

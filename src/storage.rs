@@ -312,6 +312,59 @@ mod tests {
         save(&path, &doc).unwrap();
         assert!(load(&path).is_err());
     }
+    /// A project written before round bars and the chuck (LIO-187), with a
+    /// fixed box held in a vise and a chuck fixture note, as such a file
+    /// holds it: it loads unchanged, its stock is the same box, it models
+    /// no chuck and its simulation stock is that whole box.
+    #[test]
+    fn a_box_stock_project_from_before_the_chuck_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("box.axis.json");
+        let mut doc = Document::sample();
+        let vise = doc
+            .workholding
+            .first()
+            .map(|h| h.id.clone())
+            .unwrap_or_default();
+        for (k, v) in [
+            ("stock_type", "Fixed size box"),
+            ("stock_x", "140"),
+            ("stock_y", "100"),
+            ("stock_z", "40"),
+            ("holding", "Vise"),
+            ("holder", vise.as_str()),
+            ("fixture", "Chuck"),
+        ] {
+            doc.setup_mut().p.insert(k.into(), v.into());
+        }
+        let value = serde_json::to_value(&doc).unwrap();
+        let text = serde_json::to_string(&value).unwrap();
+        for new in [
+            "Round bar",
+            "stock_diameter",
+            "\"chuck_",
+            "\"holding\":\"Chuck\"",
+        ] {
+            assert!(!text.contains(new), "{new}");
+        }
+        fs::write(&path, &text).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.setups[0].p, doc.setups[0].p);
+        let setup = &loaded.setups[0];
+        assert!(!crate::stock::round_bar(setup) && !crate::chuck::holds(setup));
+        let stock = crate::stock::resolve(setup, None).unwrap().stock;
+        assert_eq!((stock.min, stock.max), ([-70., -50., 0.], [70., 50., 40.]));
+        assert_eq!(crate::stock::round(setup, stock), None);
+        let mesh = crate::mesh::sample();
+        let frame = crate::volume::Frame::new(setup, &mesh);
+        let v = crate::volume::Volume::new(stock, frame).rounded(crate::stock::round(setup, stock));
+        assert_eq!(v.remaining, v.occupied.len());
+        assert_eq!(crate::holding::fixture_note(setup), None);
+        assert_eq!(
+            loaded.holding_label(setup),
+            doc.holding_label(&doc.setups[0])
+        );
+    }
     #[test]
     fn legacy_relative_dimensions_are_preserved_and_new_offsets_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

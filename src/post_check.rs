@@ -701,6 +701,7 @@ mod tests {
     }
     fn clamp_box(label: &str, min: [f32; 3], max: [f32; 3]) -> HoldBox {
         HoldBox {
+            shape: Default::default(),
             label: label.into(),
             bounds: Bounds { min, max },
         }

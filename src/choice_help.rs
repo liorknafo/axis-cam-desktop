@@ -243,6 +243,30 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Build the blank from the placed part bounds plus six independent offsets. Top adds material only above the part; Right adds material only on +X. Offsets follow setup rotation and translation. The first setup defines the blank for the whole job.",
             "",
         ),
+        ("stock_type", "Round bar") => (
+            "A round bar along X of the entered diameter and length, centred in X/Y with its bottom at Z=0. Its box is the stock everywhere a box is used; the preview and simulation cut the bar. Hold it in the chuck.",
+            "",
+        ),
+        ("chuck_jaws", "3-jaw") => (
+            "A self-centring 3-jaw chuck: it grips round stock. A box is refused in it.",
+            "",
+        ),
+        ("chuck_jaws", "4-jaw") => (
+            "A 4-jaw chuck, for a box (jaws square on its sides) or round stock.",
+            "",
+        ),
+        ("chuck_tailstock", "Retracted") => (
+            "The tailstock stays on the table with its centre drawn back: its centre, quill and body are checked, and the stock must end short of the centre.",
+            "",
+        ),
+        ("chuck_tailstock", "Supports the stock") => (
+            "The tailstock's centre is in the stock's free end: checked as it stands, and the stick-out bends less. The end must be within the quill's travel.",
+            "",
+        ),
+        ("chuck_tailstock", "Off the table") => (
+            "The tailstock is taken off the table: it is not checked, and the stick-out bends as a free end.",
+            "",
+        ),
         ("stock_type", "Fixed size box") => (
             "Use the entered overall X, Y and Z stock dimensions. The preview centers it in X/Y with its bottom at Z=0. The box can be smaller than the part, which is reported. Relative offsets are retained for switching back.",
             "",
@@ -296,7 +320,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("fixture", "Chuck") => (
-            "Record chuck workholding, typically for rotary access. Jaw geometry, grip and rotary collision checks are not simulated. This choice only describes the setup: the chuck is not checked, but a vise or clamps modelled under Modelled workholding are.",
+            "Record chuck workholding. This choice only describes the setup: to have the chuck checked (its jaws, grip, tailstock, every A angle), choose Chuck under Modelled workholding, on a machine with a rotary A axis.",
             "",
         ),
         ("fixture", "Custom fixture") => (

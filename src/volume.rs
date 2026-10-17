@@ -99,6 +99,8 @@ pub struct Volume {
     pub remaining: usize,
     pub cuts: std::sync::Arc<Vec<crate::stock_surface::Cut>>,
     pub version: u64,
+    /// The round bar the stock is, in its frame; None for a box.
+    pub round: Option<crate::stock::Round>,
 }
 impl Volume {
     pub fn new(bounds: Bounds, frame: Frame) -> Self {
@@ -116,7 +118,28 @@ impl Volume {
             remaining: count,
             cuts: std::sync::Arc::new(vec![]),
             version: 0,
+            round: None,
         }
+    }
+    /// The stock as the round bar `round` inside its box: the voxels whose
+    /// centres lie outside the bar hold no material. Unchanged for None.
+    pub fn rounded(mut self, round: Option<crate::stock::Round>) -> Self {
+        let Some(bar) = round else {
+            return self;
+        };
+        for z in 0..self.n[2] {
+            for y in 0..self.n[1] {
+                for x in 0..self.n[0] {
+                    let i = self.index([x, y, z]);
+                    if self.occupied[i] != 0 && !bar.contains(self.point([x, y, z], 0.5)) {
+                        self.occupied[i] = 0;
+                        self.remaining -= 1;
+                    }
+                }
+            }
+        }
+        self.round = round;
+        self
     }
     pub fn index(&self, p: [usize; 3]) -> usize {
         (p[2] * self.n[1] + p[1]) * self.n[0] + p[0]

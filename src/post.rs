@@ -2251,6 +2251,17 @@ fn unholdable(
     held: crate::holding::Gripped,
 ) -> Vec<String> {
     let setup = &doc.setups[si];
+    if crate::chuck::holds(setup) {
+        let Ok(rig) = doc.chuck_rig(setup, held.stock) else {
+            return vec![];
+        };
+        let first = walk.simulations[0];
+        let removed = (first.initial_volume.as_ref().zip(first.frame))
+            .map(|(volume, frame)| crate::rest::Removed::new(volume, frame));
+        return (rig.grip_issue(removed.as_ref()).into_iter())
+            .map(|message| format!("{}: {message}", setup.name()))
+            .collect();
+    }
     let (Ok(layout), Some(holder)) = (
         crate::holding::layout(setup),
         doc.holder(get(&setup.p, "holder")),
@@ -2288,6 +2299,24 @@ fn pushed(doc: &Document, si: usize, walk: &Walk, held: crate::holding::Gripped)
         .iter()
         .zip(&walk.simulations)
         .map(|(oi, sim)| (*oi, sim.bites()));
+    if crate::chuck::holds(&doc.setups[si]) {
+        let Ok(rig) = doc.chuck_rig(&doc.setups[si], held.stock) else {
+            return vec![];
+        };
+        return crate::forces::chuck_margins(doc, si, bites, &rig)
+            .into_iter()
+            .flat_map(|(oi, margin)| {
+                let name = doc.setups[si].operations[oi].name();
+                (margin.iter())
+                    .flat_map(|m| crate::forces::chuck_issues(name, m))
+                    .map(|message| Held {
+                        operation: Some(oi),
+                        message,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
     crate::forces::margins(doc, si, bites, held, removed.as_ref())
         .into_iter()
         .filter_map(|(oi, margin)| {
@@ -4528,6 +4557,7 @@ M2
             max: [100., 60., 40.],
         };
         let jaw = |top: f32| HoldBox {
+            shape: Default::default(),
             label: "vise jaw on +X".into(),
             bounds: Bounds {
                 min: [100., 0., -20.],
@@ -4545,6 +4575,7 @@ M2
         assert_eq!(in_the_way(stock, [At::Mid; 2], &[jaw(29.)]), None);
         // A clamp over the top's spot.
         let clamp = HoldBox {
+            shape: Default::default(),
             label: "clamp on -X (offset 0)".into(),
             bounds: Bounds {
                 min: [-30., 25., 40.],
@@ -4561,6 +4592,7 @@ M2
         // above the 50 mm the column used to reach: the probe comes down
         // beside the side from 65 mm, through it.
         let bar = HoldBox {
+            shape: Default::default(),
             label: "clamp on +X (offset 0)".into(),
             bounds: Bounds {
                 min: [90., 25., 50.],
@@ -4579,6 +4611,7 @@ M2
         // 70 mm the probe travels at. The routine flies over it
         // (`control::tests::a_clamp_bar_on_the_stock_top_is_flown_over_or_refused`).
         let toe = HoldBox {
+            shape: Default::default(),
             label: "clamp on +X (offset 0)".into(),
             bounds: Bounds {
                 min: [80., 0., 40.],
@@ -5476,6 +5509,76 @@ M2
             e.contains("is not a round hole the part opens on its bottom in this setup"),
             "{e}"
         );
+    }
+    /// The fixture's pocket on a round bar held in a chuck on a 4-axis
+    /// machine whose rotary unit takes a Ø200 chuck: clear of the jaws
+    /// with the bar far enough out of them, warned of (the operation
+    /// preview's check, `holding::hits` on `Document::holding_boxes`) with
+    /// the jaws over the pocket.
+    #[test]
+    fn a_chuck_keeps_the_pocket_out_of_its_jaws_and_the_stock_they_grip() {
+        use crate::holding;
+        let (mut doc, mesh) = pocket_job();
+        let mut m = Machine::new(4);
+        for (k, v) in [
+            ("a_chuck_diameter", "200"),
+            ("a_grip_max", "150"),
+            ("a_fit_diameter", "150"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        assert!(m.issues().is_empty(), "{:?}", m.issues());
+        doc.setups[0].machine = m;
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "110"),
+            ("stock_length", "200"),
+            ("holding", "Chuck"),
+        ] {
+            doc.setups[0].p.insert(k.into(), v.into());
+        }
+        // The part on the bar's axis, its top 35 mm under the bar's.
+        let low = crate::stock::resolve(&doc.setups[0], Some(&mesh))
+            .unwrap()
+            .part
+            .unwrap();
+        let tz = 35. - low.min[2];
+        doc.setups[0].p.insert("tz".into(), tz.to_string());
+        doc.settle_holding(0);
+        let hits = |doc: &Document| {
+            let mut plans = vec![];
+            crate::simulation::sequence(doc, &mesh, None, |_, _, r| plans.push(r.unwrap().plan));
+            let boxes = doc.holding_boxes(&doc.setups[0], plans[0].stock).unwrap();
+            holding::hits(&plans[0], &boxes, 2.)
+        };
+        // 170 mm out of the jaws: their front is 70 mm on -X from the
+        // bar's middle, past the pocket.
+        doc.setups[0]
+            .p
+            .insert("chuck_stickout".into(), "170".into());
+        assert!(
+            doc.holding_issues(0, Some(&mesh)).is_empty(),
+            "{:?}",
+            doc.holding_issues(0, Some(&mesh))
+        );
+        let clear = hits(&doc);
+        assert!(clear.is_empty(), "{clear:?}");
+        // 100 mm out: the jaws reach to the bar's middle, over the pocket.
+        doc.setups[0]
+            .p
+            .insert("chuck_stickout".into(), "100".into());
+        assert!(doc.holding_issues(0, Some(&mesh)).is_empty());
+        let found = hits(&doc);
+        assert!(
+            found
+                .iter()
+                .any(|h| h.label == "stock gripped in the chuck jaws")
+                && found.iter().any(|h| h.label.starts_with("chuck jaw")),
+            "{found:?}"
+        );
+        // A vise cannot hold the bar.
+        hold(&mut doc, "Vise", &[("vise_grip", "8")]);
+        assert!(doc.holding_issues(0, Some(&mesh))[0].contains("round bar"));
     }
     #[test]
     fn workholding_over_the_toolpath_refuses_the_setup_and_clear_workholding_exports() {
