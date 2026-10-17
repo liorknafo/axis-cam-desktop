@@ -98,6 +98,12 @@ pub struct Run {
     pub touched: bool,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
+    /// The stock after each of the setup's operations, by its index in the
+    /// setup, pictured for the Tool runs panel (`op_pictures`): empty until
+    /// worked out after the check.
+    pub pictures: Vec<(usize, iced::widget::image::Handle)>,
+    /// The stock the check left, until it is pictured (`App::picture_run`).
+    pub left: Option<Arc<Left>>,
 }
 
 impl Run {
@@ -119,6 +125,8 @@ impl Run {
             last: None,
             touched: false,
             outcome: None,
+            pictures: vec![],
+            left: None,
         }
     }
 
@@ -139,7 +147,7 @@ impl Run {
             None => {
                 // Out of range, so that no setup the project has is shown as picked.
                 self.setup = usize::MAX;
-                self.checked_as(Arc::new(Err(vec![REMOVED.into()])));
+                self.checked_as(Arc::new(Err(vec![REMOVED.into()])), None);
                 None
             }
         }
@@ -150,14 +158,26 @@ impl Run {
         self.programs.as_deref()?.as_deref().ok()
     }
 
-    /// A check's answer.
-    pub fn checked_as(&mut self, programs: Arc<Result<Vec<Checked>, Vec<String>>>) {
+    /// A check's answer, and the stock it left to picture.
+    pub fn checked_as(
+        &mut self,
+        programs: Arc<Result<Vec<Checked>, Vec<String>>>,
+        left: Option<Arc<Left>>,
+    ) {
         let count = programs.as_ref().as_ref().map_or(0, Vec::len);
         if self.done.len() != count {
             self.done = vec![false; count];
             self.next = 0;
         }
         self.programs = Some(programs);
+        self.left = left.filter(|_| self.checked().is_some());
+        self.pictures.clear();
+    }
+
+    /// The picture of the stock operation `op` (its index in the setup)
+    /// leaves, once worked out.
+    pub fn picture(&self, op: usize) -> Option<&iced::widget::image::Handle> {
+        self.pictures.iter().find(|(i, _)| *i == op).map(|(_, p)| p)
     }
 
     /// The next tool run, when its tool is not the one the last tool run
@@ -423,6 +443,43 @@ impl Run {
     }
 }
 
+/// Where an operation of a tool run stands, for the Tool runs panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Done,
+    /// The machine is cutting it.
+    Cutting,
+    /// Cycle Start starts it: the first of the tool run marked next.
+    Next,
+    ToCome,
+}
+
+impl Run {
+    /// Where each operation of tool run `i` stands, the machine being at
+    /// program line `line`: while it runs, those before the one it cuts are
+    /// done; otherwise all are once the tool run is.
+    pub fn stages(&self, i: usize, line: Option<u32>) -> Vec<Stage> {
+        let Some(p) = self.checked().and_then(|c| c.get(i)) else {
+            return vec![];
+        };
+        let cutting = self
+            .progress(line)
+            .filter(|_| self.running.as_ref().is_some_and(|r| r.index == i))
+            .map(|(_, op, _)| op);
+        let done = self.done.get(i) == Some(&true);
+        (0..p.ops.len())
+            .map(|k| match cutting {
+                Some(op) if k < op => Stage::Done,
+                Some(op) if k == op => Stage::Cutting,
+                Some(_) => Stage::ToCome,
+                None if done => Stage::Done,
+                None if i == self.next && k == 0 => Stage::Next,
+                None => Stage::ToCome,
+            })
+            .collect()
+    }
+}
+
 /// The machine's tool while a tool run cuts, for the 3D view.
 pub struct Live {
     pub setup: usize,
@@ -464,19 +521,21 @@ fn op_of(b: &Block) -> Option<usize> {
 /// The checked programs of setup `si` for a UC100 run, one per tool run,
 /// from a simulation of the job up to the end of that setup.
 pub fn programs(doc: &Document, mesh: &Mesh, si: usize) -> Result<Vec<Checked>, Vec<String>> {
+    check(doc, mesh, si).0
+}
+
+/// `programs`, and the stock that simulation leaves after each operation
+/// of the setup, for its pictures (`op_pictures`).
+pub fn check(doc: &Document, mesh: &Mesh, si: usize) -> (Result<Vec<Checked>, Vec<String>>, Left) {
     if si >= doc.setups.len() {
-        return Err(vec![REMOVED.into()]);
+        return (Err(vec![REMOVED.into()]), Left::default());
     }
     if doc.file.is_none() {
-        return Err(vec![NO_PART.into()]);
+        return (Err(vec![NO_PART.into()]), Left::default());
     }
-    crate::post::checked(
-        doc,
-        mesh,
-        si,
-        &simulated(doc, mesh, si),
-        PostSettings::for_uc100,
-    )
+    let (sims, left) = simulated_with(doc, mesh, si);
+    let programs = crate::post::checked(doc, mesh, si, &sims, PostSettings::for_uc100);
+    (programs, left)
 }
 
 const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
@@ -484,21 +543,110 @@ const REMOVED: &str = "This setup was removed from the project.";
 
 /// The `sequence` results of setup `si`'s enabled operations, from a
 /// simulation of the job up to the end of that setup.
-fn simulated(
-    doc: &Document,
-    mesh: &Mesh,
-    si: usize,
-) -> Vec<(usize, Result<crate::simulation::Simulation, String>)> {
+fn simulated(doc: &Document, mesh: &Mesh, si: usize) -> Sims {
+    simulated_with(doc, mesh, si).0
+}
+
+/// A setup's `sequence` results, by its operations' index in the setup.
+type Sims = Vec<(usize, Result<crate::simulation::Simulation, String>)>;
+
+/// `simulated`, and the stock it leaves after each operation (`Left`).
+fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
     let last = doc.setups[si].operations.iter().rposition(|o| o.enabled);
     let mut sims = vec![];
+    let mut after = vec![];
     if let Some(oi) = last {
-        crate::simulation::sequence(doc, mesh, Some((si, oi)), |s, oi, r| {
-            if s == si {
-                sims.push((oi, r))
+        crate::simulation::sequence_with(
+            doc,
+            mesh,
+            Some((si, oi)),
+            |s, oi, r| {
+                if s == si {
+                    sims.push((oi, r))
+                }
+            },
+            |s, oi, v| {
+                if s == si {
+                    after.push((oi, v.clone()))
+                }
+            },
+        );
+    }
+    // The walk stops at the last operation, before playing it to its end.
+    let last = sims
+        .last()
+        .filter(|(oi, _)| Some(*oi) == last)
+        .and_then(|(oi, r)| Some((*oi, r.as_ref().ok()?.clone())));
+    (sims, Left { after, last })
+}
+
+/// The stock a run's check leaves after each operation of its setup, for
+/// their pictures (`op_pictures`).
+#[derive(Debug, Clone, Default)]
+pub struct Left {
+    /// The stock each operation but the last leaves, by its index in the
+    /// setup: none from an operation that could not be generated on.
+    pub after: Vec<(usize, crate::volume::Volume)>,
+    /// The last operation's simulation, which `op_pictures` plays to its end:
+    /// the check does not need the stock it leaves.
+    pub last: Option<(usize, crate::simulation::Simulation)>,
+}
+
+/// How many stocks `op_pictures` meshes at once: each mesher also runs
+/// threads of its own.
+const PICTURING_THREADS: usize = 4;
+
+/// Pictures of the stock each operation leaves (`left`), by its index in
+/// the setup: meshed at Draft detail and seen in the setup's `frame` with the
+/// boxes `jaws` (its jaws, clamps or pins, in its frame in mm) as the 3D view
+/// first shows the setup, `viewport::OP_PICTURE` px.
+pub fn op_pictures(
+    left: &Left,
+    frame: crate::volume::Frame,
+    jaws: &[crate::mesh::Bounds],
+) -> Vec<(usize, iced::widget::image::Handle)> {
+    let holding: Vec<_> = jaws
+        .iter()
+        .flat_map(|b| crate::viewport::box_triangles(*b, crate::viewport::JAWS))
+        .collect();
+    let picture = |volume: &crate::volume::Volume| {
+        let surface = crate::stock_surface::Snapshot {
+            bounds: volume.bounds,
+            frame: volume.frame,
+            cuts: volume.cuts.clone(),
+            detail: crate::stock_surface::Detail::Draft,
+        }
+        .build()
+        .ok()?;
+        let mut triangles: Vec<_> =
+            crate::viewport::stock_triangles(volume, &surface, frame).collect();
+        triangles.extend(holding.iter().cloned());
+        crate::viewport::stock_picture(&triangles, crate::viewport::OP_PICTURE)
+    };
+    let mut end = None;
+    if let Some((oi, sim)) = &left.last {
+        let mut sim = sim.clone();
+        sim.seek(1.);
+        end = sim.volume.map(|v| (*oi, v));
+    }
+    let stocks: Vec<&(usize, crate::volume::Volume)> = left.after.iter().chain(&end).collect();
+    // A few stocks are meshed at once: most of a mesh's time is the field of
+    // its cuts, built on one thread.
+    let mut pictures = vec![];
+    for chunk in stocks.chunks(PICTURING_THREADS) {
+        std::thread::scope(|scope| {
+            let drawn: Vec<_> = chunk
+                .iter()
+                .map(|(oi, volume)| (*oi, scope.spawn(|| picture(volume))))
+                .collect();
+            for (oi, h) in drawn {
+                if let Ok(Some(p)) = h.join() {
+                    pictures.push((oi, p));
+                }
             }
         });
     }
-    sims
+    pictures
 }
 
 /// What the checks before a run find for one setup, for the browser's marks
@@ -960,6 +1108,8 @@ mod tests {
             last: None,
             touched: false,
             outcome: None,
+            pictures: vec![],
+            left: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
