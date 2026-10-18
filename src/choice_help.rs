@@ -391,11 +391,19 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Save coordinated XYZ and two-rotary capability. Tool-axis planning, singularity handling and machine kinematics are not yet available.",
             "",
         ),
-        ("direction" | "direction2", "Positive") if matches!(target, Target::Machine) => (
+        ("direction", "Positive") if matches!(target, Target::Machine) => (
+            "Positive A turns the part by the right-hand rule about +X: the top of the part toward −Y, the front. The indexed setups, the chuck checks, the program header and Find A zero all take it.",
+            "",
+        ),
+        ("direction", "Negative") if matches!(target, Target::Machine) => (
+            "Positive A turns the part the other way: the top of the part toward +Y, the back. The indexed setups, the chuck checks, the program header and Find A zero all take it; the controller's A is not reversed by it.",
+            "",
+        ),
+        ("direction2", "Positive") if matches!(target, Target::Machine) => (
             "Record the positive rotary sign convention for this axis. Match the machine documentation; this setting is saved for future kinematics.",
             "",
         ),
-        ("direction" | "direction2", "Negative") if matches!(target, Target::Machine) => (
+        ("direction2", "Negative") if matches!(target, Target::Machine) => (
             "Record the reversed rotary sign convention for this axis. This changes the intended sign mapping, not the current part placement or a live machine command.",
             "",
         ),

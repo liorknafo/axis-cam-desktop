@@ -1311,7 +1311,7 @@ impl Calibrate {
                 self.label()
             ),
             Calibrate::AZero => format!(
-                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the top of the part toward −Y, the front; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
+                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the part the way the machine's Direction says: the top toward −Y, the front, for Positive, toward +Y for Negative; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
                 self.label()
             ),
         }
@@ -1342,11 +1342,18 @@ const LEVEL_TURN: f64 = 20.;
 const DIRECTION_TURN: f64 = 1.;
 
 /// Why A zero stops when A turned the flat the wrong way: by `turned` (°)
-/// for a turn of A by `turn` (°), of the other sign. +A is the right-hand rule about +X: it
-/// turns the top of the part toward −Y, the front of the machine.
-fn a_backwards(turn: f64, turned: f64) -> String {
+/// for a turn of A by `turn` (°), of the other sign than the machine's
+/// Direction (`sign`) gives. With Direction Positive, +A is the right-hand
+/// rule about +X: it turns the top of the part toward −Y, the front of the
+/// machine; with Negative, toward +Y, the back.
+fn a_backwards(turn: f64, turned: f64, sign: f64) -> String {
+    let (direction, want, got) = if sign < 0. {
+        ("Negative", "+Y, the back", "−Y, the front")
+    } else {
+        ("Positive", "−Y, the front", "+Y, the back")
+    };
     format!(
-        "A turns backwards: turning A by {turn:+.3}° turned the flat by {turned:+.3}°, the top of the part toward +Y, the back. +A must turn the top of the part toward −Y, the front (the right-hand rule about +X), or a flat cut at A 90° lands on the opposite face and the jaw checks at each angle are wrong. Invert A's direction in the machine's profile (Reverse the direction, in the A axis of Setup), save it, jog A+ to check the top now moves toward the front, and find A zero again. AXIS CAM does not adapt to A turning the other way."
+        "A turns backwards: turning A by {turn:+.3}° turned the flat by {turned:+.3}°: +A turns the top of the part toward {got}. The machine's Direction is {direction}, so +A must turn the top of the part toward {want}, or a flat cut at A 90° lands on the opposite face and the jaw checks at each angle are wrong. Either invert A's direction in the machine's profile (Reverse the direction, in the A axis of Setup), save it and jog A+ to check the top now moves toward {want}; or, if A is wired as it should be, set the machine's Direction to match it in the Machine library. Then find A zero again."
     )
 }
 /// Misalignment over which a check warns (mm), as the fixture plate's
@@ -1459,6 +1466,9 @@ struct Turning {
     a_range: Option<(f64, f64)>,
     /// A's degrees per step: A zero levels the flat to within one.
     a_step: f64,
+    /// Which way +A turns the part, as the machine's Direction says
+    /// (`Rotary::sign`): A zero refuses an A that turns the other way.
+    sign: f64,
     /// The touches at the current angle.
     touches: Vec<Vec6>,
     /// What each angle done found: the centreline's Y, its top's Z and the
@@ -1657,27 +1667,28 @@ impl Turning {
                             "Turning A by {turn:.3}° turned the flat by {turned:.3}°: it does not turn with A. Is the stock held in the chuck?"
                         ));
                     }
-                    // A wired backwards is refused, never adapted to: every
-                    // A angle a program commands would turn the part the
-                    // other way. The first turn, of `DIRECTION_TURN` or
-                    // more, tells.
-                    if k == 2 && turned / turn < 0. {
-                        return Err(a_backwards(turn, turned));
+                    // A turning the other way than the machine's Direction
+                    // says is refused, never adapted to: every A angle a
+                    // program commands would turn the part the other way.
+                    // The first turn, of `DIRECTION_TURN` or more, tells.
+                    if k == 2 && self.sign * turned / turn < 0. {
+                        return Err(a_backwards(turn, turned, self.sign));
                     }
                 }
                 // Level, or as level as one step of A sets it.
                 let turn = match gain {
-                    // Positive A turns +Y up toward +Z (the right-hand rule
-                    // about +X): a flat high on +Y turns back by its slope.
-                    // The first turn is always made, and by at least
-                    // `DIRECTION_TURN`, so that the touches after it show
-                    // which way A really turns.
-                    None if slope.abs() >= DIRECTION_TURN => Some(-slope),
+                    // With Direction Positive, +A turns +Y up toward +Z (the
+                    // right-hand rule about +X), with Negative down: a flat
+                    // high on +Y turns back by its slope. The first turn is
+                    // always made, and by at least `DIRECTION_TURN`, so
+                    // that the touches after it show which way A really
+                    // turns.
+                    None if slope.abs() >= DIRECTION_TURN => Some(-self.sign * slope),
                     None => {
                         let turn = if slope > 0. {
-                            -DIRECTION_TURN
+                            -self.sign * DIRECTION_TURN
                         } else {
-                            DIRECTION_TURN
+                            self.sign * DIRECTION_TURN
                         };
                         let inside = |t: f64| {
                             (self.a_range).is_none_or(|(lo, hi)| (lo..=hi).contains(&(a + t)))
@@ -1732,6 +1743,9 @@ impl Turning {
 pub struct Rotary {
     pub unit: crate::model::RotaryUnit,
     pub mark: String,
+    /// +1 when the machine's Direction is Positive (+A turns the part by
+    /// the right-hand rule about +X), -1 for Negative (`indexed::sign`).
+    pub sign: f64,
 }
 
 impl Rotary {
@@ -1740,6 +1754,7 @@ impl Rotary {
         Some(Self {
             unit: m.rotary_unit()?,
             mark: get(&m.p, CENTRE_MARK).trim().to_string(),
+            sign: crate::indexed::sign(m) as f64,
         })
     }
 
@@ -3792,6 +3807,7 @@ impl Connection {
             angles,
             a_range: a.and_then(|x| Some((x.soft_min?, x.soft_max?))),
             a_step: a.map_or(0.01, |x| 1. / x.steps_per_unit),
+            sign: self.rotary.as_ref().map_or(1., |r| r.sign),
             touches: vec![],
             found: vec![],
             spacing: self.spacing().unwrap_or(10.),
@@ -5462,6 +5478,122 @@ spindle_max_rpm = 24000
         }
     }
 
+    /// LIO-209's job on the library CNC4030 + rotary (55 mm of Z, the A
+    /// centreline at machine Y 140 Z -40, a Ø100 chuck, its face at machine
+    /// X 20): a contour round a part `x0` mm along a Ø`bar` bar `stickout`
+    /// mm out of the jaws, down to 2 mm over the axis (the web keeps the
+    /// part on the bar, LIO-208), at A 0, 90, 180 and -90, on
+    /// `controller`, its UC100 profile in `dir`.
+    fn library_bar_job(
+        dir: &Path,
+        mesh: &crate::mesh::Mesh,
+        x0: f32,
+        stickout: &str,
+        bar: f32,
+        controller: &str,
+    ) -> crate::model::Document {
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar};
+        let mut op = on_the_bar(&cutter("12"));
+        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+            op.p.insert(k.into(), v.into());
+        }
+        let path = dir.join("profile.toml");
+        let mut doc = bar_job(mesh, x0, stickout, "-40", "0, 90, 180, -90", op);
+        let mut m = rotary_machine(dir).unwrap();
+        for (k, v) in [
+            ("controller", controller),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+            (CENTRE_MARK, MEASURED),
+            (crate::model::CENTRE_REF, "10 10 -50"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        doc.setups[0].machine = m;
+        let p = &mut doc.setups[0].p;
+        p.insert("stock_diameter".into(), bar.to_string());
+        // The part on the bar's axis.
+        let s = mesh.display_scale();
+        let tz = bar / 2. - mesh.dimensions[2] / 2. - 4. / s;
+        p.insert("tz".into(), tz.to_string());
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+        });
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_indexed();
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(mesh));
+        doc
+    }
+
+    /// Setup 2 of `doc` (`library_bar_job`, on the UC100) picked to run on
+    /// the simulated UC100 with the library machine's travel and A range:
+    /// its work zero where the setup has it on the A centreline, A zero at
+    /// machine A 0, the tool touched off on the A reference as long as the
+    /// probe, and the tool at the top of Z over the bar's free end
+    /// (machine X 150 Y 140 Z 0).
+    fn library_run(
+        dir: &Path,
+        doc: &crate::model::Document,
+        mesh: &crate::mesh::Mesh,
+    ) -> Connection {
+        let profile = [
+            ("soft_max = 600.0", "soft_max = 390.0"),
+            ("soft_max = 400.0", "soft_max = 280.0"),
+            ("soft_min = -300.0", "soft_min = -55.0"),
+            ("soft_min = -360.0", "soft_min = -180.0"),
+            ("soft_max = 360.0", "soft_max = 180.0"),
+        ]
+        .iter()
+        .fold(ROTARY_SIM.to_string(), |p, (from, to)| p.replace(from, to));
+        let m = doc.setups[1].machine.clone();
+        let mut c = zeroed_sim(dir, &profile, Some(&m), 4);
+        let (programs, left) = crate::run::check(doc, mesh, 1);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        let zero = doc.at_angle(1, 0., mesh).unwrap().machine_zero.unwrap();
+        let here = c.snapshot.machine_pos;
+        for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
+            c.send(Command::SetWork {
+                axis,
+                value: here[axis] - z,
+            });
+            until(&mut c, 2.0, "the work offset", |s| {
+                (s.work_offset[axis] - z).abs() < 1e-6
+            });
+        }
+        go_to(&mut c, [150., 140., 0., 0.]);
+        let mut run = crate::run::Run::new(doc, 1, 0);
+        run.checked_as(
+            std::sync::Arc::new(Ok(programs)),
+            Some(std::sync::Arc::new(left)),
+        );
+        run.length = Some((doc.tools[0].id.clone(), 0., -50.));
+        c.run = Some(run);
+        c
+    }
+
+    /// Rapids the simulated machine to machine X, Y, Z and A `to`, each
+    /// alone, Z first, and waits until it is there.
+    fn go_to(c: &mut Connection, to: [f64; 4]) {
+        let mut at = c.snapshot.machine_pos;
+        let mut legs = vec![];
+        for k in [2, 0, 1, 3] {
+            at[k] = to[k];
+            legs.push(at);
+        }
+        let start = c.snapshot.machine_pos;
+        c.send(job("To the start", moves_from(start, &legs)));
+        until(c, 30.0, "the start", |s| {
+            s.state == Some(State::Idle) && (0..4).all(|k| (s.machine_pos[k] - to[k]).abs() < 1e-3)
+        });
+    }
+
     /// LIO-209: the library CNC4030 + rotary, 55 mm of Z with the A
     /// centreline at machine Z -40 and a Ø100 chuck. Its jaws reach 55.9 mm
     /// from the centreline, above the top of the Z travel, but a contour
@@ -5474,52 +5606,13 @@ spindle_max_rpm = 24000
     /// with the numbers.
     #[test]
     fn a_four_angle_bar_job_on_the_library_rotary_machine_exports_and_runs() {
-        use crate::indexed::tests::{bar_job, cutter, height, on_the_bar, prism};
+        use crate::indexed::tests::{height, prism};
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mesh = prism(30.);
-        // Down to 2 mm over the axis: the web keeps the part on the bar
-        // (LIO-208).
-        let mut op = on_the_bar(&cutter("12"));
-        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
-            op.p.insert(k.into(), v.into());
-        }
-        let path = dir.path().join("profile.toml");
-        let job =
-            |mesh: &crate::mesh::Mesh, x0: f32, stickout: &str, bar: f32, controller: &str| {
-                let mut doc = bar_job(mesh, x0, stickout, "-40", "0, 90, 180, -90", op.clone());
-                let mut m = rotary_machine(dir.path()).unwrap();
-                for (k, v) in [
-                    ("controller", controller),
-                    ("uc100_profile", &*path.display().to_string()),
-                    ("uc100_connection", "Simulated"),
-                    ("feed", "60000"),
-                    ("post_dwell", "0.2"),
-                    (CENTRE_MARK, MEASURED),
-                    (crate::model::CENTRE_REF, "10 10 -50"),
-                ] {
-                    m.p.insert(k.into(), v.into());
-                }
-                doc.setups[0].machine = m;
-                let p = &mut doc.setups[0].p;
-                p.insert("stock_diameter".into(), bar.to_string());
-                // The part on the bar's axis.
-                let s = mesh.display_scale();
-                let tz = bar / 2. - mesh.dimensions[2] / 2. - 4. / s;
-                p.insert("tz".into(), tz.to_string());
-                doc.tools[0].p.insert("number".into(), "1".into());
-                doc.file = Some(crate::model::ModelFile {
-                    name: "bar.stl".into(),
-                    path: "bar.stl".into(),
-                    format: "STL".into(),
-                    bytes: 1,
-                });
-                doc.machines = vec![doc.setups[0].machine.clone()];
-                doc.sync_indexed();
-                doc.sync_stock_sources();
-                doc.sync_turns(Some(mesh));
-                doc
-            };
+        let job = |mesh: &crate::mesh::Mesh, x0, stickout, bar, controller| {
+            library_bar_job(dir.path(), mesh, x0, stickout, bar, controller)
+        };
         let doc = job(&mesh, 20., "100", 40., "UC100");
         let m = doc.setups[1].machine.clone();
         let unit = m.rotary_unit().unwrap();
@@ -5563,38 +5656,8 @@ spindle_max_rpm = 24000
         let refused = crate::run::check(&thick("UC100"), &mesh, 1).0.unwrap_err();
         assert!(says(&refused), "{refused:?}");
         // The Ø40 job runs on the simulated UC100, its travel and A range
-        // the library machine's.
-        let profile = [
-            ("soft_max = 600.0", "soft_max = 390.0"),
-            ("soft_max = 400.0", "soft_max = 280.0"),
-            ("soft_min = -300.0", "soft_min = -55.0"),
-            ("soft_min = -360.0", "soft_min = -180.0"),
-            ("soft_max = 360.0", "soft_max = 180.0"),
-        ]
-        .iter()
-        .fold(ROTARY_SIM.to_string(), |p, (from, to)| p.replace(from, to));
-        let mut c = zeroed_sim(dir.path(), &profile, Some(&m), 4);
-        let (programs, left) = crate::run::check(&doc, &mesh, 1);
-        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
-        let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
-        let here = c.snapshot.machine_pos;
-        for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
-            c.send(Command::SetWork {
-                axis,
-                value: here[axis] - z,
-            });
-            until(&mut c, 2.0, "the work offset", |s| {
-                (s.work_offset[axis] - z).abs() < 1e-6
-            });
-        }
-        let mut run = crate::run::Run::new(&doc, 1, 0);
-        run.checked_as(
-            std::sync::Arc::new(Ok(programs)),
-            Some(std::sync::Arc::new(left)),
-        );
-        // Touched off on the A reference, as long as the probe.
-        run.length = Some((doc.tools[0].id.clone(), 0., -50.));
-        c.run = Some(run);
+        // the library machine's, the tool over the bar's free end.
+        let mut c = library_run(dir.path(), &doc, &mesh);
         let problems = c.run.as_ref().unwrap().problems(&c, &doc);
         assert!(problems.is_empty(), "{problems:?}");
         // Every turn of A with the tool at that height, inside the travel.
@@ -5650,6 +5713,189 @@ spindle_max_rpm = 24000
         assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
         assert!(c.snapshot.machine_pos[3].abs() < 0.03);
     }
+    /// LIO-212: the library CNC4030 + rotary retracts to machine Z home, so
+    /// a run on it retracts as export does, to the top of Z, and its checks
+    /// take that retract: with clearance-plane retracts both refuse the job
+    /// alike, the plane under the jaws' reach. Run and export make the same
+    /// moves. From wherever the machine is the run goes up (never down),
+    /// across, turns A and comes down, each move checked against the chuck
+    /// at the A it is made at: parked over the jaws at machine X25 Z0 A30,
+    /// or beside the chuck, Cycle Start is refused with what it would hit,
+    /// at the start and from a later operation alike; from over the bar's
+    /// free end it starts, at any A.
+    #[test]
+    fn a_run_on_the_library_rotary_machine_retracts_up_as_export_does_and_checks_its_way_in() {
+        use crate::indexed::tests::prism;
+        use crate::model::{POST_RETRACT, POST_TOOL_LENGTH};
+        use crate::post::PostSettings;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        // A second operation, for a start partway.
+        let job = |controller| {
+            let mut doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., controller);
+            let mut second = doc.setups[1].operations[0].clone();
+            second.id = crate::model::id();
+            doc.setups[1].operations.push(second);
+            doc.sync_turns(Some(&mesh));
+            doc
+        };
+        let doc = job("UC100");
+        // Export in touch-off mode, as a run is made.
+        let mut linuxcnc = job("LinuxCNC");
+        (linuxcnc.setups[0].machine.p)
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        linuxcnc.sync_indexed();
+        // One retract for the run, its checks and export: the top of Z.
+        let settings = PostSettings::for_uc100(&doc.setups[1].machine).unwrap();
+        assert!(settings.machine_home);
+        let exported = PostSettings::from_machine(&linuxcnc.setups[1].machine).unwrap();
+        assert_eq!(settings, exported);
+        // Retracting to the clearance plane, both refuse it alike.
+        for (d, run) in [(&doc, true), (&linuxcnc, false)] {
+            let mut plane = d.clone();
+            (plane.setups[0].machine.p).insert("post_retract".into(), POST_RETRACT[1].into());
+            plane.sync_indexed();
+            let refused = match run {
+                true => crate::run::check(&plane, &mesh, 1).0.unwrap_err(),
+                false => (crate::post::post_job(&plane, &mesh).setups[1]
+                    .result
+                    .clone())
+                .unwrap_err(),
+            };
+            assert!(
+                refused
+                    .iter()
+                    .any(|e| e.contains("is not above the chuck jaw")),
+                "run {run}: {refused:?}"
+            );
+        }
+        // Run and export make the same moves, from the tool over the bar's
+        // free end at the top of Z.
+        let mut c = library_run(dir.path(), &doc, &mesh);
+        let problems = |c: &Connection| c.run.as_ref().unwrap().problems(c, &doc);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let offset = c.snapshot.work_offset;
+        let moves = |k: usize, start: Vec6| -> Vec<Vec6> {
+            (crate::run::lower(&p, k, offset, start).unwrap().iter())
+                .filter_map(|l| match l.action {
+                    Do::Move { target, .. } => Some(target),
+                    _ => None,
+                })
+                .collect()
+        };
+        let programs = crate::post::post_job(&linuxcnc, &mesh).setups[1]
+            .result
+            .clone()
+            .unwrap();
+        let replay = crate::ngc::replay(&programs[0].text).unwrap();
+        // The exported program's moves at the work offset, from `start`.
+        let posted = |start: Vec6| -> Vec<Vec6> {
+            let mut at = start;
+            let mut out = vec![];
+            for step in (replay.steps.iter()).filter(|s| s.kind != crate::ngc::StepKind::Dwell) {
+                let mut to = at;
+                for k in 0..3 {
+                    if let Some(v) = step.to[k] {
+                        to[k] = if step.machine { v } else { v + offset[k] };
+                    }
+                }
+                if let Some(a) = step.a {
+                    to[3] = a + offset[3];
+                }
+                if (0..4).any(|k| (to[k] - at[k]).abs() > 2e-3) {
+                    out.push(to);
+                    at = to;
+                }
+            }
+            out
+        };
+        // From the top of Z, and from 10 mm under it, where both first
+        // retract up, Z alone.
+        let start = c.snapshot.machine_pos;
+        let mut under = start;
+        under[2] = -10.;
+        for from in [start, under] {
+            let (run, posted) = (moves(0, from), posted(from));
+            assert_eq!(run.len(), posted.len());
+            for (r, e) in run.iter().zip(&posted) {
+                assert!(
+                    (0..4).all(|k| (r[k] - e[k]).abs() < 2e-3),
+                    "run {r:?}, export {e:?}"
+                );
+            }
+        }
+        assert_eq!(moves(0, under)[0][..3], [150., 140., 0.]);
+        // The way in: up, never down; across with A still; A alone; down.
+        let way = |found: &[Vec6], from: Vec6| -> Vec<&str> {
+            let mut at = from;
+            let mut out = vec![];
+            for m in found {
+                let d: Vec<bool> = (0..4).map(|k| (m[k] - at[k]).abs() > 1e-9).collect();
+                out.push(match (d[0] || d[1], d[2], d[3]) {
+                    (false, true, false) if m[2] > at[2] => "up",
+                    (false, true, false) => "down",
+                    (true, false, false) => "across",
+                    (false, false, true) => "turn",
+                    _ => "other",
+                });
+                at = *m;
+                if out.last() == Some(&"down") {
+                    break;
+                }
+            }
+            out
+        };
+        // Parked over the jaws at the top of Z, A at 30°: across at Z 0, A
+        // turned there to A0 over the first cut, then down; the way across
+        // starts within the chuck's reach (its body is Ø100 round the
+        // centreline at Z -40, up to Z 10), and Cycle Start is refused.
+        let refused = |c: &Connection| -> Vec<String> {
+            problems(c)
+                .into_iter()
+                .filter(|p| p.starts_with("From where the machine is, Cycle Start would bring the"))
+                .collect()
+        };
+        go_to(&mut c, [25., 140., 0., 30.]);
+        let here = c.snapshot.machine_pos;
+        assert_eq!(way(&moves(0, here), here), ["across", "turn", "down"]);
+        assert!(moves(0, here)[..2].iter().all(|m| m[2] == 0.));
+        let said = refused(&c);
+        assert!(
+            said.len() == 1
+                && said[0].contains("of the chuck")
+                && said[0].contains("on the way across at A 30°"),
+            "{said:?}"
+        );
+        c.run_act(R::CycleStart, &doc);
+        assert!(c.run.as_ref().unwrap().running.is_none());
+        // Beside the chuck's body, off to +Y and down: up to the top of Z,
+        // then across over the body, which reaches above it. From beside
+        // the jaws, 20 mm farther along X, the way across is clear of it.
+        go_to(&mut c, [30., 205., -30., 0.]);
+        assert!(refused(&c).is_empty(), "{:?}", problems(&c));
+        go_to(&mut c, [10., 205., -30., 0.]);
+        let here = c.snapshot.machine_pos;
+        assert_eq!(way(&moves(0, here), here), ["up", "across", "down"]);
+        let said = refused(&c);
+        assert!(
+            said.len() == 1 && said[0].contains("chuck body on the way across at A 0°"),
+            "{said:?}"
+        );
+        // So from the second operation, as after a Stop.
+        c.run_act(R::From(0, 1), &doc);
+        assert_eq!(way(&moves(1, here), here), ["up", "across", "down"]);
+        assert!(refused(&c).len() == 1, "{:?}", problems(&c));
+        c.run_act(R::From(0, 0), &doc);
+        // Over the bar's free end, down at -10 at A -120: up to the top of
+        // Z, across, A turned to A0 over the first cut, down; all clear.
+        go_to(&mut c, [150., 140., -10., -120.]);
+        let here = c.snapshot.machine_pos;
+        assert_eq!(way(&moves(0, here), here), ["up", "across", "turn", "down"]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+    }
+
     /// A Ø40 bar milled square at A 0, 90, 180 and 270 in one job on the
     /// simulated UC100 (LIO-192): admitted only on a measured, current A
     /// centreline with the work zero on it and every A inside its soft
@@ -5783,6 +6029,10 @@ spindle_max_rpm = 24000
         );
         set(&mut c, 3, 0.);
         assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        // The tool 20 mm under the top of Z, where the tool run's retract
+        // to machine home (Machine::new's Safe retract) lifts it (LIO-212).
+        go_to(&mut c, [0., 0., -20., 0.]);
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
         // Lowered: A turns alone, to each angle in order, then back to A0.
         let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
         let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
@@ -5830,7 +6080,7 @@ spindle_max_rpm = 24000
             panic!("{before:?}");
         };
         assert!(
-            retract[..2] == start[..2] && retract[3] == start[3],
+            retract[..2] == start[..2] && retract[2] == 0. && retract[3] == start[3],
             "{retract:?}"
         );
         assert!(
@@ -7674,6 +7924,7 @@ probe = { pin = 13, active_low = true }
             angles: vec![0., 180.],
             a_range: None,
             a_step: 0.0225,
+            sign: 1.,
             touches: vec![],
             found: vec![],
             spacing: 10.,
@@ -7751,7 +8002,10 @@ probe = { pin = 13, active_low = true }
     /// from +Z toward −Y at A 0 (as `SimAxis::flat`), its A wired `wired`:
     /// 1 the convention's way, −1 backwards. The A it levels the flat at,
     /// or why it stops.
-    fn a_zero_walk(flat_at: f64, wired: f64) -> Result<f64, String> {
+    /// A zero walked over the simulator's bar with a flat `flat_at` degrees
+    /// from level, A turning it by `wired` × A, on a machine whose
+    /// Direction is `sign`.
+    fn a_zero_walk(flat_at: f64, wired: f64, sign: f64) -> Result<f64, String> {
         let t = flat_at.to_radians();
         let bar = Bar {
             x: [20., 270.],
@@ -7774,6 +8028,7 @@ probe = { pin = 13, active_low = true }
             angles: vec![0.],
             a_range: Some((-180., 180.)),
             a_step: 0.0225,
+            sign,
             touches: vec![],
             found: vec![],
             spacing: 6.,
@@ -7803,10 +8058,13 @@ probe = { pin = 13, active_low = true }
         Ok(t.angle())
     }
 
-    /// +A is the right-hand rule about +X (LIO-210): the simulator's bar
-    /// turns that way, A zero levels a flat by it, and an A wired
-    /// backwards is refused, even on a flat level already, never adapted
-    /// to.
+    /// +A is the right-hand rule about +X on a machine whose Direction is
+    /// Positive (LIO-210): the simulator's bar turns that way, A zero levels
+    /// a flat by it, and an A wired backwards is refused, even on a flat
+    /// level already, never adapted to. A machine whose Direction is
+    /// Negative takes +A the other way (LIO-212): A zero levels the flat on
+    /// an A that turns so, and refuses one that turns by the right-hand
+    /// rule.
     #[test]
     fn a_zero_refuses_an_a_that_turns_backwards() {
         // The simulator's bar, its centre 1 mm up at A 0, has it 1 mm
@@ -7823,19 +8081,35 @@ probe = { pin = 13, active_low = true }
         let down = |y: f64| bar.entry(90., [100., y, 0.], [100., y, -80.], 0.);
         assert!(down(139.).is_some() && down(141.).is_none());
         for (flat, level) in [(2., -2.), (0.4, -0.4), (0., 0.), (-3., 3.)] {
-            let a = a_zero_walk(flat, 1.).unwrap();
+            let a = a_zero_walk(flat, 1., 1.).unwrap();
             assert!((a - level).abs() < 0.03, "{flat}°: A {a}");
+            let a = a_zero_walk(flat, -1., -1.).unwrap();
+            assert!((a + level).abs() < 0.03, "Negative, {flat}°: A {a}");
         }
         for flat in [2., 0.4, 0., -3.] {
-            let why = a_zero_walk(flat, -1.).unwrap_err();
+            let why = a_zero_walk(flat, -1., 1.).unwrap_err();
             assert!(
                 why.starts_with("A turns backwards")
-                    && why.contains("toward +Y")
-                    && why.contains("Reverse the direction")
-                    && why.contains("does not adapt"),
+                    && why.contains("+A turns the top of the part toward +Y")
+                    && why.contains("The machine's Direction is Positive")
+                    && why.contains("Reverse the direction"),
                 "{flat}°: {why}"
             );
+            let why = a_zero_walk(flat, 1., -1.).unwrap_err();
+            assert!(
+                why.starts_with("A turns backwards")
+                    && why.contains("+A turns the top of the part toward −Y")
+                    && why.contains("The machine's Direction is Negative")
+                    && why.contains("Direction to match it"),
+                "Negative, {flat}°: {why}"
+            );
         }
+        // The machine's Direction is what A zero takes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = rotary_machine(dir.path()).unwrap();
+        assert_eq!(Rotary::of(&m).unwrap().sign, 1.);
+        m.p.insert("direction".into(), "Negative".into());
+        assert_eq!(Rotary::of(&m).unwrap().sign, -1.);
     }
 
     #[test]

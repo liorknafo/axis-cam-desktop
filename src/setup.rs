@@ -40,9 +40,9 @@ pub struct Draft {
     pub a_direction: bool,
 }
 
-/// The A axis' commissioning step for its direction (LIO-210): +A is the
-/// right-hand rule about +X.
-pub const A_DIRECTION: &str = "Jogged A+ and the top of the part moved toward −Y, the front (+A is the right-hand rule about +X; if it moved toward the back, tick Reverse the direction)";
+/// The A axis' commissioning step for its direction (LIO-210): +A turns the
+/// part as the machine's Direction says (LIO-212).
+pub const A_DIRECTION: &str = "Jogged A+ and the top of the part moved the way the machine's Direction in the Machine library says: toward −Y, the front, for Positive (the right-hand rule about +X), toward +Y, the back, for Negative (if it moved the other way, tick Reverse the direction)";
 
 /// What the Setup view asks.
 #[derive(Debug, Clone)]

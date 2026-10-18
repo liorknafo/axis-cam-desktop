@@ -603,6 +603,16 @@ impl Run {
             }
         }
         e.extend(a_problems(&setup.machine, &c.config));
+        // A retract to machine home goes to machine Z 0, which the checks
+        // take as the top of Z.
+        if p.settings.machine_home
+            && let Some(top) = limits[2].map(|(_, hi)| hi)
+            && top.abs() > 1e-6
+        {
+            e.push(format!(
+                "This setup retracts to machine home, machine Z 0, which the checks take as the top of Z's travel, but the UC100 profile's Z soft limits end at {top:.3} mm. Make Z's soft maximum 0."
+            ));
+        }
         if let Some(blocks) = blocks {
             e.extend(rotary_problems(
                 c,
@@ -646,6 +656,11 @@ impl Run {
                     ));
                 }
             }
+        }
+        if let Some(blocks) = blocks
+            && unset.is_empty()
+        {
+            e.extend(way_in_problems(p, blocks, s.work_offset, s.machine_pos));
         }
         e.extend(output_problems(&c.config.outputs, &p.ops[from..]));
         // A spindle left running by hand the other way: the driver E-stops a
@@ -1430,6 +1445,15 @@ pub(crate) fn plan_problems(
 /// Cycle Start is pressed: the first retract moves Z alone there, and A, B
 /// and C stay where they are. Each action's line is its block's index + 1.
 ///
+/// A retract goes to machine Z 0, the top of Z, when the program's settings
+/// retract to machine home (`G53 G0 Z0`, a machine with A whose Safe
+/// retract says so), else to the setup clearance plane; it never moves Z
+/// down: a tool above that height stays there (LIO-212). The approach after
+/// it moves X and Y alone at the height the tool is at, as export's `G0 X Y`
+/// does, A turns over the first point and the tool comes down onto it: from
+/// wherever the machine is, the way in goes up, across, turns A and comes
+/// down, each move alone, as `way_in_problems` checks it.
+///
 /// An indexed program's A angles become machine A the same way (machine A =
 /// A + A's work offset). A turns only in its index blocks (`Block::Index`),
 /// a rapid of A alone at A's speed with X, Y and Z still, made where the
@@ -1449,6 +1473,18 @@ pub fn lower(
     start: [f64; 6],
 ) -> Result<Vec<Located>, Vec<String>> {
     let blocks = p.from(k)?;
+    lower_blocks(p, blocks, blocks.len(), offset, start)
+}
+
+/// `lower` of program `p`'s `blocks` (its own, or from one of its
+/// operations on) up to block `end`.
+fn lower_blocks(
+    p: &Checked,
+    blocks: &[Block],
+    end: usize,
+    offset: [f64; 6],
+    start: [f64; 6],
+) -> Result<Vec<Located>, Vec<String>> {
     let plane = clearance_plane(blocks);
     // X, Y and Z of plan point `q`; A, B and C where the tool is (`at`).
     let machine = |q: [f32; 3], at: [f64; 6]| -> [f64; 6] {
@@ -1458,11 +1494,15 @@ pub fn lower(
         }
         m
     };
-    let high = machine([0., 0., plane], start)[2];
+    // Machine Z 0 is the top of Z's travel.
+    let high = match p.settings.machine_home {
+        true => 0.,
+        false => machine([0., 0., plane], start)[2],
+    };
     let mut out = vec![];
     let mut at = start;
     let (mut spindle, mut coolant) = (false, (false, false));
-    for (i, block) in blocks.iter().enumerate() {
+    for (i, block) in blocks[..end].iter().enumerate() {
         let line = i as u32 + 1;
         let mut actions = vec![];
         match block {
@@ -1484,7 +1524,7 @@ pub fn lower(
             }
             Block::Retract => {
                 let mut to = at;
-                to[2] = high;
+                to[2] = high.max(at[2]);
                 go(&mut at, to, None, &mut actions);
             }
             Block::Start { .. } => {}
@@ -1516,8 +1556,10 @@ pub fn lower(
             Block::Wait { seconds } | Block::Standstill { seconds } => actions.push(Do::Dwell {
                 seconds: *seconds as f64,
             }),
+            // X and Y alone, at the retract's height.
             Block::Approach { xy, .. } => {
-                let to = machine([xy[0], xy[1], plane], at);
+                let mut to = machine([xy[0], xy[1], 0.], at);
+                to[2] = at[2];
                 go(&mut at, to, None, &mut actions)
             }
             Block::Descend { xy, z, .. } => {
@@ -1564,6 +1606,55 @@ pub fn lower(
         )]);
     }
     Ok(out)
+}
+
+/// Why Cycle Start cannot take the tool from where the machine is, `start`,
+/// into program `p` at the first operation of its `blocks`, with the live
+/// work `offset`, on a setup in the chuck (`Checked::chuck`, LIO-212): its
+/// way in as `lower` makes it (up to the retract height, across, A turning
+/// and down onto the first point), each move checked at the A it is made
+/// at (`rotary_check::Chuck::way_in`). Wherever the machine stands, at any
+/// X, Z and A, after a Stop or before a later operation alike. Nothing for
+/// a setup not in the chuck: its clearance plane, checked over all its
+/// clamping, is clear from wherever the tool comes to it.
+fn way_in_problems(
+    p: &Checked,
+    blocks: &[Block],
+    offset: [f64; 6],
+    start: [f64; 6],
+) -> Vec<String> {
+    let Some(chuck) = &p.chuck else {
+        return vec![];
+    };
+    let end = blocks
+        .iter()
+        .position(|b| matches!(b, Block::Descend { .. }))
+        .map_or(blocks.len(), |i| i + 1);
+    let actions = match lower_blocks(p, blocks, end, offset, start) {
+        Ok(actions) => actions,
+        Err(why) => return why,
+    };
+    let op = blocks[..end].iter().find_map(|b| match b {
+        Block::Start { op, .. } => Some(*op),
+        _ => None,
+    });
+    // Machine X, Y, Z and A in the setup's frame, A as commanded.
+    let frame = |m: [f64; 6]| -> ([f32; 3], f32) {
+        (
+            std::array::from_fn(|k| (m[k] - offset[k] + p.datum[k] as f64) as f32),
+            (m[3] - offset[3]) as f32,
+        )
+    };
+    let mut at = start;
+    let mut moves = vec![];
+    for l in &actions {
+        if let Do::Move { target, .. } = l.action {
+            let ((from, a), (to, b)) = (frame(at), frame(target));
+            moves.push((from, to, a, b));
+            at = target;
+        }
+    }
+    chuck.way_in(op.unwrap_or(0), &moves, p.datum)
 }
 
 /// Within this of each other, two A positions are the same (degrees): far
@@ -1716,6 +1807,7 @@ mod tests {
             pins: None,
             starts: vec![],
             partly: vec![],
+            chuck: None,
         }
     }
 
@@ -1801,7 +1893,8 @@ mod tests {
         let p = program();
         // Work zero (the stock top centre, plan Z10) at machine X100 Y50 Z-30.
         let offset = [100., 50., -30., 0., 0., 0.];
-        let start = [7., 8., -2., 0., 0., 45.];
+        // Under the clearance plane: the retract lifts Z alone to it.
+        let start = [7., 8., -27., 0., 0., 45.];
         let actions = lower(&p, 0, offset, start).unwrap();
         // Plan times are f32: a dwell is its seconds to a few µs.
         let found: Vec<Do> = actions
@@ -1858,6 +1951,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A retract never moves Z down (LIO-212): from above the clearance
+    /// plane (machine Z-25 here) the tool stays at its height, crosses
+    /// there and comes down to the first point; from below it, it goes up
+    /// to the plane as before. The end's retract, after the cut, goes up.
+    /// Retracting to machine home, it goes to machine Z 0, the top of Z,
+    /// and stays there from a start at it.
+    #[test]
+    fn a_retract_below_the_tool_does_not_move_it_down() {
+        let p = program();
+        let offset = [100., 50., -30., 0., 0., 0.];
+        let moves = |p: &Checked, start: [f64; 6]| -> Vec<[f64; 6]> {
+            (lower(p, 0, offset, start).unwrap().iter())
+                .filter_map(|l| match l.action {
+                    Do::Move { target, .. } => Some(target),
+                    _ => None,
+                })
+                .collect()
+        };
+        let high = moves(&p, [7., 8., -2., 0., 0., 0.]);
+        assert_eq!(
+            high[..3],
+            [
+                [100., 50., -2., 0., 0., 0.],
+                [100., 50., -25., 0., 0., 0.],
+                [100., 50., -35., 0., 0., 0.],
+            ]
+        );
+        assert_eq!(high.last().unwrap(), &[110., 50., -25., 0., 0., 0.]);
+        let low = moves(&p, [7., 8., -40., 0., 0., 0.]);
+        assert_eq!(
+            low[..2],
+            [[7., 8., -25., 0., 0., 0.], [100., 50., -25., 0., 0., 0.]]
+        );
+        let mut home = program();
+        home.settings.machine_home = true;
+        let up = moves(&home, [7., 8., -2., 0., 0., 0.]);
+        assert_eq!(
+            up[..3],
+            [
+                [7., 8., 0., 0., 0., 0.],
+                [100., 50., 0., 0., 0., 0.],
+                [100., 50., -25., 0., 0., 0.],
+            ]
+        );
+        let top = moves(&home, [7., 8., 0., 0., 0., 0.]);
+        assert_eq!(top[..2], up[1..3]);
+        assert_eq!(top.last().unwrap(), &[110., 50., 0., 0., 0., 0.]);
     }
 
     /// A facing tool run made at A90 then A180 as an indexed setup's

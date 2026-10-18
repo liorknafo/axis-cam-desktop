@@ -44,10 +44,12 @@ impl PostSettings {
         Ok(Self::read(m))
     }
     /// What running a setup on a UC100 machine uses: touch-off mode (one
-    /// program per tool run, the tool changed by hand in between), retracts
-    /// to the setup clearance plane, which the checks prove clear of the
-    /// stock and the jaws, and the machine's spindle start dwell and Air
-    /// output. The driver blends corners with the profile's own setting:
+    /// program per tool run, the tool changed by hand in between), and the
+    /// machine's spindle start dwell and Air output. A 3-axis machine
+    /// retracts to the setup clearance plane, which the checks prove clear
+    /// of the stock and the jaws; a machine with A retracts as its Safe
+    /// retract says, as export does (`G53 G0 Z0`: the top of Z), so that the
+    /// run, its checks and export take one retract (LIO-212). The driver blends corners with the profile's own setting:
     /// nothing writes it, and the checks allow for it as export's do. A
     /// 4-axis machine with A around X is accepted, as export accepts it, and
     /// a run turns its A (`run::lower`).
@@ -66,10 +68,11 @@ impl PostSettings {
         if !e.is_empty() {
             return Err(e);
         }
+        let read = Self::read(m);
         Ok(Self {
             tool_table: false,
-            machine_home: false,
-            ..Self::read(m)
+            machine_home: m.has_a() && read.machine_home,
+            ..read
         })
     }
     /// What the planner checks a machine's setups with: a UC100 run's
@@ -2769,6 +2772,10 @@ pub struct Checked {
     /// operations of the setup before it being cut. Empty unless worked out
     /// for a run.
     pub partly: Vec<Partly>,
+    /// The chuck the setup's stock is held in, which a run's way in from
+    /// wherever the machine is is checked against (`run::way_in_problems`,
+    /// LIO-212); None for a setup not in the chuck.
+    pub chuck: Option<crate::rotary_check::Chuck>,
 }
 impl Checked {
     /// The program from operation `k` (index in `ops`) on: the whole from
@@ -2949,6 +2956,14 @@ fn checked_with(
             setup, group_ops, group_sims, &blocks, &settings, zero,
         ));
         problems.extend(index_problems(doc, mesh, si, &walk, g, &blocks));
+        let tools: Vec<(usize, &Plan)> = g
+            .clone()
+            .map(|k| (walk.indexes[k], &walk.simulations[k].plan))
+            .collect();
+        let chuck = crate::rotary_check::chuck(doc, mesh, si, held.stock, &tools, settings.blend)
+            .map_err(|e| problems.push(format!("{}: {e}", setup.name())))
+            .ok()
+            .flatten();
         // An indexed setup's jaws were checked at each angle above.
         if !indexed {
             problems.extend(
@@ -3019,6 +3034,7 @@ fn checked_with(
             pins: found.pins.clone(),
             starts,
             partly: partly.get(g.clone()).map(<[_]>::to_vec).unwrap_or_default(),
+            chuck,
         });
     }
     Ok(out)
