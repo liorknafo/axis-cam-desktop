@@ -221,7 +221,10 @@ pub fn problems(
         } else {
             NOT_PLACED
         };
-        out.push((None, format!("{name}: {why}")));
+        // Said once: the swing finds the geometry missing too.
+        if !out.iter().any(|(_, m)| m.ends_with(why)) {
+            out.push((None, format!("{name}: {why}")));
+        }
         return out;
     };
     let limits = match limits(machine) {
@@ -237,6 +240,10 @@ pub fn problems(
     let on_machine =
         |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|k| p[k] - at.zero[k] + machine_zero[k]) };
     let centre_z = unit.map_or(0., |u| u.centre_z);
+    // The holder is kept the setup's gap over the bar, as off the jaws.
+    let gap = crate::holding::gap(&doc.setups[base]).unwrap_or(2.);
+    // The A the machine is at, from one operation to the next.
+    let mut a_now = a_before(doc, si);
     for (oi, sim) in sims
         .iter()
         .filter_map(|(oi, r)| r.as_ref().ok().map(|s| (*oi, s)))
@@ -256,7 +263,6 @@ pub fn problems(
         };
         let mut holder = None;
         let mut index = None;
-        let mut a_now = plan.moves.first().and_then(|m| m.a).unwrap_or(first);
         for m in &plan.moves {
             let a = m.a.unwrap_or(a_now);
             for p in [m.from, m.to] {
@@ -283,8 +289,8 @@ pub fn problems(
             let bottom = m.from[2].min(m.to[2]);
             if let Some(top) = bar
                 .as_ref()
-                .and_then(|b| b.top_under(m.from, m.to, plan.holder_radius))
-                && bottom + plan.tool_length < top - 1e-3
+                .and_then(|b| b.top_under(m.from, m.to, plan.holder_radius + gap))
+                && bottom + plan.tool_length < top + gap - 1e-3
             {
                 holder = Some((
                     a,
@@ -300,17 +306,16 @@ pub fn problems(
                 format!("{name} at A {}°, {op}: {what}", degrees(a)),
             )
         };
-        for k in 0..4 {
+        // Each end of each axis, against the first of its limits it is past.
+        for (k, below) in (0..4).flat_map(|k| [(k, true), (k, false)]) {
             let axis = ["X", "Y", "Z", "A"][k];
             for (what, lo, hi) in &limits[k] {
-                let ((v, a), beyond) = if low[k].0 < lo - 1e-3 {
-                    (low[k], lo - low[k].0)
-                } else if high[k].0 > hi + 1e-3 {
-                    (high[k], high[k].0 - hi)
-                } else {
-                    continue;
+                let ((v, a), beyond) = match below {
+                    true if low[k].0 < lo - 1e-3 => (low[k], lo - low[k].0),
+                    false if high[k].0 > hi + 1e-3 => (high[k], high[k].0 - hi),
+                    _ => continue,
                 };
-                let line = match (k, v < *lo) {
+                let line = match (k, below) {
                     (2, true) => format!(
                         "the cut's bottom is at machine Z {}, {} mm short: below Z {}, the bottom of {what}. The {words} is centred at machine Z {}{}. Cut it from another angle, or measure the A centreline (Rotary A on the Control page).",
                         mm(v),
@@ -350,7 +355,7 @@ pub fn problems(
                     ),
                 };
                 out.push(say(a, line));
-                // The first limit it is outside is enough.
+                // The first limit it is past is enough.
                 break;
             }
         }
@@ -365,12 +370,20 @@ pub fn problems(
             )));
         }
         if let Some((a, top, bottom, p)) = holder {
+            let over = bottom + plan.tool_length - top;
+            let left = match over < 0. {
+                true => format!("{} mm into it", mm(-over)),
+                false => format!(
+                    "only {} mm over it, inside the {} mm gap",
+                    mm(over),
+                    mm(gap)
+                ),
+            };
             out.push(say(a, format!(
-                "the holder, and the spindle above it, would come down onto the {words} at X{} Y{}: the cut goes {} mm below the bar's top there, {} mm more than the tool's {} mm stick-out. Use a longer stick-out or a shallower cut.",
+                "the holder, and the spindle above it, would come down onto the {words} at X{} Y{}: the cut goes {} mm below the bar's top there, and the tool's {} mm stick-out leaves the holder {left}. Use a longer stick-out or a shallower cut.",
                 mm(p[0] - at.zero[0]),
                 mm(p[1] - at.zero[1]),
                 mm(top - bottom),
-                mm(top - bottom - plan.tool_length),
                 mm(plan.tool_length),
             )));
         }
@@ -764,6 +777,24 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_too_low_whose_retract_is_too_high_is_refused_at_both_ends() {
+        let (doc, mesh, sim) = job("-150", "90");
+        let said = reach(&doc, &mesh, &sim, [300., 300., 0.01], 90.);
+        assert_eq!(said.len(), 1, "{said:?}");
+        let (from, to) = (
+            frame(&doc, &mesh, [300., 300., 0.01]),
+            frame(&doc, &mesh, [300., 300., -300.01]),
+        );
+        let said = found(&doc, &mesh, with(&sim, &[(from, to, Motion::Feed, 90.)]));
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said[0].contains("the cut's bottom is at machine Z -300.01")
+                && said[1].contains("the tool goes up to machine Z 0.01"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
     fn a_uc100s_profile_soft_limits_are_kept_too() {
         let (mut doc, mesh, sim) = job("-150", "90");
         let dir = tempfile::tempdir().unwrap();
@@ -825,21 +856,26 @@ mod tests {
 
     #[test]
     fn the_holder_coming_down_onto_the_bar_is_refused_with_how_much() {
-        // The tool is 50 mm out of its holder; the Ø40 bar's top is at Z 40.
+        // The tool is 50 mm out of its holder and the gap is 2 mm; the Ø40
+        // bar's top is at Z 40.
         let (doc, mesh, sim) = job("-150", "90");
-        for (deep, refused) in [(50.01, true), (49.99, false)] {
+        let into = "the cut goes 50.01 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder 0.01 mm into it.";
+        let near = "the cut goes 48.01 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder only 1.99 mm over it, inside the 2 mm gap.";
+        for (deep, refused) in [(50.01, Some(into)), (48.01, Some(near)), (47.99, None)] {
             let (from, to) = ([0., 0., 60.], [10., 0., 40. - deep]);
             let said = found(&doc, &mesh, with(&sim, &[(from, to, Motion::Feed, 90.)]));
-            if refused {
-                assert_eq!(said.len(), 1, "{said:?}");
-                assert!(said[0].starts_with("Flats at A 90°, Contour: the holder, and the spindle above it, would come down onto the Ø40 mm bar at X-50 Y0: the cut goes 50.01 mm below the bar's top there, 0.01 mm more than the tool's 50 mm stick-out."), "{said:?}");
-            } else {
-                assert!(said.is_empty(), "{said:?}");
+            match refused {
+                Some(words) => {
+                    assert_eq!(said.len(), 1, "{said:?}");
+                    let start = "Flats at A 90°, Contour: the holder, and the spindle above it, would come down onto the Ø40 mm bar at X-50 Y0: ";
+                    assert!(said[0].starts_with(&format!("{start}{words}")), "{said:?}");
+                }
+                None => assert!(said.is_empty(), "{said:?}"),
             }
         }
-        // Beside the bar, past the holder's reach, it is clear.
+        // Beside the bar, past the holder's reach and the gap, it is clear.
         let r = sim.plan.holder_radius;
-        let beside = [0., 20. + r + 0.01, -20.];
+        let beside = [0., 20. + r + 2.01, -20.];
         assert!(
             found(
                 &doc,
@@ -861,7 +897,7 @@ mod tests {
                 assert_eq!(said.len(), 1, "{said:?}");
                 assert!(
                     said[0].contains(
-                        "the index move from A 90° to A 90° turns A with the tool tip at Z"
+                        "the index move from A 0° to A 90° turns A with the tool tip at Z"
                     ),
                     "{said:?}"
                 );
