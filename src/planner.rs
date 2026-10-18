@@ -3502,7 +3502,7 @@ pub(crate) mod tests {
         let text = || stream.lock().unwrap().clone();
         assert_eq!(
             backend
-                .reply(&messages, &[], ToolChoice::Auto)
+                .reply(&messages, &[], ToolChoice::Auto, false)
                 .await
                 .unwrap()
                 .text,
@@ -3511,7 +3511,7 @@ pub(crate) mod tests {
         assert_eq!(text(), "{}", "the structured refusal streamed nothing");
         *stream.lock().unwrap() = "x".repeat(40);
         let tools = planner_tools::offered(true);
-        let reply = backend.reply(&messages, &tools, ToolChoice::None);
+        let reply = backend.reply(&messages, &tools, ToolChoice::None, false);
         assert_eq!(reply.await.unwrap().text, "{}");
         assert_eq!(text(), "{}", "the plain request starts the text again");
         let sent = fake.seen("/v1/responses");
@@ -4169,6 +4169,7 @@ pub(crate) mod tests {
             pictures: true,
             tool: true,
             overview: false,
+            edit: false,
         };
         let mut state = ToolState::new(look::Scene {
             doc: Arc::new(doc),
@@ -4676,6 +4677,7 @@ pub(crate) mod tests {
             pictures: true,
             tool: true,
             overview: true,
+            edit: false,
         };
         for error in [
             ApiError::BadRequest("tools and images".into()),

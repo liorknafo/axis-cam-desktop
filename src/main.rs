@@ -18,6 +18,7 @@ mod model;
 mod ngc;
 mod oauth;
 mod openai;
+mod plan_changes;
 mod plan_check;
 mod planner;
 mod planner_tools;
@@ -384,6 +385,14 @@ pub enum GuideAction {
     Beat(Instant),
     /// The guide of the job with this fingerprint (`App::guide_key`), built.
     Built(u64, Result<std::sync::Arc<steps::Shown>, String>),
+}
+/// A preview a change asked in the chat started from, as the page showed it.
+#[derive(Debug, Clone)]
+struct Refined {
+    preview: std::sync::Arc<PlanPreview>,
+    timeline: Vec<Step>,
+    overview: Option<Shown>,
+    asked: Option<String>,
 }
 /// A plan that passed every check, with the stock it leaves for the 3D view.
 #[derive(Debug)]
@@ -898,6 +907,9 @@ pub struct App {
     /// The chat request of the current run, or of the preview or failure it
     /// left; None for a run of Plan this job.
     pub plan_asked: Option<String>,
+    /// The preview a running change started from, which comes back when the
+    /// change fails or is cancelled.
+    plan_refined: Option<Refined>,
     pub undo: Option<Document>,
     pub confirm_delete_setup: bool,
     /// The operation editor asks before deleting the selected operation.
@@ -1310,6 +1322,7 @@ impl App {
             plan_request: String::new(),
             plan_chat: vec![],
             plan_asked: None,
+            plan_refined: None,
             plan_busy: planner::Busy::default(),
             plan_dropped: None,
             undo: None,
@@ -2594,12 +2607,22 @@ impl App {
             return Task::none();
         };
         let asked = (!chat.request.is_empty()).then(|| chat.request.clone());
-        let doc = match (&self.planner, &asked) {
-            (Planner::Preview(preview), Some(_)) => planner::applied(&preview.outcome),
-            _ => self.doc.clone(),
+        let refined = match (&self.planner, &asked) {
+            (Planner::Preview(preview), Some(_)) => Some(Refined {
+                preview: preview.clone(),
+                timeline: self.plan_timeline.clone(),
+                overview: self.plan_overview.clone(),
+                asked: self.plan_asked.clone(),
+            }),
+            _ => None,
         };
+        let doc = refined.as_ref().map_or_else(
+            || self.doc.clone(),
+            |r| planner::applied(&r.preview.outcome),
+        );
         let edit = planner::editing(&doc, &chat);
         self.drop_plan();
+        self.plan_refined = refined;
         let epoch = self.plan_epoch;
         self.plan_account_epoch = self.account_epoch;
         self.plan_model = self.settings.model.clone();
@@ -2623,6 +2646,13 @@ impl App {
         self.plan_run = Some(handle);
         task
     }
+    /// Shows again the preview a change started from.
+    fn restore_refined(&mut self, refined: Refined) {
+        self.planner = Planner::Preview(refined.preview);
+        self.plan_timeline = refined.timeline;
+        self.plan_overview = refined.overview;
+        self.plan_asked = refined.asked;
+    }
     /// Stop a running plan and forget a preview: both describe the job as it was.
     fn drop_plan(&mut self) {
         if let Some(handle) = self.plan_run.take() {
@@ -2635,6 +2665,7 @@ impl App {
         self.plan_enlarged = None;
         self.plan_expanded.clear();
         self.plan_asked = None;
+        self.plan_refined = None;
         // The aborted run may still write to the old text.
         self.plan_stream = Default::default();
     }
@@ -4579,7 +4610,19 @@ impl App {
                     self.refresh_guide(),
                 ]);
             }
-            Message::Plan => return self.start_plan(planner::Chat::default()),
+            Message::Plan => {
+                // Try again after a failed change asks for the same change.
+                let request = match &self.planner {
+                    Planner::Failed(_) => self.plan_asked.clone().unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let turns = if request.is_empty() {
+                    vec![]
+                } else {
+                    self.plan_chat.clone()
+                };
+                return self.start_plan(planner::Chat { turns, request });
+            }
             Message::PlanAsk(text) => self.plan_request = text,
             Message::PlanSend => {
                 let request = self.plan_request.trim().to_string();
@@ -4653,7 +4696,14 @@ impl App {
                     Err(failure) => {
                         self.status = failure.message.clone();
                         let api = failure.api.clone();
-                        self.planner = Planner::Failed(failure);
+                        // A failed change leaves the preview it started from;
+                        // the chat says why.
+                        if let Some(refined) = self.plan_refined.take() {
+                            self.status = format!("{} The preview is as it was.", failure.message);
+                            self.restore_refined(refined);
+                        } else {
+                            self.planner = Planner::Failed(failure);
+                        }
                         // Only the client the run started with can be signed out by it.
                         if let (Some(error), true) = (api, same_client) {
                             self.account_error(error);
@@ -4669,8 +4719,15 @@ impl App {
                     {
                         self.plan_request = asked;
                     }
+                    let refined = self.plan_refined.take();
                     self.drop_plan();
-                    self.status = "Planning cancelled. The job is unchanged.".into();
+                    self.status = if let Some(refined) = refined {
+                        self.restore_refined(refined);
+                        "Change cancelled. The preview is as it was."
+                    } else {
+                        "Planning cancelled. The job is unchanged."
+                    }
+                    .into();
                 }
             }
             Message::PlanPicture(picture) => {

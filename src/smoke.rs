@@ -12746,7 +12746,7 @@ flood = { pin = 8 }
         // The next request's attempt starts at zero and counts its own reply.
         assert_eq!(
             backend
-                .reply(&conversation, &[], crate::openai::ToolChoice::Auto)
+                .reply(&conversation, &[], crate::openai::ToolChoice::Auto, false)
                 .await
                 .unwrap()
                 .text,

@@ -1529,6 +1529,7 @@ pub(crate) mod tests {
             through: None,
             coolant: "Flood".into(),
             reason: "test".into(),
+            from: None,
         }
     }
     fn ids(report: &PartReport, up: &str, depth: f32) -> Vec<usize> {
