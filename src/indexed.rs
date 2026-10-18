@@ -299,7 +299,7 @@ impl Document {
         let base = self.index_base(si).ok_or(NOT_INDEXED)?;
         let clamped = &self.setups[base];
         let stock = self.setup_stock(base, Some(mesh)).ok_or(STOCK_UNKNOWN)?;
-        let unit = clamped.machine.rotary_unit().ok_or(NO_GEOMETRY)?;
+        let unit = self.rotary_unit(&clamped.machine).ok_or(NO_GEOMETRY)?;
         let axis = axis_of(stock);
         let [_, dy, dz] = stock.dimensions();
         let mut reach = vec![("the stock reaches", dy.hypot(dz) / 2.)];
@@ -369,7 +369,7 @@ impl Document {
         let axis = axis_of(stock);
         let frame = crate::volume::Frame::new(clamped, mesh).turned(axis, sign(&setup.machine) * a);
         let zero = crate::post::datum(clamped, stock, mesh)?;
-        let unit = clamped.machine.rotary_unit();
+        let unit = self.rotary_unit(&clamped.machine);
         let face = crate::chuck::holds(clamped)
             .then(|| crate::chuck::rig(clamped, stock, false).ok())
             .flatten()
@@ -388,6 +388,22 @@ impl Document {
             machine_zero,
             measured: self.centre_mark(&clamped.machine) == crate::control::MEASURED,
         })
+    }
+    /// The rotary unit of machine `m`: its A centreline as the Control page
+    /// measured it, in the machine library, while it is marked measured;
+    /// else the setup's copy's.
+    pub fn rotary_unit(&self, m: &Machine) -> Option<crate::model::RotaryUnit> {
+        let mut unit = m.rotary_unit()?;
+        if self.centre_mark(m) == crate::control::MEASURED
+            && let Some(library) = self
+                .machines
+                .iter()
+                .find(|x| x.id == m.id)
+                .and_then(Machine::rotary_unit)
+        {
+            (unit.centre_y, unit.centre_z) = (library.centre_y, library.centre_z);
+        }
+        Some(unit)
     }
     /// How the A centreline of machine `m` was found (`control::CENTRE_MARK`),
     /// from the machine library, which the Control page keeps it in, else
@@ -445,6 +461,9 @@ impl Document {
         }
     }
 }
+/// Why an indexed setup's cuts are not checked against its workholding: its
+/// index moves are, as they are generated (`generate`).
+pub const NOT_HELD: &str = "it indexes A, and its cuts are checked against the chuck at each A angle only once programs command A; its index moves are checked as they are made";
 /// Why an indexed setup has no program yet.
 pub const NOT_POSTED: &str =
     "it indexes A, which programs do not command yet, so it is not exported or run.";
@@ -485,7 +504,7 @@ pub const AVAILABILITY: &str = "Unavailable · indexed work is a setup now: add 
 /// Why an Indexed operation of an older project that could not be moved
 /// into an indexed setup (`Document::migrate_indexed_operations`) is not
 /// ready.
-pub const LEGACY: &str = "This Indexed operation is from an older project and could not become a Facing operation in an indexed setup: its machine has no A axis around X, or it sets a B angle or an A angle that is not a number. Indexing is a setup now: add a setup on a machine with A, choose Reposition → Index rotary axis at the angle, and add a Facing operation there.";
+pub const LEGACY: &str = "This Indexed operation is from an older project and was not moved into an indexed setup: it was disabled at an angle, its machine has no A axis around X, or it sets a B angle or an A angle that is not a number. Indexing is a setup now: add a setup on a machine with A, choose Reposition → Index rotary axis at the angle, and add a Facing operation there.";
 impl Document {
     /// Moves each Indexed operation of an older project (an Indexed face,
     /// which only recorded the A angle `angle_a`) into the setups that index
@@ -522,7 +541,12 @@ impl Document {
                         _ => num(&op.p, "angle_a"),
                     };
                     let b = num(&op.p, "angle_b").unwrap_or(0.);
-                    match a.filter(|_| setup.machine.has_a() && b.abs() < 1e-3) {
+                    // A disabled one at an angle would split the setup for
+                    // nothing it cuts: it stays, as it did.
+                    let moved = |a: &f32| {
+                        setup.machine.has_a() && b.abs() < 1e-3 && (op.enabled || a.abs() < 1e-3)
+                    };
+                    match a.filter(moved) {
                         Some(a) => {
                             op.strategy = Strategy::Face;
                             op.p.remove("angle_a");
@@ -535,8 +559,13 @@ impl Document {
                                     degrees(a),
                                     setup.name()
                                 ),
+                                None if own => format!(
+                                    "{}: the Indexed operation is a Facing operation in {}, at that setup's A angles.",
+                                    op.name(),
+                                    setup.name()
+                                ),
                                 None => format!(
-                                    "{}: the Indexed operation is a Facing operation in {}, at its A angle.",
+                                    "{}: the Indexed operation at A 0° is a Facing operation in {}.",
                                     op.name(),
                                     setup.name()
                                 ),
@@ -1071,22 +1100,25 @@ mod tests {
     /// coordinates (`volume::Frame::map`) put it about X with its middle at
     /// Y0, Z `centre_z`.
     fn prism(len: f32) -> Mesh {
+        block(len, 20., 20.)
+    }
+    /// A block `l` × `w` (Y) × `h` (Z) as the part.
+    fn block(l: f32, w: f32, h: f32) -> Mesh {
         let mut t = vec![];
         let mut quad = |p: [[f32; 3]; 4]| {
             t.push([p[0], p[1], p[2]]);
             t.push([p[0], p[2], p[3]]);
         };
-        let (l, h) = (len, 20.);
-        quad([[0., 0., h], [l, 0., h], [l, h, h], [0., h, h]]);
-        quad([[0., 0., 0.], [0., h, 0.], [l, h, 0.], [l, 0., 0.]]);
+        quad([[0., 0., h], [l, 0., h], [l, w, h], [0., w, h]]);
+        quad([[0., 0., 0.], [0., w, 0.], [l, w, 0.], [l, 0., 0.]]);
         quad([[0., 0., 0.], [l, 0., 0.], [l, 0., h], [0., 0., h]]);
-        quad([[l, h, 0.], [0., h, 0.], [0., h, h], [l, h, h]]);
-        quad([[0., h, 0.], [0., 0., 0.], [0., 0., h], [0., h, h]]);
-        quad([[l, 0., 0.], [l, h, 0.], [l, h, h], [l, 0., h]]);
+        quad([[l, w, 0.], [0., w, 0.], [0., w, h], [l, w, h]]);
+        quad([[0., w, 0.], [0., 0., 0.], [0., 0., h], [0., w, h]]);
+        quad([[l, 0., 0.], [l, w, 0.], [l, w, h], [l, 0., h]]);
         crate::mesh::normalize(t).unwrap()
     }
     fn centre_z(mesh: &Mesh) -> f32 {
-        4. / mesh.display_scale() + 10.
+        4. / mesh.display_scale() + mesh.dimensions[2] / 2.
     }
     /// A flat end mill: Ø`d`, 35 mm of flute, 50 mm out of its holder.
     fn cutter(d: &str) -> crate::model::Tool {
@@ -1121,7 +1153,10 @@ mod tests {
         let p = &mut doc.setups[0].p;
         p.insert("chuck_stickout".into(), stickout.into());
         p.insert("tx".into(), (x0 + len / 2.).to_string());
-        p.insert("tz".into(), (10. - 4. / s).to_string());
+        p.insert(
+            "tz".into(),
+            (20. - mesh.dimensions[2] / 2. - 4. / s).to_string(),
+        );
         doc.tools = vec![cutter("12")];
         let mut op = op;
         op.tool = doc.tools[0].id.clone();
@@ -1501,5 +1536,78 @@ mod tests {
             op.issues(&doc.setups[0].machine, &doc.tools, &[])[0],
             LEGACY
         );
+    }
+
+    #[test]
+    fn the_plan_check_checks_each_angles_moves_against_the_part_posed_there() {
+        // 30 wide in Y and 10 high at A0, 10 wide at A90: the contour at
+        // A90 runs 11 mm from the axis, inside where the part is at A0.
+        let mesh = block(30., 30., 10.);
+        let doc = bar_job(&mesh, 0., "80", "-150", "0, 90", contour(&cutter("12")));
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let first = crate::cam::Geometry::new(&doc.setups[1], &mesh);
+        let index = crate::analysis::Index::new(&first);
+        let found = crate::plan_check::angle_problems(&doc, &mesh, 1, &sim, &first, &index);
+        assert!(found.is_empty(), "{found:?}");
+        // Against the part at A0 alone, the A90 moves would go through it.
+        let wrong = crate::plan_check::axis_problems(&sim.plan, &first, &index, 1);
+        assert!(wrong[0].contains("passes through"), "{wrong:?}");
+    }
+
+    #[test]
+    fn the_swing_takes_the_centreline_the_control_page_measured() {
+        let mesh = prism(30.);
+        let mut doc = bar_job(&mesh, 0., "80", "-40", "0, 90", contour(&cutter("12")));
+        assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_err());
+        // Measured at Z -150 in the machine library; the setup's copy still
+        // says -40.
+        let mut library = doc.setups[0].machine.clone();
+        library.p.insert("a_centre_z".into(), "-150".into());
+        library.p.insert(
+            crate::control::CENTRE_MARK.into(),
+            crate::control::MEASURED.into(),
+        );
+        doc.machines = vec![library];
+        assert_eq!(get(&doc.setups[1].machine.p, "a_centre_z"), "-40");
+        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        assert!((swing.machine_z - (-150. + swing.radius + 15.)).abs() < 1e-3);
+        assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_ok());
+        // Gone stale, it is not trusted: the setup's copy is used again.
+        doc.machines[0].p.insert(
+            crate::control::CENTRE_MARK.into(),
+            "stale after an E-stop".into(),
+        );
+        assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_err());
+    }
+
+    #[test]
+    fn an_indexed_setups_cuts_are_not_said_held_by_the_chuck_at_its_first_angle() {
+        let mesh = prism(30.);
+        let doc = bar_job(&mesh, 0., "80", "-150", "0, 90", contour(&cutter("12")));
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim))]);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].message, format!("Holding not checked: {NOT_HELD}."));
+    }
+
+    #[test]
+    fn a_disabled_indexed_operation_at_an_angle_stays_where_it_is() {
+        use crate::model::{Operation, Strategy};
+        let (mut doc, _) = job("90");
+        doc.setups.truncate(1);
+        let tool = doc.tools[0].id.clone();
+        let mut old = Operation::new(Strategy::Indexed, tool.clone());
+        old.p.insert("angle_a".into(), "90".into());
+        old.enabled = false;
+        let after = Operation::new(Strategy::Contour, tool);
+        doc.setups[0].operations = vec![old, after];
+        let notes = doc.migrate_indexed_operations();
+        assert_eq!(doc.setups.len(), 1);
+        let ops = &doc.setups[0].operations;
+        assert_eq!(
+            (ops[0].strategy, ops[1].strategy),
+            (Strategy::Indexed, Strategy::Contour)
+        );
+        assert!(notes[0].ends_with(LEGACY), "{notes:?}");
     }
 }

@@ -722,9 +722,13 @@ impl Simulation {
             let to = movement.at(seconds.min(movement.end));
             if movement.motion == Motion::Feed {
                 let frame = self.frame_of(movement);
-                // The top-down grid is the setup's frame's: a move at
-                // another A angle cuts the volume only.
-                if frame == self.frame {
+                // The top-down grid is the setup's frame's, its first A
+                // angle's: a move at another angle cuts the volume only.
+                let own = movement
+                    .a
+                    .zip(self.turns.first())
+                    .is_none_or(|(a, t)| (a - t.0).abs() < 1e-4);
+                if own {
                     self.stock
                         .cut_shape(from, to, self.plan.radius, self.plan.shape);
                 }

@@ -2414,6 +2414,10 @@ pub(crate) fn held_walked(
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Result<Vec<Held>, Vec<String>> {
+    // The jaws would be checked at the first A angle only (`holding_boxes`).
+    if crate::indexed::is_indexed(&doc.setups[si]) {
+        return Err(vec![crate::indexed::NOT_HELD.into()]);
+    }
     let walk = walk(doc, mesh, si, sims, PostSettings::for_holding)?;
     let held = gripped(doc, mesh, si, &walk);
     let boxes = match holding_boxes(doc, mesh, si, held, walk.zero) {

@@ -1037,6 +1037,10 @@ The Machine library could save 4 axes but not where the rotary sits; the owner's
 - `three_axis_moves_carry_no_a_and_no_index`: setup 1's contour in the same job has no A and no index move, move for move as the kernel generates it alone; the golden program tests are unchanged.
 - `a_setup_posed_at_an_angle_has_the_frame_at_angle_gives`: `Document::setup_at` poses the part in `at_angle`'s frame at five angles.
 - `indexed_operations_of_an_older_project_move_into_indexed_setups`, `storage::tests::a_project_with_an_indexed_operation_loads_it_into_an_indexed_setup`: an Indexed operation at A 90° loads as a Facing operation (same id, no `angle_a`) in a new indexed setup after its own, in its clamping, the operations after it in one at A 0°; one at A 0° stays in place; on a 5-axis machine it stays Indexed and its first issue says why.
+- `the_plan_check_checks_each_angles_moves_against_the_part_posed_there`: a block 30 wide and 10 high, contoured at A 0 and 90, has no gouge when each angle's moves are checked against the part at that angle, though the A90 moves pass through the part as it sits at A0.
+- `the_swing_takes_the_centreline_the_control_page_measured`: a centreline measured at Z −150 in the machine library clears the refusal that the setup's copy (Z −40) gives; once marked stale the copy is used again.
+- `an_indexed_setups_cuts_are_not_said_held_by_the_chuck_at_its_first_angle`: the workholding check says "Holding not checked" for an indexed setup instead of checking every angle's cuts against the jaws at the first.
+- `a_disabled_indexed_operation_at_an_angle_stays_where_it_is`: a disabled Indexed operation at A 90° does not split its setup.
 - Not validated: the removal drawn at other angles (LIO-190), anything on the machine.
 
 ## Rotary calibration: the A centreline, A zero and the line to the tailstock (LIO-186, 18 October 2026)
