@@ -3138,6 +3138,34 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn a_part_off_and_a_face_to_the_centre_ask_for_the_tool_on_centre() {
+        let mut a = lathe_app("Diameter", |_| {});
+        // Once in the set up, on the Zero.
+        assert!(!has(&a, "set every tool on centre"));
+        send(&mut a, GuideAction::Next);
+        shows(&a, &["Zero", "set every tool on centre"]);
+        let face = nth(&a, 0, |l| matches!(l, L::Face { .. }));
+        send(&mut a, GuideAction::Go(face));
+        shows(&a, &["on centre height"]);
+        // The outside does not cut to the centre.
+        send(&mut a, GuideAction::Go(face + 1));
+        assert!(!has(&a, "on centre height"));
+        let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
+        send(&mut a, GuideAction::Go(part - 1));
+        shows(&a, &["Touch", "on centre height"]);
+        send(&mut a, GuideAction::Go(part));
+        shows(&a, &["Part off", "on centre height"]);
+        // A face that stops short of the centre does not ask.
+        let mut a = lathe_app("Diameter", |doc| {
+            doc.setups[0].operations[0]
+                .p
+                .insert("to_diameter".into(), "20".into());
+        });
+        let face = nth(&a, 0, |l| matches!(l, L::Face { .. }));
+        send(&mut a, GuideAction::Go(face));
+        assert!(!has(&a, "on centre height"));
+    }
+    #[test]
     fn until_the_dial_check_is_answered_the_cross_slide_shows_no_number() {
         let mut a = lathe_app("", |_| {});
         shows(
@@ -3315,6 +3343,7 @@ pub(crate) mod tests {
         shot(&mut a, "14-thread-touch", thread - 1, 0);
         shot(&mut a, "15-thread-pass-3", thread + 2, 1);
         let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
+        shot(&mut a, "16a-part-off-touch", part - 1, 0);
         shot(&mut a, "16-part-off", part, 0);
         shot(&mut a, "17-hand-over", part + 1, 0);
         // Chamfers: a shoulder one on the carriage, an end one.

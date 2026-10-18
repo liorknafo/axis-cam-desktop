@@ -795,6 +795,21 @@ fn top_angle<'a>(from_cross: f32, out: bool) -> Element<'a, Message> {
     .width(170)
     .into()
 }
+/// What a part off or a face to the centre asks of the tool's height.
+const ON_CENTRE: &str = "on centre height";
+/// What the set up asks of every tool once.
+const EVERY_ON_CENTRE: &str = "set every tool on centre";
+/// Whether operation `op` cuts to the centre: a part off, or a face to Ø0.
+fn to_centre(p: &Page<'_>, op: usize) -> bool {
+    let Some(o) = p.setup.operations.get(op) else {
+        return false;
+    };
+    match crate::model::get(&o.p, "turn_kind") {
+        "Part off" => true,
+        "Face" => num(&o.p, "to_diameter").unwrap_or(0.) <= 1e-3,
+        _ => false,
+    }
+}
 /// The chip of the top slide's setting for a Face or a Chamfer: along the
 /// bed, or set back to it from the angle a thread left it at.
 fn set_back<'a>(swung: Option<f32>) -> Element<'a, Message> {
@@ -1287,6 +1302,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             if *jaws == 4 {
                 c.push(warn_chip("4-jaw: centre it with the dial gauge"));
             }
+            // Said once in the set up: on the Zero, else here.
+            let zero =
+                (p.guide().steps.iter()).any(|s| matches!(s, Step::Lathe(LatheStep::Zero { .. })));
+            if !zero {
+                c.push(warn_chip(EVERY_ON_CENTRE));
+            }
             let right = column![
                 chips(c),
                 line(
@@ -1354,7 +1375,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ));
             }
             let mut right = column![
-                chips(vec![tool_chip(p, tool)]),
+                chips(vec![tool_chip(p, tool), warn_chip(EVERY_ON_CENTRE)]),
                 label(if *cross {
                     "Touch, then zero the collars"
                 } else {
@@ -1433,7 +1454,14 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ));
             }
             if *carriage {
-                marks.push(Mark::Tool(cutter_of(p, tool), [end, r * 0.45]));
+                // A blade touches the end with its left side, the side its
+                // carriage readings are of.
+                let kind = cutter_of(p, tool);
+                let z = match kind {
+                    Cutter::Blade(w) => end + w / 2.,
+                    _ => end,
+                };
+                marks.push(Mark::Tool(kind, [z, r * 0.45]));
                 marks.push(Mark::Word(
                     [end + 1., r * 0.15],
                     "touch the end".into(),
@@ -1458,7 +1486,11 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 tags.push("zero the cross dial".into());
                 rows.push(next("cross slide", "0".into(), tags));
             }
-            let mut right = column![chips(vec![tool_chip(p, tool), rpm_chip(*rpm)])];
+            let mut c = vec![tool_chip(p, tool), rpm_chip(*rpm)];
+            if to_centre(p, *op) {
+                c.push(warn_chip(ON_CENTRE));
+            }
+            let mut right = column![chips(c)];
             if let Some(a) = top {
                 // Swing the top slide first: its angle from the cross slide.
                 let out = cross.as_ref().is_some_and(|c| c.inside);
@@ -1506,8 +1538,13 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             if swung.is_some() {
                 face_dials.push(top_angle(90., false));
             }
+            let mut c = vec![tool_chip(p, tool), rpm_chip(*rpm)];
+            if *to_diameter <= 1e-3 {
+                // To the centre: a tool above or below it leaves a pip.
+                c.push(warn_chip(ON_CENTRE));
+            }
             let right = column![
-                chips(vec![tool_chip(p, tool), rpm_chip(*rpm)]),
+                chips(c),
                 chips(vec![set_back(*swung), warn_chip("lock the carriage")]),
                 dials(face_dials),
                 line(
@@ -2019,8 +2056,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     None,
                 )),
             }
+            let mut c = vec![tool_chip(p, tool), rpm_chip(*rpm)];
+            if *part_off {
+                c.push(warn_chip(ON_CENTRE));
+            }
             let mut right = column![
-                chips(vec![tool_chip(p, tool), rpm_chip(*rpm)]),
+                chips(c),
                 dials(d),
                 chips(vec![warn_chip("lock the carriage"), chip("slow, oil")]),
             ]
