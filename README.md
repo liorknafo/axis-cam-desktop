@@ -2,7 +2,7 @@
 
 A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.14. It carries the web prototype's Manufacture-style layout into a native application, with local persistence, editable operation parameters and a 3D model viewport. There is no embedded browser.
 
-**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Vise jaws and clamps that a setup models are checked as boxes with a clearance gap (see **Workholding**); parallels, bolts, the table and the machine body are not checked, and production CAM remains pending. The example project's other paths are demonstrations. The AI planner signs in with a ChatGPT account and proposes a whole job for an imported part; the app generates, simulates and checks every proposal before it can be applied (see **Plan a job with AI**).
+**G-code output is LinuxCNC 3-axis only.** Seven imported-part operations have bounded motion previews with approximate stock removal: Facing, Adaptive clearing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Vise jaws and clamps that a setup models are checked as boxes with a clearance gap (see **Workholding**); parallels, bolts, the table and the machine body are not checked, and production CAM remains pending. The example project's other paths are demonstrations. The AI planner signs in with a ChatGPT account and proposes a whole job for an imported part; the app generates, simulates and checks every proposal before it can be applied (see **Plan a job with AI**).
 
 ![Native workspace](docs/workspace.png)
 
@@ -50,26 +50,26 @@ The script (rewritten for #32 and untested on a Mac since) builds the release bi
 | Tool library | Editable tool types, diameter, flutes, flute length, stickout and holder diameter; in-use tool deletion protection |
 | Material library | Saved materials with group, hardness, notes and cutting data for carbide tools (surface speed and chip load per tooth by tool diameter); fifteen starter materials marked as starting points; a project material picked from the library; warnings when an operation's speed or feed is outside the material's data |
 | Workholding library | Saved vises and toe clamps with their sizes (two starters); a setup models a vise or clamps from the library, the app suggests where they go, the 3D view draws them, and every move is checked against them as boxes with a clearance gap; a later setup starts from the stock the earlier setups left, and its holder is checked on that stock (see **Workholding**) |
-| Operations | Six implemented imported-mesh preview strategies and Box for a manual mill; explicit status for all twelve strategies; unavailable operations cannot be added to imported jobs |
-| Geometry | Imported planar surface selection for Facing, Pocket and Drilling; a Pocket's or inside Contour's holes picked whole by a click on any wall; whole-model Contour/Parallel/Waterline; separate selectable example housing; depth-tested rendering; orbit, pan, zoom and orthographic views |
+| Operations | Seven implemented imported-mesh preview strategies, Box for a manual mill and Turn for a manual lathe; explicit status for all thirteen strategies; unavailable operations cannot be added to imported jobs |
+| Geometry | Imported planar surface selection for Facing, Adaptive clearing, Pocket and Drilling; a Pocket's or inside Contour's holes picked whole by a click on any wall; whole-model Contour/Parallel/Waterline; separate selectable example housing; depth-tested rendering; orbit, pan, zoom and orthographic views |
 | STL | Real binary and ASCII mesh preview |
 | OBJ | Real mesh preview; polygon fan triangulation and negative face indices |
 | STEP / STP | Open CASCADE CAD import and complete tessellated preview, assembly placements, source units converted to mm |
 | 3MF | ZIP/XML mesh reader, declared units, build items, nested components, mirrored/placed instances and Production extension external model references |
 | Hover help | Descriptions for every app button/input; choice help follows the selected value and related settings; matching native concept animations; F1 pins the focused field's card |
 | Planner | One click asks an OpenAI model, on your ChatGPT plan, for setups, operations, tools and cutting parameters; the app checks every proposal with its generators, simulation, export checks and the speeds and feeds against the project material's cutting data, sends failures back for correction, and shows a passing plan for review, apply and undo; while it runs, a timeline lists each step with its time, the size of the reply received and each check's result |
-| Simulation | Six imported strategies with cumulative stock across operations/setups, adaptive octree surface meshing, background detail updates, pause/replay/scrub; separate example motion |
+| Simulation | Seven imported strategies with cumulative stock across operations/setups, adaptive octree surface meshing, background detail updates, pause/replay/scrub; separate example motion |
 | Operation audit | Generate all checks every enabled operation across every setup, reports generated paths and actionable failures, skips suppressed operations |
 | Saving | Automatic local workspace saving; explicit JSON project save/open; complete machine, setup, tool, material and operation data |
 | Export | LinuxCNC 3-axis `.ngc` per setup (checked and replayed) and a Markdown setup sheet |
 
 ### Operation strategies
 
-Facing, adaptive clearing, pocket, contour, drilling, parallel finishing, waterline finishing, scallop finishing, indexed face, rotary finishing, 5-axis surface and Box (manual mill only: see **Manual mill**).
+Facing, adaptive clearing, pocket, contour, drilling, parallel finishing, waterline finishing, scallop finishing, indexed face, rotary finishing, 5-axis surface, Box (manual mill only: see **Manual mill**) and Turn (manual lathe only: see **Manual lathe**).
 
 Milling operations use **Tool → Geometry → Heights → Passes → Linking**. Drilling replaces Passes with Cycle. Indexed, rotary and 5-axis strategies add Orientation.
 
-Fields are specific to each strategy: optimal load/rest machining for adaptive clearing; compensation for contours; pecks/dwell for drilling; slopes and surface spacing for finishing; rotary ranges, lead/lean and tilt limits for multi-axis work.
+Fields are specific to each strategy: optimal load and minimum cutting radius for adaptive clearing; compensation for contours; pecks/dwell for drilling; slopes and surface spacing for finishing; rotary ranges, lead/lean and tilt limits for multi-axis work.
 
 ## Operation coverage and checking a whole job
 
@@ -79,17 +79,17 @@ Open **Operation support** in the toolbar for the complete support list. **Gener
 | --- | --- |
 | Facing | Highest planar face; rectangular raster; flat/face cutter; one-way or zigzag |
 | Pocket | One or more selected recessed planar floors, each to its own height; offset loops keep clear of everything above the floor, may stand over a lower area past an open edge, and go only where earlier cuts left material (rest passes); openings through a floor optionally cut through; holes picked by a click on a wall (any outline, round or not), each part of them cut down to the floor under it or through the part; a floor overhung only in a band under 0.2 mm wide is cut clear of it, not refused; flat cutter; plunge/profile ramp |
+| Adaptive | The same selected recessed planar floors, walls and islands as Pocket (each floor to its own height, highest first; openings optionally cut through; rest passes automatic); the path holds the cutter's side load near the optimal load (2% to 50% of the diameter), so the stepdown can be deep; each level ends with one pass round the walls and islands at the radial stock to leave; helix or plunge entry, or from the side where the floor is open; flat end mill |
 | Contour | Outside model silhouette or Inside walls/islands of a selected recessed floor; In computer compensation; depth layers and repeat passes |
 | Drilling | Circular openings in selected horizontal rim(s), including counterbores; narrowest vertical bore check; drilling, chip breaking, deep peck and bottom-dwell cycles; with a chamfer mill, countersinks each opening to its diameter at the rim; Helical milling cycle: a flat end mill narrower than the holes mills each one down a helix to a flat floor, in rings from the centre out for a hole over twice its size (not on the manual mill) |
 | Parallel | Whole-model vertical flat/ball cutter envelope; angled zigzag passes, surface spacing, slope range, vertical stock allowance |
 | Waterline | Constant-Z contours around geometry projected above each level; flat cutter, radial allowance and Climb/Conventional |
-| Adaptive | Unavailable: engagement-controlled clearing kernel pending |
 | Scallop | Unavailable: constant surface-spacing kernel pending |
 | Indexed | Unavailable: indexed tool frames / rotary kinematics pending |
 | Rotary | Unavailable: continuous rotary paths and stock simulation pending |
 | 5-axis | Unavailable: tool-axis planning / machine kinematics pending |
 
-The five unavailable strategies retain their educational illustrations in the explicit example project. Those illustrations are not machining calculations. Existing imported projects containing those operations retain their settings and report a failure when checked.
+The four unavailable strategies retain their educational illustrations in the explicit example project. Those illustrations are not machining calculations. Existing imported projects containing those operations retain their settings and report a failure when checked.
 
 ### Contour, drilling and finishing flow
 
@@ -182,7 +182,7 @@ An ordinary **Drill** operation in an earlier setup drills the holes, from the f
 
 The same point is used everywhere: the program's coordinates (plan point − work zero), the simulation and a run's moves (plan point − work zero + the machine's work offset), the 3D view's **X0 Y0 Z0** marker (drawn on the stock the simulation starts from, or the box the editor knows for the setup), the header's touch-off words, the Run panel's steps and the probe.
 
-Six operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks beyond the vise jaws and clamps a setup models (see **Workholding**) and the five explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
+Seven operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks beyond the vise jaws and clamps a setup models (see **Workholding**) and the four explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
 
 ## Try the example workflow
 
@@ -361,8 +361,8 @@ left of the toolbar:
 - **MACHINE** runs the CNC through the UC100 (the Control page below): its
   toolbar has **Control** and **Controller configuration**, and the red
   **E-STOP** while connected.
-  A setup on a manual mill shows its **Steps** page there instead (see
-  **Manual mill**).
+  A setup on a manual mill or a manual lathe shows its **Steps** page there
+  instead (see **Manual mill** and **Manual lathe**).
 
 As in Fusion 360, each toolbar button has an icon above its label, and the
 switcher shows the open workspace's icon. Each icon is a solid tile with a
@@ -457,7 +457,7 @@ The page is split into sections: **Set up** (Hold, Zero), one section per cuttin
 
 ### Minutes
 
-The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Manual 18 min · CNC 42 min · moving 10 min" beside the total. The Steps page shows the setup's minutes.
+The minutes of a manual operation are the cut length over the feed, plus the travel off the cut over the hand rapid, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a manual and another machine, and shows the split as "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min" beside the total (the lathe's and the manual mill's parts only when they have minutes). The Steps page shows the setup's minutes.
 
 ### No G-code
 
@@ -466,6 +466,126 @@ A manual setup is left out of the export and the Run strip. The NC review page s
 ### Not in this version
 
 Power feed, a DRO connection, arcs or two axes moving together on the manual mill, a rotary table, boring heads and tapping are not planned. Choosing the manual work for you (suggested boxes, the AI planner) and saving the steps as pages to take to the machine are not built yet; you mark the manual work yourself. The Steps screens can be drawn headless to PNG files with the ignored test `steps::tests::render_the_steps` (it writes to `/tmp/manual-steps`).
+
+## Manual lathe
+
+A job can turn round bar on a hand-fed lathe that has **no DRO**, before or after the mills. The app plans the turning and simulates it like any other operation, so a mill setup after it starts from the turned part and a lathe setup after the mills starts from the milled part. It makes **no G-code** for it: MACHINE shows the setup as a visual step guide in which every number is a **dial picture** (whole turns plus the reading) or a **measurement** you take.
+
+**The app does not read the dials.** It shows the numbers a dial should read and you wind the slides. Nothing in the app confirms that a slide is where a step says; tapping a readout only lights the next number. Every dial picture is only as good as the zero you set and the numbers you entered for the lathe.
+
+### The lathe machine
+
+A machine has the kind **Lathe** besides CNC and Manual (the mill). The wizard's first step chooses it and fills the lathe defaults; its steps are Identity, Spindle & travel, Dials & feeds and Review. The library card says "Manual lathe · no G-code". The post, probe and controller fields do not apply and are hidden. The lathe's travel is its size (X and Y the swing, Z the distance between centres) and, on save, its rpm becomes the top gear.
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| Spindle speeds (`speeds`) | The gears, in rpm, comma-separated; `min-max` means a variable drive | 70, 110, 180, 280, 450, 710, 1120, 1800 |
+| Swing (`swing`) | The largest diameter over the bed, mm | 250 |
+| Centres (`centres`) | The distance between centres, mm | 550 |
+| Cross-slide dial reads (`cross_reads`) | `Diameter`, `Radius` or empty (not known yet: see **The dial check**) | empty |
+| Cross slide dial per turn, divisions | What the dial's numbers go through in one turn, and how many divisions it has | 4, 100 |
+| Top slide | The same | 2, 100 |
+| Carriage handwheel | The same | 20, 100 |
+| Tailstock quill | The same | 2.5, 50 |
+| Power feeds (`feeds`) | The carriage's power feeds, mm per revolution (the cross slide has none) | 0.05, 0.1, 0.15, 0.2 |
+| Threads (`pitches`) | The pitches the gearbox cuts, mm | 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3 |
+| Pass time, tool time, move time | As for the manual mill | 20 s, 3 min, 10 min |
+
+Every "dial per turn" is in **the dial's own numbers**: the number the dial shows after one full turn from 0. The app never needs the screw's pitch. A dial must have a positive number per turn and a whole positive number of divisions, the speeds, feeds and pitches must be lists of positive numbers, and `cross_reads` must be Diameter, Radius or empty; the machine editor and the plan check report what is not. These are placeholders until you enter your lathe's numbers.
+
+A **dial reading** is made from a distance with the dial's numbers: the distance is divided by the numbers per turn, the whole turns are shown as "N turns +", and the rest is the reading, rounded to the dial's division (0.2 on a carriage dial of 20 in 100 divisions). A reading that rounds up to a whole turn carries into the turns. The carriage dial is read from its zero on the free end, the top slide and the quill from their own touch, and the cross slide as the next paragraphs say. A negative distance is refused.
+
+### The dial check
+
+Whether the cross-slide dial reads the **diameter** or the **radius** is not the same on every lathe, so the app does not guess. While `cross_reads` is empty, the cross-slide numbers of every lathe step read "Check the dial first" and the first step of the guide is the **Dial check**: turn a light skin on the bar, go in 10 divisions, cut 30 mm long and measure. The screen shows what the dial reads for those 10 divisions and two buttons, "by 1× → diameter" (the Ø went down by the reading) and "by 2× → radius" (it went down by twice the reading); you tap the one that matches the caliper. The answer is saved to the lathe in the library and in every setup's snapshot of it, the cross-slide numbers appear, and the check does not come back. With a diameter dial a reading of `d` takes `d` off the diameter; with a radius dial it takes `2d`: taking 6.00 off the diameter on a dial of 4 per turn is "1 turn + 2.00" on a diameter dial and "0 turns + 3.00" on a radius dial. The check can also be answered on the machine editor's Dials & feeds step.
+
+### Round bar stock
+
+A lathe setup's frame puts the spindle axis along the setup's Z with **Z 0 at the free end of the bar**, the end the tool faces, and +Z out of the chuck toward the tailstock. X and Y are radial. The work zero is **Stock top center** (the only one a lathe accepts). In everything you see, Z is zero at the free end and negative toward the chuck, and sizes are diameters.
+
+The stock type has two more values, **Round bar** (a diameter and a length) and **Relative round bar** (the part's largest radius about the axis plus a radial allowance, and the offsets along the axis). The simulation clears everything outside the cylinder, the 3D view draws the bar's cylinder and end faces as stock, and the turned faces as cut. The bar's bounds are its box, so every box consumer keeps working conservatively. A turning cut is a ring about the axis; it is the same cut in a mill setup, so a mill setup after a lathe setup sees the turned diameters, and a lathe setup after the mills sees what the mills cut.
+
+### Chucks and the 3-jaw
+
+The Workholding library has a third kind, **Chuck**, with its jaws (3 or 4), the smallest and largest diameter it closes on, the length of its jaws, its body diameter and the lathes it fits. A library with none gets two starters, marked "Measure yours: these are typical sizes.": a 160 mm 3-jaw (Ø3 to Ø140) and a 160 mm 4-jaw (Ø6 to Ø150). A chuck fits lathes only and a vise or a clamp set does not fit a lathe. A lathe setup's holding is **Chuck**, with its **grip** (the length of bar in the jaws; the chuck's jaw length at first) and its **stickout** (from the jaws to the free end).
+
+- **Changing the chuck is slow, so the 3-jaw is preferred.** **Suggest** in the setup editor chooses the 3-jaw whenever the gripped section is round and inside its range: a round bar, or a section an earlier lathe setup turned; **+ Add lathe setup** takes the library's 3-jaw when it has one. The 4-jaw is chosen only for a square or off-centre section, and the setup then says "4-jaw: change the chuck" (the status line and the Holding step). Suggest chooses the chuck only; the grip and the stickout are yours. The Hold step of a 4-jaw adds "4-jaw: centre it with the dial gauge". You can override the choice in the setup editor.
+- **What is checked**, in the editor and the plan check, as workholding problems: the diameter in the jaws is within the chuck's range; the grip is at least a third of that diameter and no more than the jaws' length; the grip and the stickout do not come to more than the bar; the bar is not wider than the swing; a 3-jaw is not holding work that is not round; the stickout is at least the furthest cut from the free end plus 5 mm; and nothing is cut inside the grip. A stickout of more than four diameters is a warning, not a problem: "Long and thin: support it or cut it in two setups."
+- **The chuck body** is a box 40 mm deep behind the jaws' end, as wide as the chuck. Tool moves are checked against it as against vise jaws, with the same clearance gap ("Turn · Groove: the tool hits the chuck body at …"). The ring a part off cuts into the bar left in the chuck is allowed; it is the part leaving.
+
+### Lathe tools
+
+The tool types gain **Turning tool** (hand, nose radius, lead angle), **Boring bar** (nose radius, smallest bore it enters, reach), **Grooving tool** and **Parting blade** (width, reach) and **Threading tool** (60° or 55°, the pitches it covers). Drills are reused, held in the tailstock. A lathe tool fits lathes only, and a mill operation refuses one. The tool editor shows the fields of the chosen type and none of a mill's (no flutes, no mill diameter). Each Turn kind needs the tool type of its kind (Face, Outside and Chamfer a turning tool, Bore a boring bar, Groove a grooving tool, Part off a parting blade, Thread a threading tool), a boring bar must fit the hole and reach its depth, and a groove cannot be narrower than its tool.
+
+### Turn and the lathe Drill
+
+On a lathe setup the ribbon offers only **Turn** and **Drill**; Turn is dimmed and refused on a mill setup, and Box is refused on a lathe. The **Turn** strategy has a kind:
+
+| Kind | Fields | What it does |
+| --- | --- | --- |
+| Face | Face off, to diameter (0 = to the centre) | One cut across the end by hand, that much off the end. You plan the passes, as for milling |
+| Outside | Diameter, Z end (the shoulder), depth per pass, finish, allowance | Passes from the diameter at hand to the diameter, with the carriage's power feed, toward the chuck |
+| Bore | The same | The same from a hole outward; it needs a hole first (a Drill or a smaller bore) |
+| Chamfer | Edge (End outside, End inside, Shoulder), size | A 45° chamfer of that leg, by hand, on the end's outside or inside edge or on the first shoulder |
+| Groove | Z (the side toward the part), width, bottom diameter | One plunge by hand, more side by side when the groove is wider than the tool |
+| Part off | Z (the blade's side toward the part) | One plunge by hand to 0.5 mm past the centre. The bar left in the chuck goes from the stock |
+| Thread | Outside or inside, major diameter, pitch, Z end, passes | Passes at the gearbox's pitch, each fed in further |
+
+**Drill** is the same Drill as on the CNC with no hole selection: it drills on the centre line from the tailstock to a depth, pecking every diameter, with a centre drill first. Its depth is measured from where the drill first touches the end plus its 118° point.
+
+**Pass rules.**
+
+- **Equal passes, then the finish.** Outside and Bore take the diameter in equal passes, none deeper than the depth per pass, down to the finish short of the diameter, and then the finish pass (0.2 mm by default, 0.1 on a bore), which is the last. No pass is a thin sliver and no pass cuts into the allowance (stock to leave) or the part. Each pass feeds toward the chuck from 1 mm in front of the material to the Z end at the power feed nearest 0.1 mm per revolution, the finer when two are as near; Face, Chamfer, Groove, Part off and the drill are fed by hand.
+- **Measure before the finish.** Before the last pass of an Outside or a Bore the guide asks you to measure the diameter. What is left above (or below, boring) the planned diameter is all taken by the finish pass, so a diameter that came out other than planned does not carry into the part.
+- **Thread infeed.** A thread has a number of passes (by default 4 times the pitch, rounded, plus 2: 6 for a pitch of 1, 8 for 1.5) and goes to a depth of 0.61 times the pitch outside or 0.54 times it inside. The infeed after pass `i` of `n` is the depth times the square root of `i / n`, so each pass takes about the same chip: the first is the deepest and the last ends exactly on the depth. The pitch must be one the gearbox cuts and the threading tool covers.
+- **Starts from the material at hand.** Each pass starts from the diameter the earlier operations left, so a second Outside does not cut air, and never deeper than the material.
+- **Part check.** A Turn is refused when a ring it removes comes within its allowance of the part ("The cut reaches the part at Z …, Ø …."). The part's distance from the axis is read from its triangles, and a shoulder face on a ring's end does not count. A stock allowance is kept on every ring.
+- **Simulation.** The cuts are rings about the axis. A chamfer and a drill's point are short runs of thin rings (0.1 mm steps). **The thread form is not simulated:** a thread leaves a plain cylinder at the pitch diameter.
+- **Minutes.** The cut length over the feed per revolution times the rpm, plus the pass time for each pass, plus the tool time for each tool and change of tool. The plan check adds the move time each time the stock goes between a hand machine and another, and shows the lathe's minutes apart ("Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min").
+
+### + Add lathe setup
+
+**+ Add lathe setup** on the setup list (shown once the library has a lathe) inserts a setup named "Lathe" with a Ø50 × 100 round bar held in a chuck, the 3-jaw when the library has one, the grip the chuck's jaw length and the rest of the bar standing out. It goes before the first CNC setup. Placed first it takes the old first setup's orientation (so that the turning axis is the one you chose), and the old first setup then starts from the bar it leaves; a bar of another size is set in the setup editor. A library without a chuck is given the chuck starters. Turning a box stock into a round bar is not automatic: pick Round bar.
+
+### The Steps page for a lathe
+
+A lathe setup opens in MACHINE on its **Steps** page, like the manual mill's: the same section bar, Back and Next, a place that is saved with the project, and it works with no controller connected and while the CNC runs another job. The steps are made from the setup's simulated operations. The drawing is a **side view** of the bar (the chuck on the left, you at the front) with the cut hatched, the part's outline, the jaws, the tool and the "do not pass" lines. Text is short labels; the numbers are pictures of the collars: the index at the top, the arc from 0 to the reading, the reading in the middle and "N turns +" above it.
+
+| Screen | What it shows |
+| --- | --- |
+| Dial check | Only while the cross-slide dial is not known (see above) |
+| Hold | The bar in the chuck: the chuck and its jaws, the bar's size, the stickout as a big number and the grip ("in the jaws") |
+| Zero | With the first turning tool (the outside one): touch the end and zero the carriage dial, measure the bar and type its diameter, touch the bar and zero the cross-slide dial. A setup with only inside tools (drill, boring bar) touches the end and measures the bar, and its sections touch the hole |
+| Touch | Before a section, only what needs zeroing (see below) |
+| Face | One screen: the tool, the gear, "lock the carriage", the top slide dial for how much comes off, and the carriage zeroed again on the new end |
+| Pass | One screen per pass of an Outside or a Bore: the cross-slide dial in (out, boring) for this pass, the carriage dial where to stop, the power feed and "last 1 mm by hand", and the pass tiles with their diameters |
+| Measure | Before the last pass: type the measured diameter; the last pass's cross-slide reading is worked out again from it and is shown at once |
+| Drill | The tailstock: centre drill first, then the drill; the quill dial for the depth and the point, a peck every diameter |
+| Chamfer | A tool with a **45° edge**, the top slide set **along the bed (90° from the cross slide)**: the edge on the corner, zero the top slide, then in the chamfer's size toward the chuck, so both legs are the size (a shoulder one first sets the carriage with the tool's point that size short of the shoulder); carriage locked |
+| Groove, Part off | The carriage dial for the tool's left side, the cross-slide dial for the depth (to the centre for a part off), "lock the carriage", and "catch the part" |
+| Thread pass | One screen per pass: the gearbox pitch, the top slide, the top slide dial for the infeed of this pass, the cross slide back to its zero, and the half-nuts rule |
+| Hand over | The bar as it leaves, the next setup and how it is held |
+
+- **Zeroes.** Every carriage reading is measured from the carriage dial's zero on the free end. After a **Face** the tool stands on the new end, so the carriage is zeroed there and every later reading is from the new end. A **new tool**, or slides that have moved since the last zero (a thread swings the top slide, a chamfer feeds it in), sends a Touch step first that zeroes the carriage again on the end. The pictures give a stop the same way, from the end the carriage dial was zeroed on ("shoulder 64 from the end" over a dial at 3 turns + 4.0), never the Z from the end the bar had before it was faced.
+- **Cross touch per section.** The cross-slide dial is zeroed on the diameter the section starts from: before each Outside, Bore, Groove, Thread and Part off section a Touch step has you touch that diameter (a Part off cuts to the centre and a Chamfer on an end edge touches the corner itself, so they need no cross touch), the measured bar when you typed it at Zero, and set the dial to zero. Each cross-slide reading is then the amount in from (out from, boring) that touch.
+- **Top slide at 29.5° for threads.** For a 60° thread the Thread section swings the top slide to **29.5° from the cross slide** (27.5° for a 55° thread), so the tool cuts on its leading flank and only shaves the other; its Touch and passes draw that angle against the cross slide in a small picture. The top slide dial then reads the infeed over the cosine of that angle, as the slide moves along the angle and not straight in. The last pass is set to the dial's division **below** its travel, never deeper than the thread (1.0513 is set at 1.04, not 1.06), no pass before it is set past that, so the readings never go back, and the last pass says "try the nut, then a spring pass". The gearbox is set to the pitch. The half-nuts stay closed through the thread: at the end of the pass back the tool out, reverse the spindle to come back to the start, and take the next pass.
+- **Carriage stop.** The first pass of an Outside or a Bore says "set the carriage stop at the shoulder" ("at the bottom", boring) and its picture shows how far the shoulder is from the jaws ("5 to the jaws"), as the carriage runs toward the chuck under power feed.
+- **Centre height.** The Zero says "set every tool on centre" once (the Hold, when there is no Zero); a Part off, a Face to the centre and their Touch steps say "on centre height", as a tool above or below the centre leaves a pip.
+- **Top slide angle.** Every step that uses the top slide says how it is set, named from the cross slide: a Face and a Chamfer "top slide along the bed (90° from the cross slide)", a thread "29.5° from the cross slide". A Face or a Chamfer after a thread says to set it back ("top slide from 29.5° back along the bed (90° from the cross slide)") with the picture, its arrow captioned with the way it takes the tool ("toward the axis" on a thread).
+- **Winding out.** A collar counts down when its handle is wound out from its zero: after 9.80 out on a cross dial of 4 a turn it reads 2.20, not 1.80. A dial wound out (a bore's cross slide, an inside thread's top slide) shows what the collar will **read**, the arc counter-clockwise from 0, and is titled "2 turns out, reads 2.20".
+- **Measure.** A measured diameter is kept with the project (under the setup and the step), so it survives saving and loading; the guide uses it for the rest of that section.
+
+### Lathe ↔ mill
+
+Parts go both ways. **Lathe → mill:** the mill setup starts from the turned part's leftover box, and the cuts of the lathe are in its simulation, so the CNC or the manual mill sees the turned diameters. Its vise holds the round part on the **bounding box**, and the lathe's Hand over screen says "Round part: hold it on a V-block or in soft jaws." V-blocks and soft jaws are not modelled. **Mill → lathe:** the lathe setup's frame is chosen like any setup's (its rotation) so that the part's turning axis is Z; the chuck is chosen as above.
+
+### No G-code
+
+A lathe setup is left out of the export and the Run strip, as the manual mill is. The NC review page says "manual lathe, no G-code — follow the steps on the MACHINE page", and the setup sheet names the lathe. The lathe setups still take part in the plan check: generation, the part check, the spindle speed check (the rpm must be one of the gears) and the chuck's holding checks.
+
+### Not in this version
+
+A CNC lathe and its G-code, a DRO on the lathe, taper turning with the top slide set over (other than threads and chamfers), knurling, between-centres work and the steady or follow rest are not planned. Finding the turned profile from an imported part and suggesting the Turn operations (you add and size them yourself), V-blocks and soft jaws for round parts in the mill vise, and the AI planner on lathes are not built yet. The lathe's Steps screens can be drawn headless to PNG files with the ignored test `steps::tests::render_the_lathe_steps` (it writes to `/tmp/lathe-steps`).
 
 ## Machine control (UC100)
 
@@ -1041,17 +1161,17 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-nine s
 - `src/machine_view.rs`: the CNC4030 model on the Control page: assumed dimensions, flat-shaded faces drawn far to near, the travel box and the tool tip.
 - `src/setup.rs`: the Control page's Controller configuration view: the UC100 profile edited in place with `toml_edit` (`Draft`: comments and line endings kept, checked by the driver, saved atomically, refused over a change on disk), the inputs and output test, calibration and the audit.
 - `src/post_check.rs`: export checks: spindle and feed limits, travel, rapids into material, holder clearance, jaw and clamp clearance over every program move, and touch-off rules.
-- `src/holding.rs`: the workholding library (vises and clamps and their starters), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
+- `src/holding.rs`: the workholding library (vises, clamps and chucks and their starters), the chuck's layout, checks and choice (the 3-jaw preferred), where a setup's jaws or clamps sit, the exact check of a move against them, the suggested layout, and `holdable`: whether a later setup's holder has material to hold on the stock the earlier setups left.
 - `src/forces.rs`: whether the vise or clamps hold the stock against each operation's cutting force: the stock it removes stretch by stretch, the force that takes up to what the spindle drives, the friction and leverage that resist it over the jaws' real contact, the margin and its issue; every assumed number (friction, clamping forces, spindle power, kc by material group, the peak, lift and ×2 margin factors) is named at its top.
 - `src/ngc.rs`: strict reader for the G-code subset the post writes, and the replay that compares each program move by move with the simulation.
 - `src/simulation.rs`: bounded Facing planning, timed motion, cumulative operation/setup sequencing and rewind, and the box each later setup starts from (`sequence_walk`, `leftover_box`).
 - `src/pocket.rs`: selected-floor polygon union/offsets, islands, depth layers, profile ramps, direction and reach/access guards.
 - `src/surface.rs`: connected planar mesh regions, model-bound selections and planar geometry checks.
 - `src/cam.rs`: bounded inside/outside contour, circular-hole detection/drilling, flat/ball drop-cutter parallel and constant-Z waterline previews; geometric and playback regressions.
-- `src/volume.rs`: persistent cutter history, setup-frame transforms and approximate removal-volume grid.
+- `src/volume.rs`: persistent cutter history, setup-frame transforms and approximate removal-volume grid; a round bar clears the voxels outside its cylinder and a lathe cut removes a ring about the axis.
 - `src/stock_surface.rs`: continuous cutter implicit fields, adaptive octree meshing and detail levels, and the cut a move leaves (each remembers the setup and operation that made it).
 - `src/uncut.rs`: the faces the job leaves under stock: each face sampled just outside itself against the cuts that made the stock, the regions those faces make where they share edges, and the share of the part's area they cover.
-- `src/stock.rs`: part placement, six-sided stock offsets, resolved bounds and stock report text.
+- `src/stock.rs`: part placement, six-sided stock offsets, resolved bounds and stock report text, and round bar stock (its box, its axis and its radius).
 - `src/analysis.rs`: part report (the project material with its cutting data, the tools, and planes, pocket floors and holes for each of six orientations), orientation helpers and the planning preconditions.
 - `src/proposal.rs`: plan format and JSON schema, reference checks, building a job from a plan and reading a reply that is still streaming (`partial`).
 - `src/plan_check.rs`: plan stages (structure, cutting data, generation, export and workholding, a UC100 machine's run checks in place of export, tool axis, coarse gouge) and coverage.
@@ -1062,17 +1182,20 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-nine s
 - `src/settings.rs`: non-secret app settings.
 - `src/openai.rs`: Responses API client on the ChatGPT plan: conversation items with images, the tools and their calls, and the text of a streamed reply for the planner's timeline.
 - `src/fake_openai.rs`: test-only loopback stand-in for OpenAI.
+- `src/lathe.rs`: the manual lathe: its machine profile and defaults, the lathe tool types, the Turn kinds with their tools and starting values, and `dial`, the conversion of a distance to what a dial shows (whole turns and a reading in the dial's own numbers, the cross slide by what its dial reads).
+- `src/turn.rs`: the Turn strategy and the lathe Drill: the passes of each kind as moves in the setup's frame and as rings about the axis for the simulation, the equal passes and the finish, the thread infeed table, the material left by earlier lathe cuts and the check against the part.
 - `src/manual.rs`: the manual machine: its defaults, gears and speeds, handwheel turns, which tools and vises fit a machine, the minutes the stock spends moving, and the Box fill from a part face.
-- `src/guide.rs`: the step guide of a manual setup: sections, steps and the DRO targets (edge or centre, locks), made from the simulated plans.
+- `src/guide.rs`: the step guide of a manual setup: sections, steps and the DRO targets (edge or centre, locks), made from the simulated plans; for a lathe setup (`lathe_guide`), the dial check, Hold, Zero, the touches, each Turn kind's steps with their dial readings and the measured diameters.
 - `src/steps.rs`: the Steps page that draws the guide: the section bar, the step screens and their pictures.
+- `src/steps/turning.rs`: the lathe's screens on the Steps page: the side view of the bar, the dial collars, the Measure input and the dial check's answer buttons.
 - `src/smoke.rs`: renderer smoke workflow and application action tests.
-- `assets/op-*.svg`: the eleven original operation icons from the web prototype.
+- `assets/op-*.svg`: the eleven original operation icons from the web prototype, and the Turn icon (`op-12.svg`).
 - `assets/tb-*.svg`: the nine toolbar icons (white glyphs on solid tiles, checked for contrast by `toolbar_glyphs_meet_contrast_on_their_tiles`).
 
 ## Next engineering stages
 
 1. Keep exact CAD topology in the application, extend imported geometry selection beyond tessellated patches, and implement exact stock/fixture placement.
-2. Extend the six bounded operation previews into a production 3-axis CAM engine with exact boundaries, robust linking, additional strategies, rest-aware path optimization and fixture collision checks beyond vise jaws and clamps.
+2. Extend the seven bounded operation previews into a production 3-axis CAM engine with exact boundaries, robust linking, additional strategies, rest-aware path optimization and fixture collision checks beyond vise jaws and clamps.
 3. Implement rotary and 5-axis kinematics, limit checking, singularity handling and machine simulation.
 4. Add more postprocessors (GRBL, Fanuc…), arcs and canned cycles, each with the same replay verification, and validate them on known machines.
 5. Extend the planner as more strategies become available for imported parts, and make it aware of fixtures beyond vise jaws and clamps.

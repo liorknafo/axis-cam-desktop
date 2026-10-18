@@ -246,7 +246,15 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let (doc, notes) = load_reporting(&path).unwrap();
         let names: Vec<_> = doc.workholding.iter().map(|h| h.name()).collect();
-        assert_eq!(names, ["100 mm machine vise", "Toe clamp 60 mm"]);
+        assert_eq!(
+            names,
+            [
+                "100 mm machine vise",
+                "Toe clamp 60 mm",
+                "160 mm 3-jaw chuck",
+                "160 mm 4-jaw chuck"
+            ]
+        );
         assert!(
             notes.iter().all(|n| !n.contains("workholding")),
             "{notes:?}"

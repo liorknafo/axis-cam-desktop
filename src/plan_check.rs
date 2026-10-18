@@ -28,9 +28,11 @@ pub struct CheckReport {
     pub operations: Vec<OpResult>,
     pub coverage: Option<Coverage>,
     pub total_minutes: f32,
-    /// What `total_minutes` is made of: the minutes at the manual mill (its
-    /// operations and tool changes), at the CNC, and moving the stock between
-    /// machines. Not sent to the model.
+    /// What `total_minutes` is made of: the minutes at the lathe, at the
+    /// manual mill (each its operations and tool changes), at the CNC, and
+    /// moving the stock between machines. Not sent to the model.
+    #[serde(skip)]
+    pub lathe_minutes: f32,
     #[serde(skip)]
     pub manual_minutes: f32,
     #[serde(skip)]
@@ -50,39 +52,55 @@ pub struct CheckReport {
 }
 impl CheckReport {
     /// Sets the minutes from the operations that generated: `total_minutes`
-    /// is theirs, plus the manual setups' tool changes and the moves of the
-    /// stock between machines; the split counts the manual setups'
-    /// operations and tool changes as manual.
+    /// is theirs, plus the hand setups' tool changes and the moves of the
+    /// stock between machines; the split counts the lathe's and the manual
+    /// mill's operations and tool changes apart from the CNC's.
     fn add_minutes(&mut self, built: &Document, operations: &[OpResult]) {
-        let round = |m: f32| (m * 10.).round() / 10.;
-        let manual = |setup: usize| crate::manual::is_manual(&built.setups[setup - 1].machine);
-        let of = |manual_ops: bool| -> f32 {
-            (operations.iter())
-                .filter(|o| manual(o.setup) == manual_ops)
+        use crate::manual::{is_hand, is_manual};
+        // To a tenth of a minute, never -0 (an empty sum of f32 is -0).
+        let round = |m: f32| (m * 10.).round() / 10. + 0.;
+        // The operations' minutes and the tool changes of the setups `of`.
+        let minutes = |of: &dyn Fn(&crate::model::Machine) -> bool| -> f32 {
+            let ops: f32 = (operations.iter())
+                .filter(|o| of(&built.setups[o.setup - 1].machine))
                 .map(|o| o.minutes)
-                .sum()
+                .sum();
+            let changes: f32 = (built.setups.iter())
+                .filter(|s| is_hand(&s.machine) && of(&s.machine))
+                .map(|s| {
+                    crate::manual::tool_changes(s) as f32
+                        * crate::model::num(&s.machine.p, "tool_time").unwrap_or(0.)
+                })
+                .sum();
+            ops + changes
         };
-        let changes: f32 = (built.setups.iter())
-            .filter(|s| crate::manual::is_manual(&s.machine))
-            .map(|s| {
-                crate::manual::tool_changes(s) as f32
-                    * crate::model::num(&s.machine.p, "tool_time").unwrap_or(0.)
-            })
-            .sum();
+        let (lathe, mill, cnc) = (
+            minutes(&|m| crate::lathe::is_lathe(m)),
+            minutes(&|m| is_manual(m)),
+            minutes(&|m| !is_hand(m)),
+        );
         let moves = crate::manual::move_minutes(built);
-        self.manual_minutes = round(of(true) + changes);
-        self.cnc_minutes = round(of(false));
+        self.lathe_minutes = round(lathe);
+        self.manual_minutes = round(mill);
+        self.cnc_minutes = round(cnc);
         self.move_minutes = round(moves);
-        self.total_minutes = round(of(true) + of(false) + changes + moves);
+        self.total_minutes = round(lathe + mill + cnc + moves);
     }
-    /// "Manual 18 min · CNC 42 min · moving 10 min", for a job that has a
-    /// manual setup; None for a job on CNC machines alone.
+    /// "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 10 min", for
+    /// a job that has a hand setup, the lathe's and the manual mill's parts
+    /// only when they have minutes; None for a job on CNC machines alone.
     pub fn split_line(&self) -> Option<String> {
-        (self.manual_minutes > 0. || self.move_minutes > 0.).then(|| {
-            format!(
-                "Manual {:.0} min · CNC {:.0} min · moving {:.0} min",
-                self.manual_minutes, self.cnc_minutes, self.move_minutes
-            )
+        (self.lathe_minutes > 0. || self.manual_minutes > 0. || self.move_minutes > 0.).then(|| {
+            let mut parts = vec![];
+            if self.lathe_minutes > 0. {
+                parts.push(format!("Lathe {:.0} min", self.lathe_minutes));
+            }
+            if self.manual_minutes > 0. {
+                parts.push(format!("Manual mill {:.0} min", self.manual_minutes));
+            }
+            parts.push(format!("CNC {:.0} min", self.cnc_minutes));
+            parts.push(format!("moving {:.0} min", self.move_minutes));
+            parts.join(" · ")
         })
     }
 }
@@ -692,14 +710,22 @@ pub fn coverage(
         note: "Approximate: measured on the coarse stock grid. Stock thinner than about 1.5 grid cells is not seen.",
     }
 }
-/// One problem per operation whose speed or feed lies outside the project
-/// material's cutting data, per value, or that cannot be checked (no
-/// material, no cutting data, a tool or operation without the numbers),
-/// naming its setup and operation. Each message is one line of at most 300
-/// characters: it names the material.
+/// One problem per operation (of a setup that is not a lathe's) whose speed
+/// or feed lies outside the project material's cutting data, per value, or
+/// that cannot be checked (no material, no cutting data, a tool or operation
+/// without the numbers), naming its setup and operation. Each message is one
+/// line of at most 300 characters: it names the material.
 fn cutting_data_problems(built: &Document) -> Vec<Problem> {
     let mut problems = vec![];
     for (si, setup) in built.setups.iter().enumerate() {
+        // The data is a mill cutter's: surface speed and chip load per tooth
+        // of a tool with a diameter and flutes. A turning tool has neither,
+        // its diameter changes in the cut and its feed is per revolution, so
+        // the data can only answer "could not be checked" and would refuse
+        // every lathe job.
+        if crate::lathe::is_lathe(&setup.machine) {
+            continue;
+        }
         for (oi, op) in setup.operations.iter().enumerate() {
             let messages = match built.speed_feed(setup, op) {
                 Some(SpeedFeed::InRange { .. }) => vec![],
@@ -757,6 +783,7 @@ pub fn evaluate_full(
                 operations: vec![],
                 coverage: None,
                 total_minutes: 0.,
+                lathe_minutes: 0.,
                 manual_minutes: 0.,
                 cnc_minutes: 0.,
                 move_minutes: 0.,
@@ -888,6 +915,7 @@ fn run(
         operations: vec![],
         coverage: None,
         total_minutes: 0.,
+        lathe_minutes: 0.,
         manual_minutes: 0.,
         cnc_minutes: 0.,
         move_minutes: 0.,
@@ -943,7 +971,19 @@ fn run(
                         name: op.name().to_string(),
                         minutes: (sim.plan.duration / 6.).round() / 10.,
                     });
-                    for message in axis_problems(&sim.plan, &geometries[si], &indexes[si], si) {
+                    // A lathe plan's moves are a side view (X the tool's
+                    // distance from the spindle axis, Z along it), not a
+                    // tool hanging down the setup's Z: the part above its
+                    // tip and the floor under it do not apply. Its rings
+                    // were checked against the part when it was generated
+                    // (`turn::generate`), and the stock check below sees
+                    // them in the volume.
+                    let lathe = sim.plan.is_lathe();
+                    for message in (!lathe)
+                        .then(|| axis_problems(&sim.plan, &geometries[si], &indexes[si], si))
+                        .into_iter()
+                        .flatten()
+                    {
                         axis.push(Problem {
                             setup: si + 1,
                             operation: Some(oi + 1),
@@ -2134,6 +2174,7 @@ mod tests {
                     workholding: String::new(),
                     holder: None,
                     operations,
+                    from: None,
                 })
                 .collect(),
             unmachined: vec![],
@@ -2202,6 +2243,36 @@ mod tests {
         let report = analysis::report(&doc, &closed).unwrap();
         let (check, _) = super::check(&doc, &closed, &report, &face_and_waterline(&report));
         assert!(check.passed, "{:?}", stages(&check));
+    }
+    #[test]
+    fn a_lathe_plan_is_not_read_as_a_tool_hanging_down_the_setup_z() {
+        use crate::turn::tests::{add, job, tube};
+        // A groove beyond the end of a Ø30 shaft: the tool's tip, at Ø20,
+        // has the shaft above it along the setup's Z, which is the spindle
+        // axis, not the tool's.
+        let (mut doc, mesh) = job(50., 100., tube(0., 15., 0., 50.), -60.);
+        add(
+            &mut doc,
+            "Groove",
+            &[("z", "-70"), ("width", "3"), ("diameter", "20")],
+        );
+        doc.adopt_materials();
+        doc.material_id = doc.materials[0].id.clone();
+        let sim = crate::simulation::prepare(&doc, &mesh, 0, 0).unwrap();
+        let geometry = Geometry::new(&doc.setups[0], &mesh);
+        let index = Index::new(&geometry);
+        assert!(!axis_problems(&sim.plan, &geometry, &index, 0).is_empty());
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let check = check_built(&doc, &mesh, &report);
+        assert!(
+            !check
+                .problems
+                .iter()
+                .any(|p| p.stage == "gouge" || p.stage == "generation"),
+            "{:?}",
+            check.problems
+        );
+        assert_eq!(check.operations.len(), 1);
     }
     #[test]
     fn a_plunge_where_the_underside_is_open_is_refused() {
@@ -2641,7 +2712,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "Manual {:.0} min · CNC {:.0} min · moving 10 min",
+                "Manual mill {:.0} min · CNC {:.0} min · moving 10 min",
                 check.manual_minutes, check.cnc_minutes
             )
         );
@@ -2651,6 +2722,180 @@ mod tests {
             assert!(json.get(key).is_none(), "{key}");
         }
         assert!(json["total_minutes"].as_f64().unwrap() > 0.);
+    }
+    /// A Ø30 shaft in a Ø50.2 × 100 bar held by the 3-jaw (grip 30,
+    /// stickout 70), which a Face, an Outside turn to Ø40, a Groove and a
+    /// Part off at work Z -62 cut, with its tools numbered.
+    fn lathe_job() -> (Document, Mesh, PartReport) {
+        use crate::turn::tests::{add, job, numbered, tube};
+        let (mut doc, mesh) = job(50.2, 100., tube(0., 15., 0., 50.), -60.);
+        add(&mut doc, "Face", &[]);
+        add(&mut doc, "Outside", &[("diameter", "40"), ("z_end", "-30")]);
+        add(
+            &mut doc,
+            "Groove",
+            &[("z", "-45"), ("width", "3"), ("diameter", "35")],
+        );
+        // The blade reaches the centre of the bar from the outside.
+        for tool in &mut doc.tools {
+            if get(&tool.p, "type") == "Parting blade" {
+                tool.p.insert("reach".into(), "30".into());
+            }
+        }
+        add(&mut doc, "Part off", &[("z", "-62")]);
+        numbered(&mut doc);
+        // The material has cutting data, none of it for a turning tool.
+        crate::proposal::tests::aluminium(&mut doc);
+        let report = analysis::report_unchecked(&doc, &mesh).unwrap();
+        (doc, mesh, report)
+    }
+    #[test]
+    fn a_clean_lathe_job_has_no_problems_at_any_stage_and_its_minutes_are_the_lathes() {
+        let (job, mesh, report) = lathe_job();
+        let check = check_built(&job, &mesh, &report);
+        assert!(check.passed, "{:?}", stages(&check));
+        assert_eq!(check.operations.len(), 4);
+        // All of it is the lathe's: its operations and its tool changes (3, at
+        // 3 min each: the turning tool serves the Face and the Outside turn).
+        let sum: f32 = check.operations.iter().map(|o| o.minutes).sum();
+        assert!(
+            (check.lathe_minutes - (sum + 9.)).abs() < 0.25,
+            "{} from {:?}",
+            check.lathe_minutes,
+            check.operations
+        );
+        assert_eq!(
+            (check.manual_minutes, check.cnc_minutes, check.move_minutes),
+            (0., 0., 0.)
+        );
+        assert!((check.total_minutes - check.lathe_minutes).abs() < 0.11);
+        // The parts that have no minutes are left out of the line, but the
+        // CNC's and the moving's stay beside the lathe's.
+        assert_eq!(
+            check.split_line().unwrap(),
+            format!(
+                "Lathe {:.0} min · CNC 0 min · moving 0 min",
+                check.lathe_minutes
+            )
+        );
+        // Cutting data is a mill cutter's: a turning tool has no diameter or
+        // flutes for it, and the job has a material whose data would ask.
+        assert!(
+            job.selected_material()
+                .is_some_and(|m| m.cutting_data().is_some())
+        );
+        let (setup, op) = (&job.setups[0], &job.setups[0].operations[0]);
+        assert!(matches!(
+            job.speed_feed(setup, op),
+            Some(SpeedFeed::Unchecked(_))
+        ));
+        assert!(!check.problems.iter().any(|p| p.stage == "cutting data"));
+        // Nor does the stock grid see a gouge in the turned bar.
+        assert_eq!(check.stocks.len(), 1);
+    }
+    #[test]
+    fn a_lathe_job_gets_the_chucks_workholding_problems_and_nothing_about_export() {
+        // A stickout 1 mm short of the part off's cut (62 + 3 + 5 = 70).
+        let (mut job, mesh, report) = lathe_job();
+        job.setups[0].p.insert("stickout".into(), "69".into());
+        job.setups[0].p.insert("grip".into(), "30".into());
+        let found = stages(&check_built(&job, &mesh, &report));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("workholding 1/None: The stickout is 69 mm; Turn · Part off cuts 65 mm from the free end"),
+            "{found:?}"
+        );
+        // A grip longer than the jaws is the editor's issue, said once at the
+        // workholding stage as every holding problem is.
+        let (mut job, mesh, report) = lathe_job();
+        job.setups[0].p.insert("grip".into(), "40".into());
+        job.setups[0].p.insert("stickout".into(), "60".into());
+        let found = stages(&check_built(&job, &mesh, &report));
+        assert!(
+            found
+                .iter()
+                .all(|f| f.starts_with("workholding 1/None: Lathe: ")),
+            "{found:?}"
+        );
+        assert!(found[0].contains("these jaws are 30 mm long"), "{found:?}");
+        // A cut inside the grip names its operation.
+        let (mut job, mesh, report) = lathe_job();
+        job.setups[0].p.insert("stickout".into(), "30".into());
+        job.setups[0].p.insert("grip".into(), "30".into());
+        let found = stages(&check_built(&job, &mesh, &report));
+        assert!(
+            found.contains(&"workholding 1/Some(3): Turn · Groove: cuts at Z-45.0, inside the grip: the jaws start at Z-30.0.".to_string()),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|f| f.starts_with("workholding ")),
+            "{found:?}"
+        );
+    }
+    #[test]
+    fn the_split_names_the_lathe_the_manual_mill_and_the_cnc_and_leaves_out_hand_parts_with_no_minutes()
+     {
+        let mut report = CheckReport {
+            passed: true,
+            problems: vec![],
+            operations: vec![],
+            coverage: None,
+            total_minutes: 0.,
+            lathe_minutes: 0.,
+            manual_minutes: 0.,
+            cnc_minutes: 42.,
+            move_minutes: 0.,
+            stocks: vec![],
+            zeros: vec![],
+        };
+        // A job on CNC machines alone has no line.
+        assert_eq!(report.split_line(), None);
+        report.lathe_minutes = 20.4;
+        report.manual_minutes = 18.;
+        report.move_minutes = 20.;
+        assert_eq!(
+            report.split_line().unwrap(),
+            "Lathe 20 min · Manual mill 18 min · CNC 42 min · moving 20 min"
+        );
+        report.manual_minutes = 0.;
+        assert_eq!(
+            report.split_line().unwrap(),
+            "Lathe 20 min · CNC 42 min · moving 20 min"
+        );
+        report.lathe_minutes = 0.;
+        report.manual_minutes = 18.;
+        assert_eq!(
+            report.split_line().unwrap(),
+            "Manual mill 18 min · CNC 42 min · moving 20 min"
+        );
+        // Stock moving alone is a line as before.
+        report.manual_minutes = 0.;
+        assert_eq!(report.split_line().unwrap(), "CNC 42 min · moving 20 min");
+    }
+    #[test]
+    fn a_lathe_before_a_cnc_setup_is_counted_as_the_lathe_and_moves_the_stock_once() {
+        let (mut job, mesh, report) = good_job();
+        crate::post::fixture::with_lathe_setup(&mut job);
+        let check = check_built(&job, &mesh, &report);
+        assert_eq!(check.operations.iter().filter(|o| o.setup == 1).count(), 1);
+        let groove = &check.operations[0];
+        assert_eq!((groove.setup, groove.operation), (1, 1));
+        // The groove's minutes and its one tool change (3 min); the CNC's own
+        // minutes as before; the lathe's move time (10 min) once.
+        assert!((check.lathe_minutes - (groove.minutes + 3.)).abs() < 0.11);
+        assert_eq!(check.manual_minutes, 0.);
+        assert_eq!(check.move_minutes, 10.);
+        let sum = check.lathe_minutes + check.cnc_minutes + check.move_minutes;
+        assert!((check.total_minutes - sum).abs() < 0.11);
+        assert_eq!(
+            check.split_line().unwrap(),
+            format!(
+                "Lathe {:.0} min · CNC {:.0} min · moving 10 min",
+                check.lathe_minutes, check.cnc_minutes
+            )
+        );
+        // The CNC setups after it are checked as they always were.
+        assert!(check.passed, "{:?}", stages(&check));
     }
     #[test]
     fn a_manual_setup_still_gets_its_generation_and_holding_problems() {
@@ -2904,6 +3149,7 @@ mod totem {
                         }),
                         cut("Contour", 2, &[], 700., &outline(2.)),
                     ],
+                    from: None,
                 },
                 ProposedSetup {
                     orientation: "-Z".into(),
@@ -2920,6 +3166,7 @@ mod totem {
                         // Last, it cuts the skin and frees the part.
                         cut("Contour", 2, &[], 700., &outline(0.)),
                     ],
+                    from: None,
                 },
             ],
             unmachined: vec![],

@@ -4,10 +4,10 @@
 use crate::material::NAME_LIMIT;
 use crate::mesh::{Bounds, Mesh};
 use crate::model::{Document, Fields, Setup, fields, get, id, num};
-use crate::simulation::Plan;
+use crate::simulation::{Motion, Plan};
 use serde::{Deserialize, Serialize};
 
-pub const KINDS: [&str; 2] = ["Vise", "Clamp"];
+pub const KINDS: [&str; 3] = ["Vise", "Clamp", "Chuck"];
 const NOTE: &str = "Measure yours: these are typical sizes.";
 /// How far below the stock bottom a vise jaw is modelled to reach.
 const JAW_DEPTH: f32 = 100.;
@@ -39,17 +39,22 @@ impl Holder {
     }
     /// The numbers that size the entry, by kind.
     pub fn keys(&self) -> &'static [&'static str] {
-        if self.kind() == "Vise" {
-            &[
+        match self.kind() {
+            "Vise" => &[
                 "jaw_width",
                 "jaw_height",
                 "jaw_thickness",
                 "max_opening",
                 "grip",
-            ]
-        } else {
-            &["length", "width", "height", "bite"]
+            ],
+            "Chuck" => &["jaws", "min_grip", "max_grip", "jaw_length", "body"],
+            _ => &["length", "width", "height", "bite"],
         }
+    }
+    /// Whether the entry is on machine `m`: one it lists, else, with no list,
+    /// every CNC machine, or for a chuck every lathe.
+    pub fn fits(&self, m: &crate::model::Machine) -> bool {
+        crate::manual::fits(get(&self.p, "machines"), self.kind() == "Chuck", m)
     }
     pub fn issues(&self) -> Vec<String> {
         let mut e = vec![];
@@ -62,9 +67,13 @@ impl Holder {
             e.push("Notes can be at most 500 characters.".into());
         }
         if !KINDS.contains(&self.kind()) {
-            e.push("Choose Vise or Clamp.".into());
+            e.push("Choose Vise, Clamp or Chuck.".into());
         }
         for k in self.keys() {
+            // A chuck's jaws are 3 or 4, said below.
+            if *k == "jaws" {
+                continue;
+            }
             if !num(&self.p, k).is_some_and(|v| v > 0.) {
                 e.push(format!(
                     "{} must be a positive number.",
@@ -79,6 +88,21 @@ impl Holder {
             e.push(
                 "The clamping force must be a positive number, or empty for a typical one.".into(),
             );
+        }
+        if self.kind() == "Chuck" {
+            if !matches!(num(&self.p, "jaws"), Some(j) if j == 3. || j == 4.) {
+                e.push("A chuck has 3 or 4 jaws.".into());
+            }
+            let (min, max) = (num(&self.p, "min_grip"), num(&self.p, "max_grip"));
+            if min.zip(max).is_some_and(|(a, b)| a >= b) {
+                e.push("The smallest grip must be below the largest.".into());
+            }
+            if max
+                .zip(num(&self.p, "body"))
+                .is_some_and(|(grip, body)| body <= grip)
+            {
+                e.push("The chuck body must be wider than the largest grip.".into());
+            }
         }
         if self.kind() == "Clamp"
             && num(&self.p, "bite")
@@ -114,10 +138,29 @@ pub fn starters() -> Vec<Holder> {
     ] {
         c.p.insert(k.into(), x.into());
     }
-    for h in [&mut v, &mut c] {
+    let chuck = |name, jaws, min, max| {
+        let mut h = Holder::new("Chuck", name);
+        for (k, x) in [
+            ("jaws", jaws),
+            ("min_grip", min),
+            ("max_grip", max),
+            ("jaw_length", "30"),
+            ("body", "160"),
+        ] {
+            h.p.insert(k.into(), x.into());
+        }
+        h
+    };
+    let mut all = vec![
+        v,
+        c,
+        chuck("160 mm 3-jaw chuck", "3", "3", "140"),
+        chuck("160 mm 4-jaw chuck", "4", "6", "150"),
+    ];
+    for h in &mut all {
         h.p.insert("notes".into(), NOTE.into());
     }
-    vec![v, c]
+    all
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -155,6 +198,14 @@ pub enum Layout {
         holder: String,
         clamps: Vec<(Side, f32)>,
         gap: f32,
+    },
+    /// A lathe chuck: `grip` mm of the bar in the jaws, `stickout` mm from
+    /// the jaws' end (the chuck's face) to the free end. Its body is a box
+    /// (`boxes`) and the checks of `chuck_issues` and `chuck_problems` apply.
+    Chuck {
+        holder: String,
+        grip: f32,
+        stickout: f32,
     },
 }
 /// Encodes clamp positions as stored on the setup ("-X:0;+X:10").
@@ -259,6 +310,18 @@ pub fn layout(setup: &Setup) -> Result<Layout, String> {
                 gap: gap(setup)?,
             })
         }
+        "Chuck" => {
+            let positive = |key, what| {
+                number(get(p, key))
+                    .filter(|v| *v > 0.)
+                    .ok_or(format!("The chuck {what} must be a positive number."))
+            };
+            Ok(Layout::Chuck {
+                holder,
+                grip: positive("grip", "grip")?,
+                stickout: positive("stickout", "stickout")?,
+            })
+        }
         other => Err(format!("\"{other}\" is not a workholding choice.")),
     }
 }
@@ -301,6 +364,23 @@ pub struct Gripped {
     /// without earlier cuts, for clamps, and wherever the earlier cuts are
     /// not known.
     pub bottom: f32,
+    /// For a chuck, the material in its jaws as the earlier setups' lathe
+    /// cuts left it (`girth`); None for a vise or clamps and wherever those
+    /// cuts are not known: the stock box and the setup's stock type tell then.
+    pub girth: Option<Girth>,
+}
+/// What a lathe chuck grips: how wide the material is over the jaws and
+/// whether it is round there, and how wide the bar is at its widest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Girth {
+    /// The diameter over the jaws, mm: across the corners of a square bar.
+    pub grip: f32,
+    /// Whether the material over the jaws is a full disc about the spindle
+    /// axis, which a 3-jaw holds.
+    pub round: bool,
+    /// The diameter at the widest anywhere along the bar, mm: what swings
+    /// over the bed.
+    pub widest: f32,
 }
 /// A box whose jaws close on the whole of it (`Gripped::whole`): setup 1's,
 /// or one whose earlier cuts are not known.
@@ -316,6 +396,7 @@ impl Gripped {
             stock,
             band: stock,
             bottom: stock.min[2],
+            girth: None,
         }
     }
     /// The box a layout's jaws or clamps sit against: the band for a vise,
@@ -348,6 +429,11 @@ impl Bands {
     /// closes on in `stock` (`rest::RestStock::band`: the band at its grip,
     /// its sides across the jaws over their reach). `stock` for clamps or no
     /// workholding.
+    /// The lathe cuts the earlier setups made about the setup's Z axis,
+    /// which tell what a chuck grips (`girth`).
+    pub fn coaxial(&self) -> &crate::rest::Coaxial {
+        self.rest.coaxial()
+    }
     pub fn at(&self, stock: Bounds, layout: &Layout, holder: &Holder) -> Bounds {
         let Layout::Vise {
             axis_y,
@@ -402,16 +488,76 @@ pub fn gripped(layout: &Layout, holder: &Holder, stock: Bounds, bands: Option<&B
                 stock,
                 band,
                 bottom: bands.bottom(band, layout, holder),
+                girth: None,
             }
         }
         _ => Gripped::whole(stock),
     }
+}
+/// How far below its face a chuck's body reaches along the bar, mm.
+pub const BODY_DEPTH: f32 = 40.;
+/// What the stickout must leave past the furthest cut, mm.
+pub const STICKOUT_MARGIN: f32 = 5.;
+/// A stickout of more than this many diameters is long and thin.
+pub const SLENDER: f32 = 4.;
+/// What a 3-jaw on work that is not round is told.
+pub const THREE_JAW_ROUND: &str = "A 3-jaw holds round work: use the 4-jaw.";
+/// The warning for a bar that sticks out too far for its diameter.
+pub const LONG_THIN: &str = "Long and thin: support it or cut it in two setups.";
+/// The chip on a setup held in a 4-jaw: the chuck is changed for it.
+pub const CHANGE_CHUCK: &str = "4-jaw: change the chuck";
+/// The frame Z of a chuck's jaws' end, the face the bar leaves: `stickout`
+/// below the free end (the top of `stock`).
+pub fn jaws_end(stock: Bounds, stickout: f32) -> f32 {
+    stock.max[2] - stickout
+}
+/// What a chuck at `layout` grips in `stock` (the setup's box, in its frame):
+/// the material between the jaws' end and the grip below it, as
+/// `turn::Material` tells it. `first` is whether the setup is the job's first,
+/// which starts as its own round bar when its stock type is one; a later
+/// setup's stock is the box the earlier ones left, less the lathe cuts in
+/// `coaxial`. None for anything but a chuck and where no material lies in the
+/// jaws.
+pub fn girth(
+    setup: &Setup,
+    first: bool,
+    layout: &Layout,
+    stock: Bounds,
+    coaxial: Option<&crate::rest::Coaxial>,
+) -> Option<Girth> {
+    let Layout::Chuck { grip, stickout, .. } = layout else {
+        return None;
+    };
+    let material =
+        crate::turn::Material::of(stock, first && crate::stock::is_round(setup), coaxial);
+    let end = jaws_end(stock, *stickout);
+    let (grip, round) = material.girth(end - grip, end)?;
+    let (widest, _) = material.girth(stock.min[2], stock.max[2])?;
+    Some(Girth {
+        grip,
+        round,
+        widest,
+    })
+}
+/// Whether `setup` is the first of `doc`'s.
+fn is_first(doc: &Document, setup: &Setup) -> bool {
+    doc.setups.first().is_some_and(|s| s.id == setup.id)
 }
 /// What `setup`'s vise or clamps, with their entry in `doc`'s library, hold
 /// of `stock` (`gripped`): the whole box when its layout does not read or
 /// the entry is not there, which `Document::holding_issues` says.
 pub fn held_by(doc: &Document, setup: &Setup, stock: Bounds, bands: Option<&Bands>) -> Gripped {
     match (layout(setup), doc.holder(get(&setup.p, "holder"))) {
+        (Ok(layout @ Layout::Chuck { .. }), Some(_)) => Gripped {
+            girth: girth(
+                setup,
+                is_first(doc, setup),
+                &layout,
+                stock,
+                bands.map(Bands::coaxial),
+            ),
+            ..Gripped::whole(stock)
+        },
         (Ok(layout), Some(holder)) => gripped(&layout, holder, stock, bands),
         _ => Gripped::whole(stock),
     }
@@ -423,6 +569,7 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
         Layout::None => return None,
         Layout::Vise { .. } => "Vise",
         Layout::Clamps { .. } => "Clamp",
+        Layout::Chuck { .. } => "Chuck",
     };
     if holder.kind() != want && KINDS.contains(&holder.kind()) {
         return Some(format!(
@@ -438,6 +585,21 @@ pub fn refusal(layout: &Layout, holder: &Holder) -> Option<String> {
             issues.join(" ")
         )
     })
+}
+/// Why `machine` cannot take the workholding a setup chose (its `holding`
+/// key): a lathe holds its bar in a chuck, not a vise or clamps, and a chuck
+/// is for a lathe. None for no workholding.
+pub fn machine_refusal(holding: &str, machine: &crate::model::Machine) -> Option<String> {
+    let lathe = crate::lathe::is_lathe(machine);
+    match holding {
+        "Vise" | "Clamps" if lathe => {
+            Some("A lathe holds the stock in a chuck, not a vise or clamps. Choose a chuck.".into())
+        }
+        "Chuck" if !lathe => {
+            Some("A chuck is for a lathe setup. Choose a vise or clamps for this machine.".into())
+        }
+        _ => None,
+    }
 }
 /// `v` mm for a message: up to two decimals, without trailing zeros.
 fn mm(v: f32) -> String {
@@ -476,7 +638,7 @@ pub fn position_issue(
 ) -> Option<String> {
     let length = held.into().on(layout).dimensions();
     match layout {
-        Layout::None => None,
+        Layout::None | Layout::Chuck { .. } => None,
         Layout::Vise { axis_y, offset, .. } => {
             let along = length[usize::from(!*axis_y)] / 2. + num(&holder.p, "jaw_width")? / 2.;
             (offset.abs() >= along).then(|| {
@@ -528,6 +690,18 @@ pub fn boxes(
     ];
     Ok(match layout {
         Layout::None => vec![],
+        // The body of the chuck, about the spindle axis (X = Y = 0), from the
+        // jaws' end back along the bar.
+        Layout::Chuck { stickout, .. } => {
+            let (top, half) = (jaws_end(held.stock, *stickout), n("body") / 2.);
+            vec![HoldBox {
+                label: "chuck body".into(),
+                bounds: Bounds {
+                    min: [-half, -half, top - BODY_DEPTH],
+                    max: [half, half, top],
+                },
+            }]
+        }
         Layout::Vise {
             axis_y,
             offset,
@@ -739,6 +913,47 @@ pub fn hits_segments(
     }
     out
 }
+/// The boxes a lathe plan's moves come within `gap` of. The moves are a side
+/// view (X the tip's distance from the spindle axis, Y 0, Z along it), not a
+/// tool hanging down the setup's Z, so the vertical test of `hits_segments`
+/// (the tool from its tip up by its stickout) does not mean what it says for
+/// them. The tip is the part of a turning tool that reaches the chuck first
+/// (the tool trails from it toward the free end), and it is taken to hit a
+/// box when a point of a move lies no higher than the box's top (the chuck's
+/// face) plus the `gap`, and no farther from the axis than the box's half
+/// width plus the tip's `radius` (the nose, or half the blade) and the gap.
+/// One hit per box: the first move's, where it first comes that near.
+fn lathe_hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
+    boxes
+        .iter()
+        .filter_map(|b| {
+            let top = f64::from(b.bounds.max[2] + gap);
+            let reach = f64::from(
+                b.bounds.max[0]
+                    .max(-b.bounds.min[0])
+                    .max(b.bounds.max[1])
+                    .max(-b.bounds.min[1])
+                    + plan.radius
+                    + gap,
+            );
+            plan.moves.iter().find_map(|m| {
+                let (from, to) = (m.from.map(f64::from), m.to.map(f64::from));
+                let (t0, t1) = within(from[2], to[2], f64::NEG_INFINITY, top)?;
+                let x = |t: f64| from[0] + (to[0] - from[0]) * t;
+                let nearest = if x(t0) * x(t1) <= 0. {
+                    0.
+                } else {
+                    x(t0).abs().min(x(t1).abs())
+                };
+                (nearest <= reach).then(|| Hit {
+                    label: b.label.clone(),
+                    part: "tool",
+                    at: [0, 1, 2].map(|k| (from[k] + (to[k] - from[k]) * t0) as f32),
+                })
+            })
+        })
+        .collect()
+}
 /// By how much the moves of `plan` keep clear of the box `b`: for each move
 /// and each part of the tool, the distance `hits_segments` finds (XY, from
 /// the stretch whose heights overlap the box grown by `gap`, to the box's
@@ -758,8 +973,11 @@ fn margin(plan: &Plan, b: &Bounds, gap: f32) -> f32 {
     }
     least as f32
 }
-/// `hits_segments` for the moves of `plan`.
+/// `hits_segments` for the moves of `plan`; for a lathe plan, `lathe_hits`.
 pub fn hits(plan: &Plan, boxes: &[HoldBox], gap: f32) -> Vec<Hit> {
+    if plan.is_lathe() {
+        return lathe_hits(plan, boxes, gap);
+    }
     let moves: Vec<_> = plan.moves.iter().map(|m| (m.from, m.to)).collect();
     hits_segments(
         &moves,
@@ -791,6 +1009,11 @@ pub fn sentence(layout: &Layout, holder: &Holder) -> String {
     let name = holder.name().trim();
     match layout {
         Layout::None => String::new(),
+        Layout::Chuck { grip, stickout, .. } => format!(
+            "{name}, grip {} mm, stickout {} mm.",
+            mm(*grip),
+            mm(*stickout)
+        ),
         Layout::Vise {
             axis_y,
             offset,
@@ -1056,6 +1279,9 @@ pub fn request(setup: &Setup, holder: Option<&Holder>) -> Result<Request, String
     let (kind, vise) = match get(&setup.p, "holding") {
         "Vise" => ("vise", true),
         "Clamps" => ("clamp", false),
+        "Chuck" => {
+            return Err("A chuck has no layout to suggest: set its grip and stickout.".into());
+        }
         _ => return Err("Choose a vise or clamps for this setup first.".into()),
     };
     let gap = gap(setup)?;
@@ -1229,12 +1455,22 @@ pub fn placement(layout: &Layout) -> Vec<(&'static str, String)> {
             ("vise_grip", mm(*grip)),
         ],
         Layout::Clamps { clamps, .. } => vec![("clamps", clamps_text(clamps))],
+        Layout::Chuck { grip, stickout, .. } => {
+            vec![("grip", mm(*grip)), ("stickout", mm(*stickout))]
+        }
     }
 }
 /// Where `layout` puts the jaws or clamps, for a status line.
 fn describe(layout: &Layout) -> String {
     match layout {
         Layout::None => String::new(),
+        Layout::Chuck { grip, stickout, .. } => {
+            format!(
+                "chuck, grip {} mm, stickout {} mm",
+                mm(*grip),
+                mm(*stickout)
+            )
+        }
         Layout::Vise { axis_y, grip, .. } => format!(
             "vise jaws on ±{}, grip {} mm",
             if *axis_y { "Y" } else { "X" },
@@ -1296,6 +1532,213 @@ pub fn height_issue(layout: &Layout, stock: Bounds) -> Option<String> {
             mm(*grip)
         )
     })
+}
+/// What is wrong with a chuck at `layout` holding a bar of `girth` and
+/// `length` (the bar's, mm; the stock's Z extent) on a lathe that swings
+/// `swing` mm over its bed, from the numbers alone (the editor has no
+/// toolpaths): a 3-jaw on work that is not round; the diameter in the jaws
+/// outside the range the chuck closes on; a grip under a third of that
+/// diameter or longer than the jaws; a bar wider than the swing; and a grip
+/// and stickout that come to more than the bar. Nothing for any other layout.
+/// What the toolpaths do to the chuck is `chuck_problems`.
+pub fn chuck_issues(
+    layout: &Layout,
+    holder: &Holder,
+    girth: Girth,
+    length: f32,
+    swing: Option<f32>,
+) -> Vec<String> {
+    let Layout::Chuck { grip, stickout, .. } = layout else {
+        return vec![];
+    };
+    let n = |k| num(&holder.p, k).unwrap_or(0.);
+    if n("jaws") == 3. && !girth.round {
+        return vec![THREE_JAW_ROUND.into()];
+    }
+    let d = girth.grip;
+    let mut found = vec![];
+    let (min, max) = (n("min_grip"), n("max_grip"));
+    if d < min - 0.005 || d > max + 0.005 {
+        found.push(format!(
+            "The bar is Ø{} mm where the jaws close; this chuck closes on Ø{} to Ø{} mm.",
+            mm(d),
+            mm(min),
+            mm(max)
+        ));
+    }
+    if *grip < d / 3. - 0.005 {
+        found.push(format!(
+            "The grip is {} mm; the jaws need at least a third of the Ø{} mm bar, {} mm.",
+            mm(*grip),
+            mm(d),
+            mm(d / 3.)
+        ));
+    }
+    if *grip > n("jaw_length") + 0.005 {
+        found.push(format!(
+            "The grip is {} mm; these jaws are {} mm long.",
+            mm(*grip),
+            mm(n("jaw_length"))
+        ));
+    }
+    if let Some(swing) = swing
+        && girth.widest > swing + 0.005
+    {
+        found.push(format!(
+            "The bar is Ø{} mm; the lathe swings Ø{} mm over its bed.",
+            mm(girth.widest),
+            mm(swing)
+        ));
+    }
+    if grip + stickout > length + 0.005 {
+        found.push(format!(
+            "The grip, {} mm, and the stickout, {} mm, come to more than the {} mm bar.",
+            mm(*grip),
+            mm(*stickout),
+            mm(length)
+        ));
+    }
+    found
+}
+/// What a chuck at `layout` holding a bar of `girth` warns of, though it
+/// holds it: a stickout over `SLENDER` diameters, `LONG_THIN`. A warning
+/// never refuses anything.
+pub fn chuck_warnings(layout: &Layout, girth: Girth) -> Vec<String> {
+    match layout {
+        Layout::Chuck { stickout, .. } if *stickout > SLENDER * girth.grip + 0.005 => {
+            vec![LONG_THIN.into()]
+        }
+        _ => vec![],
+    }
+}
+/// What the toolpaths do to a chuck at `layout` (jaws' end `jaws_end` below
+/// the free end of `stock`): for each operation `(index in the setup, name,
+/// plan)`, a cutting move inside the grip (below the jaws' end) or, when
+/// there is none, a move that comes within `gap` of the chuck's body `body`
+/// (`boxes`; `hits`, which a lathe plan answers as `lathe_hits`); then,
+/// for the setup as a whole, a stickout that is not the furthest cut from the
+/// free end plus `STICKOUT_MARGIN`. Said in lathe
+/// work coordinates (Z 0 at the free end). Only the moves count: the ring
+/// that a part off clears the bar left in the chuck with reaches into the
+/// grip by design. Nothing for any other layout.
+pub fn chuck_problems(
+    layout: &Layout,
+    stock: Bounds,
+    gap: f32,
+    body: &[HoldBox],
+    operations: &[(usize, &str, &Plan)],
+) -> Vec<(Option<usize>, String)> {
+    let Layout::Chuck { stickout, .. } = layout else {
+        return vec![];
+    };
+    let (end, jaws) = (crate::turn::end(stock), jaws_end(stock, *stickout));
+    let work = |z: f32| tenth(crate::turn::work_z(stock, z));
+    let mut found = vec![];
+    // The lowest cutting move of all, and the operation it belongs to.
+    let mut furthest: Option<(f32, &str)> = None;
+    for &(index, name, plan) in operations {
+        let lowest = plan
+            .moves
+            .iter()
+            .filter(|m| m.motion == Motion::Feed)
+            .map(|m| m.from[2].min(m.to[2]))
+            .reduce(f32::min);
+        if let Some(low) = lowest {
+            if furthest.is_none_or(|(z, _)| low < z) {
+                furthest = Some((low, name));
+            }
+            if low < jaws - 0.005 {
+                found.push((
+                    Some(index),
+                    format!(
+                        "{name}: cuts at Z{}, inside the grip: the jaws start at Z{}.",
+                        work(low),
+                        work(jaws)
+                    ),
+                ));
+                // The tool in the chuck is said once.
+                continue;
+            }
+        }
+        if let Some(hit) = hits(plan, body, gap).first() {
+            found.push((Some(index), message(name, hit, gap, [0., 0., end])));
+        }
+    }
+    if let Some((low, name)) = furthest {
+        let needed = end - low + STICKOUT_MARGIN;
+        if *stickout < needed - 0.005 {
+            found.push((
+                None,
+                format!(
+                    "The stickout is {} mm; {name} cuts {} mm from the free end and {} mm must stay clear of the jaws. Leave at least {} mm.",
+                    mm(*stickout),
+                    mm(end - low),
+                    mm(STICKOUT_MARGIN),
+                    mm(needed)
+                ),
+            ));
+        }
+    }
+    found
+}
+/// The chuck of `doc`'s library to hold a bar of `girth` on `machine`: the
+/// 3-jaw when the section in the jaws is round and within its range, else the
+/// 4-jaw that closes on it (the setup then says `CHANGE_CHUCK`). Never a
+/// vise, and never a 3-jaw for work that is not round. The first of its kind
+/// in the library that fits the machine, has no issues and closes on the
+/// diameter; or why there is none.
+pub fn suggest_chuck<'a>(
+    doc: &'a Document,
+    machine: &crate::model::Machine,
+    girth: Girth,
+) -> Result<&'a Holder, String> {
+    let closes = |h: &&Holder| {
+        h.kind() == "Chuck"
+            && h.fits(machine)
+            && h.issues().is_empty()
+            && num(&h.p, "min_grip").is_some_and(|min| girth.grip >= min - 0.005)
+            && num(&h.p, "max_grip").is_some_and(|max| girth.grip <= max + 0.005)
+    };
+    let jaws = |h: &&Holder, n: f32| num(&h.p, "jaws") == Some(n);
+    let mut fitting = doc.workholding.iter().filter(closes);
+    let chosen = if girth.round {
+        fitting.clone().find(|h| jaws(h, 3.))
+    } else {
+        None
+    };
+    chosen
+        .or_else(|| fitting.find(|h| jaws(h, 4.)))
+        .ok_or_else(|| {
+            format!(
+                "No chuck in the library closes on this {} Ø{} mm bar. Add one on the Workholding page.",
+                if girth.round { "round" } else { "square" },
+                mm(girth.grip)
+            )
+        })
+}
+/// The chuck to hold `setup`'s bar (`suggest_chuck`) as `held` has it (the
+/// stock and what the earlier lathe cuts left in the jaws), with the status
+/// line that says so: its library id and the line. Never a vise. The 4-jaw's
+/// line ends with `CHANGE_CHUCK`.
+pub fn chuck_for(doc: &Document, setup: &Setup, held: Gripped) -> Result<(String, String), String> {
+    let layout = layout(setup)?;
+    let girth = held
+        .girth
+        .or_else(|| girth(setup, is_first(doc, setup), &layout, held.stock, None))
+        .ok_or("No chuck suggested: there is no bar in the jaws.")?;
+    let chuck = suggest_chuck(doc, &setup.machine, girth)?;
+    let line = format!(
+        "Suggested: {}, for a {} Ø{} mm bar.{}",
+        chuck.name(),
+        if girth.round { "round" } else { "square" },
+        mm(girth.grip),
+        if num(&chuck.p, "jaws") == Some(4.) {
+            format!(" {CHANGE_CHUCK}.")
+        } else {
+            String::new()
+        }
+    );
+    Ok((chuck.id.clone(), line))
 }
 /// How the holding checks name operation `operation` of setup `setup` of
 /// `doc` (both from 0, as `stock_surface::Cut::source` stores them): its
@@ -1528,7 +1971,8 @@ pub fn holdable(
     };
     let n = setup + 1;
     match layout {
-        Layout::None => {}
+        // The chuck's grip is not checked against earlier cuts yet.
+        Layout::None | Layout::Chuck { .. } => {}
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let axis = if *axis_y { "Y" } else { "X" };
@@ -1719,7 +2163,7 @@ mod tests {
     #[test]
     fn starters_are_valid() {
         let all = starters();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 4);
         for h in &all {
             assert!(h.issues().is_empty(), "{}: {:?}", h.name(), h.issues());
             assert!(get(&h.p, "notes").contains("Measure yours"));
@@ -1730,6 +2174,286 @@ mod tests {
         let mut negative = vise();
         negative.p.insert("jaw_width".into(), "-1".into());
         assert!(!negative.issues().is_empty());
+    }
+    fn chuck(kind: &str) -> Holder {
+        let name = format!("160 mm {kind}-jaw chuck");
+        starters().into_iter().find(|h| h.name() == name).unwrap()
+    }
+    fn lathe_setup(pairs: &[(&str, &str)]) -> Setup {
+        let mut s = setup(pairs);
+        s.machine = crate::lathe::defaults();
+        s
+    }
+    #[test]
+    fn the_chuck_starters_are_3_and_4_jaw_with_measure_yours_notes() {
+        let (three, four) = (chuck("3"), chuck("4"));
+        for (h, jaws, min, max) in [(&three, "3", "3", "140"), (&four, "4", "6", "150")] {
+            assert_eq!(h.kind(), "Chuck");
+            assert!(h.issues().is_empty(), "{}: {:?}", h.name(), h.issues());
+            assert_eq!(
+                [
+                    get(&h.p, "jaws"),
+                    get(&h.p, "min_grip"),
+                    get(&h.p, "max_grip")
+                ],
+                [jaws, min, max]
+            );
+            assert_eq!(get(&h.p, "body"), "160");
+            assert!(get(&h.p, "notes").contains("Measure yours"));
+            assert!(get(&h.p, "machines").is_empty());
+        }
+        assert_eq!(
+            h_keys(&three),
+            ["jaws", "min_grip", "max_grip", "jaw_length", "body"]
+        );
+        assert_eq!(KINDS, ["Vise", "Clamp", "Chuck"]);
+    }
+    fn h_keys(h: &Holder) -> Vec<&'static str> {
+        h.keys().to_vec()
+    }
+    #[test]
+    fn a_chuck_needs_3_or_4_jaws_a_grip_range_a_jaw_length_and_a_body() {
+        let issues = |k: &str, v: &str| {
+            let mut h = chuck("3");
+            h.p.insert(k.into(), v.into());
+            h.issues()
+        };
+        assert!(issues("jaws", "4").is_empty());
+        for bad in ["2", "5", "3.5", "", "x"] {
+            assert!(
+                issues("jaws", bad)
+                    .iter()
+                    .any(|e| e.contains("3 or 4 jaws") || e.contains("jaws")),
+                "{bad}"
+            );
+        }
+        for k in ["min_grip", "max_grip", "jaw_length", "body"] {
+            for bad in ["0", "-5", "", "x"] {
+                assert!(
+                    issues(k, bad)
+                        .iter()
+                        .any(|e| e.contains(&k.replace('_', " "))),
+                    "{k}={bad}"
+                );
+            }
+        }
+        assert!(
+            issues("min_grip", "140")
+                .iter()
+                .any(|e| e.contains("smallest grip"))
+        );
+        assert!(
+            issues("min_grip", "150")
+                .iter()
+                .any(|e| e.contains("smallest grip"))
+        );
+        assert!(
+            issues("max_grip", "2")
+                .iter()
+                .any(|e| e.contains("smallest grip"))
+        );
+        assert!(issues("min_grip", "139").is_empty());
+        assert!(
+            issues("body", "140")
+                .iter()
+                .any(|e| e.contains("wider than the largest grip"))
+        );
+        assert!(issues("body", "141").is_empty());
+        // The kind itself is checked, and a vise is not asked for a chuck's sizes.
+        let mut other = chuck("3");
+        other.p.insert("kind".into(), "Collet".into());
+        assert!(
+            other
+                .issues()
+                .iter()
+                .any(|e| e.contains("Vise, Clamp or Chuck"))
+        );
+        assert!(vise().issues().is_empty());
+    }
+    #[test]
+    fn a_chuck_fits_lathes_only_and_a_vise_or_clamp_does_not_fit_one() {
+        let (lathe, cnc) = (crate::lathe::defaults(), Machine::new(3));
+        let manual = crate::manual::defaults();
+        for h in [chuck("3"), chuck("4")] {
+            assert!(h.fits(&lathe) && !h.fits(&cnc) && !h.fits(&manual));
+        }
+        for h in [vise(), clamp()] {
+            assert!(h.fits(&cnc) && !h.fits(&lathe) && !h.fits(&manual));
+        }
+        let mut listed = chuck("3");
+        listed
+            .p
+            .insert("machines".into(), format!("{},{}", cnc.id, lathe.id));
+        assert!(listed.fits(&lathe) && listed.fits(&cnc));
+    }
+    #[test]
+    fn a_chuck_layout_is_read_from_the_setup_keys() {
+        assert_eq!(
+            layout(&setup(&[
+                ("holding", "Chuck"),
+                ("holder", "c1"),
+                ("grip", "30"),
+                ("stickout", " 45.5 ")
+            ]))
+            .unwrap(),
+            Layout::Chuck {
+                holder: "c1".into(),
+                grip: 30.,
+                stickout: 45.5
+            }
+        );
+        for (grip, stickout, what) in [
+            ("", "40", "grip"),
+            ("0", "40", "grip"),
+            ("x", "40", "grip"),
+            ("30", "", "stickout"),
+            ("30", "-1", "stickout"),
+        ] {
+            assert_eq!(
+                layout(&setup(&[
+                    ("holding", "Chuck"),
+                    ("grip", grip),
+                    ("stickout", stickout)
+                ])),
+                Err(format!("The chuck {what} must be a positive number.")),
+                "{grip:?} {stickout:?}"
+            );
+        }
+        // The placement keys are the setup's own, and are written back as read.
+        let layout = Layout::Chuck {
+            holder: "c1".into(),
+            grip: 30.,
+            stickout: 45.5,
+        };
+        assert_eq!(
+            placement(&layout),
+            vec![("grip", "30".to_string()), ("stickout", "45.5".to_string())]
+        );
+        let mut s = setup(&[("holding", "Chuck")]);
+        assert!(place(&mut s, &layout));
+        assert!(!place(&mut s, &layout));
+        assert_eq!(get(&s.p, "stickout"), "45.5");
+    }
+    #[test]
+    fn the_machine_refuses_the_wrong_kind_of_workholding() {
+        let (lathe, cnc, manual) = (
+            crate::lathe::defaults(),
+            Machine::new(3),
+            crate::manual::defaults(),
+        );
+        let chuck_at = Layout::Chuck {
+            holder: String::new(),
+            grip: 30.,
+            stickout: 50.,
+        };
+        let vise_at = Layout::Vise {
+            holder: String::new(),
+            axis_y: false,
+            offset: 0.,
+            grip: 8.,
+            gap: 2.,
+        };
+        let clamps_at = Layout::Clamps {
+            holder: String::new(),
+            clamps: vec![(Side::MinusX, 0.)],
+            gap: 2.,
+        };
+        assert_eq!(machine_refusal("Chuck", &lathe), None);
+        for wrong in ["Vise", "Clamps"] {
+            assert_eq!(machine_refusal(wrong, &cnc), None);
+            assert_eq!(machine_refusal(wrong, &manual), None);
+            assert!(
+                machine_refusal(wrong, &lathe)
+                    .unwrap()
+                    .contains("chuck, not a vise or clamps")
+            );
+        }
+        for mill in [&cnc, &manual] {
+            assert!(
+                machine_refusal("Chuck", mill)
+                    .unwrap()
+                    .contains("for a lathe setup")
+            );
+        }
+        for m in [&lathe, &cnc] {
+            for none in ["", "None"] {
+                assert_eq!(machine_refusal(none, m), None);
+            }
+        }
+        // And the entry must be of the layout's kind.
+        assert!(
+            refusal(&chuck_at, &vise())
+                .unwrap()
+                .contains("is a vise, not a chuck")
+        );
+        assert!(
+            refusal(&chuck_at, &clamp())
+                .unwrap()
+                .contains("is a clamp, not a chuck")
+        );
+        assert!(
+            refusal(&vise_at, &chuck("3"))
+                .unwrap()
+                .contains("is a chuck, not a vise")
+        );
+        assert!(
+            refusal(&clamps_at, &chuck("4"))
+                .unwrap()
+                .contains("is a chuck, not a clamp")
+        );
+        assert_eq!(refusal(&chuck_at, &chuck("3")), None);
+        let mut broken = chuck("3");
+        broken.p.insert("jaws".into(), "7".into());
+        assert!(
+            refusal(&chuck_at, &broken)
+                .unwrap()
+                .contains("needs fixing")
+        );
+    }
+    #[test]
+    fn every_holding_path_takes_a_chuck_without_applying_vise_logic() {
+        let layout = Layout::Chuck {
+            holder: String::new(),
+            grip: 30.,
+            stickout: 50.,
+        };
+        let three = chuck("3");
+        // The body is the one box, and a wrong entry still refuses.
+        assert_eq!(boxes(&layout, &three, stock()).unwrap().len(), 1);
+        assert!(boxes(&layout, &vise(), stock()).is_err());
+        assert_eq!(
+            gripped(&layout, &three, stock(), None),
+            Gripped::whole(stock())
+        );
+        assert_eq!(opening_issue(&layout, &three, stock()), None);
+        assert_eq!(position_issue(&layout, &three, stock()), None);
+        assert_eq!(height_issue(&layout, stock()), None);
+        // The sentence and the status line say what it is.
+        assert_eq!(
+            sentence(&layout, &three),
+            "160 mm 3-jaw chuck, grip 30 mm, stickout 50 mm."
+        );
+        assert_eq!(
+            summary(&layout, 0, 0, 0, None),
+            "Suggested: chuck, grip 30 mm, stickout 50 mm. No toolpaths were available to check, so only the stock was considered."
+        );
+        // Not checked against earlier cuts yet, and a wrong entry still refuses.
+        let (v, f, _) = untouched();
+        let removed = Removed::new(&v, f);
+        let names = |_: u16, _: u16| String::new();
+        assert!(holdable(0, &layout, &three, stock(), Some(&removed), &names).is_empty());
+        assert!(holdable(0, &layout, &three, stock(), None, &names).is_empty());
+        let refused = holdable(0, &layout, &vise(), stock(), None, &names);
+        assert!(refused[0].contains("is a vise, not a chuck"), "{refused:?}");
+        assert_eq!(clashes(&[], &[], 2.), 0);
+        // Not a modelled box, and nothing to suggest.
+        let s = lathe_setup(&[("holding", "Chuck"), ("grip", "30"), ("stickout", "50")]);
+        assert!(!modelled(&s));
+        assert_eq!(held([&s]), Held::No);
+        assert!(placed(&s));
+        let asked = request(&s, Some(&three)).err().unwrap();
+        assert!(asked.contains("no layout to suggest"), "{asked}");
+        assert_eq!(boxes(&layout, &three, stock()).unwrap().len(), 1);
     }
     #[test]
     fn layouts_are_read_from_the_setup() {
@@ -3718,5 +4442,442 @@ mod tests {
         let mut low = vise();
         low.p.insert("grip".into(), "2".into());
         assert_eq!(suggest_vise(tall(1.), None, &low, &[], 2.).1, 2.);
+    }
+
+    /// A Ø50.2 × 100 bar: Z 0 at the chuck end, 100 at the free end.
+    fn bar() -> Bounds {
+        Bounds {
+            min: [-25.1, -25.1, 0.],
+            max: [25.1, 25.1, 100.],
+        }
+    }
+    fn chucked(grip: f32, stickout: f32) -> Layout {
+        Layout::Chuck {
+            holder: String::new(),
+            grip,
+            stickout,
+        }
+    }
+    /// The girth of a round Ø50.2 bar.
+    fn round_bar() -> Girth {
+        Girth {
+            grip: 50.2,
+            round: true,
+            widest: 50.2,
+        }
+    }
+    #[test]
+    fn a_chuck_holds_a_bar_inside_its_range_grip_stickout_swing_and_length() {
+        let (three, four) = (chuck("3"), chuck("4"));
+        let issues = |layout: &Layout, holder: &Holder, girth: Girth, length, swing| {
+            chuck_issues(layout, holder, girth, length, swing)
+        };
+        // The default lathe bar passes.
+        assert!(issues(&chucked(30., 70.), &three, round_bar(), 100., Some(250.)).is_empty());
+        // A 3-jaw on a square bar is told to use the 4-jaw, and nothing else.
+        let square = Girth {
+            grip: 70.,
+            round: false,
+            widest: 70.,
+        };
+        assert_eq!(
+            issues(&chucked(30., 70.), &three, square, 100., Some(250.)),
+            [THREE_JAW_ROUND]
+        );
+        assert_eq!(THREE_JAW_ROUND, "A 3-jaw holds round work: use the 4-jaw.");
+        // The 4-jaw holds it: Ø70 is inside Ø6 to Ø150.
+        assert!(issues(&chucked(30., 70.), &four, square, 100., Some(250.)).is_empty());
+        // The diameter must be one the chuck closes on: not under Ø3 ...
+        let thin = Girth {
+            grip: 2.,
+            round: true,
+            widest: 2.,
+        };
+        assert_eq!(
+            issues(&chucked(30., 70.), &three, thin, 100., None),
+            ["The bar is Ø2 mm where the jaws close; this chuck closes on Ø3 to Ø140 mm."]
+        );
+        // ... nor over Ø140 (the 4-jaw closes on Ø150).
+        let wide = Girth {
+            grip: 145.,
+            round: true,
+            widest: 145.,
+        };
+        assert_eq!(
+            issues(&chucked(30., 70.), &three, wide, 100., None)[0],
+            "The bar is Ø145 mm where the jaws close; this chuck closes on Ø3 to Ø140 mm."
+        );
+        assert!(
+            !issues(&chucked(30., 70.), &four, wide, 100., None)
+                .iter()
+                .any(|i| i.contains("where the jaws close"))
+        );
+        // The grip is a third of the diameter at least, and no longer than the jaws.
+        assert_eq!(
+            issues(&chucked(10., 70.), &three, round_bar(), 100., None),
+            ["The grip is 10 mm; the jaws need at least a third of the Ø50.2 mm bar, 16.73 mm."]
+        );
+        assert!(issues(&chucked(16.8, 70.), &three, round_bar(), 100., None).is_empty());
+        assert_eq!(
+            issues(&chucked(40., 60.), &three, round_bar(), 100., None),
+            ["The grip is 40 mm; these jaws are 30 mm long."]
+        );
+        // The bar must swing over the bed.
+        let fat = Girth {
+            grip: 90.,
+            round: true,
+            widest: 260.,
+        };
+        assert_eq!(
+            issues(&chucked(30., 70.), &three, fat, 100., Some(250.)),
+            ["The bar is Ø260 mm; the lathe swings Ø250 mm over its bed."]
+        );
+        // The grip and the stickout are inside the bar.
+        assert_eq!(
+            issues(&chucked(30., 80.), &three, round_bar(), 100., None),
+            ["The grip, 30 mm, and the stickout, 80 mm, come to more than the 100 mm bar."]
+        );
+        assert!(issues(&chucked(30., 70.), &three, round_bar(), 100., None).is_empty());
+        // Nothing for other layouts.
+        assert!(chuck_issues(&Layout::None, &three, round_bar(), 100., None).is_empty());
+    }
+    #[test]
+    fn a_stickout_over_four_diameters_is_a_warning_not_an_issue() {
+        let layout = chucked(30., 201.);
+        assert_eq!(
+            chuck_warnings(&layout, round_bar()),
+            ["Long and thin: support it or cut it in two setups."]
+        );
+        // The issues do not mention it (the bar is long enough for it).
+        assert!(chuck_issues(&layout, &chuck("3"), round_bar(), 300., None).is_empty());
+        // 4 diameters is not over.
+        assert!(chuck_warnings(&chucked(30., 200.), round_bar()).is_empty());
+        assert!(chuck_warnings(&chucked(30., 70.), round_bar()).is_empty());
+        assert!(chuck_warnings(&Layout::None, round_bar()).is_empty());
+    }
+    #[test]
+    fn what_a_chuck_grips_is_the_widest_material_in_its_jaws_and_whether_it_is_round() {
+        let layout = chucked(30., 70.);
+        let s = lathe_setup(&[("stock_type", "Round bar")]);
+        // The round bar, first: Ø50.2 and round, over the whole bar too.
+        let g = girth(&s, true, &layout, bar(), None).unwrap();
+        assert!((g.grip - 50.2).abs() < 1e-3 && g.round && (g.widest - 50.2).abs() < 1e-3);
+        // A square 50 bar is Ø70.7 across its corners and not round.
+        let square = Bounds {
+            min: [-25., -25., 0.],
+            max: [25., 25., 100.],
+        };
+        let b = lathe_setup(&[("stock_type", "Fixed size box")]);
+        let g = girth(&b, true, &layout, square, None).unwrap();
+        assert!((g.grip - 70.71).abs() < 0.01 && !g.round);
+        // Turned to Ø30 over the jaws (frame Z 0 to 30 of the 100 mm bar), a
+        // later setup holds it round, and the swing is still the square's.
+        let turned = crate::rest::Coaxial {
+            bar: None,
+            rings: vec![[0., 40., 15., 100.]],
+        };
+        let g = girth(&b, false, &layout, square, Some(&turned)).unwrap();
+        assert!((g.grip - 30.).abs() < 1e-3 && g.round, "{g:?}");
+        assert!((g.widest - 70.71).abs() < 0.01);
+        // Turned elsewhere, the jaws still hold the square.
+        let elsewhere = crate::rest::Coaxial {
+            bar: None,
+            rings: vec![[50., 100., 15., 100.]],
+        };
+        let g = girth(&b, false, &layout, square, Some(&elsewhere)).unwrap();
+        assert!(!g.round && (g.grip - 70.71).abs() < 0.01);
+        // A round bar a mill has flatted is not round: its box is narrower
+        // than the bar the volume remembers.
+        let flatted = Bounds {
+            min: [-25., -25., 0.],
+            max: [20., 25., 100.],
+        };
+        let remembered = crate::rest::Coaxial {
+            bar: Some(25.),
+            rings: vec![],
+        };
+        let g = girth(&b, false, &layout, flatted, Some(&remembered)).unwrap();
+        assert!(!g.round, "{g:?}");
+        // A bar off the spindle axis is no round work for a 3-jaw.
+        let off = Bounds {
+            min: [-10., -25., 0.],
+            max: [40., 25., 100.],
+        };
+        assert!(!girth(&s, true, &layout, off, None).unwrap().round);
+        // Not a chuck, or no material in the jaws: nothing.
+        assert_eq!(girth(&s, true, &Layout::None, bar(), None), None);
+        assert_eq!(girth(&s, true, &chucked(30., 150.), bar(), None), None);
+    }
+    #[test]
+    fn the_chuck_body_is_a_box_behind_the_jaws_end_about_the_axis() {
+        let three = chuck("3");
+        let body = boxes(&chucked(30., 70.), &three, bar()).unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0].label, "chuck body");
+        // 160 mm wide, 40 mm deep, ending 70 mm below the free end.
+        assert_eq!(
+            body[0].bounds,
+            Bounds {
+                min: [-80., -80., -10.],
+                max: [80., 80., 30.],
+            }
+        );
+        assert_eq!(jaws_end(bar(), 70.), 30.);
+        // A bar that is not centred still has its chuck on the axis.
+        let off = Bounds {
+            min: [-10., -25., 0.],
+            max: [40., 25., 100.],
+        };
+        assert_eq!(boxes(&chucked(30., 70.), &three, off).unwrap(), body);
+    }
+    /// A lathe plan of `moves` (motion, from, to) with a tip of radius `r`,
+    /// on the Ø50.2 × 100 bar.
+    fn lathe_plan(r: f32, moves: &[(Motion, [f32; 3], [f32; 3])]) -> Plan {
+        let mut p = crate::post::fixture::plan(moves[0].1, &[]);
+        p.shape = CutterShape::Revolve;
+        p.stock = bar();
+        p.radius = r;
+        p.moves = moves
+            .iter()
+            .map(|&(motion, from, to)| Move {
+                from,
+                to,
+                motion,
+                cutting_pass: motion == Motion::Feed,
+                feed: 100.,
+                start: 0.,
+                end: 0.,
+            })
+            .collect();
+        p
+    }
+    fn body_for(stickout: f32) -> Vec<HoldBox> {
+        boxes(&chucked(30., stickout), &chuck("3"), bar()).unwrap()
+    }
+    #[test]
+    fn a_turn_inside_the_grip_is_a_cut_in_the_chuck_and_a_short_stickout_says_how_much_to_leave() {
+        // Jaws' end at Z 30 (work Z -70). A pass to Z 70 (work -30) is clear.
+        let clear = lathe_plan(
+            0.4,
+            &[
+                (Motion::Rapid, [27., 0., 101.], [20., 0., 101.]),
+                (Motion::Feed, [20., 0., 101.], [20., 0., 70.]),
+            ],
+        );
+        let run = |ops: &[(usize, &str, &Plan)], stickout: f32| {
+            chuck_problems(&chucked(30., stickout), bar(), 2., &body_for(stickout), ops)
+        };
+        assert!(run(&[(0, "Turn · Outside", &clear)], 70.).is_empty());
+        // A part off at work Z -62, blade 3 wide: the tool's side is at frame
+        // Z 35, 65 from the end, so 70 is exactly enough.
+        let part_off = lathe_plan(
+            1.5,
+            &[
+                (Motion::Rapid, [27., 0., 101.], [27., 0., 35.]),
+                (Motion::Feed, [27., 0., 35.], [-0.5, 0., 35.]),
+            ],
+        );
+        assert!(run(&[(1, "Turn · Part off", &part_off)], 70.).is_empty());
+        // One more millimetre of cut, and the stickout is 1 mm short.
+        let deeper = lathe_plan(
+            1.5,
+            &[
+                (Motion::Rapid, [27., 0., 101.], [27., 0., 34.]),
+                (Motion::Feed, [27., 0., 34.], [-0.5, 0., 34.]),
+            ],
+        );
+        assert_eq!(
+            run(&[(1, "Turn · Part off", &deeper)], 70.),
+            [(
+                None,
+                "The stickout is 70 mm; Turn · Part off cuts 66 mm from the free end and 5 mm must stay clear of the jaws. Leave at least 71 mm.".to_string()
+            )]
+        );
+        // The stickout is the furthest operation's, whichever comes first.
+        let both = run(
+            &[
+                (0, "Turn · Outside", &clear),
+                (1, "Turn · Part off", &deeper),
+            ],
+            70.,
+        );
+        assert_eq!(both.len(), 1);
+        assert!(both[0].1.contains("Turn · Part off cuts 66 mm"), "{both:?}");
+        // A cut below the jaws' end is in the grip: said for the operation,
+        // in work coordinates, once (not again as a collision).
+        let inside = lathe_plan(
+            0.4,
+            &[
+                (Motion::Rapid, [27., 0., 101.], [20., 0., 101.]),
+                (Motion::Feed, [20., 0., 101.], [20., 0., 28.]),
+            ],
+        );
+        let found = run(&[(2, "Turn · Outside", &inside)], 70.);
+        assert_eq!(
+            found.iter().map(|f| f.0).collect::<Vec<_>>(),
+            [Some(2), None]
+        );
+        assert_eq!(
+            found[0].1,
+            "Turn · Outside: cuts at Z-72.0, inside the grip: the jaws start at Z-70.0."
+        );
+        assert!(
+            found[1].1.starts_with("The stickout is 70 mm;"),
+            "{found:?}"
+        );
+        // The plan checks work with a layout of any grip; others say nothing.
+        assert!(chuck_problems(&Layout::None, bar(), 2., &[], &[(0, "x", &inside)]).is_empty());
+    }
+    #[test]
+    fn a_move_into_the_jaws_is_refused_as_the_tool_hitting_the_chuck_body() {
+        let body = body_for(70.);
+        // A rapid that ends 1 mm above the jaws' end (Z 30) is within the 2 mm
+        // gap; the feeds stay out of the grip, so this is a collision only.
+        let rapid = lathe_plan(
+            0.4,
+            &[
+                (Motion::Rapid, [27., 0., 101.], [27., 0., 31.]),
+                (Motion::Feed, [27., 0., 31.], [20., 0., 40.]),
+            ],
+        );
+        let found = chuck_problems(
+            &chucked(30., 70.),
+            bar(),
+            2.,
+            &body,
+            &[(4, "Turn · Groove", &rapid)],
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].0, Some(4));
+        assert_eq!(
+            found[0].1,
+            "Turn · Groove: the tool hits the chuck body at X27.0 Y0.0 Z-68.0 (within the 2 mm gap)."
+        );
+        // The same move at 3 mm above (gap 2) is clear.
+        let clear = lathe_plan(0.4, &[(Motion::Rapid, [27., 0., 101.], [27., 0., 33.])]);
+        assert!(hits(&clear, &body, 2.).is_empty());
+        let near = lathe_plan(0.4, &[(Motion::Rapid, [27., 0., 101.], [27., 0., 32.])]);
+        assert_eq!(hits(&near, &body, 2.).len(), 1);
+        // Outside the chuck's radius the tool passes beside it: the body is
+        // 80 mm from the axis, plus the tip and the gap.
+        let beside = lathe_plan(0.4, &[(Motion::Rapid, [90., 0., 101.], [90., 0., 10.])]);
+        assert!(hits(&beside, &body, 2.).is_empty());
+        let touching = lathe_plan(0.4, &[(Motion::Rapid, [82., 0., 101.], [82., 0., 10.])]);
+        assert_eq!(hits(&touching, &body, 2.).len(), 1);
+        // A drill on the centre line goes through X 0.
+        let drill = lathe_plan(5., &[(Motion::Feed, [0., 0., 101.], [0., 0., 20.])]);
+        assert_eq!(hits(&drill, &body, 2.)[0].at, [0., 0., 32.]);
+    }
+    #[test]
+    fn the_mill_hit_logic_is_unchanged_for_a_plan_that_is_not_a_lathes() {
+        let jaw = HoldBox {
+            label: "vise jaw".into(),
+            bounds: Bounds {
+                min: [-50., 10., -100.],
+                max: [50., 30., 20.],
+            },
+        };
+        // A mill tool hangs down from its tip: a plan that is not a lathe's
+        // goes through `hits_segments` as it always did.
+        let moves = [([0., 0., 40.], [0., 20., 10.])];
+        let p = plan(5., &moves);
+        assert!(!p.is_lathe());
+        let direct = hits_segments(&moves, 5., 30., 16., std::slice::from_ref(&jaw), 2.);
+        assert!(!direct.is_empty());
+        assert_eq!(hits(&p, std::slice::from_ref(&jaw), 2.), direct);
+    }
+    fn library(kinds: &[&str]) -> Document {
+        Document {
+            workholding: starters()
+                .into_iter()
+                .filter(|h| {
+                    h.kind() != "Chuck"
+                        || kinds.iter().any(|k| h.name().contains(&format!("{k}-jaw")))
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn suggest_chooses_the_3_jaw_for_round_work_that_fits_and_the_4_jaw_with_the_chip_otherwise() {
+        let doc = library(&["3", "4"]);
+        let lathe = crate::lathe::defaults();
+        let name = |girth| suggest_chuck(&doc, &lathe, girth).map(|h| h.name().to_string());
+        // Round and in range: the 3-jaw, wherever it comes in the library.
+        assert_eq!(name(round_bar()), Ok("160 mm 3-jaw chuck".to_string()));
+        let mut reversed = doc.clone();
+        reversed.workholding.reverse();
+        assert_eq!(
+            suggest_chuck(&reversed, &lathe, round_bar())
+                .unwrap()
+                .name(),
+            "160 mm 3-jaw chuck"
+        );
+        // Square: the 4-jaw.
+        let square = Girth {
+            grip: 70.7,
+            round: false,
+            widest: 70.7,
+        };
+        assert_eq!(name(square), Ok("160 mm 4-jaw chuck".to_string()));
+        // Round but wider than the 3-jaw closes: the 4-jaw.
+        let wide = Girth {
+            grip: 145.,
+            round: true,
+            widest: 145.,
+        };
+        assert_eq!(name(wide), Ok("160 mm 4-jaw chuck".to_string()));
+        // A round bar with no 3-jaw in the library: the 4-jaw; with no 4-jaw
+        // and a square bar: none, and never a vise.
+        let only_four = library(&["4"]);
+        assert_eq!(
+            suggest_chuck(&only_four, &lathe, round_bar())
+                .unwrap()
+                .name(),
+            "160 mm 4-jaw chuck"
+        );
+        let only_three = library(&["3"]);
+        let none = suggest_chuck(&only_three, &lathe, square).unwrap_err();
+        assert!(
+            none.starts_with("No chuck in the library closes on this square Ø70.7 mm bar."),
+            "{none}"
+        );
+        let none = suggest_chuck(&library(&[]), &lathe, round_bar()).unwrap_err();
+        assert!(none.contains("closes on this round Ø50.2 mm bar"), "{none}");
+        // A chuck that is not on the machine is not suggested.
+        let mut listed = doc.clone();
+        for h in &mut listed.workholding {
+            h.p.insert("machines".into(), "other".into());
+        }
+        assert!(suggest_chuck(&listed, &lathe, round_bar()).is_err());
+        // The status line says to change the chuck for the 4-jaw only.
+        let mut d = doc.clone();
+        let s = lathe_setup(&[
+            ("holding", "Chuck"),
+            ("grip", "30"),
+            ("stickout", "70"),
+            ("stock_type", "Round bar"),
+        ]);
+        d.setups = vec![s.clone()];
+        let (id, line) = chuck_for(&d, &s, Gripped::whole(bar())).unwrap();
+        assert_eq!(d.holder(&id).map(Holder::name), Some("160 mm 3-jaw chuck"));
+        assert_eq!(
+            line,
+            "Suggested: 160 mm 3-jaw chuck, for a round Ø50.2 mm bar."
+        );
+        let mut s = s;
+        s.p.insert("stock_type".into(), "Fixed size box".into());
+        d.setups = vec![s.clone()];
+        let flat = Bounds {
+            min: [-25., -25., 0.],
+            max: [25., 25., 100.],
+        };
+        let (id, line) = chuck_for(&d, &s, Gripped::whole(flat)).unwrap();
+        assert_eq!(d.holder(&id).map(Holder::name), Some("160 mm 4-jaw chuck"));
+        assert_eq!(
+            line,
+            "Suggested: 160 mm 4-jaw chuck, for a square Ø70.71 mm bar. 4-jaw: change the chuck."
+        );
+        assert_eq!(CHANGE_CHUCK, "4-jaw: change the chuck");
     }
 }

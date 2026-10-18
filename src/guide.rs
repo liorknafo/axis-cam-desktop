@@ -1,16 +1,19 @@
-//! The step guide of a setup on a manual mill: what to do at the hand-fed
-//! machine, screen by screen, with the numbers its DRO should read. It is
-//! made from the setup's simulated plans, so every number is a move the app
+//! The step guide of a setup on a manual mill or a manual lathe: what to do
+//! at the hand-fed machine, screen by screen, with the numbers its DRO (the
+//! mill) or its dials (the lathe, which has no DRO) should read. It is made
+//! from the setup's simulated plans, so every number is a move the app
 //! checked. Every coordinate a step shows is a work coordinate (the stock
 //! frame less the work zero); `Guide::zero` converts the kept plans.
 use crate::{
     cam::{box_block, box_cut, open_sides},
-    holding::Gripped,
+    holding::{Gripped, Layout},
+    lathe::{self, Slide},
     manual,
     mesh::{Bounds, Mesh},
-    model::{Document, Machine, Strategy, get, num},
+    model::{Document, Machine, Operation, Strategy, get, num},
     post::At,
-    simulation::{self, Motion, Move, Plan},
+    simulation::{self, Motion, Move, POINT_RISE, Plan},
+    turn,
     volume::Volume,
 };
 use std::ops::Range;
@@ -142,6 +145,303 @@ pub enum Step {
     Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
     HandOver { next: Option<usize> },
+    /// A step at the manual lathe.
+    Lathe(LatheStep),
+}
+/// A number set on one of the lathe's dials: `lathe::dial` of `distance`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dial {
+    pub slide: Slide,
+    /// How far the slide goes from its zero, mm: for the cross slide the
+    /// amount off the diameter (onto it, boring) from the touch on it; for
+    /// the carriage the travel toward the chuck from its zero on the end;
+    /// for the top slide and the quill the travel along them.
+    pub distance: f32,
+    /// Whole turns and how far past them the handle is wound (in the dial's
+    /// numbers), or why there is no number: `lathe::CHECK_THE_DIAL` while
+    /// the cross-slide dial is not known, never a guessed reading.
+    pub reading: Result<(u32, f32), String>,
+    /// Wound out, away from the work (a bore's cross slide, an inside
+    /// thread's top slide): the collar counts down from its zero.
+    pub out: bool,
+    /// What the collar reads at its index once set (`lathe::reads`): the
+    /// reading winding in, `turn − reading` winding out.
+    pub reads: Option<f32>,
+}
+impl Dial {
+    /// Wound in from its zero.
+    pub fn new(machine: &Machine, slide: Slide, distance: f32) -> Self {
+        Self::wound(machine, slide, distance, false)
+    }
+    /// Wound `out` (or in) from its zero.
+    pub fn wound(machine: &Machine, slide: Slide, distance: f32, out: bool) -> Self {
+        let reading = lathe::dial(machine, slide, distance);
+        let reads =
+            (reading.as_ref().ok()).and_then(|(_, r)| lathe::reads(machine, slide, *r, out));
+        Self {
+            slide,
+            distance,
+            reading,
+            out,
+            reads,
+        }
+    }
+    /// No number until the dial check is answered.
+    pub fn unknown(&self) -> bool {
+        self.reading
+            .as_ref()
+            .is_err_and(|e| e == lathe::CHECK_THE_DIAL)
+    }
+    /// The distance the shown reading sets (`distance` to the dial's
+    /// division): what the slide is really at once it is set.
+    fn set(&self, machine: &Machine) -> Option<f32> {
+        let (turns, reading) = *self.reading.as_ref().ok()?;
+        let key = match self.slide {
+            Slide::Cross => "cross_turn",
+            Slide::Top => "top_turn",
+            Slide::Carriage => "carriage_turn",
+            Slide::Quill => "quill_turn",
+        };
+        let amount = turns as f32 * num(&machine.p, key)? + reading;
+        Some(match (self.slide, lathe::cross_reads(machine)) {
+            (Slide::Cross, Some("Radius")) => 2. * amount,
+            _ => amount,
+        })
+    }
+    /// "1 turn + 2.00", "2 turns out, reads 2.20", or why there is no
+    /// number.
+    pub fn text(&self) -> String {
+        match (&self.reading, self.out) {
+            (Ok((t, _)), true) => {
+                let turns = if *t == 1 { "turn" } else { "turns" };
+                format!("{t} {turns} out, reads {:.2}", self.reads.unwrap_or(0.))
+            }
+            (Ok((0, r)), false) => format!("{r:.2}"),
+            (Ok((1, r)), false) => format!("1 turn + {r:.2}"),
+            (Ok((t, r)), false) => format!("{t} turns + {r:.2}"),
+            (Err(e), _) => e.clone(),
+        }
+    }
+}
+/// A diameter the tool touches to zero the cross-slide dial on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contact {
+    /// The diameter there as planned, mm.
+    pub planned: f32,
+    /// What the user measured it at (the bar, at the Zero step), when this
+    /// is that diameter.
+    pub measured: Option<f32>,
+    /// A hole, touched from inside.
+    pub inside: bool,
+}
+impl Contact {
+    /// The diameter the cross-slide readings are measured from.
+    pub fn diameter(&self) -> f32 {
+        self.measured.unwrap_or(self.planned)
+    }
+}
+/// The key of a measurement in `Document::measured`: the setup's id and the
+/// step's (`zero` for the bar at the Zero step, an operation's id for the
+/// Measure before its last pass).
+pub fn measure_key(setup: &str, step: &str) -> String {
+    format!("{setup}/{step}")
+}
+/// The top slide's angle from the cross slide for a thread of
+/// `thread_angle`: 29.5° for 60° (half of it less ½°, so the tool cuts on
+/// its leading flank and only shaves the other), 27.5° for 55° (spec §6).
+pub fn top_angle(thread_angle: f32) -> f32 {
+    if (thread_angle - 55.).abs() < 1e-3 {
+        27.5
+    } else {
+        thread_angle / 2. - 0.5
+    }
+}
+/// How far the top slide, swung to `angle`° from the cross slide, travels to
+/// feed the tool `infeed` mm in toward the axis: moving `s` along it moves the
+/// tool `s·cos(angle)` in and `s·sin(angle)` toward the chuck, so
+/// `s = infeed / cos(angle)`.
+pub fn top_travel(infeed: f32, angle: f32) -> f32 {
+    infeed / angle.to_radians().cos()
+}
+/// A step of a lathe setup's guide. Lengths in mm, diameters as diameters,
+/// Z in lathe work coordinates (0 at the free end as the setup starts,
+/// negative toward the chuck).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LatheStep {
+    /// Only while the machine's `cross_reads` is empty: turn a light skin, go
+    /// in `divisions` on the cross dial (a reading of `reading`), cut
+    /// `length` long and measure: the diameter went down by `reading` (the
+    /// dial reads the diameter) or by twice it (the radius).
+    DialCheck {
+        divisions: u32,
+        reading: f32,
+        length: f32,
+    },
+    /// The bar in the chuck `holder` (an id) with `jaws` jaws: `grip` in the
+    /// jaws, `stickout` from the jaws to the free end; `diameter` where the
+    /// jaws close, `length` of the stock, and `reach`, how far from the end
+    /// the deepest cut goes.
+    Hold {
+        holder: String,
+        jaws: u32,
+        grip: f32,
+        stickout: f32,
+        diameter: f32,
+        length: f32,
+        reach: f32,
+    },
+    /// With `tool` (the first turning tool, which cuts outside): touch the
+    /// end → zero the carriage dial; measure the bar (`planned` Ø;
+    /// `measured` under `key` once typed); when `cross`, touch it → zero
+    /// the cross dial. A setup with only inside tools (a boring bar) does
+    /// not touch the bar's outside: its sections touch the hole.
+    Zero {
+        tool: String,
+        key: String,
+        planned: f32,
+        measured: Option<f32>,
+        cross: bool,
+    },
+    /// Before an operation's cuts, with `tool` at `rpm`: with `top`, swing
+    /// the top slide to that angle (a thread) and zero its dial on the
+    /// touch; when `carriage`, touch the end (at `end`) → zero the carriage
+    /// dial (a new tool, or the slides moved since the last zero); with
+    /// `cross`, touch that diameter → zero the cross dial.
+    Touch {
+        op: usize,
+        tool: String,
+        rpm: f32,
+        carriage: bool,
+        end: f32,
+        cross: Option<Contact>,
+        top: Option<f32>,
+    },
+    /// One screen: lock the carriage, touch the end, the top slide (along
+    /// the bed) in `face_off` on its dial, face across to `to_diameter`;
+    /// then, the tool on the new end at `new_end`: zero the carriage dial
+    /// there. Every later carriage reading is from the new end. The top
+    /// slide is set along the bed (90° from the cross slide); `swung` is the angle from the cross
+    /// slide a thread before left it at, to set back.
+    Face {
+        op: usize,
+        tool: String,
+        rpm: f32,
+        face_off: f32,
+        to_diameter: f32,
+        top: Dial,
+        new_end: f32,
+        swung: Option<f32>,
+    },
+    /// Pass `index` of `of` of an Outside (or Bore, `bore`) to `diameter`:
+    /// the cross dial in (out, boring) to `cross`, power feed at `feed`
+    /// mm/rev toward the chuck, off at `feed_off` (1 mm before), the last
+    /// mm by hand to `carriage`; `to_jaws` from where it stops to the jaws,
+    /// what the carriage stop guards under power feed.
+    Pass {
+        op: usize,
+        index: usize,
+        of: usize,
+        bore: bool,
+        diameter: f32,
+        rpm: f32,
+        feed: f32,
+        cross: Dial,
+        carriage: Dial,
+        feed_off: Option<Dial>,
+        to_jaws: f32,
+    },
+    /// Before the last pass: measure the diameter (`expect` as planned, the
+    /// last pass to `target`); typed under `key`, it sets the last pass's
+    /// cross reading: what is left (measured − target, boring the other
+    /// way) all on that pass.
+    Measure {
+        op: usize,
+        key: String,
+        expect: f32,
+        target: f32,
+        bore: bool,
+        measured: Option<f32>,
+    },
+    /// The tailstock: centre drill, then the `diameter` drill `depth` deep
+    /// from where it touches the end plus `point`, on the quill dial
+    /// (`quill`, zeroed on the touch), pecking every `peck`.
+    TailDrill {
+        op: usize,
+        tool: String,
+        rpm: f32,
+        diameter: f32,
+        depth: f32,
+        point: f32,
+        peck: f32,
+        quill: Dial,
+    },
+    /// A 45° chamfer of leg `size` on `edge` with a tool that has a 45°
+    /// edge: the carriage at `carriage` (on a shoulder: the tool's point
+    /// `size` short of it; the end edges are touched), locked; the 45° edge
+    /// brought to the corner, then the top slide, set along the bed (90°
+    /// from the cross slide), in `top` (`size`) toward the chuck, so both legs are `size`.
+    Chamfer {
+        op: usize,
+        tool: String,
+        rpm: f32,
+        edge: String,
+        size: f32,
+        top: Dial,
+        carriage: Option<Dial>,
+        /// The angle from the cross slide a thread before left the top
+        /// slide at, to set back along the bed (90° from the cross slide).
+        swung: Option<f32>,
+    },
+    /// A groove (or a part off, `part_off`) with a `width` blade: the
+    /// carriage locked with the tool's left side at each of `carriages`, the
+    /// cross dial in to `cross` (the `bottom` Ø; to the centre when parting
+    /// off, None).
+    Plunge {
+        op: usize,
+        tool: String,
+        rpm: f32,
+        width: f32,
+        part_off: bool,
+        bottom: f32,
+        cross: Option<Dial>,
+        carriages: Vec<Dial>,
+    },
+    /// Thread pass `index` of `of` at `pitch` on the gearbox, the top slide
+    /// at `angle`°: the cross slide back to its zero, the top slide in to
+    /// `top` (`infeed` toward the axis from the touch), the half-nuts closed
+    /// to `carriage`, then back out and reverse. The last pass is set to the
+    /// division below its travel, never deeper than planned (`infeed` is
+    /// what it feeds); then try the nut, and a spring pass.
+    ThreadPass {
+        op: usize,
+        index: usize,
+        of: usize,
+        rpm: f32,
+        pitch: f32,
+        angle: f32,
+        infeed: f32,
+        top: Dial,
+        carriage: Dial,
+    },
+}
+impl LatheStep {
+    /// The step's name, as a screen's title.
+    pub fn title(&self) -> &'static str {
+        match self {
+            LatheStep::DialCheck { .. } => "Dial check",
+            LatheStep::Hold { .. } => "Hold",
+            LatheStep::Zero { .. } => "Zero",
+            LatheStep::Touch { .. } => "Touch",
+            LatheStep::Face { .. } => "Face",
+            LatheStep::Pass { .. } => "Pass",
+            LatheStep::Measure { .. } => "Measure",
+            LatheStep::TailDrill { .. } => "Drill",
+            LatheStep::Chamfer { .. } => "Chamfer",
+            LatheStep::Plunge { part_off: true, .. } => "Part off",
+            LatheStep::Plunge { .. } => "Groove",
+            LatheStep::ThreadPass { .. } => "Thread pass",
+        }
+    }
 }
 /// A stretch of the steps: "Set up", one per operation, "Hand over".
 #[derive(Debug, Clone, PartialEq)]
@@ -333,17 +633,20 @@ fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
     }
     holes
 }
-/// The guide of setup `si`, a setup on a manual mill: the document's
-/// operations simulated in order up to the end of it.
-pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
+/// A setup's enabled operations as simulated: (operation index, plan) in
+/// order, the stock after each, and the stock before the first.
+struct Walked {
+    done: Vec<(usize, Plan)>,
+    afters: Vec<Volume>,
+    before: Volume,
+}
+/// The operations of setup `si` simulated in order up to its last enabled
+/// one; `empty` when it has none.
+fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walked, String> {
     let setup = doc.setups.get(si).ok_or("Choose a setup.")?;
-    let machine = &setup.machine;
-    if !manual::is_manual(machine) {
-        return Err("Steps are for a setup on a manual mill.".into());
-    }
     let last = (setup.operations.iter())
         .rposition(|o| o.enabled)
-        .ok_or("Add a Box or Drill operation to see the steps.")?;
+        .ok_or(empty)?;
     let (mut done, mut afters, mut before, mut error) = (vec![], vec![], None, None);
     let mut end = None;
     simulation::sequence_with(
@@ -381,6 +684,40 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     if done.is_empty() || afters.len() != done.len() {
         return Err("The setup's operations did not all simulate.".into());
     }
+    Ok(Walked {
+        done,
+        afters,
+        before,
+    })
+}
+/// The guide of setup `si`, a setup on a manual mill or a manual lathe
+/// (`lathe_guide`): the document's operations simulated in order up to the
+/// end of it.
+pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
+    let setup = doc.setups.get(si).ok_or("Choose a setup.")?;
+    let machine = &setup.machine;
+    if lathe::is_lathe(machine) {
+        let walked = simulate(
+            doc,
+            mesh,
+            si,
+            "Add a Turn or Drill operation to see the steps.",
+        )?;
+        return lathe_guide(doc, mesh, si, walked);
+    }
+    if !manual::is_manual(machine) {
+        return Err("Steps are for a setup on a manual mill or lathe.".into());
+    }
+    let Walked {
+        done,
+        afters,
+        before,
+    } = simulate(
+        doc,
+        mesh,
+        si,
+        "Add a Box or Drill operation to see the steps.",
+    )?;
     let stock = done[0].1.stock;
     let zero = crate::post::datum(setup, stock, mesh)?;
     let work = |b: Bounds| b.translated(zero.map(|v| -v));
@@ -418,6 +755,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 stock: work(held.stock),
                 band: work(held.band),
                 bottom: held.bottom - zero[2],
+                girth: held.girth,
             },
             vise,
         },
@@ -578,6 +916,493 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         done: done_ops,
     })
 }
+/// `v` to the thousandth of a mm.
+fn mm(v: f32) -> f32 {
+    (v * 1000.).round() / 1000.
+}
+/// Where the lathe's carriage dial is zeroed, as the guide goes.
+struct Zeroes<'a> {
+    machine: &'a Machine,
+    stock: Bounds,
+    /// The setup-frame Z of the free end as it is now.
+    end: f32,
+    /// The tool the carriage dial was last zeroed with, and the setup-frame
+    /// Z it was zeroed at; None once the slides moved since (a thread swings
+    /// the top slide, a chamfer feeds it in).
+    carriage: Option<(String, f32)>,
+}
+impl Zeroes<'_> {
+    /// The Touch step before operation `op` with `tool` at `rpm`, when it
+    /// has anything to zero: the carriage when `carriage` is asked and it was
+    /// zeroed with another tool or not since the slides moved (or the top
+    /// slide swings to `top`), the cross dial on `cross`. The setup-frame Z
+    /// the carriage readings are then from.
+    fn touch(
+        &mut self,
+        steps: &mut Vec<Step>,
+        (op, tool, rpm): (usize, &str, f32),
+        carriage: bool,
+        cross: Option<Contact>,
+        top: Option<f32>,
+    ) -> f32 {
+        let again =
+            carriage && (top.is_some() || self.carriage.as_ref().is_none_or(|(t, _)| t != tool));
+        if again {
+            self.carriage = Some((tool.into(), self.end));
+        }
+        if again || cross.is_some() || top.is_some() {
+            steps.push(Step::Lathe(LatheStep::Touch {
+                op,
+                tool: tool.into(),
+                rpm,
+                carriage: again,
+                end: mm(turn::work_z(self.stock, self.end)),
+                cross,
+                top,
+            }));
+        }
+        self.carriage.as_ref().map_or(self.end, |c| c.1)
+    }
+    fn dial(&self, slide: Slide, distance: f32) -> Dial {
+        Dial::new(self.machine, slide, mm(distance))
+    }
+    /// A dial wound `out` (or in) by `distance`.
+    fn wound(&self, slide: Slide, distance: f32, out: bool) -> Dial {
+        Dial::wound(self.machine, slide, mm(distance), out)
+    }
+}
+/// The guide of setup `si`, a setup on the manual lathe: Set up (the dial
+/// check while the cross-slide dial is not known, Hold, Zero), one section
+/// per operation, Hand over. Every number is a dial reading
+/// (`lathe::dial`): the cross slide from a touch on the diameter, the
+/// carriage from its zero on the end (the new end after a Face), the top
+/// slide for Face, Chamfer and Thread infeed, the quill for drills.
+fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result<Guide, String> {
+    let Walked {
+        done,
+        afters,
+        before,
+    } = walked;
+    let setup = &doc.setups[si];
+    let machine = &setup.machine;
+    let stock = done[0].1.stock;
+    let zero = crate::post::datum(setup, stock, mesh)?;
+    let frame = crate::volume::Frame::new(setup, mesh);
+    let end = turn::end(stock);
+    let tool_time = num(&machine.p, "tool_time").unwrap_or(0.);
+    let material =
+        |v: &Volume| turn::Material::of(stock, false, Some(&crate::rest::coaxial(v, frame)));
+    let tool_of = |id: &str| doc.tools.iter().find(|t| t.id == id);
+    let mut steps = vec![];
+
+    // Set up.
+    if lathe::cross_reads(machine).is_none() {
+        let reading = num(&machine.p, "cross_turn")
+            .zip(num(&machine.p, "cross_div"))
+            .filter(|(_, d)| *d > 0.)
+            .map_or(0., |(t, d)| 10. * t / d);
+        steps.push(Step::Lathe(LatheStep::DialCheck {
+            divisions: 10,
+            reading: mm(reading),
+            length: 30.,
+        }));
+    }
+    let layout = crate::holding::layout(setup)?;
+    let Layout::Chuck {
+        holder,
+        grip,
+        stickout,
+    } = &layout
+    else {
+        return Err("Hold the bar in a chuck: choose Chuck on the setup.".into());
+    };
+    let chuck = (doc.holder(holder)).ok_or("Choose a chuck from the Workholding library.")?;
+    let first = material(&before);
+    let (bar, _) = (first.girth(stock.min[2], stock.max[2])).ok_or("No stock is left to turn.")?;
+    let bar = mm(bar);
+    let coaxial = crate::rest::coaxial(&before, frame);
+    let held = crate::holding::girth(setup, si == 0, &layout, stock, Some(&coaxial));
+    let deepest = (done.iter())
+        .flat_map(|(_, p)| p.moves.iter().filter(|m| m.motion == Motion::Feed))
+        .map(|m| m.to[2])
+        .fold(end, f32::min);
+    steps.push(Step::Lathe(LatheStep::Hold {
+        holder: holder.clone(),
+        jaws: num(&chuck.p, "jaws").unwrap_or(3.) as u32,
+        grip: *grip,
+        stickout: *stickout,
+        diameter: mm(held.map_or(bar, |g| g.grip)),
+        length: mm(stock.max[2] - stock.min[2]),
+        reach: mm(end - deepest),
+    }));
+    let zero_key = measure_key(&setup.id, "zero");
+    let typed = |key: &str| (doc.measured.get(key).copied()).filter(|v| v.is_finite() && *v > 0.);
+    let bar_measured = typed(&zero_key);
+    let mut zeroes = Zeroes {
+        machine,
+        stock,
+        end,
+        carriage: None,
+    };
+    // The Zero is made with the first turning tool, which cuts outside;
+    // with none, with the first Turn's tool, touching the bar's outside only
+    // when that tool cuts outside.
+    let turns: Vec<&Operation> = (done.iter())
+        .map(|(oi, _)| &setup.operations[*oi])
+        .filter(|o| o.strategy == Strategy::Turn)
+        .collect();
+    let type_of = |o: &Operation| tool_of(&o.tool).map_or("", |t| get(&t.p, "type"));
+    let inside = |o: &Operation| {
+        type_of(o) == "Boring bar"
+            || match get(&o.p, "turn_kind") {
+                "Bore" => true,
+                "Thread" => get(&o.p, "thread_side") == "Inside",
+                "Chamfer" => get(&o.p, "edge") == "End inside",
+                _ => false,
+            }
+    };
+    let zero_op = (turns.iter())
+        .find(|o| type_of(o) == "Turning tool")
+        .or(turns.first());
+    if let Some(op) = zero_op {
+        steps.push(Step::Lathe(LatheStep::Zero {
+            tool: op.tool.clone(),
+            key: zero_key,
+            planned: bar,
+            measured: bar_measured,
+            cross: !inside(op),
+        }));
+        zeroes.carriage = Some((op.tool.clone(), end));
+    }
+    // A touch on the bar as it came is a touch on what was measured there.
+    let contact = |planned: f32, inside: bool| Contact {
+        planned,
+        measured: bar_measured.filter(|_| !inside && (planned - bar).abs() < 1e-3),
+        inside,
+    };
+    let mut sections = vec![Section {
+        name: "Set up".into(),
+        op: None,
+        steps: 0..steps.len(),
+        count: 0,
+        minutes: 0.,
+    }];
+
+    // One section per operation.
+    let mut last_tool: Option<String> = None;
+    // The top slide's angle from the cross slide while a thread left it
+    // swung; None while it is along the bed.
+    let mut swung: Option<f32> = None;
+    let mut done_ops: Vec<Done> = vec![];
+    for ((oi, plan), after) in done.into_iter().zip(afters) {
+        let op = &setup.operations[oi];
+        let tool = op.tool.as_str();
+        let rpm = num(&op.p, "rpm").unwrap_or(0.);
+        let changed = last_tool.replace(tool.into()).as_deref() != Some(tool);
+        let minutes = plan.duration / 60. + if changed { tool_time } else { 0. };
+        let begin = steps.len();
+        let mat = material(done_ops.last().map_or(&before, |d| &d.after));
+        let feeds: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .collect();
+        let along: Vec<&Move> = (feeds.iter().copied())
+            .filter(|m| (m.from[0] - m.to[0]).abs() < 1e-6)
+            .collect();
+        let across: Vec<&Move> = (feeds.iter().copied())
+            .filter(|m| (m.from[2] - m.to[2]).abs() < 1e-6)
+            .collect();
+        let kind = match op.strategy {
+            Strategy::Drill => "Drill",
+            _ => get(&op.p, "turn_kind"),
+        };
+        let missing = || format!("{} has no cut to guide.", op.name());
+        // The widest outside, or the narrowest hole, from `z` to the end.
+        let outer = |z: f32| {
+            (mat.sections(z, end).iter())
+                .map(|s| s.outer)
+                .fold(0., f32::max)
+        };
+        let hole = |z: f32| {
+            (mat.sections(z, end).iter())
+                .map(|s| s.inner)
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let count = match kind {
+            "Face" => {
+                let z = plan.target;
+                let face_off = num(&op.p, "face_off").unwrap_or(0.);
+                steps.push(Step::Lathe(LatheStep::Face {
+                    op: oi,
+                    tool: tool.into(),
+                    rpm,
+                    face_off,
+                    to_diameter: num(&op.p, "to_diameter").unwrap_or(0.),
+                    top: zeroes.dial(Slide::Top, face_off),
+                    new_end: mm(turn::work_z(stock, z)),
+                    swung: swung.take(),
+                }));
+                // The tool is on the new end: the carriage is zeroed there.
+                zeroes.end = z;
+                zeroes.carriage = Some((tool.into(), z));
+                1
+            }
+            "Outside" | "Bore" => {
+                let bore = kind == "Bore";
+                let z0 = along.first().ok_or_else(missing)?.to[2];
+                let planned = mm(2. * if bore { hole(z0) } else { outer(z0) });
+                let touch = contact(planned, bore);
+                let from = touch.diameter();
+                let zc = zeroes.touch(&mut steps, (oi, tool, rpm), true, Some(touch), None);
+                let stop = zc - z0;
+                let key = measure_key(&setup.id, &op.id);
+                let measured = typed(&key);
+                let n = along.len();
+                let mut last: Option<(f32, Dial)> = None;
+                for (i, m) in along.iter().enumerate() {
+                    let d = mm(2. * m.to[0]);
+                    let off = |to: f32| if bore { to - from } else { from - to };
+                    let mut cross = zeroes.wound(Slide::Cross, off(d), bore);
+                    if i + 1 == n {
+                        let expect = last.as_ref().map_or(from, |l| l.0);
+                        steps.push(Step::Lathe(LatheStep::Measure {
+                            op: oi,
+                            key: key.clone(),
+                            expect,
+                            target: d,
+                            bore,
+                            measured,
+                        }));
+                        if let Some(was) = measured {
+                            // From where the dial is now, all of what is left.
+                            let at = last
+                                .as_ref()
+                                .map_or(0., |l| l.1.set(machine).unwrap_or(l.1.distance));
+                            let left = if bore { d - was } else { was - d };
+                            let past = off(was) < -1e-3;
+                            cross = if left < -1e-3 {
+                                Dial {
+                                    reading: Err(format!("Ø{was:.2} is past Ø{d:.2} already.")),
+                                    reads: None,
+                                    ..cross
+                                }
+                            } else if past {
+                                Dial {
+                                    reading: Err(format!(
+                                        "Ø{was:.2} is not what was cut from Ø{from:.2}: measure again."
+                                    )),
+                                    reads: None,
+                                    ..cross
+                                }
+                            } else {
+                                zeroes.wound(Slide::Cross, at + left.max(0.), bore)
+                            };
+                        }
+                    }
+                    steps.push(Step::Lathe(LatheStep::Pass {
+                        op: oi,
+                        index: i + 1,
+                        of: n,
+                        bore,
+                        diameter: d,
+                        rpm,
+                        feed: if rpm > 0. { mm(m.feed / rpm) } else { 0. },
+                        cross: cross.clone(),
+                        carriage: zeroes.dial(Slide::Carriage, stop),
+                        feed_off: (stop > 1. + 1e-3)
+                            .then(|| zeroes.dial(Slide::Carriage, stop - 1.)),
+                        to_jaws: mm(turn::work_z(stock, m.to[2]) + stickout),
+                    }));
+                    last = Some((d, cross));
+                }
+                n
+            }
+            "Drill" => {
+                feeds.first().ok_or_else(missing)?;
+                let diameter = tool_of(tool)
+                    .and_then(|t| num(&t.p, "diameter"))
+                    .unwrap_or(0.);
+                // Where the drill touches: the nearest material to the
+                // tailstock narrower than the drill (as `turn` plans it).
+                let touch = (mat.sections(stock.min[2], end).iter())
+                    .filter(|s| s.inner < diameter / 2. - 1e-3)
+                    .map(|s| s.z[1])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let quill = touch - plan.target;
+                let point = mm(diameter / 2. * POINT_RISE);
+                steps.push(Step::Lathe(LatheStep::TailDrill {
+                    op: oi,
+                    tool: tool.into(),
+                    rpm,
+                    diameter,
+                    depth: mm(quill - point),
+                    point,
+                    peck: diameter,
+                    quill: zeroes.dial(Slide::Quill, quill),
+                }));
+                1
+            }
+            "Chamfer" => {
+                let cut = feeds.first().ok_or_else(missing)?;
+                let edge = get(&op.p, "edge");
+                let size = num(&op.p, "size").unwrap_or(0.);
+                let shoulder = edge == "Shoulder";
+                let zc = zeroes.touch(&mut steps, (oi, tool, rpm), shoulder, None, None);
+                steps.push(Step::Lathe(LatheStep::Chamfer {
+                    op: oi,
+                    tool: tool.into(),
+                    rpm,
+                    edge: edge.into(),
+                    size,
+                    top: zeroes.dial(Slide::Top, size),
+                    carriage: shoulder.then(|| zeroes.dial(Slide::Carriage, zc - cut.from[2])),
+                    swung: swung.take(),
+                }));
+                // The top slide was fed in: the carriage zero no longer holds.
+                zeroes.carriage = None;
+                1
+            }
+            "Groove" | "Part off" => {
+                let part_off = kind == "Part off";
+                let first = across.first().ok_or_else(missing)?;
+                let width = tool_of(tool).and_then(|t| num(&t.p, "width")).unwrap_or(0.);
+                let low = across.iter().map(|m| m.to[2]).fold(f32::INFINITY, f32::min);
+                let high = across.iter().map(|m| m.to[2]).fold(low, f32::max) + width;
+                let planned = mm(2.
+                    * (mat.sections(low, high).iter())
+                        .map(|s| s.outer)
+                        .fold(0., f32::max));
+                let touch = (!part_off).then(|| contact(planned, false));
+                let from = touch.as_ref().map_or(planned, Contact::diameter);
+                let zc = zeroes.touch(&mut steps, (oi, tool, rpm), true, touch, None);
+                let bottom = if part_off { 0. } else { mm(2. * first.to[0]) };
+                steps.push(Step::Lathe(LatheStep::Plunge {
+                    op: oi,
+                    tool: tool.into(),
+                    rpm,
+                    width,
+                    part_off,
+                    bottom,
+                    cross: (!part_off).then(|| zeroes.dial(Slide::Cross, from - bottom)),
+                    carriages: (across.iter())
+                        .map(|m| zeroes.dial(Slide::Carriage, zc - m.to[2]))
+                        .collect(),
+                }));
+                if part_off {
+                    // What is left in the chuck ends at the blade's left side.
+                    zeroes.end = low;
+                }
+                across.len()
+            }
+            "Thread" => {
+                let z0 = along.first().ok_or_else(missing)?.to[2];
+                let inside = get(&op.p, "thread_side") == "Inside";
+                let pitch = num(&op.p, "pitch").unwrap_or(0.);
+                let angle = top_angle(
+                    tool_of(tool)
+                        .and_then(|t| num(&t.p, "thread_angle"))
+                        .unwrap_or(60.),
+                );
+                let planned = mm(2. * if inside { hole(z0) } else { outer(z0) });
+                let touch = contact(planned, inside);
+                let r0 = touch.diameter() / 2.;
+                let zc = zeroes.touch(&mut steps, (oi, tool, rpm), true, Some(touch), Some(angle));
+                let n = along.len();
+                // In toward the axis from the touch (out, inside), as
+                // planned.
+                let infeeds: Vec<f32> = (along.iter())
+                    .map(|m| mm(if inside { m.to[0] - r0 } else { r0 - m.to[0] }.max(0.)))
+                    .collect();
+                // The last pass is set to the top slide's division below
+                // its travel, never deeper than planned; the passes before
+                // it never past that, so the readings never go back.
+                let deepest = infeeds.last().map_or(0., |d| {
+                    lathe::floor(machine, Slide::Top, mm(top_travel(*d, angle)))
+                });
+                for (i, infeed) in infeeds.iter().enumerate() {
+                    let travel = if i + 1 == n {
+                        deepest
+                    } else {
+                        mm(top_travel(*infeed, angle)).min(deepest)
+                    };
+                    let top = zeroes.wound(Slide::Top, travel, inside);
+                    // What the top slide set there feeds in.
+                    let infeed = if i + 1 == n {
+                        mm(deepest * angle.to_radians().cos())
+                    } else {
+                        *infeed
+                    };
+                    steps.push(Step::Lathe(LatheStep::ThreadPass {
+                        op: oi,
+                        index: i + 1,
+                        of: n,
+                        rpm,
+                        pitch,
+                        angle,
+                        infeed,
+                        top,
+                        carriage: zeroes.dial(Slide::Carriage, zc - z0),
+                    }));
+                }
+                // The top slide is swung and fed in: the carriage zero no
+                // longer holds.
+                zeroes.carriage = None;
+                swung = Some(angle);
+                n
+            }
+            other => return Err(format!("\"{other}\" does not run on the manual lathe.")),
+        };
+        sections.push(Section {
+            name: op.name().into(),
+            op: Some(oi),
+            steps: begin..steps.len(),
+            count,
+            minutes,
+        });
+        done_ops.push(Done {
+            op: oi,
+            plan,
+            after,
+        });
+    }
+    let n = steps.len();
+    steps.push(Step::HandOver {
+        next: (si + 1 < doc.setups.len()).then_some(si + 1),
+    });
+    sections.push(Section {
+        name: "Hand over".into(),
+        op: None,
+        steps: n..n + 1,
+        count: 0,
+        minutes: 0.,
+    });
+    Ok(Guide {
+        setup: si,
+        minutes: sections.iter().map(|s| s.minutes).sum(),
+        steps,
+        sections,
+        zero,
+        before,
+        done: done_ops,
+    })
+}
+/// The lathe `guide` worked out again for `doc` from its own simulation,
+/// which neither a measurement nor the dial check's answer changes: the
+/// cross-slide numbers and the measure steps as they are now, at once.
+pub fn again(doc: &Document, mesh: &Mesh, guide: &Guide) -> Result<Guide, String> {
+    let setup = doc.setups.get(guide.setup).ok_or("Choose a setup.")?;
+    if !lathe::is_lathe(&setup.machine) {
+        return build(doc, mesh, guide.setup);
+    }
+    let walked = Walked {
+        done: (guide.done.iter())
+            .map(|d| (d.op, d.plan.clone()))
+            .collect(),
+        afters: guide.done.iter().map(|d| d.after.clone()).collect(),
+        before: guide.before.clone(),
+    };
+    lathe_guide(doc, mesh, guide.setup, walked)
+}
 /// The step the guide was left at (`Document::guide`), within its steps.
 pub fn place(doc: &Document, guide: &Guide) -> usize {
     (doc.setups.get(guide.setup))
@@ -588,7 +1413,7 @@ pub fn place(doc: &Document, guide: &Guide) -> usize {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{BOX_FIELDS, Operation, Tool};
+    use crate::model::{BOX_FIELDS, Tool};
 
     /// A Box named `name` cutting `b` (x_min, x_max, y_min, y_max, z_top,
     /// z_bottom, work frame) with the tool `tool`.
@@ -678,6 +1503,7 @@ pub(crate) mod tests {
                 Step::Holes { .. } => "Holes",
                 Step::Check { .. } => "Check",
                 Step::HandOver { .. } => "HandOver",
+                Step::Lathe(l) => l.title(),
             })
             .collect()
     }
@@ -1290,5 +2116,925 @@ pub(crate) mod tests {
             op.enabled = false;
         }
         assert!(build(&doc, &mesh, 0).is_err());
+    }
+
+    // ---- The lathe ----
+
+    use crate::turn::tests::{add, job as lathe_job, tube};
+
+    /// The mockup's part: a Ø35 sleeve (bore Ø11) 61 long, its end 1 mm in
+    /// from the bar's end, in a Ø50.2 × 100 bar on the 3-jaw; the cross
+    /// dial reads `reads` ("" = not known yet). Face 1, Outside Ø40 to the
+    /// shoulder at −65 (2 a pass, 0.2 finish), Drill Ø10 30 deep, Groove 3
+    /// wide to Ø36 at −46, Thread M40 × 1.5 to −40, Part off at −62.
+    pub(crate) fn sample(reads: &str) -> (Document, Mesh) {
+        let (mut doc, mesh) = lathe_job(50.2, 100., tube(5.5, 17.5, 0., 61.), -62.);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), reads.into());
+        add(&mut doc, "Face", &[("face_off", "1")]);
+        add(
+            &mut doc,
+            "Outside",
+            &[
+                ("diameter", "40"),
+                ("z_end", "-65"),
+                ("depth", "2"),
+                ("finish", "0.2"),
+                ("allowance", "0"),
+            ],
+        );
+        add(&mut doc, "Drill", &[("depth", "30")]);
+        add(
+            &mut doc,
+            "Groove",
+            &[("z", "-46"), ("width", "3"), ("diameter", "36")],
+        );
+        add(
+            &mut doc,
+            "Thread",
+            &[
+                ("thread_side", "Outside"),
+                ("diameter", "40"),
+                ("pitch", "1.5"),
+                ("z_end", "-40"),
+            ],
+        );
+        add(&mut doc, "Part off", &[("z", "-62")]);
+        (doc, mesh)
+    }
+    fn lathe_steps(guide: &Guide) -> Vec<&LatheStep> {
+        (guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Lathe(l) => Some(l),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Every dial number of the guide.
+    fn dials(guide: &Guide) -> Vec<&Dial> {
+        let mut out = vec![];
+        for l in lathe_steps(guide) {
+            match l {
+                LatheStep::Face { top, .. } | LatheStep::TailDrill { quill: top, .. } => {
+                    out.push(top)
+                }
+                LatheStep::Pass {
+                    cross,
+                    carriage,
+                    feed_off,
+                    ..
+                } => out.extend(
+                    [Some(cross), Some(carriage), feed_off.as_ref()]
+                        .into_iter()
+                        .flatten(),
+                ),
+                LatheStep::Chamfer { top, carriage, .. } => {
+                    out.extend([Some(top), carriage.as_ref()].into_iter().flatten())
+                }
+                LatheStep::Plunge {
+                    cross, carriages, ..
+                } => out.extend(cross.iter().chain(carriages)),
+                LatheStep::ThreadPass { top, carriage, .. } => out.extend([top, carriage]),
+                _ => {}
+            }
+        }
+        out
+    }
+    fn reads(dial: &Dial, turns: u32, reading: f32) {
+        let (t, r) = dial
+            .reading
+            .clone()
+            .unwrap_or_else(|e| panic!("{dial:?}: {e}"));
+        assert!(
+            t == turns && (r - reading).abs() < 1e-4,
+            "{dial:?} is not {turns} turns + {reading}"
+        );
+    }
+    fn passes(guide: &Guide, op: usize) -> Vec<(f32, &Dial, &Dial, Option<&Dial>)> {
+        (lathe_steps(guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::Pass {
+                    op: o,
+                    diameter,
+                    cross,
+                    carriage,
+                    feed_off,
+                    ..
+                } if *o == op => Some((*diameter, cross, carriage, feed_off.as_ref())),
+                _ => None,
+            })
+            .collect()
+    }
+    fn set_measured(doc: &mut Document, step: &str, value: f32) {
+        let key = measure_key(&doc.setups[0].id.clone(), step);
+        doc.measured.insert(key, value);
+    }
+
+    #[test]
+    fn the_sample_parts_steps_run_set_up_each_operation_and_hand_over() {
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let names: Vec<&str> = guide.sections.iter().map(|s| s.name.as_str()).collect();
+        let ops: Vec<String> = (doc.setups[0].operations.iter())
+            .map(|o| o.name().to_string())
+            .collect();
+        assert_eq!(names[0], "Set up");
+        assert_eq!(
+            names[1..7],
+            ops.iter().map(|s| s.as_str()).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(names[7], "Hand over");
+        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
+        // The dial is known: no dial check.
+        assert_eq!(of(0), ["Hold", "Zero"]);
+        assert_eq!(of(1), ["Face"]);
+        // The turning tool faced and is zeroed on the new end: only the
+        // cross dial is touched again, on the bar.
+        assert_eq!(
+            of(2),
+            [
+                "Touch", "Pass", "Pass", "Pass", "Pass", "Pass", "Measure", "Pass"
+            ]
+        );
+        assert_eq!(of(3), ["Drill"]);
+        assert_eq!(of(4), ["Touch", "Groove"]);
+        assert_eq!(of(5)[..2], ["Touch", "Thread pass"]);
+        assert_eq!(of(5).len(), 9);
+        assert_eq!(of(6), ["Touch", "Part off"]);
+        assert_eq!(of(7), ["HandOver"]);
+        let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
+        assert_eq!(counts, [0, 1, 6, 1, 1, 8, 1, 0]);
+        // The ranges cover every step once, in order.
+        let mut at = 0;
+        for s in &guide.sections {
+            assert_eq!(s.steps.start, at);
+            at = s.steps.end;
+        }
+        assert_eq!(at, guide.steps.len());
+        let plans: f32 = guide.done.iter().map(|d| d.plan.duration / 60.).sum();
+        assert!(guide.minutes > plans && guide.minutes.is_finite());
+
+        // Hold: the 3-jaw, the setup's grip and stickout, the cuts 65 deep.
+        let setup = &doc.setups[0];
+        let Step::Lathe(LatheStep::Hold {
+            holder,
+            jaws,
+            grip,
+            stickout,
+            diameter,
+            length,
+            reach,
+        }) = &guide.steps[0]
+        else {
+            panic!("{:?}", guide.steps[0])
+        };
+        assert_eq!(holder, get(&setup.p, "holder"));
+        assert_eq!(*jaws, 3);
+        assert_eq!(Some(*grip), num(&setup.p, "grip"));
+        assert_eq!(Some(*stickout), num(&setup.p, "stickout"));
+        close(*diameter, 50.2);
+        close(*length, 100.);
+        close(*reach, 65.);
+        // Zero: the first turning tool, the bar to measure.
+        let turning = &setup.operations[0].tool;
+        assert_eq!(
+            guide.steps[1],
+            Step::Lathe(LatheStep::Zero {
+                tool: turning.clone(),
+                key: measure_key(&setup.id, "zero"),
+                planned: 50.2,
+                measured: None,
+                cross: true,
+            })
+        );
+        // Face: 1.00 on the top slide, then the carriage zeroed on the new end.
+        let Step::Lathe(LatheStep::Face { top, new_end, .. }) = &guide.steps[2] else {
+            panic!()
+        };
+        reads(top, 0, 1.);
+        close(*new_end, -1.);
+        // The Outside touches the bar to zero the cross dial; the carriage
+        // keeps the zero the Face made.
+        let Step::Lathe(LatheStep::Touch {
+            carriage, cross, ..
+        }) = &guide.steps[3]
+        else {
+            panic!()
+        };
+        assert!(!carriage);
+        assert_eq!(
+            cross,
+            &Some(Contact {
+                planned: 50.2,
+                measured: None,
+                inside: false
+            })
+        );
+        assert_eq!(guide.steps.last(), Some(&Step::HandOver { next: None }));
+    }
+    #[test]
+    fn the_outside_passes_read_off_the_touched_diameter_and_stop_from_the_new_end() {
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let passes = passes(&guide, 1);
+        // The plan's passes, in order, 2.00 off the Ø each, the finish last.
+        let plan = &guide.done[1].plan;
+        let planned: Vec<f32> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .map(|m| mm(2. * m.to[0]))
+            .collect();
+        let shown: Vec<f32> = passes.iter().map(|p| p.0).collect();
+        assert_eq!(shown, planned);
+        assert_eq!(shown, [48.2, 46.2, 44.2, 42.2, 40.2, 40.]);
+        // Off the Ø50.20 touched: 2, 4, 6 (1 turn + 2.00 on a 4-a-turn
+        // dial), 8, 10, 10.2.
+        for ((d, cross, ..), (turns, reading)) in
+            passes
+                .iter()
+                .zip([(0, 2.), (1, 0.), (1, 2.), (2, 0.), (2, 2.), (2, 2.2)])
+        {
+            close(cross.distance, 50.2 - d);
+            reads(cross, turns, reading);
+        }
+        // Faced 1 mm, the carriage was zeroed on the new end: the shoulder
+        // at −65 is 64 from it, 3 turns + 4.0 on a 20-a-turn dial; the power
+        // feed goes off 1 mm before, at 3 turns + 3.0.
+        // The shoulder at −65 is 5 from the jaws, 70 out of them.
+        let setup = &doc.setups[0];
+        assert_eq!(num(&setup.p, "stickout"), Some(70.));
+        for l in lathe_steps(&guide) {
+            if let LatheStep::Pass { op: 1, to_jaws, .. } = l {
+                close(*to_jaws, 5.);
+            }
+        }
+        for (_, _, carriage, feed_off) in &passes {
+            close(carriage.distance, 64.);
+            reads(carriage, 3, 4.);
+            let off = feed_off.unwrap();
+            close(off.distance, 63.);
+            reads(off, 3, 3.);
+        }
+        // Without the Face the carriage is zeroed on the bar's end: 65.
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations.remove(0);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        for (_, _, carriage, feed_off) in passes_of(&guide, 0) {
+            reads(carriage, 3, 5.);
+            reads(feed_off.unwrap(), 3, 4.);
+        }
+        // The groove and the part off are from the new end too.
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let plunges: Vec<&LatheStep> = (lathe_steps(&guide).into_iter())
+            .filter(|l| matches!(l, LatheStep::Plunge { .. }))
+            .collect();
+        let LatheStep::Plunge {
+            cross: Some(cross),
+            carriages,
+            bottom,
+            width,
+            ..
+        } = plunges[0]
+        else {
+            panic!()
+        };
+        // The grooving tool's left side at −46: 45 from the new end.
+        assert_eq!((carriages.len(), *width), (1, 3.));
+        close(carriages[0].distance, 45.);
+        reads(&carriages[0], 2, 5.);
+        // From the touch on the turned Ø40 to Ø36: 4 off, 1 turn.
+        close(*bottom, 36.);
+        close(cross.distance, 4.);
+        reads(cross, 1, 0.);
+        // The blade's left side at −65 (−62 less its 3): 64 from the new
+        // end; to the centre, no cross number.
+        let LatheStep::Plunge {
+            part_off: true,
+            cross: None,
+            carriages,
+            ..
+        } = plunges[1]
+        else {
+            panic!("{:?}", plunges[1])
+        };
+        close(carriages[0].distance, 64.);
+        reads(&carriages[0], 3, 4.);
+    }
+    fn passes_of(guide: &Guide, op: usize) -> Vec<(f32, &Dial, &Dial, Option<&Dial>)> {
+        passes(guide, op)
+    }
+    #[test]
+    fn a_new_tool_or_moved_slides_zero_the_carriage_again_on_the_end() {
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        type Seen = (usize, bool, f32, Option<f32>, Option<f32>);
+        let touches: Vec<Seen> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::Touch {
+                    op,
+                    carriage,
+                    end,
+                    cross,
+                    top,
+                    ..
+                } => Some((
+                    *op,
+                    *carriage,
+                    *end,
+                    cross.as_ref().map(|c| c.planned),
+                    *top,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            touches,
+            [
+                // The Outside: the turning tool is zeroed already.
+                (1, false, -1., Some(50.2), None),
+                // The grooving tool: a new tool touches the new end.
+                (3, true, -1., Some(40.), None),
+                // The threading tool, the top slide swung to 29.5° first.
+                (4, true, -1., Some(40.), Some(29.5)),
+                // The blade: a new tool; to the centre, no cross touch.
+                (5, true, -1., None, None),
+            ]
+        );
+        // The same tool after a thread, with the top slide swung, touches
+        // the end again.
+        let (mut doc, mesh) = sample("Diameter");
+        let thread_tool = doc.setups[0].operations[4].tool.clone();
+        doc.setups[0].operations.truncate(5);
+        add(
+            &mut doc,
+            "Thread",
+            &[
+                ("thread_side", "Outside"),
+                ("diameter", "40"),
+                ("pitch", "1.5"),
+                ("z_end", "-30"),
+            ],
+        );
+        assert_eq!(doc.setups[0].operations[5].tool, thread_tool);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let second = guide.sections[6].steps.start;
+        assert!(matches!(
+            guide.steps[second],
+            Step::Lathe(LatheStep::Touch {
+                op: 5,
+                carriage: true,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn every_dial_number_is_lathe_dial_of_its_distance() {
+        for reads in ["Diameter", "Radius"] {
+            let (doc, mesh) = sample(reads);
+            let guide = build(&doc, &mesh, 0).unwrap();
+            let machine = &doc.setups[0].machine;
+            let all = dials(&guide);
+            assert!(all.len() > 30, "{}", all.len());
+            for d in all {
+                assert_eq!(
+                    d.reading,
+                    lathe::dial(machine, d.slide, d.distance),
+                    "{d:?}"
+                );
+                assert!(d.reading.is_ok(), "{d:?}");
+                // Nothing on the outside part winds out: each reads what
+                // it is wound.
+                assert!(!d.out, "{d:?}");
+                assert_eq!(d.reads, d.reading.as_ref().ok().map(|r| r.1), "{d:?}");
+            }
+        }
+    }
+    #[test]
+    fn a_radius_dial_reads_half_what_a_diameter_dial_reads_for_the_same_pass() {
+        let (doc, mesh) = sample("Diameter");
+        let diameter = build(&doc, &mesh, 0).unwrap();
+        let (doc, mesh) = sample("Radius");
+        let radius = build(&doc, &mesh, 0).unwrap();
+        let (a, b) = (passes(&diameter, 1), passes(&radius, 1));
+        assert_eq!(a.len(), b.len());
+        for (p, q) in a.iter().zip(&b) {
+            // The same 6.00 off the Ø: 1 turn + 2.00, or 0 turns + 3.00.
+            assert_eq!(p.1.distance, q.1.distance);
+        }
+        reads(a[2].1, 1, 2.);
+        reads(b[2].1, 0, 3.);
+        assert_ne!(a[2].1.reading, b[2].1.reading);
+        // The carriage does not depend on it.
+        assert_eq!(a[2].2, b[2].2);
+    }
+    #[test]
+    fn the_dial_check_comes_first_only_while_the_cross_dial_is_not_known() {
+        let (doc, mesh) = sample("");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert_eq!(
+            kinds(&guide, guide.sections[0].steps.clone()),
+            ["Dial check", "Hold", "Zero"]
+        );
+        // 10 divisions of 0.04: 0.40 on the dial.
+        assert_eq!(
+            guide.steps[0],
+            Step::Lathe(LatheStep::DialCheck {
+                divisions: 10,
+                reading: 0.4,
+                length: 30.,
+            })
+        );
+        // Every cross-slide number waits for it; never a guess. The others
+        // are numbers.
+        let all = dials(&guide);
+        let cross: Vec<&&Dial> = all.iter().filter(|d| d.slide == Slide::Cross).collect();
+        assert_eq!(cross.len(), 7);
+        for d in &cross {
+            assert!(d.unknown(), "{d:?}");
+            assert_eq!(d.reading, Err(lathe::CHECK_THE_DIAL.into()));
+            assert_eq!(d.text(), lathe::CHECK_THE_DIAL);
+        }
+        for d in all.iter().filter(|d| d.slide != Slide::Cross) {
+            assert!(d.reading.is_ok(), "{d:?}");
+        }
+        // A measurement does not make a number of it either.
+        let (mut doc, mesh) = sample("");
+        let id = doc.setups[0].operations[1].id.clone();
+        set_measured(&mut doc, &id, 40.3);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert!(passes(&guide, 1).iter().all(|p| p.1.unknown()));
+        // Answered: no check, every cross number shown.
+        for answer in ["Diameter", "Radius"] {
+            let (doc, mesh) = sample(answer);
+            let guide = build(&doc, &mesh, 0).unwrap();
+            assert!(!kinds(&guide, 0..guide.steps.len()).contains(&"Dial check"));
+            assert!(dials(&guide).iter().all(|d| d.reading.is_ok()));
+        }
+    }
+    #[test]
+    fn the_measured_diameter_puts_what_is_left_on_the_last_pass() {
+        let (mut doc, mesh) = sample("Diameter");
+        let id = doc.setups[0].operations[1].id.clone();
+        let key = measure_key(&doc.setups[0].id, &id);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let measure = |guide: &Guide| {
+            (lathe_steps(guide).into_iter())
+                .find_map(|l| match l {
+                    LatheStep::Measure {
+                        key,
+                        expect,
+                        target,
+                        measured,
+                        bore,
+                        ..
+                    } => Some((key.clone(), *expect, *target, *measured, *bore)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // Before the last pass: Ø40.20 expected, Ø40.00 to come.
+        assert_eq!(measure(&guide), (key.clone(), 40.2, 40., None, false));
+        reads(passes(&guide, 1)[5].1, 2, 2.2);
+        // It sprang: Ø40.32 after the pass at 10.00. All of the 0.32 left
+        // goes on the last pass: 10.32, 2 turns + 2.32.
+        doc.measured.insert(key.clone(), 40.32);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert_eq!(measure(&guide).3, Some(40.32));
+        let last = passes(&guide, 1)[5].1;
+        close(last.distance, 10.32);
+        reads(last, 2, 2.32);
+        // The passes before it do not change.
+        reads(passes(&guide, 1)[4].1, 2, 2.);
+        // With a radius dial: 5.16 on the dial, 1 turn + 1.16.
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Radius".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        reads(passes(&guide, 1)[5].1, 1, 1.16);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        // Under size already, or bigger than the bar: no number.
+        for (was, says) in [(39.9, "past"), (50.5, "measure again")] {
+            doc.measured.insert(key.clone(), was);
+            let guide = build(&doc, &mesh, 0).unwrap();
+            let last = passes(&guide, 1)[5].1;
+            assert!(
+                last.reading.as_ref().unwrap_err().contains(says),
+                "{last:?}"
+            );
+        }
+        // The bar measured at the Zero step is what the Outside touches:
+        // Ø50.28, so 2.08 to Ø48.20.
+        doc.measured.remove(&key);
+        set_measured(&mut doc, "zero", 50.28);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        assert!(matches!(
+            guide.steps[1],
+            Step::Lathe(LatheStep::Zero {
+                measured: Some(m),
+                ..
+            }) if m == 50.28
+        ));
+        let first = passes(&guide, 1)[0].1;
+        close(first.distance, 2.08);
+        reads(first, 0, 2.08);
+        // The groove touches the turned Ø40, not the bar.
+        let plunge = (lathe_steps(&guide).into_iter())
+            .find_map(|l| match l {
+                LatheStep::Plunge { cross: Some(c), .. } => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        close(plunge.distance, 4.);
+    }
+    #[test]
+    fn a_bore_reads_out_from_the_hole_and_its_measure_the_other_way() {
+        let (mut doc, mesh) = lathe_job(50.2, 100., tube(10.5, 17.5, 0., 61.), -62.);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Boring bar" {
+                t.p.insert("min_bore".into(), "8".into());
+            }
+        }
+        add(&mut doc, "Drill", &[("depth", "30")]);
+        add(
+            &mut doc,
+            "Bore",
+            &[
+                ("diameter", "20"),
+                ("z_end", "-20"),
+                ("depth", "2"),
+                ("finish", "0.2"),
+                ("allowance", "0"),
+            ],
+        );
+        let guide = build(&doc, &mesh, 0).unwrap();
+        // No turning tool: the Zero step uses the first Turn's tool, the
+        // boring bar, which touches the end and has the bar measured but
+        // does not touch its outside.
+        let of = |g: &Guide, i: usize| kinds(g, g.sections[i].steps.clone());
+        assert_eq!(of(&guide, 0), ["Hold", "Zero"]);
+        let bar_tool = doc.setups[0].operations[1].tool.clone();
+        assert!(matches!(
+            &guide.steps[1],
+            Step::Lathe(LatheStep::Zero { tool, cross: false, planned, .. })
+                if *tool == bar_tool && (*planned - 50.2).abs() < 1e-4
+        ));
+        assert_eq!(of(&guide, 1), ["Drill"]);
+        assert_eq!(of(&guide, 2)[0], "Touch");
+        // The boring bar zeroed the carriage at the Zero step: only the
+        // hole is touched.
+        let Step::Lathe(LatheStep::Touch {
+            carriage: false,
+            cross: Some(cross),
+            ..
+        }) = &guide.steps[guide.sections[2].steps.start]
+        else {
+            panic!("{:?}", guide.steps[guide.sections[2].steps.start])
+        };
+        assert_eq!(
+            (cross.planned, cross.inside, cross.measured),
+            (10., true, None)
+        );
+        let bore = passes(&guide, 1);
+        let shown: Vec<f32> = bore.iter().map(|p| p.0).collect();
+        assert_eq!(shown, [11.96, 13.92, 15.88, 17.84, 19.8, 20.]);
+        for (d, cross, carriage, _) in &bore {
+            close(cross.distance, d - 10.);
+            assert!(cross.out && !carriage.out, "{cross:?}");
+            reads(carriage, 1, 0.);
+        }
+        // Wound out from the zero on the Ø10 hole the collar counts down:
+        // pass 5 is 9.80 out on a 4-a-turn diameter dial, 2 turns and 1.80
+        // more, so the collar reads 4 − 1.80 = 2.20.
+        close(bore[4].1.distance, 9.8);
+        reads(bore[4].1, 2, 1.8);
+        close(bore[4].1.reads.unwrap(), 2.2);
+        assert_eq!(bore[4].1.text(), "2 turns out, reads 2.20");
+        // Pass 1: 1.96 out reads 2.04; the last, 10.00 out, reads 2.00.
+        assert_eq!(bore[0].1.text(), "0 turns out, reads 2.04");
+        reads(bore[5].1, 2, 2.);
+        close(bore[5].1.reads.unwrap(), 2.);
+        // Measured Ø19.88 after 9.80: the 0.12 left on the last pass.
+        let id = doc.setups[0].operations[1].id.clone();
+        set_measured(&mut doc, &id, 19.88);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let last = passes(&guide, 1)[5].1;
+        close(last.distance, 9.92);
+        reads(last, 2, 1.92);
+        assert_eq!(last.text(), "2 turns out, reads 2.08");
+        assert!(
+            lathe_steps(&guide)
+                .iter()
+                .any(|l| matches!(l, LatheStep::Pass { bore: true, .. }))
+        );
+        // An inside thread feeds the top slide out, away from the axis: its
+        // collar counts down too.
+        doc.measured.clear();
+        doc.setups[0].operations[1]
+            .p
+            .insert("diameter".into(), "20.4".into());
+        add(
+            &mut doc,
+            "Thread",
+            &[
+                ("thread_side", "Inside"),
+                ("diameter", "22"),
+                ("pitch", "1.5"),
+                ("z_end", "-15"),
+            ],
+        );
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let tops: Vec<&Dial> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::ThreadPass { top, carriage, .. } => {
+                    assert!(!carriage.out);
+                    Some(top)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!tops.is_empty());
+        let machine = &doc.setups[0].machine;
+        for top in tops {
+            assert!(top.out, "{top:?}");
+            let (_, r) = top.reading.clone().unwrap();
+            assert_eq!(top.reads, lathe::reads(machine, Slide::Top, r, true));
+            close(top.reads.unwrap(), (2. - r) % 2.);
+        }
+    }
+    #[test]
+    fn the_zero_is_made_with_the_turning_tool_even_when_a_bore_comes_first() {
+        let (mut doc, mesh) = lathe_job(50.2, 100., tube(10.5, 17.5, 0., 61.), -62.);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Boring bar" {
+                t.p.insert("min_bore".into(), "8".into());
+            }
+        }
+        add(&mut doc, "Drill", &[("depth", "30")]);
+        add(&mut doc, "Bore", &[("diameter", "20"), ("z_end", "-20")]);
+        add(&mut doc, "Outside", &[("diameter", "40"), ("z_end", "-30")]);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let turning = doc.setups[0].operations[2].tool.clone();
+        // The turning tool touches the end and the bar's outside.
+        assert!(matches!(
+            &guide.steps[1],
+            Step::Lathe(LatheStep::Zero { tool, cross: true, .. }) if *tool == turning
+        ));
+        // The boring bar is a new tool: it touches the end again, and the
+        // hole for its cross dial.
+        assert!(matches!(
+            &guide.steps[guide.sections[2].steps.start],
+            Step::Lathe(LatheStep::Touch {
+                carriage: true,
+                cross: Some(Contact { inside: true, .. }),
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn the_tailstock_drill_reads_its_depth_and_point_on_the_quill() {
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let Some(LatheStep::TailDrill {
+            diameter,
+            depth,
+            point,
+            peck,
+            quill,
+            ..
+        }) = lathe_steps(&guide)
+            .into_iter()
+            .find(|l| matches!(l, LatheStep::TailDrill { .. }))
+        else {
+            panic!()
+        };
+        // 30 deep plus the Ø10 drill's 3.00 point, from where it touches
+        // the faced end: 33.00 on a 2.5-a-turn quill, 13 turns + 0.50.
+        assert_eq!((*diameter, *peck), (10., 10.));
+        close(*depth, 30.);
+        close(*point, 3.004);
+        close(quill.distance, 33.004);
+        reads(quill, 13, 0.5);
+        let plan = &guide.done[2].plan;
+        let feeds: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .collect();
+        // The plan starts its feed 1 mm in front of the end it touches.
+        close(
+            quill.distance,
+            mm(feeds[0].from[2] - crate::turn::CLEAR - plan.target),
+        );
+    }
+    #[test]
+    fn a_thread_feeds_the_top_slide_at_29_5_degrees_by_the_infeed_over_its_cosine() {
+        // Moving the top slide s at 29.5° from the cross slide moves the
+        // tool s·cos 29.5° toward the axis: the 0.915 thread depth of M40 ×
+        // 1.5 is 1.0513 along the top slide.
+        close(top_travel(0.915, 29.5), 1.0513);
+        close(top_angle(60.), 29.5);
+        close(top_angle(55.), 27.5);
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let threads: Vec<(f32, f32, &Dial, &Dial)> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::ThreadPass {
+                    infeed,
+                    angle,
+                    top,
+                    carriage,
+                    pitch,
+                    ..
+                } => {
+                    assert_eq!(*pitch, 1.5);
+                    Some((*infeed, *angle, top, carriage))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(threads.len(), 8);
+        let plan = &guide.done[4].plan;
+        let feeds: Vec<&Move> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .collect();
+        let n = threads.len();
+        for (k, ((infeed, angle, top, carriage), m)) in threads.iter().zip(&feeds).enumerate() {
+            assert_eq!(*angle, 29.5);
+            if k + 1 < n {
+                // The infeed is the plan's, in from the touch on the Ø40
+                // blank.
+                close(*infeed, mm(20. - m.to[0]));
+                close(top.distance, mm(top_travel(*infeed, 29.5)));
+            }
+            // The half-nuts stay closed to the thread's end at −40: 39 from
+            // the faced end.
+            close(carriage.distance, 39.);
+            reads(carriage, 1, 19.);
+        }
+        // Pass 3: 0.560 in, 0.643 along the slide, 0.64 on its dial of
+        // 0.02s.
+        close(threads[2].0, 0.56);
+        reads(threads[2].2, 0, 0.64);
+        // The last: 0.915 in is 1.0513 along the slide. Rounded to the
+        // nearest 0.02 it would be 1.06, 0.007 deeper than the thread; it is
+        // set at 1.04, 0.905 in, and the nut and a spring pass finish it.
+        close(threads[7].2.distance, 1.04);
+        reads(threads[7].2, 0, 1.04);
+        close(threads[7].0, 0.905);
+        assert!(threads[7].0 <= 0.915 + 1e-6);
+        // The readings never go back from one pass to the next.
+        let set: Vec<f32> = threads
+            .iter()
+            .map(|t| t.2.reading.clone().unwrap().1)
+            .collect();
+        assert!(set.windows(2).all(|w| w[1] >= w[0] - 1e-6), "{set:?}");
+        assert_eq!(
+            set.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>(),
+            [
+                "0.38", "0.52", "0.64", "0.74", "0.84", "0.92", "0.98", "1.04"
+            ]
+        );
+    }
+    #[test]
+    fn a_thread_never_goes_past_its_last_reading() {
+        // In 30 passes the last few are less than a division apart: none is
+        // set past the last, which is set below its travel, and the
+        // readings never go back.
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations[4]
+            .p
+            .insert("passes".into(), "30".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let set: Vec<f32> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::ThreadPass { top, .. } => Some(top.reading.clone().unwrap().1),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(set.len(), 30);
+        close(*set.last().unwrap(), 1.04);
+        assert!(set.iter().all(|r| *r <= 1.04 + 1e-6), "{set:?}");
+        assert!(set.windows(2).all(|w| w[1] >= w[0] - 1e-6), "{set:?}");
+    }
+    #[test]
+    fn a_chamfer_feeds_the_top_slide_and_a_shoulder_one_reads_the_carriage() {
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations.truncate(2);
+        add(&mut doc, "Chamfer", &[("edge", "Shoulder"), ("size", "1")]);
+        add(
+            &mut doc,
+            "Chamfer",
+            &[("edge", "End outside"), ("size", "0.5")],
+        );
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
+        // The turning tool, zeroed on the faced end: no touch first.
+        assert_eq!(of(3), ["Chamfer"]);
+        let Step::Lathe(LatheStep::Chamfer {
+            top,
+            carriage: Some(carriage),
+            ..
+        }) = &guide.steps[guide.sections[3].steps.start]
+        else {
+            panic!()
+        };
+        // The top slide, along the bed, feeds the 45° edge the leg: 1.00.
+        assert_eq!(top.slide, Slide::Top);
+        close(top.distance, 1.);
+        reads(top, 0, 1.);
+        // The shoulder at −65 is 64 from the faced end: the point stops 1
+        // short of it, at 63, for the top slide to feed it the last 1.
+        close(carriage.distance, 63.);
+        // The top slide was fed in: the next chamfer's carriage zero no
+        // longer holds, but an end chamfer needs none.
+        assert_eq!(of(4), ["Chamfer"]);
+        let Step::Lathe(LatheStep::Chamfer {
+            top,
+            carriage: None,
+            ..
+        }) = &guide.steps[guide.sections[4].steps.start]
+        else {
+            panic!()
+        };
+        reads(top, 0, 0.5);
+    }
+    #[test]
+    fn after_a_thread_the_top_slide_is_set_back_along_the_bed() {
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        // The Face comes first: the top slide is along the bed already.
+        assert!(matches!(
+            guide.steps[2],
+            Step::Lathe(LatheStep::Face { swung: None, .. })
+        ));
+        // A chamfer and a face after the thread set it back from 29.5°;
+        // the face after the chamfer finds it along the bed.
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations.truncate(5);
+        add(
+            &mut doc,
+            "Chamfer",
+            &[("edge", "End outside"), ("size", "0.5")],
+        );
+        add(
+            &mut doc,
+            "Face",
+            &[("face_off", "0.5"), ("to_diameter", "36")],
+        );
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let swung: Vec<Option<f32>> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::Face { swung, .. } | LatheStep::Chamfer { swung, .. } => Some(*swung),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(swung, [None, Some(29.5), None]);
+    }
+    #[test]
+    fn the_measurements_and_the_place_survive_save_and_load() {
+        let (mut doc, mesh) = sample("");
+        let id = doc.setups[0].id.clone();
+        let op = doc.setups[0].operations[1].id.clone();
+        set_measured(&mut doc, "zero", 50.28);
+        set_measured(&mut doc, &op, 40.32);
+        doc.guide.insert(id.clone(), 5);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shaft.axis.json");
+        crate::storage::save(&path, &doc).unwrap();
+        let loaded = crate::storage::load(&path).unwrap();
+        assert_eq!(loaded.measured, doc.measured);
+        assert_eq!(loaded.measured.get(&measure_key(&id, "zero")), Some(&50.28));
+        let guide = build(&loaded, &mesh, 0).unwrap();
+        assert_eq!(place(&loaded, &guide), 5);
+        assert_eq!(build(&doc, &mesh, 0).unwrap().steps, guide.steps);
+        // A project saved without measurements loads with none.
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("measured");
+        let old: Document = serde_json::from_value(json).unwrap();
+        assert!(old.measured.is_empty());
+    }
+    #[test]
+    fn a_lathe_setup_needs_an_operation_and_a_chuck() {
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].p.insert("holding".into(), "None".into());
+        let error = build(&doc, &mesh, 0).unwrap_err();
+        assert!(error.contains("chuck"), "{error}");
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations.clear();
+        let error = build(&doc, &mesh, 0).unwrap_err();
+        assert!(error.contains("Turn"), "{error}");
     }
 }

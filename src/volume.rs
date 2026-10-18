@@ -97,10 +97,46 @@ pub struct Volume {
     pub cell: [f32; 3],
     pub occupied: Vec<u8>,
     pub remaining: usize,
+    /// How many voxels held material at the start: all of them for a box,
+    /// those inside the cylinder for a round bar.
+    pub material: usize,
     pub cuts: std::sync::Arc<Vec<crate::stock_surface::Cut>>,
     pub version: u64,
+    /// Whether the stock started as a round bar (`bar`): the cylinder in
+    /// `bounds` (`crate::stock::bar`), not the whole box.
+    pub round: bool,
 }
 impl Volume {
+    /// A round bar's stock: `new`, with the voxels whose centres lie outside
+    /// the bar's cylinder (`crate::stock::bar`, along `frame`'s Z) cleared.
+    pub fn bar(bounds: Bounds, frame: Frame) -> Self {
+        let mut v = Self::new(bounds, frame);
+        v.round = true;
+        let (centre, radius) = crate::stock::bar(bounds);
+        for z in 0..v.n[2] {
+            for y in 0..v.n[1] {
+                for x in 0..v.n[0] {
+                    let p = v.point([x, y, z], 0.5);
+                    if (p[0] - centre[0]).hypot(p[1] - centre[1]) > radius {
+                        let i = v.index([x, y, z]);
+                        v.occupied[i] = 0;
+                        v.remaining -= 1;
+                    }
+                }
+            }
+        }
+        v.material = v.remaining;
+        v
+    }
+    /// The stock a setup's resolved `bounds` make: a round bar (`bar`) when
+    /// `round`, else the box (`new`).
+    pub fn stock(bounds: Bounds, frame: Frame, round: bool) -> Self {
+        if round {
+            Self::bar(bounds, frame)
+        } else {
+            Self::new(bounds, frame)
+        }
+    }
     pub fn new(bounds: Bounds, frame: Frame) -> Self {
         let size = bounds.dimensions();
         let step = size.into_iter().fold(0., f32::max) / 96.;
@@ -114,8 +150,10 @@ impl Volume {
             cell,
             occupied: vec![1; count],
             remaining: count,
+            material: count,
             cuts: std::sync::Arc::new(vec![]),
             version: 0,
+            round: false,
         }
     }
     pub fn index(&self, p: [usize; 3]) -> usize {
@@ -139,7 +177,7 @@ impl Volume {
         self.occupied[self.index(at)] != 0
     }
     pub fn removed_volume(&self) -> f32 {
-        (self.occupied.len() - self.remaining) as f32 * self.cell.iter().product::<f32>()
+        (self.material - self.remaining) as f32 * self.cell.iter().product::<f32>()
     }
     pub fn transformed_bounds(&self, to: Frame) -> Bounds {
         self.frame.transfer_bounds(self.bounds, to)
@@ -153,18 +191,32 @@ impl Volume {
         b: [f32; 3],
         radius: f32,
         flute: f32,
+        shape: CutterShape,
         current: Frame,
     ) -> Option<[(usize, usize); 3]> {
-        let lo = [
-            a[0].min(b[0]) - radius,
-            a[1].min(b[1]) - radius,
-            a[2].min(b[2]),
-        ];
-        let hi = [
-            a[0].max(b[0]) + radius,
-            a[1].max(b[1]) + radius,
-            a[2].max(b[2]) + flute,
-        ];
+        let (lo, hi) = if shape == CutterShape::Revolve {
+            // A ring goes nowhere when it is empty.
+            if !(a[0] < b[0] && a[1] < b[1]) {
+                return None;
+            }
+            ([-b[1], -b[1], a[0]], [b[1], b[1], b[0]])
+        } else {
+            if (0..3).all(|k| (a[k] - b[k]).abs() < 1e-7) {
+                return None;
+            }
+            (
+                [
+                    a[0].min(b[0]) - radius,
+                    a[1].min(b[1]) - radius,
+                    a[2].min(b[2]),
+                ],
+                [
+                    a[0].max(b[0]) + radius,
+                    a[1].max(b[1]) + radius,
+                    a[2].max(b[2]) + flute,
+                ],
+            )
+        };
         let mut low = [f32::INFINITY; 3];
         let mut high = [f32::NEG_INFINITY; 3];
         for mask in 0..8 {
@@ -176,9 +228,6 @@ impl Volume {
             }
         }
         if (0..3).any(|k| high[k] < self.bounds.min[k] || low[k] > self.bounds.max[k]) {
-            return None;
-        }
-        if (0..3).all(|k| (a[k] - b[k]).abs() < 1e-7) {
             return None;
         }
         Some(std::array::from_fn(|k| {
@@ -204,7 +253,7 @@ impl Volume {
         shape: CutterShape,
         current: Frame,
     ) -> bool {
-        let Some(ranges) = self.ranges(a, b, radius, flute, current) else {
+        let Some(ranges) = self.ranges(a, b, radius, flute, shape, current) else {
             return false;
         };
         for z in ranges[2].0..ranges[2].1 {
@@ -233,7 +282,7 @@ impl Volume {
         current: Frame,
         source: (u16, u16),
     ) {
-        let Some(ranges) = self.ranges(a, b, radius, flute, current) else {
+        let Some(ranges) = self.ranges(a, b, radius, flute, shape, current) else {
             return;
         };
         let cut = crate::stock_surface::Cut {
@@ -266,6 +315,32 @@ impl Volume {
             }
         }
     }
+    /// Turn away the ring of `current`'s frame between `z0` and `z1` along
+    /// its Z axis and between the radii `r0` and `r1` from it (mm, in either
+    /// order; a negative radius is taken as 0): a lathe cut, recorded as a
+    /// `Revolve` cut with `a = [z0, r0, 0]`, `b = [z1, r1, 0]`, its radius
+    /// `r1` and no flutes.
+    pub fn revolve(
+        &mut self,
+        z0: f32,
+        z1: f32,
+        r0: f32,
+        r1: f32,
+        current: Frame,
+        source: (u16, u16),
+    ) {
+        let (z0, z1) = (z0.min(z1), z0.max(z1));
+        let (r0, r1) = (r0.min(r1).max(0.), r0.max(r1).max(0.));
+        self.cut(
+            [z0, r0, 0.],
+            [z1, r1, 0.],
+            r1,
+            0.,
+            CutterShape::Revolve,
+            current,
+            source,
+        );
+    }
 }
 pub(crate) fn swept(
     p: [f32; 3],
@@ -275,6 +350,11 @@ pub(crate) fn swept(
     flute: f32,
     shape: CutterShape,
 ) -> bool {
+    if shape == CutterShape::Revolve {
+        // The ring between Z a[0]..b[0] and radii a[1]..b[1] about Z.
+        let radial = p[0].hypot(p[1]);
+        return p[2] >= a[0] && p[2] <= b[0] && radial >= a[1] && radial <= b[1];
+    }
     let v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let l2 = v[0] * v[0] + v[1] * v[1];
     let projection = if l2 < 1e-12 {
@@ -332,6 +412,8 @@ pub(crate) fn swept(
             CutterShape::Ball => r - (r * r - radial).max(0.).sqrt(),
             CutterShape::Flat => 0.,
             CutterShape::Drill | CutterShape::Chamfer(_) => rise * radial.sqrt(),
+            // Rings return above.
+            CutterShape::Revolve => 0.,
         };
     p[2] >= bottom - 0.00001
 }
@@ -550,6 +632,122 @@ mod tests {
             }
             assert!(checked > 500);
         }
+    }
+    const BAR: Bounds = Bounds {
+        min: [-25., -25., 0.],
+        max: [25., 25., 100.],
+    };
+    #[test]
+    fn a_round_bar_has_material_only_inside_its_cylinder() {
+        let (a, _) = frames();
+        let bar = Volume::bar(BAR, a);
+        assert!(bar.round && !Volume::new(BAR, a).round);
+        let mut inside = 0;
+        for z in 0..bar.n[2] {
+            for y in 0..bar.n[1] {
+                for x in 0..bar.n[0] {
+                    let p = bar.point([x, y, z], 0.5);
+                    let occupied = bar.occupied[bar.index([x, y, z])] != 0;
+                    assert_eq!(occupied, p[0].hypot(p[1]) <= 25., "{p:?}");
+                    inside += usize::from(occupied);
+                }
+            }
+        }
+        assert_eq!(inside, bar.remaining);
+        let volume = bar.remaining as f32 * bar.cell.iter().product::<f32>();
+        let exact = std::f32::consts::PI * 25. * 25. * 100.;
+        assert!((volume / exact - 1.).abs() < 0.01, "{volume} vs {exact}");
+        assert_eq!(bar.removed_volume(), 0.);
+        // A box stock is the whole box, as before.
+        let block = Volume::stock(BAR, a, false);
+        assert_eq!(block.remaining, block.occupied.len());
+        assert!(block.occupied.iter().all(|v| *v == 1));
+    }
+    #[test]
+    fn a_revolve_ring_removes_exactly_its_ring_in_its_own_frame() {
+        let (a, b) = frames();
+        let ring = |p: [f32; 3]| {
+            swept(
+                p,
+                [30., 15., 0.],
+                [60., 22., 0.],
+                22.,
+                0.,
+                CutterShape::Revolve,
+            )
+        };
+        // Each bound, inside and out.
+        for (p, inside) in [
+            ([18., 0., 45.], true),
+            ([0., -15., 30.], true),
+            ([22. * 0.6, 22. * 0.8, 60.], true),
+            ([12., 12., 45.], true),
+            ([18., 0., 29.9], false),
+            ([18., 0., 60.1], false),
+            ([14.9, 0., 45.], false),
+            ([0., 22.1, 45.], false),
+            ([0., 0., 45.], false),
+        ] {
+            assert_eq!(ring(p), inside, "{p:?}");
+        }
+        // In the volume's own frame, and from a frame turned over and moved,
+        // whose axis lies 12 mm off the bar's.
+        for current in [a, b] {
+            let before = Volume::bar(BAR, a);
+            let seen = before.transformed_bounds(current);
+            let middle = (seen.min[2] + seen.max[2]) / 2.;
+            let (z0, z1) = (middle - 15., middle + 15.);
+            let ring = |p: [f32; 3]| {
+                swept(
+                    p,
+                    [z0, 15., 0.],
+                    [z1, 22., 0.],
+                    22.,
+                    0.,
+                    CutterShape::Revolve,
+                )
+            };
+            let mut after = before.clone();
+            // Either order of the bounds is the same ring.
+            after.revolve(z1, z0, 22., 15., current, (0, 3));
+            let cut = &after.cuts[0];
+            assert_eq!(cut.shape, CutterShape::Revolve);
+            assert_eq!((cut.a, cut.b), ([z0, 15., 0.], [z1, 22., 0.]));
+            assert_eq!((cut.frame, cut.source), (current, (0, 3)));
+            let mut removed = 0;
+            for i in 0..before.occupied.len() {
+                let voxel = [
+                    i % before.n[0],
+                    (i / before.n[0]) % before.n[1],
+                    i / (before.n[0] * before.n[1]),
+                ];
+                let p = a.transfer(before.point(voxel, 0.5), current);
+                let expected = before.occupied[i] != 0 && !ring(p);
+                assert_eq!(after.occupied[i] != 0, expected, "{voxel:?}");
+                removed += usize::from(before.occupied[i] != after.occupied[i]);
+            }
+            assert_eq!(after.remaining, before.remaining - removed);
+            assert!(removed > 1000, "{removed}");
+            // Material is left inside the ring's inner radius, none in it.
+            let touches = |r0: f32| {
+                after.touches(
+                    [z0, r0, 0.],
+                    [z1, 22., 0.],
+                    22.,
+                    0.,
+                    CutterShape::Revolve,
+                    current,
+                )
+            };
+            assert!(touches(10.));
+            assert!(!touches(15.5));
+        }
+        // Rings never merge, even the same ring twice; an empty ring is no cut.
+        let mut v = Volume::bar(BAR, a);
+        v.revolve(30., 60., 15., 22., a, (0, 0));
+        v.revolve(30., 60., 15., 22., a, (0, 0));
+        v.revolve(30., 30., 15., 22., a, (0, 0));
+        assert_eq!(v.cuts.len(), 2);
     }
     #[test]
     fn finite_cutter_does_not_erase_stock_above_its_flutes() {

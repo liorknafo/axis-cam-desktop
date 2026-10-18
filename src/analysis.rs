@@ -72,7 +72,7 @@ pub struct LibraryEntry {
 pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
     doc.workholding
         .iter()
-        .filter(|h| crate::holding::KINDS.contains(&h.kind()))
+        .filter(|h| matches!(h.kind(), "Vise" | "Clamp"))
         .collect()
 }
 /// The number, counted as `library` is, of the entry that holds `setup1`: None

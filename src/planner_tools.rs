@@ -104,7 +104,13 @@ pub fn crashed(name: &str) -> Answer {
 
 /// The tools the model is offered: `view_model` only when the run shows
 /// pictures.
+#[cfg(test)]
 pub fn offered(pictures: bool) -> Vec<Tool> {
+    offered_with(pictures, false)
+}
+/// `offered`, with `edit` (the planner changes the current plan) drafts for
+/// `check_plan` in `proposal::schema_for(true)`, with their `from`.
+pub fn offered_with(pictures: bool, edit: bool) -> Vec<Tool> {
     let mut tools = vec![];
     if pictures {
         tools.push(look::tool());
@@ -114,7 +120,7 @@ pub fn offered(pictures: bool) -> Vec<Tool> {
         description: format!("Checks a draft proposal as an answer is checked, which takes some seconds, and answers with the same check report: `passed`, the `problems` by setup and operation, `operations` with their minutes, `coverage`, `total_minutes`, and `stocks`, the stock before each setup. The draft becomes the latest for `stock_after`, `check_holding` and the operation views. At most {MAX_CHECKS_PER_REQUEST} per request and {MAX_CHECKS_PER_RUN} in the run."),
         parameters: json!({
             "type": "object",
-            "properties": {"proposal": proposal::schema()},
+            "properties": {"proposal": proposal::schema_for(edit)},
             "required": ["proposal"],
             "additionalProperties": false
         }),

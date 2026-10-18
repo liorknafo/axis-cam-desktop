@@ -27,11 +27,17 @@ pub struct RestStock {
     bounds: Bounds,
     reference: Frame,
     current: Frame,
+    /// The box the material left lies in, in `current`: the stock's box,
+    /// less what lathe cuts turned away (`turned`).
     extent: Bounds,
+    /// The stock's whole box in `current`.
+    whole: Bounds,
     cuts: Vec<Capsule>,
     /// Where every earlier cut, of any cutter shape, can have removed
     /// material (`removal_boxes`, in `current`): what `bottom` reads.
     removal: Vec<Bounds>,
+    /// The earlier lathe cuts about `current`'s Z axis (`coaxial`).
+    coaxial: Coaxial,
 }
 fn corners(b: Bounds) -> [[f32; 3]; 8] {
     std::array::from_fn(|mask| {
@@ -60,19 +66,155 @@ fn transformed(b: Bounds, from: Frame, to: Frame) -> Bounds {
     }
     out
 }
+/// The box, in `current`, the material left in `volume` lies in once its
+/// lathe cuts (`Revolve`) are made: None without one. In each frame those
+/// cuts were made in, the stock is taken as a bar round that frame's Z axis
+/// out to its box's farthest corner (or to the round stock's cylinder, when
+/// that shares the axis); at each height the rings reaching in from there
+/// without a gap take that radius down to their inner one, and a section
+/// they take to the axis is gone. The bar left, as wide as the widest
+/// section left and as long as the sections left reach, bounds the
+/// material: each frame's box, seen in `current`, narrows the one before.
+/// Other cuts are not counted, so the box never claims more than was cut.
+fn turned(volume: &Volume, current: Frame) -> Option<Bounds> {
+    const TOLERANCE: f32 = 1e-4;
+    let mut frames: Vec<Frame> = vec![];
+    for c in volume.cuts.iter() {
+        if c.shape == CutterShape::Revolve && !frames.contains(&c.frame) {
+            frames.push(c.frame);
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    let mut out = volume.transformed_bounds(current);
+    for frame in frames {
+        let seen = transformed(out, current, frame);
+        // (z0, z1, r0, r1) of each ring made in this frame.
+        let rings: Vec<[f32; 4]> = volume
+            .cuts
+            .iter()
+            .filter(|c| c.shape == CutterShape::Revolve && c.frame == frame)
+            .map(|c| [c.a[0], c.b[0], c.a[1], c.b[1]])
+            .collect();
+        let mut outer = corners(seen)
+            .iter()
+            .map(|p| p[0].hypot(p[1]))
+            .fold(0., f32::max);
+        if volume.round {
+            let (centre, radius) = crate::stock::bar(volume.bounds);
+            let axis = volume.frame.transfer_vector([0., 0., 1.], frame);
+            if axis[0].abs() < 1e-4 && axis[1].abs() < 1e-4 {
+                let c = volume.frame.transfer([centre[0], centre[1], 0.], frame);
+                outer = outer.min(c[0].hypot(c[1]) + radius);
+            }
+        }
+        let mut levels: Vec<f32> = rings
+            .iter()
+            .flat_map(|r| [r[0], r[1]])
+            .filter(|z| *z > seen.min[2] && *z < seen.max[2])
+            .chain([seen.min[2], seen.max[2]])
+            .collect();
+        levels.sort_by(f32::total_cmp);
+        levels.dedup();
+        let (mut low, mut high, mut widest) = (f32::INFINITY, f32::NEG_INFINITY, 0f32);
+        for w in levels.windows(2) {
+            let mut r = outer;
+            loop {
+                let inner = rings
+                    .iter()
+                    .filter(|g| {
+                        g[0] <= w[0] + TOLERANCE
+                            && g[1] >= w[1] - TOLERANCE
+                            && g[2] < r
+                            && g[3] >= r - TOLERANCE
+                    })
+                    .map(|g| g[2])
+                    .fold(r, f32::min);
+                if inner >= r {
+                    break;
+                }
+                r = inner;
+            }
+            if r > TOLERANCE {
+                (low, high, widest) = (low.min(w[0]), high.max(w[1]), widest.max(r));
+            }
+        }
+        // Every section turned to the axis: nothing proven, keep the box.
+        if low > high {
+            continue;
+        }
+        let left = Bounds {
+            min: [(-widest).max(seen.min[0]), (-widest).max(seen.min[1]), low],
+            max: [widest.min(seen.max[0]), widest.min(seen.max[1]), high],
+        };
+        let back = transformed(left, frame, current);
+        for k in 0..3 {
+            out.min[k] = out.min[k].max(back.min[k]);
+            out.max[k] = out.max[k].min(back.max[k]);
+        }
+    }
+    Some(out)
+}
+/// The lathe's view of the stock in `volume` about `current`'s Z axis
+/// (X = Y = 0), what a Turn plans its passes from.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Coaxial {
+    /// How far from the axis the round bar reaches, when the stock started
+    /// as a round bar whose axis is parallel to it: its radius, plus the
+    /// offset of its axis when that is not on it.
+    pub bar: Option<f32>,
+    /// Every lathe cut (`Revolve`) made about this same axis, in any setup
+    /// whose Z axis lies on it either way round, as `[z0, z1, r0, r1]` in
+    /// `current` (mm, `z0 <= z1`, `r0 <= r1`). Lathe cuts about another
+    /// axis, and every other cut, are left out: the passes may start in air
+    /// after them, but never deeper than the material.
+    pub rings: Vec<[f32; 4]>,
+}
+/// `Coaxial` of `volume` about `current`'s Z axis.
+pub fn coaxial(volume: &Volume, current: Frame) -> Coaxial {
+    const TOLERANCE: f32 = 1e-3;
+    let on_axis = |frame: Frame, p: [f32; 3]| {
+        let axis = frame.transfer_vector([0., 0., 1.], current);
+        let at = frame.transfer(p, current);
+        (axis[0].abs() < 1e-4 && axis[1].abs() < 1e-4).then_some(at)
+    };
+    let bar = volume
+        .round
+        .then(|| crate::stock::bar(volume.bounds))
+        .and_then(|(centre, radius)| {
+            on_axis(volume.frame, [centre[0], centre[1], 0.]).map(|c| c[0].hypot(c[1]) + radius)
+        });
+    let rings = volume
+        .cuts
+        .iter()
+        .filter(|c| c.shape == CutterShape::Revolve)
+        .filter_map(|c| {
+            let low = on_axis(c.frame, [0., 0., c.a[0]])?;
+            let high = on_axis(c.frame, [0., 0., c.b[0]])?;
+            (low[0].hypot(low[1]) < TOLERANCE).then_some([
+                low[2].min(high[2]),
+                low[2].max(high[2]),
+                c.a[1],
+                c.b[1],
+            ])
+        })
+        .collect();
+    Coaxial { bar, rings }
+}
 /// Box, in `current`, around each earlier cut of any cutter shape: material can
 /// only have been removed inside these boxes.
 pub fn cut_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
     volume.cuts.iter().map(|c| cut_box(c, current)).collect()
 }
-/// `cut_boxes`' box of one cut.
+/// `cut_boxes`' box of one cut: a lathe's ring's own box.
 pub fn cut_box(c: &Cut, current: Frame) -> Bounds {
-    let b = Bounds {
+    let b = c.ring().unwrap_or_else(|| Bounds {
         min: std::array::from_fn(|k| c.a[k].min(c.b[k]) - c.radius),
         max: std::array::from_fn(|k| {
             c.a[k].max(c.b[k]) + c.radius + if k == 2 { c.flute } else { 0. }
         }),
-    };
+    });
     transformed(b, c.frame, current)
 }
 /// Box, in `current`, around the material each earlier cut can have
@@ -86,9 +228,9 @@ pub fn removal_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
         .map(|c| removal_box(c, current))
         .collect()
 }
-/// `removal_boxes`' box of one cut.
+/// `removal_boxes`' box of one cut: a lathe's ring's own box.
 pub fn removal_box(c: &Cut, current: Frame) -> Bounds {
-    let b = Bounds {
+    let b = c.ring().unwrap_or(Bounds {
         min: [
             c.a[0].min(c.b[0]) - c.radius,
             c.a[1].min(c.b[1]) - c.radius,
@@ -99,7 +241,7 @@ pub fn removal_box(c: &Cut, current: Frame) -> Bounds {
             c.a[1].max(c.b[1]) + c.radius,
             c.a[2].max(c.b[2]) + c.flute,
         ],
-    };
+    });
     transformed(b, c.frame, current)
 }
 /// Where earlier cuts can have removed material, for single points: within
@@ -230,6 +372,17 @@ fn removes(cut: &Cut, b: &Bounds, current: Frame, p: [f32; 3]) -> bool {
     const GUARD: f32 = 0.001;
     (0..3).all(|k| p[k] >= b.min[k] - 2. * GUARD && p[k] <= b.max[k] + 2. * GUARD) && {
         let q = transfer(p, current, cut.frame);
+        if cut.shape == CutterShape::Revolve {
+            // The ring grown by the guard on every side.
+            return crate::volume::swept(
+                q,
+                [cut.a[0] - GUARD, cut.a[1] - GUARD, 0.],
+                [cut.b[0] + GUARD, cut.b[1] + GUARD, 0.],
+                0.,
+                0.,
+                cut.shape,
+            );
+        }
         // Raised by the guard against a flute top raised twice as far.
         crate::volume::swept(
             [q[0], q[1], q[2] + GUARD],
@@ -351,17 +504,24 @@ impl RestStock {
                 }
             })
             .collect();
+        let whole = volume.transformed_bounds(current);
         Self {
             bounds: volume.bounds,
             reference: volume.frame,
             current,
-            extent: volume.transformed_bounds(current),
+            extent: turned(volume, current).unwrap_or(whole),
+            whole,
             cuts,
             removal: removal_boxes(volume, current),
+            coaxial: coaxial(volume, current),
         }
     }
-    /// The stock box's XY extent in the current frame, mm: outside it no
-    /// stock ever was.
+    /// What earlier lathe cuts left about the current frame's Z axis.
+    pub fn coaxial(&self) -> &Coaxial {
+        &self.coaxial
+    }
+    /// The box the stock left lies in, in the current frame, mm: outside it
+    /// no stock is left (the stock's box, less what lathe cuts turned away).
     pub fn extent(&self) -> Bounds {
         self.extent
     }
@@ -423,7 +583,7 @@ impl RestStock {
         }
         out
     }
-    /// Whether `region` lies wholly beside the stock box, where no stock ever was.
+    /// Whether `region` lies wholly beside the stock box, where no stock is left.
     pub fn beside(&self, region: Bounds) -> bool {
         (0..2).any(|k| region.max[k] <= self.extent.min[k] || region.min[k] >= self.extent.max[k])
     }
@@ -483,7 +643,8 @@ impl RestStock {
         candidates[hi]
     }
     /// The stock box a later setup starts from, in the current frame (mm):
-    /// the original block's box with each of its six sides moved in past
+    /// the original block's box, narrowed to what lathe cuts left (`turned`),
+    /// with each of its six sides moved in past
     /// every layer earlier cuts provably removed whole (the same evidence and
     /// proof as `top`). Sides are trimmed in a fixed order (top, bottom, -X,
     /// +X, -Y, +Y), each against the box trimmed so far. Without proof a side
@@ -503,7 +664,17 @@ impl RestStock {
             (1, false),
             (1, true),
         ];
-        self.trim(self.extent, &SIX, part, budget, None)
+        // Lathe cuts never take the box into the part (a cut that did is
+        // refused): it reaches out to it, within the stock's box.
+        let start = Bounds {
+            min: std::array::from_fn(|k| {
+                self.extent.min[k].min(part.min[k]).max(self.whole.min[k])
+            }),
+            max: std::array::from_fn(|k| {
+                self.extent.max[k].max(part.max[k]).min(self.whole.max[k])
+            }),
+        };
+        self.trim(start, &SIX, part, budget, None)
     }
     /// What a vise's jaws close on in a later setup that starts from `stock`
     /// (current frame, mm) and grips `grip` mm of it, the jaws closing along
@@ -948,6 +1119,93 @@ mod tests {
                 (0, 0),
             );
         }
+    }
+    #[test]
+    fn a_mill_setup_turned_square_to_a_lathe_starts_from_the_turned_bar() {
+        // A 10 mm cube for the part, well inside the Ø40 the bar is turned to.
+        let mesh = mesh::normalize(vec![[[-5., -5., 0.], [5., 5., 10.], [5., -5., 0.]]]).unwrap();
+        let mut lathe = Setup::new(Machine::new(3), "G54");
+        for (k, v) in [
+            ("stock_type", "Round bar"),
+            ("stock_diameter", "50"),
+            ("stock_length", "100"),
+        ] {
+            lathe.p.insert(k.into(), v.into());
+        }
+        let stock = crate::stock::resolve(&lathe, Some(&mesh)).unwrap().stock;
+        let a = Frame::new(&lathe, &mesh);
+        // The mill holds the bar on its side: the lathe's Z is its X.
+        let mut mill = Setup::new(Machine::new(3), "G55");
+        mill.p.insert("ry".into(), "90".into());
+        let b = Frame::new(&mill, &mesh);
+        let close = |x: Bounds, y: Bounds| {
+            for k in 0..3 {
+                assert!(
+                    (x.min[k] - y.min[k]).abs() < 0.001 && (x.max[k] - y.max[k]).abs() < 0.001,
+                    "{x:?} != {y:?}"
+                );
+            }
+        };
+        let in_mill = |b0: Bounds| a.transfer_bounds(b0, b);
+        let mut v = Volume::bar(stock, a);
+        let whole = crate::simulation::leftover_box(&v, &mill, &mesh);
+        close(whole, in_mill(stock));
+        let d = whole.dimensions();
+        assert!(
+            (d[0] - 100.).abs() < 0.001 && (d[1] - 50.).abs() < 0.001,
+            "{d:?}"
+        );
+        // Turned over 60 mm from the free end only: the chuck end keeps the
+        // bar's diameter, so the box does not narrow.
+        let mut part_way = v.clone();
+        part_way.revolve(40., 101., 20., 25., a, (0, 0));
+        close(
+            crate::simulation::leftover_box(&part_way, &mill, &mesh),
+            whole,
+        );
+        // Turned to Ø40 over the whole length in two passes, and faced 2 mm.
+        v.revolve(-1., 101., 22.5, 25., a, (0, 0));
+        v.revolve(-1., 101., 20., 22.5, a, (0, 1));
+        v.revolve(98., 101., 0., 20., a, (0, 2));
+        let turned = Bounds {
+            min: [-20., -20., 0.],
+            max: [20., 20., 98.],
+        };
+        close(
+            crate::simulation::leftover_box(&v, &mill, &mesh),
+            in_mill(turned),
+        );
+        // The mill sees the rings point by point, through `Frame::transfer`.
+        let removed = Removed::new(&v, b);
+        for (p, cut) in [
+            ([21., 0., 50.], true),
+            ([0., -24., 3.], true),
+            ([5., 5., 99.], true),
+            ([19., 0., 50.], false),
+            ([0., 0., 97.], false),
+        ] {
+            assert_eq!(removed.at(a.transfer(p, b)), cut, "{p:?}");
+        }
+        assert_eq!(removed.by(a.transfer([0., 0., 99.], b)), Some((0, 2)));
+        // The rings are not capsule evidence: nothing is cleared, no start
+        // height is lowered by them.
+        let rest = RestStock::new(&v, b);
+        assert!(rest.cuts.is_empty());
+        let everywhere = Bounds {
+            min: [-200.; 3],
+            max: [200.; 3],
+        };
+        assert!(rest.cleared(everywhere, -100., 100.).is_empty());
+        assert_eq!(rest.top(everywhere, -50., 60.), 60.);
+        // The removal boxes are the rings' boxes, seen in the mill's frame.
+        assert_eq!(removal_boxes(&v, b).len(), 3);
+        close(
+            cut_boxes(&v, b)[2],
+            in_mill(Bounds {
+                min: [-20., -20., 98.],
+                max: [20., 20., 101.],
+            }),
+        );
     }
     #[test]
     fn cleared_outlines_the_flat_sweeps_spanning_the_heights_in_either_frame() {

@@ -46,6 +46,10 @@ pub enum CutterShape {
     /// A chamfer mill: a cone of this included angle, in tenths of a degree,
     /// from its pointed tip up to its diameter.
     Chamfer(u16),
+    /// A lathe cut: the ring `volume::Volume::revolve` makes, every point of
+    /// the cut's frame whose Z lies between `a[0]` and `b[0]` and whose
+    /// distance from its Z axis lies between `a[1]` and `b[1]`.
+    Revolve,
 }
 impl CutterShape {
     /// How far a pointed cutter's cone rises per mm from its axis: a drill's
@@ -54,7 +58,7 @@ impl CutterShape {
         match self {
             CutterShape::Drill => Some(POINT_RISE),
             CutterShape::Chamfer(tenths) => Some(1. / (f32::from(tenths) / 20.).to_radians().tan()),
-            CutterShape::Flat | CutterShape::Ball => None,
+            CutterShape::Flat | CutterShape::Ball | CutterShape::Revolve => None,
         }
     }
 }
@@ -80,6 +84,27 @@ pub struct Plan {
     pub rest_top: Option<f32>,
     pub spindle_clockwise: bool,
     pub milling_direction: &'static str,
+    /// A lathe plan's cuts (`turn::generate`), in the order they are made:
+    /// the simulation turns each ring away when its move ends, instead of
+    /// sweeping the cutter along the moves. Empty for every other plan.
+    pub rings: Vec<Ring>,
+}
+impl Plan {
+    /// Whether this is a lathe plan: its moves are a side view (X the
+    /// tool's distance from the spindle axis, Y 0, Z along the axis) and its
+    /// cuts are its `rings`.
+    pub fn is_lathe(&self) -> bool {
+        self.shape == CutterShape::Revolve
+    }
+}
+/// A lathe cut: the ring of the plan's setup frame between `z[0]` and `z[1]`
+/// along its Z axis and between the radii `r[0]` and `r[1]` from it (mm),
+/// turned away when move `at` of the plan ends (`volume::Volume::revolve`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ring {
+    pub at: usize,
+    pub z: [f32; 2],
+    pub r: [f32; 2],
 }
 fn number(operation: &Operation, key: &str) -> Result<f32, String> {
     num(&operation.p, key).ok_or_else(|| {
@@ -107,6 +132,10 @@ pub fn generate(
     tool: &Tool,
     mesh: &Mesh,
 ) -> Result<Plan, String> {
+    // Turning and a lathe's centre drilling are planned in their own frame.
+    if operation.strategy == Strategy::Turn || operation.on_centre(&setup.machine) {
+        return crate::turn::generate(setup, operation, tool, mesh);
+    }
     // Keep coordinates within the preview polygon kernel's integer range.
     // This applies to every strategy before its geometry-specific calculations.
     // A fixed-size box stays at the origin while the part follows the setup's
@@ -129,6 +158,9 @@ pub fn generate(
     }
     if operation.strategy == Strategy::Pocket {
         return crate::pocket::generate(setup, operation, tool, mesh);
+    }
+    if operation.strategy == Strategy::Adaptive {
+        return crate::adaptive::generate(setup, operation, tool, mesh);
     }
     if operation.strategy != Strategy::Face {
         return crate::cam::generate(setup, operation, tool, mesh);
@@ -366,6 +398,7 @@ pub fn generate(
         } else {
             "Conventional"
         },
+        rings: vec![],
     };
     let mut position = [area.min[0], area.min[1], clearance];
     let mut done = 0;
@@ -716,7 +749,8 @@ impl Simulation {
             }
             let from = movement.at(self.seconds.max(movement.start));
             let to = movement.at(seconds.min(movement.end));
-            if movement.motion == Motion::Feed {
+            // A lathe plan cuts with its rings, below, not along its moves.
+            if movement.motion == Motion::Feed && !self.plan.is_lathe() {
                 self.stock
                     .cut_shape(from, to, self.plan.radius, self.plan.shape);
                 if let (Some(volume), Some(frame)) = (&mut self.volume, self.frame) {
@@ -734,6 +768,18 @@ impl Simulation {
             self.position = to;
             if movement.end > seconds {
                 break;
+            }
+            if let (Some(volume), Some(frame)) = (&mut self.volume, self.frame) {
+                for ring in self.plan.rings.iter().filter(|r| r.at == self.current) {
+                    volume.revolve(
+                        ring.z[0],
+                        ring.z[1],
+                        ring.r[0],
+                        ring.r[1],
+                        frame,
+                        self.source,
+                    );
+                }
             }
             self.current += 1;
         }
@@ -827,7 +873,7 @@ pub fn sequence_walk(
             setup.preview_stock = starts;
         } else if blocked.is_none() {
             match stock::resolve(&setup, Some(mesh)) {
-                Ok(s) => volume = Some(Volume::new(s.stock, frame)),
+                Ok(s) => volume = Some(Volume::stock(s.stock, frame, stock::is_round(&setup))),
                 Err(error) => blocked = Some(format!("{}: {error}", setup.name())),
             }
         }
@@ -853,7 +899,7 @@ pub fn sequence_walk(
                 .filter(|v| !v.cuts.is_empty())
                 .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, frame)));
             let mut issues = setup.issues();
-            issues.extend(op.issues(&setup.machine, &doc.tools, &setup.operations[..oi]));
+            issues.extend(setup.operation_issues(oi, &doc.tools));
             let plan = if let Some(issue) = issues.first() {
                 Err(issue.clone())
             } else {

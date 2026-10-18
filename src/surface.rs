@@ -146,8 +146,13 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     if !operation.strategy.imported_preview() {
         return vec![operation.strategy.availability().into()];
     }
-    // A Box is a block of numbers: it selects no surfaces.
-    if operation.strategy == crate::model::Strategy::Box {
+    // A Box and a Turn are numbers, and a lathe Drill is on the centre: they
+    // select no surfaces.
+    if matches!(
+        operation.strategy,
+        crate::model::Strategy::Box | crate::model::Strategy::Turn
+    ) || operation.on_centre(&setup.machine)
+    {
         return vec![];
     }
     let Some(mesh) = mesh else {
@@ -189,11 +194,14 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         }
         heights.push(rotation(surface.center, angles)[2]);
     }
-    // A Pocket clears each selected floor to its own height.
-    if operation.strategy != crate::model::Strategy::Pocket
-        && heights.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-            - heights.iter().copied().fold(f32::INFINITY, f32::min)
-            > 0.001 * mesh.display_scale()
+    // A Pocket or Adaptive clearing clears each selected floor to its own
+    // height.
+    if !matches!(
+        operation.strategy,
+        crate::model::Strategy::Pocket | crate::model::Strategy::Adaptive
+    ) && heights.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        - heights.iter().copied().fold(f32::INFINITY, f32::min)
+        > 0.001 * mesh.display_scale()
     {
         result.push(
             "Selected surfaces are at different heights. Use a separate operation for each plane."
