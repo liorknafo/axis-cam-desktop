@@ -48,7 +48,7 @@ fn mm(v: f32) -> String {
 /// The tool of operation `oi` of `setup`, whose plan is `plan`, in the
 /// spindle of `unit` (LIO-204); and what of it is assumed, as a sentence
 /// ending a message ("" when nothing is).
-fn in_spindle(
+pub(crate) fn in_spindle(
     doc: &Document,
     setup: &Setup,
     oi: usize,
@@ -1290,6 +1290,52 @@ mod tests {
             said.iter().any(|s| s.starts_with("Flats, Contour: the index move from A 0° to A 90° brings the tool within the 2 mm gap of the chuck jaw")),
             "{said:?}"
         );
+    }
+
+    #[test]
+    fn a_chuck_setup_at_a0_keeps_the_spindle_nose_off_the_jaws() {
+        // Setup 1 cuts the bar in the chuck at A0, with the contour's tool
+        // (50 mm out of a Ø32 holder, the holder 10 mm long, assumed): the
+        // Ø65 nose is 60 mm over the tip. A plunge to Z10 beside jaw 1's
+        // front (it stands up to Z75 at A0) brings the nose, not the tool
+        // or the holder, within the 2 mm gap of it.
+        let (mut doc, mesh, _) = job("-150", "90");
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.setups[0].operations = doc.setups[1].operations.clone();
+        let sim = prepare(&doc, &mesh, 0, 0).unwrap();
+        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+        let jaw = rig
+            .boxes(0.)
+            .into_iter()
+            .find(|b| b.label == "chuck jaw 1")
+            .unwrap();
+        assert!((jaw.bounds.max[2] - 75.).abs() < 0.1, "{:?}", jaw.bounds);
+        let front = jaw.bounds.max[0];
+        // The gap and the machine's 0.01 mm blend.
+        for (x, hit) in [(front + 32.5 + 2.02, false), (front + 32.5 + 2., true)] {
+            let (high, low) = ([x, 0., 150.], [x, 0., 10.]);
+            let said: Vec<String> = crate::post::held(
+                &doc,
+                &mesh,
+                0,
+                &[(0, Ok(with(&sim, &[(high, low, Motion::Feed, 0.)])))],
+            )
+            .into_iter()
+            .map(|h| h.message)
+            .collect();
+            assert!(
+                !said
+                    .iter()
+                    .any(|s| s.contains("the tool hits") || s.contains("the holder hits")),
+                "{said:?}"
+            );
+            let nose = said.iter().any(|s| {
+                s.starts_with("Contour: the spindle nose hits the chuck jaw 1 at ")
+                    && s.ends_with("(within the 2 mm gap). Assumed: the holder's 10 mm length (the tool gives none: enter it in the Tool library).")
+            });
+            assert_eq!(nose, hit, "{said:?}");
+        }
     }
 
     #[test]

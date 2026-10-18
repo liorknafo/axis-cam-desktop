@@ -338,7 +338,9 @@ const HOME_CLEARANCE: f32 = 10_000.;
 /// program's first rapid starts wherever the tool was, so the plane itself
 /// has to be above the highest box and its gap: one more problem, for the
 /// program. Messages are in work coordinates (`datum`), each with the index in
-/// `ops` of the operation it is about (None for the plane's).
+/// `ops` of the operation it is about (None for the plane's). The tests'
+/// way in; the walk of a setup takes its tools' parts (`holding_problems_of`).
+#[cfg(test)]
 pub fn holding_problems(
     ops: &[OpState],
     plans: &[&Plan],
@@ -348,6 +350,29 @@ pub fn holding_problems(
     gap: f32,
     datum: [f32; 3],
 ) -> Vec<(Option<usize>, String)> {
+    let tools: Vec<_> = plans
+        .iter()
+        .map(|p| {
+            let parts = crate::holding::parts(p.radius, p.tool_length, p.holder_radius);
+            (parts.to_vec(), String::new())
+        })
+        .collect();
+    holding_problems_of(ops, plans, blocks, settings, boxes, (gap, datum), &tools)
+}
+/// `holding_problems` with each operation's tool made of its own parts and
+/// a sentence ending the message of a hit by any part but the cutter (what
+/// of it is assumed): a chuck's setup takes the spindle nose over the holder
+/// (`rotary_check::in_spindle`, LIO-204). `place` is the gap and the datum.
+pub fn holding_problems_of(
+    ops: &[OpState],
+    plans: &[&Plan],
+    blocks: &[Block],
+    settings: &PostSettings,
+    boxes: &[HoldBox],
+    place: (f32, [f32; 3]),
+    tools: &[(Vec<crate::holding::Part>, String)],
+) -> Vec<(Option<usize>, String)> {
+    let (gap, datum) = place;
     // The highest box, the first of equals.
     let Some(highest) = boxes.iter().fold(None::<&HoldBox>, |best, b| {
         best.filter(|x| x.bounds.max[2] >= b.bounds.max[2])
@@ -418,17 +443,13 @@ pub fn holding_problems(
         }
     }
     for (k, path) in segments.iter().enumerate() {
-        let plan = plans[k];
-        let hits = crate::holding::hits_segments(
-            path,
-            plan.radius,
-            plan.tool_length,
-            plan.holder_radius,
-            boxes,
-            reach,
-        );
+        let (parts, assumed) = &tools[k];
+        let hits = crate::holding::hits_parts(path, parts, boxes, reach);
         for hit in hits {
-            let message = crate::holding::message(&ops[k].name, &hit, gap, datum);
+            let mut message = crate::holding::message(&ops[k].name, &hit, gap, datum);
+            if hit.part != "tool" {
+                message.push_str(assumed);
+            }
             problems.add_about(Some(k), hit.part, &hit.label, message);
         }
     }

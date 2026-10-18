@@ -2215,6 +2215,10 @@ struct Walk<'a> {
     /// The runs of `ops` that make one program each: touch-off mode splits
     /// the setup at every change of tool.
     groups: Vec<std::ops::Range<usize>>,
+    /// Each of `ops`' tool as the workholding check takes it, and what of
+    /// it is assumed (`post_check::holding_problems_of`): in a chuck, with
+    /// the spindle nose over its holder (LIO-204).
+    tools: Vec<(Vec<crate::holding::Part>, String)>,
 }
 /// How a setup's machine turns into post settings: `PostSettings::from_machine`
 /// for G-code export, `PostSettings::for_uc100` for a UC100 run.
@@ -2282,14 +2286,33 @@ fn walk<'a>(
             _ => groups.push(k..k + 1),
         }
     }
+    let indexes: Vec<usize> = sims.iter().map(|(oi, _)| *oi).collect();
+    let unit = doc.rotary_unit(&setup.machine);
+    let tools = (simulations.iter().zip(&indexes))
+        .map(|(sim, &oi)| {
+            let p = &sim.plan;
+            match crate::chuck::holds(setup) {
+                true => {
+                    use crate::chuck::ToolParts;
+                    let (tool, assumed) = crate::rotary_check::in_spindle(doc, setup, oi, p, unit);
+                    (tool.parts(), assumed)
+                }
+                false => {
+                    let parts = crate::holding::parts(p.radius, p.tool_length, p.holder_radius);
+                    (parts.to_vec(), String::new())
+                }
+            }
+        })
+        .collect();
     Ok(Walk {
         settings,
         zero,
         stock,
         ops,
         simulations,
-        indexes: sims.iter().map(|(oi, _)| *oi).collect(),
+        indexes,
         groups,
+        tools,
     })
 }
 /// A workholding problem of one setup's programs: the operation it is about,
@@ -2515,14 +2538,14 @@ impl Walk<'_> {
         boxes: &[crate::holding::HoldBox],
     ) -> Vec<Held> {
         let gap = crate::holding::gap(setup).unwrap_or_default();
-        crate::post_check::holding_problems(
+        crate::post_check::holding_problems_of(
             &self.ops[group.clone()],
             &self.plans(group),
             blocks,
             &self.settings,
             boxes,
-            gap,
-            self.zero,
+            (gap, self.zero),
+            &self.tools[group.clone()],
         )
         .into_iter()
         .map(|(k, message)| Held {
