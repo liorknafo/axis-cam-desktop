@@ -461,9 +461,6 @@ impl Document {
         }
     }
 }
-/// Why an indexed setup has no program yet.
-pub const NOT_POSTED: &str =
-    "it indexes A, which programs do not command yet, so it is not exported or run.";
 /// Why a setup cannot be indexed on its machine.
 pub const NO_A: &str = "Index rotary axis turns the stock about A: the setup's machine has no rotary A axis around X. Choose one, or Reclamp and probe origin.";
 /// What is wrong with `setup`'s A angles on its machine, when it is indexed.
@@ -1592,6 +1589,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_indexed_setup_exports_g0_a_alone_after_each_retract_and_replays() {
+        // The part 20 mm along the bar and 100 mm of it out of the jaws:
+        // the holder stays clear of them round the part at each angle.
+        let mesh = prism(30.);
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180", contour(&cutter("12")));
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+        });
+        let posted = crate::post::post_job(&doc, &mesh);
+        // `post_job` writes a program only once its replay matches the
+        // simulated moves, A included.
+        let programs = posted.setups[1].result.as_ref().unwrap();
+        let text = &programs[0].text;
+        assert!(text.starts_with("(AXIS CAM Studio - LinuxCNC 4-axis indexed program)\n"));
+        assert!(
+            text.contains("The A centreline is at machine Y140 Z-150 mm, assumed, not measured"),
+            "{text}"
+        );
+        let code: Vec<&str> = text.lines().filter(|l| !l.starts_with('(')).collect();
+        // A90 after the tool change's retract, A180 at the index move's
+        // height, A0 after the last retract; no other line has an A word.
+        let turns: Vec<usize> = (0..code.len()).filter(|&i| code[i].contains('A')).collect();
+        assert_eq!(turns.len(), 3, "{code:?}");
+        assert_eq!(code[turns[0]], "G0 A90.000");
+        assert_eq!(code[turns[0] - 1], "G53 G0 Z0");
+        assert_eq!(code[turns[1]], "G0 A180.000");
+        assert_eq!(code[turns[2] - 1..], ["G53 G0 Z0", "G0 A0.000", "M2"]);
+        // The tool is above all that A swings when A turns: the jaws'
+        // reach from the axis and 15 mm clearance.
+        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        let z = |line: &str| -> f32 {
+            let w = line.split(' ').find(|w| w.starts_with('Z')).unwrap();
+            w[1..].parse().unwrap()
+        };
+        let before = code[..turns[1]]
+            .iter()
+            .rev()
+            .find(|l| l.contains('Z'))
+            .unwrap();
+        // Work Z0 is on the centreline.
+        let axis = doc.setups[1].turn.unwrap().axis;
+        assert!(
+            (z(before) - (swing.z - axis[1])).abs() < 1e-3,
+            "{before} {swing:?}"
+        );
+        // The checks see the chuck's jaws at each angle: nothing says the
+        // holding was not checked.
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim))]);
+        assert!(held.is_empty(), "{held:?}");
+    }
+
+    #[test]
     fn a_disabled_indexed_operation_at_an_angle_stays_where_it_is() {
         use crate::model::{Operation, Strategy};
         let (mut doc, _) = job("90");
@@ -1610,5 +1664,102 @@ pub(crate) mod tests {
             (Strategy::Indexed, Strategy::Contour)
         );
         assert!(notes[0].ends_with(LEGACY), "{notes:?}");
+    }
+
+    /// `bar_job` with a numbered tool and a part file, so it posts.
+    fn posting_bar_job(x0: f32, stickout: &str, angles: &str) -> (Document, Mesh) {
+        let mesh = prism(30.);
+        let mut doc = bar_job(&mesh, x0, stickout, "-150", angles, contour(&cutter("12")));
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+        });
+        (doc, mesh)
+    }
+    #[test]
+    fn a_turn_of_a_below_the_swing_height_is_refused() {
+        use crate::model::POST_RETRACT;
+        // Setup 3 indexes to A90 as setup 2 left it: its plan has no index
+        // move, so the program turns A to A90 where its retract leaves the
+        // tool, since the A the machine is at when it starts is not known.
+        let (mut doc, mesh) = posting_bar_job(20., "100", "90");
+        let mut third = doc.setups[1].clone();
+        third.id = crate::model::id();
+        doc.setups.push(third);
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        // Setup 3 starts at the angle setup 2 left, so its kernel's own
+        // approach, over the stock's corner in the chuck body, is refused
+        // too. At machine Z home, above everything, its turn is not.
+        let turn = "A turns to A 90° with the tool tip at Z";
+        let posted = crate::post::post_job(&doc, &mesh);
+        assert!(
+            posted.setups[1].result.is_ok(),
+            "{:?}",
+            posted.setups[1].result
+        );
+        let home = posted.setups[2].result.as_ref().unwrap_err();
+        assert!(home.iter().all(|e| !e.contains(turn)), "{home:?}");
+        // At the clearance plane, below the jaws' swing, the turn is
+        // refused; setup 2's turns are at its index move's height and pass.
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_retract".into(), POST_RETRACT[1].into());
+        doc.sync_indexed();
+        let posted = crate::post::post_job(&doc, &mesh);
+        assert!(
+            posted.setups[1].result.is_ok(),
+            "{:?}",
+            posted.setups[1].result
+        );
+        let refused = posted.setups[2].result.as_ref().unwrap_err();
+        assert!(
+            refused.iter().any(|e| e.contains(turn)
+                && e.contains("below Z70.902 where nothing A swings reaches it")),
+            "{refused:?}"
+        );
+    }
+    #[test]
+    fn each_angles_cuts_are_checked_against_the_jaws_at_that_angle() {
+        // The part 20 mm from the jaws: round it the holder comes within
+        // their gap at the angles it is cut at.
+        let (doc, mesh) = posting_bar_job(0., "80", "90, 180");
+        let posted = crate::post::post_job(&doc, &mesh);
+        let refused = posted.setups[1].result.as_ref().unwrap_err();
+        assert!(
+            refused
+                .iter()
+                .any(|e| e.contains("the holder hits the chuck jaw")),
+            "{refused:?}"
+        );
+        // The workholding check says the same.
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim))]);
+        assert!(
+            held.iter().any(|h| h.message.contains("chuck jaw")),
+            "{held:?}"
+        );
+    }
+    #[test]
+    fn an_indexed_setup_that_the_rotary_checks_refuse_is_not_exported() {
+        // Exported as it is; with 150 mm of Y travel the bar, on the A
+        // centreline at machine Y140, is cut beyond it at Y156: only the
+        // rotary checks, which put each move on the machine, see that.
+        let (mut doc, mesh) = posting_bar_job(20., "100", "90, 180");
+        assert!(crate::post::post_job(&doc, &mesh).setups[1].result.is_ok());
+        doc.setups[0].machine.p.insert("y".into(), "150".into());
+        doc.sync_indexed();
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let found = crate::rotary_check::problems(&doc, &mesh, 1, &[(0, Ok(sim))]);
+        assert!(!found.is_empty());
+        let posted = crate::post::post_job(&doc, &mesh);
+        let refused = posted.setups[1].result.as_ref().unwrap_err();
+        for (_, message) in &found {
+            assert!(refused.contains(message), "{message} not in {refused:?}");
+        }
     }
 }

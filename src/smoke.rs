@@ -7184,7 +7184,7 @@ soft_max = 180.0
         assert_eq!(page.machine, NcMachine::LinuxCnc);
         assert_eq!(page.title, "NC review");
         assert_eq!(page.intro, "Check each setup, then export LinuxCNC G-code.");
-        assert!(page.note.starts_with("LinuxCNC 3-axis output"));
+        assert!(page.note.starts_with("LinuxCNC 3-axis or indexed A output"));
         assert!(page.ready && page.run_buttons().is_empty() && page.problems().is_empty());
         assert!(matches!(page.cards[0].1, NcCard::Programs(_)));
         let _ = b.view();
@@ -14838,9 +14838,9 @@ soft_max = 180.0
         // own checks covered the plan as applied, not later edits.
         assert_eq!(
             program_note(Held::No),
-            "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
+            "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. Fixtures, clamps and the machine body are not checked: preview each program in LinuxCNC and air-cut first."
         );
-        let base = "LinuxCNC 3-axis output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. ";
+        let base = "LinuxCNC 3-axis or indexed A output, one .ngc program per setup. Export repeats the export checks — limits, travel, rapids into material, holder clearance — and a replay of each program against the simulated moves, and writes nothing if any setup fails. The planner's tool-axis and gouge checks covered the plan as applied, not later edits. ";
         assert_eq!(
             program_note(Held::Every),
             format!(

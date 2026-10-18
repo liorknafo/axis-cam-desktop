@@ -676,7 +676,11 @@ impl Simulation {
     /// The frame move `m` cuts in: the one `turns` lists for its A angle,
     /// else `frame`.
     pub fn frame_of(&self, m: &Move) -> Option<crate::volume::Frame> {
-        m.a.and_then(|a| {
+        self.frame_at(m.a)
+    }
+    /// The frame a move at A `a` cuts in (`frame_of`).
+    pub fn frame_at(&self, a: Option<f32>) -> Option<crate::volume::Frame> {
+        a.and_then(|a| {
             self.turns
                 .iter()
                 .find(|(b, _)| (a - b).abs() < 1e-4)
