@@ -142,6 +142,13 @@ pub struct OpStock {
     pub op: usize,
     pub stock: StockGrid,
     pub shape: CutterShape,
+    /// The stock as the simulation holds it (`Simulation::initial_volume`),
+    /// its cutter's flute length, and the frame the part is posed in at each
+    /// A angle (`Simulation::turns`, empty for a 3-axis setup): an indexed
+    /// setup's live carve cuts this, at each move's angle.
+    pub volume: Option<crate::volume::Volume>,
+    pub flute: f32,
+    pub turns: Vec<(f32, crate::volume::Frame)>,
 }
 
 /// The stock a run's tool runs have cut, as the machine's tool moved: each
@@ -150,6 +157,11 @@ pub struct OpStock {
 #[derive(Debug, Clone)]
 pub struct Carving {
     pub stock: StockGrid,
+    /// For a tool run that turns A, the stock as a volume, cut at each
+    /// move's A in the frame the part is posed in there; the top-view
+    /// `stock` is then not cut, being the first angle's.
+    pub volume: Option<crate::volume::Volume>,
+    turns: Vec<(f32, crate::volume::Frame)>,
     /// The block of the running blocks at the last sample: None between
     /// tool runs, so that a jog then does not cut.
     last: Option<usize>,
@@ -253,21 +265,21 @@ impl Run {
         if self.carving.is_some() {
             return true;
         }
-        // The stock seen from above is the first angle's: moves at others
-        // would carve it where they do not cut.
-        if self
-            .running_blocks()
-            .is_some_and(|b| !a_angles(b).is_empty())
-        {
-            return false;
-        }
         let first = (self.running.as_ref())
             .and_then(|r| self.checked()?.get(r.index)?.indexes.get(r.from).copied());
         let Some(b) = self.before.iter().find(|b| Some(b.op) == first) else {
             return false;
         };
+        // The stock seen from above is the first angle's: a tool run that
+        // turns A carves the volume instead, at each move's angle.
+        let turning = (self.running_blocks()).is_some_and(|b| !a_angles(b).is_empty());
+        if turning && (b.volume.is_none() || b.turns.is_empty()) {
+            return false;
+        }
         self.carving = Some(Carving {
             stock: b.stock.clone(),
+            volume: b.volume.clone().filter(|_| turning),
+            turns: b.turns.clone(),
             last: None,
             version: 0,
         });
@@ -298,12 +310,14 @@ impl Run {
             return;
         };
         let ends = |b: usize| match blocks.get(b) {
-            Some(Block::Move { op, from, to, .. }) => Some((*op, *from, *to)),
+            Some(Block::Move {
+                op, from, to, a, ..
+            }) => Some((*op, *from, *to, *a)),
             _ => None,
         };
         let now = to.map_or(blocks.len(), |(b, _)| b);
         let mut sweeps: Vec<_> = (from.unwrap_or(0)..now).filter_map(ends).collect();
-        if let (Some((_, tip)), Some((op, a, b))) = (to, ends(now)) {
+        if let (Some((_, tip)), Some((op, a, b, angle))) = (to, ends(now)) {
             // The tip's place on the move: the share of it done.
             let d: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
             let length = d.iter().map(|v| v * v).sum::<f32>();
@@ -312,21 +326,35 @@ impl Run {
             } else {
                 ((0..3).map(|k| (tip[k] - a[k]) * d[k]).sum::<f32>() / length).clamp(0., 1.)
             };
-            sweeps.push((op, a, std::array::from_fn(|k| a[k] + t * d[k])));
-            sweeps.push((op, tip, tip));
+            sweeps.push((op, a, std::array::from_fn(|k| a[k] + t * d[k]), angle));
+            sweeps.push((op, tip, tip, angle));
         }
         let cutter = |op: usize| {
-            let shape = (self.before.iter())
-                .find(|b| Some(b.op) == p.indexes.get(op).copied())
-                .map_or(CutterShape::Flat, |b| b.shape);
-            (p.ops.get(op).map_or(0., |o| o.diameter / 2.), shape)
+            let before = (self.before.iter()).find(|b| Some(b.op) == p.indexes.get(op).copied());
+            let radius = p.ops.get(op).map_or(0., |o| o.diameter / 2.);
+            let flute = before.map_or(0., |b| b.flute);
+            (radius, before.map_or(CutterShape::Flat, |b| b.shape), flute)
         };
+        let si = u16::try_from(self.setup).unwrap_or(u16::MAX);
         let sweeps: Vec<_> = (sweeps.into_iter())
-            .map(|(op, a, b)| (a, b, cutter(op)))
+            .map(|(op, a, b, angle)| {
+                let oi = p.indexes.get(op).copied().unwrap_or(op);
+                let source = (si, u16::try_from(oi).unwrap_or(u16::MAX));
+                (a, b, cutter(op), angle, source)
+            })
             .collect();
         if let Some(c) = &mut self.carving {
-            for (a, b, (radius, shape)) in sweeps {
-                c.stock.cut_shape(a, b, radius, shape);
+            for (a, b, (radius, shape, flute), angle, source) in sweeps {
+                match &mut c.volume {
+                    Some(volume) => {
+                        let frame = (c.turns.iter())
+                            .find(|t| angle.is_some_and(|x| (x - t.0).abs() < 1e-4))
+                            .map(|t| t.1);
+                        let Some(frame) = frame else { continue };
+                        volume.cut(a, b, radius, flute, shape, frame, source);
+                    }
+                    None => c.stock.cut_shape(a, b, radius, shape),
+                }
                 c.version += 1;
             }
         }
@@ -335,8 +363,14 @@ impl Run {
     /// The stock as this run's tool runs have cut it, once one has moved
     /// (`carve`), with its version.
     pub fn stock(&self) -> Option<(&StockGrid, u64)> {
-        let c = self.carving.as_ref()?;
+        let c = self.carving.as_ref().filter(|c| c.volume.is_none())?;
         Some((&c.stock, c.version))
+    }
+    /// The stock as this run's tool runs that turn A have cut it, as a
+    /// volume (`Carving::volume`), with its version.
+    pub fn carved_volume(&self) -> Option<(&crate::volume::Volume, u64)> {
+        let c = self.carving.as_ref()?;
+        Some((c.volume.as_ref()?, c.version))
     }
 
     /// A tool run has started: X/Y work zero is kept from then on.
@@ -1125,6 +1159,9 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
                 op: *oi,
                 stock,
                 shape: sim.plan.shape,
+                volume: sim.initial_volume.clone(),
+                flute: sim.plan.flute_length,
+                turns: sim.turns.clone(),
             })
         })
         .collect();

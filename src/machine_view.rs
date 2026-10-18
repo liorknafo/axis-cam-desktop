@@ -38,6 +38,12 @@ pub struct MachineView {
     pub block: Option<[[f32; 3]; 2]>,
     /// The active work zero (machine mm), marked once the position is set.
     pub zero: [f32; 3],
+    /// The rotary unit at its machine library position (`chuck::Rig::on_machine`),
+    /// on a machine with A and its geometry; it stands on the table, whose
+    /// top is then its centre height under the centreline.
+    pub rotary: Option<crate::chuck::Rig>,
+    /// The controller's A (degrees): the chuck and its jaws turn to it.
+    pub a: f32,
 }
 
 /// What a caption says, which sets its colour.
@@ -183,7 +189,16 @@ fn cylinder(
 }
 
 /// The machine with its tool tip at `pos` (machine X, Y, Z).
+#[cfg(test)]
 fn faces(pos: [f32; 3], known: bool) -> Vec<Face> {
+    machine(pos, known, None, 0.)
+}
+
+/// The machine with its tool tip at `pos`, and the rotary unit `rotary`
+/// with its chuck at A `a` (degrees). With the unit the table's top is the
+/// unit's (its centre height under the centreline) and the gantry's beam
+/// clears its chuck.
+fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f32) -> Vec<Face> {
     let rgb = |r, g, b| Color::from_rgb8(r, g, b);
     // The moving parts turn amber until the machine position is set.
     let moving = |c: Color| {
@@ -198,14 +213,17 @@ fn faces(pos: [f32; 3], known: bool) -> Vec<Face> {
         }
     };
     let [x, y, z] = pos;
-    let table_top = -TIP_HEIGHT;
+    let table_top = rotary.map_or(-TIP_HEIGHT, |r| r.table);
+    let clearance = rotary.map_or(BEAM_CLEARANCE, |r| {
+        BEAM_CLEARANCE.max(r.unit.centre_height + r.unit.chuck_diameter / 2. + 10.)
+    });
     let tx = [(TRAVEL[0] - TABLE[0]) / 2., (TRAVEL[0] + TABLE[0]) / 2.];
     let ty = [(TRAVEL[1] - TABLE[1]) / 2., (TRAVEL[1] + TABLE[1]) / 2.];
     let r = SPINDLE[0] / 2.;
     let nose = z + TOOL[1] + 14.;
     // The gantry: spindle in front (toward the operator, −Y), then the Z
     // plate, the X carriage and the beam behind it.
-    let beam = [table_top + BEAM_CLEARANCE, table_top + BEAM_CLEARANCE + 80.];
+    let beam = [table_top + clearance, table_top + clearance + 80.];
     let beam_y = [y + r + 30., y + r + 90.];
     let side = [tx[0] - 40., tx[1] + 40.];
     // The base and rails reach behind the beam at the back of Y.
@@ -319,7 +337,68 @@ fn faces(pos: [f32; 3], known: bool) -> Vec<Face> {
         moving(rgb(226, 178, 72)),
         "tool",
     );
+    if let Some(rig) = rotary {
+        rotary_faces(&mut f, rig, a);
+    }
     f
+}
+
+/// The rotary unit's solids at A `a` (`chuck::Rig::solids`): the chuck
+/// and its jaws turn with A, the head and the tailstock stand still.
+fn rotary_faces(f: &mut Vec<Face>, rig: &crate::chuck::Rig, a: f32) {
+    let rgb = |r, g, b| Color::from_rgb8(r, g, b);
+    for (label, prism, _) in rig.solids(a) {
+        let (part, color) = match label.as_str() {
+            "chuck body" => ("chuck", rgb(176, 182, 190)),
+            l if l.starts_with("chuck jaw") => ("jaw", rgb(92, 100, 110)),
+            "rotary head" => ("rotary head", rgb(64, 110, 160)),
+            _ => ("tailstock", rgb(120, 132, 146)),
+        };
+        let [a, b] = &prism.ends;
+        let n = a.len();
+        let all = a.iter().chain(b);
+        let centre = all.clone().fold([0.; 3], |c, p| {
+            std::array::from_fn(|k| c[k] + p[k] / (2 * n) as f32)
+        });
+        // Each face's normal, turned away from the solid's middle.
+        let mut push = |pts: Vec<[f32; 3]>| {
+            let (u, v) = (sub(pts[1], pts[0]), sub(pts[pts.len() - 1], pts[0]));
+            let mut normal = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let length = dot(normal, normal).sqrt();
+            if length < 1e-9 {
+                return;
+            }
+            let mid: [f32; 3] =
+                std::array::from_fn(|k| pts.iter().map(|p| p[k]).sum::<f32>() / pts.len() as f32);
+            let out = if dot(normal, sub(mid, centre)) < 0. {
+                -1.
+            } else {
+                1.
+            };
+            normal = normal.map(|v| v * out / length);
+            f.push(Face {
+                pts,
+                normal,
+                color,
+                layer: 2,
+                part,
+            });
+        };
+        for i in 0..n {
+            let j = (i + 1) % n;
+            push(vec![a[i], a[j], b[j], b[i]]);
+        }
+        push(a.clone());
+        push(b.clone());
+    }
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -447,8 +526,9 @@ impl canvas::Program<Message> for MachineView {
         let view = View::new(state.yaw, state.pitch);
         // Fit a fixed box round the whole machine, so the scale holds still
         // while it moves.
+        let table_top = self.rotary.as_ref().map_or(-TIP_HEIGHT, |r| r.table);
         let (lo, hi) = (
-            [-120., -60., -TIP_HEIGHT - 80.],
+            [-120., -60., table_top - 80.],
             [TRAVEL[0] + 120., TRAVEL[1] + 160., 260.],
         );
         let corners: Vec<[f32; 2]> = (0..8)
@@ -469,7 +549,7 @@ impl canvas::Program<Message> for MachineView {
             (bounds.height - size.height * scale) / 2. - min(1) * scale,
         );
         let screen = |p: [f32; 2]| Point::new(origin.x + p[0] * scale, origin.y + p[1] * scale);
-        let mut f = faces(self.pos, self.known);
+        let mut f = machine(self.pos, self.known, self.rotary.as_ref(), self.a);
         if let Some([lo, hi]) = self.block {
             boxed(&mut f, lo, hi, Color::from_rgb8(214, 184, 132), 2, "stock");
         }
@@ -566,7 +646,13 @@ impl canvas::Program<Message> for MachineView {
             });
         }
         frame.fill_text(canvas::Text {
-            content: "CNC4030, assumed dimensions · drag to turn".into(),
+            content: match &self.rotary {
+                Some(_) => format!(
+                    "CNC4030, assumed dimensions · rotary unit as the machine library places it, A {}° · drag to turn",
+                    crate::indexed::degrees(self.a)
+                ),
+                None => "CNC4030, assumed dimensions · drag to turn".into(),
+            },
             position: Point::new(10., bounds.height - 20.),
             color: Color::from_rgb8(110, 128, 145),
             size: 11.into(),
@@ -616,6 +702,54 @@ mod tests {
         let colour = |f: &[Face], name: &str| f.iter().find(|f| f.part == name).unwrap().color;
         assert_ne!(colour(&unset, "spindle"), colour(&home, "spindle"));
         assert_eq!(colour(&unset, "table"), colour(&home, "table"));
+    }
+
+    #[test]
+    fn the_rotary_unit_stands_where_the_library_puts_it_and_its_chuck_turns_with_a() {
+        let mut m = crate::model::Machine::new(4);
+        m.fill_rotary_defaults();
+        let unit = m.rotary_unit().unwrap();
+        let rig = crate::chuck::Rig::on_machine(unit, 1.);
+        let at = |a: f32| machine([100., 50., 0.], true, Some(&rig), a);
+        let zero = at(0.);
+        let highest =
+            |f: &[Face], name: &str, k: usize| part(f, name).map(|p| p[k]).fold(f32::MIN, f32::max);
+        // The chuck's face at the chuck X, round the centreline at its Y
+        // and Z; the table's top its centre height under it.
+        let r = unit.chuck_diameter / 2.;
+        assert!((highest(&zero, "chuck", 0) - unit.chuck_x).abs() < 1e-3);
+        assert!((highest(&zero, "chuck", 2) - (unit.centre_z + r)).abs() < 3.);
+        assert!((lowest(&zero, "chuck", 1) - (unit.centre_y - r)).abs() < 3.);
+        let table = unit.centre_z - unit.centre_height;
+        assert_eq!(highest(&zero, "table", 2), table);
+        assert_eq!(lowest(&zero, "rotary head", 2), table);
+        // The jaws stand out of the chuck's face and turn with A about the
+        // centreline, +Y up to +Z for positive A.
+        assert!(lowest(&zero, "jaw", 0) >= unit.chuck_x - 1e-3);
+        let quarter = at(90.);
+        let jaws = |f: &[Face]| part(f, "jaw").collect::<Vec<_>>();
+        let axis = [unit.centre_y, unit.centre_z];
+        assert!(!jaws(&zero).is_empty());
+        for (p, q) in jaws(&zero).into_iter().zip(jaws(&quarter)) {
+            let want = crate::indexed::turn_point(p, axis, 90.);
+            assert!(
+                (0..3).all(|k| (want[k] - q[k]).abs() < 1e-3),
+                "{want:?} {q:?}"
+            );
+        }
+        // The head and the tailstock stand still; the tool stays above the
+        // table and the beam above the chuck.
+        let solid = |f: &[Face], name: &str| part(f, name).collect::<Vec<_>>();
+        for name in ["rotary head", "tailstock"] {
+            assert!(!solid(&zero, name).is_empty());
+            assert_eq!(solid(&zero, name), solid(&quarter, name));
+        }
+        assert!(lowest(&at(0.), "tool", 2) > table);
+        assert!(lowest(&zero, "beam", 2) > unit.centre_z + r);
+        // Without a rotary unit the machine is the one it was.
+        let plain = faces([100., 50., 0.], true);
+        assert!(part(&plain, "jaw").next().is_none());
+        assert_eq!(highest(&plain, "table", 2), -TIP_HEIGHT);
     }
 
     #[test]

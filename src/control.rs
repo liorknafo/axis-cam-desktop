@@ -4896,7 +4896,7 @@ spindle_max_rpm = 24000
             )
             .is_err()
         );
-        let (programs, _) = crate::run::check(&doc, &mesh, 1);
+        let (programs, left) = crate::run::check(&doc, &mesh, 1);
         let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(programs.len(), 1);
         // The work zero on the measured centreline, A0 at machine A0.
@@ -4916,7 +4916,10 @@ spindle_max_rpm = 24000
         }
         set(&mut c, 3, 0.);
         let mut run = crate::run::Run::new(&doc, 1, 0);
-        run.checked_as(std::sync::Arc::new(Ok(programs)), None);
+        run.checked_as(
+            std::sync::Arc::new(Ok(programs)),
+            Some(std::sync::Arc::new(left)),
+        );
         c.run = Some(run);
         let problems =
             |c: &Connection, doc: &crate::model::Document| c.run.as_ref().unwrap().problems(c, doc);
@@ -5078,6 +5081,19 @@ spindle_max_rpm = 24000
             "{:?}",
             c.snapshot.machine_pos
         );
+        // The live carve followed A (LIO-190): the volume it cut at each
+        // angle leaves the square on the bar's axis, the bar round it gone.
+        let (carved, _) = run.carved_volume().expect("a live carve of the volume");
+        assert!(run.stock().is_none(), "the top view is not carved");
+        let base = crate::volume::Frame::new(&doc.setups[0], &mesh);
+        let c0 = 4. / mesh.display_scale() + mesh.dimensions[2] / 2.;
+        let filled = |dy: f32, dz: f32| carved.filled(base.map([0., dy, c0 + dz]), base);
+        for (dy, dz) in [(7., 0.), (-7., 0.), (0., 7.), (0., -7.), (6., -6.)] {
+            assert!(filled(dy, dz), "inside the square at {dy} {dz}");
+        }
+        for (dy, dz) in [(14., 0.), (-14., 0.), (0., 14.), (0., -14.)] {
+            assert!(!filled(dy, dz), "outside the square at {dy} {dz}");
+        }
     }
 
     #[test]

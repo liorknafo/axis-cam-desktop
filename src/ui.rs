@@ -1842,7 +1842,9 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         holding: holding_boxes(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
+        a: app.live_a(),
         live_stock: app.live_stock(),
+        live_volume: app.live_volume(),
         uncut: job_uncut(app)
             .and_then(|found| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
@@ -4002,8 +4004,14 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
             .active_simulation()
             .map(|sim| sim.plan.stock)
             .or_else(|| app.known_stock(app.doc.index()).0)?;
+        // An indexed setup's chuck and jaws turn to the A shown.
+        let mut posed = setup.clone();
+        if let (Some(t), Some(a)) = (setup.turn, app.shown_a()) {
+            let turn = crate::indexed::sign(&setup.machine) * a;
+            posed.turn = Some(crate::indexed::Turn { a, turn, ..t });
+        }
         let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps" | "Chuck") {
-            let jaws = app.doc.holding_boxes(setup, held_of(app, stock));
+            let jaws = app.doc.holding_boxes(&posed, held_of(app, stock));
             crate::holding::shown(&jaws.unwrap_or_default(), stock)
         } else {
             vec![]
@@ -5254,6 +5262,13 @@ fn control(app: &App) -> Element<'_, Message> {
             .block
             .map(|(lo, hi)| [lo.map(|v| v as f32), hi.map(|v| v as f32)]),
         zero: std::array::from_fn(|k| s.work_offset[k] as f32),
+        rotary: c.rotary.as_ref().filter(|_| c.axis(3)).map(|r| {
+            let sign = (app.doc.machines.iter())
+                .find(|m| m.id == c.machine_id)
+                .map_or(1., crate::indexed::sign);
+            crate::chuck::Rig::on_machine(r.unit, sign)
+        }),
+        a: s.machine_pos[3] as f32,
     };
     let position = machine_panel(
         "Position",
@@ -8147,7 +8162,9 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         }

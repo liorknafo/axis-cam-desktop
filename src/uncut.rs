@@ -298,10 +298,13 @@ impl<'a> Cuts<'a> {
         Self { stock, buckets }
     }
     /// Whether stock is left at `p` (the stock's frame): inside the block it
-    /// started as, and swept by none of its cuts.
+    /// started as (the round bar, when it is one), and swept by none of its
+    /// cuts.
     fn left(&self, p: [f32; 3]) -> bool {
         let b = self.stock.bounds;
-        if (0..3).any(|k| p[k] < b.min[k] || p[k] > b.max[k]) {
+        if (0..3).any(|k| p[k] < b.min[k] || p[k] > b.max[k])
+            || self.stock.round.is_some_and(|bar| !bar.contains(p))
+        {
             return false;
         }
         let cell: [usize; 3] = std::array::from_fn(|k| {
@@ -321,6 +324,27 @@ impl<'a> Cuts<'a> {
 #[cfg(test)]
 mod tests {
     use crate::post::fixture;
+    #[test]
+    fn a_round_bars_box_corners_are_no_stock() {
+        let bounds = crate::mesh::Bounds {
+            min: [0., -20., 0.],
+            max: [100., 20., 40.],
+        };
+        let mesh = crate::mesh::sample();
+        let setup = crate::model::Document::sample().setups[0].clone();
+        let frame = super::Frame::new(&setup, &mesh);
+        let bar = crate::stock::Round {
+            axis: [0., 20.],
+            radius: 20.,
+        };
+        let stock = super::Volume::new(bounds, frame).rounded(Some(bar));
+        let cuts = super::Cuts::new(&stock);
+        assert!(cuts.left([50., 0., 20.]));
+        assert!(cuts.left([50., 13., 34.]));
+        // In the box round the bar, outside the bar: never material.
+        assert!(!cuts.left([50., 18., 38.]));
+        assert!(!cuts.left([50., -19., 1.]));
+    }
     /// The faces of `mesh` that lie on a side of its box in setup 1: the
     /// side across `axis` (2 for Z) at its high end for a positive `sign`.
     fn outer(
