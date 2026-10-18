@@ -230,8 +230,11 @@ const HANDED_OVER: [&str; 17] = [
 /// LIO-186). Machine files saved before these fields existed lack the keys
 /// and still load: the geometry is then not recorded (`Machine::rotary_unit`
 /// is None) and is not checked, until the machine is edited (which fills
-/// these defaults in, `Machine::fill_rotary_defaults`).
-pub const ROTARY_GEOMETRY: [(&str, &str, &str); 15] = [
+/// these defaults in, `Machine::fill_rotary_defaults`). The spindle nose's
+/// two (LIO-204), last, are ASSUMED for the CNC4030's 800 W spindle, a Ø65
+/// mm body; a file without them takes these defaults (`NOSE_DEFAULT`) and
+/// the rotary checks say so.
+pub const ROTARY_GEOMETRY: [(&str, &str, &str); 17] = [
     ("a_centre_y", "A centreline in machine Y · mm", "140"),
     ("a_centre_z", "A centreline in machine Z · mm", "-40"),
     ("a_chuck_x", "Chuck face in machine X · mm", "20"),
@@ -259,7 +262,16 @@ pub const ROTARY_GEOMETRY: [(&str, &str, &str); 15] = [
         "Longest part between chuck and tailstock · mm",
         "250",
     ),
+    ("a_nose_diameter", "Spindle nose diameter · mm", "65"),
+    (
+        "a_nose_length",
+        "Spindle body length above its nose · mm",
+        "185",
+    ),
 ];
+/// The spindle nose's diameter and its body's length (mm) a machine file
+/// without them is taken to have: the assumed 800 W spindle's (LIO-204).
+pub const NOSE_DEFAULT: [f32; 2] = [65., 185.];
 
 /// The rotary unit's geometry, mm, as `Machine::rotary_unit` reads it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -279,6 +291,13 @@ pub struct RotaryUnit {
     pub tail_x: f32,
     pub fit_diameter: f32,
     pub fit_length: f32,
+    /// The spindle nose: its diameter and how far its body reaches up
+    /// from it (LIO-204).
+    pub nose_diameter: f32,
+    pub nose_length: f32,
+    /// Whether the machine file gives no spindle nose, so `NOSE_DEFAULT`'s
+    /// is taken.
+    pub nose_assumed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +401,12 @@ impl Machine {
             return None;
         }
         let v = |i: usize| num(&self.p, ROTARY_GEOMETRY[i].0);
+        // A file saved before the spindle nose existed takes the default.
+        let given = |i: usize| !get(&self.p, ROTARY_GEOMETRY[i].0).trim().is_empty();
+        let nose = |i: usize| match given(i) {
+            true => v(i).filter(|n| *n > 0.),
+            false => Some(NOSE_DEFAULT[i - 15]),
+        };
         Some(RotaryUnit {
             centre_y: v(0)?,
             centre_z: v(1)?,
@@ -398,6 +423,9 @@ impl Machine {
             tail_x: v(12)?,
             fit_diameter: v(13)?,
             fit_length: v(14)?,
+            nose_diameter: nose(15)?,
+            nose_length: nose(16)?,
+            nose_assumed: !given(15) || !given(16),
         })
     }
     /// What is wrong with the rotary unit's geometry. Nothing is checked
@@ -420,6 +448,8 @@ impl Machine {
         for (k, _, _) in ROTARY_GEOMETRY {
             let ok = match k {
                 "a_centre_y" | "a_centre_z" | "a_chuck_x" | "a_tail_x" => num(p, k).is_some(),
+                // Empty takes the assumed spindle's (`NOSE_DEFAULT`).
+                "a_nose_diameter" | "a_nose_length" if get(p, k).trim().is_empty() => true,
                 "a_grip_min" => num(p, k).is_some_and(|n| n >= 0.),
                 _ => num(p, k).is_some_and(|n| n > 0.),
             };
@@ -564,6 +594,10 @@ impl Machine {
         }
     }
 }
+/// The holder length taken for a tool that gives none, mm (LIO-204):
+/// short, so the spindle nose is taken as low as it can plausibly be (an
+/// ER11 collet nut on the 800 W spindle stands about this far below it).
+pub const HOLDER_LENGTH: f32 = 10.;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub id: String,
@@ -601,10 +635,25 @@ impl Tool {
         if num(&self.p, "stickout") < num(&self.p, "length") {
             e.push("Stickout must be at least the flute length.".into())
         }
+        // Optional: empty takes `HOLDER_LENGTH`, assumed.
+        if !get(&self.p, "holder_length").trim().is_empty()
+            && !num(&self.p, "holder_length").is_some_and(|v| v >= 0.)
+        {
+            e.push("Holder length must be zero or more.".into())
+        }
         if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
         }
         e
+    }
+    /// How far the holder reaches up from where the tool comes out of it to
+    /// the spindle nose, mm, and whether it is assumed (`HOLDER_LENGTH`):
+    /// a tool saved before the field existed, or left empty (LIO-204).
+    pub fn holder_length(&self) -> (f32, bool) {
+        match num(&self.p, "holder_length").filter(|v| *v >= 0.) {
+            Some(v) => (v, false),
+            None => (HOLDER_LENGTH, true),
+        }
     }
     /// A chamfer mill's included tip angle in degrees (90 when not saved),
     /// None when it is outside 20–160°.
@@ -4277,6 +4326,62 @@ mod rotary_unit {
         let doc: Document =
             serde_json::from_str(&serde_json::to_string(&Document::default()).unwrap()).unwrap();
         assert!(doc.machines.is_empty());
+    }
+
+    #[test]
+    fn a_machine_file_saved_before_the_spindle_nose_existed_takes_the_assumed_one() {
+        // A file with the rotary unit of LIO-184 and no spindle nose.
+        let mut m = Machine::new(4);
+        m.p.remove("a_nose_diameter");
+        m.p.remove("a_nose_length");
+        let back: Machine = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let u = back.rotary_unit().unwrap();
+        assert_eq!(
+            (u.nose_diameter, u.nose_length, u.nose_assumed),
+            (65., 185., true)
+        );
+        assert_eq!(back.issues(), Vec::<String>::new());
+        // The rest of its geometry is as it was.
+        assert_eq!((u.chuck_diameter, u.centre_z), (100., -40.));
+        // Given, it is the machine's; editing fills in the assumed values.
+        let new = Machine::new(4).rotary_unit().unwrap();
+        assert_eq!(
+            (new.nose_diameter, new.nose_length, new.nose_assumed),
+            (65., 185., false)
+        );
+        let mut edited = back;
+        edited.p.insert("a_nose_diameter".into(), "52".into());
+        edited.fill_rotary_defaults();
+        let u = edited.rotary_unit().unwrap();
+        assert_eq!(
+            (u.nose_diameter, u.nose_length, u.nose_assumed),
+            (52., 185., false)
+        );
+        // One that is not a size is refused, and the geometry not taken.
+        edited.p.insert("a_nose_diameter".into(), "0".into());
+        assert_eq!(edited.rotary_unit(), None);
+        assert_eq!(
+            edited.issues(),
+            vec!["Spindle nose diameter must be greater than zero.".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tool_without_a_holder_length_takes_a_short_assumed_one() {
+        let mut t = Tool::new("Flat", "Flat end mill", "6");
+        assert_eq!(t.holder_length(), (HOLDER_LENGTH, true));
+        assert_eq!(HOLDER_LENGTH, 10.);
+        assert!(t.issues().is_empty());
+        t.p.insert("holder_length".into(), "25".into());
+        assert_eq!(t.holder_length(), (25., false));
+        t.p.insert("holder_length".into(), "0".into());
+        assert_eq!(t.holder_length(), (0., false));
+        t.p.insert("holder_length".into(), "-1".into());
+        assert_eq!(
+            t.issues(),
+            vec!["Holder length must be zero or more.".to_string()]
+        );
+        assert_eq!(t.holder_length(), (HOLDER_LENGTH, true));
     }
 
     #[test]

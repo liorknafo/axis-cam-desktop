@@ -14,7 +14,7 @@
 //! Y and Z. At A, every solid that turns is turned about that axis by A, +Y
 //! towards +Z for a machine whose A direction is Positive (the other way for
 //! Negative); the tailstock body and the rotary head do not turn.
-use crate::holding::{Hit, HoldBox, Shape, hits_segments};
+use crate::holding::{Hit, HoldBox, Part, Shape, hits_parts};
 use crate::mesh::Bounds;
 use crate::model::{RotaryUnit, Setup, get};
 use std::sync::Arc;
@@ -112,6 +112,51 @@ pub struct Rig {
     pub table: f32,
     /// How far the stock sticks out of the jaws, mm.
     pub stickout: f32,
+}
+/// A tool in the spindle as the rotary checks see it (LIO-204): the cutter
+/// and its shank from the tip up by the stick-out, the holder from there up
+/// by its length to the spindle nose, then the spindle, as wide as its nose
+/// (or the holder, if that is wider), all the way up: its body for its
+/// length and what holds it above that, which is not modelled and so is
+/// taken as no narrower.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InSpindle {
+    pub radius: f32,
+    pub stickout: f32,
+    pub holder_radius: f32,
+    pub holder_length: f32,
+    pub nose_radius: f32,
+}
+impl InSpindle {
+    /// How far the spindle nose is over the tip.
+    pub fn gauge(&self) -> f32 {
+        self.stickout + self.holder_length
+    }
+}
+/// The parts of a tool the checks here take: `holding::parts`'s cutter and
+/// holder, as (radius, stick-out, holder radius), or an `InSpindle`'s.
+pub trait ToolParts {
+    fn parts(&self) -> Vec<Part>;
+}
+impl ToolParts for (f32, f32, f32) {
+    fn parts(&self) -> Vec<Part> {
+        crate::holding::parts(self.0, self.1, self.2).to_vec()
+    }
+}
+impl ToolParts for InSpindle {
+    fn parts(&self) -> Vec<Part> {
+        let g = self.gauge();
+        vec![
+            ("tool", self.radius, 0., self.stickout),
+            ("holder", self.holder_radius, self.stickout, g),
+            (
+                "spindle nose",
+                self.nose_radius.max(self.holder_radius),
+                g,
+                f32::INFINITY,
+            ),
+        ]
+    }
 }
 /// Whether the setup holds its stock in the chuck.
 pub fn holds(setup: &Setup) -> bool {
@@ -530,17 +575,17 @@ impl Rig {
             smooth: false,
         }
     }
-    /// Straight tool moves (tip positions, the setup's frame) whose tool or
-    /// holder comes within `gap` of the chuck, its jaws, the rotary head,
+    /// Straight tool moves (tip positions, the setup's frame) whose tool,
+    /// holder or spindle (`ToolParts`) comes within `gap` of the chuck, its jaws, the rotary head,
     /// the tailstock or the stock gripped in the jaws, at A `a` degrees.
     pub fn hits_at(
         &self,
         a: f32,
         segments: &[([f32; 3], [f32; 3])],
-        tool: (f32, f32, f32),
+        tool: impl ToolParts,
         gap: f32,
     ) -> Vec<Hit> {
-        hits_segments(segments, tool.0, tool.1, tool.2, &self.boxes(a), gap)
+        hits_parts(segments, &tool.parts(), &self.boxes(a), gap)
     }
     /// `hits_at` for an index move from A `from` to A `to`: the tool, at
     /// any point of `segments` while A turns, against all that the turn
@@ -550,10 +595,10 @@ impl Rig {
         from: f32,
         to: f32,
         segments: &[([f32; 3], [f32; 3])],
-        tool: (f32, f32, f32),
+        tool: impl ToolParts,
         gap: f32,
     ) -> Vec<Hit> {
-        hits_segments(segments, tool.0, tool.1, tool.2, &self.swept(from, to), gap)
+        hits_parts(segments, &tool.parts(), &self.swept(from, to), gap)
     }
     /// How long the jaws still grip the stock after earlier cuts (`removed`,
     /// None when nothing was cut before): the jaws' contact sampled at 12
@@ -763,6 +808,76 @@ mod tests {
             let near = r.hits_at(a, &plunge(10., 0., 15. + 15.), TOOL, gap);
             assert!(!near.is_empty(), "A{a}");
         }
+    }
+    #[test]
+    fn the_spindle_nose_is_kept_off_the_jaws_and_the_tailstock_on_both_sides() {
+        // TOOL with a 10 mm holder in a Ø65 spindle: the nose is 30 mm
+        // over the tip, 32.5 mm out from it.
+        let spindle = InSpindle {
+            radius: 3.,
+            stickout: 20.,
+            holder_radius: 10.,
+            holder_length: 10.,
+            nose_radius: 32.5,
+        };
+        let gap = 2.;
+        let r = rig_of(&setup(&[("chuck_tailstock", "Retracted")]));
+        let parts = |hits: Vec<Hit>| -> Vec<(String, &str)> {
+            hits.into_iter().map(|h| (h.label, h.part)).collect()
+        };
+        // Down to the bar's top (Z30) beside jaw 1's front (X20, its top
+        // Z65 at A0): the nose comes within its radius and the gap of it.
+        for (x, hit) in [
+            (20. + 32.5 + gap + 0.01, false),
+            (20. + 32.5 + gap - 0.01, true),
+        ] {
+            let down = plunge(x, 0., 30.);
+            assert!(r.hits_at(0., &down, TOOL, gap).is_empty());
+            let found = parts(r.hits_at(0., &down, spindle, gap));
+            match hit {
+                true => assert_eq!(found, [("chuck jaw 1".to_string(), "spindle nose")]),
+                false => assert!(found.is_empty(), "{found:?}"),
+            }
+        }
+        // Down to Z-10 beside the tailstock body (Z25 at its top, 60 mm
+        // wide): the nose, 20 mm up, comes within reach of its side.
+        let body = r
+            .solids(0.)
+            .into_iter()
+            .find(|s| s.0 == "tailstock body")
+            .unwrap()
+            .1
+            .bounds();
+        let x = (body.min[0] + body.max[0]) / 2.;
+        for (y, hit) in [
+            (30. + 32.5 + gap + 0.01, false),
+            (30. + 32.5 + gap - 0.01, true),
+        ] {
+            let down = plunge(x, y, -10.);
+            assert!(r.hits_at(0., &down, TOOL, gap).is_empty());
+            let found = parts(r.hits_at(0., &down, spindle, gap));
+            match hit {
+                true => assert_eq!(found, [("tailstock body".to_string(), "spindle nose")]),
+                false => assert!(found.is_empty(), "{found:?}"),
+            }
+            // While A turns too.
+            let turning = parts(r.hits_turning(0., 90., &down, spindle, gap));
+            assert_eq!(
+                turning.iter().any(|f| f.1 == "spindle nose"),
+                hit,
+                "{turning:?}"
+            );
+        }
+        // A holder wider than the nose is taken for the spindle's width.
+        let wide = InSpindle {
+            holder_radius: 40.,
+            ..spindle
+        };
+        let down = plunge(20. + 40. + gap - 0.01, 0., 30.);
+        assert!(
+            parts(r.hits_at(0., &down, wide, gap))
+                .contains(&("chuck jaw 1".to_string(), "spindle nose"))
+        );
     }
     #[test]
     fn cuts_into_the_gripped_length_are_refused_and_beyond_it_are_not() {

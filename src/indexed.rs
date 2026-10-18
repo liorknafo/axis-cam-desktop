@@ -1818,11 +1818,24 @@ pub(crate) mod tests {
     fn an_indexed_setups_cuts_are_checked_against_the_chuck_at_each_angle() {
         // 90 mm out of the jaws, with 40 mm of clearance over the bar: clear
         // of the chuck at both angles, so nothing is said, not even that the
-        // holding was not checked (LIO-191).
+        // holding was not checked (LIO-191). The Ø65 spindle nose is kept
+        // over the jaws by a 40 mm holder (LIO-204): with the assumed 10 mm
+        // one it comes down beside jaw 1.
         let mesh = prism(30.);
         let mut op = contour(&cutter("12"));
         op.p.insert("clearance".into(), "40".into());
-        let doc = bar_job(&mesh, 0., "90", "-150", "0, 90", op);
+        let mut doc = bar_job(&mesh, 0., "90", "-150", "0, 90", op);
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim))]);
+        assert!(
+            held.iter().any(|h| h.message.starts_with(
+                "Flats at A 0°, Contour: the spindle nose hits the chuck jaw 1"
+            ) && h.message.ends_with(
+                "Assumed: the holder's 10 mm length (the tool gives none: enter it in the Tool library)."
+            )),
+            "{held:?}"
+        );
+        doc.tools[0].p.insert("holder_length".into(), "40".into());
         let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
         let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim))]);
         assert!(held.is_empty(), "{held:?}");

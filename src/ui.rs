@@ -4668,7 +4668,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 if m.has_a() {
                     form = form
                         .push(bold("Rotary unit", 15))
-                        .push(note("Where the A axis sits and how big its chuck and tailstock are, all in mm in machine coordinates (Z is zero at the top and negative down). New values are ASSUMED for a 100 mm 3-jaw chuck on a NEMA23 rotary unit and still to be measured: calibration will replace them."));
+                        .push(note("Where the A axis sits and how big its chuck and tailstock are, all in mm in machine coordinates (Z is zero at the top and negative down). New values are ASSUMED for a 100 mm 3-jaw chuck on a NEMA23 rotary unit and the 800 W spindle's Ø65 mm body, and still to be measured: calibration will replace them."));
                     for (k, l, _) in crate::model::ROTARY_GEOMETRY {
                         form = form.push(field(p, k, l, t));
                     }
@@ -7053,6 +7053,10 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
         ("length", "Flute length · mm"),
         ("stickout", "Stickout · mm"),
         ("holder", "Holder diameter · mm"),
+        (
+            "holder_length",
+            "Holder length to the spindle nose · mm (empty: 10, assumed)",
+        ),
     ] {
         form = form.push(field(p, k, l, t));
     }
