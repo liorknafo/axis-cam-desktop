@@ -613,6 +613,10 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 Motion::Rapid => Kind::Rapid,
                 Motion::Feed => Kind::Feed,
                 Motion::Dwell => Kind::Dwell,
+                // Programs do not command A yet (LIO-193): `checked_with`
+                // refuses an indexed setup, whose plans alone turn A, so
+                // none reaches here.
+                Motion::Index => continue,
             };
             out.push(Block::Move {
                 op: k,
@@ -3081,6 +3085,7 @@ pub(crate) mod fixture {
                 feed: if *motion == Motion::Dwell { 0. } else { *rate },
                 start: plan.duration,
                 end: plan.duration + seconds,
+                a: None,
             });
             plan.duration += seconds;
             at = *to;

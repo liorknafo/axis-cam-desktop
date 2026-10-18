@@ -65,9 +65,7 @@ impl Strategy {
                 "Unavailable · engagement-controlled adaptive kernel is not implemented"
             }
             Self::Scallop => "Unavailable · constant surface-spacing kernel is not implemented",
-            Self::Indexed => {
-                "Unavailable · indexed tool frames and rotary kinematics are not implemented"
-            }
+            Self::Indexed => crate::indexed::AVAILABILITY,
             Self::Rotary => {
                 "Unavailable · continuous rotary paths and stock simulation are not implemented"
             }
@@ -138,7 +136,7 @@ impl Strategy {
             "Finish shallow surfaces using parallel passes. Set direction, surface spacing and the slope range.",
             "Finish steep walls at constant Z levels. Choose surfaces and a vertical stepdown.",
             "Finish surfaces at approximately constant spacing. Use rest machining to target a previous operation’s remaining stock.",
-            "Position a rotary axis, lock it, then machine a face. Set the indexed angles within the machine travel limits.",
+            "Indexed work is a setup, not an operation: add a setup, choose Reposition → Index rotary axis and list its A angles. Every operation in it runs at each angle.",
             "Finish around a rotary axis. Choose an axis, angular range and line, circular or spiral motion.",
             "Orient the cutter along a surface. Set axis control, tilt limits and lead/lean before checking machine motion.",
             "Remove a rectangular block of material, one axis at a time, on a manual mill.",
@@ -159,7 +157,7 @@ impl Strategy {
             return vec!["Tool", "Box", "Heights", "Passes"];
         }
         let mut v = vec!["Tool", "Geometry"];
-        if matches!(self, Self::Indexed | Self::Rotary | Self::FiveAxis) {
+        if matches!(self, Self::Rotary | Self::FiveAxis) {
             v.push("Orientation")
         }
         v.push("Heights");
@@ -838,8 +836,6 @@ impl Operation {
             ("ramp_angle", "2"),
             ("lead_in", "2"),
             ("keep_down", "Yes"),
-            ("angle_a", "0"),
-            ("angle_b", "0"),
             ("rotary_axis", "A around X"),
             ("rotary_start", "0"),
             ("rotary_end", "360"),
@@ -955,6 +951,11 @@ impl Operation {
     }
     pub fn issues(&self, m: &Machine, tools: &[Tool], preceding: &[Operation]) -> Vec<String> {
         let mut e = vec![];
+        // An older project's Indexed operation that could not be moved into
+        // an indexed setup (`Document::migrate_indexed_operations`).
+        if self.strategy == Strategy::Indexed {
+            e.push(crate::indexed::LEGACY.into())
+        }
         if self.strategy == Strategy::Face {
             e.extend(facing_setting_issues(&self.p));
         }
@@ -1032,7 +1033,7 @@ impl Operation {
         if s == Strategy::Box && !manual::is_manual(m) {
             e.push(manual::BOX_ON_CNC.into())
         }
-        if matches!(s, Strategy::Indexed | Strategy::Rotary) && m.axes() < 4 {
+        if s == Strategy::Rotary && m.axes() < 4 {
             e.push("This strategy needs at least 4 machine axes.".into())
         }
         if s == Strategy::FiveAxis && (m.axes() != 5 || get(&m.p, "mode") != "Simultaneous 5-axis")
@@ -1125,24 +1126,6 @@ impl Operation {
                 .any(|o| o.id == get(&self.p, "rest_source") && o.enabled)
         {
             e.push("Rest machining needs an enabled preceding operation.".into())
-        }
-        if s == Strategy::Indexed {
-            bounded(
-                &self.p,
-                "angle_a",
-                num(&m.p, "rotary_min").unwrap_or(0.),
-                num(&m.p, "rotary_max").unwrap_or(0.),
-                &mut e,
-            );
-            if m.axes() == 5 {
-                bounded(
-                    &self.p,
-                    "angle_b",
-                    num(&m.p, "rotary2_min").unwrap_or(0.),
-                    num(&m.p, "rotary2_max").unwrap_or(0.),
-                    &mut e,
-                )
-            }
         }
         if s == Strategy::Rotary {
             range(&self.p, "rotary_start", "rotary_end", &mut e);
@@ -2285,7 +2268,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 42] = [
+const OPERATION_FIELDS: [&str; 40] = [
     "name",
     "x_min",
     "x_max",
@@ -2301,8 +2284,6 @@ const OPERATION_FIELDS: [&str; 42] = [
     "top",
     "bottom",
     "breakthrough",
-    "angle_a",
-    "angle_b",
     "rotary_start",
     "rotary_end",
     "tilt_min",

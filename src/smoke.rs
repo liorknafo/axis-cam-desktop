@@ -17102,8 +17102,10 @@ soft_max = 180.0
         assert!(!adds(&a, Strategy::Face));
         assert!(!adds(&a, Strategy::FiveAxis));
         assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
-        // The ten dimmed tiles each say why; Box and Drill are not dimmed.
-        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 2);
+        // The nine dimmed tiles each say why; Box and Drill are not dimmed,
+        // and Indexed points to indexed setups.
+        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 3);
+        assert_eq!(reasons(&a, crate::indexed::POINTER), 1);
         assert_eq!(reasons(&a, box_on_cnc), 0);
         // Back on the CNC setup only Box is dimmed.
         a.doc.active = a.doc.setups[1].id.clone();

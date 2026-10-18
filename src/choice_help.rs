@@ -345,7 +345,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ),
         ("reposition", "Index rotary axis") => (
             "A turns the stock in the clamping of the setup before it: no re-clamp, no re-probing. This setup's frame is that one's turned about the A centreline by each A angle listed, and it keeps that setup's work zero, offset, machine and chuck.",
-            "List one angle (90) or several for the same operations (0, 90, 180, -90). Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck along +X. Needs a machine with A around X. A work zero on the A axis has Y0 Z0 on the centreline the Control page's Rotary A calibration measures; while it is assumed or stale, the setup says so. Programs do not command A yet: an indexed setup is not exported or run.",
+            "List one angle (90) or several for the same operations (0, 90, 180, -90). Every operation in the setup is generated at each angle in turn, as 3-axis cuts on the stock and part as A poses them, and between angles the tool retracts above all that A swings (the stock, the part and the jaws, at any angle, plus the operation's clearance), A turns, and the tool comes back down; a retract above the Z travel is refused, never cut short. Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck along +X, so a flat on the part's +Y side is on top at A90. Needs a machine with A around X. A work zero on the A axis has Y0 Z0 on the centreline the Control page's Rotary A calibration measures; while it is assumed or stale, the setup says so. Programs do not command A yet: an indexed setup is not exported or run.",
         ),
         ("reposition", "Change fixture") => (
             "Document moving the part to different workholding. Set the new placement and locating instructions. Stock remains the result of earlier enabled operations.",
@@ -376,7 +376,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("mode", "Indexed (3+1)") => (
-            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. The rotary unit's place and chuck and tailstock sizes are saved with the machine (Rotary unit); automatic index-angle solving and machine motion are not implemented.",
+            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. Index a setup (Reposition → Index rotary axis) to run its operations at each A angle it lists. The rotary unit's place and chuck and tailstock sizes are saved with the machine (Rotary unit); programs do not command A yet.",
             "",
         ),
         ("mode", "Indexed (3+2)") => (

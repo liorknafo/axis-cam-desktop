@@ -87,7 +87,7 @@ pub struct Bite {
 /// ponytail: a replay more than the simulation makes; keep what
 /// `Simulation::seek` removes per move if that time ever shows.
 pub fn bites(sim: &Simulation) -> Vec<Bite> {
-    let (Some(mut volume), Some(frame)) = (sim.initial_volume.clone(), sim.frame) else {
+    let (Some(mut volume), Some(_)) = (sim.initial_volume.clone(), sim.frame) else {
         return vec![];
     };
     if sim.plan.strategy == crate::model::Strategy::Drill {
@@ -103,7 +103,8 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
     // some. Half a voxel reaches the original stock faces, which lie half a
     // voxel above the centres, but not a floor or a wall an earlier cut
     // left, which can lie a whole voxel past the last centre it kept.
-    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume| {
+    // Each move cuts in its A angle's frame (`Simulation::frame_of`).
+    let touches = |from: [f32; 3], to: [f32; 3], volume: &Volume, frame| {
         let lower = |p: [f32; 3]| [p[0], p[1], p[2] - thick];
         volume.touches(
             lower(from),
@@ -127,6 +128,9 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             .map(|k| (m.to[k] - m.from[k]).powi(2))
             .sum::<f32>()
             .sqrt();
+        let Some(frame) = sim.frame_of(m) else {
+            continue;
+        };
         let pieces = (length / reach).ceil().max(1.);
         let at = |t: f32| std::array::from_fn(|k| m.from[k] + (m.to[k] - m.from[k]) * t);
         for i in 0..pieces as usize {
@@ -147,7 +151,7 @@ pub fn bites(sim: &Simulation) -> Vec<Bite> {
             run.2 += length / pieces / m.feed;
             run.3 = run.3.min(from[2]).min(to[2]);
             if run.0 == 0 && !run.4 {
-                run.4 = touches(from, to, &volume);
+                run.4 = touches(from, to, &volume, frame);
             }
             if run.1 >= 0.999 * reach {
                 runs.push(std::mem::replace(&mut run, fresh));

@@ -119,6 +119,10 @@ impl Placement {
             bounds: bounds.translated(shift),
         }
     }
+    /// The part's rotation (`mesh::rotation`'s angles), A's turn included.
+    pub fn rotation(&self) -> [f32; 3] {
+        self.angles
+    }
     pub fn transform(&self, point: [f32; 3]) -> [f32; 3] {
         let r = rotation(point, self.angles);
         std::array::from_fn(|i| r[i] + self.shift[i])

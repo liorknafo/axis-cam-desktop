@@ -616,6 +616,7 @@ mod tests {
                 feed: 0.,
                 start: 0.,
                 end: 0.,
+                a: None,
             };
             plan.moves.splice(
                 1..1,
@@ -1201,6 +1202,7 @@ mod tests {
                 feed: 0.,
                 start: 0.,
                 end: 0.,
+                a: None,
             };
             plan.moves.splice(
                 1..1,
