@@ -1228,6 +1228,12 @@ pub fn lower(
                 let feed = (*kind == Kind::Feed).then(|| *feed as f64 / 60.);
                 go(&mut at, machine(*to), feed, &mut actions)
             }
+            // A run does not turn A yet (`post::not_run`).
+            Block::Index { .. } => {
+                return Err(vec![
+                    "A run does not turn A yet: this program indexes A.".into(),
+                ]);
+            }
             Block::End => actions.push(Do::End),
         }
         out.extend(actions.into_iter().map(|action| Located { line, action }));

@@ -2473,7 +2473,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "controller") => (
-            "Controller family. LinuxCNC has a 3-axis postprocessor; other controllers are saved for planning and cannot export G-code yet.",
+            "Controller family. LinuxCNC has a 3-axis postprocessor that also indexes A; other controllers are saved for planning and cannot export G-code yet.",
             "",
             None,
         ),

@@ -35,12 +35,7 @@ impl PostSettings {
                 m.name()
             )),
         }
-        if m.axes() != 3 || get(&m.p, "mode") != "3-axis" {
-            e.push(format!(
-                "{} is not a 3-axis machine. Only 3-axis output is implemented.",
-                m.name()
-            ));
-        }
+        e.extend(axes_issue(m));
         e.extend(m.issues());
         e.extend(post_setting_issues(&m.p));
         if !e.is_empty() {
@@ -53,7 +48,9 @@ impl PostSettings {
     /// to the setup clearance plane, which the checks prove clear of the
     /// stock and the jaws, and the machine's spindle start dwell and Air
     /// output. The driver blends corners with the profile's own setting:
-    /// nothing writes it, and the checks allow for it as export's do.
+    /// nothing writes it, and the checks allow for it as export's do. A
+    /// 4-axis machine with A around X is accepted, as export accepts it; a
+    /// run still refuses it (`run::not_run`).
     pub fn for_uc100(m: &Machine) -> Result<Self, Vec<String>> {
         let mut e = vec![];
         if get(&m.p, "controller") != "UC100" {
@@ -63,12 +60,7 @@ impl PostSettings {
                 get(&m.p, "controller")
             ));
         }
-        if m.axes() != 3 || get(&m.p, "mode") != "3-axis" {
-            e.push(format!(
-                "{} is not a 3-axis machine. Only 3-axis runs are implemented.",
-                m.name()
-            ));
-        }
+        e.extend(axes_issue(m));
         e.extend(m.issues());
         e.extend(post_setting_issues(&m.p));
         if !e.is_empty() {
@@ -113,6 +105,23 @@ impl PostSettings {
             },
         }
     }
+}
+/// The motion modes of a machine with A around X whose programs are
+/// posted: indexed A only (`Block::Index`), so a continuous 4-axis machine
+/// indexes too, and the checks refuse A turning during a move.
+pub const INDEXED_MODES: [&str; 2] = ["Indexed (3+1)", "Continuous 4-axis"];
+/// Why machine `m`'s axes are not posted: anything but a 3-axis machine or
+/// a 4-axis one with A about X (`Machine::has_a`) in `INDEXED_MODES`.
+fn axes_issue(m: &Machine) -> Option<String> {
+    let mode = get(&m.p, "mode");
+    let three = m.axes() == 3 && mode == "3-axis";
+    let indexed = m.has_a() && INDEXED_MODES.contains(&mode);
+    (!three && !indexed).then(|| {
+        format!(
+            "{} is not a 3-axis machine or a 4-axis one with A around X. Only 3-axis and indexed A output is implemented.",
+            m.name()
+        )
+    })
 }
 /// The path blending tolerance of machine `m`'s profile (`post_blend`, written
 /// as G64 P), in mm: how far the controller may leave the programmed path at
@@ -528,11 +537,33 @@ pub enum Block {
         to: [f32; 3],
         feed: f32,
         seconds: f32,
+        /// The A angle (degrees, as commanded) the move is made at: None on
+        /// a 3-axis setup's moves, which never command A. The checks refuse
+        /// one whose A is not the A the last `Index` turned to: A turning
+        /// during a move (`post_check::check_setup`).
+        a: Option<f32>,
+    },
+    /// G0 A alone: A turns to `a` (degrees, as commanded) with X, Y and Z
+    /// still, where the tool is: after the retract that starts an indexed
+    /// operation's tool run, or at an index move's height above all that A
+    /// swings (`indexed::generate`).
+    Index {
+        op: usize,
+        a: f32,
     },
     End,
 }
+/// One program's blocks from its operations' plans. An indexed setup's
+/// moves carry A: after the retract that starts each tool run, A turns to
+/// the A of its operation's first move before the spindle starts (the A the
+/// machine is at is not known when a program starts), each index move of
+/// the plans turns A alone, and after the last retract A turns back to A0.
+/// A move whose A differs from the last turn's keeps its A, for the checks
+/// to refuse.
 pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<Block> {
     let mut out = vec![];
+    // The A the program has turned to; None until it commands one.
+    let mut a_now: Option<f32> = None;
     for (k, (op, plan)) in ops.iter().zip(plans).enumerate() {
         let first = plan.moves[0].from;
         let previous = k.checked_sub(1);
@@ -560,6 +591,10 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         if change {
             // The new tool's tip (after G43 or a manual touch-off) goes to a safe height first.
             out.push(Block::Retract);
+            if let Some(a) = plan.moves[0].a.filter(|a| a_now != Some(*a)) {
+                out.push(Block::Index { op: k, a });
+                a_now = Some(a);
+            }
         }
         out.push(Block::Run {
             op: k,
@@ -603,6 +638,7 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                         to,
                         feed: 0.,
                         seconds: 0.,
+                        a: a_now,
                     });
                     at = to;
                 }
@@ -613,10 +649,18 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 Motion::Rapid => Kind::Rapid,
                 Motion::Feed => Kind::Feed,
                 Motion::Dwell => Kind::Dwell,
-                // Programs do not command A yet (LIO-193): `checked_with`
-                // refuses an indexed setup, whose plans alone turn A, so
-                // none reaches here.
-                Motion::Index => continue,
+                // A alone, where the tool is: nothing when A is there
+                // already (the turn after the retract made it).
+                Motion::Index if m.from == m.to => {
+                    if let Some(a) = m.a.filter(|a| a_now != Some(*a)) {
+                        out.push(Block::Index { op: k, a });
+                        a_now = Some(a);
+                    }
+                    continue;
+                }
+                // A turning while X, Y or Z moves: a rapid at the new A,
+                // which the checks refuse.
+                Motion::Index => Kind::Rapid,
             };
             out.push(Block::Move {
                 op: k,
@@ -629,10 +673,19 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 } else {
                     0.
                 },
+                a: m.a,
             });
         }
     }
-    out.extend([Block::Stop, Block::Retract, Block::End]);
+    out.extend([Block::Stop, Block::Retract]);
+    // A program that turned A ends back at A0, where the next program, which
+    // may be a setup that is not indexed and does not turn A, starts.
+    if let (Some(a), Some(last)) = (a_now, ops.len().checked_sub(1))
+        && a.abs() > 1e-4
+    {
+        out.push(Block::Index { op: last, a: 0. });
+    }
+    out.push(Block::End);
     out
 }
 /// Highest tool-tip Z of the setup's motion (plan coordinates).
@@ -675,6 +728,10 @@ pub struct Header<'a> {
     /// The setup's modelled workholding in a sentence (`Document::holding_text`).
     pub holding: Option<String>,
     pub disabled: Vec<String>,
+    /// What an indexed program assumes of A (`a_axis_note`): its sense, the
+    /// A centreline and whether it was measured, and A zero. None for a
+    /// program that does not command A.
+    pub a_axis: Option<String>,
 }
 struct Writer(String);
 impl Writer {
@@ -700,7 +757,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     let (d, setup) = (h.datum, h.setup);
     let offset = get(&setup.p, "offset");
     let mut w = Writer(String::new());
-    w.line("(AXIS CAM Studio - LinuxCNC 3-axis program)");
+    let indexed = blocks.iter().any(|b| matches!(b, Block::Index { .. }));
+    w.line(if indexed {
+        "(AXIS CAM Studio - LinuxCNC 4-axis indexed program)"
+    } else {
+        "(AXIS CAM Studio - LinuxCNC 3-axis program)"
+    });
     w.wrapped(
         "Job: ",
         &format!(
@@ -725,10 +787,18 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     // stock: it is located from the part's walls and the stock top instead.
     let origin = get(&setup.p, "origin");
     let model = origin == "Model origin";
+    // An indexed setup's work zero is its clamping's, touched off there: the
+    // stock A has turned no longer has the faces it was found on.
+    let kept = indexed && crate::indexed::zero_words(origin).is_none();
     if later {
         w.note(&format!(
             "Work zero: {origin} in {offset}. X0 Y0 are unchanged from program 1."
         ));
+    } else if kept {
+        w.wrapped(
+            "Work zero: ",
+            &format!("{origin} in {offset}, as the setup this one indexes from set it. Do not touch it off again: A has turned the stock."),
+        );
     } else if let Some(words) = crate::indexed::zero_words(origin) {
         w.wrapped("Work zero: ", &format!("{origin} in {offset}. {words}"));
     } else if let Some(spots) = touch_off_spots(origin, h.stock) {
@@ -742,7 +812,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     }
     // The stock top is offered only while no earlier setup has cut it.
     let top = h.located.and_then(|(_, top)| top);
-    if let (true, Some((part, _))) = (model, h.located) {
+    if let (true, false, Some((part, _))) = (model, kept, h.located) {
         w.note(&format!(
             "Part in work coordinates: X{} to {} Y{} to {} Z{} to {} mm.{}",
             coord(part.min[0]),
@@ -782,6 +852,9 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     }
     if let Some(holding) = &h.holding {
         w.wrapped("Workholding: ", holding);
+    }
+    if let Some(note) = &h.a_axis {
+        w.wrapped("A axis: ", note);
     }
     // The operator's requested fixture clearance, a note checked by nothing,
     // as a fixed sentence with the app's number, before the notes' free text.
@@ -870,7 +943,16 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         // AXIS cannot touch off while a program is paused; G49 below would cancel a Tool Touch Off.
         // Earlier programs cut away the Z0 surface, so later tools use a fixed reference.
         let (t, name) = (ops[0].tool, &ops[0].tool_name);
-        if h.part.is_none_or(|(i, _)| i == 1) {
+        if kept {
+            // The faces the zero was found on have turned away with A.
+            w.wrapped(
+                "Before starting: ",
+                &format!(
+                    "load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted in the setup this one indexes from and enter its noted Z."
+                ),
+            );
+            w.note("Do not touch off on the stock: A has turned it.");
+        } else if h.part.is_none_or(|(i, _)| i == 1) {
             w.wrapped(
                 "Before starting: ",
                 &format!(
@@ -988,6 +1070,11 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
                 let z = work(*z, d[2]);
                 w.line(format!("G0 Z{z}"));
                 position[2] = Some(z);
+                motion = Some(Kind::Rapid);
+            }
+            Block::Index { a, .. } => {
+                // A alone: no X, Y or Z word on the line.
+                w.line(format!("G0 A{}", coord(*a)));
                 motion = Some(Kind::Rapid);
             }
             Block::Move {
@@ -2343,6 +2430,84 @@ fn pushed(doc: &Document, si: usize, walk: &Walk, held: crate::holding::Gripped)
         })
         .collect()
 }
+/// Why a UC100 run refuses machine `m`: one that is not 3-axis. Its
+/// settings (`PostSettings::for_uc100`) take a 4-axis machine with A, as
+/// export's do, but a run does not turn A yet.
+pub(crate) fn not_run(m: &Machine) -> Option<String> {
+    (m.axes() != 3 || get(&m.p, "mode") != "3-axis").then(|| {
+        format!(
+            "{} is not a 3-axis machine. Only 3-axis runs are implemented.",
+            m.name()
+        )
+    })
+}
+/// Where indexed program `blocks` of setup `si` turn A (`Block::Index`):
+/// each turn with the tool tip at or above its operation's index height
+/// (`Document::swing`: the A centreline, the farthest that A swings reaches
+/// from it and the operation's clearance), where nothing A swings reaches
+/// the tool, whatever A the machine is at when the program starts. The
+/// program is made of `walk`'s operations `range`. Plan Z, said in work
+/// coordinates.
+fn index_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    walk: &Walk,
+    range: &std::ops::Range<usize>,
+    blocks: &[Block],
+) -> Vec<String> {
+    let setup = &doc.setups[si];
+    let (ops, indexes) = (&walk.ops[range.clone()], &walk.indexes[range.clone()]);
+    let (settings, datum) = (&walk.settings, walk.zero);
+    let plane = clearance_plane(blocks);
+    // A retract to machine home is above everything.
+    let retract = if settings.machine_home {
+        f32::INFINITY
+    } else {
+        plane
+    };
+    let mut tip: Option<f32> = None;
+    let mut out = vec![];
+    for block in blocks {
+        match block {
+            Block::Retract | Block::Approach { .. } => tip = Some(retract),
+            Block::Descend { z, .. } => tip = Some(*z),
+            Block::Move { kind, to, .. } if *kind != Kind::Dwell => tip = Some(to[2]),
+            Block::Index { op, a } => {
+                let name = &ops[*op].name;
+                let swing = setup
+                    .operations
+                    .get(indexes[*op])
+                    .ok_or_else(|| "The operation was removed.".to_string())
+                    .and_then(|o| crate::cam::number(o, "clearance"))
+                    .and_then(|clearance| doc.swing(si, mesh, clearance));
+                let problem = match (swing, tip) {
+                    (Err(e), _) => Some(format!("{name}: {e}")),
+                    (Ok(s), Some(z)) if z >= s.z - EPS_INDEX => None,
+                    (Ok(s), z) => Some(format!(
+                        "{name}: A turns to A {}° with the tool tip at {}, below Z{} where nothing A swings reaches it ({} mm from the A centreline + {} mm clearance), and the A the machine is at when the program starts is not known. Raise the operations' clearance so that the program retracts above it.",
+                        crate::indexed::degrees(*a),
+                        z.map_or("an unknown height".into(), |z| format!(
+                            "Z{}",
+                            work(z, datum[2])
+                        )),
+                        work(s.z, datum[2]),
+                        exact_mm(s.radius),
+                        exact_mm(s.clearance),
+                    )),
+                };
+                if let Some(p) = problem.filter(|p| !out.contains(p)) {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+/// How far below its index height (`index_problems`) a turn of A may be
+/// made, mm: the output's resolution.
+const EPS_INDEX: f32 = 0.0005;
 impl Walk<'_> {
     /// The plans of the operations of `group`, one of `groups`.
     fn plans(&self, group: &std::ops::Range<usize>) -> Vec<&Plan> {
@@ -2456,6 +2621,59 @@ pub(crate) fn held_walked(
     }
     Ok(found)
 }
+/// What the programs of setup `si` assume of A, for their header (`Header::a_axis`):
+/// for an indexed setup its A angles, how positive A turns, the A centreline
+/// it turns about and whether that was measured, and where A0 is; for
+/// another setup on a machine with A, that it cuts at A0 and does not turn
+/// A. None on a machine without A.
+pub(crate) fn a_axis_note(doc: &Document, si: usize) -> Option<String> {
+    let setup = doc.setups.get(si)?;
+    let m = &setup.machine;
+    if !m.has_a() {
+        return None;
+    }
+    let zero = "A0 is where Find A zero on a flat set it, with Rotary A on the Control page";
+    let Some(base) = doc.index_base(si) else {
+        return Some(format!(
+            "this setup cuts at A0 and the program does not turn A: turn A to A0 before Cycle Start. An indexed program ends at A0. {zero}."
+        ));
+    };
+    let angles = match crate::indexed::angles(setup) {
+        Ok(v) => v
+            .iter()
+            .map(|a| format!("A{}", crate::indexed::degrees(*a)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Err(e) => e,
+    };
+    let sense = if crate::indexed::sign(m) > 0. {
+        "positive A turns +Y up to +Z, the right-hand rule about +X"
+    } else {
+        "the machine's A direction is Negative: positive A turns +Y down to -Z"
+    };
+    let centre = match doc.rotary_unit(m) {
+        None => "The A centreline is not recorded: the machine's rotary unit geometry is missing."
+            .to_string(),
+        Some(u) => {
+            let how = match doc.centre_mark(m) {
+                crate::control::MEASURED => "measured with Rotary A on the Control page".to_string(),
+                "" => "assumed, not measured: probe it with Rotary A on the Control page before running this program".to_string(),
+                why => format!(
+                    "measured, but it went {why}: probe it again with Rotary A on the Control page before running this program"
+                ),
+            };
+            format!(
+                "The A centreline is at machine Y{} Z{} mm, {how}.",
+                exact_mm(u.centre_y),
+                exact_mm(u.centre_z)
+            )
+        }
+    };
+    Some(format!(
+        "indexed to {angles} degrees in the clamping of setup {}; {sense}. Each turn is G0 A alone, X Y Z still, with the tool above all that A swings, and the program ends back at A0; no move turns A. {centre} {zero}.",
+        base + 1
+    ))
+}
 /// One program of a setup that passed every check: its blocks and what they
 /// were made from.
 #[derive(Debug, Clone)]
@@ -2563,6 +2781,7 @@ pub(crate) fn prepare(
                     .filter(|o| !o.enabled)
                     .map(|o| o.name().to_string())
                     .collect(),
+                a_axis: a_axis_note(doc, si),
             };
             Prepared {
                 file_name: file_name(doc, si, c.part),
@@ -2614,36 +2833,54 @@ fn checked_with(
     if crate::manual::is_manual(&setup.machine) {
         return Ok(vec![]);
     }
-    // The post does not command A yet: an indexed setup's program would cut
-    // its turned stock at whatever A the machine is at.
-    if crate::indexed::is_indexed(setup) {
-        return Err(vec![format!(
-            "{}: {}",
-            setup.name(),
-            crate::indexed::NOT_POSTED
-        )]);
+    // A UC100 setup is only checked for a run, which does not turn A yet.
+    if get(&setup.machine.p, "controller") == "UC100"
+        && let Some(why) = not_run(&setup.machine)
+    {
+        return Err(vec![why]);
     }
+    let indexed = crate::indexed::is_indexed(setup);
     let offset = get(&setup.p, "offset").to_string();
     let walk = walk(doc, mesh, si, sims, settings)?;
     let (settings, zero, stock) = (walk.settings, walk.zero, walk.stock);
     let (ops, simulations, groups) = (&walk.ops, &walk.simulations, &walk.groups);
     let held = gripped(doc, mesh, si, &walk);
     let boxes = holding_boxes(doc, mesh, si, held, zero).map_err(|e| vec![e])?;
-    let unholdable = unholdable(doc, mesh, si, &walk, held);
-    if !unholdable.is_empty() {
-        return Err(unholdable);
-    }
-    let pushed: Vec<String> = pushed(doc, si, &walk, held)
-        .into_iter()
-        .map(|h| h.message)
-        .collect();
-    if !pushed.is_empty() {
-        return Err(pushed);
+    // The jaws turn with A: an indexed setup's moves on the machine (travel,
+    // A range, Z reach, the swing) and its grip, the cutting forces and the
+    // tool's way past the chuck at each angle and while A turns are
+    // `rotary_check`'s, said with the program's own problems. Its program
+    // links operations as they are checked there; its own turns of A are
+    // `index_problems`'.
+    let mut rotary: Vec<String> = vec![];
+    if indexed {
+        rotary.extend(
+            crate::rotary_check::problems(doc, mesh, si, sims)
+                .into_iter()
+                .map(|(_, message)| message),
+        );
+        match crate::rotary_check::held(doc, mesh, si, sims) {
+            Ok(held) => rotary.extend(held.into_iter().map(|h| h.message)),
+            Err(why) => rotary.extend(why),
+        }
+    } else {
+        let unholdable = unholdable(doc, mesh, si, &walk, held);
+        if !unholdable.is_empty() {
+            return Err(unholdable);
+        }
+        let pushed: Vec<String> = pushed(doc, si, &walk, held)
+            .into_iter()
+            .map(|h| h.message)
+            .collect();
+        if !pushed.is_empty() {
+            return Err(pushed);
+        }
     }
     let origin = get(&setup.p, "origin");
     let found = zero_check(setup, mesh, stock, zero, simulations[0], &boxes);
     if !found.refused.is_empty() {
-        return Err(found.refused);
+        rotary.extend(found.refused);
+        return Err(rotary);
     }
     let located = model_zero(setup, mesh, simulations[0]);
     let probe_from = probe_from(setup, stock, simulations[0], &boxes);
@@ -2659,13 +2896,19 @@ fn checked_with(
         let group_sims = &simulations[g.clone()];
         let plans = walk.plans(g);
         let blocks = blocks(group_ops, &plans, &settings);
-        let mut problems =
-            crate::post_check::check_setup(setup, group_ops, group_sims, &blocks, &settings, zero);
-        problems.extend(
-            walk.held(setup, g, &blocks, &boxes)
-                .into_iter()
-                .map(|h| h.message),
-        );
+        let mut problems = rotary.clone();
+        problems.extend(crate::post_check::check_setup(
+            setup, group_ops, group_sims, &blocks, &settings, zero,
+        ));
+        problems.extend(index_problems(doc, mesh, si, &walk, g, &blocks));
+        // An indexed setup's jaws were checked at each angle above.
+        if !indexed {
+            problems.extend(
+                walk.held(setup, g, &blocks, &boxes)
+                    .into_iter()
+                    .map(|h| h.message),
+            );
+        }
         if !problems.is_empty() {
             return Err(problems);
         }
@@ -2686,11 +2929,14 @@ fn checked_with(
                     &settings,
                     zero,
                 );
-                problems.extend(
-                    walk.held(setup, &range, &start, &boxes)
-                        .into_iter()
-                        .map(|h| h.message),
-                );
+                problems.extend(index_problems(doc, mesh, si, &walk, &range, &start));
+                if !indexed {
+                    problems.extend(
+                        walk.held(setup, &range, &start, &boxes)
+                            .into_iter()
+                            .map(|h| h.message),
+                    );
+                }
                 if !problems.is_empty() {
                     return Err(problems);
                 }
@@ -2699,7 +2945,8 @@ fn checked_with(
                     | Block::Run { op, .. }
                     | Block::Approach { op, .. }
                     | Block::Descend { op, .. }
-                    | Block::Move { op, .. } = b
+                    | Block::Move { op, .. }
+                    | Block::Index { op, .. } = b
                     {
                         *op += k;
                     }
@@ -3413,6 +3660,7 @@ mod tests {
             datum: [0., 0., 10.],
             holding: None,
             disabled: vec![],
+            a_axis: None,
         };
         (emit(&header, &ops, &blocks, &settings), blocks, settings)
     }
@@ -3491,6 +3739,7 @@ M2
                         datum: [0., 0., 10.],
                         holding: None,
                         disabled: vec![],
+                        a_axis: None,
                     },
                     &ops,
                     &blocks,
@@ -3651,11 +3900,236 @@ M2
         let mut m = Machine::new(3);
         m.p.insert("controller".into(), "GRBL".into());
         assert!(PostSettings::from_machine(&m).unwrap_err()[0].contains("Only the LinuxCNC"));
-        assert!(
-            PostSettings::from_machine(&Machine::new(4))
+        let refused = |m: &Machine| {
+            PostSettings::from_machine(m)
                 .unwrap_err()
                 .iter()
-                .any(|e| e.contains("3-axis"))
+                .any(|e| e.contains("Only 3-axis and indexed A output"))
+        };
+        // 5-axis is still refused, and so is a 4-axis machine whose fourth
+        // axis is not A around X.
+        assert!(refused(&Machine::new(5)));
+        let mut b = Machine::new(4);
+        b.p.insert("arrangement".into(), "B table around Y".into());
+        assert!(refused(&b));
+        // A 4-axis machine with A around X posts indexed A, from either
+        // mode: a continuous one's A moves are refused by the checks.
+        let mut a = Machine::new(4);
+        assert!(PostSettings::from_machine(&a).is_ok());
+        a.p.insert("mode".into(), "Continuous 4-axis".into());
+        assert!(PostSettings::from_machine(&a).is_ok());
+        // The UC100's settings take its axes too; a run still refuses it.
+        a.p.insert("controller".into(), "UC100".into());
+        let uc100 = PostSettings::for_uc100(&a).err().unwrap_or_default();
+        assert!(uc100.iter().all(|e| !e.contains("axis")), "{uc100:?}");
+        let mut five = Machine::new(5);
+        five.p.insert("controller".into(), "UC100".into());
+        assert!(
+            PostSettings::for_uc100(&five)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.contains("Only 3-axis and indexed A output"))
+        );
+        assert!(not_run(&a).is_some_and(|e| e.contains("Only 3-axis runs")));
+        assert!(not_run(&Machine::new(3)).is_none());
+    }
+    /// The golden Facing pass made at A90 as an indexed setup's operation
+    /// is, from A0: the index move at the swing height (Z40) first.
+    fn indexed_plan(moves: &[(Motion, [f32; 3], f32, f32)]) -> Plan {
+        let steps: Vec<_> = moves.iter().map(|m| (m.0, m.1, m.2)).collect();
+        let mut plan = fixture::plan([-15., -15., 40.], &steps);
+        for (m, step) in plan.moves.iter_mut().zip(moves) {
+            m.a = Some(step.3);
+        }
+        plan
+    }
+    const AT_A90: [(Motion, [f32; 3], f32, f32); 5] = [
+        (Motion::Index, [-15., -15., 40.], 3600., 90.),
+        (Motion::Rapid, [-15., -15., 11.], 6000., 90.),
+        (Motion::Feed, [-15., -15., 9.], 250., 90.),
+        (Motion::Feed, [15., -15., 9.], 1000., 90.),
+        (Motion::Rapid, [15., -15., 25.], 6000., 90.),
+    ];
+    /// A job of `Machine::new(4)` whose setup 2 indexes to A90.
+    fn indexed_doc() -> Document {
+        let mut base = Setup::new(Machine::new(4), "G54");
+        base.p.insert("name".into(), "Bar".into());
+        let mut turned = base.duplicate("G54");
+        turned.p.insert("name".into(), "Flat".into());
+        turned
+            .p
+            .insert("reposition".into(), crate::indexed::ACTION.into());
+        turned.p.insert(crate::indexed::ANGLES.into(), "90".into());
+        Document {
+            title: "Golden".into(),
+            setups: vec![base, turned],
+            ..Default::default()
+        }
+    }
+    fn indexed_program(plan: &Plan) -> (String, Vec<Block>, PostSettings) {
+        indexed_program_in(&indexed_doc(), plan)
+    }
+    fn indexed_program_in(doc: &Document, plan: &Plan) -> (String, Vec<Block>, PostSettings) {
+        let settings = PostSettings::from_machine(&doc.setups[1].machine).unwrap();
+        let ops = vec![fixture::facing_op()];
+        let blocks = blocks(&ops, &[plan], &settings);
+        let header = Header {
+            job: "Golden",
+            setup: &doc.setups[1],
+            number: 2,
+            part: None,
+            stock: plan.stock,
+            located: None,
+            datum: [0., 0., 10.],
+            holding: None,
+            disabled: vec![],
+            a_axis: a_axis_note(doc, 1),
+        };
+        (emit(&header, &ops, &blocks, &settings), blocks, settings)
+    }
+    const INDEXED_GOLDEN: &str = "(AXIS CAM Studio - LinuxCNC 4-axis indexed program)
+(Job: Golden - Setup 2: Flat - G54)
+(Machine: Rotary Mill v1)
+(Work zero: Stock top center in G54, as the setup this one indexes from set it. Do not touch it off again: A has turned the stock.)
+(Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
+(A axis: indexed to A90 degrees in the clamping of setup 1; positive A turns +Y up to +Z, the right-hand rule about +X. Each turn is G0 A alone, X Y Z still, with the tool above all that A swings, and)
+(A axis, continued: the program ends back at A0; no move turns A. The A centreline is at machine Y140 Z-40 mm, assumed, not measured: probe it with Rotary A on the Control page before running this)
+(A axis, continued: program. A0 is where Find A zero on a flat set it, with Rotary A on the Control page.)
+(Requested fixture clearance, not checked: 15.000 mm)
+(T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
+(Operation 1: Face top - Facing - T1 - S8000)
+(Extents: X-15.000 to 15.000 Y-15.000 to -15.000 Z-1.000 to 30.000 mm)
+(Not checked: fixtures, clamps and the machine body. LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.)
+G17 G21 G40 G49 G80 G90 G94
+G64 P0.010
+G54
+G53 G0 Z0
+(Operation 1/1: Face top - T1)
+T1 M6
+G43 H1
+G53 G0 Z0
+G0 A90.000
+S8000 M3
+M8
+G4 P2.000
+G0 X-15.000 Y-15.000
+G0 Z30.000
+Z1.000
+G1 Z-1.000 F250.0
+X15.000 F1000.0
+G0 Z15.000
+M9
+M5
+G53 G0 Z0
+G0 A0.000
+M2
+";
+    #[test]
+    fn an_indexed_program_retracts_then_turns_a_alone_then_approaches_and_cuts() {
+        let plan = indexed_plan(&AT_A90);
+        let (text, blocks, settings) = indexed_program(&plan);
+        assert_eq!(text, INDEXED_GOLDEN);
+        let ops = [fixture::facing_op()];
+        crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54").unwrap();
+        // Two angles: the next turn is made where the index move puts the
+        // tool, at the swing height, after it leaves the first angle's cut.
+        let mut two = AT_A90.to_vec();
+        two.extend([
+            (Motion::Rapid, [15., -15., 40.], 6000., 90.),
+            (Motion::Index, [15., -15., 40.], 3600., 180.),
+            (Motion::Rapid, [15., -15., 11.], 6000., 180.),
+            (Motion::Feed, [15., -15., 9.], 250., 180.),
+            (Motion::Rapid, [15., -15., 25.], 6000., 180.),
+        ]);
+        let (text, blocks, settings) = indexed_program(&indexed_plan(&two));
+        let lines: Vec<&str> = text.lines().collect();
+        let turn = lines.iter().position(|l| *l == "G0 A180.000").unwrap();
+        assert_eq!(
+            lines[turn - 1..=turn + 1],
+            ["Z30.000", "G0 A180.000", "Z1.000"]
+        );
+        let turns: Vec<&str> = text.lines().filter(|l| l.starts_with("G0 A")).collect();
+        assert_eq!(turns, ["G0 A90.000", "G0 A180.000", "G0 A0.000"], "{text}");
+        crate::ngc::verify(&text, &blocks, &ops, [0., 0., 10.], &settings, "G54").unwrap();
+    }
+    #[test]
+    fn an_indexed_program_does_not_touch_off_on_the_turned_stock() {
+        let mut doc = indexed_doc();
+        for s in &mut doc.setups {
+            s.machine
+                .p
+                .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        }
+        let (text, ..) = indexed_program_in(&doc, &indexed_plan(&AT_A90));
+        assert!(text.contains("(Before starting: load T1 Flat end mill - D10, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted in the setup this one indexes from and enter its noted Z.)"), "{text}");
+        assert!(text.contains("(Do not touch off on the stock: A has turned it.)"));
+        assert!(!text.contains("on the stock top"), "{text}");
+    }
+    #[test]
+    fn the_replay_fails_a_program_whose_a_is_not_the_simulated_a() {
+        let (text, blocks, settings) = indexed_program(&indexed_plan(&AT_A90));
+        let ops = [fixture::facing_op()];
+        let check = |t: &str| crate::ngc::verify(t, &blocks, &ops, [0., 0., 10.], &settings, "G54");
+        assert_eq!(check(&text), Ok(()));
+        // The other way round, or a degree off.
+        for wrong in ["G0 A-90.000", "G0 A89.000"] {
+            let e = check(&text.replace("G0 A90.000", wrong)).unwrap_err();
+            assert!(e.contains("does not match the simulated A90.000"), "{e}");
+        }
+        // Not turned at all: the cut would be made at whatever A it was.
+        let e = check(&text.replace("G0 A90.000\n", "")).unwrap_err();
+        assert!(e.contains("expected G0 A90.000 alone"), "{e}");
+        // A turned during a move, or at a feed, is never read.
+        for bad in ["G0 X-15.000 Y-15.000 A90.000", "G1 A90.000 F100"] {
+            let e = check(&text.replace("G0 A90.000", bad)).unwrap_err();
+            assert!(e.contains("line "), "{e}");
+        }
+        // A 3-axis program never turns A: a turn in it is a move too many.
+        let (golden, blocks, settings) = program(Machine::new(3));
+        let with_a = golden.replace("G0 X-15.000 Y-15.000", "G0 A0.000\nG0 X-15.000 Y-15.000");
+        let e = crate::ngc::verify(&with_a, &blocks, &ops, [0., 0., 10.], &settings, "G54")
+            .unwrap_err();
+        assert!(e.contains("expected the rapid approach in X/Y"), "{e}");
+    }
+    #[test]
+    fn a_turning_during_a_move_is_refused_before_any_output() {
+        let doc = indexed_doc();
+        let settings = PostSettings::from_machine(&doc.setups[1].machine).unwrap();
+        let problems = |moves: &[(Motion, [f32; 3], f32, f32)]| {
+            let plan = indexed_plan(moves);
+            let ops = [fixture::facing_op()];
+            let blocks = blocks(&ops, &[&plan], &settings);
+            let sim = Simulation::new(plan);
+            crate::post_check::check_setup(
+                &doc.setups[1],
+                &ops,
+                &[&sim],
+                &blocks,
+                &settings,
+                [0., 0., 10.],
+            )
+        };
+        assert_eq!(problems(&AT_A90), Vec::<String>::new());
+        // A feed whose A is not the A of the move before: continuous A.
+        let mut continuous = AT_A90;
+        continuous[3].3 = 100.;
+        let found = problems(&continuous);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("Face top: A turns from A 90° to A 100° during a feed move to X15.000 Y-15.000 Z-1.000."),
+            "{found:?}"
+        );
+        // An index move that also moves X, Y or Z.
+        let mut combined = AT_A90.to_vec();
+        combined.extend([
+            (Motion::Rapid, [15., -15., 40.], 6000., 90.),
+            (Motion::Index, [15., -15., 35.], 3600., 180.),
+            (Motion::Feed, [15., -15., 9.], 250., 180.),
+        ]);
+        let found = problems(&combined);
+        assert!(
+            found.iter().any(|p| p.contains("during a rapid move")),
+            "{found:?}"
         );
     }
     #[test]
@@ -3824,6 +4298,7 @@ M2
             datum: [0., 0., 10.],
             holding: None,
             disabled: vec![],
+            a_axis: None,
         };
         let text = emit(&header, &ops, &blocks, &settings);
         (text, blocks, ops, settings)
@@ -3982,6 +4457,7 @@ M2
             to: [15., 15., 25.],
             feed: 0.,
             seconds: 0.,
+            a: None,
         }));
     }
     #[test]
@@ -4964,7 +5440,10 @@ M2
             },
             "Only the LinuxCNC",
         );
-        refused(&|d| d.setups[0].machine = Machine::new(4), "3-axis");
+        refused(
+            &|d| d.setups[0].machine = Machine::new(5),
+            "Only 3-axis and indexed A output",
+        );
         refused(
             &|d| {
                 d.setups[0].machine.p.insert("x".into(), "50".into());
@@ -5610,8 +6089,8 @@ M2
         assert!(doc.holding_issues(0, Some(&mesh))[0].contains("round bar"));
     }
     #[test]
-    fn an_indexed_setup_is_not_exported() {
-        use crate::indexed::{ACTION, ANGLES, NOT_POSTED};
+    fn an_indexed_setup_on_a_machine_without_a_is_not_exported() {
+        use crate::indexed::{ACTION, ANGLES, NO_A};
         let (mut doc, mesh) = pocket_job();
         assert!(post_job(&doc, &mesh).ready());
         let mut later = doc.setups[0].duplicate("G55");
@@ -5626,7 +6105,7 @@ M2
         assert!(posted.setups[0].result.is_ok());
         let refused = errors(&posted);
         assert_eq!(refused.len(), 1, "{refused:?}");
-        assert!(refused[0].ends_with(NOT_POSTED), "{refused:?}");
+        assert!(refused[0].ends_with(NO_A), "{refused:?}");
     }
     #[test]
     fn workholding_over_the_toolpath_refuses_the_setup_and_clear_workholding_exports() {
@@ -6452,6 +6931,7 @@ M2
                             datum: [0., 0., 10.],
                             holding: Some(user.clone()),
                             disabled: vec![user.clone()],
+                            a_axis: None,
                         };
                         let text = emit(&header, &ops, &blocks, &settings);
                         let counts = assert_comments_begin_with_app_words(&text);
@@ -6534,6 +7014,7 @@ M2
                 datum: [0., 0., 10.],
                 holding: None,
                 disabled: vec![],
+                a_axis: None,
             };
             let text = emit(&header, &ops, &blocks, &settings);
             assert_comments_begin_with_app_words(&text);
