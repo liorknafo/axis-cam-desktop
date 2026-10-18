@@ -983,7 +983,10 @@ impl Chuck {
         datum: [f32; 3],
     ) -> Vec<String> {
         let Some((tool, assumed)) = self.tools.get(op) else {
-            return vec![];
+            return vec![format!(
+                "The way in from where the machine is cannot be checked: operation {} has no tool. Check the setup again.",
+                op + 1
+            )];
         };
         let reach = self.gap + self.blend;
         let mut out = vec![];

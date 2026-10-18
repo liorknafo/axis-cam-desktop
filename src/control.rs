@@ -5785,41 +5785,48 @@ spindle_max_rpm = 24000
                 })
                 .collect()
         };
-        let start = c.snapshot.machine_pos;
-        let run = moves(0, start);
         let programs = crate::post::post_job(&linuxcnc, &mesh).setups[1]
             .result
             .clone()
             .unwrap();
         let replay = crate::ngc::replay(&programs[0].text).unwrap();
-        let mut at = start;
-        let mut posted = vec![];
-        for step in replay
-            .steps
-            .iter()
-            .filter(|s| s.kind != crate::ngc::StepKind::Dwell)
-        {
-            let mut to = at;
-            for k in 0..3 {
-                if let Some(v) = step.to[k] {
-                    to[k] = if step.machine { v } else { v + offset[k] };
+        // The exported program's moves at the work offset, from `start`.
+        let posted = |start: Vec6| -> Vec<Vec6> {
+            let mut at = start;
+            let mut out = vec![];
+            for step in (replay.steps.iter()).filter(|s| s.kind != crate::ngc::StepKind::Dwell) {
+                let mut to = at;
+                for k in 0..3 {
+                    if let Some(v) = step.to[k] {
+                        to[k] = if step.machine { v } else { v + offset[k] };
+                    }
+                }
+                if let Some(a) = step.a {
+                    to[3] = a + offset[3];
+                }
+                if (0..4).any(|k| (to[k] - at[k]).abs() > 2e-3) {
+                    out.push(to);
+                    at = to;
                 }
             }
-            if let Some(a) = step.a {
-                to[3] = a + offset[3];
-            }
-            if (0..4).any(|k| (to[k] - at[k]).abs() > 2e-3) {
-                posted.push(to);
-                at = to;
+            out
+        };
+        // From the top of Z, and from 10 mm under it, where both first
+        // retract up, Z alone.
+        let start = c.snapshot.machine_pos;
+        let mut under = start;
+        under[2] = -10.;
+        for from in [start, under] {
+            let (run, posted) = (moves(0, from), posted(from));
+            assert_eq!(run.len(), posted.len());
+            for (r, e) in run.iter().zip(&posted) {
+                assert!(
+                    (0..4).all(|k| (r[k] - e[k]).abs() < 2e-3),
+                    "run {r:?}, export {e:?}"
+                );
             }
         }
-        assert_eq!(run.len(), posted.len());
-        for (r, e) in run.iter().zip(&posted) {
-            assert!(
-                (0..4).all(|k| (r[k] - e[k]).abs() < 2e-3),
-                "run {r:?}, export {e:?}"
-            );
-        }
+        assert_eq!(moves(0, under)[0][..3], [150., 140., 0.]);
         // The way in: up, never down; across with A still; A alone; down.
         let way = |found: &[Vec6], from: Vec6| -> Vec<&str> {
             let mut at = from;
