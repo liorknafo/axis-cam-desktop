@@ -2039,7 +2039,8 @@ mod tests {
         assert!(!passed);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
-            problems[0].starts_with("generation/2: Index moves turn A with the tool above all that A swings: at machine Z 1.86")
+            problems[0].starts_with("generation/2: Index moves turn A with the tool above all that A swings under it: at machine Z 1.11 with the tool over X")
+                && problems[0].contains("(the A centreline at Z -45 + 31.11 mm, as far as the stock reaches from it at any angle, + 15 mm clearance)")
                 && problems[0].contains("above the top of the machine's 100 mm Z travel (Z 0)"),
             "{problems:?}"
         );

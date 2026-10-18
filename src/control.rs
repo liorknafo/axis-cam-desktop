@@ -5427,6 +5427,194 @@ spindle_max_rpm = 24000
         }
     }
 
+    /// LIO-209: the library CNC4030 + rotary, 55 mm of Z with the A
+    /// centreline at machine Z -40 and a Ø100 chuck. Its jaws reach 55.9 mm
+    /// from the centreline, above the top of the Z travel, but a contour
+    /// round a part 20 mm along a Ø40 bar is over the bar: A turns 15 mm
+    /// over the bar's top, at machine Z -5. The job at A 0, 90, 180 and -90
+    /// (its A turns ±180°) exports at 60
+    /// and 100 mm of stick-out, and at 100 runs to the end on the simulated
+    /// UC100, every turn of A at that height. A Ø80 bar leaves 15 mm of
+    /// clearance over it above the Z travel: export and the run refuse it
+    /// with the numbers.
+    #[test]
+    fn a_four_angle_bar_job_on_the_library_rotary_machine_exports_and_runs() {
+        use crate::indexed::tests::{bar_job, cutter, height, on_the_bar, prism};
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        // Down to 2 mm over the axis: the web keeps the part on the bar
+        // (LIO-208).
+        let mut op = on_the_bar(&cutter("12"));
+        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+            op.p.insert(k.into(), v.into());
+        }
+        let path = dir.path().join("profile.toml");
+        let job =
+            |mesh: &crate::mesh::Mesh, x0: f32, stickout: &str, bar: f32, controller: &str| {
+                let mut doc = bar_job(mesh, x0, stickout, "-40", "0, 90, 180, -90", op.clone());
+                let mut m = rotary_machine(dir.path()).unwrap();
+                for (k, v) in [
+                    ("controller", controller),
+                    ("uc100_profile", &*path.display().to_string()),
+                    ("uc100_connection", "Simulated"),
+                    ("feed", "60000"),
+                    ("post_dwell", "0.2"),
+                    (CENTRE_MARK, MEASURED),
+                    (crate::model::CENTRE_REF, "10 10 -50"),
+                ] {
+                    m.p.insert(k.into(), v.into());
+                }
+                doc.setups[0].machine = m;
+                let p = &mut doc.setups[0].p;
+                p.insert("stock_diameter".into(), bar.to_string());
+                // The part on the bar's axis.
+                let s = mesh.display_scale();
+                let tz = bar / 2. - mesh.dimensions[2] / 2. - 4. / s;
+                p.insert("tz".into(), tz.to_string());
+                doc.tools[0].p.insert("number".into(), "1".into());
+                doc.file = Some(crate::model::ModelFile {
+                    name: "bar.stl".into(),
+                    path: "bar.stl".into(),
+                    format: "STL".into(),
+                    bytes: 1,
+                });
+                doc.machines = vec![doc.setups[0].machine.clone()];
+                doc.sync_indexed();
+                doc.sync_stock_sources();
+                doc.sync_turns(Some(mesh));
+                doc
+            };
+        let doc = job(&mesh, 20., "100", 40., "UC100");
+        let m = doc.setups[1].machine.clone();
+        let unit = m.rotary_unit().unwrap();
+        assert_eq!((unit.centre_z, unit.chuck_diameter), (-40., 100.));
+        assert_eq!(get(&m.p, "z"), "55");
+        // Along all of A the jaws are out of reach; under the tool A swings
+        // only the bar.
+        assert!(doc.swing(1, &mesh, 15.).is_err());
+        let plan = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap().plan;
+        let swing = height(&doc, &mesh, 1, &plan, 15.);
+        assert_eq!((swing.what, swing.radius), ("the stock reaches", 20.));
+        assert!((swing.machine_z - -5.).abs() < 1e-3, "{swing:?}");
+        // Both stick-outs export, as LinuxCNC programs. At 60 mm the part
+        // is shorter and nearer the bar's end: the Ø65 spindle nose comes
+        // down to the part's bottom, 50 mm over the centreline, so it stays
+        // its radius and the gap off the jaws in X.
+        let short = prism(15.);
+        for (mesh, x0, stickout) in [(&mesh, 20., "100"), (&short, 42., "60")] {
+            let linuxcnc = job(mesh, x0, stickout, 40., "LinuxCNC");
+            let exported = crate::post::post_job(&linuxcnc, mesh);
+            let result = &exported.setups[1].result;
+            assert!(result.is_ok(), "{stickout}: {result:?}");
+        }
+        // The Ø80 bar: refused by export and the run, with its numbers.
+        let words = [
+            "at machine Z 15 with the tool over X",
+            "(the A centreline at Z -40 + 40 mm, as far as the stock reaches from it at any angle, + 15 mm clearance)",
+            "15 mm above the top of the machine's 55 mm Z travel (Z 0)",
+        ];
+        let says = |e: &[String]| words.iter().all(|w| e.iter().any(|e| e.contains(w)));
+        // The contour from the bar's top to 15 mm over the part's bottom,
+        // within the cutter's reach.
+        let thick = |controller| {
+            let mut doc = job(&mesh, 20., "100", 80., controller);
+            (doc.setups[1].operations[0].p).insert("bottom".into(), "15".into());
+            doc
+        };
+        let exported = crate::post::post_job(&thick("LinuxCNC"), &mesh);
+        let refused = exported.setups[1].result.as_ref().unwrap_err();
+        assert!(says(refused), "{refused:?}");
+        let refused = crate::run::check(&thick("UC100"), &mesh, 1).0.unwrap_err();
+        assert!(says(&refused), "{refused:?}");
+        // The Ø40 job runs on the simulated UC100, its travel and A range
+        // the library machine's.
+        let profile = [
+            ("soft_max = 600.0", "soft_max = 390.0"),
+            ("soft_max = 400.0", "soft_max = 280.0"),
+            ("soft_min = -300.0", "soft_min = -55.0"),
+            ("soft_min = -360.0", "soft_min = -180.0"),
+            ("soft_max = 360.0", "soft_max = 180.0"),
+        ]
+        .iter()
+        .fold(ROTARY_SIM.to_string(), |p, (from, to)| p.replace(from, to));
+        let mut c = zeroed_sim(dir.path(), &profile, Some(&m), 4);
+        let (programs, left) = crate::run::check(&doc, &mesh, 1);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
+        let here = c.snapshot.machine_pos;
+        for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
+            c.send(Command::SetWork {
+                axis,
+                value: here[axis] - z,
+            });
+            until(&mut c, 2.0, "the work offset", |s| {
+                (s.work_offset[axis] - z).abs() < 1e-6
+            });
+        }
+        let mut run = crate::run::Run::new(&doc, 1, 0);
+        run.checked_as(
+            std::sync::Arc::new(Ok(programs)),
+            Some(std::sync::Arc::new(left)),
+        );
+        // Touched off on the A reference, as long as the probe.
+        run.length = Some((doc.tools[0].id.clone(), 0., -50.));
+        c.run = Some(run);
+        let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+        assert!(problems.is_empty(), "{problems:?}");
+        // Every turn of A with the tool at that height, inside the travel.
+        let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+        let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+        let mut at = start;
+        let mut turns = vec![];
+        for l in &actions {
+            if let Do::Move { target, .. } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    assert!(plan_z(target) >= swing.z as f64 - 1e-3, "{l:?} {swing:?}");
+                    assert!(target[2] <= 1e-6, "{l:?}");
+                    turns.push(target[3]);
+                }
+                at = target;
+            }
+        }
+        assert_eq!(turns, [90., 180., -90., 0.]);
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.run_act(R::CycleStart, &doc);
+        assert!(c.run.as_ref().unwrap().running.is_some());
+        let mut reached = [false; 4];
+        let cap = Instant::now() + Duration::from_secs(600);
+        while !c
+            .snapshot
+            .program_outcome
+            .as_ref()
+            .is_some_and(|o| o.seq > seq)
+        {
+            c.refresh();
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let s = &c.snapshot;
+            for (k, a) in [0., 90., 180., -90.].iter().enumerate() {
+                reached[k] |= s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+            }
+            assert!(Instant::now() < cap, "the job did not end: {:?}", s.log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        assert_eq!(reached, [true; 4]);
+        until(&mut c, 3.0, "Idle after the job", |s| {
+            s.state == Some(State::Idle)
+        });
+        if let Some(r) = &mut c.run {
+            r.refresh(c.snapshot.program_outcome.as_ref());
+        }
+        let run = c.run.as_ref().unwrap();
+        assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
+        assert!(c.snapshot.machine_pos[3].abs() < 0.03);
+    }
     /// A Ø40 bar milled square at A 0, 90, 180 and 270 in one job on the
     /// simulated UC100 (LIO-192): admitted only on a measured, current A
     /// centreline with the work zero on it and every A inside its soft
@@ -5577,12 +5765,13 @@ spindle_max_rpm = 24000
             }
         }
         assert_eq!(turns, [90., 180., 270., 0.]);
-        // Each turn as export makes it: the tool up at or above all that A
-        // swings, A alone, then on. The first follows the tool run's Z-only
-        // retract and comes before the spindle starts, its dwell and the
-        // approach in X and Y.
+        // Each turn as export makes it: the tool up at or above what A
+        // swings under it, A alone, then on. The first follows the tool
+        // run's Z-only retract, the spindle start, its dwell and the
+        // approach in X and Y over the first cut (LIO-209).
         let clearance = crate::cam::number(&doc.setups[1].operations[0], "clearance").unwrap();
-        let swing = doc.swing(1, &mesh, clearance).unwrap();
+        let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
+        let swing = crate::indexed::tests::height(&doc, &mesh, 1, &sim.plan, clearance);
         let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
         let mut at = start;
         let mut first = None;
@@ -5596,13 +5785,25 @@ spindle_max_rpm = 24000
             }
         }
         let i = first.unwrap();
+        let before: Vec<(usize, [f64; 6])> = (0..i)
+            .filter_map(|k| match actions[k].action {
+                Do::Move { target, .. } => Some((k, target)),
+                _ => None,
+            })
+            .collect();
+        let [.., (r, retract), (k, across)] = before[..] else {
+            panic!("{before:?}");
+        };
         assert!(
-            matches!(actions[i - 1].action, Do::Move { target, .. } if target[..2] == start[..2] && target[3] == start[3])
+            retract[..2] == start[..2] && retract[3] == start[3],
+            "{retract:?}"
         );
-        let next = (i + 1..actions.len())
-            .find(|&k| matches!(actions[k].action, Do::Move { .. }))
-            .unwrap();
-        let between: Vec<&Do> = actions[i + 1..next].iter().map(|l| &l.action).collect();
+        assert!(
+            across[2] == retract[2] && across[3] == start[3],
+            "{across:?}"
+        );
+        assert_eq!(k, i - 1);
+        let between: Vec<&Do> = actions[r + 1..k].iter().map(|l| &l.action).collect();
         assert!(
             matches!(between.first(), Some(Do::Spindle { .. }))
                 && matches!(between.last(), Some(Do::Dwell { .. }))
@@ -5612,8 +5813,11 @@ spindle_max_rpm = 24000
                 )),
             "{between:?}"
         );
+        let next = (i + 1..actions.len())
+            .find(|&k| matches!(actions[k].action, Do::Move { .. }))
+            .unwrap();
         assert!(
-            matches!(actions[next].action, Do::Move { target, feed: None } if target[2] == at_z(&actions, i) && target[3] == 90.),
+            matches!(actions[next].action, Do::Move { target, feed: None } if target[..2] == across[..2] && target[2] < at_z(&actions, i) && target[3] == 90.),
             "{:?}",
             actions[next]
         );

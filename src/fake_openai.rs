@@ -319,7 +319,7 @@ pub mod rotary {
     pub fn mesh() -> Mesh {
         crate::indexed::tests::prism(30.)
     }
-    /// The project: the bar on a rotary machine whose A centreline is 80 mm
+    /// The project: the bar on a rotary machine whose A centreline is 45 mm
     /// under the top of a 100 mm Z travel, with a Ø10 end mill as tool 1 and
     /// aluminium. Setup 1 is held by nothing yet; the
     /// stock is a box round the part.
@@ -336,7 +336,7 @@ pub mod rotary {
         let mut machine = crate::indexed::tests::rotary();
         for (key, value) in [
             ("z", "100"),
-            ("a_centre_z", "-80"),
+            ("a_centre_z", "-45"),
             ("rotary_min", "-360"),
             ("rotary_max", "360"),
         ] {
@@ -421,8 +421,8 @@ pub mod rotary {
         }
     }
     /// A plan whose stock is too big for the Z travel: a 44 mm box, whose
-    /// corners and the jaws swing so far from the centreline that a retract
-    /// above them is out of the Z travel.
+    /// corners swing 31.1 mm from the centreline under the tool, so that a
+    /// retract 15 mm above them is out of the Z travel (LIO-209).
     pub fn too_big() -> Proposal {
         let mut plan = good();
         plan.summary = "The same, in a larger box.".into();
