@@ -615,6 +615,9 @@ pub const DRILL_CYCLES: [&str; 5] = [
 /// helix to a flat bottom, in rings out to the hole's size when it is over
 /// twice the cutter's.
 pub const HELICAL_MILLING: &str = "Helical milling";
+/// Why a drill's pin-hole Drill refuses Helical milling, which it would
+/// drill as a plain plunge (`cam::pin_holes`).
+pub const HELICAL_PIN_DRILL: &str = "A drill drills the pin holes: Helical milling is for a flat end mill. Choose another drilling cycle, or a flat end mill.";
 /// How Adaptive clearing enters material it cannot reach from the side
 /// (its `ramp` setting).
 pub const ADAPTIVE_ENTRIES: [&str; 2] = ["Helix", "Plunge"];
@@ -1293,6 +1296,8 @@ impl Operation {
                         "Choose a drill, or a flat end mill to mill them, for the pin holes."
                             .into(),
                     )
+                } else if get(&t.p, "type") == "Drill" && get(&self.p, "cycle") == HELICAL_MILLING {
+                    e.push(HELICAL_PIN_DRILL.into())
                 }
             } else if self.helical() && crate::lathe::is_lathe(m) {
                 // Its own issue below: the tool is not what is wrong.
@@ -2961,6 +2966,25 @@ mod tests {
             o.tool = tool.id.clone();
             assert_eq!(only(&o, &lathe), [crate::lathe::HELICAL_ON_LATHE]);
         }
+        // Switched to the pin holes, a drill would plunge them: the cycle
+        // is refused. An end mill mills them whatever the cycle says.
+        o.p.insert("holes".into(), DRILL_HOLES[1].into());
+        o.tool = drill.id.clone();
+        assert!(
+            o.issues(&m, &tools, &[])
+                .contains(&HELICAL_PIN_DRILL.to_string())
+        );
+        o.tool = mill.id.clone();
+        assert!(
+            !o.issues(&m, &tools, &[])
+                .contains(&HELICAL_PIN_DRILL.to_string())
+        );
+        o.p.insert("cycle".into(), DRILL_CYCLES[0].into());
+        o.tool = drill.id.clone();
+        assert!(
+            !o.issues(&m, &tools, &[])
+                .contains(&HELICAL_PIN_DRILL.to_string())
+        );
     }
     #[test]
     fn incompatible_pick_ignored() {

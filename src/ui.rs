@@ -554,7 +554,12 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("name") | None => {
             return if issue.contains("feature or surface") {
                 Some("Geometry")
-            } else if issue == manual::HELICAL_ON_MANUAL || issue == crate::lathe::HELICAL_ON_LATHE
+            } else if [
+                manual::HELICAL_ON_MANUAL,
+                crate::lathe::HELICAL_ON_LATHE,
+                crate::model::HELICAL_PIN_DRILL,
+            ]
+            .contains(&issue)
             {
                 Some("Cycle")
             } else if issue.starts_with("Choose a tool")
@@ -9839,6 +9844,10 @@ mod tests {
         );
         assert_eq!(
             super::operation_issue_tab(Strategy::Drill, crate::lathe::HELICAL_ON_LATHE),
+            Some("Cycle")
+        );
+        assert_eq!(
+            super::operation_issue_tab(Strategy::Drill, crate::model::HELICAL_PIN_DRILL),
             Some("Cycle")
         );
         assert_eq!(
