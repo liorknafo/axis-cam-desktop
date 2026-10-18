@@ -702,21 +702,28 @@ impl canvas::Program<Message> for TopAngle {
     ) -> Vec<canvas::Geometry> {
         let mut f = canvas::Frame::new(renderer, bounds.size());
         let (w, h) = (bounds.width, bounds.height);
-        let c = Point::new(w * 0.62, h * 0.6);
+        // Wound out, the arrow points down, away from the axis: the
+        // centre higher, room for it and its words below.
+        let c = Point::new(w * 0.62, h * if self.out { 0.3 } else { 0.6 });
         let l = (h * 0.5).min(w * 0.45);
         // The bed, along the axis, and the cross slide, toward it.
         f.stroke(
             &canvas::Path::line(Point::new(6., c.y), Point::new(w - 6., c.y)),
             dashed(MUTED, 1.),
         );
+        let (top, bottom) = if self.out {
+            (c.y - l * 0.5, c.y + l * 0.9)
+        } else {
+            (c.y - l, c.y + l * 0.55)
+        };
         f.stroke(
-            &canvas::Path::line(Point::new(c.x, c.y + l * 0.55), Point::new(c.x, c.y - l)),
+            &canvas::Path::line(Point::new(c.x, bottom), Point::new(c.x, top)),
             stroke(INK, 1.4),
         );
         word(
             &mut f,
             "cross slide",
-            Point::new(c.x + 5., c.y - l + 6.),
+            Point::new(c.x + 5., top + 6.),
             MUTED,
             11.,
             Align::Left,
@@ -739,7 +746,7 @@ impl canvas::Program<Message> for TopAngle {
         arrow(&mut f, c, tip, ACCENT, 3.);
         let along = self.from_cross > 89.9;
         // The angle between the cross slide and the top slide.
-        if self.from_cross > 0.5 && !along {
+        if self.from_cross > 0.5 {
             let up = if self.out {
                 std::f32::consts::FRAC_PI_2
             } else {
@@ -758,26 +765,45 @@ impl canvas::Program<Message> for TopAngle {
             f.stroke(&arc, stroke(ACCENT, 1.4));
         }
         // The number left of the top slide's arrow, the arc showing which
-        // angle it is.
+        // angle it is: along the bed, the quarter from the cross slide.
         let mid = Point::new(c.x - a.sin() * l * 0.55, c.y + v * a.cos() * l * 0.55);
-        let (label, at) = if along {
-            ("0°".to_string(), Point::new(c.x - l * 0.55, c.y - 12.))
+        let at = if along {
+            Point::new(c.x - l * 0.48, c.y - l * 0.42)
         } else {
-            (
-                format!("{}°", trimmed(self.from_cross)),
-                Point::new(mid.x - 8., mid.y),
-            )
+            Point::new(mid.x - 8., mid.y)
         };
+        let label = format!("{}°", trimmed(self.from_cross));
         word(&mut f, &label, at, ACCENT, 13., Align::Right, bold_font());
+        // Which way the arrow takes the tool.
+        // Which way the arrow takes the tool (along the bed: to the chuck,
+        // as its word says).
+        if !along {
+            // Above the tip ending just right of it, clear of "cross
+            // slide"; below it, under the cross slide's line.
+            let (way, at, align) = if self.out {
+                (
+                    "away from the axis",
+                    Point::new(tip.x + 10., bottom + 9.),
+                    Align::Center,
+                )
+            } else {
+                (
+                    "toward the axis",
+                    Point::new(tip.x + 8., tip.y - 9.),
+                    Align::Right,
+                )
+            };
+            word(&mut f, way, at, ACCENT, 10., align, Font::DEFAULT);
+        }
         vec![f.into_geometry()]
     }
 }
 /// The top slide's angle as a small picture over its words: "29.5° from
-/// the cross slide", or "0°, along the bed".
+/// the cross slide", or "along the bed (90° from the cross slide)".
 fn top_angle<'a>(from_cross: f32, out: bool) -> Element<'a, Message> {
     let along = (from_cross - 90.).abs() < 1e-3;
     let words = if along {
-        "top slide 0°, along the bed".to_string()
+        "along the bed\n(90° from the cross slide)".to_string()
     } else {
         format!("{}° from the cross slide", trimmed(from_cross))
     };
@@ -816,15 +842,18 @@ fn to_centre(p: &Page<'_>, op: usize) -> bool {
         _ => false,
     }
 }
+/// The top slide along the bed, named, as a thread's angle is, from the
+/// cross slide.
+const ALONG: &str = "top slide along the bed (90° from the cross slide)";
 /// The chip of the top slide's setting for a Face or a Chamfer: along the
 /// bed, or set back to it from the angle a thread left it at.
 fn set_back<'a>(swung: Option<f32>) -> Element<'a, Message> {
     match swung {
         Some(a) => warn_chip(format!(
-            "top slide back from {}° to 0°, along the bed",
+            "top slide from {}° back along the bed (90° from the cross slide)",
             mm(a)
         )),
-        None => chip("top slide 0°, along the bed"),
+        None => chip(ALONG),
     }
 }
 /// A slide's name on the screens.

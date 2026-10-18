@@ -2941,7 +2941,7 @@ pub(crate) mod tests {
                 "Face",
                 "top slide",
                 "in 1.00 from the touch",
-                "top slide 0°, along the bed",
+                "top slide along the bed (90° from the cross slide)",
                 "lock the carriage",
                 "on the new end",
                 "Section done ▶",
@@ -3157,7 +3157,7 @@ pub(crate) mod tests {
             &a,
             &[
                 "45° tool edge",
-                "top slide back from 29.5° to 0°, along the bed",
+                "top slide from 29.5° back along the bed (90° from the cross slide)",
             ],
         );
     }
@@ -3429,5 +3429,23 @@ pub(crate) mod tests {
         // Only inside tools: the Zero touches the end and measures the bar.
         let zero = nth(&a, 0, |l| matches!(l, L::Zero { .. }));
         shot(&mut a, "21-zero-bore-first", zero, 1);
+        // An inside thread: the top slide wound out, away from the axis.
+        let mut a = bore_app(|doc| {
+            doc.setups[0].operations[1]
+                .p
+                .insert("diameter".into(), "20.4".into());
+            crate::turn::tests::add(
+                doc,
+                "Thread",
+                &[
+                    ("thread_side", "Inside"),
+                    ("diameter", "22"),
+                    ("pitch", "1.5"),
+                    ("z_end", "-15"),
+                ],
+            );
+        });
+        let thread = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
+        shot(&mut a, "25-inside-thread-pass-2", thread + 1, 1);
     }
 }

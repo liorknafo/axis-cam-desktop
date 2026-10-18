@@ -320,7 +320,7 @@ pub enum LatheStep {
     /// the bed) in `face_off` on its dial, face across to `to_diameter`;
     /// then, the tool on the new end at `new_end`: zero the carriage dial
     /// there. Every later carriage reading is from the new end. The top
-    /// slide is set 0°, along the bed; `swung` is the angle from the cross
+    /// slide is set along the bed (90° from the cross slide); `swung` is the angle from the cross
     /// slide a thread before left it at, to set back.
     Face {
         op: usize,
@@ -378,8 +378,8 @@ pub enum LatheStep {
     /// A 45° chamfer of leg `size` on `edge` with a tool that has a 45°
     /// edge: the carriage at `carriage` (on a shoulder: the tool's point
     /// `size` short of it; the end edges are touched), locked; the 45° edge
-    /// brought to the corner, then the top slide, set along the bed (0°),
-    /// in `top` (`size`) toward the chuck, so both legs are `size`.
+    /// brought to the corner, then the top slide, set along the bed (90°
+    /// from the cross slide), in `top` (`size`) toward the chuck, so both legs are `size`.
     Chamfer {
         op: usize,
         tool: String,
@@ -389,7 +389,7 @@ pub enum LatheStep {
         top: Dial,
         carriage: Option<Dial>,
         /// The angle from the cross slide a thread before left the top
-        /// slide at, to set back to 0°, along the bed.
+        /// slide at, to set back along the bed (90° from the cross slide).
         swung: Option<f32>,
     },
     /// A groove (or a part off, `part_off`) with a `width` blade: the
