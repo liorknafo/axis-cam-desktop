@@ -2,7 +2,7 @@ use crate::{
     App, Message, Page, Target,
     help::{self, Help, HelpButton},
     holding::Held,
-    manual,
+    lathe, manual,
     material::SpeedFeed,
     model::*,
     planner::Dropped,
@@ -503,10 +503,13 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             } else if issue.starts_with("Choose a tool")
                 || issue.starts_with("Choose a drill")
                 || issue.contains(" is not on ")
+                || (issue.starts_with("Choose a ") && issue.ends_with(" turn."))
             {
                 Some("Tool")
             } else if issue.starts_with("The box must be") {
                 Some("Box")
+            } else if issue == lathe::DRILL_ON_CENTRE {
+                Some("Centre")
             } else {
                 None
             };
@@ -514,6 +517,10 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("rpm" | "feed") => "Tool",
         Some("hole_diameter") => "Geometry",
         Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
+        Some(
+            "turn_kind" | "face_off" | "to_diameter" | "diameter" | "z_end" | "z" | "edge" | "size"
+            | "width" | "thread_side" | "pitch",
+        ) => "Turn",
         Some(
             "clearance" | "retract" | "top" | "bottom" | "breakthrough" | "openings" | "tab_count"
             | "tab_width" | "tab_height",
@@ -1065,16 +1072,26 @@ fn ribbon(app: &App) -> Element<'_, Message> {
         .doc
         .active_setup()
         .is_some_and(|s| manual::is_manual(&s.machine));
+    let lathe_setup = app
+        .doc
+        .active_setup()
+        .is_some_and(|s| lathe::is_lathe(&s.machine));
     for (label, range) in [
         ("2D MILLING", 0..5),
         ("3D FINISHING", 5..8),
         ("MULTI-AXIS", 8..11),
         ("MANUAL", 11..12),
+        ("LATHE", 12..13),
     ] {
         let mut buttons = Row::new().spacing(1);
         for s in &Strategy::ALL[range] {
             let s = *s;
-            let reason = if s == Strategy::Box {
+            // Why the strategy is dimmed on the active setup's machine.
+            let reason = if lathe_setup {
+                (!matches!(s, Strategy::Turn | Strategy::Drill)).then_some(lathe::ONLY_TURN)
+            } else if s == Strategy::Turn {
+                Some(lathe::TURN_ON_MILL)
+            } else if s == Strategy::Box {
                 (!manual_setup).then_some(manual::BOX_ON_CNC)
             } else {
                 (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
@@ -1467,7 +1484,7 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
                 container(muted(format!("{} · v{}", s.machine.name(), s.machine.version)).size(12))
                     .padding([0, 16]),
             );
-            if manual::is_manual(&s.machine) {
+            if manual::is_hand(&s.machine) {
                 tree = tree.push(
                     container(
                         secondary("Steps ▶", Message::Guide(crate::GuideAction::Open(si)))
@@ -1550,6 +1567,9 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
         .push(secondary("+ Add setup", Message::AddSetup).width(Fill));
     if app.doc.machines.iter().any(manual::is_manual) {
         tree = tree.push(secondary("+ Add manual setup", Message::AddManualSetup).width(Fill));
+    }
+    if app.doc.machines.iter().any(lathe::is_lathe) {
+        tree = tree.push(secondary("+ Add lathe setup", Message::AddLatheSetup).width(Fill));
     }
     let footer = column![
         rule::horizontal(1),
@@ -2251,7 +2271,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     ]
     .spacing(9)
     .align_y(Alignment::Center);
-    let all = o.strategy.tabs();
+    let all = o.tabs(&app.doc.setup().machine);
     let mut tabs = Column::new().spacing(2);
     // Five tabs fit one row; the sixth, Orientation, takes two rows of three.
     for chunk in all.chunks(if all.len() > 5 { 3 } else { all.len().max(1) }) {
@@ -2276,10 +2296,18 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
     }
     let p = &o.p;
     let t = Target::Operation;
+    let machine = &app.doc.setup().machine;
+    let lathe = lathe::is_lathe(machine);
     match app.tab.as_str() {
         "Tool" => {
             c = c.push(section("Cutter"));
-            for tool in &app.doc.tools {
+            // A lathe's operation offers the tools that fit the lathe.
+            for tool in app
+                .doc
+                .tools
+                .iter()
+                .filter(|tool| !lathe || tool.fits(machine) || o.tool == tool.id)
+            {
                 c = c.push(
                     btn(
                         tool_label(tool),
@@ -2293,7 +2321,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 .push(secondary("Open tool library", Message::Page(Page::Tools)))
                 .push(section("Feeds & speeds"))
                 .push(checks.field(p, "rpm", "Spindle speed · rpm"));
-            if o.strategy.imported_preview() && o.strategy != Strategy::Box && !app.is_sample() {
+            if o.strategy.imported_preview()
+                && !matches!(o.strategy, Strategy::Box | Strategy::Turn)
+                && !lathe
+                && !app.is_sample()
+            {
                 c = c
                     .push(choice_value(
                         p,
@@ -2310,15 +2342,18 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         .size(12),
                     );
             }
-            c = c
-                .push(checks.field(p, "feed", "Cutting feed · mm/min"))
-                .push(choice(
-                    p,
-                    "coolant",
-                    "Coolant",
-                    &["Flood", "Mist", "Air", "Off"],
-                    t,
-                ));
+            if o.strategy == Strategy::Turn {
+                c = c.push(muted("Feed: the carriage power feed, or by hand.").size(12));
+            } else {
+                c = c.push(checks.field(p, "feed", "Cutting feed · mm/min"));
+            }
+            c = c.push(choice(
+                p,
+                "coolant",
+                "Coolant",
+                &["Flood", "Mist", "Air", "Off"],
+                t,
+            ));
             // A speed or feed outside the material's cutting data is a
             // warning at its field; why none is checked is said here.
             if let Some(SpeedFeed::Unchecked(why)) = app.doc.speed_feed(app.doc.setup(), o) {
@@ -2536,14 +2571,22 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     .push(secondary("From selected face", Message::BoxFromFace).width(Fill));
             }
         }
+        "Turn" => {
+            c = c.push(turn_fields(o, checks));
+        }
+        "Centre" => {
+            c = c
+                .push(note(
+                    "Drills on the centre line from the tailstock, in from the free end.",
+                ))
+                .push(checks.field(p, "depth", "Depth · mm"));
+        }
         "Heights" => {
             c = c.push(note(if o.strategy == Strategy::Box {
                 "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
             } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
-            } else if !app.is_sample() && o.strategy == Strategy::Adaptive {
-                "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
-            } else if !app.is_sample() && o.strategy == Strategy::Pocket {
+            } else if !app.is_sample() && matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket) {
                 "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
             } else if !app.is_sample() && o.strategy==Strategy::Contour && get(p,"boundary")=="Selected geometry" {
                 "Inside contour skips fully cleared top layers and ends at the selected floor + bottom offset. Negative bottom offsets are rejected. Profile ramp/plunge are configured in Linking; the pocket interior is not cleared. Clearance/retract retain the original stock reference."
@@ -2690,20 +2733,21 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             if get(p, "cycle") == "Counterboring" {
                 c = c.push(checks.field(p, "dwell", "Dwell at bottom · seconds"));
             }
-            c = c
-                .push(choice(
+            if !lathe {
+                c = c.push(choice(
                     p,
                     "hole_order",
                     "Hole order",
                     &["Optimize travel", "By X then Y"],
                     t,
-                ))
-                .push(note(match get(p, "cycle") {
-                    "Chip breaking" => "Retract slightly after each peck to break the chip.",
-                    "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
-                    "Counterboring" => "Feed to depth and dwell before retracting.",
-                    _ => "Feed to the bottom in one move, then retract.",
-                }));
+                ));
+            }
+            c = c.push(note(match get(p, "cycle") {
+                "Chip breaking" => "Retract slightly after each peck to break the chip.",
+                "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
+                "Counterboring" => "Feed to depth and dwell before retracting.",
+                _ => "Feed to the bottom in one move, then retract.",
+            }));
         }
         "Passes" => {
             c = c.push(pass_fields(app, o, checks));
@@ -2849,11 +2893,98 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
         foot: Some(foot.into()),
     }
 }
+/// A Turn's kind and the sizes of that kind, in lathe work coordinates.
+fn turn_fields<'a>(o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
+    let p = &o.p;
+    let t = Target::Operation;
+    let mut c =
+        Column::new()
+            .spacing(12)
+            .push(choice(p, "turn_kind", "Kind", &lathe::TURN_KINDS, t));
+    c = c.push(note(
+        "Z 0 is the free end of the bar, negative toward the chuck. Sizes are diameters.",
+    ));
+    match get(p, "turn_kind") {
+        "Face" => {
+            c = c
+                .push(checks.field(p, "face_off", "Take off the end · mm"))
+                .push(checks.field(p, "to_diameter", "Face to diameter · mm (0 = centre)"));
+        }
+        "Outside" | "Bore" => {
+            c = c.push(
+                row![
+                    checks.field(p, "diameter", "Diameter · mm"),
+                    checks.field(p, "z_end", "Z end · mm")
+                ]
+                .spacing(9),
+            );
+        }
+        "Chamfer" => {
+            c = c
+                .push(choice(p, "edge", "Edge", &lathe::EDGES, t))
+                .push(checks.field(p, "size", "Size · mm"));
+        }
+        "Groove" => {
+            c = c
+                .push(
+                    row![
+                        checks.field(p, "z", "Z, left side · mm"),
+                        checks.field(p, "width", "Width · mm")
+                    ]
+                    .spacing(9),
+                )
+                .push(checks.field(p, "diameter", "Bottom diameter · mm"));
+        }
+        "Part off" => {
+            c = c.push(checks.field(p, "z", "Z · mm"));
+        }
+        "Thread" => {
+            c = c
+                .push(choice(
+                    p,
+                    "thread_side",
+                    "Thread on",
+                    &lathe::THREAD_SIDES,
+                    t,
+                ))
+                .push(
+                    row![
+                        checks.field(p, "diameter", "Major diameter · mm"),
+                        checks.field(p, "pitch", "Pitch · mm")
+                    ]
+                    .spacing(9),
+                )
+                .push(checks.field(p, "z_end", "Z end · mm"));
+        }
+        _ => {}
+    }
+    c.into()
+}
 fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Element<'a, Message> {
     let p = &o.p;
     let t = Target::Operation;
     let s = o.strategy;
     let mut c = Column::new().spacing(12);
+    if s == Strategy::Turn {
+        return match get(p, "turn_kind") {
+            "Outside" | "Bore" => c
+                .push(
+                    row![
+                        checks.field(p, "depth", "Depth per pass · mm"),
+                        checks.field(p, "finish", "Finish pass · mm")
+                    ]
+                    .spacing(9),
+                )
+                .push(checks.field(p, "allowance", "Stock to leave · mm"))
+                .push(note("Equal passes down to the diameter plus the stock to leave, then the finish pass."))
+                .into(),
+            "Thread" => c
+                .push(checks.hinted(p, "passes", "Passes", "Auto"))
+                .push(note("Leave Passes empty for the usual number for the pitch."))
+                .into(),
+            _ => c.into(),
+        };
+    }
     if s == Strategy::Box {
         return c
             .push(checks.field(p, "allowance", "Stock to leave · mm"))
@@ -3075,7 +3206,8 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
             .iter()
             .all(|k| num(&s.p, k).is_some()),
         "Holding" => {
-            matches!(get(&s.p, "holding"), "Vise" | "Clamps") && holding_lines(app).is_empty()
+            matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                && holding_lines(app).is_empty()
         }
         _ => false,
     }
@@ -3083,12 +3215,15 @@ pub(crate) fn setup_step_done(app: &App, step: &str) -> bool {
 /// Whether the part reaches outside the setup's fixed stock box.
 fn outside_fixed_stock(s: &Setup, resolved: &crate::stock::ResolvedStock) -> bool {
     !crate::stock::relative(s)
-        && resolved.part.is_some_and(|part| {
+        && get(&s.p, "stock_type") != "Relative round bar"
+        && (resolved.part.is_some_and(|part| {
             (0..3).any(|i| {
                 part.min[i] < resolved.stock.min[i] - 0.001
                     || part.max[i] > resolved.stock.max[i] + 0.001
             })
-        })
+        }) || resolved
+            .part_radius
+            .is_some_and(|r| r > crate::stock::bar(resolved.stock).1 + 0.001))
 }
 fn setup_editor(app: &App) -> Panel<'_> {
     let s = app.doc.setup();
@@ -3640,10 +3775,36 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
             p,
             "stock_type",
             "Initial stock mode",
-            &["Relative size box", "Fixed size box"],
+            &[
+                "Relative size box",
+                "Fixed size box",
+                "Round bar",
+                "Relative round bar",
+            ],
             t,
         ));
-        if crate::stock::relative(s) {
+        let round = crate::stock::is_round(s);
+        if get(p, "stock_type") == "Relative round bar" {
+            c = c.push(muted("Extra material round the part · mm"));
+            c = c.push(field(p, "stock_radial", "Radial · mm", t));
+            c = c.push(
+                row![
+                    container(field(p, "stock_top", "Top (+Z) · mm", t))
+                        .width(Length::FillPortion(1)),
+                    container(field(p, "stock_bottom", "Bottom (−Z) · mm", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10),
+            );
+            c = c.push(muted("Bar along setup Z, on X 0 Y 0."));
+        } else if round {
+            for (k, l) in [
+                ("stock_diameter", "Bar Ø · mm"),
+                ("stock_length", "Length · mm"),
+            ] {
+                c = c.push(field(p, k, l, t));
+            }
+        } else if crate::stock::relative(s) {
             c = c.push(muted("Extra material from each side of the part · mm"));
             for pair in [
                 [
@@ -3681,18 +3842,28 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
         }
         match crate::stock::resolve(s, app.part_mesh()) {
             Ok(resolved) => {
-                let mut summary = column![
-                    bold("Resulting stock · X × Y × Z", 12),
-                    text(crate::stock::dimensions_text(resolved.stock.dimensions()))
-                        .size(14)
-                        .color(BLUE)
-                ]
-                .spacing(6);
+                let (title, size) = if round {
+                    (
+                        "Resulting stock · Ø × length",
+                        crate::stock::bar_text(resolved.stock),
+                    )
+                } else {
+                    (
+                        "Resulting stock · X × Y × Z",
+                        crate::stock::dimensions_text(resolved.stock.dimensions()),
+                    )
+                };
+                let mut summary =
+                    column![bold(title, 12), text(size).size(14).color(BLUE)].spacing(6);
                 if let Some(part) = resolved.part {
                     summary = summary.push(muted(format!(
                         "Part: {}",
                         crate::stock::dimensions_text(part.dimensions())
                     )));
+                }
+                if let Some(r) = resolved.part_radius {
+                    summary =
+                        summary.push(muted(format!("Part Ø round the axis: {:.3} mm", 2. * r)));
                 }
                 c = c.push(
                     container(summary)
@@ -3701,7 +3872,11 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
                         .style(panel_style),
                 );
                 if outside_fixed_stock(s, &resolved) {
-                    c = c.push(note("The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."));
+                    c = c.push(note(if round {
+                        "The part extends outside this bar. Increase its size, adjust placement, or choose Relative round bar."
+                    } else {
+                        "The part extends outside this fixed stock box. Increase its dimensions, adjust placement, or choose Relative size box."
+                    }));
                 }
             }
             Err(error) => c = c.push(note(error)),
@@ -3867,6 +4042,15 @@ pub(crate) fn speed_feed_heading(lines: &[(bool, String)]) -> &'static str {
         "Speeds and feeds not checked (export still allowed)"
     }
 }
+/// The workholding a setup can model: a lathe setup a chuck, any other a
+/// vise or clamps.
+pub(crate) fn holding_choices(lathe: bool) -> &'static [&'static str] {
+    if lathe {
+        &["None", "Chuck"]
+    } else {
+        &["None", "Vise", "Clamps"]
+    }
+}
 /// The setup editor's controls for the modelled workholding, above the
 /// fixture description.
 fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
@@ -3876,18 +4060,49 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         "" => "None",
         value => value,
     };
+    let lathe = crate::lathe::is_lathe(&app.doc.setup().machine);
     let mut c: Vec<Element<_>> = vec![
-        muted("The vise or clamps that hold the stock, from the workholding library.").into(),
+        muted(if lathe {
+            "The chuck that holds the bar, from the workholding library."
+        } else {
+            "The vise or clamps that hold the stock, from the workholding library."
+        })
+        .into(),
         choice_value(
             p,
             holding,
             "holding",
             "Modelled workholding",
-            &["None", "Vise", "Clamps"],
+            holding_choices(lathe),
             t,
         ),
     ];
     match holding {
+        "Chuck" => {
+            c.push(holder_picker(app, "Chuck"));
+            // Changing the chuck is slow: say so wherever the 4-jaw is on.
+            if app
+                .doc
+                .holder(get(p, "holder"))
+                .is_some_and(|h| h.kind() == "Chuck" && get(&h.p, "jaws") == "4")
+            {
+                c.push(
+                    text(crate::holding::CHANGE_CHUCK)
+                        .size(12)
+                        .color(WARN)
+                        .into(),
+                );
+            }
+            c.push(
+                row![
+                    container(field(p, "grip", "Grip · mm", t)).width(Length::FillPortion(1)),
+                    container(field(p, "stickout", "Stickout · mm", t))
+                        .width(Length::FillPortion(1))
+                ]
+                .spacing(10)
+                .into(),
+            );
+        }
         "Vise" => {
             c.push(holder_picker(app, "Vise"));
             let axes: Vec<Named> = [("X", "X sides"), ("Y", "Y sides")]
@@ -3958,11 +4173,21 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
         }
     }
     if holding != "None" {
-        c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
+        // A chuck has no clearance gap to set; Suggest picks its library entry.
+        if holding != "Chuck" {
+            c.push(field(p, "holding_gap", HOLDING_GAP_LABEL, t));
+        }
         c.push(
-            secondary("Suggest layout", Message::SuggestLayout)
-                .width(Fill)
-                .into(),
+            secondary(
+                if holding == "Chuck" {
+                    "Suggest chuck"
+                } else {
+                    "Suggest layout"
+                },
+                Message::SuggestLayout,
+            )
+            .width(Fill)
+            .into(),
         );
         let lines = holding_lines(app);
         if !lines.is_empty() {
@@ -3972,6 +4197,9 @@ fn holding_controls(app: &App) -> Vec<Element<'_, Message>> {
                 if lines.len() == 1 { "" } else { "s" }
             );
             c.push(caution(heading, lines));
+        }
+        for note in holding_warnings(app) {
+            c.push(text(note).size(12).color(WARN).into());
         }
         let margins = holding_margins(app);
         if !margins.is_empty() {
@@ -4048,10 +4276,12 @@ fn clamp_editor<'a>(typed: &str) -> Element<'a, Message> {
     c.into()
 }
 /// A check box per library machine for the `machines` of a tool or holder
-/// (`p`): none checked fits every CNC machine.
+/// (`p`): none checked fits every CNC machine, or every lathe for a lathe
+/// tool or a chuck (`lathe`).
 fn machine_boxes<'a>(
     app: &'a App,
     p: &Fields,
+    lathe: bool,
     toggle: fn(String, bool) -> Message,
 ) -> Element<'a, Message> {
     let listed: Vec<&str> = get(p, "machines").split(',').map(str::trim).collect();
@@ -4067,8 +4297,15 @@ fn machine_boxes<'a>(
             widget::tooltip::Position::Right,
         ));
     }
-    c.push(muted("None checked: every CNC machine.").size(12))
-        .into()
+    c.push(
+        muted(if lathe {
+            "None checked: every lathe."
+        } else {
+            "None checked: every CNC machine."
+        })
+        .size(12),
+    )
+    .into()
 }
 /// The library's vises or clamps (`kind`) that fit the active setup's machine.
 pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::holding::Holder> {
@@ -4076,7 +4313,7 @@ pub(crate) fn fitting_holders<'a>(app: &'a App, kind: &str) -> Vec<&'a crate::ho
     app.doc
         .workholding
         .iter()
-        .filter(|h| h.kind() == kind && manual::fits(get(&h.p, "machines"), machine))
+        .filter(|h| h.kind() == kind && h.fits(machine))
         .collect()
 }
 /// The picker of the library's vises or clamps (`kind`) for the active setup.
@@ -4413,12 +4650,18 @@ fn holding_note(
     name: &str,
     setup: &Setup,
 ) -> crate::HoldingNote {
+    // A lathe setup has no export to refuse anything.
+    let on_lathe = lathe::is_lathe(&setup.machine);
     let boxes = match app.doc.holding_boxes(setup, held_of(app, plan.stock)) {
         Ok(boxes) => boxes,
         Err(error) => {
             return Some((
-                "Workholding cannot be checked; export will refuse this setup until it is fixed"
-                    .into(),
+                if on_lathe {
+                    "Workholding cannot be checked until it is fixed"
+                } else {
+                    "Workholding cannot be checked; export will refuse this setup until it is fixed"
+                }
+                .into(),
                 vec![error],
             ));
         }
@@ -4429,10 +4672,23 @@ fn holding_note(
     let datum = app
         .part_mesh()
         .and_then(|mesh| crate::post::datum(setup, plan.stock, mesh).ok());
-    let lines: Vec<String> = crate::holding::hits(plan, &boxes, reach)
-        .iter()
-        .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
-        .collect();
+    // A chuck is told what this operation's moves do to it: a cut in the
+    // grip, a move into the body, a stickout short of the cut.
+    let chuck = crate::holding::layout(setup)
+        .ok()
+        .filter(|l| on_lathe && matches!(l, crate::holding::Layout::Chuck { .. }));
+    let lines: Vec<String> = match chuck {
+        Some(layout) => {
+            crate::holding::chuck_problems(&layout, plan.stock, reach, &boxes, &[(0, name, plan)])
+                .into_iter()
+                .map(|(_, line)| line)
+                .collect()
+        }
+        None => crate::holding::hits(plan, &boxes, reach)
+            .iter()
+            .map(|hit| crate::holding::message(name, hit, gap, datum.unwrap_or_default()))
+            .collect(),
+    };
     (!lines.is_empty()).then(|| {
         let frame = if datum.is_none() {
             "; coordinates in the setup frame"
@@ -4440,7 +4696,11 @@ fn holding_note(
             ""
         };
         (
-            format!("Too close to the workholding (export will refuse this{frame})"),
+            if on_lathe {
+                "This cut conflicts with the chuck".to_string()
+            } else {
+                format!("Too close to the workholding (export will refuse this{frame})")
+            },
             lines,
         )
     })
@@ -4472,6 +4732,12 @@ pub(crate) fn holding_lines_in(
         .filter(|c| Some(c.held) == held)
         .map(|c| c.problems.clone())
         .unwrap_or_default()
+}
+/// What the active setup's chuck warns of without refusing anything
+/// (`Document::holding_warnings`), for the stock the editor knows.
+pub(crate) fn holding_warnings(app: &App) -> Vec<String> {
+    let si = app.doc.index();
+    app.doc.holding_warnings(si, app.known_held(si))
 }
 /// Each operation's margin against the cutting forces (`forces::line`), as
 /// the setup editor lists it under the workholding's issues: from the
@@ -4553,17 +4819,28 @@ fn machines(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center),
             rule::horizontal(1),
             row![
-                muted(format!(
-                    "Travel  {} × {} × {} {}",
-                    get(&m.p, "x"),
-                    get(&m.p, "y"),
-                    get(&m.p, "z"),
-                    get(&m.p, "units")
-                )),
+                muted(if lathe::is_lathe(m) {
+                    format!(
+                        "Swing  {} × {} {}",
+                        get(&m.p, "swing"),
+                        get(&m.p, "centres"),
+                        get(&m.p, "units")
+                    )
+                } else {
+                    format!(
+                        "Travel  {} × {} × {} {}",
+                        get(&m.p, "x"),
+                        get(&m.p, "y"),
+                        get(&m.p, "z"),
+                        get(&m.p, "units")
+                    )
+                }),
                 space().width(35),
                 muted(format!("Spindle  {} rpm", get(&m.p, "rpm"))),
                 space().width(35),
-                muted(if manual::is_manual(m) {
+                muted(if lathe::is_lathe(m) {
+                    "Manual lathe  ·  no G-code".to_string()
+                } else if manual::is_manual(m) {
                     "Manual mill  ·  no G-code".to_string()
                 } else {
                     format!("Controller  {}", get(&m.p, "controller"))
@@ -4603,9 +4880,12 @@ fn machines(app: &App) -> Element<'_, Message> {
     .into()
 }
 /// The wizard's steps for `m`: a manual mill has no kinematics or controller
-/// to describe, and one step of its own in their place.
+/// to describe, and one step of its own in their place; a manual lathe has two
+/// of its own.
 pub(crate) fn wizard_steps(m: &Machine) -> Vec<&'static str> {
-    if manual::is_manual(m) {
+    if lathe::is_lathe(m) {
+        vec!["Identity", "Spindle & travel", "Dials & feeds", "Review"]
+    } else if manual::is_manual(m) {
         vec!["Identity", "Travel & spindle", "Manual mill", "Review"]
     } else {
         vec![
@@ -4638,17 +4918,19 @@ fn wizard(app: &App) -> Element<'_, Message> {
                 .push(field(p, "name", "Machine name", t))
                 .push(choice_value(
                     p,
-                    if manual::is_manual(m) {
+                    if lathe::is_lathe(m) {
+                        "Lathe"
+                    } else if manual::is_manual(m) {
                         "Manual"
                     } else {
                         "CNC"
                     },
                     "kind",
                     "Machine kind",
-                    &["CNC", "Manual"],
+                    &["CNC", "Manual", "Lathe"],
                     t,
                 ));
-            if !manual::is_manual(m) {
+            if !manual::is_hand(m) {
                 form = form.push(choice(p, "axes", "Number of axes", &["3", "4", "5"], t));
             }
             form=form.push(choice(p,"units","Machine specification units",&["mm","inch"],t)).push(note("Machine profile values use these units. The CAM project and tool definitions use millimeters."));
@@ -4677,6 +4959,66 @@ fn wizard(app: &App) -> Element<'_, Message> {
             {
                 form = form.push(field(p, k, l, t));
             }
+        }
+        "Spindle & travel" => {
+            for (k, l) in [
+                ("power", "Spindle power · W"),
+                ("speeds", "Spindle speeds · rpm, or a range"),
+                ("swing", "Swing over the bed · mm"),
+                ("centres", "Distance between centres · mm"),
+            ] {
+                form = form.push(field(p, k, l, t));
+            }
+        }
+        "Dials & feeds" => {
+            form = form
+                .push(choice_value(
+                    p,
+                    lathe::cross_reads(m).unwrap_or("Not known yet"),
+                    "cross_reads",
+                    "Cross-slide dial reads",
+                    &["Not known yet", "Diameter", "Radius"],
+                    t,
+                ))
+                .push(
+                    row![
+                        field(p, "cross_turn", "Cross slide · dial per turn", t),
+                        field(p, "cross_div", "Cross slide · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(
+                    row![
+                        field(p, "top_turn", "Top slide · dial per turn", t),
+                        field(p, "top_div", "Top slide · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(
+                    row![
+                        field(p, "carriage_turn", "Carriage · dial per turn", t),
+                        field(p, "carriage_div", "Carriage · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(
+                    row![
+                        field(p, "quill_turn", "Tailstock quill · dial per turn", t),
+                        field(p, "quill_div", "Tailstock quill · divisions", t),
+                    ]
+                    .spacing(8),
+                )
+                .push(field(p, "feeds", "Power feeds · mm per revolution", t))
+                .push(field(p, "pitches", "Threads the gearbox cuts · mm", t))
+                .push(field(p, "pass_time", "Time per pass · s", t))
+                .push(field(p, "tool_time", "Time per tool change · min", t))
+                .push(field(
+                    p,
+                    "move_time",
+                    "Time to move the stock to another machine · min",
+                    t,
+                ))
+                .push(note("Manual lathe — no G-code; MACHINE shows the steps."));
         }
         "Manual mill" => {
             form = form
@@ -4858,6 +5200,23 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(note("Dowel pins pressed into a plate on the table, square to X and Y, typed in the plate's own coordinates as drilled. A part drops over them by holes in it, so it sits in the same place and turn every time, also after a flip: a setup that sits on the pins (its Work zero step) gets its X and Y work offset from them without probing; Z is still touched off. Pin 1 is the reference pin: its machine place is recorded once on the Control page, and after every E-stop or power cycle Reference X Y from pin 1 makes machine X and Y, every saved work offset and the soft limits hold again."))
                     .push(note("AXIS CAM drives this machine itself from the Control page, one tool run at a time with a manual tool change in between. The profile is the UC100 driver's machine file: I/O pins, steps per mm, speeds, limits and homing. Set this machine's X, Y and Z travel to the profile's soft limits: Cycle Start checks that they agree."));
             }
+        }
+        _ if lathe::is_lathe(m) => {
+            form = form
+                .push(bold(m.name(), 18))
+                .push(muted(format!("Manual lathe · speeds {} rpm", get(p, "speeds"))))
+                .push(muted(format!(
+                    "Swing {} · centres {} {}",
+                    get(p, "swing"),
+                    get(p, "centres"),
+                    get(p, "units")
+                )))
+                .push(muted(match lathe::cross_reads(m) {
+                    Some(reads) => format!("Cross-slide dial reads the {}", reads.to_lowercase()),
+                    None => "Cross-slide dial: checked on the first lathe setup".to_string(),
+                }))
+                .push(warnings(m.issues()))
+                .push(note("Save this profile to your local library. Assign it to a setup, or add a lathe setup, to turn on it."));
         }
         _ if manual::is_manual(m) => {
             form = form
@@ -5062,8 +5421,8 @@ pub(crate) fn limits_off_warning(
 fn control(app: &App) -> Element<'_, Message> {
     use crate::control::Action;
     use uc100::{controller::State, gcode::Spindle};
-    // A setup on the manual mill shows its steps, with or without the CNC
-    // connected.
+    // A setup on the manual mill or the lathe shows its steps, with or
+    // without the CNC connected.
     if app.steps_page() {
         return crate::steps::view(app);
     }
@@ -5116,8 +5475,13 @@ fn control(app: &App) -> Element<'_, Message> {
             .style(panel_style),
         );
     }
-    if (app.doc.active_setup()).is_some_and(|s| crate::manual::is_manual(&s.machine)) {
-        left = left.push(secondary("Manual mill steps", Message::ShowGuide));
+    if let Some(s) = (app.doc.active_setup()).filter(|s| crate::manual::is_hand(&s.machine)) {
+        let steps = if crate::lathe::is_lathe(&s.machine) {
+            "Manual lathe steps"
+        } else {
+            "Manual mill steps"
+        };
+        left = left.push(secondary(steps, Message::ShowGuide));
     }
     if let Some(m) = target {
         let sim = crate::control::simulated(m);
@@ -5889,7 +6253,7 @@ fn cycle_start<'a>(msg: Option<Message>) -> Element<'a, Message> {
 /// it, except a manual mill's, which have steps instead of a run.
 pub(crate) fn run_setups<'a>(doc: &'a Document, machine_id: &str) -> Vec<(usize, &'a Setup)> {
     (doc.setups.iter().enumerate())
-        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_manual(&x.machine))
+        .filter(|(_, x)| x.machine.id == machine_id && !crate::manual::is_hand(&x.machine))
         .collect()
 }
 
@@ -6768,6 +7132,7 @@ fn holder_word(h: &crate::holding::Holder) -> &'static str {
     match h.kind() {
         "Vise" => "vise",
         "Clamp" => "clamp",
+        "Chuck" => "chuck",
         _ => "entry",
     }
 }
@@ -6862,26 +7227,66 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
                 "Bull nose end mill",
                 "Face mill",
                 "Drill",
-                "Chamfer mill"
+                "Chamfer mill",
+                "Turning tool",
+                "Boring bar",
+                "Grooving tool",
+                "Parting blade",
+                "Threading tool"
             ],
             t
         )
     ]
     .spacing(14);
-    for (k, l) in [
-        ("number", "Tool number · T"),
-        ("diameter", "Diameter · mm"),
-        ("flutes", "Flutes"),
-        ("length", "Flute length · mm"),
-        ("stickout", "Stickout · mm"),
-        ("holder", "Holder diameter · mm"),
-    ] {
-        form = form.push(field(p, k, l, t));
+    let lathe = crate::lathe::is_tool(get(p, "type"));
+    form = form.push(field(p, "number", "Tool number · T", t));
+    // A lathe tool has no mill diameter, flutes, flute length, stickout or holder.
+    if !lathe {
+        for (k, l) in [
+            ("diameter", "Diameter · mm"),
+            ("flutes", "Flutes"),
+            ("length", "Flute length · mm"),
+            ("stickout", "Stickout · mm"),
+            ("holder", "Holder diameter · mm"),
+        ] {
+            form = form.push(field(p, k, l, t));
+        }
     }
     if get(p, "type") == "Chamfer mill" {
         form = form.push(field(p, "tip_angle", "Tip angle · °", t));
     }
-    form = form.push(machine_boxes(app, p, Message::ToolMachine));
+    match get(p, "type") {
+        "Turning tool" => {
+            form = form
+                .push(choice(p, "hand", "Hand", &crate::lathe::HANDS, t))
+                .push(field(p, "nose_radius", "Nose radius · mm", t))
+                .push(field(p, "lead_angle", "Lead angle · °", t));
+        }
+        "Boring bar" => {
+            form = form
+                .push(field(p, "nose_radius", "Nose radius · mm", t))
+                .push(field(p, "min_bore", "Smallest bore · mm", t))
+                .push(field(p, "reach", "Reach · mm", t));
+        }
+        "Grooving tool" | "Parting blade" => {
+            form = form
+                .push(field(p, "width", "Blade width · mm", t))
+                .push(field(p, "reach", "Deepest plunge · mm", t));
+        }
+        "Threading tool" => {
+            form = form
+                .push(choice(
+                    p,
+                    "thread_angle",
+                    "Thread angle · °",
+                    &["60", "55"],
+                    t,
+                ))
+                .push(field(p, "pitches", "Pitches · mm, min-max", t));
+        }
+        _ => {}
+    }
+    form = form.push(machine_boxes(app, p, lathe, Message::ToolMachine));
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
     form = form.push(warnings(tool_issues));
@@ -6998,6 +7403,12 @@ const VISE_FIELDS: [(&str, &str); 6] = [
     ("grip", "Grip height · mm"),
     ("force", "Clamping force · N"),
 ];
+const CHUCK_FIELDS: [(&str, &str); 4] = [
+    ("min_grip", "Smallest grip · Ø mm"),
+    ("max_grip", "Largest grip · Ø mm"),
+    ("jaw_length", "Jaw length · mm"),
+    ("body", "Chuck body · Ø mm"),
+];
 const CLAMP_FIELDS: [(&str, &str); 5] = [
     ("length", "Length · mm"),
     ("width", "Width · mm"),
@@ -7021,6 +7432,12 @@ fn holder_summary(h: &crate::holding::Holder) -> String {
             n("width"),
             n("bite")
         ),
+        "Chuck" => format!(
+            "Chuck · {} jaws · grips Ø{}–Ø{} mm",
+            n("jaws"),
+            n("min_grip"),
+            n("max_grip")
+        ),
         other => other.to_string(),
     }
 }
@@ -7030,7 +7447,8 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         row![
             // Two equal choices: neither is the panel's one filled command.
             secondary("+ New vise", Message::NewHolder("Vise")),
-            secondary("+ New clamp", Message::NewHolder("Clamp"))
+            secondary("+ New clamp", Message::NewHolder("Clamp")),
+            secondary("+ New chuck", Message::NewHolder("Chuck"))
         ]
         .spacing(8)
     ]
@@ -7051,16 +7469,25 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
     let (title, sizes): (&str, &[(&str, &str)]) = match draft.kind() {
         "Vise" => ("Vise definition", &VISE_FIELDS),
         "Clamp" => ("Clamp definition", &CLAMP_FIELDS),
+        "Chuck" => ("Chuck definition", &CHUCK_FIELDS),
         _ => ("Workholding definition", &[]),
     };
     let mut form = column![bold(title, 21), field(p, "name", "Name", t)].spacing(14);
+    if draft.kind() == "Chuck" {
+        form = form.push(choice(p, "jaws", "Jaws", &["3", "4"], t));
+    }
     for (key, label) in sizes {
         form = form.push(field(p, key, label, t));
     }
     let mut issues = draft.issues();
     issues.extend(app.doc.holder_name_issues(draft));
     form = form
-        .push(machine_boxes(app, p, Message::HolderMachine))
+        .push(machine_boxes(
+            app,
+            p,
+            draft.kind() == "Chuck",
+            Message::HolderMachine,
+        ))
         .push(field(p, "notes", "Notes", t))
         .push(warnings(issues));
     let (save, delete) = holder_labels(draft);
@@ -7074,7 +7501,7 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
         column![
             page_header(
                 "Workholding",
-                "Vises and toe clamps your setups can model. The starter entries have typical sizes: measure yours."
+                "Vises, toe clamps and lathe chucks your setups can model. The starter entries have typical sizes: measure yours."
             ),
             row![
                 container(scrollable(list))
@@ -7506,6 +7933,9 @@ fn tool_label(tool: &Tool) -> String {
 }
 /// The line under a tool's name in the library: what the name may not say.
 fn tool_details(tool: &Tool) -> String {
+    if tool.is_lathe() {
+        return get(&tool.p, "type").to_string();
+    }
     format!(
         "{} · Ø{} mm · {}",
         get(&tool.p, "type"),
@@ -7750,6 +8180,14 @@ pub(crate) fn modelled(app: &App) -> bool {
         .setups
         .get(app.doc.index())
         .is_some_and(crate::holding::modelled)
+        && holding_lines(app).is_empty()
+}
+/// Whether the active setup's chuck is checked: it holds the bar in one and
+/// there is nothing wrong with how (`holding_lines`).
+pub(crate) fn chuck_modelled(app: &App) -> bool {
+    app.doc
+        .active_setup()
+        .is_some_and(|s| get(&s.p, "holding") == "Chuck")
         && holding_lines(app).is_empty()
 }
 pub(crate) fn fixtures(note: Note, modelled: bool) -> &'static str {
@@ -8692,7 +9130,7 @@ pub(crate) fn nc_page(app: &App) -> NcPage<'_> {
             let uc100 = (app.doc.setups.get(s.setup))
                 .is_some_and(|x| get(&x.machine.p, "controller") == "UC100");
             let manual =
-                (app.doc.setups.get(s.setup)).is_some_and(|x| crate::manual::is_manual(&x.machine));
+                (app.doc.setups.get(s.setup)).is_some_and(|x| crate::manual::is_hand(&x.machine));
             let card = if manual {
                 NcCard::Manual
             } else if uc100 {
@@ -8769,7 +9207,11 @@ fn post(app: &App) -> Element<'_, Message> {
                             .push(warnings(problems.to_vec()));
                     }
                     NcCard::Manual => {
-                        summary = summary.push(muted(crate::manual::no_gcode(name)));
+                        let line = match app.doc.setups.iter().find(|x| x.name() == *name) {
+                            Some(x) => crate::manual::no_gcode_on(&x.machine, name),
+                            None => crate::manual::no_gcode(name),
+                        };
+                        summary = summary.push(muted(line));
                     }
                     NcCard::Run { problems, setup } => {
                         let mark = if problems.is_empty() { "✓" } else { "!" };

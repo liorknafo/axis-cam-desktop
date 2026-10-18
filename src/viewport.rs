@@ -346,6 +346,7 @@ impl Viewport<'_> {
                 part: None,
                 stock,
                 display_scale: self.mesh.display_scale(),
+                part_radius: None,
             }),
             None => stock::resolve(setup, Some(self.mesh)).ok(),
         }
@@ -1617,9 +1618,21 @@ pub(crate) fn stock_triangles<'a>(
                 || source
                     .iter()
                     .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
-        });
+        }) || volume.round && on_bar(volume.bounds, &source, surface.cell_mm);
         (points, shade(&points, if outer { BLOCK } else { CUT }))
     })
+}
+/// Whether every vertex of `triangle` lies on the cylinder of the round bar
+/// whose box is `bounds` (`stock::bar`); its end faces are the box's. Dual
+/// contouring puts a curved face's vertices within a few hundredths of a
+/// mesh cell (`cell`, mm) of it, so 6 % of a cell counts, at least 0.01 mm
+/// as on the box's faces: under 0.05 mm at Draft, half a 0.2 mm finish pass.
+fn on_bar(bounds: crate::mesh::Bounds, triangle: &[[f32; 3]; 3], cell: f32) -> bool {
+    let (centre, radius) = stock::bar(bounds);
+    let tolerance = (0.06 * cell).max(0.01);
+    triangle
+        .iter()
+        .all(|p| ((p[0] - centre[0]).hypot(p[1] - centre[1]) - radius).abs() < tolerance)
 }
 /// The faces of a box `b` (mm), two triangles each, in `base` shaded as the
 /// view shades stock.
@@ -2149,6 +2162,44 @@ mod tests {
         bytes.iter().fold(0xcbf29ce484222325, |h, b| {
             (h ^ *b as u64).wrapping_mul(0x100000001b3)
         })
+    }
+    #[test]
+    fn a_round_bars_cylinder_and_ends_are_block_and_its_turned_faces_cut() {
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = crate::volume::Frame::new(
+            &crate::model::Setup::new(crate::model::Machine::new(3), "G54"),
+            &mesh,
+        );
+        let bar = crate::mesh::Bounds {
+            min: [-25., -25., 0.],
+            max: [25., 25., 100.],
+        };
+        let mut v = crate::volume::Volume::bar(bar, frame);
+        v.revolve(50., 101., 20., 26., frame, (0, 0));
+        let surface = crate::stock_surface::Snapshot::of(&v, crate::stock_surface::Detail::Draft)
+            .build()
+            .unwrap();
+        let (mut block, mut cut) = (0, 0);
+        for (points, color) in stock_triangles(&v, &surface, frame) {
+            let radii = points.map(|p| p[0].hypot(p[1]));
+            let z = points.map(|p| p[2]);
+            if radii.iter().all(|r| (r - 25.).abs() < 0.05) && z.iter().all(|z| *z < 49.) {
+                // The bar's own cylinder, below the turned part.
+                assert_eq!(color, shade(&points, BLOCK), "{points:?}");
+                block += 1;
+            } else if z.iter().all(|z| z.abs() < 0.001) {
+                // The end in the chuck.
+                assert_eq!(color, shade(&points, BLOCK), "{points:?}");
+            } else if radii.iter().all(|r| (r - 20.).abs() < 0.01) && z.iter().all(|z| *z > 51.)
+                || z.iter().all(|z| (z - 50.).abs() < 0.001)
+            {
+                // The turned diameter and its shoulder.
+                assert_eq!(color, shade(&points, CUT), "{points:?}");
+                cut += 1;
+            }
+        }
+        assert!(block > 50 && cut > 50, "{block} block, {cut} cut");
     }
     #[test]
     fn the_viewport_draws_the_same_pixels_after_the_split() {

@@ -328,7 +328,8 @@ fn hold(
             .unwrap_or(typical)
     };
     match layout {
-        Layout::None => None,
+        // A chuck's hold against the cutting forces is not modelled.
+        Layout::None | Layout::Chuck { .. } => None,
         Layout::Vise { axis_y, grip, .. } => {
             let (across, along) = if *axis_y { (1, 0) } else { (0, 1) };
             let (band, stock) = (held.band, held.stock);

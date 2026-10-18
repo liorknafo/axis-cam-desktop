@@ -1114,6 +1114,7 @@ fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> 
         rest_top: (highest < top - 0.0001).then_some(highest),
         spindle_clockwise: clockwise,
         milling_direction: if climb { "Climb" } else { "Conventional" },
+        rings: vec![],
     };
     let first = planned[0].0[0][0][0];
     let mut position = [first.0 as f32, first.1 as f32, clearance];

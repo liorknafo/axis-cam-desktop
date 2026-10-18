@@ -252,16 +252,17 @@ impl Cells {
                 // Rows whose centre line lies in [lo.y, hi.y).
                 let j0 = ((lo.1 - self.y0) / self.h - 0.5).ceil().max(0.);
                 let j1 = ((hi.1 - self.y0) / self.h - 0.5).ceil().min(self.ny as f64);
-                for j in j0 as usize..j1.max(j0) as usize {
+                let rows = rows.iter_mut().enumerate();
+                for (j, row) in rows.take(j1.max(j0) as usize).skip(j0 as usize) {
                     let cy = self.y0 + (j as f64 + 0.5) * self.h;
-                    rows[j].push(lo.0 + (cy - lo.1) / (hi.1 - lo.1) * (hi.0 - lo.0));
+                    row.push(lo.0 + (cy - lo.1) / (hi.1 - lo.1) * (hi.0 - lo.0));
                 }
             }
         }
         for (j, xs) in rows.iter_mut().enumerate() {
             xs.sort_by(f64::total_cmp);
-            for pair in xs.chunks_exact(2) {
-                if let Some((i0, i1)) = self.run(pair[0], pair[1]) {
+            for &[x0, x1] in xs.as_chunks::<2>().0 {
+                if let Some((i0, i1)) = self.run(x0, x1) {
                     bits.fill(j, i0, i1);
                 }
             }
@@ -1244,6 +1245,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             rest_top: (highest < job.top - 0.0001).then_some(highest),
             spindle_clockwise: clockwise,
             milling_direction: if climb { "Climb" } else { "Conventional" },
+            rings: vec![],
         },
         at: [0., 0., job.clearance],
     };
@@ -1938,11 +1940,13 @@ mod tests {
             .filter(|&i| plan.moves[i].cutting_pass && plan.moves[i].from[2] == plan.moves[i].to[2])
             .max_by(|&a, &b| all[a].total_cmp(&all[b]))
             .unwrap();
-        for k in worst.saturating_sub(3)..worst + 2 {
-            let m = &plan.moves[k];
+        for (k, (m, e)) in (plan.moves.iter().zip(&all).enumerate())
+            .take(worst + 2)
+            .skip(worst.saturating_sub(3))
+        {
             eprintln!(
-                "  {k}: {:?} -> {:?} {:?} cut {} feed {} e {:.3}",
-                m.from, m.to, m.motion, m.cutting_pass, m.feed, all[k]
+                "  {k}: {:?} -> {:?} {:?} cut {} feed {} e {e:.3}",
+                m.from, m.to, m.motion, m.cutting_pass, m.feed
             );
         }
         let mut pocket = op.clone();
@@ -2426,7 +2430,7 @@ mod tests {
                     for dy in -1..=1 {
                         for &i in grid.get(&(gx + dx, gy + dy)).into_iter().flatten() {
                             let face = &faces[i];
-                            let d = if pocket::inside(&[face.clone()], xy) {
+                            let d = if pocket::inside(std::slice::from_ref(face), xy) {
                                 0.
                             } else {
                                 pocket::nearest(face, xy).0

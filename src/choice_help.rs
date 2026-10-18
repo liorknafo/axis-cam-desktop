@@ -259,6 +259,14 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "Build the blank from the placed part bounds plus six independent offsets. Top adds material only above the part; Right adds material only on +X. Offsets follow setup rotation and translation. The first setup defines the blank for the whole job.",
             "",
         ),
+        ("stock_type", "Round bar") => (
+            "A round bar of the entered diameter and length along the setup Z axis, centred on X 0 Y 0, from Z 0 up. The simulation starts from the cylinder; lathe cuts turn it.",
+            "",
+        ),
+        ("stock_type", "Relative round bar") => (
+            "A round bar along the setup Z axis, on X 0 Y 0: the part's largest distance from the axis plus Radial, and Top and Bottom past its ends.",
+            "",
+        ),
         ("stock_type", "Fixed size box") => (
             "Use the entered overall X, Y and Z stock dimensions. The preview centers it in X/Y with its bottom at Z=0. The box can be smaller than the part, which is reported. Relative offsets are retained for switching back.",
             "",
@@ -423,6 +431,37 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. Chamfers along edges are not generated.",
             "",
         ),
+        ("type", "Turning tool") => (
+            "A lathe tool that turns outside diameters and faces. Its nose radius and hand decide which corners and directions it can cut. It fits lathes only.",
+            "",
+        ),
+        ("type", "Boring bar") => (
+            "A lathe tool on a bar that enters a hole to bore it larger. It must be smaller than the bore and long enough to reach the depth. It fits lathes only.",
+            "",
+        ),
+        ("type", "Grooving tool") => (
+            "A lathe tool with a narrow blade that plunges to cut a groove as wide as the blade. It fits lathes only.",
+            "",
+        ),
+        ("type", "Parting blade") => (
+            "A thin lathe blade that plunges to part the finished piece off the bar. It fits lathes only.",
+            "",
+        ),
+        ("type", "Threading tool") => (
+            "A lathe tool ground to the thread form, which cuts a thread over several passes. It fits lathes only.",
+            "",
+        ),
+        ("hand", "Right") => (
+            "A right-hand tool cuts toward the chuck, with the carriage moving left.",
+            "",
+        ),
+        ("hand", "Left") => (
+            "A left-hand tool cuts away from the chuck, to reach up to a shoulder from the other side.",
+            "",
+        ),
+        ("hand", "Neutral") => ("A neutral tool cuts in either direction.", ""),
+        ("thread_angle", "60") => ("A 60° thread form: metric and unified threads.", ""),
+        ("thread_angle", "55") => ("A 55° thread form: Whitworth threads.", ""),
         ("ramp", "Helix") => (
             "Descend in a circle at the ramp angle (0.1° to 15°) where Adaptive clearing cannot reach the material from the side. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Imported Pocket does not use this setting: it offers Profile ramp or Plunge in Contour entry.",
             "",

@@ -217,6 +217,7 @@ impl App {
                 122 => "98-machine-setup".into(),
                 123 => "99-machine-work-zero".into(),
                 124 => "100-manual-steps".into(),
+                125 => "101-lathe-steps".into(),
                 _ => format!("motion-{:02}", self.smoke_step.saturating_sub(26)),
             })
     }
@@ -1281,6 +1282,12 @@ impl App {
                 self.smoke_manual_setup();
                 vec![Message::Page(Page::Control)]
             }
+            // MACHINE on a lathe setup put first: its Steps page at the dial
+            // check, the cross-slide dial not known yet.
+            125 => {
+                self.smoke_lathe_setup();
+                vec![Message::Page(Page::Control)]
+            }
             _ => {
                 assert!(self.doc.validate_structure().is_ok());
                 self.disconnect_machine();
@@ -1298,6 +1305,10 @@ impl App {
             124 => {
                 let line = self.smoke_manual_check();
                 eprintln!("Screen 100: {line}");
+            }
+            125 => {
+                let line = self.smoke_lathe_check();
+                eprintln!("Screen 101: {line}");
             }
             // The machine drawn under the work zero, in view.
             120 => {
@@ -1430,6 +1441,69 @@ impl App {
         self.doc.add_manual_setup().expect("a manual setup");
         self.doc.setups[0].operations = vec![face];
         self.doc.active = self.doc.setups[0].id.clone();
+    }
+    /// Screen 101's job: the manual lathe in the library with a turning
+    /// tool, and a lathe setup on a relative round bar put first that faces
+    /// 0.5 mm off the end, made the active setup.
+    pub(crate) fn smoke_lathe_setup(&mut self) {
+        use crate::model::{Operation, Strategy, Tool};
+        let lathe = crate::lathe::defaults();
+        let tool = Tool::lathe("RH turning tool", "Turning tool");
+        let mut face = Operation::for_machine(Strategy::Turn, tool.id.clone(), &lathe);
+        face.set_turn_kind("Face");
+        face.p.insert("face_off".into(), "0.5".into());
+        self.doc.machines.push(lathe);
+        self.doc.tools.push(tool);
+        self.doc.add_lathe_setup().expect("a lathe setup");
+        let at = (self.doc.setups.iter())
+            .position(|s| crate::lathe::is_lathe(&s.machine))
+            .expect("the lathe setup");
+        let mut setup = self.doc.setups.remove(at);
+        for (k, v) in [
+            ("stock_type", "Relative round bar"),
+            ("stock_radial", "2"),
+            ("stock_top", "1"),
+            ("stock_bottom", "30"),
+        ] {
+            setup.p.insert(k.into(), v.into());
+        }
+        setup.operations = vec![face];
+        self.doc.active = setup.id.clone();
+        self.doc.setups.insert(0, setup);
+        self.doc.sync_stock_sources();
+    }
+    /// What screen 101 shows: the Steps page on the lathe setup, its guide
+    /// built (set up with the dial check, the face, the hand-over) at the
+    /// dial check, the face's top slide read off its dial.
+    pub(crate) fn smoke_lathe_check(&self) -> String {
+        use crate::guide::{LatheStep, Step};
+        assert!(self.steps_page(), "the Steps page");
+        let (shown, at) = self.guide_at().unwrap_or_else(|| {
+            panic!(
+                "the guide: {:?}",
+                self.current_guide().map(|r| r.as_ref().err())
+            )
+        });
+        let g = &shown.guide;
+        let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Set up", "Turn · Face", "Hand over"]);
+        assert_eq!(at, 0);
+        assert!(
+            matches!(g.steps[0], Step::Lathe(LatheStep::DialCheck { .. })),
+            "{:?}",
+            g.steps[0]
+        );
+        let Some(Step::Lathe(LatheStep::Face { top, .. })) =
+            (g.steps.iter()).find(|s| matches!(s, Step::Lathe(LatheStep::Face { .. })))
+        else {
+            panic!("no Face step: {:?}", g.steps)
+        };
+        assert_eq!(top.reading, Ok((0, 0.5)), "{top:?}");
+        format!(
+            "{} steps, the dial check first, the face 0.50 on the top slide, ~{:.0} min",
+            g.steps.len(),
+            g.minutes.ceil()
+        )
     }
     /// What screen 100 shows: the Steps page on the manual setup, its
     /// guide built (set up, the face, the hand-over) at its first step.
@@ -3888,14 +3962,10 @@ flood = { pin = 8 }
             let key = a.stock_mesh_key().unwrap();
             let sim = a.active_simulation().unwrap();
             let volume = sim.volume.as_ref().unwrap();
-            let result = crate::stock_surface::Snapshot {
-                bounds: volume.bounds,
-                frame: volume.frame,
-                cuts: volume.cuts.clone(),
-                detail: crate::stock_surface::Detail::Fine,
-            }
-            .build()
-            .map(std::sync::Arc::new);
+            let result =
+                crate::stock_surface::Snapshot::of(volume, crate::stock_surface::Detail::Fine)
+                    .build()
+                    .map(std::sync::Arc::new);
             let seconds = sim.seconds;
             a.stock_mesh_job = None;
             let _ = a.update(Message::StockMeshed {
@@ -3960,12 +4030,7 @@ flood = { pin = 8 }
             let key = a.stock_mesh_key().expect("a simulation with stock");
             let sim = a.active_simulation().unwrap();
             let volume = sim.volume.as_ref().unwrap();
-            let snapshot = crate::stock_surface::Snapshot {
-                bounds: volume.bounds,
-                frame: volume.frame,
-                cuts: volume.cuts.clone(),
-                detail: a.stock_detail,
-            };
+            let snapshot = crate::stock_surface::Snapshot::of(volume, a.stock_detail);
             let seconds = sim.seconds;
             let result = snapshot.build().map(std::sync::Arc::new);
             a.stock_mesh_job = Some(key.clone());
@@ -5134,6 +5199,75 @@ flood = { pin = 8 }
         for want in ["Big mill", "Set up", "Face", "Hold"] {
             assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
+    }
+
+    #[test]
+    fn screen_101_shows_the_dial_steps_of_a_lathe_setup_put_first() {
+        let mut a = imported_app();
+        a.smoke_lathe_setup();
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        a.smoke_lathe_check();
+        let texts = page_texts(&a);
+        for want in [
+            "Manual lathe",
+            "Set up",
+            "Face",
+            "Check the cross-slide dial",
+            "by 1× → diameter",
+        ] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+    }
+
+    #[test]
+    fn the_lathe_steps_work_while_the_cnc_jogs() {
+        use crate::control::Action;
+        use crate::guide::{LatheStep, Step};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        idle(&mut a);
+        let _ = a.update(Message::Machine(Action::JogPress(0, false)));
+        tick_until(&mut a, 2.0, "the jog", |s| s.state == Some(State::Jog));
+        assert!(a.locked());
+        // The lathe guide's job, its dial not known yet, its steps built.
+        let lathe = crate::steps::tests::lathe_app("", |_| {});
+        a.doc = lathe.doc.clone();
+        a.imported_mesh = lathe.imported_mesh.clone();
+        a.guide = lathe.guide.clone();
+        a.status.clear();
+        let _ = a.update(Message::Page(Page::Control));
+        assert!(a.steps_page() && a.guide_at().is_some());
+        // The dial check answered, a measurement typed, places moved: all
+        // while the CNC jogs, its run not disturbed.
+        let _ = a.update(Message::Guide(crate::GuideAction::CrossReads(
+            crate::lathe::Reads::Diameter,
+        )));
+        assert_ne!(a.status, crate::LOCKED);
+        assert_eq!(
+            crate::model::get(&a.doc.setups[0].machine.p, "cross_reads"),
+            "Diameter"
+        );
+        let (shown, _) = a.guide_at().expect("the guide, built again");
+        let measure = (shown.guide.steps.iter())
+            .position(|s| matches!(s, Step::Lathe(LatheStep::Measure { .. })))
+            .unwrap();
+        let _ = a.update(Message::Guide(crate::GuideAction::Go(measure)));
+        let key = crate::guide::measure_key(&a.doc.setups[0].id, &a.doc.setups[0].operations[1].id);
+        let _ = a.update(Message::Guide(crate::GuideAction::Measured(
+            key.clone(),
+            40.36,
+        )));
+        assert_eq!(a.doc.measured.get(&key), Some(&40.36));
+        assert_eq!(a.guide_at().unwrap().1, measure);
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t == "in to 10.36 → Ø40.00"),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Machine(Action::JogRelease));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     #[test]
@@ -8014,7 +8148,12 @@ flood = { pin = 8 }
         let mut a = App::from_workspace(path.clone(), None);
         assert_eq!(
             holders_named(&a.doc),
-            ["100 mm machine vise", "Toe clamp 60 mm"]
+            [
+                "100 mm machine vise",
+                "Toe clamp 60 mm",
+                "160 mm 3-jaw chuck",
+                "160 mm 4-jaw chuck"
+            ]
         );
         assert_eq!(a.holder_draft.id, a.doc.workholding[0].id);
         assert!(a.doc.validate_structure().is_ok());
@@ -8025,6 +8164,10 @@ flood = { pin = 8 }
         edit_holder(&mut a, &[("jaw_width", "125")]);
         let _ = a.update(Message::SaveHolder);
         let _ = a.update(Message::DeleteHolder(clamp));
+        for _ in 0..2 {
+            let chuck = first_of(&a, "Chuck");
+            let _ = a.update(Message::DeleteHolder(chuck));
+        }
         assert_eq!(holders_named(&a.doc), ["100 mm machine vise"]);
         a.dirty = true;
         a.persist();
@@ -8063,7 +8206,7 @@ flood = { pin = 8 }
         // An empty library is given the starters again.
         a.doc.workholding.clear();
         let _ = a.update(Message::NewProject);
-        assert_eq!(a.doc.workholding.len(), 2);
+        assert_eq!(a.doc.workholding.len(), 4);
         assert!(
             a.status.contains("materials and workholding are available"),
             "{}",
@@ -8117,7 +8260,7 @@ flood = { pin = 8 }
             "{status}"
         );
         let (doc, _) = crate::merge_sample(&Document::default());
-        assert_eq!(holders_named(&doc).len(), 2);
+        assert_eq!(holders_named(&doc).len(), 4);
     }
     #[test]
     fn holders_are_created_edited_saved_refused_and_deleted_like_materials() {
@@ -16766,6 +16909,192 @@ flood = { pin = 8 }
         assert_eq!(a.doc.machines.len(), count);
     }
     #[test]
+    fn the_wizard_offers_the_lathe_and_shows_its_own_steps_and_fields() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        shows(&a, &["Machine kind", "Number of axes"]);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        assert!(crate::lathe::is_lathe(&a.machine_draft));
+        assert!(!crate::manual::is_manual(&a.machine_draft));
+        assert_eq!(
+            crate::ui::wizard_steps(&a.machine_draft),
+            ["Identity", "Spindle & travel", "Dials & feeds", "Review"]
+        );
+        shows(
+            &a,
+            &["Machine kind", "2  Spindle & travel", "3  Dials & feeds"],
+        );
+        lacks(&a, &["Number of axes", "3  Manual mill", "3  Kinematics"]);
+        let _ = a.update(Message::WizardStep(1));
+        shows(
+            &a,
+            &[
+                "Spindle power · W",
+                "Spindle speeds · rpm, or a range",
+                "Swing over the bed · mm",
+                "Distance between centres · mm",
+            ],
+        );
+        lacks(
+            &a,
+            &[
+                "X travel",
+                "Hand feed · mm/min",
+                "Maximum spindle speed · rpm",
+                "X per handwheel turn · mm",
+            ],
+        );
+        let _ = a.update(Message::WizardStep(2));
+        shows(
+            &a,
+            &[
+                "Cross-slide dial reads",
+                "Cross slide · dial per turn",
+                "Cross slide · divisions",
+                "Top slide · dial per turn",
+                "Carriage · dial per turn",
+                "Tailstock quill · divisions",
+                "Power feeds · mm per revolution",
+                "Threads the gearbox cuts · mm",
+                "Time per pass · s",
+                "Time per tool change · min",
+                "Time to move the stock to another machine · min",
+                "Manual lathe — no G-code; MACHINE shows the steps.",
+            ],
+        );
+        lacks(&a, &["DRO tool radius compensation", "Motion capability"]);
+        let _ = a.update(Message::WizardStep(9));
+        assert_eq!(a.wizard_step, 3);
+        shows(
+            &a,
+            &[
+                "Review",
+                "Save machine profile",
+                "Manual lathe · speeds 70,110,180,280,450,710,1120,1800 rpm",
+            ],
+        );
+        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::SaveMachine)));
+        // The post and probe fields are on no step.
+        for step in 0..4 {
+            let _ = a.update(Message::WizardStep(step));
+            lacks(
+                &a,
+                &["Spindle start dwell · s", "Touch plate thickness · mm"],
+            );
+        }
+    }
+    #[test]
+    fn choosing_the_lathe_kind_keeps_the_name_and_power_and_the_dial_answer_is_saved() {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        for (k, v) in [("name", "Colchester"), ("power", "1500")] {
+            let _ = a.update(Message::Edit(Target::Machine, k, v.into()));
+        }
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        let p = &a.machine_draft.p;
+        assert_eq!(
+            [
+                get(p, "name"),
+                get(p, "power"),
+                get(p, "speeds"),
+                get(p, "cross_reads")
+            ],
+            ["Colchester", "1500", "70,110,180,280,450,710,1120,1800", ""]
+        );
+        // The dial's answer is kept; "Not known yet" empties it again.
+        for (choice, saved) in [
+            ("Radius", "Radius"),
+            ("Not known yet", ""),
+            ("Diameter", "Diameter"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Machine, "cross_reads", choice.into()));
+            assert_eq!(get(&a.machine_draft.p, "cross_reads"), saved);
+        }
+        // Back to a manual mill and a CNC, and to the lathe again.
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Manual".into()));
+        assert!(crate::manual::is_manual(&a.machine_draft));
+        assert_eq!(get(&a.machine_draft.p, "name"), "Colchester");
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        assert!(crate::lathe::is_lathe(&a.machine_draft));
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "CNC".into()));
+        assert!(!crate::manual::is_hand(&a.machine_draft));
+        assert_eq!(crate::ui::wizard_steps(&a.machine_draft).len(), 5);
+    }
+    #[test]
+    fn saving_a_lathe_settles_its_rpm_and_travel_and_refuses_bad_dials_and_the_library_card_says_so()
+     {
+        let mut a = app();
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        for (k, v) in [
+            ("speeds", "100, 400,2500"),
+            ("swing", "300"),
+            ("centres", "700"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Machine, k, v.into()));
+        }
+        let id = a.machine_draft.id.clone();
+        let _ = a.update(Message::SaveMachine);
+        let saved = a.doc.machines.iter().find(|m| m.id == id).expect("saved");
+        assert_eq!(
+            [get(&saved.p, "rpm"), get(&saved.p, "x"), get(&saved.p, "z")],
+            ["2500", "300", "700"]
+        );
+        assert_eq!(a.page, Page::Machines);
+        shows(&a, &["Manual lathe  ·  no G-code", "Swing  300 × 700 mm"]);
+        // A dial with no divisions is refused.
+        let _ = a.update(Message::NewMachine);
+        let _ = a.update(Message::Edit(Target::Machine, "kind", "Lathe".into()));
+        let _ = a.update(Message::Edit(Target::Machine, "carriage_div", "0".into()));
+        let count = a.doc.machines.len();
+        let _ = a.update(Message::SaveMachine);
+        assert_eq!(a.doc.machines.len(), count);
+    }
+    #[test]
+    fn a_lathe_setup_is_hand_work_with_no_program_run_offset_or_cnc_minutes() {
+        let (mut doc, mesh) = crate::post::fixture::job();
+        let lathe = crate::lathe::defaults();
+        doc.machines.push(lathe.clone());
+        let cnc_offset = get(&doc.setups[0].p, "offset").to_string();
+        let mut setup = crate::model::Setup::new(lathe, &cnc_offset);
+        setup.p.insert("name".into(), "Turn".into());
+        doc.setups.insert(0, setup);
+        // The same work offset as the CNC setup is no clash for a hand machine.
+        assert!(
+            !doc.issues()
+                .iter()
+                .any(|e| e.contains("work offset is also used")),
+            "{:?}",
+            doc.issues()
+        );
+        // It makes no program, and the run's checks pass it by.
+        assert_eq!(
+            crate::post::checked(&doc, &mesh, 0, &[], crate::post::PostSettings::for_uc100)
+                .map(|p| p.len()),
+            Ok(0)
+        );
+        assert!(crate::run::plan_problems(&doc, &mesh, 0, &[]).is_ok());
+        assert!(crate::post::PostSettings::for_holding(&doc.setups[0].machine).is_ok());
+        // The export's line and the setup sheet name it.
+        assert_eq!(
+            crate::manual::no_gcode_on(&doc.setups[0].machine, "Turn"),
+            "Turn: manual lathe, no G-code — follow the steps on the MACHINE page."
+        );
+        assert!(
+            doc.setup_sheet(None)
+                .contains("Manual lathe: steps on the MACHINE page")
+        );
+        // A mill tool with no machines listed does not fit it.
+        assert!(!crate::manual::fits("", false, &doc.setups[0].machine));
+        assert!(crate::manual::fits("", false, &doc.setups[1].machine));
+        assert!(crate::manual::fits(
+            &doc.setups[0].machine.id,
+            false,
+            &doc.setups[0].machine
+        ));
+    }
+    #[test]
     fn the_tool_editor_has_a_check_box_per_machine_that_edits_machines() {
         let mut a = app();
         with_manual(&mut a);
@@ -16788,6 +17117,258 @@ flood = { pin = 8 }
         let _ = a.update(Message::ToolMachine(id, false));
         let _ = a.update(Message::ToolMachine(other, false));
         assert_eq!(get(&a.tool_draft.p, "machines"), "");
+    }
+    #[test]
+    fn the_tool_editor_shows_the_fields_of_each_lathe_tool_type_and_no_mill_ones() {
+        let mut a = app();
+        a.page = Page::Tools;
+        a.tool_draft = a.doc.tools[0].clone();
+        shows(&a, &["Diameter · mm", "Flutes", "Holder diameter · mm"]);
+        lacks(&a, &["Nose radius · mm", "Lead angle · °"]);
+        for (kind, shown, hidden) in [
+            (
+                "Turning tool",
+                &["Hand", "Nose radius · mm", "Lead angle · °"][..],
+                &["Reach · mm"][..],
+            ),
+            (
+                "Boring bar",
+                &["Nose radius · mm", "Smallest bore · mm", "Reach · mm"],
+                &["Hand"],
+            ),
+            (
+                "Grooving tool",
+                &["Blade width · mm", "Deepest plunge · mm"],
+                &["Nose radius · mm"],
+            ),
+            (
+                "Parting blade",
+                &["Blade width · mm", "Deepest plunge · mm"],
+                &["Hand"],
+            ),
+            (
+                "Threading tool",
+                &["Thread angle · °", "Pitches · mm, min-max"],
+                &["Blade width · mm"],
+            ),
+        ] {
+            let _ = a.update(Message::Edit(Target::Tool, "type", kind.into()));
+            assert!(
+                a.tool_draft.issues().is_empty(),
+                "{kind}: {:?}",
+                a.tool_draft.issues()
+            );
+            shows(
+                &a,
+                &["Tool number · T", "Machines", "None checked: every lathe."],
+            );
+            shows(&a, shown);
+            lacks(
+                &a,
+                &[
+                    "Diameter · mm",
+                    "Flutes",
+                    "Flute length · mm",
+                    "Stickout · mm",
+                    "Holder diameter · mm",
+                    "Tip angle · °",
+                ],
+            );
+            lacks(&a, hidden);
+            assert!(a.tool_draft.fits(&crate::lathe::defaults()));
+        }
+        // A bad size is told under the form, and saving is refused.
+        let _ = a.update(Message::Edit(Target::Tool, "nose_radius", "-1".into()));
+        let _ = a.update(Message::Edit(Target::Tool, "type", "Boring bar".into()));
+        let _ = a.update(Message::Edit(Target::Tool, "min_bore", "0".into()));
+        shows(&a, &["• min bore must be greater than zero."]);
+        let before = a.doc.tools.len();
+        let _ = a.update(Message::SaveTool);
+        assert_eq!(a.doc.tools.len(), before);
+        // Back to a mill and its fields.
+        let _ = a.update(Message::Edit(Target::Tool, "type", "Flat end mill".into()));
+        shows(
+            &a,
+            &[
+                "Diameter · mm",
+                "Flutes",
+                "None checked: every CNC machine.",
+            ],
+        );
+        lacks(&a, &["Smallest bore · mm"]);
+    }
+    #[test]
+    fn a_lathe_tool_is_saved_to_the_library_and_listed_by_its_type() {
+        let mut a = app();
+        let _ = a.update(Message::NewTool);
+        let _ = a.update(Message::Edit(Target::Tool, "type", "Threading tool".into()));
+        let _ = a.update(Message::Edit(Target::Tool, "name", "60° thread".into()));
+        let _ = a.update(Message::SaveTool);
+        let saved = a.doc.tools.last().unwrap();
+        assert_eq!(saved.name(), "60° thread");
+        assert!(saved.is_lathe());
+        shows(&a, &["T4 · 60° thread\nThreading tool"]);
+    }
+    #[test]
+    fn the_workholding_editor_has_new_chuck_and_the_chuck_fields() {
+        let mut a = app();
+        a.page = Page::Workholding;
+        a.doc.workholding = crate::holding::starters();
+        shows(&a, &["+ New chuck"]);
+        assert!(
+            crate::ui::probe::clicks(a.view(), WINDOW)
+                .iter()
+                .any(|m| matches!(m, Message::NewHolder("Chuck")))
+        );
+        let _ = a.update(Message::NewHolder("Chuck"));
+        assert_eq!(a.holder_draft.kind(), "Chuck");
+        shows(
+            &a,
+            &["Chuck definition", "Jaws", "None checked: every lathe."],
+        );
+        // The sizes of a chuck, not a vise's.
+        let sent = |a: &App| crate::ui::probe::texts(a.view(), iced::Size::new(1440., 2400.));
+        let seen = sent(&a);
+        for text in [
+            "Smallest grip · Ø mm",
+            "Largest grip · Ø mm",
+            "Jaw length · mm",
+            "Chuck body · Ø mm",
+        ] {
+            assert!(seen.iter().any(|t| t == text), "{text}");
+        }
+        assert!(!seen.iter().any(|t| t == "Jaw width · mm"));
+        // The library lists the starters' chucks by their jaws and range.
+        shows(
+            &a,
+            &[
+                "160 mm 3-jaw chuck\nChuck · 3 jaws · grips Ø3–Ø140 mm",
+                "160 mm 4-jaw chuck\nChuck · 4 jaws · grips Ø6–Ø150 mm",
+            ],
+        );
+        // A new one is not valid until sized, and saving says so.
+        let count = a.doc.workholding.len();
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), count);
+        for (k, v) in [
+            ("jaws", "4"),
+            ("min_grip", "5"),
+            ("max_grip", "100"),
+            ("jaw_length", "25"),
+            ("body", "125"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Holder, k, v.into()));
+        }
+        let _ = a.update(Message::SaveHolder);
+        assert_eq!(a.doc.workholding.len(), count + 1);
+    }
+    #[test]
+    fn a_lathe_setup_offers_a_chuck_and_a_mill_setup_a_vise_or_clamps() {
+        assert_eq!(crate::ui::holding_choices(true), ["None", "Chuck"]);
+        assert_eq!(
+            crate::ui::holding_choices(false),
+            ["None", "Vise", "Clamps"]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = holding_app(&dir);
+        a.page = Page::Work;
+        a.selected = None;
+        let _ = a.update(Message::SetupStep("Holding"));
+        shows(
+            &a,
+            &["The vise or clamps that hold the stock, from the workholding library."],
+        );
+        edit_setup(&mut a, &[("holding", "Vise")]);
+        shows(&a, &["Vise", "Suggest layout", "Jaw offset · mm"]);
+        lacks(&a, &["Stickout · mm"]);
+        // On the lathe: the chuck picker, the grip and stickout, no clearance gap, and a chuck to suggest.
+        a.doc.setup_mut().machine = crate::lathe::defaults();
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Round bar"),
+                ("stock_diameter", "50"),
+                ("stock_length", "100"),
+            ],
+        );
+        edit_setup(&mut a, &[("holding", "Chuck")]);
+        assert_eq!(get(&a.doc.setup().p, "holder"), first_of(&a, "Chuck"));
+        assert_eq!(get(&a.doc.setup().p, "grip"), "30");
+        shows(
+            &a,
+            &[
+                "The chuck that holds the bar, from the workholding library.",
+                "Chuck",
+                "Grip · mm",
+                "Stickout · mm",
+            ],
+        );
+        lacks(
+            &a,
+            &[
+                "Suggest layout",
+                "Jaw offset · mm",
+                "Jaws face",
+                "4-jaw: change the chuck",
+            ],
+        );
+        shows(&a, &["Suggest chuck", "1 workholding issue"]);
+        edit_setup(&mut a, &[("stickout", "50")]);
+        assert!(a.doc.holding_issues(0, None).is_empty());
+        lacks(&a, &["1 workholding issue"]);
+        // The 3D view and the guide have no jaws to draw for it.
+        assert!(crate::ui::holding_boxes(&a).is_empty());
+        // Suggest keeps the 3-jaw for a round bar and the grip and stickout the user's.
+        let three = first_of(&a, "Chuck");
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(
+            a.status, "Suggested: 160 mm 3-jaw chuck, for a round Ø50 mm bar.",
+            "{}",
+            a.status
+        );
+        assert_eq!(get(&a.doc.setup().p, "holder"), three);
+        assert_eq!(get(&a.doc.setup().p, "stickout"), "50");
+        // A square bar needs the 4-jaw: Suggest chooses it and the setup says to change the chuck.
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Fixed size box"),
+                ("stock_x", "50"),
+                ("stock_y", "50"),
+                ("stock_z", "100"),
+            ],
+        );
+        assert_eq!(
+            crate::ui::holding_lines(&a),
+            ["A 3-jaw holds round work: use the 4-jaw."]
+        );
+        let _ = a.update(Message::SuggestLayout);
+        assert_eq!(
+            a.status,
+            "Suggested: 160 mm 4-jaw chuck, for a square Ø70.71 mm bar. 4-jaw: change the chuck."
+        );
+        assert_ne!(get(&a.doc.setup().p, "holder"), three);
+        assert!(crate::ui::holding_lines(&a).is_empty());
+        shows(&a, &["4-jaw: change the chuck"]);
+        // A stickout over 4 diameters of the Ø50 bar is a warning, not an issue.
+        edit_setup(
+            &mut a,
+            &[
+                ("stock_type", "Round bar"),
+                ("stock_diameter", "20"),
+                ("stock_length", "300"),
+            ],
+        );
+        let _ = a.update(Message::SuggestLayout);
+        edit_setup(&mut a, &[("grip", "10"), ("stickout", "250")]);
+        assert!(
+            crate::ui::holding_lines(&a).is_empty(),
+            "{:?}",
+            crate::ui::holding_lines(&a)
+        );
+        shows(&a, &["Long and thin: support it or cut it in two setups."]);
+        edit_setup(&mut a, &[("stickout", "70")]);
+        lacks(&a, &["Long and thin: support it or cut it in two setups."]);
     }
     #[test]
     fn the_holder_editor_has_a_check_box_per_machine_that_edits_machines() {
@@ -16873,13 +17454,347 @@ flood = { pin = 8 }
         assert!(!adds(&a, Strategy::FiveAxis));
         assert!(adds(&a, Strategy::Drill) && adds(&a, Strategy::Box));
         // The ten dimmed tiles each say why; Box and Drill are not dimmed.
-        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 2);
+        assert_eq!(reasons(&a, one_axis), Strategy::ALL.len() - 3);
         assert_eq!(reasons(&a, box_on_cnc), 0);
         // Back on the CNC setup only Box is dimmed.
         a.doc.active = a.doc.setups[1].id.clone();
         assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Box));
         assert_eq!(reasons(&a, one_axis), 0);
         assert_eq!(reasons(&a, box_on_cnc), 1);
+    }
+    /// The sample app with a lathe in the library and a lathe tool of each type.
+    fn with_lathe(a: &mut App) {
+        a.doc.machines.push(crate::lathe::defaults());
+        for kind in crate::lathe::TOOLS {
+            a.doc.tools.push(crate::model::Tool::lathe(kind, kind));
+        }
+        a.doc.number_tools();
+    }
+    /// `with_lathe`, a lathe setup first and selected.
+    fn on_the_lathe(a: &mut App) {
+        with_lathe(a);
+        let _ = a.update(Message::AddLatheSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        a.selected = None;
+    }
+    #[test]
+    fn add_lathe_setup_shows_with_a_lathe_and_inserts_the_setup() {
+        let mut a = app();
+        lacks(&a, &["+ Add lathe setup"]);
+        a.doc.machines.push(crate::manual::defaults());
+        lacks(&a, &["+ Add lathe setup"]);
+        with_lathe(&mut a);
+        shows(&a, &["+ Add lathe setup"]);
+        let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+        assert!(clicks.iter().any(|m| matches!(m, Message::AddLatheSetup)));
+        let old = a.doc.active.clone();
+        let _ = a.update(Message::AddLatheSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        assert_eq!(a.doc.setups[0].name(), "Lathe");
+        assert_eq!(a.doc.setups[1].id, old);
+        assert_eq!(a.doc.active, old);
+        assert_eq!(a.page, Page::Work);
+        assert_eq!(a.selected, None);
+        assert!(a.status.contains("Lathe setup added"), "{}", a.status);
+        assert!(a.doc.workholding.iter().any(|h| h.kind() == "Chuck"));
+        // Without a lathe the press says so and changes nothing.
+        let mut b = app();
+        let _ = b.update(Message::AddLatheSetup);
+        assert_eq!(b.doc.setups.len(), 1);
+        assert!(b.status.contains("lathe"), "{}", b.status);
+    }
+    #[test]
+    fn the_ribbon_has_a_lathe_group_and_enables_only_turn_and_drill_on_a_lathe_setup() {
+        let mut a = app();
+        with_lathe(&mut a);
+        let sent = |a: &App| crate::ui::probe::clicks(a.view(), WINDOW);
+        let adds = |a: &App, s: Strategy| {
+            sent(a)
+                .iter()
+                .any(|m| matches!(m, Message::AddOp(x) if *x == s))
+        };
+        let reasons = |a: &App, reason: &str| {
+            let (_, cards) = laid(a).run(Helps::default()).expect("the view");
+            cards.iter().filter(|c| c.body == reason).count()
+        };
+        let (only_turn, turn_on_mill) = (crate::lathe::ONLY_TURN, crate::lathe::TURN_ON_MILL);
+        shows(&a, &["LATHE", "MANUAL"]);
+        // On a CNC setup Turn is dimmed and says so; everything else as before.
+        assert!(!adds(&a, Strategy::Turn) && adds(&a, Strategy::Face));
+        assert_eq!(reasons(&a, turn_on_mill), 1);
+        assert_eq!(reasons(&a, only_turn), 0);
+        let _ = a.update(Message::AddLatheSetup);
+        a.doc.active = a.doc.setups[0].id.clone();
+        for s in Strategy::ALL {
+            assert_eq!(
+                adds(&a, s),
+                matches!(s, Strategy::Turn | Strategy::Drill),
+                "{s:?}"
+            );
+        }
+        // The eleven others each say why.
+        assert_eq!(reasons(&a, only_turn), Strategy::ALL.len() - 2);
+        assert_eq!(reasons(&a, turn_on_mill), 0);
+        // Back on the CNC setup.
+        a.doc.active = a.doc.setups[1].id.clone();
+        assert!(adds(&a, Strategy::Face) && !adds(&a, Strategy::Turn));
+        assert_eq!(reasons(&a, only_turn), 0);
+        assert_eq!(reasons(&a, turn_on_mill), 1);
+        // And on the manual mill.
+        a.doc.machines.push(crate::manual::defaults());
+        let _ = a.update(Message::AddManualSetup);
+        a.doc.active = a
+            .doc
+            .setups
+            .iter()
+            .find(|s| crate::manual::is_manual(&s.machine))
+            .unwrap()
+            .id
+            .clone();
+        assert!(!adds(&a, Strategy::Turn) && adds(&a, Strategy::Box));
+        assert_eq!(reasons(&a, turn_on_mill), 1);
+    }
+    #[test]
+    fn adding_a_turn_on_the_lathe_takes_a_turning_tool_and_a_gear_and_the_kind_changes_both() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        let tool = |a: &App, kind: &str| {
+            a.doc
+                .tools
+                .iter()
+                .find(|t| get(&t.p, "type") == kind)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let _ = a.update(Message::AddOp(Strategy::Turn));
+        let op = a.operation().unwrap().clone();
+        assert_eq!(op.strategy, Strategy::Turn);
+        assert_eq!(op.tool, tool(&a, "Turning tool"));
+        assert_eq!(get(&op.p, "turn_kind"), "Outside");
+        assert!(
+            num(&op.p, "rpm")
+                .is_some_and(|rpm| crate::manual::on_gear(&a.doc.setup().machine, rpm))
+        );
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        assert_eq!(a.tab, "Tool");
+        // Each kind: its fields, the tool of its type, no issue.
+        for kind in crate::lathe::TURN_KINDS {
+            let _ = a.update(Message::Edit(Target::Operation, "turn_kind", kind.into()));
+            let op = a.operation().unwrap().clone();
+            assert_eq!(get(&op.p, "turn_kind"), kind);
+            assert_eq!(
+                op.tool,
+                tool(&a, crate::lathe::tool_for(kind).unwrap()),
+                "{kind}"
+            );
+            assert_eq!(a.op_issues(), Vec::<String>::new(), "{kind}");
+            assert!(!op.preview);
+        }
+        // A tool of the kind's type already chosen stays.
+        let other = crate::model::Tool::lathe("Second parting blade", "Parting blade");
+        let other_id = other.id.clone();
+        a.doc.tools.push(other);
+        let _ = a.update(Message::Edit(Target::Operation, "tool", other_id.clone()));
+        if let Some(o) = a.operation_mut() {
+            o.tool = other_id.clone();
+        }
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "turn_kind",
+            "Part off".into(),
+        ));
+        assert_eq!(a.operation().unwrap().tool, other_id);
+        // A drill on the lathe is on the centre: no selection, a depth.
+        let mut drill = crate::model::Tool::new("Drill 8", "Drill", "8");
+        drill
+            .p
+            .insert("machines".into(), a.doc.setup().machine.id.clone());
+        a.doc.tools.push(drill);
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let op = a.operation().unwrap();
+        assert!(op.geometry.is_empty() && get(&op.p, "depth") == "20");
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        // A Turn with no turning tool in the library goes to the tools page.
+        let mut b = app();
+        b.doc.machines.push(crate::lathe::defaults());
+        let _ = b.update(Message::AddLatheSetup);
+        b.doc.active = b.doc.setups[0].id.clone();
+        let _ = b.update(Message::AddOp(Strategy::Turn));
+        assert_eq!(b.page, Page::Tools);
+        assert!(b.doc.setups[0].operations.is_empty());
+        assert!(b.status.contains("needs a cutter"), "{}", b.status);
+    }
+    #[test]
+    fn the_turn_editor_has_a_kind_chooser_and_the_fields_of_each_kind() {
+        let mut a = imported_app();
+        on_the_lathe(&mut a);
+        let _ = a.update(Message::AddOp(Strategy::Turn));
+        let _ = a.update(Message::Tab("Turn".into()));
+        shows(&a, &["Kind", "Diameter · mm", "Z end · mm"]);
+        lacks(&a, &["Take off the end · mm", "Pitch · mm"]);
+        let _ = a.update(Message::Tab("Passes".into()));
+        shows(
+            &a,
+            &[
+                "Depth per pass · mm",
+                "Finish pass · mm",
+                "Stock to leave · mm",
+            ],
+        );
+        lacks(
+            &a,
+            &[
+                "Pass direction · degrees",
+                "Tolerance · mm",
+                "Stepover · % tool diameter",
+            ],
+        );
+        // The tool tab: the lathe's tools, a speed, no feed in mm/min and no rotation choice.
+        let _ = a.update(Message::Tab("Tool".into()));
+        shows(&a, &["Spindle speed · rpm"]);
+        lacks(&a, &["Cutting feed · mm/min", "Spindle rotation"]);
+        assert!(page_texts(&a).iter().any(|t| t.contains("Turning tool")));
+        // The mill's tools are not offered to the lathe.
+        assert!(!page_texts(&a).iter().any(|t| t.contains("Flat end mill")));
+        for (kind, tab, shown, hidden) in [
+            (
+                "Face",
+                "Turn",
+                vec![
+                    "Take off the end · mm",
+                    "Face to diameter · mm (0 = centre)",
+                ],
+                vec!["Diameter · mm"],
+            ),
+            (
+                "Bore",
+                "Turn",
+                vec!["Diameter · mm", "Z end · mm"],
+                vec!["Pitch · mm"],
+            ),
+            ("Bore", "Passes", vec!["Depth per pass · mm"], vec![]),
+            (
+                "Chamfer",
+                "Turn",
+                vec!["Edge", "Size · mm"],
+                vec!["Diameter · mm"],
+            ),
+            (
+                "Groove",
+                "Turn",
+                vec!["Z, left side · mm", "Width · mm", "Bottom diameter · mm"],
+                vec!["Z end · mm"],
+            ),
+            (
+                "Part off",
+                "Turn",
+                vec!["Z · mm"],
+                vec!["Width · mm", "Diameter · mm"],
+            ),
+            (
+                "Thread",
+                "Turn",
+                vec![
+                    "Thread on",
+                    "Major diameter · mm",
+                    "Pitch · mm",
+                    "Z end · mm",
+                ],
+                vec!["Depth per pass · mm"],
+            ),
+            ("Thread", "Passes", vec!["Passes"], vec!["Finish pass · mm"]),
+        ] {
+            let _ = a.update(Message::Edit(Target::Operation, "turn_kind", kind.into()));
+            let _ = a.update(Message::Tab(tab.into()));
+            shows(&a, &shown);
+            lacks(&a, &hidden);
+        }
+        // Kinds that cut in one go have no Passes tab: it is not in the row.
+        let _ = a.update(Message::Edit(Target::Operation, "turn_kind", "Face".into()));
+        assert!(
+            !a.operation()
+                .unwrap()
+                .tabs(&a.doc.setup().machine)
+                .contains(&"Passes")
+        );
+        for tab in ["Tool", "Turn", "Passes", "Centre"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            let _view = a.view();
+        }
+        // A wrong number shows at its field and opens its tab from the audit.
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "turn_kind",
+            "Outside".into(),
+        ));
+        let _ = a.update(Message::Edit(Target::Operation, "diameter", "0".into()));
+        let _ = a.update(Message::Tab("Turn".into()));
+        let checks = crate::ui::op_checks(&a);
+        assert_eq!(
+            checks.len(),
+            1,
+            "{:?}",
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(checks[0].key, Some("diameter"));
+        // Generating plans the passes, a lathe plan the simulation turns.
+        let _ = a.update(Message::Edit(Target::Operation, "diameter", "40".into()));
+        let _ = a.update(Message::Generate);
+        assert!(
+            a.status.starts_with("Turning preview ready"),
+            "{}",
+            a.status
+        );
+        let sim = a.simulation.as_ref().unwrap();
+        assert!(sim.plan.is_lathe() && !sim.plan.rings.is_empty());
+        // A lathe has no G-code to export: the status sends the user to the steps.
+        assert!(
+            a.status.ends_with("Follow the steps on the MACHINE page."),
+            "{}",
+            a.status
+        );
+        assert!(!a.status.contains("Export G-code"), "{}", a.status);
+        // The cut is clear of the chuck, so the preview says nothing of it.
+        assert_eq!(crate::ui::holding_warning(&a), None);
+        // With the jaws 10 mm further out, the same cut is inside the grip.
+        let _ = a.update(Message::Edit(Target::Setup, "stickout", "20".into()));
+        let _ = a.update(Message::Generate);
+        let (heading, lines) = crate::ui::holding_warning(&a).unwrap();
+        assert_eq!(heading, "This cut conflicts with the chuck");
+        assert!(
+            lines[0].ends_with("cuts at Z-30.0, inside the grip: the jaws start at Z-20.0."),
+            "{lines:?}"
+        );
+    }
+    #[test]
+    fn a_lathe_drill_has_a_centre_tab_and_no_hole_selection() {
+        let mut a = app();
+        on_the_lathe(&mut a);
+        let mut drill = crate::model::Tool::new("Drill 8", "Drill", "8");
+        drill
+            .p
+            .insert("machines".into(), a.doc.setup().machine.id.clone());
+        a.doc.tools.push(drill);
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let tabs = a.operation().unwrap().tabs(&a.doc.setup().machine);
+        assert_eq!(tabs, vec!["Tool", "Centre", "Cycle"]);
+        let _ = a.update(Message::Tab("Centre".into()));
+        shows(&a, &["Depth · mm"]);
+        let _ = a.update(Message::Tab("Cycle".into()));
+        shows(&a, &["Drilling cycle"]);
+        lacks(&a, &["Hole order"]);
+        // No pick mode on the lathe, whatever the tab.
+        let _ = a.update(Message::Tab("Geometry".into()));
+        assert!(!a.picking && !a.can_pick());
+        // The same operation on a CNC setup keeps its tabs and its hole order.
+        a.doc.active = a.doc.setups[1].id.clone();
+        a.selected = Some(0);
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let tabs = a.operation().unwrap().tabs(&a.doc.setup().machine);
+        assert_eq!(tabs, Strategy::Drill.tabs());
+        let _ = a.update(Message::Tab("Cycle".into()));
+        shows(&a, &["Hole order"]);
     }
     #[test]
     fn adding_a_box_on_the_big_mill_takes_a_fitting_tool_and_a_gear() {

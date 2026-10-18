@@ -1062,6 +1062,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Add a setup on the manual mill before the CNC setups, for the cuts the big mill makes first. Put first, it takes the stock, orientation, zero and holding of the old first setup, which then starts from the stock it leaves.",
             "",
         ),
+        AddLatheSetup => (
+            "Add a setup on the lathe before the CNC setups, with a round bar in the 3-jaw chuck. Put first, it takes the orientation of the old first setup, which then starts from the bar it leaves.",
+            "",
+        ),
         SetupEditor => (
             "Set the machine, work coordinate system, stock, part orientation and workholding for the current setup.",
             "",
@@ -1203,6 +1207,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Say if the DRO compensates the tool radius, and the minutes a pass, a tool change and moving the stock cost on this mill.",
             "",
         ),
+        WizardStep(2) if label.ends_with("Dials & feeds") => (
+            "Say what the cross-slide dial reads, the numbers and divisions of each dial, the power feeds and threads the gearbox cuts, and the minutes a pass, a tool change and moving the stock cost.",
+            "",
+        ),
         WizardStep(3) if label.ends_with("Review") => (
             "Review the profile and resolve configuration issues before saving it to your local machine library.",
             "",
@@ -1212,7 +1220,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         WizardStep(0) => (
-            "Name the machine, choose a CNC or a manual mill, then 3, 4 or 5 axes for a CNC, and the units used by its specification.",
+            "Name the machine, choose a CNC, a manual mill or a manual lathe, then 3, 4 or 5 axes for a CNC, and the units used by its specification.",
             "",
         ),
         WizardStep(1) => (
@@ -1271,6 +1279,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Create a toe clamp with its length, width, height and bite. It joins the library when you save it. Enter the sizes of your own clamp.",
             "",
         ),
+        NewHolder("Chuck") => (
+            "Create a lathe chuck with its jaw count, the range of diameters it closes on, how deep its jaws reach and its body diameter. It joins the library when you save it. Enter the sizes of your own chuck.",
+            "",
+        ),
         NewHolder(_) => (
             "Create a vise with its jaw sizes, maximum opening and grip. It joins the library when you save it. Enter the sizes of your own vise.",
             "",
@@ -1289,7 +1301,7 @@ pub fn command(m: &Message, label: String) -> Help {
         ),
         SuggestLayout => (
             "Place this setup's vise jaws or clamps. A vise goes on the X or the Y sides, whichever its generated toolpaths leave clearer, at its grip or less. Clamps are chosen among the middle and quarter points of each side: four, or two on a small stock.",
-            "The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again.",
+            "The status says how many operations still come within the clearance gap. The setup's operations are generated for this and never changed. Jaws and clamps are checked as boxes with the gap; parallels, bolts, the table and the machine body are not. Choosing Vise or Clamps, or another library entry, does this too; other edits are kept until you press this again. On a lathe setup it chooses the chuck instead: the 3-jaw when the bar in the jaws is round and within its range, else the 4-jaw (change the chuck), never a vise; the grip and the stickout stay yours.",
         ),
         SetClamps(_) if label == crate::ui::ADD_CLAMP => (
             "Add a clamp at the middle of a side of the stock, the sides taken in turn. Change its side and offset in its row.",
@@ -1401,6 +1413,10 @@ pub fn command(m: &Message, label: String) -> Help {
                     "Passes" => {
                         "Control cutting depth, spacing, finishing allowance and tolerance."
                     }
+                    "Turn" => {
+                        "Choose what to turn and set its sizes: Z 0 is the free end, diameters are diameters."
+                    }
+                    "Centre" => "Set how deep the drill goes on the lathe's centre line.",
                     "Linking" => {
                         "Control how the tool enters a cut and moves between cutting passes."
                     }
@@ -1609,10 +1625,23 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "",
         ),
         Open(_) => (
-            "Open this setup in MACHINE: a setup on the manual mill shows its steps, with the DRO numbers to move to, whether or not the CNC is connected.",
+            "Open this setup in MACHINE: a setup on the manual mill shows its steps with the DRO numbers to move to, one on the lathe with its dial pictures, whether or not the CNC is connected.",
             "",
         ),
         Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
+        CrossReads(crate::lathe::Reads::Diameter) => (
+            "The diameter went down by the dial's reading: the cross-slide dial reads the diameter. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
+            "",
+        ),
+        CrossReads(crate::lathe::Reads::Radius) => (
+            "The diameter went down by twice the dial's reading: the cross-slide dial reads the radius. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
+            "",
+        ),
+        Typed(..) => ("Type the diameter the calipers read, in mm.", ""),
+        Measured(..) => (
+            "Keep this measured diameter with the project: the cross-slide numbers that follow are worked out from it, the last pass taking all that is left. The app does not read the calipers.",
+            "",
+        ),
     }
 }
 
@@ -1700,6 +1729,10 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         }
         (Target::Machine, "mdi_line") => {
             let (body, more) = machine_help(&crate::control::Action::MdiText(String::new()));
+            (body, more, None)
+        }
+        (Target::Machine, "measured") => {
+            let (body, more) = guide_help(&crate::GuideAction::Measured(String::new(), 0.));
             (body, more, None)
         }
         (Target::Machine, "work_set") => {
@@ -1824,9 +1857,154 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             None,
         ),
+        (Target::Holder, "jaws") => (
+            "How many jaws the chuck has: 3 (self-centring, for round bar) or 4 (independent, for square or off-centre work).",
+            "",
+            None,
+        ),
+        (Target::Holder, "min_grip") => (
+            "The smallest diameter the jaws close on, in mm, with the jaws in their normal position.",
+            "",
+            None,
+        ),
+        (Target::Holder, "max_grip") => (
+            "The largest diameter the jaws close on, in mm. It must be above the smallest grip and below the chuck body.",
+            "",
+            None,
+        ),
+        (Target::Holder, "jaw_length") => (
+            "How deep the jaws reach along the bar, in mm: the most length a setup can hold in them. A setup starts from it.",
+            "",
+            None,
+        ),
+        (Target::Holder, "body") => (
+            "The chuck's outside diameter, in mm. The 160 mm starters are typical: measure yours.",
+            "",
+            None,
+        ),
+        (Target::Setup, "grip") => (
+            "How much of the bar is held in the jaws, in mm. It starts at the chuck's jaw length. Hold at least a third of the diameter.",
+            "",
+            None,
+        ),
+        (Target::Setup, "stickout") => (
+            "How far the bar sticks out of the jaws to its free end, in mm. It must reach the furthest cut from the end.",
+            "",
+            None,
+        ),
+        (Target::Tool, "hand") => (
+            "Which way the turning tool cuts: Right cuts toward the chuck, Left away from it, Neutral either way.",
+            "",
+            None,
+        ),
+        (Target::Tool, "nose_radius") => (
+            "The radius of the insert's tip in mm; 0 is a sharp point. It rounds inside corners and sets the finish.",
+            "",
+            None,
+        ),
+        (Target::Tool, "lead_angle") => (
+            "The angle between the cutting edge and the bar's axis, in degrees; 93 is typical for a turning tool that can also face.",
+            "",
+            None,
+        ),
+        (Target::Tool, "min_bore") => (
+            "The smallest hole the boring bar goes into, in mm.",
+            "",
+            None,
+        ),
+        (Target::Tool, "reach") => (
+            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge.",
+            "",
+            None,
+        ),
+        (Target::Tool, "width") => (
+            "The width of the grooving tool's or parting blade's cutting edge, in mm. A groove is at least this wide.",
+            "",
+            None,
+        ),
+        (Target::Tool, "thread_angle") => (
+            "The included angle of the thread form, in degrees: 60 for metric and unified threads, 55 for Whitworth.",
+            "",
+            None,
+        ),
+        (Target::Tool, "pitches") => (
+            "The finest and coarsest pitch the threading tool cuts, in mm, written like 0.5-3.",
+            "",
+            None,
+        ),
+        (Target::Operation, "turn_kind") => (
+            "What this Turn does: face the end, turn an outside diameter, bore, chamfer an edge, cut a groove, part off or cut a thread. Changing the kind brings that kind's sizes and a fitting tool.",
+            "Each kind uses a tool of its own type: a turning tool for Face, Outside and Chamfer, a boring bar, a grooving tool, a parting blade, a threading tool.",
+            None,
+        ),
+        (Target::Operation, "face_off") => (
+            "How much comes off the end of the bar, in mm: the face ends up this far in from the free end.",
+            "",
+            None,
+        ),
+        (Target::Operation, "to_diameter") => (
+            "The diameter the facing cut reaches, in mm; 0 faces right to the centre.",
+            "",
+            None,
+        ),
+        (Target::Operation, "diameter") => (
+            "The finished diameter in mm: what the turned or bored section measures, a groove's bottom, or a thread's major diameter. Diameters are diameters, not radii.",
+            "",
+            None,
+        ),
+        (Target::Operation, "z_end") => (
+            "Where the cut stops along the bar, in mm. Z 0 is the free end and negative is toward the chuck, so -30 turns 30 mm of the bar.",
+            "",
+            None,
+        ),
+        (Target::Operation, "z") => (
+            "Where the cut is along the bar, in mm: the groove's side toward the chuck, or the side of a parting cut that stays with the part. Z 0 is the free end and negative is toward the chuck.",
+            "",
+            None,
+        ),
+        (Target::Operation, "depth") => (
+            "How much one pass takes off the diameter, in mm; a lathe drill's depth in from the free end. Passes are equal and no larger than this.",
+            "",
+            None,
+        ),
+        (Target::Operation, "finish") => (
+            "What the last pass takes off the diameter, in mm, to leave a clean surface at the finished size.",
+            "",
+            None,
+        ),
+        (Target::Operation, "edge") => (
+            "Which edge to break: the outside corner of the end, the inside corner of a bore, or a shoulder.",
+            "",
+            None,
+        ),
+        (Target::Operation, "size") => (
+            "The length of the 45 degree chamfer's leg, in mm.",
+            "",
+            None,
+        ),
+        (Target::Operation, "width") => (
+            "How wide the groove is, in mm. It is at least as wide as the grooving tool.",
+            "",
+            None,
+        ),
+        (Target::Operation, "thread_side") => (
+            "Cut the thread on the outside of the bar or inside a bore.",
+            "",
+            None,
+        ),
+        (Target::Operation, "pitch") => (
+            "The distance between thread crests, in mm. It must be one the gearbox cuts and one the threading tool's range covers.",
+            "",
+            None,
+        ),
+        (Target::Operation, "passes") => (
+            "How many passes cut the thread. Empty takes the usual number for the pitch; the first pass is the deepest and they get lighter.",
+            "",
+            None,
+        ),
         (Target::Setup, "holding") => (
             "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap that every move is checked against, and its hold is checked against each operation's cutting force. None models nothing.",
-            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description.",
+            "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code.",
             None,
         ),
         (Target::Setup, "holder") => (
@@ -2225,7 +2403,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (Target::Machine, "kind") => (
-            "CNC runs G-code. Manual is a hand-operated mill with a DRO: no G-code, no Run, and its setups are shown as steps on the MACHINE page.",
+            "CNC runs G-code. Manual is a hand-operated mill with a DRO, Lathe a hand-operated lathe with dials: no G-code, no Run, and their setups are shown as steps on the MACHINE page.",
             "",
             None,
         ),
@@ -2246,6 +2424,41 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "turn_x" | "turn_y" | "turn_z") => (
             "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
+            "",
+            None,
+        ),
+        (_, "swing") => (
+            "The largest diameter the lathe turns over its bed, in mm. A bar or part wider than this is refused.",
+            "",
+            None,
+        ),
+        (_, "centres") => (
+            "The distance between the centres, in mm: the longest work the lathe takes between chuck and tailstock.",
+            "",
+            None,
+        ),
+        (_, "cross_reads") => (
+            "Whether a reading on the cross-slide dial takes that much off the diameter or off the radius. Not known yet: the first lathe setup asks you to cut a test and measure, and saves the answer.",
+            "",
+            None,
+        ),
+        (_, "cross_turn" | "top_turn" | "carriage_turn" | "quill_turn") => (
+            "The numbers the dial goes through in one full turn of the handwheel: what it reads at the index after one turn. The steps use it to say how many turns and what reading.",
+            "",
+            None,
+        ),
+        (_, "cross_div" | "top_div" | "carriage_div" | "quill_div") => (
+            "How many divisions the dial has round its collar, a whole number. A reading is rounded to one division.",
+            "",
+            None,
+        ),
+        (_, "feeds") => (
+            "The carriage power feeds the gearbox has, in mm per revolution, comma-separated. Turning passes use the one nearest 0.1.",
+            "",
+            None,
+        ),
+        (_, "pitches") => (
+            "The thread pitches the gearbox cuts, in mm, comma-separated. A thread operation must use one of them.",
             "",
             None,
         ),
@@ -2285,7 +2498,22 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (_, "stock_type") => (
-            "Relative size box adds independent offsets to the six sides of the part's bounding box after setup rotation. Fixed size box uses explicit X, Y and Z dimensions. Values for each mode are kept when switching.",
+            "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe. Values are kept when switching.",
+            "",
+            None,
+        ),
+        (_, "stock_diameter") => (
+            "Round bar diameter, mm. The bar lies along the setup Z axis, centred on X 0 Y 0.",
+            "",
+            None,
+        ),
+        (_, "stock_length") => (
+            "Round bar length along the setup Z axis, mm, from Z 0 up.",
+            "",
+            None,
+        ),
+        (_, "stock_radial") => (
+            "Extra material round the part, mm: the bar's radius is the part's largest distance from the setup Z axis plus this. 0 touches the part.",
             "",
             None,
         ),
@@ -2400,7 +2628,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::FiveAxis)),
         ),
         (_, "type") => (
-            "Cutter geometry: flat end mill, ball end mill, drill or face mill. Choose a type suited to the operation.",
+            "Cutter geometry: flat end mill, ball end mill, drill or face mill, or for a lathe a turning tool, boring bar, grooving tool, parting blade or threading tool. Choose a type suited to the operation.",
             "",
             Some(Tool),
         ),
@@ -2964,6 +3192,13 @@ impl canvas::Program<Message> for Illustration {
                     };
                     [-30. + 30. * x, -18. + row * 10., 25.]
                 }
+                Strategy::Turn => {
+                    // A pass along the bar, back, and one nearer the axis.
+                    let pass = (t * 2.).floor().min(1.);
+                    let k = (t * 2.).fract();
+                    let x = if k < 0.5 { 2. * k } else { 2. - 2. * k };
+                    [-34. + 68. * x, 10. - 6. * pass, 25.]
+                }
                 Strategy::Contour => [44. * a.cos(), 27. * a.sin(), 21.],
                 Strategy::Drill => {
                     let hole = (t * 4.).floor().min(3.) as usize;
@@ -3312,6 +3547,7 @@ mod tests {
         for message in [
             Message::NewHolder("Vise"),
             Message::NewHolder("Clamp"),
+            Message::NewHolder("Chuck"),
             Message::EditHolder("h".into()),
             Message::SaveHolder,
             Message::DeleteHolder("h".into()),
@@ -3838,7 +4074,7 @@ mod tests {
                 ],
             ),
             ("speed", vec!["0.5", "1", "120"]),
-            ("holding", vec!["None", "Vise", "Clamps"]),
+            ("holding", vec!["None", "Vise", "Clamps", "Chuck"]),
             ("group", crate::material::GROUPS.to_vec()),
         ];
         for (key, values) in fallbacks {
@@ -3900,6 +4136,8 @@ mod tests {
             "Cycle",
             "Passes",
             "Linking",
+            "Turn",
+            "Centre",
             "Other",
         ] {
             commands.push((tab.into(), Tab(tab.into())));
@@ -3928,6 +4166,7 @@ mod tests {
             NewMachine,
             AddSetup,
             AddManualSetup,
+            AddLatheSetup,
             ToolMachine("m".into(), true),
             HolderMachine("m".into(), true),
             StockDetail(Detail::Draft),
@@ -3978,6 +4217,7 @@ mod tests {
             PickMaterial("m".into()),
             NewHolder("Clamp"),
             NewHolder("Vise"),
+            NewHolder("Chuck"),
             EditHolder("h".into()),
             SaveHolder,
             DeleteHolder("h".into()),
@@ -4099,10 +4339,13 @@ mod tests {
             .collect();
         for s in Strategy::ALL {
             cards.push((format!("unavailable:{s:?}"), unavailable_help(s)));
-            cards.push((
-                format!("dimmed:{s:?}"),
-                dimmed_help(s, crate::manual::ONE_AXIS),
-            ));
+            for reason in [
+                crate::manual::ONE_AXIS,
+                crate::lathe::ONLY_TURN,
+                crate::lathe::TURN_ON_MILL,
+            ] {
+                cards.push((format!("dimmed:{s:?}:{reason}"), dimmed_help(s, reason)));
+            }
             let b = HelpButton::operation(
                 widget::button("x"),
                 s,

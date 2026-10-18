@@ -236,6 +236,7 @@ impl Builder {
                 rest_top: None,
                 spindle_clockwise,
                 milling_direction: "Mixed · preview",
+                rings: vec![],
                 shape: if get(&tool.p, "type") == "Ball end mill" {
                     CutterShape::Ball
                 } else {
@@ -386,6 +387,10 @@ impl Builder {
     }
 }
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    // Turning, and drilling on a lathe's centre, are planned on the lathe.
+    if op.strategy == Strategy::Turn || op.on_centre(&setup.machine) {
+        return crate::turn::generate(setup, op, tool, mesh);
+    }
     match op.strategy {
         Strategy::Contour => contour(setup, op, tool, mesh),
         Strategy::Drill if op.drills_pin_holes() => pin_holes(setup, op, tool, mesh),
@@ -2891,7 +2896,34 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn all_twelve_strategies_have_an_explicit_executable_or_unavailable_contract() {
+    fn turning_and_a_lathes_centre_drilling_are_planned_by_the_lathe() {
+        let mesh = block();
+        let mut setup = Setup::new(crate::lathe::defaults(), "G54");
+        let mut tool = Tool::lathe("Turn", "Turning tool");
+        tool.p.insert("machines".into(), setup.machine.id.clone());
+        let turn = Operation::new(Strategy::Turn, tool.id.clone());
+        let mut drill = Operation::for_machine(Strategy::Drill, tool.id.clone(), &setup.machine);
+        drill.p.insert("depth".into(), "10".into());
+        // Both entries give the lathe's plan, or its refusal, alike.
+        for op in [&turn, &drill] {
+            let lathe = crate::turn::generate(&setup, op, &tool, &mesh).map(|p| p.moves.len());
+            for plan in [
+                generate(&setup, op, &tool, &mesh),
+                simulation::generate(&setup, op, &tool, &mesh),
+            ] {
+                assert_eq!(plan.map(|p| p.moves.len()), lathe);
+            }
+        }
+        // The drill needs a drill in the tailstock, not the turning tool.
+        let refusal = "A lathe drills on the centre with a drill in the tailstock.";
+        assert_eq!(generate(&setup, &drill, &tool, &mesh).unwrap_err(), refusal);
+        // A Drill on a mill still selects holes.
+        setup.machine = Machine::new(3);
+        let plain = Operation::new(Strategy::Drill, tool.id.clone());
+        assert_ne!(generate(&setup, &plain, &tool, &mesh).unwrap_err(), refusal);
+    }
+    #[test]
+    fn all_thirteen_strategies_have_an_explicit_executable_or_unavailable_contract() {
         let mesh = block();
         for strategy in Strategy::ALL {
             assert!(!strategy.availability().is_empty());
@@ -2908,7 +2940,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            8
+            9
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.

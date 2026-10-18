@@ -7,8 +7,15 @@ use crate::{
 
 const TURNS: [&str; 3] = ["turn_x", "turn_y", "turn_z"];
 
+/// The manual mill: a DRO, one axis at a time, steps instead of G-code.
 pub fn is_manual(m: &Machine) -> bool {
     get(&m.p, "kind") == "Manual"
+}
+
+/// A machine worked by hand: the manual mill and the manual lathe. Neither
+/// has a program, a post, an export or a UC100 Run, nor a work offset of its own.
+pub fn is_hand(m: &Machine) -> bool {
+    is_manual(m) || crate::lathe::is_lathe(m)
 }
 
 pub fn defaults() -> Machine {
@@ -44,20 +51,26 @@ fn variable(m: &Machine) -> Option<(f32, f32)> {
     (a.is_finite() && b.is_finite() && 0. < a && a < b).then_some((a, b))
 }
 
+/// The comma-separated positive numbers of the machine's setting `key`,
+/// lowest first. Empty when any entry is not a positive number.
+pub fn list(m: &Machine, key: &str) -> Vec<f32> {
+    let parsed: Option<Vec<f32>> = get(&m.p, key)
+        .split(',')
+        .map(|s| s.trim().parse::<f32>().ok())
+        .map(|v| v.filter(|v| v.is_finite() && *v > 0.))
+        .collect();
+    let mut list = parsed.unwrap_or_default();
+    list.sort_by(f32::total_cmp);
+    list
+}
+
 /// The gearbox's speeds, lowest first; a variable drive gives its two ends.
 /// Empty when any entry is not a positive number.
 pub fn gears(m: &Machine) -> Vec<f32> {
     if let Some((a, b)) = variable(m) {
         return vec![a, b];
     }
-    let parsed: Option<Vec<f32>> = get(&m.p, "speeds")
-        .split(',')
-        .map(|s| s.trim().parse::<f32>().ok())
-        .map(|v| v.filter(|v| v.is_finite() && *v > 0.))
-        .collect();
-    let mut gears = parsed.unwrap_or_default();
-    gears.sort_by(f32::total_cmp);
-    gears
+    list(m, "speeds")
 }
 
 /// The speed the machine can run nearest to `rpm`.
@@ -106,7 +119,8 @@ pub fn turns(m: &Machine, axis: usize, feed: f32) -> f32 {
 }
 
 /// Sets `rpm` to the highest gear and `feed` to the hand feed, so the rpm,
-/// feed and material checks apply to a manual machine as to any other.
+/// feed and material checks apply to a manual machine as to any other. A
+/// lathe has no hand feed; its travel is its swing and its centres.
 pub fn settle(m: &mut Machine) {
     if let Some(top) = gears(m).last() {
         m.p.insert("rpm".into(), top.to_string());
@@ -114,24 +128,44 @@ pub fn settle(m: &mut Machine) {
     if let Some(feed) = num(&m.p, "hand_feed") {
         m.p.insert("feed".into(), feed.to_string());
     }
+    if crate::lathe::is_lathe(m) {
+        for (travel, size) in [("x", "swing"), ("y", "swing"), ("z", "centres")] {
+            if let Some(v) = num(&m.p, size).filter(|v| *v > 0.) {
+                m.p.insert(travel.into(), v.to_string());
+            }
+        }
+    }
 }
 
-/// Whether a tool or holder with these `machines` ids fits `m`. Empty fits
-/// every CNC machine and no manual machine.
-pub fn fits(machines: &str, m: &Machine) -> bool {
+/// Whether a tool or holder with these `machines` ids fits `m`. A list fits
+/// the machines it names. Empty fits every CNC machine and no manual machine
+/// or lathe, except for a tool or holder made for a lathe (`lathe_only`: a
+/// lathe tool, a chuck), which then fits lathes and nothing else.
+pub fn fits(machines: &str, lathe_only: bool, m: &Machine) -> bool {
     if machines.trim().is_empty() {
-        return !is_manual(m);
+        return if lathe_only {
+            crate::lathe::is_lathe(m)
+        } else {
+            !is_hand(m)
+        };
     }
     machines.split(',').any(|id| id.trim() == m.id)
 }
 
-/// Makes the wizard's draft `kind` ("Manual" or "CNC"). Choosing Manual fills
-/// the manual defaults and keeps the name, units, travel and power entered.
+/// Makes the wizard's draft `kind` ("Manual", "Lathe" or "CNC"). Choosing
+/// Manual or Lathe fills that machine's defaults and keeps the name, units,
+/// travel and power entered.
 pub fn set_kind(m: &mut Machine, kind: &str) {
-    if kind != "Manual" {
-        m.p.insert("kind".into(), "CNC".into());
-    } else if !is_manual(m) {
-        for (k, v) in defaults().p {
+    let (fresh, new) = match kind {
+        "Manual" => (!is_manual(m), defaults()),
+        "Lathe" => (!crate::lathe::is_lathe(m), crate::lathe::defaults()),
+        _ => {
+            m.p.insert("kind".into(), "CNC".into());
+            return;
+        }
+    };
+    if fresh {
+        for (k, v) in new.p {
             if !matches!(k.as_str(), "name" | "units" | "x" | "y" | "z" | "power") {
                 m.p.insert(k, v);
             }
@@ -165,8 +199,8 @@ pub fn tool_changes(setup: &Setup) -> usize {
 }
 
 /// The minutes the stock spends moving between machines: for each pair of
-/// consecutive setups on different machines, the `move_time` of the manual
-/// machine in the pair (the longer when both are), 0 when neither is manual.
+/// consecutive setups on different machines, the `move_time` of the hand
+/// machine in the pair (the longer when both are), 0 when neither is.
 pub fn move_minutes(doc: &Document) -> f32 {
     doc.setups
         .windows(2)
@@ -174,16 +208,25 @@ pub fn move_minutes(doc: &Document) -> f32 {
         .map(|w| {
             w.iter()
                 .map(|s| &s.machine)
-                .filter(|m| is_manual(m))
+                .filter(|m| is_hand(m))
                 .map(|m| num(&m.p, "move_time").unwrap_or(0.))
                 .fold(0., f32::max)
         })
         .sum()
 }
 
-/// The export's line for a manual setup, which has no program.
+/// The export's line for a manual mill's setup, which has no program.
 pub fn no_gcode(setup: &str) -> String {
     format!("{setup}: manual mill, no G-code — follow the steps on the MACHINE page.")
+}
+
+/// `no_gcode` for a setup on the hand machine `m`: the mill's or the lathe's.
+pub fn no_gcode_on(m: &Machine, setup: &str) -> String {
+    if crate::lathe::is_lathe(m) {
+        format!("{setup}: manual lathe, no G-code — follow the steps on the MACHINE page.")
+    } else {
+        no_gcode(setup)
+    }
 }
 
 /// What `box_from_face` answers for anything but one flat face that faces up
@@ -437,17 +480,17 @@ mod tests {
     #[test]
     fn an_empty_machines_list_fits_cnc_machines_only() {
         let (cnc, manual) = (Machine::new(3), defaults());
-        assert!(fits("", &cnc));
-        assert!(fits("  ", &cnc));
-        assert!(!fits("", &manual));
+        assert!(fits("", false, &cnc));
+        assert!(fits("  ", false, &cnc));
+        assert!(!fits("", false, &manual));
     }
     #[test]
     fn a_machines_list_fits_the_named_ids_whatever_their_kind() {
         let (cnc, manual, other) = (Machine::new(3), defaults(), Machine::new(4));
         let list = format!("{}, {}", cnc.id, manual.id);
-        assert!(fits(&list, &cnc));
-        assert!(fits(&list, &manual));
-        assert!(!fits(&list, &other));
+        assert!(fits(&list, false, &cnc));
+        assert!(fits(&list, false, &manual));
+        assert!(!fits(&list, false, &other));
     }
     #[test]
     fn choosing_manual_fills_the_defaults_and_keeps_what_was_entered() {

@@ -52,7 +52,9 @@ impl Cut {
     /// Merge playback fragments only when their union is the same straight
     /// sweep and both come from the same operation.
     pub fn extend(&mut self, next: &Self) -> bool {
-        if self.source != next.source
+        // A lathe's rings never merge: each is one pass.
+        if self.shape == CutterShape::Revolve
+            || self.source != next.source
             || self.radius != next.radius
             || self.flute != next.flute
             || self.shape != next.shape
@@ -79,11 +81,33 @@ impl Cut {
         self.b = next.b;
         true
     }
+    /// The box, in this cut's frame, of the ring a `Revolve` cut removes:
+    /// as wide as its outer radius round the Z axis, from Z `a[0]` to
+    /// `b[0]`. None for other cutter shapes.
+    pub fn ring(&self) -> Option<Bounds> {
+        (self.shape == CutterShape::Revolve).then(|| Bounds {
+            min: [-self.b[1], -self.b[1], self.a[0]],
+            max: [self.b[1], self.b[1], self.b[0]],
+        })
+    }
     fn field(&self, reference: Frame) -> Tree {
         let origin = reference.transfer([0.; 3], self.frame);
         let axes = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]
             .map(|p| reference.transfer_vector(p, self.frame));
         let xyz = [Tree::x(), Tree::y(), Tree::z()];
+        if self.shape == CutterShape::Revolve {
+            // The point in the cut's frame, whose Z axis the ring is round.
+            let q: [Tree; 3] = std::array::from_fn(|k| {
+                (0..3).fold(Tree::from(origin[k]), |v, i| {
+                    v + xyz[i].clone() * axes[i][k]
+                })
+            });
+            let radial = (q[0].square() + q[1].square()).sqrt();
+            return (Tree::from(self.a[0]) - q[2].clone())
+                .max(q[2].clone() - self.b[0])
+                .max(Tree::from(self.a[1]) - radial.clone())
+                .max(radial - self.b[1]);
+        }
         let p: [Tree; 3] = std::array::from_fn(|k| {
             (0..3).fold(Tree::from(origin[k] - self.a[k]), |v, i| {
                 v + xyz[i].clone() * axes[i][k]
@@ -108,6 +132,8 @@ impl Cut {
                     Tree::from(d[2].min(0.))
                         + (p[0].square() + p[1].square()).sqrt() * self.shape.rise().unwrap()
                 }
+                // Rings return above.
+                CutterShape::Revolve => Tree::from(d[2].min(0.)),
             };
             return radial
                 .max(bottom - p[2].clone())
@@ -163,7 +189,8 @@ impl Cut {
                 let t = t.max(lo.clone()).min(hi.clone());
                 t.clone() * d[2] + ((u - t * l).square() + v.square()).sqrt() * rise
             }
-            CutterShape::Flat => {
+            // Rings return above.
+            CutterShape::Flat | CutterShape::Revolve => {
                 if d[2] < 0. {
                     hi.clone() * d[2]
                 } else {
@@ -185,6 +212,8 @@ pub struct Snapshot {
     pub frame: Frame,
     pub cuts: Arc<Vec<Cut>>,
     pub detail: Detail,
+    /// Whether the stock is the round bar in `bounds` (`Volume::round`).
+    pub round: bool,
 }
 #[derive(Debug)]
 pub struct SurfaceMesh {
@@ -201,12 +230,32 @@ fn balanced_union(trees: &mut [Tree]) -> Tree {
     balanced_union(a).min(balanced_union(b))
 }
 impl Snapshot {
+    /// The stock `volume` holds, meshed at `detail`.
+    pub fn of(volume: &crate::volume::Volume, detail: Detail) -> Self {
+        Self {
+            bounds: volume.bounds,
+            frame: volume.frame,
+            cuts: volume.cuts.clone(),
+            detail,
+            round: volume.round,
+        }
+    }
     fn field(&self) -> Tree {
         let p = [Tree::x(), Tree::y(), Tree::z()];
-        let box_field = (0..3).fold(Tree::from(f32::NEG_INFINITY), |t, k| {
-            t.max(self.bounds.min[k] - p[k].clone())
-                .max(p[k].clone() - self.bounds.max[k])
-        });
+        let box_field = if self.round {
+            // The bar's cylinder between the box's ends.
+            let (centre, radius) = crate::stock::bar(self.bounds);
+            ((p[0].clone() - centre[0]).square() + (p[1].clone() - centre[1]).square()).sqrt()
+                - radius
+        } else {
+            Tree::from(f32::NEG_INFINITY)
+        };
+        let box_field = (0..3)
+            .filter(|&k| !self.round || k == 2)
+            .fold(box_field, |t, k| {
+                t.max(self.bounds.min[k] - p[k].clone())
+                    .max(p[k].clone() - self.bounds.max[k])
+            });
         if self.cuts.is_empty() {
             return box_field;
         }
@@ -272,6 +321,7 @@ mod tests {
             frame: frame(),
             cuts: Arc::new(cuts),
             detail,
+            round: false,
         }
     }
     fn cut(a: [f32; 3], b: [f32; 3], shape: CutterShape) -> Cut {
@@ -431,6 +481,125 @@ mod tests {
                 }
             }
         }
+    }
+    fn ring(frame: Frame) -> Cut {
+        Cut {
+            a: [3., 4., 0.],
+            b: [8., 7., 0.],
+            radius: 7.,
+            flute: 0.,
+            shape: CutterShape::Revolve,
+            frame,
+            source: (0, 0),
+        }
+    }
+    #[test]
+    fn a_revolve_field_is_its_ring_in_its_own_frame() {
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let mut setup = crate::model::Setup::new(crate::model::Machine::new(3), "G55");
+        for (key, value) in [("ry", "90"), ("rz", "30"), ("tx", "5"), ("ty", "-3")] {
+            setup.p.insert(key.into(), value.into());
+        }
+        let reference = frame();
+        for current in [reference, Frame::new(&setup, &mesh)] {
+            let c = ring(current);
+            assert_eq!(
+                c.ring().unwrap(),
+                Bounds {
+                    min: [-7., -7., 3.],
+                    max: [7., 7., 8.]
+                }
+            );
+            let vm = VmShape::from(c.field(reference));
+            let tape = vm.ez_point_tape();
+            let mut eval = VmShape::new_point_eval();
+            let (mut inside, mut outside) = (0, 0);
+            for x in -18..19 {
+                for y in -18..19 {
+                    for z in -2..22 {
+                        let p = [x as f32 * 0.53, y as f32 * 0.47, z as f32 * 0.51];
+                        let q = current.transfer(p, reference);
+                        let (value, _) = eval.eval(&tape, q[0], q[1], q[2]).unwrap();
+                        if value.abs() > 0.002 {
+                            let swept = crate::volume::swept(p, c.a, c.b, 7., 0., c.shape);
+                            assert_eq!(value < 0., swept, "{p:?} {value}");
+                            inside += usize::from(swept);
+                            outside += usize::from(!swept);
+                        }
+                    }
+                }
+            }
+            assert!(inside > 500 && outside > 500, "{inside} {outside}");
+        }
+        // Rings never merge.
+        let mut first = ring(reference);
+        let mut next = ring(reference);
+        next.a = first.b;
+        next.b = [13., 7., 0.];
+        assert!(!first.extend(&next));
+        assert!(
+            first.ring().is_some()
+                && cut([0.; 3], [1., 0., 0.], CutterShape::Flat)
+                    .ring()
+                    .is_none()
+        );
+    }
+    #[test]
+    fn a_round_bar_meshes_to_its_cylinder_and_end_faces() {
+        let bar = Bounds {
+            min: [-25., -25., 0.],
+            max: [25., 25., 100.],
+        };
+        let mut v = crate::volume::Volume::bar(bar, frame());
+        let whole = Snapshot::of(&v, Detail::Draft).build().unwrap();
+        watertight(&whole);
+        let cell = whole.cell_mm;
+        let on = |p: &[f32; 3], radius: f32, low: f32| {
+            let r = p[0].hypot(p[1]);
+            assert!(
+                r <= radius + cell && p[2] >= low - cell && p[2] <= 100. + cell,
+                "{p:?}"
+            );
+            (r - radius).abs() < cell || p[2].abs() < cell || (p[2] - 100.).abs() < cell
+        };
+        assert!(whole.vertices.iter().all(|p| on(p, 25., 0.)));
+        let side = whole
+            .vertices
+            .iter()
+            .filter(|p| p[2] > 1. && p[2] < 99.)
+            .map(|p| (p[0].hypot(p[1]) - 25.).abs())
+            .fold(0., f32::max);
+        // Dual contouring puts the vertices of a curved face within a few
+        // hundredths of a cell of it (`viewport::on_bar` allows 6 %).
+        assert!(
+            side < 0.06 * cell,
+            "side vertices up to {side} mm off the cylinder"
+        );
+        // Turned to Ø40 over its top half: the step and the new face, the
+        // cylinder below.
+        v.revolve(50., 101., 20., 26., frame(), (0, 0));
+        let turned = Snapshot::of(&v, Detail::Draft).build().unwrap();
+        watertight(&turned);
+        for p in &turned.vertices {
+            let r = p[0].hypot(p[1]);
+            assert!(r <= 25. + cell, "{p:?}");
+            if p[2] > 51. {
+                assert!(r <= 20. + cell, "{p:?}");
+            } else if p[2] > 1. && p[2] < 49. {
+                assert!((r - 25.).abs() < 0.06 * cell, "{p:?}");
+            }
+        }
+        // The box field is unchanged for a box stock.
+        let block = Snapshot::of(&crate::volume::Volume::new(bar, frame()), Detail::Draft)
+            .build()
+            .unwrap();
+        assert!(
+            block
+                .vertices
+                .iter()
+                .any(|p| p[0].abs() > 24.99 && p[1].abs() > 24.99)
+        );
     }
     #[test]
     fn ball_cutter_mesh_keeps_spherical_bottom_and_closed_surface() {

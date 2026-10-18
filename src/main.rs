@@ -10,6 +10,7 @@ mod forces;
 mod guide;
 mod help;
 mod holding;
+mod lathe;
 mod look;
 mod machine_view;
 mod manual;
@@ -40,6 +41,7 @@ mod stock_surface;
 mod storage;
 mod surface;
 mod three_mf;
+mod turn;
 mod ui;
 mod uncut;
 mod viewport;
@@ -174,6 +176,9 @@ pub enum Message {
     AddSetup,
     /// Inserts a setup on the first manual machine, before the CNC setups.
     AddManualSetup,
+    /// Inserts a setup on the first lathe, with a round bar in a chuck,
+    /// before the CNC setups.
+    AddLatheSetup,
     DuplicateSetup,
     RemoveSetup,
     MoveSetup(isize),
@@ -375,7 +380,8 @@ pub enum Message {
     Guide(GuideAction),
     Noop,
 }
-/// What the Steps page of a setup on a manual mill does (`steps::view`).
+/// What the Steps page of a setup on a manual mill or lathe does
+/// (`steps::view`).
 #[derive(Debug, Clone)]
 pub enum GuideAction {
     /// The next step, or the next hole of a Holes step.
@@ -395,6 +401,14 @@ pub enum GuideAction {
     Beat(Instant),
     /// The guide of the job with this fingerprint (`App::guide_key`), built.
     Built(u64, Result<std::sync::Arc<steps::Shown>, String>),
+    /// The lathe's dial check answered: what its cross-slide dial reads,
+    /// saved to the machine in the library and in every setup on it.
+    CrossReads(lathe::Reads),
+    /// What is typed in a lathe step's measure box (its `guide::measure_key`).
+    Typed(String, String),
+    /// A diameter measured at a lathe step, mm, kept under its key in
+    /// `Document::measured`.
+    Measured(String, f32),
 }
 /// A plan that passed every check, with the stock it leaves for the 3D view.
 #[derive(Debug)]
@@ -440,6 +454,12 @@ pub struct ClampsDraft {
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
+/// What the status of a generated preview ends with on a CNC machine, and on
+/// a hand machine (the manual mill, the lathe), which has no G-code.
+pub(crate) const CNC_NEXT: &str = "Export G-code from the NC review page.";
+pub(crate) const HAND_NEXT: &str = "Follow the steps on the MACHINE page.";
+/// What a lathe preview's status says is checked of a modelled chuck.
+pub(crate) const CHUCK_CHECKED: &str = "this cut is checked against the chuck as a box with a clearance gap (a warning shows if it comes too close); the tailstock, the tool post and the machine body are not.";
 /// The stock each setup of a job starts from once the earlier setups have cut
 /// it, worked out in the background (`App::refresh_left_stock`) for the job
 /// whose fingerprint is `key` (`App::left_key`): one entry per setup, None for
@@ -632,13 +652,7 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         if surfaces.iter().any(|(v, _)| Arc::ptr_eq(v, volume)) {
             continue;
         }
-        let surface = stock_surface::Snapshot {
-            bounds: volume.bounds,
-            frame: volume.frame,
-            cuts: volume.cuts.clone(),
-            detail: stock_surface::Detail::Draft,
-        }
-        .build();
+        let surface = stock_surface::Snapshot::of(volume, stock_surface::Detail::Draft).build();
         if let Ok(surface) = surface {
             surfaces.push((volume.clone(), Arc::new(surface)));
         }
@@ -764,6 +778,8 @@ pub struct App {
     /// The readout the Steps page is at within its step, or the hole of a
     /// Holes step.
     pub guide_item: usize,
+    /// What is typed in a lathe step's measure box: its key and the text.
+    pub guide_typed: Option<(String, String)>,
     /// When the step shown was opened, and the page's clock since
     /// (`GuideAction::Beat`): the handwheel's beat.
     pub guide_clock: (Instant, Instant),
@@ -1204,6 +1220,7 @@ impl App {
             include_bytes!("../assets/op-9.svg"),
             include_bytes!("../assets/op-10.svg"),
             include_bytes!("../assets/op-11.svg"),
+            include_bytes!("../assets/op-12.svg"),
         ]
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
@@ -1259,6 +1276,7 @@ impl App {
             guide: None,
             guide_job: None,
             guide_item: 0,
+            guide_typed: None,
             guide_clock: (Instant::now(), Instant::now()),
             ready: run::Ready::default(),
             ready_job: None,
@@ -1514,11 +1532,14 @@ impl App {
     }
     pub fn can_pick(&self) -> bool {
         self.operation().is_some_and(|o| {
-            self.is_sample()
-                || (self.doc.file.is_some()
-                    && (o.needs_surfaces() || o.strategy == Strategy::Box)
-                    && o.strategy.imported_preview()
-                    && self.imported_mesh.is_some())
+            // A lathe drills on its centre and turns by numbers: nothing to pick.
+            !o.on_centre(&self.doc.setup().machine)
+                && o.strategy != Strategy::Turn
+                && (self.is_sample()
+                    || (self.doc.file.is_some()
+                        && (o.needs_surfaces() || o.strategy == Strategy::Box)
+                        && o.strategy.imported_preview()
+                        && self.imported_mesh.is_some()))
         })
     }
     fn operation_mut(&mut self) -> Option<&mut Operation> {
@@ -1538,6 +1559,9 @@ impl App {
     fn suggest_layout(&mut self) -> bool {
         let si = self.doc.index();
         let setup = self.doc.setup();
+        if get(&setup.p, "holding") == "Chuck" {
+            return self.suggest_chuck(si);
+        }
         let request = match holding::request(setup, self.doc.holder(get(&setup.p, "holder"))) {
             Ok(request) => request,
             Err(error) => {
@@ -1600,6 +1624,32 @@ impl App {
             self.touch();
         }
         self.status = message;
+        changed
+    }
+    /// Chooses the chuck of lathe setup `si` from the library
+    /// (`holding::suggest_chuck`): the 3-jaw when the bar in its jaws is
+    /// round and within its range, else the 4-jaw, which the status says to
+    /// change the chuck for. The grip and the stickout are the user's. Never a
+    /// vise. Whether the setup changed (and was marked so).
+    fn suggest_chuck(&mut self, si: usize) -> bool {
+        let setup = &self.doc.setups[si];
+        let Some(held) = self.known_held(si) else {
+            self.status = "No chuck suggested: this setup's stock is not known yet. Check the stock settings.".into();
+            return false;
+        };
+        let (id, status) = match holding::chuck_for(&self.doc, setup, held) {
+            Ok(found) => found,
+            Err(error) => {
+                self.status = error;
+                return false;
+            }
+        };
+        let changed = get(&setup.p, "holder") != id;
+        self.doc.setups[si].p.insert("holder".into(), id);
+        if changed {
+            self.touch();
+        }
+        self.status = status;
         changed
     }
     /// Keeps pin 1's machine X Y just recorded on the Control page in the
@@ -1909,12 +1959,10 @@ impl App {
         self.selected
             .and_then(|i| {
                 self.doc.setup().operations.get(i).map(|o| {
-                    let mut issues = o.issues_in(
-                        self.is_sample(),
-                        &self.doc.setup().machine,
-                        &self.doc.tools,
-                        &self.doc.setup().operations[..i],
-                    );
+                    let mut issues =
+                        self.doc
+                            .setup()
+                            .operation_issues_in(i, &self.doc.tools, self.is_sample());
                     if self.doc.file.is_some() {
                         issues.extend(surface::issues(
                             o,
@@ -2012,12 +2060,7 @@ impl App {
         }
         let sim = self.active_simulation().unwrap();
         let volume = sim.volume.as_ref().unwrap();
-        let snapshot = stock_surface::Snapshot {
-            bounds: volume.bounds,
-            frame: volume.frame,
-            cuts: volume.cuts.clone(),
-            detail: self.stock_detail,
-        };
+        let snapshot = stock_surface::Snapshot::of(volume, self.stock_detail);
         let seconds = sim.seconds;
         self.stock_mesh_job = Some(key.clone());
         self.stock_mesh_started = Some(Instant::now());
@@ -2396,25 +2439,45 @@ impl App {
     }
     /// The fingerprint of the job as the step guide of the active setup is
     /// concerned: the stock it starts from and how it is held
-    /// (`holding_fingerprint`), and which setup it is. None when the active
-    /// setup is not on a manual mill, and when `left_key` is.
+    /// (`holding_fingerprint`), which setup it is and what was measured on
+    /// it. None when the active setup is not on a hand machine (the manual
+    /// mill, the lathe), and when `left_key` is.
     pub(crate) fn guide_key(&self) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let setup = self.doc.active_setup()?;
-        if !manual::is_manual(&setup.machine) {
+        if !manual::is_hand(&setup.machine) {
             return None;
         }
         let mut hasher = std::hash::DefaultHasher::new();
         (self.holding_key()?, &setup.id).hash(&mut hasher);
+        let mine = guide::measure_key(&setup.id, "");
+        for (k, v) in self
+            .doc
+            .measured
+            .iter()
+            .filter(|(k, _)| k.starts_with(&mine))
+        {
+            (k, v.to_bits()).hash(&mut hasher);
+        }
         Some(hasher.finish())
     }
-    /// MACHINE shows the Steps page: the active setup is on a manual mill.
+    /// MACHINE shows the Steps page: the active setup is on a hand machine.
     pub(crate) fn steps_page(&self) -> bool {
         self.page == Page::Control
             && !self.machine_setup
             && (self.doc.active_setup()).is_some_and(|s| {
-                manual::is_manual(&s.machine) && self.cnc_over_guide.as_ref() != Some(&s.id)
+                manual::is_hand(&s.machine) && self.cnc_over_guide.as_ref() != Some(&s.id)
             })
+    }
+    /// The guide shown worked out again at once from its own simulation
+    /// (`steps::Shown::again`), for the job as it is now: after a measurement
+    /// or the dial check's answer, which change no cut.
+    fn guide_again(&mut self, shown: &steps::Shown) {
+        let (Some(key), Some(mesh)) = (self.guide_key(), self.part_mesh()) else {
+            return;
+        };
+        let again = shown.again(&self.doc, mesh).map(std::sync::Arc::new);
+        self.guide = Some((key, again));
     }
     /// The guide as built, when that was for the job as it is now.
     pub(crate) fn current_guide(&self) -> Option<&Result<std::sync::Arc<steps::Shown>, String>> {
@@ -2529,6 +2592,64 @@ impl App {
                 }
             }
             GuideAction::Reached(i) => self.guide_item = i + 1,
+            GuideAction::Typed(key, text) => self.guide_typed = Some((key, text)),
+            GuideAction::Measured(key, value) => {
+                if !(value.is_finite() && value > 0. && value < 10_000.) {
+                    self.status = "Type the diameter the calipers read, in mm.".into();
+                    return Task::none();
+                }
+                let mine = (self.doc.setups.get(shown.guide.setup))
+                    .is_some_and(|s| key.starts_with(&guide::measure_key(&s.id, "")));
+                if !mine {
+                    return Task::none();
+                }
+                // A measurement, not a setting: kept with the project, as the
+                // place is, with no undo step.
+                if self.doc.measured.get(&key) != Some(&value) {
+                    self.doc.measured.insert(key.clone(), value);
+                    self.dirty = true;
+                    self.last_edit = Instant::now();
+                }
+                if self.guide_typed.as_ref().is_some_and(|(k, _)| *k == key) {
+                    self.guide_typed = None;
+                }
+                self.status = format!("Measured Ø{value:.2} kept.");
+                self.guide_again(&shown);
+            }
+            GuideAction::CrossReads(reads) => {
+                let Some(setup) = self.doc.setups.get(shown.guide.setup) else {
+                    return Task::none();
+                };
+                if !lathe::is_lathe(&setup.machine) {
+                    return Task::none();
+                }
+                let id = setup.machine.id.clone();
+                let set = |m: &mut Machine| {
+                    if m.id == id {
+                        m.p.insert("cross_reads".into(), reads.key().into());
+                    }
+                };
+                self.doc.machines.iter_mut().for_each(set);
+                for s in &mut self.doc.setups {
+                    set(&mut s.machine);
+                }
+                set(&mut self.machine_draft);
+                // An edit of the machine. While the CNC runs, nothing it
+                // runs depends on the lathe: its run is not marked stale.
+                if self.locked() {
+                    self.dirty = true;
+                    self.project_dirty = true;
+                    self.last_edit = Instant::now();
+                } else {
+                    self.touch();
+                }
+                self.status = format!(
+                    "The cross-slide dial reads the {}: saved to {}.",
+                    reads.key().to_lowercase(),
+                    self.doc.setups[shown.guide.setup].machine.name()
+                );
+                self.guide_again(&shown);
+            }
             _ => {}
         }
         Task::none()
@@ -3026,8 +3147,7 @@ impl App {
                     if !self
                         .operation()
                         .unwrap()
-                        .strategy
-                        .tabs()
+                        .tabs(&self.doc.setup().machine)
                         .contains(&self.tab.as_str())
                     {
                         self.tab = "Tool".into();
@@ -3040,6 +3160,15 @@ impl App {
                     let setup = self.update(Message::SelectSetup(row.setup));
                     let operation = self.update(Message::SelectOp(row.operation));
                     if let Some(tab) = ui::issue_tab(&row.detail) {
+                        // A tab the operation does not have (a lathe Drill has
+                        // no Passes) gives its place to the one with its sizes.
+                        let tabs = (self.operation()).map(|o| o.tabs(&self.doc.setup().machine));
+                        let tab = match tabs {
+                            Some(tabs) if !tabs.contains(&tab) => {
+                                tabs.get(1).copied().unwrap_or(tab)
+                            }
+                            _ => tab,
+                        };
                         let _ = self.update(Message::Tab(tab.into()));
                     }
                     return Task::batch([setup, operation]);
@@ -3082,6 +3211,35 @@ impl App {
             }
             Message::Edit(target, k, v) => match target {
                 Target::Operation => {
+                    // A Turn's kind brings its own fields, speed and tool.
+                    if k == "turn_kind"
+                        && lathe::tool_for(&v).is_some()
+                        && self
+                            .operation()
+                            .is_some_and(|o| o.strategy == Strategy::Turn)
+                    {
+                        let machine = self.doc.setup().machine.clone();
+                        let needed = lathe::tool_for(&v);
+                        let has = |tool: &model::Tool| Some(get(&tool.p, "type")) == needed;
+                        let fitting = (self.doc.tools.iter())
+                            .find(|t| t.fits(&machine) && has(t))
+                            .map(|t| t.id.clone());
+                        let current = self.operation().map(|o| o.tool.clone());
+                        let right = self
+                            .doc
+                            .tools
+                            .iter()
+                            .any(|t| Some(&t.id) == current.as_ref() && has(t));
+                        if let Some(o) = self.operation_mut() {
+                            o.set_turn_kind(&v);
+                            manual::snap(&machine, &mut o.p);
+                            if let (false, Some(id)) = (right, fitting) {
+                                o.tool = id;
+                            }
+                        }
+                        self.touch();
+                        return Task::none();
+                    }
                     if let Some(o) = self.operation_mut() {
                         // A project saved before tabs has no sizes for them.
                         if k == "tabs" {
@@ -3124,6 +3282,9 @@ impl App {
                 Target::Machine => {
                     if k == "kind" {
                         manual::set_kind(&mut self.machine_draft, &v);
+                    } else if k == "cross_reads" && !["Diameter", "Radius"].contains(&v.as_str()) {
+                        // "Not known yet": the dial check will ask.
+                        self.machine_draft.p.insert(k.into(), String::new());
                     } else {
                         self.machine_draft.p.insert(k.into(), v.clone());
                     }
@@ -3150,7 +3311,12 @@ impl App {
                     }
                 }
                 Target::Tool => {
-                    self.tool_draft.p.insert(k.into(), v);
+                    if k == "type" {
+                        // A lathe type takes its sizes' defaults, as the editor shows them.
+                        self.tool_draft.set_type(&v);
+                    } else {
+                        self.tool_draft.p.insert(k.into(), v);
+                    }
                 }
                 Target::Material => {
                     self.material_draft.p.insert(k.into(), v);
@@ -3176,9 +3342,12 @@ impl App {
                     .tools
                     .iter()
                     .find(|t| {
-                        manual::fits(get(&t.p, "machines"), machine)
+                        t.fits(machine)
                             && if strategy == Strategy::Drill {
                                 get(&t.p, "type") == "Drill"
+                            } else if strategy == Strategy::Turn {
+                                // The default kind, Outside, turns with a turning tool.
+                                Some(get(&t.p, "type")) == lathe::tool_for("Outside")
                             } else if strategy == Strategy::Parallel {
                                 get(&t.p, "type") == "Ball end mill"
                             } else {
@@ -3187,7 +3356,11 @@ impl App {
                                         && get(&t.p, "type") == "Face mill")
                             }
                     })
-                    .or(self.doc.tools.first())
+                    .or(self
+                        .doc
+                        .tools
+                        .first()
+                        .filter(|_| strategy != Strategy::Turn))
                 else {
                     self.page = Page::Tools;
                     self.pending = Some((Page::Tools, Message::AddOp(strategy)));
@@ -3198,30 +3371,28 @@ impl App {
                     );
                     return Task::none();
                 };
-                let mut operation = Operation::new(strategy, tool.id.clone());
+                let mut operation = Operation::for_machine(strategy, tool.id.clone(), machine);
                 operation
                     .p
                     .insert("coolant".into(), control::default_coolant(machine).into());
-                if manual::is_manual(machine) {
-                    manual::snap(machine, &mut operation.p);
-                }
                 if !self.is_sample() {
                     operation.geometry.clear();
                 }
                 // Adaptive clearing starts sized to its cutter: a load of
                 // 15 % of its diameter and a stepdown of two diameters,
                 // within its flutes.
-                if strategy == Strategy::Adaptive && !self.is_sample() {
-                    if let Some(d) = num(&tool.p, "diameter").filter(|d| *d > 0.) {
-                        let load = ((d * 0.15 / 0.05).round() * 0.05).max(0.05);
-                        let flutes = num(&tool.p, "length").unwrap_or(2. * d);
-                        operation
-                            .p
-                            .insert("optimal_load".into(), format!("{load:.2}"));
-                        operation
-                            .p
-                            .insert("stepdown".into(), format!("{:.1}", (2. * d).min(flutes)));
-                    }
+                if strategy == Strategy::Adaptive
+                    && !self.is_sample()
+                    && let Some(d) = num(&tool.p, "diameter").filter(|d| *d > 0.)
+                {
+                    let load = ((d * 0.15 / 0.05).round() * 0.05).max(0.05);
+                    let flutes = num(&tool.p, "length").unwrap_or(2. * d);
+                    operation
+                        .p
+                        .insert("optimal_load".into(), format!("{load:.2}"));
+                    operation
+                        .p
+                        .insert("stepdown".into(), format!("{:.1}", (2. * d).min(flutes)));
                 }
                 self.doc.setup_mut().operations.push(operation);
                 self.selected = Some(self.doc.setup().operations.len() - 1);
@@ -3290,9 +3461,11 @@ impl App {
             }
             Message::Surface(n) => {
                 if self.doc.file.is_none()
-                    || !self
-                        .operation()
-                        .is_some_and(|o| o.strategy.imported_preview())
+                    || !self.operation().is_some_and(|o| {
+                        o.strategy.imported_preview()
+                            && o.strategy != Strategy::Turn
+                            && !o.on_centre(&self.doc.setup().machine)
+                    })
                 {
                     return Task::none();
                 }
@@ -3468,13 +3641,25 @@ impl App {
                     match result {
                         Ok(sim) => {
                             let plan = &sim.plan;
+                            // A hand machine has no program to export, and a lathe
+                            // setup's cut is checked against its chuck.
+                            let next = if manual::is_hand(&self.doc.setup().machine) {
+                                HAND_NEXT
+                            } else {
+                                CNC_NEXT
+                            };
+                            let fixtures = if ui::chuck_modelled(self) {
+                                CHUCK_CHECKED
+                            } else {
+                                ui::fixtures(ui::Note::Preview, ui::modelled(self))
+                            };
                             self.status = format!(
-                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} Export G-code from the NC review page.",
+                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} {next}",
                                 plan.strategy.name(),
                                 plan.levels,
                                 plan.duration / 60.,
                                 sim.preceding,
-                                ui::fixtures(ui::Note::Preview, ui::modelled(self))
+                                fixtures
                             );
                             self.simulation = Some(sim);
                             self.progress = 0.;
@@ -3576,6 +3761,14 @@ impl App {
                 }
                 Err(e) => self.status = e,
             },
+            Message::AddLatheSetup => match self.doc.add_lathe_setup() {
+                Ok(()) => {
+                    self.stop_selection();
+                    self.touch();
+                    self.status = "Lathe setup added before the CNC setups.".into();
+                }
+                Err(e) => self.status = e,
+            },
             Message::DuplicateSetup => {
                 let s = self.doc.setup().duplicate(&self.doc.next_offset());
                 self.doc.active = s.id.clone();
@@ -3674,8 +3867,7 @@ impl App {
                 }
             }
             Message::ControlMachine(id) => {
-                if let Some(s) = (self.doc.active_setup()).filter(|s| manual::is_manual(&s.machine))
-                {
+                if let Some(s) = (self.doc.active_setup()).filter(|s| manual::is_hand(&s.machine)) {
                     self.cnc_over_guide = Some(s.id.clone());
                 }
                 match &self.control {
@@ -3893,7 +4085,7 @@ impl App {
                 // sets the work zero of the setup it started with (#165).
                 if si >= self.doc.setups.len()
                     || c.setup_locked()
-                    || manual::is_manual(&self.doc.setups[si].machine)
+                    || manual::is_hand(&self.doc.setups[si].machine)
                 {
                     return Task::none();
                 }
@@ -3998,7 +4190,7 @@ impl App {
                 return self.picture_run();
             }
             Message::SaveMachine => {
-                if manual::is_manual(&self.machine_draft) {
+                if manual::is_hand(&self.machine_draft) {
                     manual::settle(&mut self.machine_draft);
                 }
                 let errors = self.machine_draft.issues();
@@ -4181,7 +4373,8 @@ impl App {
             }
             Message::DeleteHolder(id) => {
                 let using = self.doc.setups.iter().find(|s| {
-                    matches!(get(&s.p, "holding"), "Vise" | "Clamps") && get(&s.p, "holder") == id
+                    matches!(get(&s.p, "holding"), "Vise" | "Clamps" | "Chuck")
+                        && get(&s.p, "holder") == id
                 });
                 if let Some(setup) = using {
                     let name = self.doc.holder(&id).map_or("This entry", |h| h.name());
@@ -5587,8 +5780,11 @@ fn export_document(mut doc: Document, folder: &str) -> Result<String, String> {
         eprintln!("! {e}");
     }
     for setup in &job.setups {
-        if manual::is_manual(&doc.setups[setup.setup].machine) {
-            println!("{}", manual::no_gcode(&setup.name));
+        if manual::is_hand(&doc.setups[setup.setup].machine) {
+            println!(
+                "{}",
+                manual::no_gcode_on(&doc.setups[setup.setup].machine, &setup.name)
+            );
             continue;
         }
         match &setup.result {

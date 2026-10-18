@@ -93,7 +93,7 @@ impl PostSettings {
     /// (`for_machine`), but a manual mill makes no G-code, so its controller
     /// and post settings do not count.
     pub fn for_holding(m: &Machine) -> Result<Self, Vec<String>> {
-        if crate::manual::is_manual(m) {
+        if crate::manual::is_hand(m) {
             Ok(Self::read(m))
         } else {
             Self::for_machine(m)
@@ -1873,7 +1873,7 @@ pub fn pin_drilling_tool<'a>(
     let d = pins.diameter as f32;
     let width = d + PIN_CLEARANCE;
     let size = |t: &Tool| num(&t.p, "diameter").unwrap_or(0.);
-    let on = |t: &&Tool| crate::manual::fits(get(&t.p, "machines"), machine);
+    let on = |t: &&Tool| t.fits(machine);
     let kind = |k: &'static str| move |t: &&Tool| get(&t.p, "type") == k;
     (tools.iter().filter(on).filter(kind("Drill")))
         .filter(|t| (d - 0.001..=d + PIN_FIT + 0.001).contains(&size(t)))
@@ -2171,10 +2171,13 @@ pub fn undrilled_pins(
         .enumerate()
         .filter_map(|(i, c)| {
             // The cuts that come near the pin: those of setups square to
-            // this one by their sweep's plan, the others all.
+            // this one by their sweep's plan, the others all. A lathe's ring
+            // is no sweep: `swept` tests it as the ring it is.
             let near: Vec<&crate::stock_surface::Cut> = (volume.cuts.iter())
                 .filter(|cut| {
-                    if !cut.frame.square_to(frame) {
+                    if cut.shape == crate::simulation::CutterShape::Revolve
+                        || !cut.frame.square_to(frame)
+                    {
                         return true;
                     }
                     let [a, b] = [cut.a, cut.b].map(|p| cut.frame.transfer(p, frame));
@@ -2726,6 +2729,26 @@ impl Walk<'_> {
         .collect()
     }
 }
+/// What the plans of lathe setup `si` do to its chuck, whose body is `boxes`
+/// (`holding::chuck_problems`): a cut inside the grip, a move into the chuck
+/// and a stickout too short for the furthest cut.
+fn chucked(doc: &Document, si: usize, walk: &Walk, boxes: &[crate::holding::HoldBox]) -> Vec<Held> {
+    let setup = &doc.setups[si];
+    let Ok(layout) = crate::holding::layout(setup) else {
+        return vec![];
+    };
+    let gap = crate::holding::gap(setup).unwrap_or_default();
+    let operations: Vec<(usize, &str, &Plan)> = walk
+        .indexes
+        .iter()
+        .zip(&walk.simulations)
+        .map(|(oi, sim)| (*oi, setup.operations[*oi].name(), &sim.plan))
+        .collect();
+    crate::holding::chuck_problems(&layout, walk.stock, gap, boxes, &operations)
+        .into_iter()
+        .map(|(operation, message)| Held { operation, message })
+        .collect()
+}
 /// Every workholding problem `prepare` finds for setup `si` from its
 /// `sequence` results, in every program (`prepare` stops at the first program
 /// with any problem, and before them all at a stock the workholding cannot
@@ -2783,6 +2806,12 @@ pub(crate) fn held_walked(
     // Held where it is gripped, the stock must hold against the cut.
     if found.is_empty() {
         found = pushed(doc, si, &walk, held);
+    }
+    // A lathe has no program to walk: its plans are a side view of the cuts,
+    // which are checked against the chuck as they are.
+    if crate::lathe::is_lathe(&doc.setups[si].machine) {
+        found.extend(chucked(doc, si, &walk, &boxes));
+        return Ok(found);
     }
     // Nothing to hold against: no program need be walked.
     if boxes.is_empty() {
@@ -2955,7 +2984,7 @@ fn checked_with(
     to_start: bool,
 ) -> Result<Vec<Checked>, Vec<String>> {
     let setup = &doc.setups[si];
-    if crate::manual::is_manual(&setup.machine) {
+    if crate::manual::is_hand(&setup.machine) {
         return Ok(vec![]);
     }
     let offset = get(&setup.p, "offset").to_string();
@@ -3408,6 +3437,7 @@ pub(crate) mod fixture {
             rest_top: None,
             spindle_clockwise: true,
             milling_direction: "Climb",
+            rings: vec![],
         };
         let mut at = start;
         for (motion, to, rate) in moves {
@@ -3575,6 +3605,45 @@ pub(crate) mod fixture {
             .p
             .insert("origin".into(), "Stock top front-left".into());
         doc.setups[0].operations = vec![cut];
+    }
+    /// `doc` with the lathe's setup in front (`add_lathe_setup`) that turns
+    /// the stock of the CNC setup after it (its `stock_` keys and its frame),
+    /// so that what follows is not changed by it: its one Groove, 3 mm wide
+    /// 20 mm below the free end, takes only the four sharp corners of the
+    /// stock off, clear of the part (Ø146 is beyond the part's corners) and
+    /// of the CNC cuts.
+    pub fn with_lathe_setup(doc: &mut Document) {
+        let machine = crate::lathe::defaults();
+        let mut tool = Tool::lathe("Groover", "Grooving tool");
+        for (k, v) in [("number", "21"), ("machines", machine.id.as_str())] {
+            tool.p.insert(k.into(), v.into());
+        }
+        doc.machines.push(machine.clone());
+        doc.add_lathe_setup().unwrap();
+        let stock: Vec<(String, String)> = doc.setups[1]
+            .p
+            .iter()
+            .filter(|(k, _)| k.starts_with("stock_"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let lathe = &mut doc.setups[0];
+        for k in ["stock_diameter", "stock_length"] {
+            lathe.p.remove(k);
+        }
+        lathe.p.extend(stock);
+        // The box it turns is no bar for the chuck; the chuck is checked by
+        // the lathe tests, not by these.
+        for k in ["holding", "holder", "grip", "stickout"] {
+            lathe.p.remove(k);
+        }
+        let mut groove = Operation::for_machine(Strategy::Turn, tool.id.clone(), &machine);
+        groove.set_turn_kind("Groove");
+        for (k, v) in [("z", "-20"), ("width", "3"), ("diameter", "146")] {
+            groove.p.insert(k.into(), v.into());
+        }
+        lathe.operations = vec![groove];
+        doc.tools.push(tool);
+        doc.sync_stock_sources();
     }
     /// Facing and Pocket on G54, then the part flipped about X and faced on G55.
     pub fn flipped_job() -> (Document, Mesh) {
@@ -7279,6 +7348,45 @@ M2
         let (_, count) = write_job(&after, dir.path()).unwrap();
         assert_eq!(count, was.len());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), count);
+    }
+    #[test]
+    fn a_lathe_setup_makes_no_program_and_leaves_the_cnc_programs_as_they_were() {
+        let (plain, mesh) = fixture::job();
+        let mut doc = plain.clone();
+        fixture::with_lathe_setup(&mut doc);
+        assert_eq!(doc.setups.len(), 2);
+        assert!(crate::lathe::is_lathe(&doc.setups[0].machine));
+        // The lathe's groove generates and cuts, so it is no empty setup.
+        let cut = simulated(&doc, &mesh);
+        let groove = cut[0][0].1.as_ref().unwrap();
+        assert!(groove.plan.is_lathe() && !groove.plan.rings.is_empty());
+        let (before, after) = (post_job(&plain, &mesh), post_job(&doc, &mesh));
+        assert!(before.ready(), "{:?}", errors(&before));
+        assert!(after.ready(), "{:?}", errors(&after));
+        // No program, no run, and its checks pass it by.
+        let lathe = &after.setups[0];
+        assert!(lathe.result.as_ref().unwrap().is_empty());
+        assert!(lathe.run.is_none() && lathe.passes());
+        // The CNC setup is setup 2 now: its number is the only difference.
+        let (was, now) = (&before.setups[0], &after.setups[1]);
+        let (was, now) = (was.result.as_ref().unwrap(), now.result.as_ref().unwrap());
+        assert_eq!(was.len(), now.len());
+        for (a, b) in was.iter().zip(now) {
+            assert_eq!(a.text, b.text.replacen("Setup 2:", "Setup 1:", 1));
+            assert_eq!(a.file_name, b.file_name.replacen(" - 2 ", " - 1 ", 1));
+            assert_eq!((&a.tools, &a.operations), (&b.tools, &b.operations));
+        }
+        // Nothing of the lathe is written either.
+        let dir = tempfile::tempdir().unwrap();
+        let (_, count) = write_job(&after, dir.path()).unwrap();
+        assert_eq!(count, was.len());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), count);
+        // The run's and export's own entry points skip it, UC100 settings or not.
+        assert_eq!(
+            checked(&doc, &mesh, 0, &cut[0], PostSettings::for_uc100).map(|p| p.len()),
+            Ok(0)
+        );
+        assert!(crate::run::plan_problems(&doc, &mesh, 0, &cut[0]).is_ok());
     }
     #[test]
     fn a_job_of_manual_setups_alone_has_nothing_to_export() {
