@@ -479,10 +479,14 @@ fn floors_of<'a>(
 }
 /// Checks an operation of setup `si` (from 0) and builds it. Returns what is
 /// wrong instead when the tool, surfaces or choices do not fit the strategy.
+/// `sides` is set for a Face of an indexed setup's several angles, whose
+/// surfaces `faces_each_angle` has checked: the tool's centre goes out to
+/// each face's edges, as the UI's facing of a square's sides does.
 fn operation(
     p: &ProposedOp,
     si: usize,
     orientation: &OrientationReport,
+    sides: bool,
     report: &PartReport,
     tools: &[Tool],
     fingerprint: &str,
@@ -610,6 +614,7 @@ fn operation(
     let plane = plane_of(orientation, &ids);
     let floor = strategy == Strategy::Pocket || (strategy == Strategy::Contour && inside);
     match strategy {
+        Strategy::Face if sides => {}
         Strategy::Face if !plane.is_some_and(|pl| pl.kind == "top") => wrong.push(format!(
             "Facing needs surfaces of the top plane in orientation {}.",
             orientation.up
@@ -747,6 +752,11 @@ fn operation(
     }
     // Combinations the generators require are fixed here, not by the model.
     match strategy {
+        Strategy::Face if sides => {
+            set("boundary", "Selected geometry".into());
+            set("containment", "Tool center on boundary".into());
+            set("allowance", "0".into());
+        }
         Strategy::Face => {
             let model = p.facing_area.as_deref() == Some("model");
             set(
@@ -801,7 +811,43 @@ const INDEX_NEEDS_CHUCK: &str = "a_angles index the stock in the chuck: give `ch
 /// Why the first setup cannot index A.
 const FIRST_INDEXED: &str = "The first setup cannot index A: it is the clamping later setups turn. Give its a_angles null and index the setups after it.";
 /// Why an operation with surfaces cannot run at several A angles.
-const SURFACES_AT_ANGLES: &str = "This setup runs every operation at each of its A angles, but its surfaces face up in one orientation only. At several angles use Contour outside, Parallel or Waterline (surfaces empty), or give each angle its own setup.";
+const SURFACES_AT_ANGLES: &str = "This setup runs every operation at each of its A angles, but its surfaces face up in one orientation only. At several angles use Contour outside, Parallel or Waterline (surfaces empty), a Face whose surfaces are the top plane's IDs of the orientation each angle brings up (all the sides to face), or give each angle its own setup.";
+/// Whether `p` is a Facing of the sides an indexed setup brings up, one top
+/// plane of the orientations `at` (one per angle) after the other: every
+/// surface lies in the top plane of one of them and every angle has a face
+/// of its own to face (LIO-214). The Facing then faces, at each angle, the
+/// faces that are on top there (`indexed::on_top`).
+fn faces_each_angle(p: &ProposedOp, at: &[Option<&OrientationReport>]) -> Result<(), String> {
+    fn top(o: &OrientationReport) -> Option<&PlaneReport> {
+        o.planes.iter().find(|pl| pl.kind == "top")
+    }
+    if p.strategy != "Face" {
+        return Err(SURFACES_AT_ANGLES.into());
+    }
+    let Some(at) = at.iter().copied().collect::<Option<Vec<_>>>() else {
+        return Err(format!(
+            "An A angle of this setup brings no face of the part up, so a Face has none to face there. {SURFACES_AT_ANGLES}"
+        ));
+    };
+    if let Some(id) = p.surfaces.iter().find(|id| {
+        !at.iter()
+            .any(|o| top(o).is_some_and(|pl| pl.surfaces.contains(id)))
+    }) {
+        return Err(format!(
+            "Surface {id} is not the top plane of any orientation this setup's A angles bring up. {SURFACES_AT_ANGLES}"
+        ));
+    }
+    if let Some(o) = at
+        .iter()
+        .find(|o| !top(o).is_some_and(|pl| pl.surfaces.iter().any(|id| p.surfaces.contains(id))))
+    {
+        return Err(format!(
+            "None of the surfaces is the top plane of {}, which an A angle of this setup brings up. {SURFACES_AT_ANGLES}",
+            o.up
+        ));
+    }
+    Ok(())
+}
 /// Seats setup 1's stock in the chuck the way the setup page does: the
 /// stock fields, `Chuck` as its workholding with the proposal's jaws,
 /// stick-out and tailstock, the A axis as its work zero, and the part turned
@@ -1014,6 +1060,7 @@ pub fn build(
         // shows the part as the setup it indexes does, turned by its first
         // A angle.
         let mut indexed = None;
+        let mut at_angles: Option<Vec<Option<&OrientationReport>>> = None;
         let mut up = proposed.orientation.as_str();
         if let Some(list) = &proposed.a_angles {
             if si == 0 {
@@ -1043,6 +1090,17 @@ pub fn build(
                 crate::indexed::angles(&made),
             ) {
                 let turn = crate::indexed::sign(&made.machine) * listed[0];
+                // The orientation each angle brings up, for a Face of the
+                // sides.
+                at_angles = Some(
+                    (listed.iter())
+                        .map(|a| {
+                            let turn = crate::indexed::sign(&made.machine) * a;
+                            let up = analysis::orientation_at(base, turn)?;
+                            report.orientations.iter().find(|o| o.up == up)
+                        })
+                        .collect(),
+                );
                 match analysis::orientation_at(base, turn) {
                     Some(shown) if shown == proposed.orientation => up = shown,
                     Some(shown) => issues.push(format!(
@@ -1169,12 +1227,28 @@ pub fn build(
             .enumerate()
         {
             // Every operation of an indexed setup runs at each A angle, but a
-            // surface faces up in one orientation only.
-            if proposed.a_angles.as_ref().is_some_and(|a| a.len() > 1) && !op.surfaces.is_empty() {
-                wrong(Some(oi + 1), SURFACES_AT_ANGLES.into());
+            // surface faces up in one orientation only: a Face may name the
+            // sides that come up at the angles, each faced where it is up.
+            let sides =
+                proposed.a_angles.as_ref().is_some_and(|a| a.len() > 1) && !op.surfaces.is_empty();
+            // (Without the chuck's orientations the setup has said why.)
+            if sides && let Some(at) = &at_angles {
+                if let Err(message) = faces_each_angle(op, at) {
+                    wrong(Some(oi + 1), message);
+                    continue;
+                }
+            } else if sides {
                 continue;
             }
-            match operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint) {
+            match operation(
+                op,
+                si,
+                orientation,
+                sides,
+                report,
+                &doc.tools,
+                &mesh.fingerprint,
+            ) {
                 Ok(op) => setup.operations.push(op),
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
             }
@@ -2591,6 +2665,7 @@ pub(crate) mod tests {
             let (doc, mesh, report, plan) = rotary(|p| {
                 p.setups[1].a_angles = Some(vec![angle]);
                 p.setups[1].orientation = up.into();
+                p.setups[1].operations = vec![op("Contour", 1, vec![])];
             });
             assert!(build(&doc, &mesh, &report, &plan).is_ok(), "A {angle} {up}");
         }
@@ -2627,10 +2702,10 @@ pub(crate) mod tests {
             let said = messages(build(&doc, &mesh, &report, &plan));
             assert!(said.iter().any(|m| m.contains(words)), "{words}: {said:?}");
         }
-        // Several angles run each operation at every one of them, so no surfaces.
+        // Several angles run each operation at every one of them, so no surfaces ...
         let (doc, mesh, report, plan) = rotary(|p| {
             let top = report_top(&crate::fake_openai::rotary::report().2);
-            p.setups[1].operations = vec![op("Face", 1, top)];
+            p.setups[1].operations = vec![op("Contour", 1, top)];
         });
         let said = messages(build(&doc, &mesh, &report, &plan));
         assert_eq!(said.len(), 1, "{said:?}");
@@ -2639,6 +2714,40 @@ pub(crate) mod tests {
                 .starts_with("2/Some(1): This setup runs every operation at each of its A angles")
                 && said[0].contains("Contour outside, Parallel or Waterline"),
             "{said:?}"
+        );
+        // ... but a Face of the sides each angle brings up (LIO-214): one top
+        // plane alone leaves the angles after it nothing to face, a surface
+        // that is on top at none of them is refused.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let top = report_top(&crate::fake_openai::rotary::report().2);
+            p.setups[1].operations = vec![op("Face", 1, top)];
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("2/Some(1): None of the surfaces is the top plane of +Y"),
+            "{said:?}"
+        );
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let mut ids = p.setups[1].operations[0].surfaces.clone();
+            ids.push(usize::MAX);
+            p.setups[1].operations[0].surfaces = ids;
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.len() == 1
+                && said[0].contains(&format!("Surface {} is not the top plane", usize::MAX)),
+            "{said:?}"
+        );
+        // The four sides build as one Face, its tool centre out to the edges.
+        let (doc, mesh, report, plan) = rotary(|_| {});
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let face = &built.setups[1].operations[0];
+        assert_eq!(face.strategy, Strategy::Face);
+        assert_eq!(face.surfaces.as_ref().unwrap().ids.len(), 4);
+        assert_eq!(
+            (get(&face.p, "boundary"), get(&face.p, "containment")),
+            ("Selected geometry", "Tool center on boundary")
         );
         // One angle may use them: its orientation is told.
         let (doc, mesh, report, plan) = rotary(|p| {

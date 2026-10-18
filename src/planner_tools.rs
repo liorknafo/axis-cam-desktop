@@ -2030,9 +2030,22 @@ mod tests {
         use crate::fake_openai::rotary;
         let mut s = rotary_state();
         // The chuck and the four angles pass, and the draft is the latest.
-        let (passed, problems) = drafted(&rotary::good(), &mut s);
-        assert!(passed, "{problems:?}");
+        // Its four sides are faced whole (LIO-214), joined to the bar at a
+        // shoulder, so that the part-off and web checks pass: the stock still
+        // covers only the part's end face in the jaws.
+        let a = call(
+            "check_plan",
+            json!({"proposal": as_json(&rotary::good())}),
+            &mut s,
+        );
+        let report = json_of(&a);
+        assert_eq!(report["passed"], true, "{report}");
         assert!(s.checked.is_some());
+        let covered: Vec<&str> = (report["coverage"]["covered_planes"].as_array().unwrap())
+            .iter()
+            .map(|p| p["orientation"].as_str().unwrap())
+            .collect();
+        assert_eq!(covered, ["-X"], "{report}");
         // The Z reach of the rotary check: the retract over what A swings is
         // above the Z travel.
         let (passed, problems) = drafted(&rotary::too_big(), &mut s);
