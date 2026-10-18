@@ -3899,14 +3899,14 @@ flood = { pin = 8 }
     }
     /// The 4-axis scene (LIO-190), to $AXIS_RENDER_DIR (/tmp/four-axis-renders):
     /// the Job view after a square is milled on a bar at A 90, 180, 270 and
-    /// 0°, to 2 mm over the A axis so that a web keeps it on the bar (LIO-208),
-    /// and while A turns from 270° to 0°, and the Control page's machine view
+    /// 0°, its four sides faced out to the bar's free end, joined to the bar
+    /// at a shoulder (LIO-211), and while A turns from 270° to 0°, and the Control page's machine view
     /// with the rotary unit at A 0 and 30°. Not a check: `cargo test
     /// render_the_four_axis_scene -- --ignored`.
     #[test]
     #[ignore]
     fn render_the_four_axis_scene() {
-        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
         let out = std::path::PathBuf::from(
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/four-axis-renders".into()),
         );
@@ -3916,11 +3916,11 @@ flood = { pin = 8 }
         let mesh = prism(30.);
         let mut doc = bar_job(
             &mesh,
-            20.,
+            30.,
             "100",
             "-150",
             "90, 180, 270, 0",
-            on_the_bar(&cutter("12")),
+            faced_square(&cutter("12"), &mesh),
         );
         doc.file = Some(crate::model::ModelFile {
             name: "square-bar.stl".into(),
@@ -3955,8 +3955,15 @@ flood = { pin = 8 }
             pan: [230., 0.],
             ..iso
         };
+        // End-on close up: the square in front of the round shoulder.
+        let end_close = crate::viewport::Camera { zoom: 12., ..end };
         let shots = |a: &mut App, name: &str| {
-            for (camera, view) in [(iso, ""), (end, "-end-on"), (close, "-close")] {
+            for (camera, view) in [
+                (iso, ""),
+                (end, "-end-on"),
+                (end_close, "-end-on-close"),
+                (close, "-close"),
+            ] {
                 a.camera = camera;
                 let _ = a.view();
                 render_png(a, size, &out.join(format!("{name}{view}.png")));
@@ -4019,7 +4026,7 @@ flood = { pin = 8 }
     #[test]
     #[ignore]
     fn render_the_index_height_on_the_library_rotary() {
-        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
         let out = std::path::PathBuf::from(
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/index-height-renders".into()),
         );
@@ -4033,7 +4040,7 @@ flood = { pin = 8 }
             "100",
             "-40",
             "0, 90, 180, -90",
-            on_the_bar(&cutter("12")),
+            faced_square(&cutter("12"), &mesh),
         );
         doc.setups[0].machine = crate::control::rotary_machine(dir.path()).unwrap();
         doc.machines = vec![doc.setups[0].machine.clone()];

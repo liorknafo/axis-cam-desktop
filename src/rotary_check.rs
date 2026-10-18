@@ -23,6 +23,7 @@ use crate::post::Held;
 use crate::post_check::machine_mm;
 use crate::simulation::{Motion, Plan, Simulation};
 use std::collections::HashSet;
+use std::f32::consts::PI;
 
 /// The results of a setup's operations: (index in the setup, simulation).
 type Sims = [(usize, Result<Simulation, String>)];
@@ -224,8 +225,9 @@ fn a_before(doc: &Document, si: usize) -> f32 {
 /// index of its operation in the setup (None
 /// for the setup's), named by the setup, the A angle and the operation.
 /// Then, in any setup on the bar in the chuck, indexed or not, a cut that
-/// parts the stock off the bar the chuck holds (`parted`, LIO-208). Empty
-/// for a setup that is neither.
+/// parts the stock off the bar the chuck holds, or leaves it on a web too
+/// thin to hold it against the cut (`parted`, LIO-208, LIO-211). Empty for
+/// a setup that is neither.
 pub fn problems(
     doc: &Document,
     mesh: &Mesh,
@@ -559,20 +561,52 @@ fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
 
 /// How near the axis, mm, the tailstock's centre holds the bar's free end.
 const CENTRE: f32 = 3.;
+/// The part-off check's cells, mm on a side at most (LIO-211): the
+/// simulation's are a 96th of the stock's longest side, 2.6 mm on a 250 mm
+/// bar, too coarse to tell a chip from a piece or to measure a web, so the
+/// check cuts its own finer grid of the same stock with the same cuts.
+pub const CELL: f32 = 1.;
+/// The most a loose piece of the stock may measure and still be taken for a
+/// chip: mm along its longest side, and mm³. A real chip is no thicker than
+/// the chip load (0.2 mm at most here), and the stock model never keeps
+/// one, as it takes away all the cutter sweeps: what it leaves loose is
+/// uncut stock. Over two of the check's 1 mm cells long, or two cells'
+/// worth, it is a piece that can be thrown or break the tool, not what the
+/// cells leave between two passes.
+pub const CHIP: f32 = 2.;
+pub const CHIP_VOLUME: f32 = 2.;
+/// The thinnest web, mm across (`Section::across`), that is taken to hold
+/// the stock beyond it at all, whatever the cut: three of the check's
+/// cells, so that a web the cells barely see is never taken for a sound
+/// one.
+pub const WEB: f32 = 3.;
 
 /// The stock's voxels (`volume::Volume`) as the chuck sees them: each
-/// one's X along the A axis in the chuck's frame and how far it is from the
+/// one's X along the A axis in the chuck's frame and where it is across the
 /// axis, and the ones the jaws (or the tailstock's centre) hold. The jaws
 /// turn with the stock, so what they hold is the same at every angle.
 struct Gripped {
     x: Vec<f32>,
+    /// Y and Z from the axis.
+    yz: Vec<[f32; 2]>,
     r: Vec<f32>,
     seeds: Vec<usize>,
     n: [usize; 3],
+    /// A voxel's length along the axis, and its area across it, mm and mm².
+    along: f32,
+    area: f32,
+    /// The chuck's frame at A0, which the cuts are taken to.
+    a0: crate::volume::Frame,
 }
 impl Gripped {
+    /// The voxels of `v`: held are those inside the jaws' grip, between the
+    /// chuck's face and the jaws' front and no more than a voxel and a half
+    /// in from where the jaws close, and those the tailstock's centre holds
+    /// when it supports the bar. Material behind the jaws' front nearer the
+    /// axis is held only through what joins it to those.
     fn new(v: &crate::volume::Volume, a0: crate::volume::Frame, rig: &Rig) -> Self {
         let mut x = Vec::with_capacity(v.occupied.len());
+        let mut yz = Vec::with_capacity(v.occupied.len());
         let mut radii = Vec::with_capacity(v.occupied.len());
         let mut seeds = vec![];
         let cell = v.cell.iter().copied().fold(0., f32::max);
@@ -580,26 +614,45 @@ impl Gripped {
             for j in 0..v.n[1] {
                 for i in 0..v.n[0] {
                     let q = v.frame.transfer(v.point([i, j, k], 0.5), a0);
-                    let r = (q[1] - rig.axis[0]).hypot(q[2] - rig.axis[1]);
+                    let d = [q[1] - rig.axis[0], q[2] - rig.axis[1]];
+                    let r = d[0].hypot(d[1]);
                     let tail = match rig.tail {
                         crate::chuck::Tail::Supports(end) => {
                             q[0] >= end - 1.5 * cell && r <= CENTRE.max(1.5 * cell)
                         }
                         _ => false,
                     };
-                    if q[0] <= rig.front || tail {
+                    let gripped =
+                        (rig.face..=rig.front).contains(&q[0]) && r >= rig.inner - 1.5 * cell;
+                    if gripped || tail {
                         seeds.push(x.len());
                     }
                     x.push(q[0]);
+                    yz.push(d);
                     radii.push(r);
                 }
             }
         }
+        // The grid's axis that runs along A.
+        let k = (0..3)
+            .max_by(|&a, &b| {
+                let along = |k: usize| {
+                    let mut e = [0.; 3];
+                    e[k] = 1.;
+                    v.frame.transfer_vector(e, a0)[0].abs()
+                };
+                along(a).total_cmp(&along(b))
+            })
+            .unwrap_or(0);
         Self {
             x,
+            yz,
             r: radii,
             seeds,
             n: v.n,
+            along: v.cell[k],
+            area: v.cell.iter().product::<f32>() / v.cell[k],
+            a0,
         }
     }
     /// The voxels next to voxel `i` across its faces.
@@ -617,10 +670,13 @@ impl Gripped {
         })
     }
     /// The voxels of `filled` reached from `from` across faces through
-    /// voxels `filled` keeps.
-    fn fill(&self, from: &[usize], filled: impl Fn(usize) -> bool) -> Vec<bool> {
-        let mut reached = vec![false; self.x.len()];
-        let mut stack: Vec<usize> = from.iter().copied().filter(|&i| filled(i)).collect();
+    /// voxels `filled` keeps, marked in `reached`.
+    fn fill_into(&self, from: &[usize], filled: impl Fn(usize) -> bool, reached: &mut [bool]) {
+        let mut stack: Vec<usize> = from
+            .iter()
+            .copied()
+            .filter(|&i| filled(i) && !reached[i])
+            .collect();
         for &i in &stack {
             reached[i] = true;
         }
@@ -632,43 +688,201 @@ impl Gripped {
                 }
             }
         }
-        reached
     }
     /// The material of `v` joined to what the chuck holds.
     fn held(&self, v: &crate::volume::Volume) -> Vec<bool> {
-        self.fill(&self.seeds, |i| v.occupied[i] != 0)
+        let mut reached = vec![false; self.x.len()];
+        self.fill_into(&self.seeds, |i| v.occupied[i] != 0, &mut reached);
+        reached
     }
-    /// A piece of `v` that was held (`before`) and is no longer (`now`), at
-    /// least three voxels thick somewhere (a voxel with all its face
-    /// neighbours filled): the voxels of the piece. A thinner sliver is
-    /// taken for a chip, or for the voxels' own coarseness.
-    fn loose(
-        &self,
-        v: &crate::volume::Volume,
-        before: &[bool],
-        now: &[bool],
-    ) -> Option<Vec<usize>> {
+    /// The pieces of `v` that were held (`before`) and are no longer
+    /// (`now`), each as its voxels, larger than a chip (`CHIP`,
+    /// `CHIP_VOLUME`): the largest first.
+    fn loose(&self, v: &crate::volume::Volume, before: &[bool], now: &[bool]) -> Vec<Piece> {
         let freed = |i: usize| v.occupied[i] != 0 && before[i] && !now[i];
-        let core = (0..self.x.len())
-            .find(|&i| freed(i) && self.next(i).filter(|&j| v.occupied[j] != 0).count() == 6)?;
-        let piece = self.fill(&[core], freed);
-        Some((0..self.x.len()).filter(|&i| piece[i]).collect())
+        let mut seen = vec![false; self.x.len()];
+        let mut pieces = vec![];
+        for i in 0..self.x.len() {
+            if seen[i] || !freed(i) {
+                continue;
+            }
+            let mut stack = vec![i];
+            seen[i] = true;
+            let mut voxels = vec![];
+            while let Some(j) = stack.pop() {
+                voxels.push(j);
+                for k in self.next(j) {
+                    if !seen[k] && freed(k) {
+                        seen[k] = true;
+                        stack.push(k);
+                    }
+                }
+            }
+            let piece = Piece::of(v, voxels);
+            if piece.size.iter().copied().fold(0., f32::max) > CHIP + 1e-3
+                || piece.volume > CHIP_VOLUME + 1e-3
+            {
+                pieces.push(piece);
+            }
+        }
+        pieces.sort_by(|a, b| b.volume.total_cmp(&a.volume));
+        pieces
+    }
+    /// The section across the axis of the material `held` in each slab of
+    /// the stock a voxel long whose middle is beyond the jaws' `front` and
+    /// short of `far`: (its X, its section).
+    fn sections(&self, held: &[bool], front: f32, far: f32) -> Vec<(f32, Section)> {
+        let w = self.along;
+        let low = self.x.iter().copied().fold(f32::INFINITY, f32::min) - w / 2.;
+        let bin = |x: f32| ((x - low) / w).floor().max(0.) as usize;
+        let count = bin(self.x.iter().copied().fold(f32::NEG_INFINITY, f32::max)) + 1;
+        let mut members: Vec<Vec<usize>> = vec![vec![]; count];
+        for i in (0..self.x.len()).filter(|&i| held[i] && self.x[i] > front && self.x[i] < far) {
+            members[bin(self.x[i])].push(i);
+        }
+        (members.iter().enumerate())
+            .filter(|(_, m)| !m.is_empty())
+            .map(|(b, m)| {
+                let x = low + (b as f32 + 0.5) * w;
+                (x, Section::of(m.iter().map(|&i| self.yz[i]), self.area))
+            })
+            .collect()
     }
 }
 
-/// A cut that parts the stock off the bar the chuck holds (LIO-208), in
-/// setup `si` on a bar in the chuck, indexed or not: the stock is followed
-/// through its `sims` (`simulation::sequence`'s in-process stock across
-/// the angles), and after each angle's cuts of each operation the material
-/// still joined to what the jaws grip (or the tailstock's centre holds) is
-/// flood-filled across the voxels' faces. A piece that was joined before
-/// and is not now comes loose, to be thrown or to break the tool: refused,
-/// once, naming the operation, the angle and the X range (work
-/// coordinates) where nothing of the stock is left between the bar and the
-/// piece. The voxels hold material where their centres were not cut, so a
-/// web on the axis is seen when it is at least one voxel across (`cell`
-/// below, the stock's longest side over 96: 1.25 mm on a 120 mm bar); a
-/// thinner one counts as cut through. A deliberate part-off is not an
+/// A piece of the stock cut loose: its voxels, its size along the grid's
+/// axes, mm, and its volume, mm³.
+struct Piece {
+    voxels: Vec<usize>,
+    size: [f32; 3],
+    volume: f32,
+}
+impl Piece {
+    fn of(v: &crate::volume::Volume, voxels: Vec<usize>) -> Self {
+        let n = v.n;
+        let mut lo = [usize::MAX; 3];
+        let mut hi = [0; 3];
+        for &i in &voxels {
+            let p = [i % n[0], i / n[0] % n[1], i / (n[0] * n[1])];
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        Self {
+            size: std::array::from_fn(|k| (hi[k] + 1 - lo[k]) as f32 * v.cell[k]),
+            volume: voxels.len() as f32 * v.cell.iter().product::<f32>(),
+            voxels,
+        }
+    }
+}
+
+/// A section of the stock across the A axis, from the voxels in it (their
+/// Y and Z from the axis, each `cell` mm² across).
+#[derive(Debug, Clone, Copy)]
+struct Section {
+    /// mm²
+    area: f32,
+    /// The least of its second moments about its centroid, and the polar
+    /// one, mm⁴.
+    least: f32,
+    polar: f32,
+    /// The most, over the directions a bending moment can take, of how far
+    /// its material reaches from the neutral axis over its second moment
+    /// about it, 1/mm³: the bending stress per N·mm.
+    bending: f32,
+}
+impl Section {
+    fn of(points: impl Iterator<Item = [f32; 2]> + Clone, cell: f32) -> Self {
+        let n = points.clone().count() as f32;
+        let (sy, sz) = points
+            .clone()
+            .fold((0., 0.), |s, p| (s.0 + p[0], s.1 + p[1]));
+        let c = [sy / n, sz / n];
+        // A voxel's own second moment about its middle, as a square.
+        let own = n * cell * cell / 12.;
+        let (mut iyy, mut izz, mut iyz) = (own, own, 0.);
+        // How far the material reaches each way across a neutral axis
+        // every 5°.
+        let ways: Vec<[f32; 2]> = (0..36)
+            .map(|k| (k as f32 * 5f32.to_radians()).sin_cos())
+            .map(|(s, c)| [-s, c])
+            .collect();
+        let mut reach = vec![0f32; ways.len()];
+        for p in points {
+            let d = [p[0] - c[0], p[1] - c[1]];
+            iyy += d[1] * d[1] * cell;
+            izz += d[0] * d[0] * cell;
+            iyz += d[0] * d[1] * cell;
+            for (r, w) in reach.iter_mut().zip(&ways) {
+                *r = r.max((d[0] * w[0] + d[1] * w[1]).abs());
+            }
+        }
+        let mean = (iyy + izz) / 2.;
+        // About the axis along (cos, sin): the second moment of what lies
+        // across it, along `ways`.
+        let bending = (ways.iter().zip(&reach))
+            .map(|(w, r)| {
+                let i = izz * w[0] * w[0] + iyy * w[1] * w[1] + 2. * iyz * w[0] * w[1];
+                (r + cell.sqrt() / 2.) / i.max(1e-6)
+            })
+            .fold(0., f32::max);
+        Self {
+            area: n * cell,
+            least: mean - ((iyy - izz) / 2.).hypot(iyz),
+            polar: iyy + izz,
+            bending,
+        }
+    }
+    /// How far across it is at its thinnest, mm: the width of the rectangle
+    /// of its area and least second moment (a square's side; 0.87 of a
+    /// circle's diameter).
+    fn across(&self) -> f32 {
+        (12. * self.least / self.area).max(0.).sqrt()
+    }
+    /// The stress in it, N/mm², under a bending moment `m` (N·mm) in any
+    /// direction and a twist `t` (N·mm): the bending stress where its
+    /// material reaches farthest from the neutral axis the moment bends it
+    /// about, the worst way, the shear of the twist at its width over
+    /// Saint-Venant's torsion constant (A⁴ / 4π² J, the polar moment J's for
+    /// a round section, less for any other), together as von Mises'.
+    fn stress(&self, m: f32, t: f32) -> (f32, f32, f32) {
+        let bend = m * self.bending;
+        let torsion = self.area.powi(4) / (4. * PI * PI * self.polar.max(1e-6));
+        let shear = t * self.across() / torsion.max(1e-6);
+        (bend, shear, bend.hypot(3f32.sqrt() * shear))
+    }
+}
+/// The side of the square web, mm, whose stress (`Section::stress`) under
+/// `m` and `t` is `allowed` (N/mm²): a square's reach is its half-diagonal,
+/// its least second moment a⁴/12, its torsion constant 0.152 a⁴.
+fn square_for(m: f32, t: f32, allowed: f32) -> f32 {
+    let torsion = 6. / (4. * PI * PI);
+    let bend = m / std::f32::consts::SQRT_2 * 12.;
+    let shear = t / torsion;
+    (bend.hypot(3f32.sqrt() * shear) / allowed).cbrt()
+}
+
+/// A cut that parts the stock off the bar the chuck holds (LIO-208), or
+/// leaves it on a web too thin to hold it (LIO-211), in setup `si` on a bar
+/// in the chuck, indexed or not. The stock is followed through its `sims`
+/// (`simulation::sequence`'s in-process stock across the angles), cut again
+/// on a grid of `CELL` mm cells, finer than the simulation's: after each
+/// angle's cuts of each operation the material still joined to what the
+/// jaws grip (the stock between the chuck's face and the jaws' front where
+/// they close on it) or the tailstock's centre holds is flood-filled across
+/// the voxels' faces. A piece that was joined before and is not now, over a
+/// chip's size (`CHIP`, `CHIP_VOLUME`), comes loose, to be thrown or to
+/// break the tool: refused, naming the operation, the angle, the piece's
+/// size and the X range (work coordinates) where nothing of the stock is
+/// left between the bar and it. What stays joined is checked slab by slab
+/// out of the jaws, as far as the angle's cuts reach: each section must be
+/// at least `WEB` mm across, and hold the operation's largest cutting
+/// force (`forces::op_pushes`) at the end of what it holds, as a
+/// cantilever out of the section (the tailstock taken as no help) and
+/// twisted by it about A, with `forces::SAFETY` against the material's
+/// `forces::STRENGTH`. Refused with the web's size and the square web it
+/// needs. One message for the setup. A deliberate part-off is not an
 /// operation yet.
 fn parted(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<usize>, String)> {
     let setup = &doc.setups[si];
@@ -694,8 +908,14 @@ fn parted(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
     let Some(volume) = sims.peek().and_then(|(_, s)| s.initial_volume.as_ref()) else {
         return vec![];
     };
-    let grid = Gripped::new(volume, at.frame, &rig);
-    let mut held = grid.held(volume);
+    let mut fine =
+        crate::volume::Volume::finer(volume.bounds, volume.frame, CELL).rounded(volume.round);
+    for cut in volume.cuts.iter() {
+        fine.carve(cut);
+    }
+    let mut done = volume.cuts.len();
+    let grid = Gripped::new(&fine, at.frame, &rig);
+    let mut held = grid.held(&fine);
     let name = setup.name();
     let words = Bar::of(doc, base, mesh).map_or("stock".into(), |b| b.words);
     for (oi, sim) in sims {
@@ -718,21 +938,53 @@ fn parted(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
         if cut {
             ends.push((play.plan.duration, a_now));
         }
+        let op = setup.operations.get(oi);
+        // The operation's largest push, its bending force and its twist
+        // about A, N and N·mm: worked out when a web needs it.
+        let mut push: Option<Option<(f32, f32)>> = None;
+        let mut force = || {
+            *push.get_or_insert_with(|| {
+                let pushes = crate::forces::op_pushes(doc, setup, op?, &crate::forces::bites(sim))?;
+                let bend = pushes.iter().map(|p| p.side.hypot(p.up)).fold(0., f32::max);
+                let twist = (pushes.iter())
+                    .map(|p| p.side * (p.z - rig.axis[1]).abs() + p.up * rig.outer)
+                    .fold(0., f32::max);
+                Some((bend, twist))
+            })
+        };
         for (t, a) in ends {
             play.seek(t / play.plan.duration.max(1e-6));
             let Some(v) = play.volume.as_ref() else {
                 return vec![];
             };
-            let now = grid.held(v);
-            if let Some(piece) = grid.loose(v, &held, &now) {
-                let line = loose_line(&grid, v, &piece, at.zero[0], &words);
-                let op = setup.operations[oi].name();
-                return vec![(
+            // The angle's cuts on the finer grid, and how far along A they
+            // reach. The last one before may have grown since.
+            let mut reach = f32::NEG_INFINITY;
+            for c in &v.cuts[done.saturating_sub(1).min(v.cuts.len())..] {
+                fine.carve(c);
+                for p in [c.a, c.b] {
+                    reach = reach.max(c.frame.transfer(p, grid.a0)[0] + c.radius);
+                }
+            }
+            done = v.cuts.len();
+            let now = grid.held(&fine);
+            let say = |line: String| {
+                vec![(
                     Some(oi),
-                    format!("{name} at A {}°, {op}: {line}", degrees(a)),
-                )];
+                    format!(
+                        "{name} at A {}°, {}: {line}",
+                        degrees(a),
+                        op.map_or(String::new(), |o| o.name().to_string())
+                    ),
+                )]
+            };
+            if let Some(piece) = grid.loose(&fine, &held, &now).first() {
+                return say(loose_line(&grid, &fine, piece, at.zero[0], &words));
             }
             held = now;
+            if let Some(line) = web_line(&grid, &held, &rig, reach, at.zero[0], doc, &mut force) {
+                return say(line);
+            }
         }
     }
     vec![]
@@ -741,15 +993,15 @@ fn parted(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
 /// What is said of `piece`, cut loose from the `words` the chuck holds in
 /// `v`: where nothing of the stock is left on the A axis on its side
 /// towards the jaws (work X, `datum` being the work zero's X in the
-/// chuck's frame), its own length and place, and the voxels' size.
+/// chuck's frame), its own size and place, and the cells' size.
 fn loose_line(
     grid: &Gripped,
     v: &crate::volume::Volume,
-    piece: &[usize],
+    piece: &Piece,
     datum: f32,
     words: &str,
 ) -> String {
-    let w = v.cell.iter().copied().fold(f32::INFINITY, f32::min);
+    let w = grid.along;
     let cell = v.cell.iter().copied().fold(0., f32::max);
     let low = grid.x.iter().copied().fold(f32::INFINITY, f32::min) - w / 2.;
     let high = grid.x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -760,15 +1012,13 @@ fn loose_line(
     for i in (0..grid.x.len()).filter(|&i| v.occupied[i] != 0 && grid.r[i] <= cell) {
         on_axis[bin(grid.x[i])] = true;
     }
-    let ends = piece
-        .iter()
-        .fold([f32::INFINITY, f32::NEG_INFINITY], |e, &i| {
-            [e[0].min(grid.x[i]), e[1].max(grid.x[i])]
-        });
+    let ends = (piece.voxels.iter()).fold([f32::INFINITY, f32::NEG_INFINITY], |e, &i| {
+        [e[0].min(grid.x[i]), e[1].max(grid.x[i])]
+    });
     let (start, end) = (ends[0] - w / 2., ends[1] + w / 2.);
     let at = |x: f32| mm(x - datum);
     // The slabs bare on the axis next to the piece's own, on the jaws' side.
-    let near = (piece.iter())
+    let near = (piece.voxels.iter())
         .filter(|&&i| grid.r[i] <= cell)
         .map(|&i| grid.x[i])
         .fold(f32::INFINITY, f32::min);
@@ -777,13 +1027,20 @@ fn loose_line(
     while k > 0 && !on_axis[k - 1] {
         k -= 1;
     }
+    // Its sides, the longest first.
+    let mut size = piece.size;
+    size.sort_by(|a, b| b.total_cmp(a));
+    let size = size.map(mm);
     let fix = format!(
-        "it comes loose, to be thrown or to break the tool. Cut less deep, so that a web of the stock stays on the A axis (the stock is checked in {} mm cells: a thinner web counts as cut through); a part-off is not an operation yet.",
-        mm(cell)
+        "it comes loose, to be thrown or to break the tool. Leave a web of the stock that holds it (the stock is checked in {} mm cells: a thinner web counts as cut through, and a loose piece over {} mm long or {} mm³ is not taken for a chip); a part-off is not an operation yet.",
+        mm(cell),
+        mm(CHIP),
+        mm(CHIP_VOLUME)
     );
     let piece = format!(
-        "the {} mm piece of it from X{} to X{}",
-        mm(end - start),
+        "the {} mm piece of it ({} mm³) from X{} to X{}",
+        size.join(" × "),
+        piece.volume.round(),
         at(start),
         at(end)
     );
@@ -797,6 +1054,101 @@ fn loose_line(
             "the cuts leave {piece} joined to nothing the {words} in the chuck holds, so {fix}"
         ),
     }
+}
+
+/// The weakest web of the material `held` (`Gripped::sections`) out of the
+/// jaws of `rig` and short of `reach`, the farthest an angle's cuts went
+/// along A, and what is said of it when it is under `WEB` mm across or does
+/// not hold the operation's `force` (`parted`) at the end of what it holds:
+/// None when every one does. Work X from `datum`.
+fn web_line(
+    grid: &Gripped,
+    held: &[bool],
+    rig: &Rig,
+    reach: f32,
+    datum: f32,
+    doc: &Document,
+    force: &mut impl FnMut() -> Option<(f32, f32)>,
+) -> Option<String> {
+    use crate::forces::{SAFETY, strength};
+    let far = (0..grid.x.len())
+        .filter(|&i| held[i])
+        .map(|i| grid.x[i] + grid.along / 2.)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .min(reach);
+    let sections = grid.sections(held, rig.front, far);
+    if sections.is_empty() {
+        return None;
+    }
+    let (group, yields) = strength(doc.selected_material());
+    let what = match (doc.selected_material(), group) {
+        (None, _) => "the stock (no material is chosen: taken as copper, the least of the metals)"
+            .to_string(),
+        (_, "Other") => "the material (taken as copper, the least of the metals)".to_string(),
+        (_, group) => group.to_lowercase(),
+    };
+    let allowed = yields / SAFETY;
+    let thinnest = sections
+        .iter()
+        .min_by(|a, b| a.1.across().total_cmp(&b.1.across()))?;
+    // The most stressed section under the force, with its stresses.
+    let stressed = force().and_then(|(f, t)| {
+        sections
+            .iter()
+            .map(|&(x, s)| (x, s, s.stress(f * (far - x), t)))
+            .max_by(|a, b| a.2.2.total_cmp(&b.2.2))
+            .map(|w| (w, f, t))
+    });
+    let at = |x: f32| mm(x - datum);
+    let size = |x: f32, s: &Section| {
+        format!(
+            "the web the cuts leave at X{}, between the bar the chuck holds and the {} mm of it out to X{}, is {} mm² and {} mm across at its thinnest",
+            at(x),
+            mm(far - x),
+            at(far),
+            s.area.round(),
+            mm(s.across())
+        )
+    };
+    let fix = format!(
+        "Leave a thicker web or take a lighter cut (the stock is checked in {} mm cells); a part-off is not an operation yet.",
+        mm(CELL)
+    );
+    let (x, s) = *thinnest;
+    if s.across() < WEB {
+        let needs = match stressed {
+            Some(((xs, _, _), f, t)) => format!(
+                ", and to hold the cut's {} N {} mm out a square one about {} mm across",
+                f.round(),
+                mm(far - xs),
+                mm(square_for(f * (far - xs), t, allowed).max(WEB))
+            ),
+            None => String::new(),
+        };
+        return Some(format!(
+            "{}: a web under {} mm across does not hold what is beyond it{needs}. {fix}",
+            size(x, &s),
+            mm(WEB)
+        ));
+    }
+    let ((x, s, (bend, shear, total)), f, t) = stressed?;
+    if total <= allowed {
+        return None;
+    }
+    Some(format!(
+        "{}: the cut's {} N {} mm out bends it at {} N/mm² and its {} N·mm about A twist it at {} N/mm², {} N/mm² together, against the {} N/mm² {what} yields at ({}, under the {} wanted). It needs to be about {} mm square. {fix}",
+        size(x, &s),
+        f.round(),
+        mm(far - x),
+        bend.round(),
+        t.round(),
+        shear.round(),
+        total.round(),
+        yields.round(),
+        crate::forces::times(yields / total),
+        crate::forces::times(SAFETY),
+        mm(square_for(f * (far - x), t, allowed)),
+    ))
 }
 
 /// The workholding problems of indexed setup `si` from its `sims`, as
@@ -1201,12 +1553,13 @@ mod tests {
     use crate::indexed::tests::{bar_job, contour, cutter, prism};
     use crate::simulation::{Move, prepare};
 
-    /// `indexed`'s bar job: the part in a Ø40 × 120 bar 80 mm out of a 3-jaw
-    /// chuck, on an A centreline at machine Z `centre_z`, setup 2 a contour
-    /// indexed to `angles`; and setup 2's simulation.
+    /// `indexed`'s bar job: the part in a Ø40 × 120 aluminium bar 80 mm out
+    /// of a 3-jaw chuck, on an A centreline at machine Z `centre_z`, setup 2
+    /// a contour indexed to `angles`; and setup 2's simulation.
     fn job(centre_z: &str, angles: &str) -> (Document, Mesh, Simulation) {
         let mesh = prism(30.);
-        let doc = bar_job(&mesh, 0., "80", centre_z, angles, contour(&cutter("12")));
+        let mut doc = bar_job(&mesh, 0., "80", centre_z, angles, contour(&cutter("12")));
+        crate::proposal::tests::aluminium(&mut doc);
         let sim = prepare(&doc, &mesh, 1, 0).unwrap();
         (doc, mesh, sim)
     }
@@ -1253,7 +1606,8 @@ mod tests {
         // Machine::new's travel: X 600, Y 400, Z 300; A -360° to 360°.
         let (doc, mesh, sim) = job("-150", "90");
         // The job as generated is inside every limit.
-        assert!(found(&doc, &mesh, sim.clone()).is_empty());
+        let said = found(&doc, &mesh, sim.clone());
+        assert!(said.is_empty(), "{said:?}");
         let x = |v| [v, 300., -100.];
         let y = |v| [300., v, -100.];
         let z = |v| [300., 300., v];
@@ -1804,17 +2158,21 @@ mod tests {
         assert!(problems(&doc, &mesh, 0, &[(0, Ok(sim))]).is_empty());
     }
 
-    /// The demo 4-angle job (`render_the_four_axis_scene`): the part 20 mm
-    /// out of the chuck's jaws in the Ø40 bar 100 mm out of them, a contour
-    /// at A 90, 180, 270 and 0° whose passes across the bar's ends go
-    /// `bottom` mm over the part's bottom, 10 mm under the A axis; and
-    /// what the rotary checks say of setup 2. Ready to post: the tool
-    /// numbered and the part's file given.
-    fn four_angles(bottom: &str) -> (Document, Mesh, Vec<String>) {
+    /// The 4-angle job the demo used to be: the part 20 mm out of the
+    /// chuck's jaws in a Ø40 bar `len` mm long, 20 mm of it in the jaws, a
+    /// contour at A 90, 180, 270 and 0° whose passes across the bar's ends go
+    /// `bottom` mm over the part's bottom, 10 mm under the A axis; and what
+    /// the rotary checks say of setup 2. Ready to post: the tool numbered and
+    /// the part's file given.
+    fn four_angles_on(len: f32, bottom: &str) -> (Document, Mesh, Vec<String>) {
         let mesh = prism(30.);
         let mut op = contour(&cutter("12"));
         op.p.insert("bottom".into(), bottom.into());
-        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180, 270, 0", op);
+        let stickout = (len - 20.).to_string();
+        let mut doc = bar_job(&mesh, 20., &stickout, "-150", "90, 180, 270, 0", op);
+        doc.setups[0]
+            .p
+            .insert("stock_length".into(), len.to_string());
         doc.tools[0].p.insert("number".into(), "1".into());
         doc.file = Some(crate::model::ModelFile {
             name: "bar.stl".into(),
@@ -1822,6 +2180,8 @@ mod tests {
             format: "STL".into(),
             bytes: 0,
         });
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
         let sims = crate::run::simulated_for_tests(&doc, &mesh, 1);
         let said = problems(&doc, &mesh, 1, &sims)
             .into_iter()
@@ -1829,41 +2189,325 @@ mod tests {
             .collect();
         (doc, mesh, said)
     }
-    /// What the rotary checks say of the cut in the demo job that parts
-    /// the bar at A 180° (LIO-208).
-    const PARTED: &str = "Flats at A 180°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52.5 to X-40, and nothing else joins the 30 mm piece of it from X-40 to X-10 to the bar the chuck holds, so it comes loose, to be thrown or to break the tool. Cut less deep, so that a web of the stock stays on the A axis (the stock is checked in 1.25 mm cells: a thinner web counts as cut through); a part-off is not an operation yet.";
+    /// `four_angles_on` the 120 mm bar.
+    fn four_angles(bottom: &str) -> (Document, Mesh, Vec<String>) {
+        four_angles_on(120., bottom)
+    }
+    /// What the rotary checks say of the contour to the A axis, which parts
+    /// the bar at A 270° (LIO-208): the part, with what the angle before left
+    /// round it.
+    const PARTED: &str = "Flats at A 270°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52 to X-40, and nothing else joins the 40 × 30 × 20 mm piece of it (17520 mm³) from X-40 to X-10 to the bar the chuck holds, so it comes loose, to be thrown or to break the tool. Leave a web of the stock that holds it (the stock is checked in 1 mm cells: a thinner web counts as cut through, and a loose piece over 2 mm long or 2 mm³ is not taken for a chip); a part-off is not an operation yet.";
 
     #[test]
-    fn the_demo_job_that_cuts_the_part_off_the_bar_is_refused_where_it_does() {
-        // Each angle's passes across the bar's ends go to the part's bottom,
-        // 10 mm past the A axis: after A 90 and 180° nothing joins the part
-        // to the bar on the axis, between the passes at X-46.06 and X-40.06
-        // (the Ø12 cutter's edges at X-52.06 and X-40.06, to the 1.25 mm
-        // voxels). Said once, at the angle that parts it.
-        let (_, _, said) = four_angles("0");
+    fn a_contour_to_the_axis_that_cuts_the_part_off_the_bar_is_refused_where_it_does() {
+        // Each angle's passes across the bar's ends go to the A axis: after
+        // A 270° nothing joins the part to the bar on the axis, between the
+        // Ø12 cutter's edges at X-52.06 and X-40.06 (to the 1 mm cells).
+        // Said once, at the angle that parts it.
+        let (_, _, said) = four_angles("10");
         assert_eq!(said, vec![PARTED.to_string()]);
+        // On a 250 mm bar the part and the 63 mm of bar beyond it, out to
+        // its free end.
+        let (_, _, said) = four_angles_on(250., "10");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("Flats at A 270°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-75 to X-63, and nothing else joins the 68 × 40 × 40 mm piece of it (79878 mm³) from X-68 to X0"),
+            "{said:?}"
+        );
     }
 
     #[test]
-    fn a_web_wider_than_a_voxel_keeps_the_part_on_the_bar() {
-        // Down to 2 mm over the axis at all four angles: a 4 mm square web
-        // (the demo job now); 1 mm over it: a 2 mm one, 1.6 voxels across.
-        for bottom in ["12", "11"] {
-            let (_, _, said) = four_angles(bottom);
-            assert!(said.is_empty(), "{bottom}: {said:?}");
+    fn a_contour_to_the_parts_bottom_leaves_a_fin_at_the_bars_end_that_is_refused() {
+        // To the part's bottom, 10 mm under the axis, as the demo job once
+        // did: already at A 90° the round corner of the passes at the bar's
+        // free end leaves a fin 3 × 3 mm across, 20 mm tall, on less than a
+        // millimetre of the bar. Under three voxels thick, the first check
+        // took it for a chip (LIO-211).
+        let (_, _, said) = four_angles("0");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("Flats at A 90°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-10 to X-3, and nothing else joins the 20 × 3 × 3 mm piece of it (60 mm³) from X-3 to X0 to the bar the chuck holds"),
+            "{said:?}"
+        );
+    }
+
+    /// What the part-off check says of setup 2 of a Ø40 bar `len` mm long,
+    /// 20 mm of it in the jaws, at A 90, 180, 270 and 0°, its contour's moves
+    /// replaced by a Ø`d` flat end mill's feeds `passes`: (A, from, to) in
+    /// the setup's frame, where the A axis is at Y0 Z20 and the bar's free
+    /// end at X `len` / 2, A turning between them. At A 90° the setup's -Y
+    /// is the bar's +Z at A0, its +Z the bar's +Y.
+    fn carved(len: f32, d: f32, passes: &[(f32, [f32; 3], [f32; 3])]) -> Vec<String> {
+        let mesh = prism(30.);
+        let stickout = (len - 20.).to_string();
+        let mut doc = bar_job(
+            &mesh,
+            20.,
+            &stickout,
+            "-150",
+            "90, 180, 270, 0",
+            contour(&cutter("12")),
+        );
+        doc.setups[0]
+            .p
+            .insert("stock_length".into(), len.to_string());
+        doc.tools[0].p.insert("diameter".into(), d.to_string());
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        let mut sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        (sim.plan.radius, sim.plan.flute_length) = (d / 2., 60.);
+        let (mut moves, mut t, mut at) = (vec![], 0., None);
+        let mut step = |from, to, motion, a| {
+            moves.push(Move {
+                from,
+                to,
+                motion,
+                cutting_pass: motion == Motion::Feed,
+                feed: 1000.,
+                start: t,
+                end: t + 1.,
+                a: Some(a),
+            });
+            t += 1.;
+        };
+        for &(a, from, to) in passes {
+            if at.is_some_and(|b| b != a) {
+                let over = [from[0], from[1], 100.];
+                step(over, over, Motion::Index, a);
+            }
+            at = Some(a);
+            step(from, to, Motion::Feed, a);
         }
-        // Down to the axis: no web. The opposite angle cuts it through.
-        // Half a millimetre over it the 1 mm web holds no voxel's centre: it
-        // counts as cut through, as the message says.
-        for bottom in ["10", "10.5"] {
-            let (_, _, said) = four_angles(bottom);
-            assert_eq!(said, vec![PARTED.replace("A 180°", "A 270°")], "{bottom}");
+        (sim.plan.moves, sim.plan.duration) = (moves, t);
+        parted(&doc, &mesh, 1, &[(0, Ok(sim))])
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
+    }
+    /// The passes that cut a stick `l` × `t` × `t` mm free at the free end
+    /// `e` of the bar, along the A axis, `t` mm wide across Y (from half a
+    /// millimetre off the axis, so that the 1 mm cells see it `t` across)
+    /// and 10 to 10 + `t` mm over the axis, with a Ø`t` cutter: at A0 down to
+    /// its bottom on either side, down to its top over it and through the
+    /// bar beyond its end towards the jaws; at A 90° through the bar under
+    /// it.
+    fn stick(e: f32, l: f32, t: f32) -> Vec<(f32, [f32; 3], [f32; 3])> {
+        let (r, c, z) = (t / 2., (t / 2.).fract(), 30.);
+        let (from, to) = (e - l - 2. * r, e + 2. * r);
+        let mut v = vec![];
+        let mut y = r + r;
+        while y - r < 21. {
+            for side in [c - y, c + y] {
+                v.push((0., [from, side, z], [to, side, z]));
+            }
+            y += 1.8 * r;
+        }
+        v.push((0., [from, c, z + t], [to, c, z + t]));
+        v.push((0., [e - l - r, -26., z - t], [e - l - r, 26., z - t]));
+        v.push((90., [e - l, -(10. - r), -1.], [to, -(10. - r), -1.]));
+        v
+    }
+    /// The passes that cut a disc `t` mm thick off the free end `e` of the
+    /// bar: a Ø6 cutter across the bar beside it to half a millimetre past
+    /// the axis at A 90 and 270°.
+    fn disc(e: f32, t: f32) -> Vec<(f32, [f32; 3], [f32; 3])> {
+        let x = e - t - 3.;
+        [90., 270.]
+            .map(|a| (a, [x, -26., 19.5], [x, 26., 19.5]))
+            .to_vec()
+    }
+
+    #[test]
+    fn a_stick_or_a_disc_cut_free_is_refused_on_a_120_and_a_250_mm_bar() {
+        // A 30 × 3 × 3 mm stick on the 120 mm bar, a 60 × 6 × 6 mm one on
+        // the 250 mm bar (its simulation's voxels 2.6 mm), and the bar's
+        // full Ø40 end, 3 and 7 mm thick: none three voxels thick everywhere
+        // on the simulation's grid, all passed as chips before (LIO-211).
+        for (len, d, passes, piece, angle) in [
+            (
+                120.,
+                3.,
+                stick(60., 30., 3.),
+                "the 30 × 3 × 3 mm piece of it (270 mm³) from X-30 to X0",
+                90,
+            ),
+            (
+                250.,
+                6.,
+                stick(125., 60., 6.),
+                "the 60 × 6 × 6 mm piece of it (2160 mm³) from X-60 to X0",
+                90,
+            ),
+            (
+                120.,
+                6.,
+                disc(60., 3.),
+                "the 40 × 40 × 3 mm piece of it (3792 mm³) from X-3 to X0",
+                270,
+            ),
+            (
+                250.,
+                6.,
+                disc(125., 7.),
+                "the 40 × 40 × 7 mm piece of it (8848 mm³) from X-7 to X0",
+                270,
+            ),
+        ] {
+            let said = carved(len, d, &passes);
+            assert_eq!(said.len(), 1, "{len}: {said:?}");
+            let s = &said[0];
+            assert!(
+                s.starts_with(&format!("Flats at A {angle}°, Contour: ")),
+                "{s}"
+            );
+            assert!(s.contains(piece), "{len}: {s}");
+            assert!(
+                s.contains("so it comes loose, to be thrown or to break the tool"),
+                "{s}"
+            );
+        }
+        // Without the last pass that frees each, nothing is loose, and the
+        // webs left (the stick's base, the disc's lower half) hold.
+        for (len, d, mut passes) in [
+            (120., 3., stick(60., 30., 3.)),
+            (250., 6., stick(125., 60., 6.)),
+            (120., 6., disc(60., 3.)),
+            (250., 6., disc(125., 7.)),
+        ] {
+            passes.pop();
+            assert_eq!(carved(len, d, &passes), Vec::<String>::new(), "{len}");
+        }
+    }
+
+    #[test]
+    fn a_web_too_thin_to_hold_is_refused_with_its_size_and_a_sound_one_passes() {
+        // 0.8 mm over the axis at all four angles leaves the part on a
+        // 1.6 mm square neck: it was seen, and passed. It is refused, on the
+        // 120 and the 250 mm bar, as soon as the cuts leave it under 3 mm
+        // across, with the square web the cut's force needs.
+        for len in [120., 250.] {
+            let (_, _, said) = four_angles_on(len, "10.8");
+            assert_eq!(said.len(), 1, "{len}: {said:?}");
+            let s = &said[0];
+            assert!(
+                s.starts_with("Flats at A 270°, Contour: the web the cuts leave at X"),
+                "{s}"
+            );
+            assert!(s.contains("2 mm across at its thinnest: a web under 3 mm across does not hold what is beyond it, and to hold the cut's 168 N"), "{s}");
+            assert!(s.contains("a square one about 13."), "{s}");
+        }
+        // 2 mm over it, a 4 mm square web: thick enough to be one, too thin
+        // to hold the cut on the part out of it: refused with the stresses.
+        let (_, _, said) = four_angles("12");
+        assert_eq!(
+            said,
+            vec!["Flats at A 270°, Contour: the web the cuts leave at X-48.5, between the bar the chuck holds and the 48.5 mm of it out to X0, is 92 mm² and 4.49 mm across at its thinnest: the cut's 168 N 48.5 mm out bends it at 215 N/mm² and its 4085 N·mm about A twist it at 42 N/mm², 227 N/mm² together, against the 70 N/mm² the stock (no material is chosen: taken as copper, the least of the metals) yields at (×0.3, under the ×2 wanted). It needs to be about 13.35 mm square. Leave a thicker web or take a lighter cut (the stock is checked in 1 mm cells); a part-off is not an operation yet.".to_string()]
+        );
+        // 7 mm over it, a 14 mm web (`on_the_bar`), holds on both bars.
+        for len in [120., 250.] {
+            let (_, _, said) = four_angles_on(len, "17");
+            assert!(said.is_empty(), "{len}: {said:?}");
+        }
+    }
+
+    #[test]
+    fn held_is_inside_the_jaws_grip_not_anything_behind_their_front() {
+        // A core of the bar inside the jaws, cut free of the shell they grip
+        // round it (an annulus round it and a slab across its end), is not
+        // held: the jaws close on the shell, not on it. Only cells are
+        // cleared here; no cutter reaches inside the jaws.
+        let mesh = prism(30.);
+        let doc = bar_job(
+            &mesh,
+            20.,
+            "100",
+            "-150",
+            "90, 180, 270, 0",
+            contour(&cutter("12")),
+        );
+        let sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+        let at = doc.at_angle(1, 0., &mesh).unwrap();
+        let v0 = sim.initial_volume.unwrap();
+        let mut v = crate::volume::Volume::finer(v0.bounds, v0.frame, CELL).rounded(v0.round);
+        let grid = Gripped::new(&v, at.frame, &rig);
+        let whole = grid.held(&v);
+        let core = |i: usize| grid.r[i] < 5. && grid.x[i] < rig.front - 4.;
+        for i in 0..grid.x.len() {
+            let (r, x) = (grid.r[i], grid.x[i]);
+            let slab = r < 8. && (rig.front - 4. ..rig.front - 2.).contains(&x);
+            if (5. ..8.).contains(&r) && x < rig.front - 2. || slab {
+                v.occupied[i] = 0;
+            }
+        }
+        let held = grid.held(&v);
+        let cores: Vec<usize> = (0..grid.x.len())
+            .filter(|&i| core(i) && v.occupied[i] != 0)
+            .collect();
+        assert!(!cores.is_empty());
+        assert!(cores.iter().all(|&i| whole[i] && !held[i]));
+        // It is a piece that came loose.
+        let pieces = grid.loose(&v, &whole, &held);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].voxels.len(), cores.len());
+        // The rest of the bar out of the jaws is still held.
+        assert!(
+            (0..grid.x.len())
+                .filter(|&i| grid.x[i] > rig.front && v.occupied[i] != 0)
+                .all(|i| held[i])
+        );
+    }
+
+    #[test]
+    fn a_loose_bit_up_to_two_cells_is_a_chip_and_three_is_a_piece() {
+        let mesh = prism(30.);
+        let doc = bar_job(
+            &mesh,
+            20.,
+            "100",
+            "-150",
+            "90, 180, 270, 0",
+            contour(&cutter("12")),
+        );
+        let sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+        let at = doc.at_angle(1, 0., &mesh).unwrap();
+        let v0 = sim.initial_volume.unwrap();
+        let fresh = crate::volume::Volume::finer(v0.bounds, v0.frame, CELL).rounded(v0.round);
+        let grid = Gripped::new(&fresh, at.frame, &rig);
+        let whole = grid.held(&fresh);
+        // A bit of `n` cells in a row along X on the axis, the stock round
+        // it, a cell thick, cleared away.
+        let n = fresh.n;
+        let mid = [n[0] - 20, n[1] / 2, n[2] / 2];
+        for (len, loose) in [(1, false), (2, false), (3, true)] {
+            let mut v = fresh.clone();
+            for dz in -1i32..=1 {
+                for dy in -1i32..=1 {
+                    for dx in -1..=len {
+                        let p = [
+                            (mid[0] as i32 + dx) as usize,
+                            (mid[1] as i32 + dy) as usize,
+                            (mid[2] as i32 + dz) as usize,
+                        ];
+                        let inside = dy == 0 && dz == 0 && (0..len).contains(&dx);
+                        if !inside {
+                            let i = v.index(p);
+                            v.occupied[i] = 0;
+                        }
+                    }
+                }
+            }
+            let pieces = grid.loose(&v, &whole, &grid.held(&v));
+            assert_eq!(!pieces.is_empty(), loose, "{len} cells");
         }
     }
 
     #[test]
     fn the_export_the_plan_check_and_the_run_refuse_a_cut_that_parts_the_bar() {
-        for (bottom, parts) in [("0", true), ("12", false)] {
+        for (bottom, parts) in [("10", true), ("17", false)] {
             let (mut doc, mesh, _) = four_angles(bottom);
             let posted = crate::post::post_job(&doc, &mesh);
             match parts {
@@ -1918,7 +2562,7 @@ mod tests {
         let name = doc.setups[0].name();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said[0].starts_with(&format!("{name} at A 0°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52.5 to X-40, and nothing else joins the 30 mm piece of it from X-40 to X-10")),
+            said[0].starts_with(&format!("{name} at A 0°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52 to X-40, and nothing else joins the 40 × 30 × 20 mm piece of it (23040 mm³) from X-40 to X-10")),
             "{said:?}"
         );
         doc.tools[0].p.insert("number".into(), "1".into());
