@@ -3169,15 +3169,10 @@ impl App {
                     // Index rotary axis turns the stock about A at the angles
                     // the setup lists; another action takes them away.
                     if k == "reposition" {
-                        let p = &mut self.doc.setup_mut().p;
-                        if v == indexed::ACTION {
-                            p.entry(indexed::ANGLES.into())
-                                .or_insert_with(|| indexed::DEFAULT_ANGLES.into());
-                        } else {
-                            p.remove(indexed::ANGLES);
-                        }
+                        indexed::set_reposition(&mut self.doc.setup_mut().p, &v);
+                    } else {
+                        self.doc.setup_mut().p.insert(k.into(), v);
                     }
-                    self.doc.setup_mut().p.insert(k.into(), v);
                     if matches!(k, "holding" | "holder") {
                         self.doc.settle_holding(self.doc.index());
                     }
@@ -3621,9 +3616,7 @@ impl App {
                     .setup_mut()
                     .p
                     .insert(axis.into(), if axis == "ry" { "90" } else { "180" }.into());
-                let p = &mut self.doc.setup_mut().p;
-                p.insert("reposition".into(), "Reclamp and probe origin".into());
-                p.remove(indexed::ANGLES);
+                indexed::set_reposition(&mut self.doc.setup_mut().p, "Reclamp and probe origin");
                 self.touch();
             }
             Message::AssignMachine(id) => {

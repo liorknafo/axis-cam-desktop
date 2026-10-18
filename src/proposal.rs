@@ -27,6 +27,11 @@ const CYCLES: [&str; 4] = [
     "Counterboring",
 ];
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// The stock of a chuck proposal: a round bar, or the user's own box.
+const STOCKS: [&str; 2] = ["Round bar", "Box"];
+/// The stock left beyond the part at the free end of a chuck proposal's
+/// stock when it names none, mm.
+pub const FREE_END: f32 = 2.;
 const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
 pub const MAX_OPERATIONS: usize = 40;
@@ -47,10 +52,38 @@ pub fn clearance_cap(report: &PartReport) -> f32 {
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
     pub summary: String,
+    /// How setup 1's stock is held in the chuck on the rotary A axis; None
+    /// keeps the user's own workholding. Only on a machine with the axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chuck: Option<ProposedChuck>,
     pub setups: Vec<ProposedSetup>,
     pub unmachined: Vec<Unmachined>,
     pub warnings: Vec<String>,
 }
+/// Setup 1's stock in a chuck, as the setup's Stock and Modelled workholding
+/// fields have it: a bar along X centred on the A axis, the part placed on
+/// that axis in the stick-out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedChuck {
+    /// "Round bar" (`diameter`) or "Box" (`width` across Y and `height` in Z
+    /// in setup 1's axes), `length` long along X in both.
+    pub stock: String,
+    pub length: f32,
+    pub diameter: Option<f32>,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    /// `chuck::JAWS`.
+    pub jaws: String,
+    /// How far the stock reaches out of the jaws, mm.
+    pub stickout: f32,
+    /// `chuck::TAILSTOCK`.
+    pub tailstock: String,
+    /// The stock left beyond the part at the free (+X) end, mm; null is
+    /// `FREE_END`.
+    pub free_end: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedSetup {
@@ -61,6 +94,11 @@ pub struct ProposedSetup {
     /// The `number` of the `workholding_library` entry that holds this setup,
     /// or None: setup 1's own, which for a later setup is setup 1's.
     pub holder: Option<usize>,
+    /// The A angles, degrees, this setup indexes to in setup 1's chuck
+    /// instead of re-clamping the stock (every operation runs at each); None
+    /// for a setup that is clamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_angles: Option<Vec<f32>>,
     pub operations: Vec<ProposedOp>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -133,8 +171,17 @@ fn choice(options: &[&str], nullable: bool) -> Value {
         json!({"type": "string", "enum": options})
     }
 }
-/// Strict JSON Schema for a proposal: every field required, nothing extra.
+/// Strict JSON Schema for a proposal on a machine without a rotary axis:
+/// every field required, nothing extra.
 pub fn schema() -> Value {
+    schema_with(false)
+}
+/// `schema` for the machine of `report`: with a rotary A axis it also asks
+/// for the chuck and the A angles of the setups.
+pub fn schema_for(report: &PartReport) -> Value {
+    schema_with(report.rotary.is_some())
+}
+fn schema_with(rotary: bool) -> Value {
     let text = || json!({"type": "string"});
     let number = || json!({"type": "number"});
     let optional = || json!({"type": ["number", "null"]});
@@ -168,20 +215,35 @@ pub fn schema() -> Value {
         "coolant": choice(&COOLANTS, false),
         "reason": text(),
     }));
-    let setup = object(json!({
+    let mut setup = json!({
         "orientation": choice(&ups, false),
         "name": text(),
         "origin": choice(&ORIGINS, false),
         "workholding": text(),
         "holder": {"type": ["integer", "null"]},
         "operations": {"type": "array", "items": operation},
-    }));
-    object(json!({
+    });
+    let mut plan = json!({
         "summary": text(),
-        "setups": {"type": "array", "items": setup},
         "unmachined": {"type": "array", "items": object(json!({"feature": text(), "reason": text()}))},
         "warnings": {"type": "array", "items": text()},
-    }))
+    });
+    if rotary {
+        setup["a_angles"] = json!({"type": ["array", "null"], "items": number()});
+        plan["chuck"] = json!({"anyOf": [object(json!({
+            "stock": choice(&STOCKS, false),
+            "length": number(),
+            "diameter": optional(),
+            "width": optional(),
+            "height": optional(),
+            "jaws": choice(&crate::chuck::JAWS, false),
+            "stickout": number(),
+            "tailstock": choice(&crate::chuck::TAILSTOCK, false),
+            "free_end": optional(),
+        })), {"type": "null"}]});
+    }
+    plan["setups"] = json!({"type": "array", "items": object(setup)});
+    object(plan)
 }
 pub fn parse(text: &str) -> Result<Proposal, String> {
     serde_json::from_str(text.trim())
@@ -734,6 +796,119 @@ fn operation(
     }
     Ok(op)
 }
+/// Why a setup cannot index A without the stock in the chuck.
+const INDEX_NEEDS_CHUCK: &str = "a_angles index the stock in the chuck: give `chuck` (or have setup 1 held in the chuck) and put this setup after it, or give a_angles null.";
+/// Why the first setup cannot index A.
+const FIRST_INDEXED: &str = "The first setup cannot index A: it is the clamping later setups turn. Give its a_angles null and index the setups after it.";
+/// Why an operation with surfaces cannot run at several A angles.
+const SURFACES_AT_ANGLES: &str = "This setup runs every operation at each of its A angles, but its surfaces face up in one orientation only. At several angles use Contour outside, Parallel or Waterline (surfaces empty), or give each angle its own setup.";
+/// Seats setup 1's stock in the chuck the way the setup page does: the
+/// stock fields, `Chuck` as its workholding with the proposal's jaws,
+/// stick-out and tailstock, the A axis as its work zero, and the part turned
+/// to `up` and placed on the bar's axis in the stick-out, `free_end` mm short
+/// of the free end. The chuck's defaults and the clearance gap are filled in
+/// afterwards by `Document::settle_holding`.
+fn in_chuck(setup: &mut Setup, chuck: &ProposedChuck, up: &str, mesh: &Mesh) -> Result<(), String> {
+    let positive = |v: f32| v.is_finite() && v > 0.;
+    let round = match chuck.stock.as_str() {
+        "Round bar" => true,
+        "Box" => false,
+        other => return Err(format!("\"{other}\" is not a chuck stock.")),
+    };
+    let need = |name: &str, v: Option<f32>| {
+        v.filter(|v| positive(*v)).ok_or_else(|| {
+            format!(
+                "chuck.{name} must be a positive number for {}.",
+                chuck.stock
+            )
+        })
+    };
+    let length = need("length", Some(chuck.length))?;
+    let stickout = need("stickout", Some(chuck.stickout))?;
+    let (diameter, width, height) = if round {
+        let d = need("diameter", chuck.diameter)?;
+        (d, d, d)
+    } else {
+        (
+            0.,
+            need("width", chuck.width)?,
+            need("height", chuck.height)?,
+        )
+    };
+    let free_end = chuck.free_end.unwrap_or(FREE_END);
+    if !(free_end.is_finite() && free_end >= 0.) {
+        return Err("chuck.free_end cannot be negative.".into());
+    }
+    for (value, choices, what) in [
+        (&chuck.jaws, &crate::chuck::JAWS[..], "jaws"),
+        (&chuck.tailstock, &crate::chuck::TAILSTOCK[..], "tailstock"),
+    ] {
+        if !choices.contains(&value.as_str()) {
+            return Err(format!("\"{value}\" is not a chuck {what} choice."));
+        }
+    }
+    let rotation = analysis::rotation_for(setup, up).ok_or("Setup 1 has no such orientation.")?;
+    for (key, value) in ["rx", "ry", "rz", "tx", "ty", "tz"]
+        .iter()
+        .zip(rotation.into_iter().chain([0.; 3]))
+    {
+        setup.p.insert((*key).into(), value.to_string());
+    }
+    // The part in the bar's frame: X along it, the stock centred on Y and
+    // standing on Z0 (`stock::resolve`).
+    let scale = mesh.display_scale();
+    let placed = crate::stock::Placement::unturned(mesh, Some(setup)).bounds;
+    let size = placed.dimensions().map(|v| v / scale);
+    let across = if round { size[1].hypot(size[2]) } else { 0. };
+    if round && across > diameter {
+        return Err(format!(
+            "In orientation {up} the part is {:.2} × {:.2} mm across the bar, which needs a bar of at least Ø{:.2} mm, not Ø{diameter} mm.",
+            size[1],
+            size[2],
+            (across * 100.).ceil() / 100.
+        ));
+    }
+    if !round && (size[1] > width || size[2] > height) {
+        return Err(format!(
+            "In orientation {up} the part is {:.2} × {:.2} mm across the bar, which does not fit a box of {width} × {height} mm.",
+            size[1], size[2]
+        ));
+    }
+    if size[0] + free_end > stickout {
+        return Err(format!(
+            "In orientation {up} the part is {:.2} mm along X: with {free_end} mm of stock beyond it, it needs a stick-out of at least {:.2} mm, not {stickout} mm.",
+            size[0],
+            ((size[0] + free_end) * 100.).ceil() / 100.
+        ));
+    }
+    let [tx, ty, tz] = [
+        length / 2. - free_end - placed.max[0] / scale,
+        -(placed.min[1] + placed.max[1]) / 2. / scale,
+        height / 2. - 4. / scale - size[2] / 2.,
+    ];
+    for (key, value) in [("tx", tx), ("ty", ty), ("tz", tz)] {
+        setup.p.insert(key.into(), value.to_string());
+    }
+    let p = &mut setup.p;
+    if round {
+        p.insert("stock_type".into(), "Round bar".into());
+        p.insert("stock_diameter".into(), diameter.to_string());
+        p.insert("stock_length".into(), length.to_string());
+    } else {
+        p.insert("stock_type".into(), "Fixed size box".into());
+        for (key, value) in [("stock_x", length), ("stock_y", width), ("stock_z", height)] {
+            p.insert(key.into(), value.to_string());
+        }
+    }
+    p.insert("holding".into(), "Chuck".into());
+    p.insert("chuck_jaws".into(), chuck.jaws.clone());
+    p.insert("chuck_stickout".into(), stickout.to_string());
+    p.insert("chuck_tailstock".into(), chuck.tailstock.clone());
+    if !crate::indexed::ORIGINS.contains(&get(p, "origin")) {
+        p.insert("origin".into(), crate::indexed::ORIGINS[0].into());
+    }
+    Ok(())
+}
 /// Builds the job a proposal describes. Setup 1 keeps the user's machine,
 /// stock, work zero and fixture; its operations and all later setups are
 /// replaced. Returns every reference problem instead when there is any.
@@ -776,10 +951,20 @@ pub fn build(
         ));
     }
     let first = report.orientations.first().map(|o| o.up);
-    if proposal
-        .setups
-        .first()
-        .is_some_and(|s| Some(s.orientation.as_str()) != first)
+    let rotary = report.rotary.is_some();
+    if !rotary && proposal.chuck.is_some() {
+        whole("`chuck` must be null: this machine has no rotary A axis.".into());
+    }
+    if !rotary && proposal.setups.iter().any(|s| s.a_angles.is_some()) {
+        whole("`a_angles` must be null: this machine has no rotary A axis.".into());
+    }
+    // A stock in the chuck is turned to the orientation the proposal gives
+    // setup 1; otherwise setup 1 keeps the user's.
+    if proposal.chuck.is_none()
+        && proposal
+            .setups
+            .first()
+            .is_some_and(|s| Some(s.orientation.as_str()) != first)
     {
         whole(format!(
             "The first setup must use orientation {}, where the stock is defined.",
@@ -820,20 +1005,74 @@ pub fn build(
             }
             (si > 0).then_some(*holder)
         });
-        let Some(orientation) = report
-            .orientations
-            .iter()
-            .find(|o| o.up == proposed.orientation)
-        else {
+        let angled = proposed.a_angles.is_some();
+        let offset = (54..=59)
+            .map(|n| format!("G{n}"))
+            .find(|o| !setups.iter().any(|s| get(&s.p, "offset") == o))
+            .unwrap_or_default();
+        // An indexed setup is made as the Reposition choice makes it, and
+        // shows the part as the setup it indexes does, turned by its first
+        // A angle.
+        let mut indexed = None;
+        let mut up = proposed.orientation.as_str();
+        if let Some(list) = &proposed.a_angles {
+            if si == 0 {
+                wrong(None, FIRST_INDEXED.into());
+                continue;
+            }
+            if proposed.holder.is_some() {
+                wrong(
+                    None,
+                    "holder must be null: an indexed setup is held by the chuck of the setup it indexes.".into(),
+                );
+            }
+            let base = setups.iter().rev().find(|s| !crate::indexed::is_indexed(s));
+            let mut made = Setup::new(setup1.machine.clone(), &offset);
+            crate::indexed::set_reposition(&mut made.p, crate::indexed::ACTION);
+            made.p.insert(
+                crate::indexed::ANGLES.into(),
+                crate::indexed::angles_list(list),
+            );
+            let mut issues = crate::indexed::issues(&made);
+            // A chuck the proposal gave but could not seat is said once, by
+            // its own problem.
+            if proposal.chuck.is_none() && !base.is_some_and(crate::chuck::holds) {
+                issues.push(INDEX_NEEDS_CHUCK.into());
+            } else if let (Some(base), Ok(listed)) = (
+                base.filter(|b| crate::chuck::holds(b)),
+                crate::indexed::angles(&made),
+            ) {
+                let turn = crate::indexed::sign(&made.machine) * listed[0];
+                match analysis::orientation_at(base, turn) {
+                    Some(shown) if shown == proposed.orientation => up = shown,
+                    Some(shown) => issues.push(format!(
+                        "At A {}° the part shows {shown} up, not {}: an indexed setup's orientation is the one its first A angle brings up (positive A turns +Y towards +Z).",
+                        crate::indexed::degrees(listed[0]),
+                        proposed.orientation
+                    )),
+                    None => issues.push(format!(
+                        "At A {}° no face of the part is up: index to angles that turn a face of setup 1's orientation up, such as multiples of 90°.",
+                        crate::indexed::degrees(listed[0])
+                    )),
+                }
+            }
+            if !issues.is_empty() {
+                issues.into_iter().for_each(|m| wrong(None, m));
+                continue;
+            }
+            indexed = Some(made);
+        }
+        let Some(orientation) = report.orientations.iter().find(|o| o.up == up) else {
             wrong(
                 None,
                 format!("\"{}\" is not an orientation.", proposed.orientation),
             );
             continue;
         };
-        if proposal.setups[..si]
-            .iter()
-            .any(|s| s.orientation == proposed.orientation)
+        if !angled
+            && proposal.setups[..si]
+                .iter()
+                .any(|s| s.a_angles.is_none() && s.orientation == proposed.orientation)
         {
             wrong(
                 None,
@@ -843,7 +1082,7 @@ pub fn build(
                 ),
             );
         }
-        if si > 0 && !ORIGINS.contains(&proposed.origin.as_str()) {
+        if si > 0 && !angled && !ORIGINS.contains(&proposed.origin.as_str()) {
             wrong(
                 None,
                 format!("\"{}\" is not a work zero choice.", proposed.origin),
@@ -862,12 +1101,19 @@ pub fn build(
             );
         }
         let mut setup = if si == 0 {
-            setup1.clone()
+            let mut setup = setup1.clone();
+            if let Some(chuck) = &proposal.chuck
+                && let Err(message) = in_chuck(&mut setup, chuck, orientation.up, mesh)
+            {
+                wrong(None, message);
+            }
+            setup
+        } else if let Some(mut setup) = indexed {
+            setup
+                .p
+                .insert("notes".into(), clip(&proposed.workholding, 500));
+            setup
         } else {
-            let offset = (54..=59)
-                .map(|n| format!("G{n}"))
-                .find(|o| !setups.iter().any(|s| get(&s.p, "offset") == o))
-                .unwrap_or_default();
             let mut setup = Setup::new(setup1.machine.clone(), &offset);
             let rotation = analysis::rotation_for(setup1, orientation.up).unwrap_or_default();
             for (key, value) in ["rx", "ry", "rz"].iter().zip(rotation) {
@@ -922,6 +1168,12 @@ pub fn build(
             .take(MAX_SETUP_OPERATIONS)
             .enumerate()
         {
+            // Every operation of an indexed setup runs at each A angle, but a
+            // surface faces up in one orientation only.
+            if proposed.a_angles.as_ref().is_some_and(|a| a.len() > 1) && !op.surfaces.is_empty() {
+                wrong(Some(oi + 1), SURFACES_AT_ANGLES.into());
+                continue;
+            }
             match operation(op, si, orientation, report, &doc.tools, &mesh.fingerprint) {
                 Ok(op) => setup.operations.push(op),
                 Err(messages) => messages.into_iter().for_each(|m| wrong(Some(oi + 1), m)),
@@ -935,8 +1187,39 @@ pub fn build(
     let mut built = doc.clone();
     built.active = setups[0].id.clone();
     built.setups = setups;
+    if proposal.chuck.is_some() {
+        built.settle_holding(0);
+    }
     built.sync_stock_sources();
-    Ok(built)
+    if !rotary {
+        return Ok(built);
+    }
+    // The checks the chuck and the A angles have of their own, as the setups
+    // page shows them, before any operation is generated.
+    built.sync_turns(Some(mesh));
+    let mut refused = vec![];
+    if proposal.chuck.is_some() {
+        for message in built.holding_issues(0, Some(mesh)) {
+            refused.push((1, "workholding", format!("The chuck: {message}")));
+        }
+    }
+    for si in 1..built.setups.len() {
+        for message in built.index_issues(si) {
+            refused.push((si + 1, "structure", message));
+        }
+    }
+    if refused.is_empty() {
+        return Ok(built);
+    }
+    Err(refused
+        .into_iter()
+        .map(|(setup, stage, message)| Problem {
+            setup,
+            operation: None,
+            stage,
+            message,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1038,6 +1321,7 @@ pub(crate) mod tests {
         drill.peck = Some(3.);
         Proposal {
             summary: "Top side, then the underside.".into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: "+Z".into(),
@@ -1045,6 +1329,7 @@ pub(crate) mod tests {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         op("Face", 1, ids(report, "+Z", 0.)),
                         op("Pocket", 1, ids(report, "+Z", 12.)),
@@ -1058,6 +1343,7 @@ pub(crate) mod tests {
                     origin: "Model origin".into(),
                     workholding: "Flip about X; clamp on the machined walls.".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         op("Face", 1, ids(report, "-Z", 0.)),
                         op("Pocket", 1, ids(report, "-Z", 6.)),
@@ -2101,5 +2387,316 @@ pub(crate) mod tests {
             partial("{\"summary\": \"a  ").summary.as_deref(),
             Some("a  ")
         );
+    }
+    /// The rotary scenario's project, report and the plan that ends it,
+    /// with `edit` applied to the plan.
+    fn rotary(edit: impl FnOnce(&mut Proposal)) -> (Document, Mesh, PartReport, Proposal) {
+        let (doc, mesh, report) = crate::fake_openai::rotary::report();
+        let mut plan = crate::fake_openai::rotary::good();
+        edit(&mut plan);
+        (doc, mesh, report, plan)
+    }
+    #[test]
+    fn the_rotary_schema_asks_for_the_chuck_and_the_angles_and_stays_strict() {
+        fn walk(value: &Value, objects: &mut usize) {
+            if value["type"] == "object" {
+                *objects += 1;
+                let keys: Vec<&String> = value["properties"].as_object().unwrap().keys().collect();
+                assert_eq!(value["required"].as_array().unwrap().len(), keys.len());
+                assert_eq!(value["additionalProperties"], false);
+            }
+            match value {
+                Value::Object(map) => map.values().for_each(|v| walk(v, objects)),
+                Value::Array(items) => items.iter().for_each(|v| walk(v, objects)),
+                _ => {}
+            }
+        }
+        let (_, _, report, plan) = rotary(|_| {});
+        let schema = schema_for(&report);
+        let mut objects = 0;
+        walk(&schema, &mut objects);
+        // The proposal, its chuck, a setup, an operation and an unmachined entry.
+        assert_eq!(objects, 5);
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let props = |v: &Value| keys(&v["properties"]);
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(keys(&value), props(&schema));
+        assert_eq!(
+            keys(&value["chuck"]),
+            props(&schema["properties"]["chuck"]["anyOf"][0])
+        );
+        let setup = &schema["properties"]["setups"]["items"];
+        assert_eq!(keys(&value["setups"][1]), props(setup));
+        // The angles are numbers or null; the chuck an object or null.
+        assert_eq!(
+            setup["properties"]["a_angles"],
+            json!({"type": ["array", "null"], "items": {"type": "number"}})
+        );
+        assert_eq!(
+            schema["properties"]["chuck"]["anyOf"][1],
+            json!({"type": "null"})
+        );
+        // What the model answers reads back, null or not.
+        assert_eq!(parse(&value.to_string()).unwrap(), plan);
+        let mut nulls = value;
+        nulls["chuck"] = Value::Null;
+        nulls["setups"][1]["a_angles"] = Value::Null;
+        let parsed = parse(&nulls.to_string()).unwrap();
+        assert!(parsed.chuck.is_none() && parsed.setups[1].a_angles.is_none());
+    }
+    #[test]
+    fn a_machine_without_a_rotary_axis_refuses_a_chuck_and_angles() {
+        let (doc, mesh, report) = block();
+        assert!(report.rotary.is_none());
+        let mut plan = good(&report);
+        plan.chuck = rotary(|_| {}).3.chuck;
+        plan.setups[1].a_angles = Some(vec![90.]);
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("`chuck` must be null: this machine has no rotary A axis"))
+                && said.iter().any(|m| m.contains("`a_angles` must be null")),
+            "{said:?}"
+        );
+    }
+    #[test]
+    fn a_chuck_seats_setup_1s_stock_and_an_indexed_setup_is_made_as_the_setups_page_makes_it() {
+        let (doc, mesh, report, plan) = rotary(|_| {});
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let (first, second) = (&built.setups[0], &built.setups[1]);
+        // Setup 1: a 24 mm box of the proposal's length, in a 4-jaw chuck with
+        // the chuck's defaults and the A axis as its work zero.
+        assert_eq!(
+            [
+                get(&first.p, "stock_type"),
+                get(&first.p, "stock_x"),
+                get(&first.p, "stock_y")
+            ],
+            ["Fixed size box", "130", "24"]
+        );
+        assert_eq!(
+            [
+                get(&first.p, "holding"),
+                get(&first.p, "chuck_jaws"),
+                get(&first.p, "chuck_stickout")
+            ],
+            ["Chuck", "4-jaw", "90"]
+        );
+        assert_eq!(get(&first.p, "chuck_tailstock"), "Off the table");
+        assert_eq!(get(&first.p, "chuck_jaw_angle"), "0");
+        assert_eq!(get(&first.p, "holding_gap"), "2");
+        assert_eq!(get(&first.p, "origin"), crate::indexed::ORIGINS[0]);
+        assert_eq!(first.id, doc.setups[0].id);
+        // The part sits in the stick-out, 2 mm short of the free end, on the axis.
+        let stock = built.setup_stock(0, Some(&mesh)).unwrap();
+        let placed = crate::stock::Placement::new(&mesh, Some(first)).bounds;
+        let scale = mesh.display_scale();
+        assert!((placed.max[0] / scale - (stock.max[0] - crate::proposal::FREE_END)).abs() < 0.01);
+        let mid = |b: crate::mesh::Bounds, k: usize| (b.min[k] + b.max[k]) / 2.;
+        assert!((mid(placed, 1) / scale - mid(stock, 1)).abs() < 0.01);
+        assert!((mid(placed, 2) / scale - mid(stock, 2)).abs() < 0.01);
+        // Setup 2 is the Reposition choice with its angles, and the rest is setup 1's.
+        assert_eq!(get(&second.p, "reposition"), crate::indexed::ACTION);
+        assert_eq!(get(&second.p, crate::indexed::ANGLES), "0, 90, 180, 270");
+        assert!(crate::indexed::is_indexed(second));
+        assert_eq!(built.index_base(1), Some(0));
+        for key in [
+            "offset",
+            "holding",
+            "chuck_jaws",
+            "origin",
+            "stock_type",
+            "tx",
+            "tz",
+        ] {
+            assert_eq!(get(&second.p, key), get(&first.p, key), "{key}");
+        }
+        assert_eq!(second.machine.id, first.machine.id);
+        assert_eq!(get(&second.p, "notes"), "The bar in the chuck.");
+        assert_eq!(second.turn.map(|t| (t.base, t.a)), Some((0, 0.)));
+        assert!(built.validate_structure().is_ok());
+    }
+    #[test]
+    fn a_round_bar_is_seated_on_its_axis_and_a_part_that_does_not_fit_is_refused() {
+        let round = |diameter, stickout| {
+            move |plan: &mut Proposal| {
+                let chuck = plan.chuck.as_mut().unwrap();
+                chuck.stock = "Round bar".into();
+                (chuck.diameter, chuck.width, chuck.height) = (Some(diameter), None, None);
+                chuck.jaws = "3-jaw".into();
+                chuck.stickout = stickout;
+            }
+        };
+        let (doc, mesh, report, plan) = rotary(round(30., 60.));
+        let built = build(&doc, &mesh, &report, &plan).unwrap();
+        let first = &built.setups[0];
+        assert_eq!(
+            [
+                get(&first.p, "stock_type"),
+                get(&first.p, "stock_diameter"),
+                get(&first.p, "stock_length")
+            ],
+            ["Round bar", "30", "130"]
+        );
+        // The 20 × 20 mm part is 28.28 mm across its corners.
+        let (doc, mesh, report, plan) = rotary(round(28., 60.));
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("needs a bar of at least Ø28.29 mm, not Ø28 mm"),
+            "{said:?}"
+        );
+        // 30 mm of part and 2 mm of stock beyond it do not fit a 31 mm stick-out.
+        let (doc, mesh, report, plan) = rotary(round(30., 31.));
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said[0].contains("needs a stick-out of at least 32.00 mm, not 31 mm"),
+            "{said:?}"
+        );
+    }
+    #[test]
+    fn a_stock_the_chuck_cannot_hold_is_refused_with_the_chucks_own_message() {
+        // A 3-jaw chuck cannot hold a box.
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck.as_mut().unwrap().jaws = "3-jaw".into());
+        let said = build(&doc, &mesh, &report, &plan).unwrap_err();
+        assert_eq!((said[0].setup, said[0].stage), (1, "workholding"));
+        assert!(
+            said[0]
+                .message
+                .contains("A 3-jaw chuck centres round stock"),
+            "{said:?}"
+        );
+        // Wider across its corners than the rotary unit takes.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let chuck = p.chuck.as_mut().unwrap();
+            (chuck.width, chuck.height) = (Some(60.), Some(60.));
+        });
+        let said = build(&doc, &mesh, &report, &plan).unwrap_err();
+        assert!(
+            said.iter()
+                .any(|p| p.message.contains("the jaws grip from Ø5 to Ø80 mm")),
+            "{said:?}"
+        );
+        // Nothing but the two choices of the schema is a jaw or a tailstock choice.
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck.as_mut().unwrap().jaws = "5-jaw".into());
+        assert!(
+            messages(build(&doc, &mesh, &report, &plan))[0]
+                .contains("\"5-jaw\" is not a chuck jaws choice")
+        );
+    }
+    #[test]
+    fn the_orientation_of_an_indexed_setup_is_the_one_its_first_angle_brings_up() {
+        // With +Z up in setup 1, positive A brings +Y up at 90, -Z at 180, -Y at 270.
+        for (angle, up) in [(0., "+Z"), (90., "+Y"), (180., "-Z"), (270., "-Y")] {
+            let (doc, mesh, report, plan) = rotary(|p| {
+                p.setups[1].a_angles = Some(vec![angle]);
+                p.setups[1].orientation = up.into();
+            });
+            assert!(build(&doc, &mesh, &report, &plan).is_ok(), "A {angle} {up}");
+        }
+        let (doc, mesh, report, plan) = rotary(|p| {
+            p.setups[1].a_angles = Some(vec![90., 180.]);
+            p.setups[1].orientation = "+Z".into();
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("At A 90° the part shows +Y up, not +Z"),
+            "{said:?}"
+        );
+        // An angle that turns no face up has none to name.
+        let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(vec![45.]));
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said[0].contains("At A 45° no face of the part is up"),
+            "{said:?}"
+        );
+    }
+    #[test]
+    fn an_indexed_setup_is_refused_for_what_the_setups_page_refuses() {
+        // An angle outside the machine's A range (-360° to 360°), a repeat, none.
+        for (angles, words) in [
+            (
+                vec![400.],
+                "A 400° is outside the machine's A range, -360° to 360°.",
+            ),
+            (vec![90., 90.], "A 90° is listed twice."),
+            (vec![], "List the A angles to index to"),
+        ] {
+            let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(angles));
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(said.iter().any(|m| m.contains(words)), "{words}: {said:?}");
+        }
+        // Several angles run each operation at every one of them, so no surfaces.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let top = report_top(&crate::fake_openai::rotary::report().2);
+            p.setups[1].operations = vec![op("Face", 1, top)];
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0]
+                .starts_with("2/Some(1): This setup runs every operation at each of its A angles")
+                && said[0].contains("Contour outside, Parallel or Waterline"),
+            "{said:?}"
+        );
+        // One angle may use them: its orientation is told.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            let top = report_top(&crate::fake_openai::rotary::report().2);
+            p.setups[1].a_angles = Some(vec![0.]);
+            p.setups[1].operations = vec![op("Face", 1, top)];
+        });
+        assert!(build(&doc, &mesh, &report, &plan).is_ok());
+        // The holder is the chuck's.
+        let (mut doc, mesh, report, plan) = rotary(|p| p.setups[1].holder = Some(1));
+        doc.adopt_holders();
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("holder must be null: an indexed setup is held by the chuck")),
+            "{said:?}"
+        );
+        // The stock must be in the chuck: without `chuck` setup 1 keeps the user's.
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("a_angles index the stock in the chuck")),
+            "{said:?}"
+        );
+        // ... and an indexed setup cannot come first.
+        let (doc, mesh, report, plan) = rotary(|p| {
+            p.setups.remove(0);
+            p.setups[0].a_angles = Some(vec![90.]);
+            p.setups[0].orientation = "+Y".into();
+        });
+        let said = messages(build(&doc, &mesh, &report, &plan));
+        assert!(
+            said.iter()
+                .any(|m| m.contains("The first setup cannot index A")),
+            "{said:?}"
+        );
+    }
+    /// The top plane's surface IDs of the first orientation.
+    fn report_top(report: &PartReport) -> Vec<usize> {
+        report.orientations[0]
+            .planes
+            .iter()
+            .find(|p| p.kind == "top")
+            .unwrap()
+            .surfaces
+            .clone()
+    }
+    #[test]
+    fn a_user_chuck_in_setup_1_takes_indexed_setups_without_a_chuck_proposal() {
+        let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
+        // Build the chuck into the project as the user would, then plan on it.
+        let seated = build(&doc, &mesh, &report, &crate::fake_openai::rotary::good()).unwrap();
+        let report = analysis::report(&seated, &mesh).unwrap();
+        assert_eq!(report.workholding.as_ref().unwrap().kind, "Chuck");
+        let built = build(&seated, &mesh, &report, &plan).unwrap();
+        assert_eq!(get(&built.setups[0].p, "holding"), "Chuck");
+        assert_eq!(built.index_base(1), Some(0));
+        assert_eq!(get(&built.setups[0].p, "stock_x"), "130");
     }
 }

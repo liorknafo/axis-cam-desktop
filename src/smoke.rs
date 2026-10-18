@@ -1569,6 +1569,7 @@ impl App {
             summary:
                 "Face the top and clear the pocket, then turn the part over and face the underside."
                     .into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: up.into(),
@@ -1576,6 +1577,7 @@ impl App {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the long sides.".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         op("Face", plane(up, "top")),
                         op("Pocket", floor.clone()),
@@ -1588,6 +1590,7 @@ impl App {
                     origin: "Model origin".into(),
                     workholding: "Turn over; the vise on the long sides.".into(),
                     holder: Some(1),
+                    a_angles: None,
                     operations: vec![op("Face", plane("-Z", "top"))],
                 },
             ],
@@ -1646,12 +1649,14 @@ impl App {
         };
         let proposal = Proposal {
             summary: "Face the top, clear the main pocket and cut the outline from the top. The holes and the side features need tools and setups this plan does not have.".into(),
+            chuck: None,
             setups: vec![ProposedSetup {
                 orientation: first.up.into(),
                 name: "Top".into(),
                 origin: "Stock top center".into(),
                 workholding: "Vise on the long sides.".into(),
                 holder: None,
+                a_angles: None,
                 operations: vec![
                     op("Face", plane(0.)),
                     op("Pocket", plane(12.)),

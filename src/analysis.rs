@@ -51,6 +51,65 @@ pub struct PartReport {
     pub workholding: Option<WorkholdingReport>,
     /// The first entry is setup 1's orientation.
     pub orientations: Vec<OrientationReport>,
+    /// The rotary A axis, on a machine that has one with its geometry
+    /// recorded; absent on a 3-axis machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotary: Option<RotaryReport>,
+}
+/// The machine's rotary A axis for the planner (`model::RotaryUnit`), mm and
+/// degrees: what holds in the chuck, what fits, and how far to trust it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RotaryReport {
+    /// The A centreline above the table.
+    pub centre_height: f32,
+    /// The largest stock diameter, and the longest stock from the chuck's
+    /// face, that fit on the rotary unit.
+    pub max_diameter: f32,
+    pub max_length: f32,
+    /// The machine's A range.
+    pub a_min: f32,
+    pub a_max: f32,
+    /// The smallest and largest stock the jaws grip: a round bar's diameter,
+    /// or a box's thinner side and its diagonal.
+    pub grip_min: f32,
+    pub grip_max: f32,
+    /// "measured" while the A centreline was probed and has not gone stale,
+    /// else "assumed".
+    pub centreline: &'static str,
+}
+/// The rotary axis for the report of a job whose setup 1 is `setup1`, or
+/// None without an A axis around X and its rotary unit's sizes.
+fn rotary_report(doc: &Document, setup1: &Setup) -> Option<RotaryReport> {
+    let unit = doc.rotary_unit(&setup1.machine)?;
+    let m = &setup1.machine.p;
+    Some(RotaryReport {
+        centre_height: r2(unit.centre_height),
+        max_diameter: r2(unit.fit_diameter),
+        max_length: r2(unit.fit_length),
+        a_min: r2(num(m, "rotary_min")?),
+        a_max: r2(num(m, "rotary_max")?),
+        grip_min: r2(unit.grip_min),
+        grip_max: r2(unit.grip_max),
+        centreline: if doc.centre_mark(&setup1.machine) == crate::control::MEASURED {
+            "measured"
+        } else {
+            "assumed"
+        },
+    })
+}
+/// The orientation (the part axis that points up) of setup `base`'s part
+/// once A has turned it by `turn` degrees about +X (`indexed::Turn::turn`),
+/// or None when that is not one of the six.
+pub fn orientation_at(base: &Setup, turn: f32) -> Option<&'static str> {
+    let angles = ["rx", "ry", "rz"].map(|k| num(&base.p, k).unwrap_or(f32::NAN));
+    let mut turned = base.clone();
+    for (key, value) in ["rx", "ry", "rz"]
+        .iter()
+        .zip(crate::indexed::turned_angles(angles, turn))
+    {
+        turned.p.insert((*key).into(), value.to_string());
+    }
+    up_axis(&turned)
 }
 /// One vise or clamp of the library, told by number and size: never its name,
 /// notes or id. `proposal::build` finds the entry again by `number`.
@@ -1360,6 +1419,7 @@ fn describe(
             .into_iter()
             .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))
             .collect(),
+        rotary: rotary_report(doc, setup1),
     })
 }
 
