@@ -613,6 +613,10 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 Motion::Rapid => Kind::Rapid,
                 Motion::Feed => Kind::Feed,
                 Motion::Dwell => Kind::Dwell,
+                // Programs do not command A yet (LIO-193): `checked_with`
+                // refuses an indexed setup, whose plans alone turn A, so
+                // none reaches here.
+                Motion::Index => continue,
             };
             out.push(Block::Move {
                 op: k,
@@ -2410,6 +2414,10 @@ pub(crate) fn held_walked(
     si: usize,
     sims: &[(usize, Result<Simulation, String>)],
 ) -> Result<Vec<Held>, Vec<String>> {
+    // The jaws would be checked at the first A angle only (`holding_boxes`).
+    if crate::indexed::is_indexed(&doc.setups[si]) {
+        return Err(vec![crate::indexed::NOT_HELD.into()]);
+    }
     let walk = walk(doc, mesh, si, sims, PostSettings::for_holding)?;
     let held = gripped(doc, mesh, si, &walk);
     let boxes = match holding_boxes(doc, mesh, si, held, walk.zero) {
@@ -3081,6 +3089,7 @@ pub(crate) mod fixture {
                 feed: if *motion == Motion::Dwell { 0. } else { *rate },
                 start: plan.duration,
                 end: plan.duration + seconds,
+                a: None,
             });
             plan.duration += seconds;
             at = *to;

@@ -25,7 +25,9 @@ pub fn load(path: &Path) -> Result<Document, String> {
 }
 /// Loads a project with what the load changed worth saying: tools saved
 /// without a tool number numbered in library order (`NUMBERED_TOOLS`), then
-/// the note of linking a legacy material to the library. An empty workholding
+/// Indexed operations moved into indexed setups
+/// (`Document::migrate_indexed_operations`), then the note of linking a
+/// legacy material to the library. An empty workholding
 /// library is given the starters without a note.
 pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
@@ -70,6 +72,7 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
     if d.number_tools() {
         notes.push(NUMBERED_TOOLS.to_string());
     }
+    notes.extend(d.migrate_indexed_operations());
     notes.extend(d.adopt_materials());
     d.adopt_holders();
     d.validate_structure()?;
@@ -412,6 +415,44 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&loaded.setups).unwrap(),
             serde_json::to_value(&doc.setups).unwrap()
+        );
+    }
+    #[test]
+    fn a_project_with_an_indexed_operation_loads_it_into_an_indexed_setup() {
+        use crate::model::{Machine, Strategy};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexed-operation.axis.json");
+        let mut doc = Document::sample();
+        doc.setups.truncate(1);
+        doc.setups[0].machine = Machine::new(4);
+        let op = &mut doc.setups[0].operations[0];
+        op.strategy = Strategy::Indexed;
+        op.p.insert("angle_a".into(), "90".into());
+        op.p.insert("angle_b".into(), "0".into());
+        let (id, name) = (op.id.clone(), op.name().to_string());
+        let count = doc.setups[0].operations.len();
+        // As an older build saved it: the strategy by name.
+        let text = serde_json::to_string(&doc).unwrap();
+        assert!(text.contains(r#""strategy":"Indexed""#));
+        fs::write(&path, &text).unwrap();
+        let (loaded, notes) = load_reporting(&path).unwrap();
+        // The Facing operation it was, at A 90° in setup 1's clamping; the
+        // operations after it follow at A 0°.
+        assert_eq!(loaded.setups.len(), 3);
+        let side = &loaded.setups[1];
+        assert!(crate::indexed::is_indexed(side));
+        assert_eq!(get(&side.p, crate::indexed::ANGLES), "90");
+        assert_eq!(side.operations.len(), 1);
+        assert_eq!(
+            (side.operations[0].id.as_str(), side.operations[0].strategy),
+            (id.as_str(), Strategy::Face)
+        );
+        assert_eq!(get(&loaded.setups[2].p, crate::indexed::ANGLES), "0");
+        assert_eq!(loaded.setups[2].operations.len(), count - 1);
+        assert!(loaded.setups[0].operations.is_empty());
+        assert!(
+            notes.iter().any(|n| n.starts_with(&format!("{name}: the Indexed operation at A 90° is a Facing operation in a new indexed setup"))),
+            "{notes:?}"
         );
     }
     #[test]

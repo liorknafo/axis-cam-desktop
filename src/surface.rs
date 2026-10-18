@@ -1,7 +1,7 @@
 //! Connected planar regions of an imported tessellation, not exact CAD faces.
 use crate::{
     mesh::{Face, Mesh, rotation},
-    model::{Operation, Setup, num},
+    model::{Operation, Setup},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -162,7 +162,9 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     if !selection.matches(mesh) {
         return vec!["The model geometry changed. Clear the saved surface selection and select surfaces on the current part.".into()];
     }
-    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    // The part as the setup turns it, by A too for an indexed setup posed
+    // at an angle (`indexed`).
+    let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
     let mut result = Vec::new();
     let mut heights = Vec::new();
     for &id in &selection.ids {

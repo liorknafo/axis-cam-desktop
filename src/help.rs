@@ -1988,11 +1988,6 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "An opening is a hole in a selected floor whose column holds no part at all. Its walls are followed at the cutter's radius, as a pocket's are, so corners keep that radius; run a smaller cutter after it to sharpen them. Openings narrower than the cutter are left, for a smaller one. Round holes are openings too, but Drilling makes them faster.",
             Some(Operation(Strategy::Pocket)),
         ),
-        (_, "angle_a" | "angle_b") => (
-            "Indexed position of the primary or secondary rotary axis, in degrees. The axis is positioned before cutting and held fixed during the cut.",
-            "",
-            Some(Operation(Strategy::Indexed)),
-        ),
         (_, "rotary_axis") => (
             "A rotates about X, B about Y, and C about Z. Choose the axis that matches the setup's saved machine arrangement.",
             "",
@@ -2395,7 +2390,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "a_angles") => (
             "The A angles this indexed setup turns the stock to, in degrees: one (90), or several for the same operations at each (0, 90, 180, 270). Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck looking along +X, +Y up to +Z at A90.",
-            "Each angle must be inside the machine's A range. The stock turns about the A centreline in the clamping of the setup before, so the work zero stays where that setup has it.",
+            "Each angle must be inside the machine's A range. The stock turns about the A centreline in the clamping of the setup before, so the work zero stays where that setup has it. Every operation of the setup runs at each angle, in the order listed, with A held still while it cuts; between angles the tool retracts above the swing radius of the stock, part and jaws plus the operation's clearance before A turns.",
             Some(Orientation),
         ),
         (_, "notes") => (
@@ -2419,7 +2414,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "mode") => (
-            "Indexed motion positions the rotary axes before cutting; simultaneous motion changes rotary and linear positions together. This prototype saves the capability but does not solve it.",
+            "Indexed motion positions the rotary axes before cutting; simultaneous motion changes rotary and linear positions together. On a 4-axis machine with A around X, an indexed setup runs its operations at each A angle it lists; simultaneous motion is saved but not solved.",
             "",
             Some(Operation(Strategy::Indexed)),
         ),

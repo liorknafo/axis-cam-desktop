@@ -12,6 +12,10 @@ pub enum Motion {
     Rapid,
     Feed,
     Dwell,
+    /// A turns to the move's `a` from the move before's, X, Y and Z still,
+    /// above everything A swings (`indexed`): between the A angles of an
+    /// indexed setup.
+    Index,
 }
 #[derive(Debug, Clone)]
 pub struct Move {
@@ -23,6 +27,10 @@ pub struct Move {
     pub feed: f32,
     pub start: f32,
     pub end: f32,
+    /// The A angle (degrees, as the machine is commanded) the move is made
+    /// at, the one an `Index` move turns to: Some on every move of an
+    /// indexed setup's operation (`indexed`), None on a 3-axis one.
+    pub a: Option<f32>,
 }
 impl Move {
     pub fn at(&self, seconds: f32) -> [f32; 3] {
@@ -382,6 +390,7 @@ pub fn generate(
                 feed: rate,
                 start: plan.duration,
                 end,
+                a: None,
             });
             plan.duration = end;
         }
@@ -616,6 +625,10 @@ pub struct Simulation {
     pub volume: Option<crate::volume::Volume>,
     pub initial_volume: Option<crate::volume::Volume>,
     pub frame: Option<crate::volume::Frame>,
+    /// The frame at each A angle of an indexed setup's operation (`indexed`):
+    /// a move at A `a` cuts the part posed by the frame listed for `a`.
+    /// Empty for a 3-axis operation, whose moves are all in `frame`.
+    pub turns: Vec<(f32, crate::volume::Frame)>,
     pub preceding: usize,
     /// Setup and operation (from 0, document order) this simulation plays.
     /// Stamped on every cut it makes; `(0, 0)` outside a sequence.
@@ -645,6 +658,7 @@ impl Simulation {
             volume: None,
             initial_volume: None,
             frame: None,
+            turns: vec![],
             preceding: 0,
             source: (0, 0),
             stock_epoch: 0,
@@ -658,6 +672,17 @@ impl Simulation {
             revision: 0,
             bites: Default::default(),
         }
+    }
+    /// The frame move `m` cuts in: the one `turns` lists for its A angle,
+    /// else `frame`.
+    pub fn frame_of(&self, m: &Move) -> Option<crate::volume::Frame> {
+        m.a.and_then(|a| {
+            self.turns
+                .iter()
+                .find(|(b, _)| (a - b).abs() < 1e-4)
+                .map(|t| t.1)
+        })
+        .or(self.frame)
     }
     /// `forces::bites` of this simulation, worked out once.
     pub fn bites(&self) -> &[crate::forces::Bite] {
@@ -696,9 +721,18 @@ impl Simulation {
             let from = movement.at(self.seconds.max(movement.start));
             let to = movement.at(seconds.min(movement.end));
             if movement.motion == Motion::Feed {
-                self.stock
-                    .cut_shape(from, to, self.plan.radius, self.plan.shape);
-                if let (Some(volume), Some(frame)) = (&mut self.volume, self.frame) {
+                let frame = self.frame_of(movement);
+                // The top-down grid is the setup's frame's, its first A
+                // angle's: a move at another angle cuts the volume only.
+                let own = movement
+                    .a
+                    .zip(self.turns.first())
+                    .is_none_or(|(a, t)| (a - t.0).abs() < 1e-4);
+                if own {
+                    self.stock
+                        .cut_shape(from, to, self.plan.radius, self.plan.shape);
+                }
+                if let (Some(volume), Some(frame)) = (&mut self.volume, frame) {
                     volume.cut(
                         from,
                         to,
@@ -780,7 +814,14 @@ pub fn sequence_walk(
     let mut grid: Option<(Frame, StockGrid)> = None;
     let mut blocked: Option<String> = None;
     let mut preceding = 0;
+    // The A the machine is at: 0 in a setup that is not indexed, the last
+    // angle an indexed setup's operation turned to.
+    let mut machine_a = 0.;
     for (si, saved_setup) in doc.setups.iter().enumerate() {
+        let indexed = crate::indexed::is_indexed(saved_setup) && doc.index_base(si).is_some();
+        if !indexed {
+            machine_a = 0.;
+        }
         let frame = Frame::new(saved_setup, mesh);
         let mut setup = saved_setup.clone();
         // Stock is automatic in document order; inherited geometry supersedes
@@ -801,6 +842,9 @@ pub fn sequence_walk(
             }
         }
         begin(si, starts.filter(|_| blocked.is_none()));
+        // The stock an indexed setup starts from, which each angle's own box
+        // is taken from.
+        let began = if indexed { volume.clone() } else { None };
         for (oi, op) in setup.operations.iter().enumerate() {
             if !op.enabled {
                 if stop == Some((si, oi)) {
@@ -819,6 +863,7 @@ pub fn sequence_walk(
                 .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, frame)));
             let mut issues = setup.issues();
             issues.extend(op.issues(&setup.machine, &doc.tools, &setup.operations[..oi]));
+            let source = (index(si), index(oi));
             let plan = if let Some(issue) = issues.first() {
                 Err(issue.clone())
             } else {
@@ -826,12 +871,24 @@ pub fn sequence_walk(
                     .iter()
                     .find(|t| t.id == op.tool)
                     .ok_or_else(|| "Choose a saved tool.".to_string())
-                    .and_then(|t| generate(&setup, op, t, mesh))
+                    .and_then(|t| {
+                        if !indexed {
+                            return generate(&setup, op, t, mesh).map(|plan| (plan, vec![]));
+                        }
+                        let start = crate::indexed::Start {
+                            begin: began.as_ref(),
+                            now: volume.as_ref(),
+                            a: machine_a,
+                            source,
+                        };
+                        crate::indexed::generate(doc, si, &setup, op, t, mesh, start)
+                            .map(|posed| (posed.plan, posed.turns))
+                    })
             };
-            let result=plan.and_then(|plan| {
+            let result=plan.and_then(|(plan, turns)| {
                 if let Some(reason)=&blocked {return Err(format!("Cannot inherit remaining stock because an earlier operation/setup failed: {reason}"));}
                 let mut sim=Simulation::new(plan);
-                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.preceding=preceding;sim.source=(index(si),index(oi));
+                sim.volume=volume.clone();sim.initial_volume=volume.clone();sim.frame=Some(frame);sim.turns=turns;sim.preceding=preceding;sim.source=source;
                 if let Some((previous,stock))=&grid&& *previous==frame && stock.bounds==sim.plan.stock {sim.stock=stock.clone();sim.initial_stock=stock.clone();}
                 Ok(sim)
             });
@@ -845,6 +902,9 @@ pub fn sequence_walk(
                     volume = finished.volume;
                     grid = Some((frame, finished.stock));
                     preceding += 1;
+                    if let Some(a) = sim.plan.moves.last().and_then(|m| m.a) {
+                        machine_a = a;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {

@@ -519,8 +519,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             | "tab_width" | "tab_height",
         ) => "Heights",
         Some(
-            "angle_a" | "angle_b" | "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max"
-            | "lead_angle" | "lean_angle",
+            "rotary_start" | "rotary_end" | "tilt_min" | "tilt_max" | "lead_angle" | "lean_angle",
         ) => "Orientation",
         Some("peck" | "dwell") => "Cycle",
         Some("ramp_angle" | "lead_in") => "Linking",
@@ -1076,6 +1075,9 @@ fn ribbon(app: &App) -> Element<'_, Message> {
             let s = *s;
             let reason = if s == Strategy::Box {
                 (!manual_setup).then_some(manual::BOX_ON_CNC)
+            } else if s == Strategy::Indexed {
+                // A pointer to indexed setups, not an operation to add.
+                Some(crate::indexed::POINTER)
             } else {
                 (manual_setup && s != Strategy::Drill).then_some(manual::ONE_AXIS)
             };
@@ -2549,12 +2551,6 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             }
         }
         "Orientation" => match o.strategy {
-            Strategy::Indexed => {
-                c=c.push(note("Position the rotary axis before cutting. Angles are checked against the setup’s saved machine limits.")).push(checks.field(p, "angle_a", "Primary rotary angle · degrees"));
-                if app.doc.setup().machine.axes() == 5 {
-                    c = c.push(checks.field(p, "angle_b", "Secondary rotary angle · degrees"));
-                }
-            }
             Strategy::Rotary => {
                 c = c
                     .push(choice(

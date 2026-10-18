@@ -1739,6 +1739,7 @@ mod tests {
                 feed: 500.,
                 start: 0.,
                 end: 0.,
+                a: None,
             })
             .collect();
         p

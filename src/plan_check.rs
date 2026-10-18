@@ -509,11 +509,52 @@ fn tool_axis(plan: &Plan, index: &Index, top: f32) -> (f32, [f32; 3], f32) {
     }
     (worst, at, lowest)
 }
+/// `axis_problems` of `sim`, setup `si`'s: an indexed setup's at each of
+/// its A angles, against the part posed there (`indexed`), each said with
+/// its angle; another's against the part as `geometry` places it.
+pub(crate) fn angle_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sim: &Simulation,
+    geometry: &Geometry,
+    index: &Index,
+) -> Vec<String> {
+    if sim.turns.is_empty() {
+        return axis_problems(&sim.plan, geometry, index, si);
+    }
+    let mut out = vec![];
+    for &(a, _) in &sim.turns {
+        let posed = match doc.setup_at(&doc.setups[si], si, a, mesh) {
+            Ok(posed) => posed,
+            Err(e) => {
+                out.push(e);
+                continue;
+            }
+        };
+        let geometry = Geometry::new(&posed, mesh);
+        let mut plan = sim.plan.clone();
+        plan.moves
+            .retain(|m| m.motion != Motion::Index && m.a.is_some_and(|b| (a - b).abs() < 1e-4));
+        let at = crate::indexed::degrees(a);
+        out.extend(
+            axis_problems(&plan, &geometry, &Index::new(&geometry), si)
+                .into_iter()
+                .map(|p| format!("At A {at}°: {p}")),
+        );
+    }
+    out
+}
 /// The tool axis problems of one generated operation in setup `si` (from 0):
 /// more than 0.1 mm of part above the tool tip, whatever the strategy, and
 /// moves below the floor. The floor is the stock's bottom in setup 1; later
 /// setups rest on the part, whose underside may be all that is left there.
-fn axis_problems(plan: &Plan, geometry: &Geometry, index: &Index, si: usize) -> Vec<String> {
+pub(crate) fn axis_problems(
+    plan: &Plan,
+    geometry: &Geometry,
+    index: &Index,
+    si: usize,
+) -> Vec<String> {
     let b = geometry.bounds;
     let (worst, at, lowest) = tool_axis(plan, index, b.max[2]);
     let mut problems = vec![];
@@ -943,7 +984,9 @@ fn run(
                         name: op.name().to_string(),
                         minutes: (sim.plan.duration / 6.).round() / 10.,
                     });
-                    for message in axis_problems(&sim.plan, &geometries[si], &indexes[si], si) {
+                    for message in
+                        angle_problems(built, mesh, si, sim, &geometries[si], &indexes[si])
+                    {
                         axis.push(Problem {
                             setup: si + 1,
                             operation: Some(oi + 1),
