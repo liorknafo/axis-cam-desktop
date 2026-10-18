@@ -1203,22 +1203,38 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             key,
             planned,
             measured,
+            cross,
         } => {
             let end = end_of(start).max(0.);
             let r = outer_at(start, end);
-            let marks = vec![
-                Mark::Tool(Cutter::Turn, [end, r * 0.45]),
+            let mut marks = vec![
+                Mark::Tool(cutter_of(p, tool), [end, r * 0.45]),
                 Mark::Word(
                     [end + 1., r * 0.15],
                     "touch the end".into(),
                     ACCENT,
                     Align::Left,
                 ),
-                Mark::Dot([end - (r * 0.5).clamp(4., 15.), r], "touch the Ø".into()),
             ];
-            let right = column![
+            if *cross {
+                marks.push(Mark::Dot(
+                    [end - (r * 0.5).clamp(4., 15.), r],
+                    "touch the Ø".into(),
+                ));
+            } else {
+                marks.push(Mark::Across(
+                    end - (r * 0.9).clamp(8., 30.),
+                    r,
+                    "Ø ?".into(),
+                ));
+            }
+            let mut right = column![
                 chips(vec![tool_chip(p, tool)]),
-                label("Touch, then zero the collars"),
+                label(if *cross {
+                    "Touch, then zero the collars"
+                } else {
+                    "Touch the end, measure the bar"
+                }),
                 line(
                     Some(1),
                     "carriage",
@@ -1235,18 +1251,24 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     lit(1, item),
                     None,
                 ),
-                line(
+            ];
+            if *cross {
+                right = right.push(line(
                     Some(3),
                     "cross slide",
                     big("0", lit(2, item)),
                     vec!["touch the Ø".into(), "zero the cross dial".into()],
                     lit(2, item),
                     reached(2),
-                ),
-            ];
+                ));
+            }
             (
                 "Zero".into(),
-                "touch, then zero both collars",
+                if *cross {
+                    "touch, then zero both collars"
+                } else {
+                    "the carriage; the hole is touched later"
+                },
                 view(start, marks, 380.),
                 right,
             )

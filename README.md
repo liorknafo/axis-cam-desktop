@@ -552,7 +552,7 @@ A lathe setup opens in MACHINE on its **Steps** page, like the manual mill's: th
 | --- | --- |
 | Dial check | Only while the cross-slide dial is not known (see above) |
 | Hold | The bar in the chuck: the chuck and its jaws, the bar's size, the stickout as a big number and the grip ("in the jaws") |
-| Zero | The tool: touch the end and zero the carriage dial, measure the bar and type its diameter, touch the bar and zero the cross-slide dial |
+| Zero | With the first turning tool (the outside one): touch the end and zero the carriage dial, measure the bar and type its diameter, touch the bar and zero the cross-slide dial. A setup with only inside tools (drill, boring bar) touches the end and measures the bar, and its sections touch the hole |
 | Touch | Before a section, only what needs zeroing (see below) |
 | Face | One screen: the tool, the gear, "lock the carriage", the top slide dial for how much comes off, and the carriage zeroed again on the new end |
 | Pass | One screen per pass of an Outside or a Bore: the cross-slide dial in (out, boring) for this pass, the carriage dial where to stop, the power feed and "last 1 mm by hand", and the pass tiles with their diameters |

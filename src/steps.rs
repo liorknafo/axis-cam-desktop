@@ -3091,6 +3091,26 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn with_only_inside_tools_the_zero_does_not_touch_the_bars_outside() {
+        let mut a = bore_app(|_| {});
+        let zero = nth(&a, 0, |l| matches!(l, L::Zero { .. }));
+        send(&mut a, GuideAction::Go(zero));
+        shows(
+            &a,
+            &[
+                "Zero",
+                "Boring bar",
+                "touch the end",
+                "zero the carriage dial",
+            ],
+        );
+        assert!(!has(&a, "zero the cross dial"));
+        // With a turning tool, it touches the Ø too.
+        let mut a = lathe_app("Diameter", |_| {});
+        send(&mut a, GuideAction::Next);
+        shows(&a, &["zero the cross dial"]);
+    }
+    #[test]
     fn until_the_dial_check_is_answered_the_cross_slide_shows_no_number() {
         let mut a = lathe_app("", |_| {});
         shows(
@@ -3285,5 +3305,8 @@ pub(crate) mod tests {
         shot(&mut a, "20-bore-pass", fifth, 1);
         let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
         shot(&mut a, "22-bore-measure", measure, 0);
+        // Only inside tools: the Zero touches the end and measures the bar.
+        let zero = nth(&a, 0, |l| matches!(l, L::Zero { .. }));
+        shot(&mut a, "21-zero-bore-first", zero, 1);
     }
 }

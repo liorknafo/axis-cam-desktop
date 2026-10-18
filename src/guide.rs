@@ -10,7 +10,7 @@ use crate::{
     lathe::{self, Slide},
     manual,
     mesh::{Bounds, Mesh},
-    model::{Document, Machine, Strategy, get, num},
+    model::{Document, Machine, Operation, Strategy, get, num},
     post::At,
     simulation::{self, Motion, Move, POINT_RISE, Plan},
     turn,
@@ -290,14 +290,17 @@ pub enum LatheStep {
         length: f32,
         reach: f32,
     },
-    /// With `tool`: touch the end → zero the carriage dial; measure the bar
-    /// (`planned` Ø; `measured` under `key` once typed); touch it → zero the
-    /// cross dial.
+    /// With `tool` (the first turning tool, which cuts outside): touch the
+    /// end → zero the carriage dial; measure the bar (`planned` Ø;
+    /// `measured` under `key` once typed); when `cross`, touch it → zero
+    /// the cross dial. A setup with only inside tools (a boring bar) does
+    /// not touch the bar's outside: its sections touch the hole.
     Zero {
         tool: String,
         key: String,
         planned: f32,
         measured: Option<f32>,
+        cross: bool,
     },
     /// Before an operation's cuts, with `tool` at `rpm`: with `top`, swing
     /// the top slide to that angle (a thread) and zero its dial on the
@@ -1031,15 +1034,33 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
         end,
         carriage: None,
     };
-    let first_turn = (done.iter())
+    // The Zero is made with the first turning tool, which cuts outside;
+    // with none, with the first Turn's tool, touching the bar's outside only
+    // when that tool cuts outside.
+    let turns: Vec<&Operation> = (done.iter())
         .map(|(oi, _)| &setup.operations[*oi])
-        .find(|o| o.strategy == Strategy::Turn);
-    if let Some(op) = first_turn {
+        .filter(|o| o.strategy == Strategy::Turn)
+        .collect();
+    let type_of = |o: &Operation| tool_of(&o.tool).map_or("", |t| get(&t.p, "type"));
+    let inside = |o: &Operation| {
+        type_of(o) == "Boring bar"
+            || match get(&o.p, "turn_kind") {
+                "Bore" => true,
+                "Thread" => get(&o.p, "thread_side") == "Inside",
+                "Chamfer" => get(&o.p, "edge") == "End inside",
+                _ => false,
+            }
+    };
+    let zero_op = (turns.iter())
+        .find(|o| type_of(o) == "Turning tool")
+        .or(turns.first());
+    if let Some(op) = zero_op {
         steps.push(Step::Lathe(LatheStep::Zero {
             tool: op.tool.clone(),
             key: zero_key,
             planned: bar,
             measured: bar_measured,
+            cross: !inside(op),
         }));
         zeroes.carriage = Some((op.tool.clone(), end));
     }
@@ -1354,7 +1375,7 @@ pub fn place(doc: &Document, guide: &Guide) -> usize {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{BOX_FIELDS, Operation, Tool};
+    use crate::model::{BOX_FIELDS, Tool};
 
     /// A Box named `name` cutting `b` (x_min, x_max, y_min, y_max, z_top,
     /// z_bottom, work frame) with the tool `tool`.
@@ -2247,6 +2268,7 @@ pub(crate) mod tests {
                 key: measure_key(&setup.id, "zero"),
                 planned: 50.2,
                 measured: None,
+                cross: true,
             })
         );
         // Face: 1.00 on the top slide, then the carriage zeroed on the new end.
@@ -2609,9 +2631,17 @@ pub(crate) mod tests {
             ],
         );
         let guide = build(&doc, &mesh, 0).unwrap();
-        // The Zero step uses the first Turn's tool, the boring bar.
+        // No turning tool: the Zero step uses the first Turn's tool, the
+        // boring bar, which touches the end and has the bar measured but
+        // does not touch its outside.
         let of = |g: &Guide, i: usize| kinds(g, g.sections[i].steps.clone());
         assert_eq!(of(&guide, 0), ["Hold", "Zero"]);
+        let bar_tool = doc.setups[0].operations[1].tool.clone();
+        assert!(matches!(
+            &guide.steps[1],
+            Step::Lathe(LatheStep::Zero { tool, cross: false, planned, .. })
+                if *tool == bar_tool && (*planned - 50.2).abs() < 1e-4
+        ));
         assert_eq!(of(&guide, 1), ["Drill"]);
         assert_eq!(of(&guide, 2)[0], "Touch");
         // The boring bar zeroed the carriage at the Zero step: only the
@@ -2694,6 +2724,39 @@ pub(crate) mod tests {
             assert_eq!(top.reads, lathe::reads(machine, Slide::Top, r, true));
             close(top.reads.unwrap(), (2. - r) % 2.);
         }
+    }
+    #[test]
+    fn the_zero_is_made_with_the_turning_tool_even_when_a_bore_comes_first() {
+        let (mut doc, mesh) = lathe_job(50.2, 100., tube(10.5, 17.5, 0., 61.), -62.);
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Boring bar" {
+                t.p.insert("min_bore".into(), "8".into());
+            }
+        }
+        add(&mut doc, "Drill", &[("depth", "30")]);
+        add(&mut doc, "Bore", &[("diameter", "20"), ("z_end", "-20")]);
+        add(&mut doc, "Outside", &[("diameter", "40"), ("z_end", "-30")]);
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let turning = doc.setups[0].operations[2].tool.clone();
+        // The turning tool touches the end and the bar's outside.
+        assert!(matches!(
+            &guide.steps[1],
+            Step::Lathe(LatheStep::Zero { tool, cross: true, .. }) if *tool == turning
+        ));
+        // The boring bar is a new tool: it touches the end again, and the
+        // hole for its cross dial.
+        assert!(matches!(
+            &guide.steps[guide.sections[2].steps.start],
+            Step::Lathe(LatheStep::Touch {
+                carriage: true,
+                cross: Some(Contact { inside: true, .. }),
+                ..
+            })
+        ));
     }
     #[test]
     fn the_tailstock_drill_reads_its_depth_and_point_on_the_quill() {
