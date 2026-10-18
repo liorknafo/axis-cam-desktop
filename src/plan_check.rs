@@ -1104,15 +1104,22 @@ fn run(
                 });
             }
         }
-        // An indexed setup's moves on the machine: its travel, Z reach and A.
+        // An indexed setup's moves on the machine: its travel, Z reach and A;
+        // and a cut parting the bar in the chuck. Each said once, with its
+        // operation: the export's refusal above says them too.
         for (si, sims) in results.iter().enumerate() {
-            let found = crate::rotary_check::problems(job_doc, mesh, si, sims);
-            export.extend(found.into_iter().map(|(oi, message)| Problem {
-                setup: si + 1,
-                operation: oi.map(|oi| oi + 1),
-                stage: "export",
-                message,
-            }));
+            for (oi, message) in crate::rotary_check::problems(job_doc, mesh, si, sims) {
+                let operation = oi.map(|oi| oi + 1);
+                match (export.iter_mut()).find(|p| p.setup == si + 1 && p.message == message) {
+                    Some(said) => said.operation = said.operation.or(operation),
+                    None => export.push(Problem {
+                        setup: si + 1,
+                        operation,
+                        stage: "export",
+                        message,
+                    }),
+                }
+            }
         }
         if export.is_empty() && held.is_empty() {
             out.zeros = built

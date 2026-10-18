@@ -2871,14 +2871,13 @@ fn checked_with(
     // tool's way past the chuck at each angle and while A turns are
     // `rotary_check`'s, said with the program's own problems. Its program
     // links operations as they are checked there; its own turns of A are
-    // `index_problems`'.
-    let mut rotary: Vec<String> = vec![];
+    // `index_problems`'. A cut that parts the stock off the bar in the
+    // chuck is refused in a plain setup in the chuck too.
+    let mut rotary: Vec<String> = crate::rotary_check::problems(doc, mesh, si, sims)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect();
     if indexed {
-        rotary.extend(
-            crate::rotary_check::problems(doc, mesh, si, sims)
-                .into_iter()
-                .map(|(_, message)| message),
-        );
         match crate::rotary_check::held(doc, mesh, si, sims) {
             Ok(held) => rotary.extend(held.into_iter().map(|h| h.message)),
             Err(why) => rotary.extend(why),

@@ -3899,13 +3899,14 @@ flood = { pin = 8 }
     }
     /// The 4-axis scene (LIO-190), to $AXIS_RENDER_DIR (/tmp/four-axis-renders):
     /// the Job view after a square is milled on a bar at A 90, 180, 270 and
-    /// 0°, and while A turns from 270° to 0°, and the Control page's machine view
+    /// 0°, to 2 mm over the A axis so that a web keeps it on the bar (LIO-208),
+    /// and while A turns from 270° to 0°, and the Control page's machine view
     /// with the rotary unit at A 0 and 30°. Not a check: `cargo test
     /// render_the_four_axis_scene -- --ignored`.
     #[test]
     #[ignore]
     fn render_the_four_axis_scene() {
-        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
         let out = std::path::PathBuf::from(
             std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/four-axis-renders".into()),
         );
@@ -3919,7 +3920,7 @@ flood = { pin = 8 }
             "100",
             "-150",
             "90, 180, 270, 0",
-            contour(&cutter("12")),
+            on_the_bar(&cutter("12")),
         );
         doc.file = Some(crate::model::ModelFile {
             name: "square-bar.stl".into(),
