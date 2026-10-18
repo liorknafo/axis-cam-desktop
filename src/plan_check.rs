@@ -2172,6 +2172,7 @@ mod tests {
     fn plan_of(setups: Vec<(&str, Vec<proposal::ProposedOp>)>) -> Proposal {
         Proposal {
             summary: String::new(),
+            chuck: None,
             setups: setups
                 .into_iter()
                 .enumerate()
@@ -2186,6 +2187,7 @@ mod tests {
                     .into(),
                     workholding: String::new(),
                     holder: None,
+                    a_angles: None,
                     operations,
                 })
                 .collect(),
@@ -2915,6 +2917,7 @@ mod totem {
         };
         let proposal = Proposal {
             summary: "Top, then the underside".into(),
+            chuck: None,
             setups: vec![
                 ProposedSetup {
                     orientation: "+Z".into(),
@@ -2922,6 +2925,7 @@ mod totem {
                     origin: "Stock top center".into(),
                     workholding: "Vise on the stock's frame".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         cut("Face", 1, &top, 1200., &|_| {}),
                         cut("Pocket", 1, &well, 1200., &|o| {
@@ -2964,6 +2968,7 @@ mod totem {
                     origin: "Stock top front-left".into(),
                     workholding: "Vise on the frame".into(),
                     holder: None,
+                    a_angles: None,
                     operations: vec![
                         cut("Face", 1, &at("-Z", 0.), 1200., &|_| {}),
                         cut("Pocket", 1, &underside, 1200., &|o| o.stepdown = Some(2.)),

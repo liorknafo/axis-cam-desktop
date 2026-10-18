@@ -102,6 +102,22 @@ pub fn label(setup: &Setup) -> Option<String> {
     }
     setup.machine.has_a().then(|| "A 0°".into())
 }
+/// The A angles `v` as a setup lists them: "0, 90, 180, 270".
+pub fn angles_list(v: &[f32]) -> String {
+    v.iter().map(|a| degrees(*a)).collect::<Vec<_>>().join(", ")
+}
+/// Sets a setup's Reposition `action` in its fields `p`, as the Reposition
+/// choice does: `ACTION` keeps the A angles the setup lists (`DEFAULT_ANGLES`
+/// while it lists none), another action takes them away.
+pub fn set_reposition(p: &mut crate::model::Fields, action: &str) {
+    if action == ACTION {
+        p.entry(ANGLES.into())
+            .or_insert_with(|| DEFAULT_ANGLES.into());
+    } else {
+        p.remove(ANGLES);
+    }
+    p.insert("reposition".into(), action.into());
+}
 /// +1 when the machine's positive A turns the part by the right-hand rule
 /// about +X (direction Positive), -1 for Negative.
 pub fn sign(m: &Machine) -> f32 {
