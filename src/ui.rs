@@ -2586,9 +2586,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 "Clearance and retract are measured above the stock top. The block's own depths are set in Box."
             } else if !app.is_sample() && o.strategy == Strategy::Face {
                 "Facing uses remaining stock to skip fully cleared top layers. Bottom offset sets the target relative to the selected plane; it must not cut below the highest model feature. Clearance/retract retain their original stock reference."
-            } else if !app.is_sample() && o.strategy == Strategy::Adaptive {
-                "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
-            } else if !app.is_sample() && o.strategy == Strategy::Pocket {
+            } else if !app.is_sample() && matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket) {
                 "Each selected floor is cleared to its own height, the highest first. Cutting starts from the remaining stock after earlier operations, plus positive Top offset, and goes only where earlier cuts left material, so a smaller cutter after a larger one cleans up what that one could not reach. Bottom offset and axial stock to leave are added to each floor. Clearance/retract stay referenced to the original stock top."
             } else if !app.is_sample() && o.strategy==Strategy::Contour && get(p,"boundary")=="Selected geometry" {
                 "Inside contour skips fully cleared top layers and ends at the selected floor + bottom offset. Negative bottom offsets are rejected. Profile ramp/plunge are configured in Linking; the pocket interior is not cleared. Clearance/retract retain the original stock reference."
