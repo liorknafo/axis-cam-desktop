@@ -4849,9 +4849,8 @@ spindle_max_rpm = 24000
         for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
             op.p.insert(k.into(), v.into());
         }
-        // From A0 the first turn is to A90; a job whose first angle is 0
-        // starts with a rapid from the stock's corner over the chuck, which
-        // the check refuses.
+        // From A0 the first turn is to A90; the same job from A 0 is run
+        // after it, below.
         let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180, 270, 0", op);
         doc.tools[0].p.insert("number".into(), "1".into());
         doc.file = Some(crate::model::ModelFile {
@@ -4878,24 +4877,25 @@ spindle_max_rpm = 24000
         let m = doc.setups[1].machine.clone();
         assert_eq!(m.id, doc.setups[0].machine.id);
         let mut c = zeroed_sim(dir.path(), ROTARY_SIM, Some(&m), 4);
-        // Started at the angle A is at, the approach comes down over the
-        // stock's corner in the chuck: the run refuses it, as export does.
+        // Started at the angle A is at, the tool comes down from above all
+        // that A swings over the first cut, as after an index move, not over
+        // the stock's corner in the chuck (LIO-205): run and export agree.
         let mut at_zero = doc.clone();
         (at_zero.setups[1].p).insert(crate::indexed::ANGLES.into(), "0, 90, 180, 270".into());
         at_zero.sync_turns(Some(&mesh));
-        let refused = crate::run::check(&at_zero, &mesh, 1).0.unwrap_err();
-        assert!(refused.iter().any(|e| e.contains("chuck")), "{refused:?}");
-        let sims = crate::run::simulated_for_tests(&at_zero, &mesh, 1);
+        // The same job on LinuxCNC exports.
+        let mut linuxcnc = at_zero.clone();
+        (linuxcnc.setups[0].machine.p).insert("controller".into(), "LinuxCNC".into());
+        linuxcnc.sync_indexed();
+        let exported = crate::post::post_job(&linuxcnc, &mesh);
         assert!(
-            crate::post::checked(
-                &at_zero,
-                &mesh,
-                1,
-                &sims,
-                crate::post::PostSettings::from_machine
-            )
-            .is_err()
+            exported.setups[1].result.is_ok(),
+            "{:?}",
+            exported.setups[1].result
         );
+        let at_zero_programs = crate::run::check(&at_zero, &mesh, 1)
+            .0
+            .unwrap_or_else(|e| panic!("{e:?}"));
         let (programs, left) = crate::run::check(&doc, &mesh, 1);
         let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(programs.len(), 1);
@@ -5094,6 +5094,66 @@ spindle_max_rpm = 24000
         for (dy, dz) in [(14., 0.), (-14., 0.), (0., 14.), (0., -14.)] {
             assert!(!filled(dy, dz), "outside the square at {dy} {dz}");
         }
+        // The same job from A0, its first angle: A turns to 90, 180, 270 and
+        // back to 0, and the tool first comes down over the first cut from
+        // at or above all that A swings, straight down to its feed.
+        let mut run = crate::run::Run::new(&at_zero, 1, 0);
+        run.checked_as(std::sync::Arc::new(Ok(at_zero_programs)), None);
+        c.run = Some(run);
+        assert!(
+            problems(&c, &at_zero).is_empty(),
+            "{:?}",
+            problems(&c, &at_zero)
+        );
+        let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+        let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+        let mut turns = vec![];
+        let mut at = start;
+        let mut moves = vec![];
+        for l in &actions {
+            if let Do::Move { target, feed } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    turns.push(target[3]);
+                }
+                moves.push((target, feed));
+                at = target;
+            }
+        }
+        assert_eq!(turns, [90., 180., 270., 0.]);
+        let feed = moves.iter().position(|(_, f)| f.is_some()).unwrap();
+        let over = (moves[..feed].iter())
+            .rposition(|(t, _)| plan_z(*t) >= swing.z as f64 - 1e-3)
+            .unwrap();
+        for (t, _) in &moves[over..=feed] {
+            assert_eq!((&t[..2], t[3]), (&moves[over].0[..2], 0.), "{moves:?}");
+        }
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.run_act(R::CycleStart, &at_zero);
+        assert!(c.run.as_ref().unwrap().running.is_some());
+        let mut reached = [false; 4];
+        let cap = Instant::now() + Duration::from_secs(600);
+        while !c
+            .snapshot
+            .program_outcome
+            .as_ref()
+            .is_some_and(|o| o.seq > seq)
+        {
+            c.refresh();
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let s = &c.snapshot;
+            for (k, a) in [0., 90., 180., 270.].iter().enumerate() {
+                reached[k] |= s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+            }
+            assert!(Instant::now() < cap, "the job did not end: {:?}", s.log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        assert_eq!(reached, [true; 4]);
     }
 
     #[test]
