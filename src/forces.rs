@@ -83,14 +83,17 @@ pub struct Bite {
 /// a voxel of no such centre (over what the setup's earlier operations
 /// already cut away, or beside the stock), removes nothing. Empty without that stock, and
 /// for drilling, which pushes the stock down into its holding and twists
-/// it (not modelled), but not sideways or up.
+/// it (not modelled), but not sideways or up. Helical milling, a Drill
+/// cycle that cuts with an end mill's side, has its bites as milling does.
 /// ponytail: a replay more than the simulation makes; keep what
 /// `Simulation::seek` removes per move if that time ever shows.
 pub fn bites(sim: &Simulation) -> Vec<Bite> {
     let (Some(mut volume), Some(frame)) = (sim.initial_volume.clone(), sim.frame) else {
         return vec![];
     };
-    if sim.plan.strategy == crate::model::Strategy::Drill {
+    if sim.plan.strategy == crate::model::Strategy::Drill
+        && sim.plan.shape != crate::simulation::CutterShape::Flat
+    {
         return vec![];
     }
     let plan = &sim.plan;
@@ -652,6 +655,25 @@ mod tests {
         aluminium.p.insert("group".into(), "Aluminium".into());
         let soft = power_stepdown(&machine, Some(&aluminium), 25., 17.5, 120., 640., 3.);
         assert!((soft - ap * 1700. / 700.).abs() < 0.001, "{soft}");
+    }
+    #[test]
+    fn helical_milling_pushes_sideways_where_drilling_does_not() {
+        // The same Ø10 slot, as a Drill operation's moves.
+        let mut plan =
+            crate::post::fixture::plan([-60., 0., 36.], &[(Motion::Feed, [60., 0., 36.], 600.)]);
+        (plan.stock, plan.radius, plan.flute_length) = (STOCK, 5., 20.);
+        plan.strategy = crate::model::Strategy::Drill;
+        let bites = |shape: CutterShape| {
+            let mut plan = plan.clone();
+            plan.shape = shape;
+            let mut sim = Simulation::new(plan);
+            (sim.initial_volume, sim.frame) = (Some(Volume::new(STOCK, frame())), Some(frame()));
+            sim.bites().len()
+        };
+        // A drill's push is down into the holding, not modelled; Helical
+        // milling cuts with a flat end mill's side.
+        assert_eq!(bites(CutterShape::Drill), 0);
+        assert!(bites(CutterShape::Flat) > 0);
     }
     #[test]
     fn a_slot_pushes_with_the_stock_it_removes_up_to_what_the_spindle_drives() {

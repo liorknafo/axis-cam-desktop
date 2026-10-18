@@ -42,8 +42,6 @@ const BACK_OFF: f32 = 0.5;
 const STEP: f32 = 0.1;
 /// Lengths and radii closer than this are the same, mm.
 const ON: f32 = 1e-3;
-/// The most moves or rings a plan may have.
-const LIMIT: usize = 30_000;
 
 /// The frame Z of the free end, lathe work Z 0: the top of `stock`.
 pub fn end(stock: Bounds) -> f32 {
@@ -318,9 +316,11 @@ impl Cut {
     /// A move to the tool position (`x` from the axis, `z`): a feed at
     /// `rate` mm/min, else wound back by hand.
     fn go(&mut self, x: f32, z: f32, motion: Motion, rate: f32) -> Result<(), String> {
-        if self.moves.len() >= LIMIT {
-            return Err("The plan exceeds 30,000 moves.".into());
+        // What memory holds (`cam::CEILING`), and Cancel.
+        if self.moves.len() >= crate::cam::CEILING {
+            return Err(crate::cam::too_many("moves"));
         }
+        crate::progress::check()?;
         let to = [x, 0., z];
         let distance = (x - self.pos[0]).hypot(z - self.pos[2]);
         let rate = if motion == Motion::Rapid {
@@ -370,8 +370,8 @@ impl Cut {
     /// The ring `[z0, z1, r0, r1]` turned away when the last move ends, not
     /// checked against the part.
     fn ring_only(&mut self, g: [f32; 4]) -> Result<(), String> {
-        if self.rings.len() >= LIMIT {
-            return Err("The plan exceeds 30,000 rings.".into());
+        if self.rings.len() >= crate::cam::CEILING {
+            return Err(crate::cam::too_many("rings"));
         }
         self.rings.push(Ring {
             at: self.moves.len().saturating_sub(1),

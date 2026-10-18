@@ -1130,6 +1130,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Toggle this planar region on your imported part. Blue marks selected surfaces; amber shows the region under the pointer. Selection is saved with this operation and tied to this model's geometry.",
             "",
         ),
+        DropHole(_) => (
+            "Drop this hole from the operation: its walls are cleared from the selection, but for those another picked hole shares.",
+            "",
+        ),
         ClearSurfaces => (
             "Remove this operation's saved surface selections so you can choose new surfaces on the current part.",
             "",
@@ -1367,6 +1371,10 @@ pub fn command(m: &Message, label: String) -> Help {
             "Return to this point in the preview and pause. Simulated stock is recomputed when you rewind; Restart restores the uncut stock.",
             "",
         ),
+        ScrubDone => (
+            "Let go of the slider: on a long toolpath the stock catches up with where it was moved.",
+            "",
+        ),
         ToggleStock => (
             "Show or hide stock. During Facing or Pocket simulation this displays the remaining sampled stock; hide Stock to see the finished reference model. Outside simulation it shows the transparent stock box.",
             "Relative stock extends from each side of the placed part by its offset; fixed stock uses explicit dimensions. The box and part share the same display scale.",
@@ -1408,7 +1416,7 @@ pub fn command(m: &Message, label: String) -> Help {
                         "Set indexed rotary angles or the tool-axis strategy for multi-axis cutting."
                     }
                     "Cycle" => {
-                        "Choose how the drill feeds, pecks, pauses and retracts between holes."
+                        "Choose how the drill feeds, pecks, pauses and retracts between holes, or mill each hole with an end mill."
                     }
                     "Passes" => {
                         "Control cutting depth, spacing, finishing allowance and tolerance."
@@ -2083,7 +2091,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "boundary") => (
-            "Defines the region that should contain machining: selected geometry, stock outline or model outline. Facing uses rectangular extents. Pocket and Adaptive clearing follow the selected floor. Contour and finishing use the imported model silhouette.",
+            "Defines the region that should contain machining: selected geometry, stock outline or model outline. Facing uses rectangular extents. Pocket and Adaptive clearing follow the selected floor, and a Pocket the outline of each hole picked by a click on its wall. Contour and finishing use the imported model silhouette.",
             "",
             Some(Operation(Strategy::Contour)),
         ),
@@ -2188,7 +2196,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             None,
         ),
         (_, "cycle") => (
-            "Drilling feeds once to depth. Chip breaking retracts slightly between pecks; deep drilling retracts clear of the hole. Counterboring adds a bottom dwell.",
+            "Drilling feeds once to depth. Chip breaking retracts slightly between pecks; deep drilling retracts clear of the hole. Counterboring adds a bottom dwell. Helical milling cuts each hole with a flat end mill, down a helix to a flat bottom.",
             "",
             Some(Operation(Strategy::Drill)),
         ),

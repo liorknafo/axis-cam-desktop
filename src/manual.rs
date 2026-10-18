@@ -377,6 +377,8 @@ pub fn box_from_face(
 pub const ONE_AXIS: &str = "The big mill cuts one axis at a time.";
 /// Why Box is dimmed on a setup of a CNC machine.
 pub const BOX_ON_CNC: &str = "Box runs on a manual mill.";
+/// Why a manual mill cannot mill a hole round: it moves one axis at a time.
+pub const HELICAL_ON_MANUAL: &str = "Helical milling needs a CNC: the big mill moves one axis at a time. Drill the holes, or bore them by hand.";
 
 #[cfg(test)]
 mod tests {

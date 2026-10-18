@@ -70,7 +70,7 @@ pub fn changes(before: &Document, after: &Document) -> Vec<String> {
             .operations
             .iter()
             .filter(|o| !in_after(&o.id))
-            .map(|o| operation_name(o))
+            .map(operation_name)
             .collect();
         if !removed.is_empty() {
             lines.push(format!(

@@ -168,6 +168,10 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         return vec!["The model geometry changed. Clear the saved surface selection and select surfaces on the current part.".into()];
     }
     let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    let picks_holes = matches!(
+        operation.strategy,
+        crate::model::Strategy::Pocket | crate::model::Strategy::Contour
+    );
     let mut result = Vec::new();
     let mut heights = Vec::new();
     for &id in &selection.ids {
@@ -177,7 +181,12 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
             );
             break;
         };
-        if rotation(surface.normal, angles)[2].abs() < 0.5f32.to_radians().cos() {
+        let up = rotation(surface.normal, angles)[2].abs();
+        // A Pocket or an inside Contour picks a hole by its walls.
+        if picks_holes && up < crate::pocket::WALL {
+            continue;
+        }
+        if up < 0.5f32.to_radians().cos() {
             result.push(format!(
                 "Surface {} is not perpendicular to setup Z. Reposition the part in another setup.",
                 id + 1

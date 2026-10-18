@@ -20,12 +20,7 @@ const STRATEGIES: [(&str, Strategy); 6] = [
     ("Waterline", Strategy::Waterline),
 ];
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
-const CYCLES: [&str; 4] = [
-    "Drilling",
-    "Chip breaking",
-    "Deep drilling",
-    "Counterboring",
-];
+const CYCLES: [&str; 5] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
@@ -566,11 +561,17 @@ fn operation(
     let kind = get(&tool.p, "type");
     let suits = match strategy {
         Strategy::Face => ["Flat end mill", "Face mill"].contains(&kind),
+        Strategy::Drill if suits_helical(p) => kind == "Flat end mill",
         Strategy::Drill => ["Drill", "Chamfer mill"].contains(&kind),
         Strategy::Parallel => ["Ball end mill", "Flat end mill"].contains(&kind),
         _ => kind == "Flat end mill",
     };
-    if !suits {
+    if !suits && kind != "Flat end mill" && suits_helical(p) {
+        wrong.push(format!(
+            "T{} is a {kind}; Drill with Helical milling takes a flat end mill.",
+            p.tool
+        ));
+    } else if !suits {
         wrong.push(format!(
             "T{} is a {kind}, which {} cannot use.",
             p.tool, p.strategy
@@ -765,6 +766,11 @@ fn operation(
     }
     Ok(op)
 }
+/// Whether `p` is a Drill operation with the Helical milling cycle, which
+/// cuts with a flat end mill.
+fn suits_helical(p: &ProposedOp) -> bool {
+    p.strategy == "Drill" && p.drill_cycle.as_deref() == Some(crate::model::HELICAL_MILLING)
+}
 /// An operation of the current plan the planner cannot see or change: its
 /// strategy is not one of the six, its tool has no number, or it machines a
 /// selection that is not surfaces. It stays in its setup, at its place.
@@ -870,6 +876,11 @@ fn described(op: &Operation, tools: &[Tool]) -> Option<ProposedOp> {
                 .into(),
             );
             p.peck = value("peck");
+            // Helical milling's pitch and rings.
+            if op.helical() {
+                p.stepdown = value("stepdown");
+                p.stepover_percent = value("stepover");
+            }
             let through = get(&op.p, "through") == "Yes";
             p.through = Some(through);
             p.breakthrough = value("breakthrough").filter(|_| through);
@@ -2217,6 +2228,12 @@ pub(crate) mod tests {
             "T2 is a Ball end mill, which Pocket cannot use",
         );
         refused(
+            &|p| {
+                p.setups[0].operations[3].drill_cycle = Some(crate::model::HELICAL_MILLING.into());
+            },
+            "T3 is a Drill; Drill with Helical milling takes a flat end mill",
+        );
+        refused(
             &|p| p.setups[0].operations[0].rpm = 20000.,
             "rpm 20000 is outside 100-12000",
         );
@@ -2383,6 +2400,33 @@ pub(crate) mod tests {
         }
         // Without through, breakthrough is not used.
         assert!(drill(&|d| d.breakthrough = Some(30.)).is_ok());
+    }
+    #[test]
+    fn helical_milling_builds_a_drill_operation_with_a_flat_end_mill() {
+        let (doc, mesh, report) = block();
+        let mut proposal = good(&report);
+        let drill = &mut proposal.setups[0].operations[3];
+        (
+            drill.tool,
+            drill.peck,
+            drill.stepdown,
+            drill.stepover_percent,
+        ) = (1, None, Some(1.5), Some(30.));
+        drill.drill_cycle = Some(crate::model::HELICAL_MILLING.into());
+        let job = build(&doc, &mesh, &report, &proposal).unwrap();
+        let op = &job.setups[0].operations[3];
+        assert!(op.helical());
+        assert_eq!(
+            get(
+                &job.tools.iter().find(|t| t.id == op.tool).unwrap().p,
+                "type"
+            ),
+            "Flat end mill"
+        );
+        assert_eq!(
+            (get(&op.p, "stepdown"), get(&op.p, "stepover")),
+            ("1.5", "30")
+        );
     }
     #[test]
     fn speeds_and_feeds_have_floors() {

@@ -27,6 +27,7 @@ mod planner_tools;
 mod pocket;
 mod post;
 mod post_check;
+mod progress;
 mod proposal;
 mod rest;
 mod run;
@@ -159,6 +160,10 @@ pub enum Message {
     ToggleOp,
     Feature(usize),
     Surface(usize),
+    /// The Geometry list's remove button: drop this hole (its index in
+    /// `App::pocket_holes`) from a Pocket or Contour, keeping the walls
+    /// another picked hole shares.
+    DropHole(usize),
     ClearSurfaces,
     BoxFromFace,
     PickMode,
@@ -174,6 +179,18 @@ pub enum Message {
     AddPinDrilling,
     Generate,
     GenerateAll,
+    /// A generation off the window's thread is done (`App::generate`): its
+    /// epoch and the operation's simulation.
+    Generated(u64, Made),
+    /// Generate all is done: its epoch and the audit's lines.
+    GeneratedAll(u64, Vec<AuditRow>),
+    /// A setup's operations are generated for its holding: the epoch and
+    /// what they made (`App::suggest_layout`).
+    GeneratedLayout(u64, Laid),
+    /// A generation's thread failed: its epoch and why.
+    GenerationFailed(u64, String),
+    /// The progress bar's Cancel.
+    CancelGenerate,
     AddSetup,
     /// Inserts a setup on the first manual machine, before the CNC setups.
     AddManualSetup,
@@ -309,6 +326,14 @@ pub enum Message {
     PlanViewport(viewport::Event),
     Play,
     Scrub(f32),
+    /// The playback slider let go: the stock catches up with a scrub too
+    /// long to replay while it moved (`SCRUB_LIVE`).
+    ScrubDone,
+    /// The simulation replayed to where the slider was let go: the epoch
+    /// of that catch-up and the simulation.
+    Replayed(u64, Replayed),
+    /// The replay of that catch-up failed: its epoch.
+    ReplayFailed(u64),
     Speed(f32),
     StockDetail(stock_surface::Detail),
     StockMeshed {
@@ -544,6 +569,10 @@ const HOLDING_KEYS: [&str; 7] = [
 /// What `cam::holes` answers for the Drill editor's list.
 pub(crate) type DrillHoles = Result<Vec<cam::Hole>, String>;
 pub(crate) type BottomHoles = Result<Vec<cam::BottomHole>, String>;
+pub(crate) type PocketHoles = Result<Vec<pocket::Hole>, String>;
+/// The cutter's diameter and, for each picked hole, which of its levels it
+/// fits; None without holes or a flat end mill.
+pub(crate) type PocketFits = Option<(f32, Vec<Vec<bool>>)>;
 #[cfg(test)]
 thread_local! {
     /// How many times this thread has run `cam::holes` for the Drill editor.
@@ -810,6 +839,33 @@ pub struct App {
     /// The round holes the part opens on the current setup's bottom, kept
     /// as `drill_holes` is (`App::bottom_holes`).
     bottom_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<BottomHoles>)>>,
+    /// The holes a Pocket's or Contour's selected walls pick, kept as
+    /// `drill_holes` is (`App::pocket_holes`).
+    pocket_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<PocketHoles>)>>,
+    /// Which levels of those holes the operation's cutter fits (`Hole::fits`),
+    /// kept as they are (`App::pocket_fits`).
+    pocket_fits: std::cell::RefCell<Option<(u64, std::sync::Arc<PocketFits>)>>,
+    /// The playback slider moved further than `SCRUB_LIVE` replays: the stock
+    /// shown is where it was until the slider is let go (`ScrubDone`).
+    pub(crate) scrub_pending: bool,
+    /// The most moves a scrub replays while the slider moves (`SCRUB_LIVE`).
+    pub(crate) scrub_live: usize,
+    /// The catch-up replaying off the window's thread (`App::catch_up`): its
+    /// epoch, where it goes, and whether playback starts when it is done.
+    pub(crate) catching_up: Option<(u64, f32, bool)>,
+    /// When the playback slider last moved: a scrub still to be replayed is
+    /// replayed once it has been still for `SCRUB_SETTLE` (the arrow keys
+    /// and the wheel move it without letting go).
+    pub(crate) last_scrub: Instant,
+    catch_up_epoch: u64,
+    /// The generation under way off the window's thread, if any.
+    pub(crate) generating: Option<Generating>,
+    /// The last generation started: one that comes back with another is
+    /// stale.
+    generation_epoch: u64,
+    /// Generate where it is asked, not on a thread of its own: in the
+    /// headless smoke run and the unit tests, as their other work is.
+    pub(crate) generate_inline: bool,
     /// The browser's pictures of stock, each drawn once for what it shows
     /// (`ui::stock_picture`).
     pub(crate) stock_pictures: std::cell::RefCell<Vec<(u64, iced::widget::image::Handle)>>,
@@ -981,6 +1037,64 @@ pub struct App {
 /// A line of the operation audit's report (`Message::GenerateAll`): the setup
 /// and operation it is about, by index, their names, whether the operation
 /// generated, and what happened.
+/// The most moves a scrub of the playback slider replays on the window's
+/// thread while it moves: 200,000 took 0.13–0.5 s, so this is a few
+/// hundredths. A longer one waits until the slider is let go and is then
+/// replayed off the window's thread (`App::catch_up`).
+pub(crate) const SCRUB_LIVE: usize = 50_000;
+/// How long the playback slider stays still before a scrub still to be
+/// replayed is (`App::last_scrub`).
+const SCRUB_SETTLE: Duration = Duration::from_millis(400);
+/// A simulation replayed off the window's thread to where the slider was
+/// let go (`App::catch_up`).
+#[derive(Clone)]
+pub struct Replayed(std::sync::Arc<simulation::Simulation>);
+impl std::fmt::Debug for Replayed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Replayed")
+    }
+}
+/// What a generation off the window's thread makes (`App::generate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Generation {
+    /// The selected operation of the current setup, by index, with the stock
+    /// the operations before it leave.
+    Operation(usize, usize),
+    /// Every enabled operation of the job, for the audit (Generate all).
+    All,
+    /// The operations of setup `0` (by index), for where its vise jaws or
+    /// clamps go (`App::suggest_layout`).
+    Layout(usize),
+}
+/// What `Generation::Layout` made: the setup's toolpaths (None for one that
+/// could not be generated) and the band a vise closes on.
+#[derive(Clone)]
+pub struct Laid(std::sync::Arc<(Vec<Option<simulation::Plan>>, Option<holding::Bands>)>);
+impl std::fmt::Debug for Laid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Laid({} plans)", self.0.0.len())
+    }
+}
+/// A generation under way: what it makes, its progress and Cancel, and
+/// whether playback starts when it is done (Generate & play).
+pub(crate) struct Generating {
+    pub epoch: u64,
+    pub what: Generation,
+    pub progress: std::sync::Arc<progress::Progress>,
+    pub play: bool,
+}
+/// What `Generation::Operation` made: the operation's simulation, or why
+/// it could not be generated.
+#[derive(Clone)]
+pub struct Made(std::sync::Arc<Result<simulation::Simulation, String>>);
+impl std::fmt::Debug for Made {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match &*self.0 {
+            Ok(_) => "Made(Ok)",
+            Err(_) => "Made(Err)",
+        })
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditRow {
     pub setup: usize,
@@ -1254,6 +1368,7 @@ impl App {
         .iter()
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
         .collect();
+        let generate_inline = smoke_dir.is_some() || cfg!(test);
         Self {
             smoke_dir,
             smoke_step: 0,
@@ -1312,6 +1427,16 @@ impl App {
             holding_note: std::cell::RefCell::new(None),
             drill_holes: std::cell::RefCell::new(None),
             bottom_holes: std::cell::RefCell::new(None),
+            pocket_holes: std::cell::RefCell::new(None),
+            pocket_fits: std::cell::RefCell::new(None),
+            scrub_pending: false,
+            scrub_live: SCRUB_LIVE,
+            catching_up: None,
+            catch_up_epoch: 0,
+            last_scrub: Instant::now(),
+            generating: None,
+            generation_epoch: 0,
+            generate_inline,
             stock_pictures: Default::default(),
             post_epoch: 0,
             picture_job: None,
@@ -1434,6 +1559,8 @@ impl App {
         }
     }
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
+        // What is being generated is the old project's.
+        self.cancel_generation();
         self.machine_draft = doc
             .machines
             .first()
@@ -1592,12 +1719,63 @@ impl App {
     /// later setup is the box the earlier setups left when that is known,
     /// `known_stock`); without a stock nothing is written. Whether the setup changed (and was marked
     /// so): nothing is written or marked when the suggestion is what it has.
-    fn suggest_layout(&mut self) -> bool {
+    fn suggest_layout(&mut self) -> Task<Message> {
         let si = self.doc.index();
         let setup = self.doc.setup();
         if get(&setup.p, "holding") == "Chuck" {
-            return self.suggest_chuck(si);
+            // A chuck is chosen for the stock alone: no toolpaths are needed.
+            self.suggest_chuck(si);
+            return Task::none();
         }
+        if let Err(error) = holding::request(setup, self.doc.holder(get(&setup.p, "holder"))) {
+            self.status = error;
+            return Task::none();
+        }
+        let last = setup.operations.iter().rposition(|o| o.enabled);
+        let (Some(mesh), Some(last)) = (
+            self.imported_mesh.clone().filter(|_| !self.is_sample()),
+            last,
+        ) else {
+            self.place_layout(si, &[], None);
+            return Task::none();
+        };
+        // Generated off the window's thread, as Generate is.
+        let doc = self.doc.clone();
+        self.status = "Generating the setup's toolpaths to place its holding…".into();
+        self.generate(
+            Generation::Layout(si),
+            move || {
+                let mut generated: Vec<Option<simulation::Plan>> = vec![];
+                // What tells the bands a vise closes on: the setup's first
+                // simulation starts from the stock the earlier setups left.
+                let mut bands = None;
+                let setup = &doc.setups[si];
+                simulation::sequence(&doc, &mesh, Some((si, last)), |s, _, result| {
+                    if s == si {
+                        if generated.is_empty()
+                            && let Ok(first) = &result
+                        {
+                            bands = post::bands(setup, &mesh, first);
+                        }
+                        generated.push(result.ok().map(|sim| sim.plan));
+                    }
+                });
+                Laid(std::sync::Arc::new((generated, bands)))
+            },
+            Message::GeneratedLayout,
+        )
+    }
+    /// The rest of `suggest_layout`, once setup `si`'s toolpaths are
+    /// generated (`generated`, None for one that could not be).
+    fn place_layout(
+        &mut self,
+        si: usize,
+        generated: &[Option<simulation::Plan>],
+        bands: Option<&holding::Bands>,
+    ) -> bool {
+        let Some(setup) = self.doc.setups.get(si) else {
+            return false;
+        };
         let request = match holding::request(setup, self.doc.holder(get(&setup.p, "holder"))) {
             Ok(request) => request,
             Err(error) => {
@@ -1605,39 +1783,16 @@ impl App {
                 return false;
             }
         };
-        let mut generated: Vec<Option<simulation::Plan>> = vec![];
-        // What tells the bands a vise closes on: the setup's first simulation
-        // starts from the stock the earlier setups left.
-        let mut bands = None;
-        let last = self.doc.setups[si]
-            .operations
-            .iter()
-            .rposition(|o| o.enabled);
-        if let (Some(mesh), Some(last)) = (
-            self.imported_mesh.as_ref().filter(|_| !self.is_sample()),
-            last,
-        ) {
-            let setup = &self.doc.setups[si];
-            simulation::sequence(&self.doc, mesh, Some((si, last)), |s, _, result| {
-                if s == si {
-                    if generated.is_empty()
-                        && let Ok(first) = &result
-                    {
-                        bands = post::bands(setup, mesh, first);
-                    }
-                    generated.push(result.ok().map(|sim| sim.plan));
-                }
-            });
-        }
         let (refs, failed) = holding::gathered(generated.iter().map(Option::as_ref));
         // Without toolpaths, the stock the earlier setups left when that is known.
+        let known;
         let bands = if refs.is_empty() {
-            self.known_bands(si)
+            known = self.known_bands(si);
+            known.as_ref()
         } else {
             bands
         };
-        let Some((stock, layout)) =
-            request.suggest_on(&refs, || self.known_stock(si).0, bands.as_ref())
+        let Some((stock, layout)) = request.suggest_on(&refs, || self.known_stock(si).0, bands)
         else {
             self.status = "No layout suggested: this setup's stock is not known yet. Load the part and check the stock settings.".into();
             return false;
@@ -1651,7 +1806,7 @@ impl App {
         let layout = holding::layout(&self.doc.setups[si]).unwrap_or(layout);
         // Clear by the gap and the blend, as export checks and the suggestion kept.
         let holder = &request.holder;
-        let held = holding::gripped(&layout, holder, stock, bands.as_ref());
+        let held = holding::gripped(&layout, holder, stock, bands);
         let boxes = holding::boxes(&layout, holder, held).unwrap_or_default();
         let clashing = holding::clashes(&refs, &boxes, request.reach);
         let opening = holding::opening_issue(&layout, holder, held);
@@ -1704,7 +1859,105 @@ impl App {
         self.project_dirty = true;
         self.last_edit = Instant::now();
     }
+    /// Runs `work` off the window's thread with a progress the window shows
+    /// (`progress`), and sends what it makes back as `done` with this
+    /// generation's epoch; a generation under way is cancelled first. Inline
+    /// in the smoke run and the tests (`generate_inline`).
+    fn generate<T: Send + 'static>(
+        &mut self,
+        what: Generation,
+        work: impl FnOnce() -> T + Send + 'static,
+        done: fn(u64, T) -> Message,
+    ) -> Task<Message> {
+        if let Some(g) = self.generating.take() {
+            g.progress.cancel();
+        }
+        self.generation_epoch += 1;
+        let epoch = self.generation_epoch;
+        let progress = std::sync::Arc::new(progress::Progress::default());
+        self.generating = Some(Generating {
+            epoch,
+            what,
+            progress: progress.clone(),
+            play: false,
+        });
+        if self.generate_inline {
+            let made = progress.run(work);
+            return self.update(done(epoch, made));
+        }
+        Task::perform(
+            async move { tokio::task::spawn_blocking(move || progress.run(work)).await },
+            move |made| match made {
+                Ok(made) => done(epoch, made),
+                Err(e) => Message::GenerationFailed(epoch, format!("Generation failed: {e}")),
+            },
+        )
+    }
+    /// Replays the simulation to where the slider stands after a scrub too
+    /// long to replay while it moved (`scrub_pending`): off the window's
+    /// thread, on a copy (a few milliseconds even at a million moves), put
+    /// back when done if nothing moved meanwhile (`Message::Replayed`).
+    /// Playback starts then with `play`. Inline in the smoke run and tests.
+    fn catch_up(&mut self, play: bool) -> Task<Message> {
+        if !std::mem::take(&mut self.scrub_pending) {
+            return Task::none();
+        }
+        let Some(simulation) = &mut self.simulation else {
+            return Task::none();
+        };
+        let at = self.progress;
+        if self.generate_inline {
+            simulation.seek(at);
+            if play {
+                self.playing = true;
+                self.last_tick = Instant::now();
+            }
+            return Task::none();
+        }
+        self.catch_up_epoch += 1;
+        let epoch = self.catch_up_epoch;
+        self.catching_up = Some((epoch, at, play));
+        let mut copy = simulation.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    copy.seek(at);
+                    copy
+                })
+                .await
+            },
+            move |replayed| match replayed {
+                Ok(simulation) => {
+                    Message::Replayed(epoch, Replayed(std::sync::Arc::new(simulation)))
+                }
+                Err(_) => Message::ReplayFailed(epoch),
+            },
+        )
+    }
+    /// Stops the generation under way, if any: what it makes is dropped.
+    fn cancel_generation(&mut self) {
+        if let Some(g) = self.generating.take() {
+            g.progress.cancel();
+            if self.status.starts_with("Generating") {
+                self.status.clear();
+            }
+        }
+    }
+    /// The generation under way that `epoch` started, taken off: None when
+    /// it is stale (another started since, or it was cancelled).
+    fn finished(&mut self, epoch: u64) -> Option<Generating> {
+        self.generating.take_if(|g| g.epoch == epoch)
+    }
     fn touch(&mut self) {
+        // A generation under way makes the job as it was.
+        let placing = self
+            .generating
+            .as_ref()
+            .is_some_and(|g| matches!(g.what, Generation::Layout(_)));
+        self.cancel_generation();
+        if placing {
+            self.status = "The vise or clamps were not placed: the setup changed while its toolpaths were generated. Press Suggest layout to place them.".into();
+        }
         if !self.is_sample() {
             self.doc.sync_stock_sources();
             if self.doc.file.is_some()
@@ -2287,6 +2540,8 @@ impl App {
             .as_ref()
             .map(|s| (&s.mesh_fingerprint, &s.ids))
             .hash(&mut hasher);
+        // Helical milling lists the bores its flat end mill fits.
+        op.helical().hash(&mut hasher);
         let key = hasher.finish();
         let mut kept = self.drill_holes.borrow_mut();
         if let Some((k, found)) = kept.as_ref()
@@ -2297,6 +2552,83 @@ impl App {
         #[cfg(test)]
         DRILL_HOLE_RUNS.with(|n| n.set(n.get() + 1));
         let found = std::sync::Arc::new(cam::holes(setup, op, mesh));
+        *kept = Some((key, found.clone()));
+        found
+    }
+    /// The holes the selected walls of a Pocket or an inside Contour pick
+    /// (`pocket::holes`), for its Geometry tab: kept until the part, the
+    /// setup's placement or the selected surfaces change, as `drill_holes` is.
+    pub(crate) fn pocket_holes(
+        &self,
+        op: &Operation,
+        mesh: &mesh::Mesh,
+    ) -> std::sync::Arc<PocketHoles> {
+        let key = self.holes_key(op, mesh);
+        let mut kept = self.pocket_holes.borrow_mut();
+        if let Some((k, found)) = kept.as_ref()
+            && *k == key
+        {
+            return found.clone();
+        }
+        let ids = op
+            .surfaces
+            .iter()
+            .flat_map(|s| s.ids.iter().copied())
+            .collect();
+        let found = std::sync::Arc::new(pocket::holes(self.doc.setup(), &ids, mesh));
+        *kept = Some((key, found.clone()));
+        found
+    }
+    /// What the holes a Pocket's or Contour's walls pick are worked out from:
+    /// the part, the setup's placement and the selected surfaces.
+    fn holes_key(&self, op: &Operation, mesh: &mesh::Mesh) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let setup = self.doc.setup();
+        let mut hasher = std::hash::DefaultHasher::new();
+        mesh.fingerprint.hash(&mut hasher);
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+            get(&setup.p, key).hash(&mut hasher);
+        }
+        op.surfaces
+            .as_ref()
+            .map(|s| (&s.mesh_fingerprint, &s.ids))
+            .hash(&mut hasher);
+        hasher.finish()
+    }
+    /// Which levels of the holes a Pocket's or Contour's walls pick its flat
+    /// end mill fits with its radial allowance (`pocket::Hole::fits`): kept
+    /// as `pocket_holes` is, and until the tool or the allowance changes.
+    pub(crate) fn pocket_fits(
+        &self,
+        op: &Operation,
+        mesh: &mesh::Mesh,
+    ) -> std::sync::Arc<PocketFits> {
+        use std::hash::{Hash, Hasher};
+        let tool = self.doc.tools.iter().find(|t| t.id == op.tool);
+        let diameter = tool
+            .filter(|t| get(&t.p, "type") == "Flat end mill")
+            .and_then(|t| num(&t.p, "diameter"))
+            .filter(|d| *d > 0.);
+        let radial = num(&op.p, "allowance").filter(|a| *a >= 0.);
+        let holes = self.pocket_holes(op, mesh);
+        let mut hasher = std::hash::DefaultHasher::new();
+        self.holes_key(op, mesh).hash(&mut hasher);
+        diameter.map(f32::to_bits).hash(&mut hasher);
+        radial.map(f32::to_bits).hash(&mut hasher);
+        let key = hasher.finish();
+        let mut kept = self.pocket_fits.borrow_mut();
+        if let Some((k, found)) = kept.as_ref()
+            && *k == key
+        {
+            return found.clone();
+        }
+        let found = std::sync::Arc::new(match (&*holes, diameter, radial) {
+            (Ok(holes), Some(diameter), Some(radial)) if !holes.is_empty() => Some((
+                diameter,
+                holes.iter().map(|h| h.fits(diameter, radial)).collect(),
+            )),
+            _ => None,
+        });
         *kept = Some((key, found.clone()));
         found
     }
@@ -3229,6 +3561,15 @@ impl App {
                 return Task::batch([self.refresh_post(), restore, self.refresh_guide()]);
             }
             Message::SelectSetup(i) => {
+                // An operation's preview is generated for the setup it is in.
+                if i != self.doc.index()
+                    && self
+                        .generating
+                        .as_ref()
+                        .is_some_and(|g| matches!(g.what, Generation::Operation(..)))
+                {
+                    self.cancel_generation();
+                }
                 if let Some(s) = self.doc.setups.get(i) {
                     self.doc.active = s.id.clone();
                     self.stop_selection();
@@ -3238,6 +3579,13 @@ impl App {
                 }
             }
             Message::SelectOp(i) => {
+                if self
+                    .generating
+                    .as_ref()
+                    .is_some_and(|g| matches!(g.what, Generation::Operation(_, oi) if oi != i))
+                {
+                    self.cancel_generation();
+                }
                 if i < self.doc.setup().operations.len() {
                     if self.selected != Some(i) {
                         self.simulation = None;
@@ -3264,7 +3612,11 @@ impl App {
                 if let Some(row) = self.audit_report.get(i).cloned() {
                     let setup = self.update(Message::SelectSetup(row.setup));
                     let operation = self.update(Message::SelectOp(row.operation));
-                    if let Some(tab) = ui::issue_tab(&row.detail) {
+                    let tab = match self.operation() {
+                        Some(o) => ui::operation_issue_tab(o.strategy, &row.detail),
+                        None => ui::issue_tab(&row.detail),
+                    };
+                    if let Some(tab) = tab {
                         // A tab the operation does not have (a lathe Drill has
                         // no Passes) gives its place to the one with its sizes.
                         let tabs = (self.operation()).map(|o| o.tabs(&self.doc.setup().machine));
@@ -3380,8 +3732,9 @@ impl App {
                         ("holder", "Vise" | "Clamps") => get(&setup.p, "holder") != holder,
                         _ => false,
                     };
-                    if !suggest || !self.suggest_layout() {
-                        self.touch()
+                    self.touch();
+                    if suggest {
+                        return self.suggest_layout();
                     }
                 }
                 Target::Machine => {
@@ -3581,6 +3934,101 @@ impl App {
                     return Task::none();
                 }
                 let fingerprint = mesh.fingerprint.clone();
+                // A Pocket or an inside Contour takes a wall as its hole: every
+                // wall of it, added or removed together. A face that is
+                // neither a floor nor a wall (a cone, a chamfer, a fillet)
+                // takes the hole it borders, or nothing.
+                let picks_holes = self
+                    .operation()
+                    .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Contour));
+                let angles = ["rx", "ry", "rz"].map(|k| num(&self.doc.setup().p, k).unwrap_or(0.));
+                let up = mesh::rotation(mesh.surfaces[n].normal, angles)[2].abs();
+                let wall = pocket::is_wall(self.doc.setup(), mesh, n);
+                let sloped = !wall && up < 0.5f32.to_radians().cos();
+                if picks_holes && (wall || sloped) {
+                    // What a click here picks: the wall's hole, or the hole
+                    // past a sloping face (a cone, a chamfer, a fillet) or past
+                    // the one a wall's outline crosses (a screw hole's lip).
+                    let found = match wall.then(|| pocket::hole_walls(self.doc.setup(), mesh, n)) {
+                        Some(Err(e)) if e == pocket::LEANING => {
+                            pocket::hole_near(self.doc.setup(), mesh, n).unwrap_or(Err(e))
+                        }
+                        Some(found) => found,
+                        None => match pocket::hole_near(self.doc.setup(), mesh, n) {
+                            Some(Ok(walls)) => Ok(walls),
+                            _ => Err(format!(
+                                "That face slopes {:.0}°: it is no floor, and no hole past it can be picked from it. Click a flat floor, or a wall of a hole.",
+                                up.clamp(0., 1.).acos().to_degrees()
+                            )),
+                        },
+                    };
+                    // A click on a picked hole drops it, whether or not its own
+                    // outline picks a hole (`pocket::dropped`).
+                    let picked: std::collections::HashSet<usize> = (self.operation())
+                        .and_then(|o| o.surfaces.as_ref())
+                        .filter(|s| s.mesh_fingerprint == fingerprint)
+                        .map_or(Default::default(), |s| s.ids.iter().copied().collect());
+                    let holes = self.operation().map(|o| self.pocket_holes(o, mesh));
+                    let now: &[pocket::Hole] = holes
+                        .as_ref()
+                        .and_then(|h| h.as_ref().as_ref().ok())
+                        .map_or(&[], |h| h.as_slice());
+                    let clicked: Option<std::collections::HashSet<usize>> =
+                        found.as_ref().ok().map(|w| w.iter().copied().collect());
+                    let this = (clicked.as_ref())
+                        .and_then(|c| pocket::holes(self.doc.setup(), c, mesh).ok())
+                        .unwrap_or_default();
+                    let drop = pocket::dropped(now, &picked, n, clicked.as_ref(), &this);
+                    let named = |h: &pocket::Hole| {
+                        let ((x, y), (w, d)) = (h.centre(), h.size());
+                        format!("the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm)")
+                    };
+                    let said = match (&drop, this.first()) {
+                        (Some(_), _) => (0..now.len())
+                            .find(|&i| now[i].walls.contains(&n))
+                            .map(|i| named(&now[i]))
+                            .or_else(|| this.first().map(named))
+                            .map_or("Dropped the hole.".into(), |h| format!("Dropped {h}.")),
+                        (None, Some(h)) => format!("Picked {}: its walls are blue.", named(h)),
+                        (None, None) if clicked.is_some() => {
+                            "Picked the hole: its walls are blue.".into()
+                        }
+                        (None, None) => String::new(),
+                    };
+                    let walls = match (drop.is_some(), found) {
+                        (true, _) => vec![],
+                        (false, Ok(walls)) => walls,
+                        (false, Err(e)) => {
+                            self.status = e;
+                            return Task::none();
+                        }
+                    };
+                    if let Some(o) = self.operation_mut() {
+                        let selected = o.surfaces.get_or_insert_with(|| surface::Selection {
+                            mesh_fingerprint: fingerprint.clone(),
+                            ids: vec![],
+                        });
+                        if selected.mesh_fingerprint != fingerprint {
+                            selected.mesh_fingerprint = fingerprint;
+                            selected.ids.clear();
+                        }
+                        match drop {
+                            Some((drop, keep)) => selected
+                                .ids
+                                .retain(|id| !drop.contains(id) || keep.contains(id)),
+                            None => {
+                                selected.ids.retain(|id| !walls.contains(id));
+                                selected.ids.extend(walls);
+                            }
+                        }
+                        o.geometry.clear();
+                    }
+                    self.touch();
+                    if !said.is_empty() {
+                        self.status = said;
+                    }
+                    return Task::none();
+                }
                 if let Some(o) = self.operation_mut() {
                     let selected = o.surfaces.get_or_insert_with(|| surface::Selection {
                         mesh_fingerprint: fingerprint.clone(),
@@ -3601,6 +4049,35 @@ impl App {
                     o.geometry.clear();
                 }
                 self.touch();
+            }
+            Message::DropHole(i) => {
+                let Some(mesh) = self.imported_mesh.clone() else {
+                    return Task::none();
+                };
+                let Some(holes) = self.operation().map(|o| self.pocket_holes(o, &mesh)) else {
+                    return Task::none();
+                };
+                let Some(Some(hole)) = holes.as_ref().as_ref().ok().map(|h| h.get(i)) else {
+                    return Task::none();
+                };
+                let ((x, y), (w, d)) = (hole.centre(), hole.size());
+                let said = format!("Dropped the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm).");
+                let drop: std::collections::HashSet<usize> = hole.walls.iter().copied().collect();
+                let keep: std::collections::HashSet<usize> =
+                    (holes.as_ref().as_ref().unwrap().iter())
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .flat_map(|(_, h)| h.walls.iter().copied())
+                        .collect();
+                if let Some(o) = self.operation_mut()
+                    && let Some(selected) = &mut o.surfaces
+                {
+                    selected
+                        .ids
+                        .retain(|id| !drop.contains(id) || keep.contains(id));
+                }
+                self.touch();
+                self.status = said;
             }
             Message::ClearSurfaces => {
                 if let Some(o) = self.operation_mut() {
@@ -3731,50 +4208,28 @@ impl App {
                 } else if !self.is_sample() {
                     self.playing = false;
                     self.simulation = None;
-                    let result = self
-                        .imported_mesh
-                        .as_ref()
-                        .ok_or_else(|| "Load the part first.".to_string())
-                        .and_then(|mesh| {
-                            simulation::prepare(
-                                &self.doc,
-                                mesh,
-                                self.doc.index(),
-                                self.selected.ok_or("Select an operation first.")?,
-                            )
-                        });
-                    match result {
-                        Ok(sim) => {
-                            let plan = &sim.plan;
-                            // A hand machine has no program to export, and a lathe
-                            // setup's cut is checked against its chuck.
-                            let next = if manual::is_hand(&self.doc.setup().machine) {
-                                HAND_NEXT
-                            } else {
-                                CNC_NEXT
-                            };
-                            let fixtures = if ui::chuck_modelled(self) {
-                                CHUCK_CHECKED
-                            } else {
-                                ui::fixtures(ui::Note::Preview, ui::modelled(self))
-                            };
-                            self.status = format!(
-                                "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} {next}",
-                                plan.strategy.name(),
-                                plan.levels,
-                                plan.duration / 60.,
-                                sim.preceding,
-                                fixtures
-                            );
-                            self.simulation = Some(sim);
-                            self.progress = 0.;
-                            self.speed = 30.;
-                            self.paths = true;
-                            self.stock = true;
-                            self.picking = false;
-                        }
-                        Err(error) => self.status = error,
-                    }
+                    let (Some(mesh), Some(oi)) = (self.imported_mesh.clone(), self.selected) else {
+                        self.status = if self.imported_mesh.is_none() {
+                            "Load the part first.".into()
+                        } else {
+                            "Select an operation first.".into()
+                        };
+                        return Task::none();
+                    };
+                    let (doc, si) = (self.doc.clone(), self.doc.index());
+                    self.status = format!(
+                        "Generating {}…",
+                        self.operation().map_or("the operation", |o| o.name())
+                    );
+                    return self.generate(
+                        Generation::Operation(si, oi),
+                        move || {
+                            Made(std::sync::Arc::new(simulation::prepare(
+                                &doc, &mesh, si, oi,
+                            )))
+                        },
+                        Message::Generated,
+                    );
                 } else if self.doc.setup().is_repositioned() {
                     self.status="Setup saved. Toolpath computation for repositioned parts will require the CAM engine.".into()
                 } else if let Some(o) = self.operation_mut() {
@@ -3785,48 +4240,127 @@ impl App {
                             .into();
                 }
             }
+            Message::Generated(epoch, made) => {
+                let Some(g) = self.finished(epoch) else {
+                    return Task::none();
+                };
+                // Made for the operation picked when it began.
+                if g.what
+                    != Generation::Operation(self.doc.index(), self.selected.unwrap_or(usize::MAX))
+                {
+                    return Task::none();
+                }
+                match (*made.0).clone() {
+                    Ok(sim) => {
+                        let plan = &sim.plan;
+                        // A hand machine has no program to export, and a lathe
+                        // setup's cut is checked against its chuck.
+                        let next = if manual::is_hand(&self.doc.setup().machine) {
+                            HAND_NEXT
+                        } else {
+                            CNC_NEXT
+                        };
+                        let fixtures = if ui::chuck_modelled(self) {
+                            CHUCK_CHECKED
+                        } else {
+                            ui::fixtures(ui::Note::Preview, ui::modelled(self))
+                        };
+                        self.status = format!(
+                            "{} preview ready: {} levels, {:.1} min estimated. Inherits stock after {} earlier operations across setups. Sampled removal; {} {next}",
+                            plan.strategy.name(),
+                            plan.levels,
+                            plan.duration / 60.,
+                            sim.preceding,
+                            fixtures
+                        );
+                        self.simulation = Some(sim);
+                        self.progress = 0.;
+                        self.speed = 30.;
+                        self.paths = true;
+                        self.stock = true;
+                        self.picking = false;
+                        if g.play {
+                            self.playing = true;
+                            self.last_tick = Instant::now();
+                        }
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::GeneratedAll(epoch, report) => {
+                if self.finished(epoch).is_none() {
+                    return Task::none();
+                }
+                self.status = format!(
+                    "Checked {} enabled operations: {} generated, {} need attention. Remaining stock is carried through operations and setups.",
+                    report.len(),
+                    report.iter().filter(|r| r.ok).count(),
+                    report.iter().filter(|r| !r.ok).count()
+                );
+                self.audit_report = report;
+                self.page = Page::Audit;
+            }
+            Message::GeneratedLayout(epoch, laid) => {
+                let Some(g) = self.finished(epoch) else {
+                    return Task::none();
+                };
+                if let Generation::Layout(si) = g.what {
+                    let (generated, bands) = &*laid.0;
+                    self.place_layout(si, generated, bands.as_ref());
+                }
+            }
+            Message::GenerationFailed(epoch, error) => {
+                if self.finished(epoch).is_some() {
+                    self.status = error;
+                }
+            }
+            Message::CancelGenerate => {
+                if self.generating.is_some() {
+                    self.cancel_generation();
+                    self.status = progress::CANCELLED.into();
+                }
+            }
             Message::GenerateAll => {
                 if !self.is_sample() {
                     self.audit_report.clear();
-                    if let Some(mesh) = &self.imported_mesh {
-                        let mut report = vec![];
-                        simulation::sequence(&self.doc, mesh, None, |si, oi, result| {
-                            let setup = &self.doc.setups[si];
-                            let op = &setup.operations[oi];
-                            let (ok, detail) = match result {
-                                Ok(sim) => (
-                                    true,
-                                    format!(
-                                        "Generated {} moves · {:.1} min · inherits stock after {} operations",
-                                        sim.plan.moves.len(),
-                                        sim.plan.duration / 60.,
-                                        sim.preceding
-                                    ),
-                                ),
-                                Err(error) => (false, error),
-                            };
-                            report.push(AuditRow {
-                                setup: si,
-                                operation: oi,
-                                name: format!("{} / {}", setup.name(), op.name()),
-                                ok,
-                                detail,
-                            });
-                        });
-                        self.audit_report = report;
-                    } else {
+                    let Some(mesh) = self.imported_mesh.clone() else {
                         self.status = "Load the imported part first.".into();
                         self.page = Page::Audit;
                         return Task::none();
-                    }
-                    self.status = format!(
-                        "Checked {} enabled operations: {} generated, {} need attention. Remaining stock is carried through operations and setups.",
-                        self.audit_report.len(),
-                        self.audit_report.iter().filter(|r| r.ok).count(),
-                        self.audit_report.iter().filter(|r| !r.ok).count()
+                    };
+                    let doc = self.doc.clone();
+                    self.status = "Generating every enabled operation…".into();
+                    return self.generate(
+                        Generation::All,
+                        move || {
+                            let mut report = vec![];
+                            simulation::sequence(&doc, &mesh, None, |si, oi, result| {
+                                let setup = &doc.setups[si];
+                                let op = &setup.operations[oi];
+                                let (ok, detail) = match result {
+                                    Ok(sim) => (
+                                        true,
+                                        format!(
+                                            "Generated {} moves · {:.1} min · inherits stock after {} operations",
+                                            sim.plan.moves.len(),
+                                            sim.plan.duration / 60.,
+                                            sim.preceding
+                                        ),
+                                    ),
+                                    Err(error) => (false, error),
+                                };
+                                report.push(AuditRow {
+                                    setup: si,
+                                    operation: oi,
+                                    name: format!("{} / {}", setup.name(), op.name()),
+                                    ok,
+                                    detail,
+                                });
+                            });
+                            report
+                        },
+                        Message::GeneratedAll,
                     );
-                    self.page = Page::Audit;
-                    return Task::none();
                 }
                 let issues = self.job_issues();
                 if !issues.is_empty() {
@@ -4500,7 +5034,7 @@ impl App {
                 }
             }
             Message::SuggestLayout => {
-                self.suggest_layout();
+                return self.suggest_layout();
             }
             Message::SetClamps(text) => match holding::check_clamps(self.doc.setup(), &text) {
                 Ok(()) => {
@@ -4853,9 +5387,28 @@ impl App {
                         .operation()
                         .is_some_and(|o| o.enabled && o.strategy.imported_preview())
                 {
-                    let _ = self.update(Message::Generate);
+                    let task = self.update(Message::Generate);
+                    // Off the window's thread: playback starts when it is done.
+                    if let Some(g) = &mut self.generating {
+                        g.play = true;
+                        return task;
+                    }
                 }
                 if self.playback_ready() {
+                    // A scrub still to be replayed is, first: playback starts
+                    // when it is done.
+                    if self.scrub_pending && !self.playing {
+                        return self.catch_up(true);
+                    }
+                    // One replaying off the window's thread: playback starts
+                    // when it is put back.
+                    if let Some(catching) = &mut self.catching_up
+                        && !self.playing
+                    {
+                        // Again: not when it is put back after all.
+                        catching.2 = !catching.2;
+                        return Task::none();
+                    }
                     self.playing = !self.playing;
                     if self.progress >= 1. {
                         self.progress = 0.;
@@ -4879,8 +5432,46 @@ impl App {
                 }
                 self.progress = if v.is_finite() { v.clamp(0., 1.) } else { 0. };
                 self.playing = false;
+                self.last_scrub = Instant::now();
+                // A catch-up under way replays to where the slider was.
+                self.catching_up = None;
+                // A scrub that would replay many moves waits for the slider
+                // to be let go, so dragging it does not stall the window.
                 if let Some(simulation) = &mut self.simulation {
-                    simulation.seek(self.progress);
+                    if simulation.replay(self.progress) <= self.scrub_live {
+                        simulation.seek(self.progress);
+                        self.scrub_pending = false;
+                    } else {
+                        self.scrub_pending = true;
+                    }
+                }
+            }
+            Message::ScrubDone => return self.catch_up(false),
+            Message::ReplayFailed(epoch) => {
+                if self.catching_up.take_if(|c| c.0 == epoch).is_some() {
+                    self.status =
+                        "Replaying the toolpath to the slider failed: move the slider again."
+                            .into();
+                }
+            }
+            Message::Replayed(epoch, replayed) => {
+                let Some((_, at, play)) = self.catching_up.take_if(|c| c.0 == epoch) else {
+                    return Task::none();
+                };
+                // Only into the simulation it was replayed from, still there.
+                if self
+                    .simulation
+                    .as_ref()
+                    .is_some_and(|s| s.id == replayed.0.id)
+                    && self.progress == at
+                {
+                    self.simulation = Some(
+                        std::sync::Arc::try_unwrap(replayed.0).unwrap_or_else(|s| (*s).clone()),
+                    );
+                    if play {
+                        self.playing = true;
+                        self.last_tick = Instant::now();
+                    }
                 }
             }
             Message::Speed(v) => {
@@ -4989,7 +5580,9 @@ impl App {
                 let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.2);
                 self.last_tick = now;
                 self.playing &= !self.locked();
-                if self.playing {
+                // The simulation is being replayed to the slider off the
+                // window's thread: playback waits for it.
+                if self.playing && self.catching_up.is_none() {
                     let duration = self
                         .active_simulation()
                         .map_or(1. / 0.07, |s| s.plan.duration);
@@ -5001,6 +5594,14 @@ impl App {
                         self.playing = false;
                     }
                 }
+                // A scrub the slider was not let go after (arrow keys, the
+                // wheel) is replayed once it has been still a moment.
+                let settled =
+                    if self.scrub_pending && now.duration_since(self.last_scrub) > SCRUB_SETTLE {
+                        self.catch_up(false)
+                    } else {
+                        Task::none()
+                    };
                 let paused = now.duration_since(self.last_edit) > EDIT_PAUSE;
                 if self.dirty && paused {
                     self.persist()
@@ -5028,6 +5629,7 @@ impl App {
                 };
                 return Task::batch([
                     close,
+                    settled,
                     self.picture_run(),
                     self.refresh_stock_surface(),
                     self.refresh_post(),
@@ -5644,6 +6246,8 @@ impl App {
     /// the F1-pinned card shows an animation that is not paused (issue #186).
     pub fn ticks_fast(&self) -> bool {
         self.playing
+            || self.generating.is_some()
+            || self.scrub_pending
             || self.help_animating
             || self.control.is_some()
             || (self

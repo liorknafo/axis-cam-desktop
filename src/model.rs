@@ -602,6 +602,22 @@ pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
 pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// A Drill operation's cycles. The last, `HELICAL_MILLING`, mills each hole
+/// with a flat end mill instead of drilling it.
+pub const DRILL_CYCLES: [&str; 5] = [
+    "Drilling",
+    "Chip breaking",
+    "Deep drilling",
+    "Counterboring",
+    HELICAL_MILLING,
+];
+/// The Drill cycle that mills each round hole with a flat end mill: down a
+/// helix to a flat bottom, in rings out to the hole's size when it is over
+/// twice the cutter's.
+pub const HELICAL_MILLING: &str = "Helical milling";
+/// Why a drill's pin-hole Drill refuses Helical milling, which it would
+/// drill as a plain plunge (`cam::pin_holes`).
+pub const HELICAL_PIN_DRILL: &str = "A drill drills the pin holes: Helical milling is for a flat end mill. Choose another drilling cycle, or a flat end mill.";
 /// How Adaptive clearing enters material it cannot reach from the side
 /// (its `ramp` setting).
 pub const ADAPTIVE_ENTRIES: [&str; 2] = ["Helix", "Plunge"];
@@ -932,6 +948,13 @@ impl Operation {
     }
     pub fn name(&self) -> &str {
         get(&self.p, "name")
+    }
+    /// A Drill operation that mills its holes (`HELICAL_MILLING`). A Drill
+    /// of the pin holes is not: it mills them its own way (`cam::pin_holes`).
+    pub fn helical(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == HELICAL_MILLING
+            && !self.drills_pin_holes()
     }
     /// Whether this is a Drill of the pin holes in the stock's leftover
     /// (`DRILL_HOLES`), which selects no surfaces.
@@ -1273,12 +1296,19 @@ impl Operation {
                         "Choose a drill, or a flat end mill to mill them, for the pin holes."
                             .into(),
                     )
+                } else if get(&t.p, "type") == "Drill" && get(&self.p, "cycle") == HELICAL_MILLING {
+                    e.push(HELICAL_PIN_DRILL.into())
                 }
+            } else if self.helical() && crate::lathe::is_lathe(m) {
+                // Its own issue below: the tool is not what is wrong.
+            } else if self.helical() && get(&t.p, "type") != "Flat end mill" {
+                e.push("Choose a flat end mill for Helical milling.".into())
             } else if self.strategy == Strategy::Drill
+                && !self.helical()
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
             {
                 e.push(
-                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle."
+                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill."
                         .into(),
                 )
             }
@@ -1346,6 +1376,17 @@ impl Operation {
             e.push("Choose a machine configured for simultaneous 5-axis motion.".into())
         }
         if s == Strategy::Drill {
+            if manual::is_manual(m) && self.helical() {
+                e.push(manual::HELICAL_ON_MANUAL.into())
+            }
+            if crate::lathe::is_lathe(m) && self.helical() {
+                e.push(crate::lathe::HELICAL_ON_LATHE.into())
+            }
+            if self.helical() {
+                positive(&self.p, "stepdown", &mut e);
+                bounded(&self.p, "stepover", 1., 100., &mut e);
+                bounded(&self.p, "tolerance", 0.001, 0.1, &mut e)
+            }
             if ["Chip breaking", "Deep drilling"].contains(&get(&self.p, "cycle")) {
                 positive(&self.p, "peck", &mut e)
             }
@@ -1786,8 +1827,9 @@ impl Document {
     /// Gives every operation the speed and feed `material::recommend` gives
     /// for the selected material, its tool and its setup's machine, whatever
     /// it had: the same material always gives the same speeds. Drilling
-    /// operations keep theirs (it would give them an end mill's chip load),
-    /// and so do those it cannot give one: without a tool, whose tool has no
+    /// operations keep theirs (it would give them an end mill's chip load;
+    /// Helical milling, which cuts with an end mill, is given one), and so
+    /// do those it cannot give one: without a tool, whose tool has no
     /// diameter or flutes, or whose machine has no maximum spindle speed or
     /// feed. Returns what changed, old to new, and why any was not set, for
     /// the status; nothing without a material or an operation.
@@ -1809,7 +1851,7 @@ impl Document {
                 let (setup, op) = (&self.setups[si], &self.setups[si].operations[oi]);
                 // The chip loads are an end mill's per tooth; a drill's feed
                 // is per revolution, which the library has no data for.
-                if op.strategy == Strategy::Drill {
+                if op.strategy == Strategy::Drill && !op.helical() {
                     if !matches!(self.speed_feed(setup, op), Some(SpeedFeed::InRange { .. })) {
                         drills += 1;
                     }
@@ -2863,6 +2905,86 @@ mod tests {
         let mut d = Document::sample();
         d.setup_mut().operations[0].geometry.clear();
         assert!(d.issues().iter().any(|s| s.contains("Select at least")))
+    }
+    #[test]
+    fn helical_milling_takes_a_flat_end_mill_its_pass_settings_and_a_cnc() {
+        let (drill, mill) = (
+            Tool::new("Drill 3", "Drill", "3"),
+            Tool::new("End mill 1", "Flat end mill", "1"),
+        );
+        let tools = [drill.clone(), mill.clone()];
+        let m = Machine::new(3);
+        let mut o = Operation::new(Strategy::Drill, mill.id.clone());
+        o.geometry.clear();
+        o.surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: String::new(),
+            ids: vec![1],
+        });
+        // An end mill does not drill.
+        assert!(
+            o.issues(&m, &tools, &[])
+                .iter()
+                .any(|i| i.starts_with("Choose a drill"))
+        );
+        o.p.insert("cycle".into(), HELICAL_MILLING.into());
+        assert!(o.helical());
+        let only = |o: &Operation, m: &Machine| -> Vec<String> {
+            o.issues(m, &tools, &[])
+                .into_iter()
+                .filter(|i| {
+                    i.contains("elical")
+                        || i.starts_with("Choose")
+                        || ["stepdown ", "stepover ", "tolerance "]
+                            .iter()
+                            .any(|k| i.starts_with(k))
+                })
+                .collect()
+        };
+        assert_eq!(only(&o, &m), Vec::<String>::new());
+        // It mills with the end mill's side: a drill cannot.
+        o.tool = drill.id.clone();
+        assert_eq!(
+            only(&o, &m),
+            ["Choose a flat end mill for Helical milling."]
+        );
+        o.tool = mill.id.clone();
+        for (k, v) in [("stepdown", "0"), ("stepover", "150"), ("tolerance", "1")] {
+            let mut bad = o.clone();
+            bad.p.insert(k.into(), v.into());
+            assert_eq!(only(&bad, &m).len(), 1, "{k}");
+        }
+        // A manual mill moves one axis at a time.
+        let manual = crate::manual::defaults();
+        assert!(
+            o.issues(&manual, &tools, &[])
+                .contains(&crate::manual::HELICAL_ON_MANUAL.to_string())
+        );
+        // A lathe drills on the centre (a Drill copied from a mill): the
+        // cycle is what is wrong, whatever the tool.
+        let lathe = crate::lathe::defaults();
+        for tool in [&drill, &mill] {
+            o.tool = tool.id.clone();
+            assert_eq!(only(&o, &lathe), [crate::lathe::HELICAL_ON_LATHE]);
+        }
+        // Switched to the pin holes, a drill would plunge them: the cycle
+        // is refused. An end mill mills them whatever the cycle says.
+        o.p.insert("holes".into(), DRILL_HOLES[1].into());
+        o.tool = drill.id.clone();
+        assert!(
+            o.issues(&m, &tools, &[])
+                .contains(&HELICAL_PIN_DRILL.to_string())
+        );
+        o.tool = mill.id.clone();
+        assert!(
+            !o.issues(&m, &tools, &[])
+                .contains(&HELICAL_PIN_DRILL.to_string())
+        );
+        o.p.insert("cycle".into(), DRILL_CYCLES[0].into());
+        o.tool = drill.id.clone();
+        assert!(
+            !o.issues(&m, &tools, &[])
+                .contains(&HELICAL_PIN_DRILL.to_string())
+        );
     }
     #[test]
     fn incompatible_pick_ignored() {

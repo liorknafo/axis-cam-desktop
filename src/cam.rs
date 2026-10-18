@@ -12,7 +12,21 @@ use crate::{
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
-pub(crate) const LIMIT: usize = 30_000;
+/// The most moves (or samples) a toolpath may have: what memory takes, not
+/// what a preview can draw. A move takes about 190 bytes with the stock cut
+/// it leaves and the copies the simulation keeps (a Pocket of 15.3 million
+/// peaked at 2.9 GB), so this is about 1 GB. A long toolpath is generated
+/// off the window's thread, with progress and Cancel (`progress`); this only
+/// stops a mistyped stepdown or stepover from filling the memory. The
+/// largest real job seen, the TOTEM case's holes in one Pocket at 0.25 mm
+/// stepdown, is 270,000.
+pub(crate) const CEILING: usize = 5_000_000;
+/// The refusal past `CEILING`.
+pub(crate) fn too_many(what: &str) -> String {
+    format!(
+        "This toolpath would have more than 5 million {what}, more than memory holds. Check its stepdown, stepover and tolerance."
+    )
+}
 pub(crate) fn number(op: &Operation, key: &str) -> Result<f32, String> {
     num(&op.p, key).ok_or_else(|| format!("Enter a finite {} value.", key.replace('_', " ")))
 }
@@ -271,9 +285,11 @@ impl Builder {
         Ok(())
     }
     fn leg(&mut self, to: [f32; 3], motion: Motion, cut: bool, rate: f32) -> Result<(), String> {
-        if self.plan.moves.len() >= LIMIT {
-            return Err("Preview exceeds 30,000 moves. Increase spacing or stepdown.".into());
+        if self.plan.moves.len() >= CEILING {
+            return Err(too_many("moves"));
         }
+        // Each strategy counts its own steps (levels, holes, rows).
+        crate::progress::check()?;
         let distance = (0..3)
             .map(|i| (to[i] - self.pos[i]).powi(2))
             .sum::<f32>()
@@ -466,8 +482,8 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
     let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
     b.plan.rest_top = (cutting_top < top - 0.0001).then_some(cutting_top);
     let levels = ((cutting_top - target - 0.0001) / down).ceil().max(1.) as usize;
-    if levels > 1000 {
-        return Err("Too many contour levels.".into());
+    if levels > CEILING {
+        return Err(too_many("moves"));
     }
     let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
     if !crate::model::FACING_MILLING.contains(&pocket_setting(&op.p, "pocket_milling")) {
@@ -567,7 +583,9 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             ));
         }
     }
+    crate::progress::expect(levels);
     for level in 1..=levels {
+        crate::progress::report(level)?;
         let z = (cutting_top - level as f32 * down).max(target);
         for points in &loops {
             let points = match &tabs {
@@ -706,7 +724,7 @@ fn boxed(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     let steps = |from: f32, to: f32, by: f32| -> Vec<f32> {
         let n = ((to - from).abs() / by - 0.0001)
             .ceil()
-            .clamp(1., LIMIT as f32) as usize;
+            .clamp(1., CEILING as f32) as usize;
         (1..=n)
             .map(|i| {
                 if i == n {
@@ -942,6 +960,7 @@ pub struct Hole {
     /// Narrowest diameter down to the bottom: the largest drill that fits. A
     /// bore whose corridor is a ring of its own chords is read at their ends,
     /// its nominal size, not at the chords' midpoints a sagitta inside it.
+    /// For Helical milling, the bore a flat end mill fits down to `bottom`.
     pub diameter: f32,
     pub opening: f32,
     /// How far the opening's chords lie inside its circle, R(1 − cos(π/n))
@@ -949,6 +968,8 @@ pub struct Hole {
     /// twice this.
     pub sagitta: f32,
     pub top: f32,
+    /// The height of its centre's floor; for Helical milling, of the flat
+    /// floor a flat end mill stops on.
     pub bottom: f32,
     /// The bottom is the model's bottom: nothing of the part is under it.
     pub through: bool,
@@ -965,7 +986,14 @@ pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, St
     if selected.is_empty() {
         return Err("Select the horizontal face containing the hole openings.".into());
     }
-    let holes = round_holes(&g, &selected)?;
+    let mut holes = round_holes(&g, &selected)?;
+    // Helical milling's flat end mill: each hole as it mills it, the bore it
+    // fits down to the flat floor it stops on.
+    if op.helical() {
+        for h in &mut holes {
+            (h.bottom, h.diameter) = milled_bore(&g, h);
+        }
+    }
     if holes.is_empty() {
         Err("No unobstructed circular holes were found in the selected face. Select the top rim containing hole openings.".into())
     } else {
@@ -1050,106 +1078,11 @@ fn round_holes(g: &Geometry, selected: &[&Triangle]) -> Result<Vec<Hole>, String
                 .fold(0., f32::max);
             31f32.to_radians().tan().max(cone)
         };
-        let above = |p: &[f32; 3]| {
-            p[2] - point * ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt()
-        };
-        let mut corridor = radius;
-        // The nearest vertex of the triangle that sets the corridor: on a
-        // bore's wall an end of the chord whose midpoint set it, a sagitta
-        // past it; on a ledge or a boss much farther than its nearest point.
-        let mut ring = None;
-        for triangle in &g.triangles {
-            // Each edge is split at its point nearest the centre, where the
-            // cone is lowest under it, so that a ledge whose edge passes the
-            // centre closer than its ends is not taken for floor.
-            let mut outline = vec![];
-            for (a, b) in triangle
-                .p
-                .iter()
-                .zip(triangle.p.iter().cycle().skip(1))
-                .take(3)
-            {
-                outline.push(*a);
-                let v = [b[0] - a[0], b[1] - a[1]];
-                let l2 = v[0] * v[0] + v[1] * v[1];
-                if l2 >= 1e-12 {
-                    let t = ((center[0] - a[0]) * v[0] + (center[1] - a[1]) * v[1]) / l2;
-                    if t > 0. && t < 1. {
-                        outline.push(std::array::from_fn(|k| a[k] + t * (b[k] - a[k])));
-                    }
-                }
-            }
-            let mut polygon = vec![];
-            let z = bottom + 0.02;
-            for (a, b) in outline
-                .iter()
-                .zip(outline.iter().cycle().skip(1))
-                .take(outline.len())
-            {
-                let (above_a, above_b) = (above(a), above(b));
-                if above_a >= z {
-                    polygon.push((a[0] as f64, a[1] as f64));
-                }
-                if (above_a >= z) != (above_b >= z) {
-                    let t = (z - above_a) / (above_b - above_a);
-                    polygon.push((
-                        (a[0] + t * (b[0] - a[0])) as f64,
-                        (a[1] + t * (b[1] - a[1])) as f64,
-                    ));
-                }
-            }
-            if polygon.len() < 2 {
-                continue;
-            }
-            if contains(
-                std::slice::from_ref(&polygon),
-                (center[0] as f64, center[1] as f64),
-            ) {
-                corridor = 0.;
-                break;
-            }
-            let mut nearest = f32::INFINITY;
-            for (a, b) in polygon
-                .iter()
-                .zip(polygon.iter().cycle().skip(1))
-                .take(polygon.len())
-            {
-                let v = [(b.0 - a.0) as f32, (b.1 - a.1) as f32];
-                let l2 = v[0] * v[0] + v[1] * v[1];
-                let t = if l2 < 1e-12 {
-                    0.
-                } else {
-                    (((center[0] - a.0 as f32) * v[0] + (center[1] - a.1 as f32) * v[1]) / l2)
-                        .clamp(0., 1.)
-                };
-                nearest = nearest.min(
-                    ((center[0] - a.0 as f32 - t * v[0]).powi(2)
-                        + (center[1] - a.1 as f32 - t * v[1]).powi(2))
-                    .sqrt(),
-                );
-            }
-            if nearest < corridor {
-                corridor = nearest;
-                ring = Some(
-                    triangle
-                        .p
-                        .iter()
-                        .map(|p| ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt())
-                        .fold(f32::INFINITY, f32::min),
-                );
-            }
-        }
+        let (corridor, bore) = corridor(g, center, bottom + 0.02, point, radius);
         if corridor < 0.1 {
             continue;
         }
-        // A corridor set by a chord whose ends lie a sagitta past it (of the
-        // opening's tessellation or a finer one) is the chord's ring, a circle
-        // through those ends: the bore is read there, its nominal size, where
-        // the chord's midpoint is the inscribed polygon's.
-        let diameter = match ring {
-            Some(v) if v >= corridor && v - corridor <= sagitta * 1.1 + 0.001 => v * 2.,
-            _ => corridor * 2.,
-        };
+        let diameter = bore * 2.;
         holes.push(Hole {
             center,
             diameter,
@@ -1166,6 +1099,135 @@ fn round_holes(g: &Geometry, selected: &[&Triangle]) -> Result<Vec<Hole>, String
             .then(a.center[1].total_cmp(&b.center[1]))
     });
     Ok(holes)
+}
+/// The narrowest vertical corridor round `center` above the height `z`,
+/// starting from `radius`: how close to the centre the part comes anywhere
+/// above `z`, a drill's point (rising `point` per mm from the axis) taken
+/// off it, 0 when the part covers the centre. With it, the distance from
+/// the centre of the nearest vertex of the triangle that sets it.
+fn corridor(g: &Geometry, center: [f32; 2], z: f32, point: f32, radius: f32) -> (f32, f32) {
+    let above = |p: &[f32; 3]| {
+        p[2] - point * ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt()
+    };
+    let mut corridor = radius;
+    // Each triangle standing over `z`: its nearest point to the centre, its
+    // nearest corner's distance, the angle at the centre between its corners
+    // about that near (0 for one), and whether it is upright (a wall's).
+    let mut faces: Vec<(f32, f32, f32, bool)> = vec![];
+    for triangle in &g.triangles {
+        // Each edge is split at its point nearest the centre, where the
+        // cone is lowest under it, so that a ledge whose edge passes the
+        // centre closer than its ends is not taken for floor.
+        let mut outline = vec![];
+        for (a, b) in triangle
+            .p
+            .iter()
+            .zip(triangle.p.iter().cycle().skip(1))
+            .take(3)
+        {
+            outline.push(*a);
+            let v = [b[0] - a[0], b[1] - a[1]];
+            let l2 = v[0] * v[0] + v[1] * v[1];
+            if l2 >= 1e-12 {
+                let t = ((center[0] - a[0]) * v[0] + (center[1] - a[1]) * v[1]) / l2;
+                if t > 0. && t < 1. {
+                    outline.push(std::array::from_fn(|k| a[k] + t * (b[k] - a[k])));
+                }
+            }
+        }
+        let mut polygon = vec![];
+        for (a, b) in outline
+            .iter()
+            .zip(outline.iter().cycle().skip(1))
+            .take(outline.len())
+        {
+            let (above_a, above_b) = (above(a), above(b));
+            if above_a >= z {
+                polygon.push((a[0] as f64, a[1] as f64));
+            }
+            if (above_a >= z) != (above_b >= z) {
+                let t = (z - above_a) / (above_b - above_a);
+                polygon.push((
+                    (a[0] + t * (b[0] - a[0])) as f64,
+                    (a[1] + t * (b[1] - a[1])) as f64,
+                ));
+            }
+        }
+        if polygon.len() < 2 {
+            continue;
+        }
+        if contains(
+            std::slice::from_ref(&polygon),
+            (center[0] as f64, center[1] as f64),
+        ) {
+            return (0., 0.);
+        }
+        let mut nearest = f32::INFINITY;
+        for (a, b) in polygon
+            .iter()
+            .zip(polygon.iter().cycle().skip(1))
+            .take(polygon.len())
+        {
+            let v = [(b.0 - a.0) as f32, (b.1 - a.1) as f32];
+            let l2 = v[0] * v[0] + v[1] * v[1];
+            let t = if l2 < 1e-12 {
+                0.
+            } else {
+                (((center[0] - a.0 as f32) * v[0] + (center[1] - a.1 as f32) * v[1]) / l2)
+                    .clamp(0., 1.)
+            };
+            nearest = nearest.min(
+                ((center[0] - a.0 as f32 - t * v[0]).powi(2)
+                    + (center[1] - a.1 as f32 - t * v[1]).powi(2))
+                .sqrt(),
+            );
+        }
+        corridor = corridor.min(nearest);
+        let distance = |p: &[f32; 3]| (p[0] - center[0]).hypot(p[1] - center[1]);
+        let corners = triangle
+            .p
+            .iter()
+            .map(distance)
+            .fold(f32::INFINITY, f32::min);
+        let angles: Vec<f32> = (triangle.p.iter())
+            .filter(|p| distance(p) <= corners * 1.03 + 0.002 && distance(p) > 1e-4)
+            .map(|p| (p[1] - center[1]).atan2(p[0] - center[0]))
+            .collect();
+        let span = (angles.iter())
+            .flat_map(|a| angles.iter().map(move |b| (a - b).abs()))
+            .map(|d| d.min(std::f32::consts::TAU - d))
+            .fold(0., f32::max);
+        faces.push((nearest, corners, span, plane_slope(&triangle.p).is_none()));
+    }
+    // A face whose middle lies within 8 % of its corners' distance, and that
+    // spans no more of the hole's round than its other sides do, is a chord
+    // of a round wall of 8 sides or more: the bore is read at its corners,
+    // its nominal size, as a drill of that size fits and a mill is sent. A
+    // STEP's bore may have coarser sides than its rim, and corners not quite
+    // on one circle: the nearest corner sets it. Any other face, a flat or a
+    // ledge, is read at its nearest point: a D-flat's ends lie on the round
+    // too, but it spans many of its sides. Walls are matched with walls and
+    // the rim's faces with the rim's: a wall may have coarser sides.
+    let side = |upright: bool| {
+        let mut spans: Vec<f32> = (faces.iter())
+            .filter(|f| f.3 == upright && f.2 > 1e-4 && f.0 <= corridor * 1.1 + 0.01)
+            .map(|f| f.2)
+            .collect();
+        spans.sort_by(f32::total_cmp);
+        spans.get(spans.len() / 2).copied().unwrap_or(0.)
+    };
+    let sides = [side(false), side(true)];
+    let bore = (faces.iter())
+        .map(|&(nearest, corners, span, upright)| {
+            let side = sides[usize::from(upright)];
+            if nearest >= corners * 0.92 - 0.001 && span <= side * 1.5 + 0.02 {
+                corners
+            } else {
+                nearest
+            }
+        })
+        .fold(radius, f32::min);
+    (corridor, bore.max(corridor))
 }
 /// How many hole openings `holes` would examine for this selection (0 on any error).
 pub(crate) fn hole_candidates(setup: &Setup, op: &Operation, mesh: &Mesh) -> usize {
@@ -1467,15 +1529,9 @@ fn slot_lap(c: [f32; 2], along: [f32; 2], length: f32, offset: f32) -> Vec<[f32;
     lap.push(lap[0]);
     lap
 }
-fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
-    let mut b = Builder::new(setup, op, tool, mesh)?;
-    // A chamfer mill countersinks each opening rather than drilling it.
-    let chamfer = get(&tool.p, "type") == "Chamfer mill";
-    if get(&tool.p, "type") != "Drill" && !chamfer {
-        return Err(
-            "Choose a drill, or a chamfer mill to countersink, for a drilling cycle.".into(),
-        );
-    }
+/// The holes of the selected face a Drill operation cuts: those of its Hole
+/// diameter, or all of them for 0.
+fn drill_holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, String> {
     let mut holes = holes(setup, op, mesh)?;
     let filter = if op.p.contains_key("hole_diameter") {
         number(op, "hole_diameter")?
@@ -1491,6 +1547,52 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     if holes.is_empty() {
         return Err("No detected holes match the diameter filter.".into());
     }
+    if !["Optimize travel", "By X then Y"].contains(&get(&op.p, "hole_order")) {
+        return Err("Choose a valid hole order.".into());
+    }
+    Ok(holes)
+}
+/// The hole of `holes` a Drill operation cuts next, from `pos`, taken out of
+/// them: the nearest, or the next by X then Y, by its Hole order.
+fn next_hole(holes: &mut Vec<Hole>, pos: [f32; 3], op: &Operation) -> Hole {
+    let index = if get(&op.p, "hole_order") == "Optimize travel" {
+        let distance = |h: &Hole| (h.center[0] - pos[0]).powi(2) + (h.center[1] - pos[1]).powi(2);
+        (holes.iter().enumerate())
+            .min_by(|(_, a), (_, c)| distance(a).total_cmp(&distance(c)))
+            .map_or(0, |(i, _)| i)
+    } else {
+        0
+    };
+    holes.remove(index)
+}
+/// Whether a Drill operation goes through, and how far past a through
+/// hole's exit (Breakthrough, 0 when it does not).
+fn breakthrough(op: &Operation) -> Result<(bool, f32), String> {
+    if !["Yes", "No"].contains(&get(&op.p, "through")) {
+        return Err("Choose Yes or No for breakthrough.".into());
+    }
+    if get(&op.p, "through") != "Yes" {
+        return Ok((false, 0.));
+    }
+    let breakthrough = number(op, "breakthrough")?;
+    if breakthrough < 0. {
+        return Err("Breakthrough cannot be negative.".into());
+    }
+    Ok((true, breakthrough))
+}
+fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    if op.helical() {
+        return helical(setup, op, tool, mesh);
+    }
+    let mut b = Builder::new(setup, op, tool, mesh)?;
+    // A chamfer mill countersinks each opening rather than drilling it.
+    let chamfer = get(&tool.p, "type") == "Chamfer mill";
+    if get(&tool.p, "type") != "Drill" && !chamfer {
+        return Err(
+            "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill.".into(),
+        );
+    }
+    let mut holes = drill_holes(setup, op, mesh)?;
     let cycle = get(&op.p, "cycle");
     if ![
         "Drilling",
@@ -1510,21 +1612,16 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
     if peck <= 0. {
         return Err("Peck depth must be positive.".into());
     }
-    if !["Yes", "No"].contains(&get(&op.p, "through")) {
-        return Err("Choose Yes or No for breakthrough.".into());
-    }
     // Breakthrough is travel past the exit of a hole that goes through the
     // part. Under a blind hole's bottom is the part, so such a hole is
     // refused rather than drilled into, as the planner's plans are.
-    let through = get(&op.p, "through") == "Yes" && !chamfer;
-    let breakthrough = if through {
-        number(op, "breakthrough")?
+    let (through, breakthrough) = if !chamfer {
+        breakthrough(op)?
+    } else if ["Yes", "No"].contains(&get(&op.p, "through")) {
+        (false, 0.)
     } else {
-        0.
+        return Err("Choose Yes or No for breakthrough.".into());
     };
-    if breakthrough < 0. {
-        return Err("Breakthrough cannot be negative.".into());
-    }
     b.plan.milling_direction = "Drilling · axial feed";
     // The sweep is the drill's shape: its 118° point under its flutes, so
     // that a blind hole's drill-point floor is left as it is (#155); a
@@ -1539,26 +1636,11 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         CutterShape::Drill
     };
     let rise = b.plan.shape.rise().unwrap_or(0.);
-    if !["Optimize travel", "By X then Y"].contains(&get(&op.p, "hole_order")) {
-        return Err("Choose a valid hole order.".into());
-    }
+    let count = holes.len();
+    crate::progress::expect(count);
     while !holes.is_empty() {
-        let index = if get(&op.p, "hole_order") == "Optimize travel" {
-            holes
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, c)| {
-                    let distance = |h: &Hole| {
-                        (h.center[0] - b.pos[0]).powi(2) + (h.center[1] - b.pos[1]).powi(2)
-                    };
-                    distance(a).total_cmp(&distance(c))
-                })
-                .unwrap()
-                .0
-        } else {
-            0
-        };
-        let h = holes.remove(index);
+        crate::progress::report(count - holes.len())?;
+        let h = next_hole(&mut holes, b.pos, op);
         // The drill may be as wide as the bore at its tessellation's vertices,
         // which its chords lie a sagitta inside, and 0.01 over that: the part
         // report rounds the bore to 0.01 and the planner's drill is that size.
@@ -1616,8 +1698,8 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             b.plan.rest_top.zip(lower).map(|(a, b)| a.max(b))
         };
         let levels = ((cutting_top - target) / peck).ceil().max(1.) as usize;
-        if levels > 1000 {
-            return Err("Peck cycle exceeds 1,000 steps per hole.".into());
+        if levels > CEILING {
+            return Err(too_many("moves"));
         }
         b.plan.target = b.plan.target.min(target);
         b.plan.levels += levels;
@@ -1657,6 +1739,212 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
             }
             b.dwell(dwell);
         }
+        b.retract()?;
+    }
+    b.finish()
+}
+/// Where a flat end mill can mill the hole `h` of `g`: the height of its
+/// floor, the highest point of the part's sloping or flat faces inside the
+/// bore below its rim (its bottom when it goes through), and the bore's
+/// diameter above that floor. A drill's point would sink into a cone or a
+/// fillet under a blind hole; a flat end stops on top of it, and is no
+/// wider than the bore is all the way down to it.
+fn milled_bore(g: &Geometry, h: &Hole) -> (f32, f32) {
+    let floor = if h.through {
+        h.bottom
+    } else {
+        let reach = h.diameter / 2. + 0.01;
+        (g.triangles.iter())
+            .filter(|t| {
+                plane_slope(&t.p).is_some()
+                    && t.p.iter().all(|p| {
+                        (p[0] - h.center[0]).hypot(p[1] - h.center[1]) <= reach
+                            && p[2] < h.top - 0.01
+                    })
+            })
+            .flat_map(|t| t.p.map(|p| p[2]))
+            .fold(h.bottom, f32::max)
+    };
+    let (_, bore) = corridor(g, h.center, floor + 0.02, 0., h.opening / 2.);
+    (floor, bore * 2.)
+}
+/// Helical milling (`HELICAL_MILLING`): each round hole of the selected face
+/// milled with a flat end mill, down a helix of Stepdown per turn to the
+/// hole's flat floor (past its exit by Breakthrough when it goes through),
+/// once round there, then to the centre and out. A hole whose bore leaves
+/// the cutter's centre more than its radius to travel is cut in rings, the
+/// innermost first, each Stepover (% of the cutter's diameter) wider than
+/// the one inside it: the cutter clears the centre first and never takes
+/// more than that from the side. It climbs: counterclockwise round the hole
+/// with the spindle clockwise. Tolerance is the most a turn's chords stray
+/// inside its circle.
+fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    let mut b = Builder::new(setup, op, tool, mesh)?;
+    if get(&tool.p, "type") != "Flat end mill" {
+        return Err("Choose a flat end mill for Helical milling.".into());
+    }
+    if b.single_axis {
+        return Err(crate::manual::HELICAL_ON_MANUAL.into());
+    }
+    let mut holes = drill_holes(setup, op, mesh)?;
+    let (through, breakthrough) = breakthrough(op)?;
+    let pitch = number(op, "stepdown")?;
+    if pitch <= 0. || pitch > b.plan.flute_length {
+        return Err(
+            "Helical milling needs a stepdown per turn above 0 and at most the flute length."
+                .into(),
+        );
+    }
+    let stepover = number(op, "stepover")?;
+    if !(1. ..=100.).contains(&stepover) {
+        return Err("Helical milling needs a stepover of 1–100% of the tool diameter.".into());
+    }
+    let tolerance = number(op, "tolerance")?;
+    if !(0.001..=0.1).contains(&tolerance) {
+        return Err("Helical milling needs a tolerance of 0.001–0.1 mm.".into());
+    }
+    let r = b.plan.radius;
+    // Climb inside a hole: counterclockwise with the spindle clockwise.
+    let turn = if b.plan.spindle_clockwise { 1. } else { -1. };
+    b.plan.milling_direction = "Climb · helical";
+    let bottom = number(op, "bottom")?;
+    let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
+    let count = holes.len();
+    crate::progress::expect(count);
+    while !holes.is_empty() {
+        crate::progress::report(count - holes.len())?;
+        let h = next_hole(&mut holes, b.pos, op);
+        let (floor, diameter) = (h.bottom, h.diameter);
+        // As for a drill, a cutter of the bore's size fits: it may be as
+        // wide as the bore at its tessellation's vertices.
+        if 2. * r > diameter + 2. * h.sagitta + 0.01 {
+            return Err(format!(
+                "The Ø{:.2} end mill is wider than the Ø{:.2} hole at X{:.2} Y{:.2}. Choose a smaller end mill or a diameter filter.",
+                2. * r,
+                diameter,
+                h.center[0],
+                h.center[1]
+            ));
+        }
+        if through && !h.through {
+            return Err(format!(
+                "The Ø{:.2} hole at X{:.2} Y{:.2} is blind: the part goes on under its bottom, so it cannot be milled through. Set Through to No, or use the diameter filter to mill only the holes that go through.",
+                h.diameter, h.center[0], h.center[1]
+            ));
+        }
+        let lowest = if through { floor - breakthrough } else { floor };
+        let target = lowest + bottom;
+        if target >= h.top
+            || target < lowest - 0.001
+            || target < b.plan.stock.min[2] - breakthrough - 0.001
+        {
+            return Err("The bottom offset must leave the end mill in the hole, and cannot take it below the hole's floor: only Through does, below a hole that goes through the part.".into());
+        }
+        // The cutter's centre travels up to `outer` from the hole's.
+        let outer = (diameter / 2. - r).max(0.);
+        let reach = outer + r;
+        let envelope = Bounds {
+            min: [h.center[0] - reach, h.center[1] - reach, target],
+            max: [h.center[0] + reach, h.center[1] + reach, top],
+        };
+        let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
+        // The flutes cut the hole's wall from where the material starts
+        // down; the tool's reach from the stock's top is its stickout's.
+        if cutting_top - target >= b.plan.flute_length {
+            return Err(format!(
+                "The Ø{:.2} hole at X{:.2} Y{:.2} is milled {:.2} mm deep, as deep as the end mill's flutes or deeper. Choose an end mill with longer flutes.",
+                h.diameter,
+                h.center[0],
+                h.center[1],
+                cutting_top - target
+            ));
+        }
+        let lower = (cutting_top < top - 0.0001).then_some(cutting_top);
+        b.plan.rest_top = if b.plan.levels == 0 {
+            lower
+        } else {
+            b.plan.rest_top.zip(lower).map(|(a, b)| a.max(b))
+        };
+        // Rings out to `outer`: one when its turn already sweeps the centre,
+        // else from half the cutter's radius out, Stepover apart at most.
+        let rings: Vec<f32> = if outer <= r {
+            vec![outer]
+        } else {
+            let inner = r / 2.;
+            let n = ((outer - inner) / (stepover / 100. * 2. * r))
+                .ceil()
+                .max(1.) as usize;
+            (0..=n)
+                .map(|k| inner + (outer - inner) * k as f32 / n as f32)
+                .collect()
+        };
+        let turns = ((cutting_top - target) / pitch).ceil().max(1.) as usize;
+        let approach = (cutting_top + b.retract_margin).min(b.retract);
+        for (i, &radius) in rings.iter().enumerate() {
+            let segments = if radius < 0.001 {
+                1
+            } else {
+                (std::f32::consts::PI / (1. - tolerance.min(radius) / radius).acos())
+                    .ceil()
+                    .clamp(12., 360.) as usize
+            };
+            if (turns + 1) * segments > CEILING {
+                return Err(too_many("moves"));
+            }
+            let at = |step: usize, z: f32| {
+                let a = turn * step as f32 * std::f32::consts::TAU / segments as f32;
+                [
+                    h.center[0] + radius * a.cos(),
+                    h.center[1] + radius * a.sin(),
+                    z,
+                ]
+            };
+            let start = at(0, cutting_top);
+            if i == 0 {
+                b.start_at(start, Some(cutting_top))?;
+            } else {
+                // Over the cleared middle to the next ring's start, above the
+                // material, then down to it.
+                b.push(
+                    [b.pos[0], b.pos[1], approach],
+                    Motion::Rapid,
+                    false,
+                    b.rapid,
+                )?;
+                b.push(
+                    [start[0], start[1], approach],
+                    Motion::Rapid,
+                    false,
+                    b.rapid,
+                )?;
+                b.push(start, Motion::Feed, false, b.feed * 0.25)?;
+            }
+            // Straight down when the cutter is the hole's size: a plunge.
+            let rate = if radius < 0.001 {
+                b.feed * 0.25
+            } else {
+                b.feed
+            };
+            let steps = turns * segments;
+            for step in 1..=steps {
+                let z = cutting_top - (cutting_top - target) * step as f32 / steps as f32;
+                b.push(at(step, z), Motion::Feed, true, rate)?;
+            }
+            if radius >= 0.001 {
+                for step in 1..=segments {
+                    b.push(at(step, target), Motion::Feed, true, b.feed)?;
+                }
+            }
+        }
+        b.plan.target = b.plan.target.min(target);
+        b.plan.levels += turns * rings.len();
+        // Off the wall to the cleared centre before rising out of the hole.
+        b.push(
+            [h.center[0], h.center[1], target],
+            Motion::Feed,
+            false,
+            b.feed,
+        )?;
         b.retract()?;
     }
     b.finish()
@@ -1750,14 +2038,14 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
     let dims = g.bounds.dimensions();
     if dims[..2]
         .iter()
-        .any(|d| !d.is_finite() || d / step > 500_000.)
+        .any(|d| !d.is_finite() || d / step > CEILING as f32)
     {
-        return Err("Finishing extent exceeds the preview sample limit.".into());
+        return Err(too_many("samples"));
     }
     let nx = (dims[0] / step).ceil() as usize + 1;
     let ny = (dims[1] / step).ceil() as usize + 1;
-    if nx.saturating_mul(ny) > 500_000 {
-        return Err("Finishing grid exceeds 500,000 samples. Increase spacing/tolerance or reduce model size.".into());
+    if nx.saturating_mul(ny) > CEILING {
+        return Err(too_many("samples"));
     }
     let mut z = vec![None; nx * ny];
     let mut selected = vec![false; nx * ny];
@@ -1768,8 +2056,9 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
     }
     // Triangle rasterization evaluates only its expanded footprint, not the entire mesh per sample.
     let r = b.plan.radius;
-    let mut work = 0usize;
-    for t in &g.triangles {
+    crate::progress::stage(0, 3);
+    crate::progress::expect(g.triangles.len());
+    for (i, t) in g.triangles.iter().enumerate() {
         let ranges: [(usize, usize); 2] = std::array::from_fn(|k| {
             let lo = t.p.iter().map(|p| p[k]).fold(f32::INFINITY, f32::min);
             let hi = t.p.iter().map(|p| p[k]).fold(f32::NEG_INFINITY, f32::max);
@@ -1783,10 +2072,9 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
                     .clamp(0., count as f32) as usize,
             )
         });
-        work = work.saturating_add((ranges[0].1 - ranges[0].0) * (ranges[1].1 - ranges[1].0));
-        if work > 60_000_000 {
-            return Err("Finishing mesh is too dense for this bounded preview. Increase spacing or simplify the mesh.".into());
-        }
+        // A long sampling runs off the window's thread: how far, and Cancel,
+        // at each triangle (a large one takes milliseconds).
+        crate::progress::report(i)?;
         let a = std::array::from_fn::<_, 3, _>(|i| t.p[1][i] - t.p[0][i]);
         let c = std::array::from_fn::<_, 3, _>(|i| t.p[2][i] - t.p[0][i]);
         let n = [
@@ -1816,7 +2104,10 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
     }
     // Only cutter centers over the model XY silhouette. This also avoids joining disconnected islands.
     let silhouette: Vec<Polygon> = g.silhouette(false, op)?.into();
+    crate::progress::stage(1, 3);
+    crate::progress::expect(ny);
     for y in 0..ny {
+        crate::progress::report(y)?;
         for x in 0..nx {
             let i = y * nx + x;
             let xy = (
@@ -1901,6 +2192,7 @@ fn parallel(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<P
         return Err("Parallel finishing requires a ball or flat end mill.".into());
     }
     let g = Geometry::new(setup, mesh);
+    // How far: the grid's triangles, its outline, then its rows (stages).
     let grid = finish_grid(&g, op, &b)?;
     let spacing = number(op, "surface_stepover")?;
     let (sin, cos) = number(op, "direction")?.to_radians().sin_cos();
@@ -1916,14 +2208,15 @@ fn parallel(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<P
     let max = |v: &Vec<f32>| v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let rows = ((max(&across) - min(&across)) / spacing).ceil() as usize;
     let count = ((max(&along) - min(&along)) / grid.step).ceil() as usize;
-    if rows > LIMIT || count > LIMIT || rows.saturating_mul(count) > LIMIT {
-        return Err(
-            "Parallel preview exceeds 30,000 samples. Increase surface spacing/tolerance.".into(),
-        );
+    if rows > CEILING || count > CEILING || rows.saturating_mul(count) > CEILING {
+        return Err(too_many("samples"));
     }
     b.plan.levels = rows;
     b.plan.target = g.bounds.min[2];
+    crate::progress::stage(2, 3);
+    crate::progress::expect(rows + 1);
     for row in 0..=rows {
+        crate::progress::report(row)?;
         let v = min(&across) + row as f32 * spacing;
         let mut stroke = vec![];
         for j in 0..=count {
@@ -1971,8 +2264,8 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
     b.plan.rest_top = (cutting_top < top - 0.0001).then_some(cutting_top);
     let levels = ((cutting_top - target) / down).ceil().max(1.) as usize;
-    if levels > 300 {
-        return Err("Waterline preview exceeds 300 layers. Increase stepdown.".into());
+    if levels > CEILING {
+        return Err(too_many("moves"));
     }
     b.plan.levels = levels;
     b.plan.target = target;
@@ -1981,7 +2274,9 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
         return Err("Choose Climb or Conventional.".into());
     }
     b.plan.milling_direction = if climb { "Climb" } else { "Conventional" };
+    crate::progress::expect(levels);
     for level in 1..=levels {
+        crate::progress::report(level)?;
         let z = (cutting_top - level as f32 * down).max(target);
         let mut polys = vec![];
         // Projection of all geometry above the level accounts for the vertical cutter/shank corridor.
@@ -2602,6 +2897,398 @@ pub(crate) mod tests {
         assert!(floor.through);
         let through = generate(&setup, &op, &tool, &open).unwrap();
         assert!((through.target - (floor.bottom - 1.)).abs() < 0.001);
+    }
+    /// A Helical milling operation on the top face of `mesh`, with a flat
+    /// end mill of `diameter`.
+    fn helical_op(mesh: &Mesh, diameter: &str) -> (Setup, Operation, Tool) {
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        tool.p.insert("type".into(), "Flat end mill".into());
+        tool.p.insert("diameter".into(), diameter.into());
+        op.p.insert("cycle".into(), crate::model::HELICAL_MILLING.into());
+        select_top(&mut op, mesh);
+        (setup, op, tool)
+    }
+    /// How far round `center` the cutting moves of `plan` turn, radians:
+    /// positive counterclockwise.
+    fn turning(plan: &Plan, center: [f32; 2]) -> f32 {
+        let angle = |p: [f32; 3]| (p[1] - center[1]).atan2(p[0] - center[0]);
+        (plan.moves.iter())
+            .filter(|m| m.cutting_pass && m.from[..2] != m.to[..2])
+            .map(|m| {
+                let d = angle(m.to) - angle(m.from);
+                (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+            })
+            .sum()
+    }
+    #[test]
+    fn helical_milling_mills_a_blind_hole_to_size_down_to_its_flat_floor() {
+        // The Ø8 bore 8 mm deep, flat-floored, with a Ø4 end mill.
+        let mesh = cup(true);
+        let (mut setup, mut op, mut tool) = helical_op(&mesh, "4");
+        let hole = holes(&setup, &op, &mesh).unwrap()[0].clone();
+        assert!(!hole.through);
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert_eq!(plan.shape, CutterShape::Flat);
+        assert_eq!(plan.milling_direction, "Climb · helical");
+        assert!((plan.target - hole.bottom).abs() < 0.001, "{}", plan.target);
+        // Its centre goes round 2 mm from the hole's, its edge on the wall,
+        // only ever down, to the floor and no deeper.
+        let cuts: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
+        for m in &cuts {
+            let d = (m.to[0] - hole.center[0]).hypot(m.to[1] - hole.center[1]);
+            assert!((d - 2.).abs() < 0.001, "{m:?}");
+            assert!(m.to[2] <= m.from[2] + 0.0001 && m.to[2] >= hole.bottom - 0.001);
+        }
+        // From the stock's top, 2 mm over the part, 10 mm down at 2 per
+        // turn: five turns, then once round on the floor.
+        assert_eq!(plan.levels, 5);
+        let on_floor = cuts
+            .iter()
+            .filter(|m| {
+                (m.from[2] - hole.bottom).abs() < 0.001 && (m.to[2] - hole.bottom).abs() < 0.001
+            })
+            .count();
+        assert_eq!(cuts.len(), 6 * on_floor);
+        let round = std::f32::consts::TAU;
+        // Climb: counterclockwise with the spindle clockwise, and back.
+        assert!((turning(&plan, hole.center) - 6. * round).abs() < 0.01);
+        op.p.insert("spindle_rotation".into(), "Counterclockwise (CCW)".into());
+        let reversed = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((turning(&reversed, hole.center) + 6. * round).abs() < 0.01);
+        assert_plan(plan);
+        // A cutter the hole's size goes straight down; a wider one cannot.
+        tool.p.insert("diameter".into(), "8".into());
+        let plunge = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!(
+            plunge
+                .moves
+                .iter()
+                .filter(|m| m.cutting_pass)
+                .all(|m| { (m.to[0] - hole.center[0]).hypot(m.to[1] - hole.center[1]) < 0.001 })
+        );
+        tool.p.insert("diameter".into(), "9".into());
+        assert_eq!(
+            generate(&setup, &op, &tool, &mesh).unwrap_err(),
+            format!(
+                "The Ø9.00 end mill is wider than the Ø8.00 hole at X{:.2} Y{:.2}. Choose a smaller end mill or a diameter filter.",
+                hole.center[0], hole.center[1]
+            )
+        );
+        // A drill does not mill, and a manual mill moves one axis at a time.
+        tool.p.insert("diameter".into(), "4".into());
+        tool.p.insert("type".into(), "Drill".into());
+        assert_eq!(
+            generate(&setup, &op, &tool, &mesh).unwrap_err(),
+            "Choose a flat end mill for Helical milling."
+        );
+        tool.p.insert("type".into(), "Flat end mill".into());
+        setup.machine = crate::manual::defaults();
+        assert_eq!(
+            generate(&setup, &op, &tool, &mesh).unwrap_err(),
+            crate::manual::HELICAL_ON_MANUAL
+        );
+    }
+    #[test]
+    fn helical_milling_cuts_a_wide_hole_in_rings_from_the_centre_out() {
+        // The Ø8 bore with a Ø1.5 end mill: its centre travels out to 3.25 mm,
+        // over twice its radius, so it clears the middle first.
+        let mesh = cup(true);
+        let (setup, op, tool) = helical_op(&mesh, "1.5");
+        let hole = holes(&setup, &op, &mesh).unwrap()[0].clone();
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let mut rings: Vec<f32> = vec![];
+        for m in plan.moves.iter().filter(|m| m.cutting_pass) {
+            let d = (m.to[0] - hole.center[0]).hypot(m.to[1] - hole.center[1]);
+            if rings.last().is_none_or(|r| (r - d).abs() > 0.001) {
+                rings.push(d);
+            }
+        }
+        // Innermost first, each at most 40 % of the cutter's diameter wider
+        // than the one inside it, the first sweeping the centre and the last
+        // putting the cutter's edge on the wall.
+        assert!(rings.len() > 2, "{rings:?}");
+        assert!(rings[0] <= 0.75);
+        assert!((rings.last().unwrap() - 3.25).abs() < 0.001, "{rings:?}");
+        assert!(
+            rings
+                .windows(2)
+                .all(|w| w[1] > w[0] && w[1] - w[0] <= 0.6 + 0.001),
+            "{rings:?}"
+        );
+        // Each ring goes all the way down to the floor.
+        assert!(rings.iter().all(|r| plan.moves.iter().any(|m| {
+            m.cutting_pass
+                && (m.to[2] - hole.bottom).abs() < 0.001
+                && ((m.to[0] - hole.center[0]).hypot(m.to[1] - hole.center[1]) - r).abs() < 0.001
+        })));
+        assert_plan(plan);
+    }
+    #[test]
+    fn helical_milling_cuts_a_coarse_walled_hole_to_the_size_it_lists() {
+        // The TOTEM tenting bottom's holes: a rim of 64 sides over a wall of
+        // 16, whose corners are not on one circle (3.98 and 4.02 mm from the
+        // centre in turn). Read at the chords' middles the bore was Ø7.85
+        // and milled 0.15 mm small; read at the nearest corners, it lists
+        // and mills Ø7.96, cutting past no corner of the wall.
+        let mut t = vec![];
+        let at = |r: f32, a: f32, z: f32| [r * a.cos(), r * a.sin(), z];
+        let step = |n: usize, i: usize| i as f32 * std::f32::consts::TAU / n as f32;
+        for i in 0..64 {
+            let (a, b) = (step(64, i), step(64, i + 1));
+            quad(
+                &mut t,
+                [
+                    at(4., a, 10.),
+                    at(4., b, 10.),
+                    at(12., b, 10.),
+                    at(12., a, 10.),
+                ],
+            );
+            quad(
+                &mut t,
+                [
+                    at(12., a, 10.),
+                    at(12., b, 10.),
+                    at(12., b, 0.),
+                    at(12., a, 0.),
+                ],
+            );
+            t.push([[0., 0., 0.], at(12., b, 0.), at(12., a, 0.)]);
+        }
+        let corner = |i: usize| if i.is_multiple_of(2) { 3.98 } else { 4.02 };
+        for i in 0..16 {
+            let (a, b) = (step(16, i), step(16, i + 1));
+            let (ra, rb) = (corner(i), corner(i + 1));
+            quad(
+                &mut t,
+                [at(ra, a, 2.), at(rb, b, 2.), at(rb, b, 10.), at(ra, a, 10.)],
+            );
+            t.push([[0., 0., 2.], at(ra, a, 2.), at(rb, b, 2.)]);
+        }
+        let mesh = mesh::normalize(t).unwrap();
+        let (setup, op, mut tool) = helical_op(&mesh, "4");
+        let hole = holes(&setup, &op, &mesh).unwrap()[0].clone();
+        assert!((hole.diameter - 7.96).abs() < 0.002, "{hole:?}");
+        for d in ["4", "2"] {
+            tool.p.insert("diameter".into(), d.into());
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            let cut = (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .map(|m| (m.to[0] - hole.center[0]).hypot(m.to[1] - hole.center[1]))
+                .fold(0f32, f32::max)
+                + plan.radius;
+            assert!((2. * cut - hole.diameter).abs() < 0.001, "Ø{d}: {cut}");
+        }
+        // The refusal names the size listed.
+        tool.p.insert("diameter".into(), "8.2".into());
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap_err()
+                .contains("wider than the Ø7.96 hole")
+        );
+    }
+    #[test]
+    fn a_shallow_d_flat_in_a_bore_is_not_read_as_round() {
+        // A Ø8 bore of 64 sides, 8 mm deep and blind, with one flat face
+        // across it at X = `d`: a flat 0.1–0.3 mm deep. Its ends lie on the
+        // round, as a coarse side's do, but it spans many sides: the hole is
+        // read at the flat, refuses a drill of the round's size, and is
+        // milled clear of it.
+        for d in [3.7f32, 3.8, 3.9] {
+            let step = |i: usize| i as f32 * std::f32::consts::TAU / 64.;
+            let round = |i: usize| [4. * step(i).cos(), 4. * step(i).sin()];
+            let mut inner: Vec<[f32; 2]> = vec![];
+            for i in 0..64 {
+                let (a, b) = (round(i), round(i + 1));
+                if a[0] <= d {
+                    inner.push(a);
+                }
+                if (a[0] <= d) != (b[0] <= d) {
+                    let t = (d - a[0]) / (b[0] - a[0]);
+                    inner.push([d, a[1] + t * (b[1] - a[1])]);
+                }
+            }
+            let mut t = vec![];
+            let out = |p: [f32; 2]| {
+                let l = p[0].hypot(p[1]);
+                [12. * p[0] / l, 12. * p[1] / l]
+            };
+            for i in 0..inner.len() {
+                let (p, q) = (inner[i], inner[(i + 1) % inner.len()]);
+                let (pp, qq) = (out(p), out(q));
+                quad(
+                    &mut t,
+                    [
+                        [p[0], p[1], 10.],
+                        [q[0], q[1], 10.],
+                        [qq[0], qq[1], 10.],
+                        [pp[0], pp[1], 10.],
+                    ],
+                );
+                quad(
+                    &mut t,
+                    [
+                        [p[0], p[1], 2.],
+                        [q[0], q[1], 2.],
+                        [q[0], q[1], 10.],
+                        [p[0], p[1], 10.],
+                    ],
+                );
+                t.push([[0., 0., 2.], [p[0], p[1], 2.], [q[0], q[1], 2.]]);
+                quad(
+                    &mut t,
+                    [
+                        [pp[0], pp[1], 10.],
+                        [qq[0], qq[1], 10.],
+                        [qq[0], qq[1], 0.],
+                        [pp[0], pp[1], 0.],
+                    ],
+                );
+                t.push([[0., 0., 0.], [qq[0], qq[1], 0.], [pp[0], pp[1], 0.]]);
+            }
+            let mesh = mesh::normalize(t).unwrap();
+            // Drilling: listed at the flat, a Ø8 drill refused.
+            let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+            select_top(&mut op, &mesh);
+            let hole = holes(&setup, &op, &mesh).unwrap()[0].clone();
+            assert!((hole.diameter - 2. * d).abs() < 0.01, "{d}: {hole:?}");
+            tool.p.insert("diameter".into(), "8".into());
+            assert!(
+                generate(&setup, &op, &tool, &mesh)
+                    .unwrap_err()
+                    .contains("exceeds"),
+                "{d}"
+            );
+            // Helical milling with a Ø4 mill: listed at the flat, its edge
+            // never past it.
+            let (setup, op, tool) = helical_op(&mesh, "4");
+            let hole = holes(&setup, &op, &mesh).unwrap()[0].clone();
+            assert!((hole.diameter - 2. * d).abs() < 0.01, "{d}: {hole:?}");
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            let flat = hole.center[0] + d;
+            let reach = (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.to[0] + plan.radius)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(reach <= flat + 0.001, "{d}: {reach} past {flat}");
+        }
+    }
+    #[test]
+    fn helical_milling_goes_through_a_through_hole_and_stops_on_a_pointed_floors_rim() {
+        // Through the open cup's bore, Breakthrough past its exit.
+        let open = hole_part();
+        let (setup, mut op, tool) = helical_op(&open, "4");
+        let hole = holes(&setup, &op, &open).unwrap()[0].clone();
+        assert!(hole.through);
+        op.p.insert("through".into(), "Yes".into());
+        let plan = generate(&setup, &op, &tool, &open).unwrap();
+        assert!((plan.target - (hole.bottom - 1.)).abs() < 0.001);
+        // A blind hole cannot be milled through.
+        let blind = cup(true);
+        select_top(&mut op, &blind);
+        assert!(
+            generate(&setup, &op, &tool, &blind)
+                .unwrap_err()
+                .contains("is blind")
+        );
+        // A Ø8 bore whose floor is the cone a 118° drill point leaves: the
+        // flat end stops where the cone meets the wall, not at its apex,
+        // which would cut the cone away.
+        let rise = 4. * 31f32.to_radians().tan();
+        let pointed = mesh::normalize(revolved(&[
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - rise),
+        ]))
+        .unwrap();
+        op.p.insert("through".into(), "No".into());
+        select_top(&mut op, &pointed);
+        // Listed, as it mills it: 8 mm under the rim, where the bore's wall
+        // ends, the cone's apex `rise` under that, where a drill goes.
+        let hole = holes(&setup, &op, &pointed).unwrap()[0].clone();
+        assert!((hole.top - hole.bottom - 8.).abs() < 0.01, "{hole:?}");
+        let mut drilling = op.clone();
+        drilling.p.insert("cycle".into(), "Drilling".into());
+        let apex = holes(&setup, &drilling, &pointed).unwrap()[0].bottom;
+        assert!((hole.bottom - apex - rise).abs() < 0.01, "{apex}");
+        let plan = generate(&setup, &op, &tool, &pointed).unwrap();
+        assert!((plan.target - hole.bottom).abs() < 0.001, "{}", plan.target);
+    }
+    #[test]
+    fn helical_milling_mills_the_totem_cases_top_holes_without_touching_the_part() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        // Its top face's holes, Ø2 through the screw bosses, 14.5 mm deep
+        // from the stock's top, with a Ø1.5 flat end mill of 16 mm of flute,
+        // 0.5 mm a turn.
+        let (setup, mut op, mut tool) = helical_op(&mesh, "1.5");
+        tool.p.insert("length".into(), "16".into());
+        op.p.insert("stepdown".into(), "0.5".into());
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert!(!found.is_empty());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let g = Geometry::new(&setup, &mesh);
+        // Every hole is milled down to its floor.
+        for h in &found {
+            let floor = h.bottom;
+            let lowest = (plan.moves.iter())
+                .filter(|m| {
+                    m.cutting_pass
+                        && (m.to[0] - h.center[0]).hypot(m.to[1] - h.center[1]) < h.diameter
+                })
+                .map(|m| m.to[2])
+                .fold(f32::INFINITY, f32::min);
+            // Through is No: to a through hole's exit, no further.
+            assert!((lowest - floor).abs() < 0.001, "{h:?}: {lowest}");
+        }
+        // No cutting position brings the cutter's side into the part over
+        // its tip, nor its tip into the part under it: against every face,
+        // clipped to what stands 0.01 mm over the tip, the cutter's axis
+        // stays its radius away, less the bore's chords' sagitta.
+        let r = 0.75 - 0.01;
+        for m in plan.moves.iter().filter(|m| m.cutting_pass) {
+            let p = m.to;
+            for t in g.triangles.iter().filter(|t| {
+                let span = |k: usize| {
+                    let (lo, hi) = (t.p.iter().map(|q| q[k]))
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| {
+                            (a.min(v), b.max(v))
+                        });
+                    lo <= p[k] + 1. && hi >= p[k] - 1.
+                };
+                t.p.iter().any(|q| q[2] > p[2] + 0.01) && span(0) && span(1)
+            }) {
+                let part = crate::pocket::above(&t.p, p[2] + 0.01);
+                if part.len() < 2 {
+                    continue;
+                }
+                let xy = (p[0] as f64, p[1] as f64);
+                let inside = contains(std::slice::from_ref(&part), xy);
+                let near = (0..part.len())
+                    .map(|i| {
+                        let (a, b) = (part[i], part[(i + 1) % part.len()]);
+                        let v = (b.0 - a.0, b.1 - a.1);
+                        let l2 = v.0 * v.0 + v.1 * v.1;
+                        let u = if l2 < 1e-12 {
+                            0.
+                        } else {
+                            (((xy.0 - a.0) * v.0 + (xy.1 - a.1) * v.1) / l2).clamp(0., 1.)
+                        };
+                        (xy.0 - a.0 - u * v.0).hypot(xy.1 - a.1 - u * v.1)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                assert!(!inside && near >= r, "{m:?} meets {:?}", t.p);
+            }
+        }
     }
     #[test]
     fn a_blind_holes_drill_point_or_fillet_floor_does_not_narrow_its_bore() {

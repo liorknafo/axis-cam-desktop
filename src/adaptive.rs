@@ -23,8 +23,6 @@ use crate::{
 use clipper2::{EndType, FillRule, JoinType, Milli, difference, union};
 
 type P = (f64, f64);
-/// The most moves an adaptive plan may hold.
-const MAX_MOVES: usize = 300_000;
 /// The most cells a zone's grid may hold; a larger zone uses larger cells.
 const MAX_CELLS: f64 = 4_000_000.;
 /// Directions the walker weighs at each step, evenly over its turn limit,
@@ -650,6 +648,7 @@ impl Level<'_> {
         // angle either way, as sharply as it must at a wall.
         let mut turn = std::f64::consts::FRAC_PI_2;
         while path.len() <= limit {
+            crate::progress::check()?;
             let mut next = self.step(self.at, heading, turn, settled);
             // A wall, or a corner too tight for the Minimum cutting radius,
             // turns the walker as sharply as it must to keep near the load.
@@ -958,18 +957,24 @@ impl Level<'_> {
     /// Clear the level: passes from beside what is cut, entries where none
     /// can reach, then the walls (`walls`, each loop to cut with the
     /// material on the walker's side). False when it holds no material.
+    /// It reports as level `done` (from 0), its share of it the material
+    /// cleared, in thousandths.
     fn clear(
         &mut self,
         walls: &[Polygon],
         exact: &[Polygon],
         budget: usize,
+        done: usize,
     ) -> Result<bool, String> {
-        if self.material.total() == 0 {
+        let material = self.material.total();
+        if material == 0 {
             return Ok(false);
         }
         let w = self.walk;
         let mut first = true;
         while self.unfinished() {
+            let left = self.material.total().min(material);
+            crate::progress::report(done * 1000 + (1000 * (material - left) / material) as usize)?;
             if let Some((p, heading, settled)) = self.next_start() {
                 self.link(p, exact, false, &mut first);
                 let path = self.pass(heading, settled, budget)?;
@@ -1133,9 +1138,11 @@ impl Motions {
         rate: f32,
         cutting: bool,
     ) -> Result<(), String> {
-        if self.plan.moves.len() >= MAX_MOVES {
-            return Err("Adaptive clearing exceeds 300,000 moves. Increase the optimal load or the stepdown, or use a larger cutter.".into());
+        // What memory holds (`cam::CEILING`), and Cancel.
+        if self.plan.moves.len() >= crate::cam::CEILING {
+            return Err(crate::cam::too_many("moves"));
         }
+        crate::progress::check()?;
         let distance = (0..3)
             .map(|i| (self.at[i] - to[i]).powi(2))
             .sum::<f32>()
@@ -1223,6 +1230,9 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if total_levels > 1000 {
         return Err("Adaptive clearing exceeds 1,000 depth levels. Increase the stepdown.".into());
     }
+    // Each level a thousand steps of the progress bar (`Level::clear`).
+    crate::progress::expect(total_levels * 1000);
+    let mut done = 0;
     let mut out = Motions {
         plan: Plan {
             shape: crate::simulation::CutterShape::Flat,
@@ -1398,7 +1408,8 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
                 heading: None,
                 barren: Default::default(),
             };
-            if !level_walk.clear(&walls, &exact, budget)? {
+            done += 1;
+            if !level_walk.clear(&walls, &exact, budget, done - 1)? {
                 continue;
             }
             if !placed {
@@ -2512,6 +2523,68 @@ mod tests {
             let limit = if width <= 4. { 2. } else { 2.5 * 0.4 };
             assert!(most <= limit + 0.01, "{width}: most {most}");
         }
+    }
+    #[test]
+    fn a_long_adaptive_moves_the_progress_bar_and_stops_soon_after_cancel() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        // The plate between the key openings with a Ø3 mill in one level:
+        // seconds of walking.
+        let (setup, mut op, mut tool, _) = ring();
+        tool.p.insert("diameter".into(), "3".into());
+        for (k, v) in [("optimal_load", "0.45"), ("stepdown", "7")] {
+            op.p.insert(k.into(), v.into());
+        }
+        let placement = stock::Placement::new(&mesh, Some(&setup));
+        let (top, bottom) = (placement.bounds.max[2], placement.bounds.min[2]);
+        let (id, _) = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.normal[2] > 0.999999
+                    && placement.transform(s.center)[2] < top - 0.1
+                    && placement.transform(s.center)[2] > bottom + 0.1
+            })
+            .max_by(|(_, a), (_, b)| a.area.total_cmp(&b.area))
+            .unwrap();
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: vec![id],
+        });
+        let progress = std::sync::Arc::new(crate::progress::Progress::default());
+        let (sent, finished) = std::sync::mpsc::channel();
+        let worker = progress.clone();
+        std::thread::spawn(move || {
+            let result = worker.run(|| generate(&setup, &op, &tool, &mesh));
+            let _ = sent.send((result.map(|p| p.moves.len()), std::time::Instant::now()));
+        });
+        // The bar moves while the level is walked, before any move is out.
+        let start = std::time::Instant::now();
+        while progress.fraction() < 0.2 {
+            assert!(
+                start.elapsed().as_secs() < 60,
+                "the bar stood at {}",
+                progress.fraction()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let at = progress.fraction();
+        assert!(at < 1., "it finished before it could be cancelled");
+        let cancelled = std::time::Instant::now();
+        progress.cancel();
+        let (result, ended) = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(result, Err(crate::progress::CANCELLED.into()), "at {at}");
+        let took = ended.duration_since(cancelled);
+        assert!(took.as_millis() < 250, "it stopped {took:?} after Cancel");
     }
     #[test]
     fn the_totem_keyboard_case_plate_clears_with_a_2_mm_cutter_too() {

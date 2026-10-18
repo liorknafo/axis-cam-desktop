@@ -321,8 +321,9 @@ pub fn generate(
     let low = v.iter().copied().fold(f32::INFINITY, f32::min);
     let high = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let rows = ((high - low) / stepover).ceil().max(1.);
-    if !levels.is_finite() || !rows.is_finite() || levels * (rows + 1.) > 2000. {
-        return Err("Preview would exceed 2,000 facing strokes. Increase stepdown or stepover, or reduce the stock extent.".into());
+    if !levels.is_finite() || !rows.is_finite() || levels * (rows + 1.) > crate::cam::CEILING as f32
+    {
+        return Err(crate::cam::too_many("moves"));
     }
     // Build one complete layer once. Reversing its order and endpoints makes
     // the next layer start exactly where the previous layer finished, including
@@ -400,6 +401,8 @@ pub fn generate(
         rings: vec![],
     };
     let mut position = [area.min[0], area.min[1], clearance];
+    let mut done = 0;
+    crate::progress::expect(levels as usize * strokes.len());
     let mut push = |to: [f32; 3], motion: Motion, rate: f32, cutting_pass: bool| {
         let distance = (0..3)
             .map(|i| (position[i] - to[i]).powi(2))
@@ -429,6 +432,9 @@ pub fn generate(
         };
         let reverse = continue_depth && level % 2 == 0;
         for index in 0..strokes.len() {
+            // A stroke at a time: how far, and whether it was cancelled.
+            done += 1;
+            crate::progress::step(done)?;
             let (a, b) = if reverse {
                 let (a, b) = strokes[strokes.len() - 1 - index];
                 (b, a)
@@ -707,6 +713,17 @@ impl Simulation {
             |v| v.removed_volume(),
         )
     }
+    /// How many moves `seek(fraction)` replays: those from where it stands,
+    /// or from the start when it goes back.
+    pub fn replay(&self, fraction: f32) -> usize {
+        let seconds = fraction.clamp(0., 1.) * self.plan.duration;
+        let to = self.plan.moves.partition_point(|m| m.start <= seconds);
+        if seconds < self.seconds {
+            to
+        } else {
+            to.saturating_sub(self.current)
+        }
+    }
     pub fn seek(&mut self, fraction: f32) {
         let seconds = if fraction.is_finite() {
             fraction.clamp(0., 1.) * self.plan.duration
@@ -722,6 +739,10 @@ impl Simulation {
             self.seconds = 0.;
         }
         while self.current < self.plan.moves.len() {
+            // A cancelled generation's replay of an earlier operation.
+            if crate::progress::stopped() {
+                break;
+            }
             let movement = &self.plan.moves[self.current];
             if seconds < movement.start {
                 break;
@@ -826,6 +847,19 @@ pub fn sequence_walk(
     let mut grid: Option<(Frame, StockGrid)> = None;
     let mut blocked: Option<String> = None;
     let mut preceding = 0;
+    // Each enabled operation up to `stop` is an equal part of the progress
+    // of a generation off the window's thread (`progress`).
+    let parts = (doc.setups.iter().enumerate())
+        .flat_map(|(si, s)| {
+            s.operations
+                .iter()
+                .enumerate()
+                .map(move |(oi, o)| (si, oi, o))
+        })
+        .take_while(|&(si, oi, _)| stop.is_none_or(|stop| (si, oi) <= stop))
+        .filter(|(_, _, o)| o.enabled)
+        .count();
+    let mut part = 0;
     for (si, saved_setup) in doc.setups.iter().enumerate() {
         let frame = Frame::new(saved_setup, mesh);
         let mut setup = saved_setup.clone();
@@ -856,6 +890,10 @@ pub fn sequence_walk(
                 }
                 continue;
             }
+            crate::progress::part(part, parts, || {
+                format!("{} / {}", saved_setup.name(), op.name())
+            });
+            part += 1;
             setup.preview_remaining = volume
                 .as_ref()
                 .filter(|v| !v.cuts.is_empty())
@@ -1204,7 +1242,7 @@ mod tests {
         assert!(
             generate(&setup, &op, &tool, &mesh)
                 .unwrap_err()
-                .contains("2,000")
+                .contains("5 million")
         );
         op.p.insert("stepdown".into(), "2".into());
         op.surfaces.as_mut().unwrap().mesh_fingerprint = "0".repeat(64);

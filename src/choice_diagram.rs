@@ -325,6 +325,26 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
                 4.,
             );
         }
+        Diagram::DrillCycle(4) => {
+            // Helical milling: down a helix, once round at the bottom, to
+            // the centre and out.
+            block(f);
+            let mut path = vec![([0., 0., 40.], false), ([7., 0., 40.], false)];
+            let at = |step: usize, z: f32| {
+                let a = step as f32 * std::f32::consts::TAU / 16.;
+                [7. * a.cos(), 7. * a.sin(), z]
+            };
+            path.push((at(0, 26.), false));
+            for step in 1..=48 {
+                path.push((at(step, 26. - 18. * step as f32 / 48.), true));
+            }
+            for step in 1..=16 {
+                path.push((at(step, 8.), true));
+            }
+            path.extend([([0., 0., 8.], false), ([0., 0., 40.], false)]);
+            trace(f, &path, phase);
+            label(f, "HELIX DOWN · ROUND AT THE BOTTOM", 14., 4.);
+        }
         Diagram::DrillCycle(cycle) => {
             block(f);
             let mut path = vec![([0., 0., 40.], false), ([0., 0., 26.], true)];
