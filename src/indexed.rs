@@ -426,7 +426,8 @@ impl Document {
                 .find(|x| x.id == m.id)
                 .and_then(Machine::rotary_unit)
         {
-            (unit.centre_y, unit.centre_z) = (library.centre_y, library.centre_z);
+            (unit.centre_y, unit.centre_z, unit.reference) =
+                (library.centre_y, library.centre_z, library.reference);
         }
         Some(unit)
     }

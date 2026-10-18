@@ -1595,8 +1595,12 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
             "Level a flat on the stock or a jaw face: touch it at two points along Y, lift clear, turn A by the slope found and again until they are level, then zero A there in the active work system.",
             "It needs the centreline (probed or measured) and the stock's diameter, to lift the tip clear of the stock before A turns. The flat must start within 20° of level.",
         ),
+        TouchCentreReference => (
+            "With the probe the centreline was just probed with still in the spindle, over a surface that stays put (the table, a block on it, not on A), probe straight down onto it, no plate. It is saved with the centreline; each tool is touched off on the same spot.",
+            "The centreline's Z is where the probe's tip was. A tool 15 mm longer puts its tip 15 mm lower for the same Z, so every indexed cut would be 15 mm deeper and a feature cut at A 180° 30 mm off. The touch-off on this spot tells how much longer or shorter than the probe each tool is.",
+        ),
         SaveCentreline => (
-            "Keep the centreline just probed near the chuck in the machine's rotary unit geometry, marked measured. It says when the largest part on that centreline leaves no room to retract over it.",
+            "Keep the centreline just probed near the chuck, with the Z reference the probe touched, in the machine's rotary unit geometry, marked measured. It says when the largest part on that centreline leaves no room to retract over it.",
             "",
         ),
         Remounted => (
@@ -1678,6 +1682,10 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
         ProbeFromReference => (
             "With the touch plate on the recorded reference surface and the new tool above it, probe down onto the plate and set work Z so that the surface is at the reference's Z. X and Y zero stay as they are.",
             "",
+        ),
+        ProbeCentreReference => (
+            "For a tool run that turns A: with its tool in the spindle and the touch plate on the Z reference the probe touched with the A centreline, probe down onto the plate. Work Z is set on the centreline for this tool, whatever its length.",
+            "The contact's height against the probe's tells how much longer or shorter than the probe the tool is. Each tool that cuts on A is touched off this way: Set Z from reference and Zero Z do not count for a tool run that turns A, as they do not relate the tool's tip to the probed centreline.",
         ),
         CoolantOff => (
             "Set the coolant of the operations listed to Off, in every tool run of this setup: they ask for flood or mist coolant the UC100 profile has no output for. Then check the setup again.",
@@ -2221,6 +2229,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "pin_height") => (
             "How far the pins stand above the plate, in mm: measure it. The part's holes for them must be at least this deep, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
             "",
+            None,
+        ),
+        (_, "probe_length") => (
+            "How far the probe the A centreline is probed with reaches from the spindle nose to its tip, in mm. The Z travel checks at each A angle hold a tool's spindle its stick-out plus holder length less this higher. Left empty, each tool is taken as long as the probe, and the checks say so.",
+            "Only for the travel checks: the depth of every cut on A comes from each tool's touch-off on the Z reference, never from these lengths.",
             None,
         ),
         (_, "probe_tip") => (
@@ -4163,6 +4176,7 @@ mod tests {
             Ctl::Calibrate(crate::control::Calibrate::Centreline),
             Ctl::Calibrate(crate::control::Calibrate::Alignment),
             Ctl::Calibrate(crate::control::Calibrate::AZero),
+            Ctl::TouchCentreReference,
             Ctl::SaveCentreline,
             Ctl::Remounted,
         ] {
@@ -4180,6 +4194,7 @@ mod tests {
             Run::ZFromReference,
             Run::ProbeReference,
             Run::ProbeFromReference,
+            Run::ProbeCentreReference,
             Run::CoolantOff,
         ] {
             messages.push(Message::Run(a));

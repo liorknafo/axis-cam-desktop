@@ -298,6 +298,12 @@ pub struct RotaryUnit {
     /// Whether the machine file gives no spindle nose, so `NOSE_DEFAULT`'s
     /// is taken.
     pub nose_assumed: bool,
+    /// The Z reference the probe touched with the centreline (LIO-207):
+    /// machine X, Y and the machine Z of the probe's tip on the surface
+    /// (`CENTRE_REF`). `centre_z` is where the probe's tip is on the
+    /// centreline; a tool touched off on this surface is related to it.
+    /// None until the Control page saves one.
+    pub reference: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +432,7 @@ impl Machine {
             nose_diameter: nose(15)?,
             nose_length: nose(16)?,
             nose_assumed: !given(15) || !given(16),
+            reference: centre_reference(&self.p),
         })
     }
     /// What is wrong with the rotary unit's geometry. Nothing is checked
@@ -593,6 +600,16 @@ impl Machine {
             }
         }
     }
+}
+/// The machine key the Control page keeps the A centreline's Z reference
+/// in (LIO-207): "X Y Z", machine mm, as `RotaryUnit::reference`.
+pub const CENTRE_REF: &str = "a_centre_ref";
+/// The A centreline's Z reference in `p` (`CENTRE_REF`), if one is kept.
+pub fn centre_reference(p: &Fields) -> Option<[f32; 3]> {
+    let v: Vec<f32> = (get(p, CENTRE_REF).split_whitespace())
+        .map(|w| w.parse::<f32>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()?;
+    v.try_into().ok()
 }
 /// The holder length taken for a tool that gives none, mm (LIO-204):
 /// short, so the spindle nose is taken as low as it can plausibly be (an
@@ -787,9 +804,10 @@ pub const POST_KEYS: [&str; 5] = [
 /// A UC100 machine's probe settings (`control::probe_settings`). The plate's
 /// thickness and the probe tip's diameter have no default: they must be
 /// measured.
-pub const PROBE_KEYS: [&str; 5] = [
+pub const PROBE_KEYS: [&str; 6] = [
     "probe_plate",
     "probe_tip",
+    "probe_length",
     "probe_feed",
     "probe_distance",
     "probe_retract",

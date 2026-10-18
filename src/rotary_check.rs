@@ -305,6 +305,9 @@ pub fn problems(
     let on_machine =
         |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|k| p[k] - at.zero[k] + machine_zero[k]) };
     let centre_z = unit.map_or(0., |u| u.centre_z);
+    let probe_length = (crate::control::probe_settings(&machine.p).ok())
+        .and_then(|p| p.length)
+        .map(|l| l as f32);
     // The holder is kept the setup's gap over the bar, as off the jaws.
     let gap = crate::holding::gap(&doc.setups[base]).unwrap_or(2.);
     // The A the machine is at, from one operation to the next.
@@ -316,6 +319,26 @@ pub fn problems(
         let op = setup.operations[oi].name();
         let plan = &sim.plan;
         let (tool, assumed) = in_spindle(doc, setup, oi, plan, unit);
+        // The centreline's Z is the probe's tip's: a tool longer than the
+        // probe holds the spindle that much higher over the same cut
+        // (LIO-207). The cut's depth comes from its touch-off on the Z
+        // reference; only the travel is estimated from the lengths.
+        let (longer, length_note) = match probe_length {
+            Some(l) => (
+                tool.stickout + tool.holder_length - l,
+                format!(
+                    " Its tip is taken {} mm under the probe's: its {} mm stick-out and {} mm holder less the probe's {} mm length.{assumed}",
+                    mm(tool.stickout + tool.holder_length - l),
+                    mm(tool.stickout),
+                    mm(tool.holder_length),
+                    mm(l),
+                ),
+            ),
+            None => (
+                0.,
+                " Assumed: the tool as long as the probe the A centreline was probed with (enter the probe's length in the Machine library).".into(),
+            ),
+        };
         // Per axis the least and the most, with the A they are at.
         let mut low = [(f32::INFINITY, 0.); 4];
         let mut high = [(f32::NEG_INFINITY, 0.); 4];
@@ -333,7 +356,8 @@ pub fn problems(
         for m in &plan.moves {
             let a = m.a.unwrap_or(a_now);
             for p in [m.from, m.to] {
-                let q = on_machine(p);
+                let mut q = on_machine(p);
+                q[2] += longer;
                 for (k, v) in q.into_iter().enumerate() {
                     keep(k, v, a);
                 }
@@ -390,24 +414,26 @@ pub fn problems(
                     false if high[k].0 > hi + 1e-3 => (high[k], high[k].0 - hi),
                     _ => continue,
                 };
+                // The tip's machine Z, as the probe's would be there.
+                let tip = v - longer;
                 let line = match (k, below) {
                     (2, true) => format!(
-                        "the cut's bottom is at machine Z {}, {} mm short: below Z {}, the bottom of {what}. The {words} is centred at machine Z {}{}. Cut it from another angle, or measure the A centreline (Rotary A on the Control page).",
+                        "the cut's bottom is at machine Z {}, {} mm short: below Z {}, the bottom of {what}. The {words} is centred at machine Z {}{}. Cut it from another angle, or measure the A centreline (Rotary A on the Control page).{length_note}",
                         mm(v),
                         mm(beyond),
                         mm(*lo),
                         mm(centre_z),
-                        if v < centre_z {
+                        if tip < centre_z {
                             format!(
                                 ", so this cut goes {} mm below its centreline",
-                                mm(centre_z - v)
+                                mm(centre_z - tip)
                             )
                         } else {
                             String::new()
                         },
                     ),
                     (2, false) => format!(
-                        "the tool goes up to machine Z {}, {} mm above Z {}, the top of {what}. The {words}'s top is at machine Z {} (its centreline at Z {} + {} mm), so the retract over it is out of reach. Lower the clearance, or measure the A centreline (Rotary A on the Control page).",
+                        "the tool goes up to machine Z {}, {} mm above Z {}, the top of {what}. The {words}'s top is at machine Z {} (its centreline at Z {} + {} mm), so the retract over it is out of reach. Lower the clearance, or measure the A centreline (Rotary A on the Control page).{length_note}",
                         mm(v),
                         mm(beyond),
                         mm(*hi),
@@ -932,6 +958,54 @@ mod tests {
                 && said[1].contains("the tool goes up to machine Z 0.01"),
             "{said:?}"
         );
+    }
+
+    /// LIO-207: the centreline's Z is the probe's tip's, so a tool longer
+    /// than the probe holds the spindle that much higher over the same cut.
+    /// With a 50 mm probe, a tool 50 mm out of a 15 mm holder is 15 mm
+    /// longer: its Z travel is checked 15 mm higher; with a 60 mm probe and
+    /// no holder, 10 mm lower; without a probe length, as long as the
+    /// probe, and said so.
+    #[test]
+    fn the_z_travel_is_checked_with_the_tools_length_against_the_probes() {
+        let (mut doc, mesh, sim) = job("-150", "90");
+        let note = "Assumed: the tool as long as the probe the A centreline was probed with";
+        let said = reach(&doc, &mesh, &sim, [300., 300., 0.01], 90.);
+        assert!(said.len() == 1 && said[0].contains(note), "{said:?}");
+        for (probe, holder, longer) in [("50", "15", 15.), ("60", "0", -10.)] {
+            (doc.setups[0].machine.p).insert("probe_length".into(), probe.into());
+            (doc.tools[0].p).insert("holder_length".into(), holder.into());
+            // The tip's machine Z as the probe's would be there.
+            for (tip, refused) in [
+                (
+                    0.01 - longer,
+                    Some("the tool goes up to machine Z 0.01, 0.01 mm above Z 0"),
+                ),
+                (-0.01 - longer, None),
+                (
+                    -300.01 - longer,
+                    Some("the cut's bottom is at machine Z -300.01, 0.01 mm short"),
+                ),
+                (-299.99 - longer, None),
+            ] {
+                let said = reach(&doc, &mesh, &sim, [300., 300., tip], 90.);
+                match refused {
+                    Some(words) => {
+                        assert_eq!(said.len(), 1, "{longer} {tip}: {said:?}");
+                        assert!(
+                            said[0].contains(words)
+                                && said[0].contains(&format!(
+                                    "Its tip is taken {} mm under the probe's: its 50 mm stick-out and {holder} mm holder less the probe's {probe} mm length.",
+                                    mm(longer)
+                                ))
+                                && !said[0].contains(note),
+                            "{longer} {tip}: {said:?}"
+                        );
+                    }
+                    None => assert!(said.is_empty(), "{longer} {tip}: {said:?}"),
+                }
+            }
+        }
     }
 
     #[test]

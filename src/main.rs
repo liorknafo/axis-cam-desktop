@@ -1624,9 +1624,10 @@ impl App {
                 return;
             }
             match keep {
-                control::RotaryKeep::Centreline([y, z]) => {
+                control::RotaryKeep::Centreline([y, z], [rx, ry, rz]) => {
                     m.p.insert("a_centre_y".into(), format!("{y:.3}"));
                     m.p.insert("a_centre_z".into(), format!("{z:.3}"));
+                    m.p.insert(model::CENTRE_REF.into(), format!("{rx:.3} {ry:.3} {rz:.3}"));
                     m.p.insert(control::CENTRE_MARK.into(), control::MEASURED.into());
                 }
                 control::RotaryKeep::Stale(why)
@@ -4031,6 +4032,7 @@ impl App {
                             .any(|k| get(&x.p, k) != get(&m.p, k))
                     }) {
                         m.p.remove(control::CENTRE_MARK);
+                        m.p.remove(model::CENTRE_REF);
                     }
                     if let Some(c) = self.control.as_mut().filter(|c| c.machine_id == m.id) {
                         c.probe = control::probe_settings(&m.p);
