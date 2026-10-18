@@ -294,12 +294,13 @@ impl Document {
     /// operation's): the farthest the stock, the part or the chuck's jaws
     /// reach from the A centreline, at any angle, and the height above it.
     /// Refused when that height is above the machine's Z travel: it is
-    /// never cut short to fit.
+    /// never cut short to fit. For a setup that is not indexed, its own
+    /// clamping's.
     pub fn swing(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
         let swing = self.swing_unchecked(si, mesh, clearance)?;
         // Machine Z is zero at the top of its travel and negative down.
         if swing.machine_z > 0. {
-            let clamped = &self.setups[self.index_base(si).ok_or(NOT_INDEXED)?];
+            let clamped = &self.setups[self.index_base(si).unwrap_or(si)];
             let unit = self.rotary_unit(&clamped.machine).ok_or(NO_GEOMETRY)?;
             let travel = crate::post_check::machine_mm(&clamped.machine, "z");
             return Err(format!(
@@ -317,8 +318,8 @@ impl Document {
     }
     /// `swing`, though its height is above the machine's Z travel.
     pub fn swing_unchecked(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
-        let base = self.index_base(si).ok_or(NOT_INDEXED)?;
-        let clamped = &self.setups[base];
+        let base = self.index_base(si).unwrap_or(si);
+        let clamped = self.setups.get(base).ok_or("There is no such setup.")?;
         let stock = self.setup_stock(base, Some(mesh)).ok_or(STOCK_UNKNOWN)?;
         let unit = self.rotary_unit(&clamped.machine).ok_or(NO_GEOMETRY)?;
         let axis = axis_of(stock);
@@ -685,7 +686,7 @@ pub fn generate(
     mesh: &Mesh,
     start: Start,
 ) -> Result<Posed, String> {
-    use crate::simulation::{Motion, Move, Simulation};
+    use crate::simulation::Simulation;
     let list = angles(setup)?;
     let begin = start.begin.ok_or(STOCK_UNKNOWN)?;
     let mut now = start.now.cloned();
@@ -740,37 +741,6 @@ pub fn generate(
     let mut plan = parts[0].1.clone();
     plan.moves.clear();
     plan.duration = 0.;
-    let push = |plan: &mut crate::simulation::Plan, m: Move| {
-        let seconds = m.end - m.start;
-        plan.moves.push(Move {
-            start: plan.duration,
-            end: plan.duration + seconds,
-            ..m
-        });
-        plan.duration += seconds;
-    };
-    // A rapid at the rate the 3-axis kernels rapid at, none when it does not move.
-    let rapid = |plan: &mut crate::simulation::Plan, from: [f32; 3], to: [f32; 3], a: f32| {
-        let d = (0..3)
-            .map(|k| (to[k] - from[k]).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        if d > 1e-5 {
-            push(
-                plan,
-                Move {
-                    from,
-                    to,
-                    motion: Motion::Rapid,
-                    cutting_pass: false,
-                    feed: RAPID,
-                    start: 0.,
-                    end: d / RAPID * 60.,
-                    a: Some(a),
-                },
-            );
-        }
-    };
     let (mut a_now, mut at): (f32, Option<[f32; 3]>) = (start.a, None);
     for (k, (a, part)) in parts.iter().enumerate() {
         let mut moves = &part.moves[..];
@@ -778,14 +748,8 @@ pub fn generate(
         if k == 0 || turning {
             // The plan's own approach is replaced: over its first cut at the
             // swing height, straight down to where that cut starts.
-            let first = moves
-                .iter()
-                .position(|m| m.motion == Motion::Feed)
-                .unwrap_or(0);
-            let to = moves[first].from;
-            // Before the first angle the tool waits over its first cut.
-            let from = at.unwrap_or([to[0], to[1], top]);
-            let (up, over) = ([from[0], from[1], top], [to[0], to[1], top]);
+            let entry = Entry::new(moves, at, top);
+            let (from, up, over, to) = (entry.from, entry.up, entry.over, entry.to);
             if let Some((rig, gap)) = &rig {
                 let tool = (part.radius, part.tool_length, part.holder_radius);
                 let hits = [
@@ -814,25 +778,8 @@ pub fn generate(
                     ));
                 }
             }
-            rapid(&mut plan, from, up, a_now);
-            if turning {
-                push(
-                    &mut plan,
-                    Move {
-                        from: up,
-                        to: up,
-                        motion: Motion::Index,
-                        cutting_pass: false,
-                        feed: INDEX_RATE,
-                        start: 0.,
-                        end: (a - a_now).abs() / INDEX_RATE * 60.,
-                        a: Some(*a),
-                    },
-                );
-            }
-            rapid(&mut plan, up, over, *a);
-            rapid(&mut plan, over, to, *a);
-            moves = &moves[first..];
+            entry.push(&mut plan, Some(a_now), Some(*a));
+            moves = &moves[entry.first..];
         }
         for m in moves {
             push(&mut plan, m.clone());
@@ -841,6 +788,128 @@ pub fn generate(
         a_now = *a;
     }
     Ok(Posed { plan, turns })
+}
+/// `plan`, made by the 3-axis kernel for setup `si`, which is not indexed:
+/// held in the chuck, it enters as an indexed operation does (LIO-206). The
+/// kernels' own lead-in starts at the stock box's -X -Y corner at their
+/// clearance plane, which on a bar is over the jaws and below what they
+/// reach; it is replaced by a rapid over the first cut from the swing
+/// height of the setup's own clamping (`Document::swing`), or from the top
+/// of the Z travel when that is higher, straight down to where the cut
+/// starts. The moves keep no A. The workholding checks check it with the
+/// rest. Another setup's plan, or one whose swing cannot be told (the
+/// setup's issues say why), is as made.
+pub fn enter_held(
+    doc: &Document,
+    si: usize,
+    op: &crate::model::Operation,
+    mesh: &Mesh,
+    plan: crate::simulation::Plan,
+) -> Result<crate::simulation::Plan, String> {
+    let setup = &doc.setups[si];
+    if !crate::chuck::holds(setup) || plan.moves.is_empty() {
+        return Ok(plan);
+    }
+    let Ok(swing) = doc.swing_unchecked(si, mesh, crate::cam::number(op, "clearance")?) else {
+        return Ok(plan);
+    };
+    let entry = Entry::new(&plan.moves, None, swing.z - swing.machine_z.max(0.));
+    let mut entered = plan.clone();
+    entered.moves.clear();
+    entered.duration = 0.;
+    entry.push(&mut entered, None, None);
+    for m in &plan.moves[entry.first..] {
+        push(&mut entered, m.clone());
+    }
+    Ok(entered)
+}
+/// How an operation enters from above what its clamping swings: from
+/// `from` (over the first cut when the tool is not yet anywhere) straight
+/// up to the height `top`, across there over the first cut, and straight
+/// down to where it starts (`to`, the start of the first feed, `first`).
+struct Entry {
+    first: usize,
+    from: [f32; 3],
+    up: [f32; 3],
+    over: [f32; 3],
+    to: [f32; 3],
+}
+impl Entry {
+    fn new(moves: &[crate::simulation::Move], at: Option<[f32; 3]>, top: f32) -> Self {
+        use crate::simulation::Motion;
+        let first = moves
+            .iter()
+            .position(|m| m.motion == Motion::Feed)
+            .unwrap_or(0);
+        let to = moves[first].from;
+        // Before the first angle the tool waits over its first cut.
+        let from = at.unwrap_or([to[0], to[1], top]);
+        Self {
+            first,
+            from,
+            up: [from[0], from[1], top],
+            over: [to[0], to[1], top],
+            to,
+        }
+    }
+    /// Its rapids, onto `plan`: at A `a_now` up, A turned to `a` at the top
+    /// when they differ (`Motion::Index`), at `a` across and down. None:
+    /// moves of a setup that is not indexed, which keep no A.
+    fn push(&self, plan: &mut crate::simulation::Plan, a_now: Option<f32>, a: Option<f32>) {
+        use crate::simulation::{Motion, Move};
+        rapid(plan, self.from, self.up, a_now);
+        if let (Some(from), Some(to)) = (a_now, a)
+            && (to - from).abs() > 1e-4
+        {
+            push(
+                plan,
+                Move {
+                    from: self.up,
+                    to: self.up,
+                    motion: Motion::Index,
+                    cutting_pass: false,
+                    feed: INDEX_RATE,
+                    start: 0.,
+                    end: (to - from).abs() / INDEX_RATE * 60.,
+                    a,
+                },
+            );
+        }
+        rapid(plan, self.up, self.over, a);
+        rapid(plan, self.over, self.to, a);
+    }
+}
+/// `m` onto the end of `plan`, timed from where it ends.
+fn push(plan: &mut crate::simulation::Plan, m: crate::simulation::Move) {
+    let seconds = m.end - m.start;
+    plan.moves.push(crate::simulation::Move {
+        start: plan.duration,
+        end: plan.duration + seconds,
+        ..m
+    });
+    plan.duration += seconds;
+}
+/// A rapid at the rate the 3-axis kernels rapid at, none when it does not move.
+fn rapid(plan: &mut crate::simulation::Plan, from: [f32; 3], to: [f32; 3], a: Option<f32>) {
+    let d = (0..3)
+        .map(|k| (to[k] - from[k]).powi(2))
+        .sum::<f32>()
+        .sqrt();
+    if d > 1e-5 {
+        push(
+            plan,
+            crate::simulation::Move {
+                from,
+                to,
+                motion: crate::simulation::Motion::Rapid,
+                cutting_pass: false,
+                feed: RAPID,
+                start: 0.,
+                end: d / RAPID * 60.,
+                a,
+            },
+        );
+    }
 }
 /// The rapid rate of the index moves, mm/min: the 3-axis kernels'.
 const RAPID: f32 = 6000.;
@@ -1577,12 +1646,37 @@ pub(crate) mod tests {
         let mut fresh = doc.setups[0].clone();
         fresh.p.insert("stock_source".into(), "fresh".into());
         let direct = crate::simulation::generate(&fresh, &op, &doc.tools[0], &mesh).unwrap();
-        assert_eq!(direct.moves.len(), sim.plan.moves.len());
-        for (a, b) in direct.moves.iter().zip(&sim.plan.moves) {
-            assert_eq!(
-                (a.from, a.to, a.motion, a.start, a.end),
-                (b.from, b.to, b.motion, b.start, b.end)
-            );
+        // Held in the chuck it enters from above the jaws (LIO-206); from
+        // its first feed on it is the kernel's, move for move.
+        let feed = |p: &crate::simulation::Plan| {
+            (p.moves.iter())
+                .position(|m| m.motion == Motion::Feed)
+                .unwrap()
+        };
+        let (kernel, entered) = (
+            &direct.moves[feed(&direct)..],
+            &sim.plan.moves[feed(&sim.plan)..],
+        );
+        assert_eq!(kernel.len(), entered.len());
+        let shift = entered[0].start - kernel[0].start;
+        for (a, b) in kernel.iter().zip(entered) {
+            assert_eq!((a.from, a.to, a.motion), (b.from, b.to, b.motion));
+            assert!((a.start + shift - b.start).abs() < 1e-3);
+            assert!((a.end + shift - b.end).abs() < 1e-3);
+        }
+        // In a vise or clamps it is the kernel's plan itself.
+        for holding in ["Vise", "Clamps"] {
+            let mut held = doc.clone();
+            held.setups[0].p.insert("holding".into(), holding.into());
+            let sim = prepare(&held, &mesh, 0, 0).unwrap();
+            assert_eq!(direct.moves.len(), sim.plan.moves.len(), "{holding}");
+            for (a, b) in direct.moves.iter().zip(&sim.plan.moves) {
+                assert_eq!(
+                    (a.from, a.to, a.motion, a.start, a.end, a.a),
+                    (b.from, b.to, b.motion, b.start, b.end, b.a)
+                );
+            }
+            assert_eq!(direct.duration, sim.plan.duration);
         }
         // The indexed setup after it starts with A turning from 0 to 90.
         let indexed = prepare(&doc, &mesh, 1, 0).unwrap();
@@ -2009,6 +2103,103 @@ pub(crate) mod tests {
             posted.setups[1].result.is_ok(),
             "{:?}",
             posted.setups[1].result
+        );
+    }
+    /// `posting_bar_job` with the contour in setup 1 too, then a finishing
+    /// contour after it there: setup 1 is a plain setup on the bar in the
+    /// chuck.
+    fn chuck_setup_1_job(angles: &str) -> (Document, Mesh) {
+        let (mut doc, mesh) = posting_bar_job(20., "100", angles);
+        let mut rough = doc.setups[1].operations[0].clone();
+        rough.id = crate::model::id();
+        rough.p.insert("allowance".into(), "1".into());
+        let mut finish = rough.clone();
+        finish.id = crate::model::id();
+        finish.p.insert("allowance".into(), "0".into());
+        doc.setups[0].operations = vec![rough, finish];
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        (doc, mesh)
+    }
+    #[test]
+    fn a_plain_setup_in_the_chuck_comes_down_from_above_the_jaws() {
+        use crate::simulation::{Motion, prepare};
+        let (doc, mesh) = chuck_setup_1_job("90, 180");
+        // The kernel starts at the stock's -X -Y corner, in the jaws, at its
+        // clearance plane, below what they reach.
+        let mut fresh = doc.setups[0].clone();
+        fresh.p.insert("stock_source".into(), "fresh".into());
+        let op = &doc.setups[0].operations[0];
+        let kernel = crate::simulation::generate(&fresh, op, &doc.tools[0], &mesh).unwrap();
+        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+        let corner = kernel.moves[0].from;
+        assert!(
+            corner[0] < rig.front && (corner[0] - stock.min[0]).abs() < 1.,
+            "{corner:?}"
+        );
+        // Both operations instead come down over their first cut from the
+        // swing height of setup 1's own clamping, with no A, clear of the
+        // jaws (LIO-206).
+        let swing = doc.swing(0, &mesh, 15.).unwrap();
+        assert_eq!(swing, doc.swing(1, &mesh, 15.).unwrap());
+        assert!(corner[2] < swing.z - 30., "{corner:?} {swing:?}");
+        let gap = crate::holding::gap(&doc.setups[0]).unwrap();
+        for oi in 0..2 {
+            let plan = prepare(&doc, &mesh, 0, oi).unwrap().plan;
+            let first = (plan.moves.iter())
+                .position(|m| m.motion == Motion::Feed)
+                .unwrap();
+            let (down, over) = (&plan.moves[..first], plan.moves[first].from);
+            assert_eq!(down.len(), 1, "{down:?}");
+            assert_eq!(down[0].motion, Motion::Rapid);
+            assert!(close(down[0].from, [over[0], over[1], swing.z]), "{down:?}");
+            assert!(close(down[0].to, over));
+            assert!(plan.moves.iter().all(|m| m.a.is_none()));
+            let tool = (plan.radius, plan.tool_length, plan.holder_radius);
+            assert!(
+                rig.hits_at(0., &[(down[0].from, over)], tool, gap)
+                    .is_empty()
+            );
+            assert!((plan.duration - plan.moves.last().unwrap().end).abs() < 1e-3);
+        }
+        // Its workholding check finds nothing, and the job exports: setup
+        // 1 at A0 with no A word, and the indexed setup after it.
+        let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
+        let held = crate::post::held(&doc, &mesh, 0, &sims);
+        assert!(held.is_empty(), "{held:?}");
+        let posted = crate::post::post_job(&doc, &mesh);
+        for k in [0, 1] {
+            assert!(
+                posted.setups[k].result.is_ok(),
+                "{k}: {:?}",
+                posted.setups[k].result
+            );
+        }
+        let program = &posted.setups[0].result.as_ref().unwrap()[0].text;
+        let code = program.lines().filter(|l| !l.starts_with('('));
+        assert!(code.clone().all(|l| !l.contains('A')), "{program}");
+    }
+    #[test]
+    fn a_plain_setup_in_the_chuck_at_the_assumed_centreline_enters_from_the_top_of_the_z_travel() {
+        use crate::simulation::{Motion, prepare};
+        // With the assumed centreline (Z -40) all that A swings reaches
+        // above the Z travel: the entry comes down from its top (machine Z0).
+        let (mut doc, mesh) = chuck_setup_1_job("90");
+        doc.setups[0]
+            .machine
+            .p
+            .insert("a_centre_z".into(), "-40".into());
+        doc.sync_indexed();
+        let swing = doc.swing_unchecked(0, &mesh, 15.).unwrap();
+        assert!(swing.machine_z > 0., "{swing:?}");
+        let plan = prepare(&doc, &mesh, 0, 0).unwrap().plan;
+        assert_eq!(plan.moves[0].motion, Motion::Rapid);
+        let top = swing.z - swing.machine_z;
+        assert!(
+            (plan.moves[0].from[2] - top).abs() < 1e-3,
+            "{:?} {top}",
+            plan.moves[0]
         );
     }
 }
