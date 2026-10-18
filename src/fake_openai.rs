@@ -379,11 +379,15 @@ pub mod rotary {
             free_end: None,
         }
     }
-    /// One setup of the bar's plan: an outside contour at `angles`.
+    /// One setup of the bar's plan: an outside contour at `angles`, down
+    /// to 2 mm over the A axis (12 mm over the part's bottom), so that its
+    /// passes across the bar's ends leave a web on the axis that keeps the
+    /// part on the bar (LIO-208).
     fn setup(name: &str, up: &str, origin: &str, angles: Option<Vec<f32>>) -> ProposedSetup {
         let mut contour = op("Contour", 1, vec![]);
         contour.contour_mode = Some("outside".into());
         contour.stepdown = Some(6.);
+        contour.bottom_offset = Some(12.);
         ProposedSetup {
             orientation: up.into(),
             name: name.into(),

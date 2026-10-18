@@ -228,13 +228,22 @@ fn a_before(doc: &Document, si: usize) -> f32 {
 /// stick-out and holder length place them (`in_spindle`). Each with the
 /// index of its operation in the setup (None
 /// for the setup's), named by the setup, the A angle and the operation.
-/// Empty for a setup that is not indexed.
+/// Then, in any setup on the bar in the chuck, indexed or not, a cut that
+/// parts the stock off the bar the chuck holds (`parted`, LIO-208). Empty
+/// for a setup that is neither.
 pub fn problems(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
     sims: &Sims,
 ) -> Vec<(Option<usize>, String)> {
+    let mut out = placed(doc, mesh, si, sims);
+    out.extend(parted(doc, mesh, si, sims));
+    out
+}
+
+/// `problems` of an indexed setup's moves on the machine.
+fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<usize>, String)> {
     let setup = &doc.setups[si];
     let Some(base) = doc.index_base(si).filter(|_| is_indexed(setup)) else {
         return vec![];
@@ -537,6 +546,248 @@ pub fn problems(
         }
     }
     out
+}
+
+/// How near the axis, mm, the tailstock's centre holds the bar's free end.
+const CENTRE: f32 = 3.;
+
+/// The stock's voxels (`volume::Volume`) as the chuck sees them: each
+/// one's X along the A axis in the chuck's frame and how far it is from the
+/// axis, and the ones the jaws (or the tailstock's centre) hold. The jaws
+/// turn with the stock, so what they hold is the same at every angle.
+struct Gripped {
+    x: Vec<f32>,
+    r: Vec<f32>,
+    seeds: Vec<usize>,
+    n: [usize; 3],
+}
+impl Gripped {
+    fn new(v: &crate::volume::Volume, a0: crate::volume::Frame, rig: &Rig) -> Self {
+        let mut x = Vec::with_capacity(v.occupied.len());
+        let mut radii = Vec::with_capacity(v.occupied.len());
+        let mut seeds = vec![];
+        let cell = v.cell.iter().copied().fold(0., f32::max);
+        for k in 0..v.n[2] {
+            for j in 0..v.n[1] {
+                for i in 0..v.n[0] {
+                    let q = v.frame.transfer(v.point([i, j, k], 0.5), a0);
+                    let r = (q[1] - rig.axis[0]).hypot(q[2] - rig.axis[1]);
+                    let tail = match rig.tail {
+                        crate::chuck::Tail::Supports(end) => {
+                            q[0] >= end - 1.5 * cell && r <= CENTRE.max(1.5 * cell)
+                        }
+                        _ => false,
+                    };
+                    if q[0] <= rig.front || tail {
+                        seeds.push(x.len());
+                    }
+                    x.push(q[0]);
+                    radii.push(r);
+                }
+            }
+        }
+        Self {
+            x,
+            r: radii,
+            seeds,
+            n: v.n,
+        }
+    }
+    /// The voxels next to voxel `i` across its faces.
+    fn next(&self, i: usize) -> impl Iterator<Item = usize> {
+        let n = self.n;
+        let p = [i % n[0], i / n[0] % n[1], i / (n[0] * n[1])];
+        let step = [1, n[0], n[0] * n[1]];
+        (0..3).flat_map(move |k| {
+            [
+                (p[k] > 0).then(|| i - step[k]),
+                (p[k] + 1 < n[k]).then(|| i + step[k]),
+            ]
+            .into_iter()
+            .flatten()
+        })
+    }
+    /// The voxels of `filled` reached from `from` across faces through
+    /// voxels `filled` keeps.
+    fn fill(&self, from: &[usize], filled: impl Fn(usize) -> bool) -> Vec<bool> {
+        let mut reached = vec![false; self.x.len()];
+        let mut stack: Vec<usize> = from.iter().copied().filter(|&i| filled(i)).collect();
+        for &i in &stack {
+            reached[i] = true;
+        }
+        while let Some(i) = stack.pop() {
+            for j in self.next(i) {
+                if !reached[j] && filled(j) {
+                    reached[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        reached
+    }
+    /// The material of `v` joined to what the chuck holds.
+    fn held(&self, v: &crate::volume::Volume) -> Vec<bool> {
+        self.fill(&self.seeds, |i| v.occupied[i] != 0)
+    }
+    /// A piece of `v` that was held (`before`) and is no longer (`now`), at
+    /// least three voxels thick somewhere (a voxel with all its face
+    /// neighbours filled): the voxels of the piece. A thinner sliver is
+    /// taken for a chip, or for the voxels' own coarseness.
+    fn loose(
+        &self,
+        v: &crate::volume::Volume,
+        before: &[bool],
+        now: &[bool],
+    ) -> Option<Vec<usize>> {
+        let freed = |i: usize| v.occupied[i] != 0 && before[i] && !now[i];
+        let core = (0..self.x.len())
+            .find(|&i| freed(i) && self.next(i).filter(|&j| v.occupied[j] != 0).count() == 6)?;
+        let piece = self.fill(&[core], freed);
+        Some((0..self.x.len()).filter(|&i| piece[i]).collect())
+    }
+}
+
+/// A cut that parts the stock off the bar the chuck holds (LIO-208), in
+/// setup `si` on a bar in the chuck, indexed or not: the stock is followed
+/// through its `sims` (`simulation::sequence`'s in-process stock across
+/// the angles), and after each angle's cuts of each operation the material
+/// still joined to what the jaws grip (or the tailstock's centre holds) is
+/// flood-filled across the voxels' faces. A piece that was joined before
+/// and is not now comes loose, to be thrown or to break the tool: refused,
+/// once, naming the operation, the angle and the X range (work
+/// coordinates) where nothing of the stock is left between the bar and the
+/// piece. The voxels hold material where their centres were not cut, so a
+/// web on the axis is seen when it is at least one voxel across (`cell`
+/// below, the stock's longest side over 96: 1.25 mm on a 120 mm bar); a
+/// thinner one counts as cut through. A deliberate part-off is not an
+/// operation yet.
+fn parted(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<usize>, String)> {
+    let setup = &doc.setups[si];
+    let base = match doc.index_base(si) {
+        Some(base) => base,
+        None if is_indexed(setup) => return vec![],
+        None => si,
+    };
+    let clamped = &doc.setups[base];
+    if !crate::chuck::holds(clamped) {
+        return vec![];
+    }
+    let Some(stock) = doc.setup_stock(base, Some(mesh)) else {
+        return vec![];
+    };
+    let (Ok(rig), Ok(at)) = (doc.chuck_rig(clamped, stock), doc.at_angle(si, 0., mesh)) else {
+        return vec![];
+    };
+    let mut sims = sims
+        .iter()
+        .filter_map(|(oi, r)| r.as_ref().ok().map(|s| (*oi, s)))
+        .peekable();
+    let Some(volume) = sims.peek().and_then(|(_, s)| s.initial_volume.as_ref()) else {
+        return vec![];
+    };
+    let grid = Gripped::new(volume, at.frame, &rig);
+    let mut held = grid.held(volume);
+    let name = setup.name();
+    let words = Bar::of(doc, base, mesh).map_or("stock".into(), |b| b.words);
+    for (oi, sim) in sims {
+        let mut play = sim.clone();
+        play.seek(0.);
+        // When each angle's cuts end, with the angle.
+        let mut ends = vec![];
+        let mut a_now = play.plan.moves.first().and_then(|m| m.a).unwrap_or(0.);
+        let mut cut = false;
+        for m in &play.plan.moves {
+            if m.motion == Motion::Index {
+                if cut {
+                    ends.push((m.start, a_now));
+                }
+                cut = false;
+            }
+            cut |= m.motion == Motion::Feed;
+            a_now = m.a.unwrap_or(a_now);
+        }
+        if cut {
+            ends.push((play.plan.duration, a_now));
+        }
+        for (t, a) in ends {
+            play.seek(t / play.plan.duration.max(1e-6));
+            let Some(v) = play.volume.as_ref() else {
+                return vec![];
+            };
+            let now = grid.held(v);
+            if let Some(piece) = grid.loose(v, &held, &now) {
+                let line = loose_line(&grid, v, &piece, at.zero[0], &words);
+                let op = setup.operations[oi].name();
+                return vec![(
+                    Some(oi),
+                    format!("{name} at A {}°, {op}: {line}", degrees(a)),
+                )];
+            }
+            held = now;
+        }
+    }
+    vec![]
+}
+
+/// What is said of `piece`, cut loose from the `words` the chuck holds in
+/// `v`: where nothing of the stock is left on the A axis on its side
+/// towards the jaws (work X, `datum` being the work zero's X in the
+/// chuck's frame), its own length and place, and the voxels' size.
+fn loose_line(
+    grid: &Gripped,
+    v: &crate::volume::Volume,
+    piece: &[usize],
+    datum: f32,
+    words: &str,
+) -> String {
+    let w = v.cell.iter().copied().fold(f32::INFINITY, f32::min);
+    let cell = v.cell.iter().copied().fold(0., f32::max);
+    let low = grid.x.iter().copied().fold(f32::INFINITY, f32::min) - w / 2.;
+    let high = grid.x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    // Each slab of the stock across the axis, a voxel thick: whether
+    // anything of it is left on the axis, within a voxel of it.
+    let bin = |x: f32| ((x - low) / w).floor().max(0.) as usize;
+    let mut on_axis = vec![false; bin(high) + 1];
+    for i in (0..grid.x.len()).filter(|&i| v.occupied[i] != 0 && grid.r[i] <= cell) {
+        on_axis[bin(grid.x[i])] = true;
+    }
+    let ends = piece
+        .iter()
+        .fold([f32::INFINITY, f32::NEG_INFINITY], |e, &i| {
+            [e[0].min(grid.x[i]), e[1].max(grid.x[i])]
+        });
+    let (start, end) = (ends[0] - w / 2., ends[1] + w / 2.);
+    let at = |x: f32| mm(x - datum);
+    // The slabs bare on the axis next to the piece's own, on the jaws' side.
+    let near = (piece.iter())
+        .filter(|&&i| grid.r[i] <= cell)
+        .map(|&i| grid.x[i])
+        .fold(f32::INFINITY, f32::min);
+    let first = bin(if near.is_finite() { near } else { ends[0] });
+    let mut k = first;
+    while k > 0 && !on_axis[k - 1] {
+        k -= 1;
+    }
+    let fix = format!(
+        "it comes loose, to be thrown or to break the tool. Cut less deep, so that a web of the stock stays on the A axis (the stock is checked in {} mm cells: a thinner web counts as cut through); a part-off is not an operation yet.",
+        mm(cell)
+    );
+    let piece = format!(
+        "the {} mm piece of it from X{} to X{}",
+        mm(end - start),
+        at(start),
+        at(end)
+    );
+    match k < first {
+        true => format!(
+            "the cuts leave nothing of the {words} on the A axis from X{} to X{}, and nothing else joins {piece} to the bar the chuck holds, so {fix}",
+            at(low + k as f32 * w),
+            at(low + first as f32 * w),
+        ),
+        false => format!(
+            "the cuts leave {piece} joined to nothing the {words} in the chuck holds, so {fix}"
+        ),
+    }
 }
 
 /// The workholding problems of indexed setup `si` from its `sims`, as
@@ -1414,9 +1665,145 @@ mod tests {
 
     #[test]
     fn a_setup_that_is_not_indexed_is_not_checked_here() {
-        // Setup 1 holds the bar in the chuck at A0: its checks are the
-        // 3-axis ones, unchanged.
+        // Setup 1 holds the bar in the chuck at A0: its moves' checks are
+        // the 3-axis ones, unchanged; a cut parting the bar would be said.
         let (doc, mesh, sim) = job("-150", "90");
         assert!(problems(&doc, &mesh, 0, &[(0, Ok(sim))]).is_empty());
+    }
+
+    /// The demo 4-angle job (`render_the_four_axis_scene`): the part 20 mm
+    /// out of the chuck's jaws in the Ø40 bar 100 mm out of them, a contour
+    /// at A 90, 180, 270 and 0° whose passes across the bar's ends go
+    /// `bottom` mm over the part's bottom, 10 mm under the A axis; and
+    /// what the rotary checks say of setup 2. Ready to post: the tool
+    /// numbered and the part's file given.
+    fn four_angles(bottom: &str) -> (Document, Mesh, Vec<String>) {
+        let mesh = prism(30.);
+        let mut op = contour(&cutter("12"));
+        op.p.insert("bottom".into(), bottom.into());
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180, 270, 0", op);
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 0,
+        });
+        let sims = crate::run::simulated_for_tests(&doc, &mesh, 1);
+        let said = problems(&doc, &mesh, 1, &sims)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        (doc, mesh, said)
+    }
+    /// What the rotary checks say of the cut in the demo job that parts
+    /// the bar at A 180° (LIO-208).
+    const PARTED: &str = "Flats at A 180°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52.5 to X-40, and nothing else joins the 30 mm piece of it from X-40 to X-10 to the bar the chuck holds, so it comes loose, to be thrown or to break the tool. Cut less deep, so that a web of the stock stays on the A axis (the stock is checked in 1.25 mm cells: a thinner web counts as cut through); a part-off is not an operation yet.";
+
+    #[test]
+    fn the_demo_job_that_cuts_the_part_off_the_bar_is_refused_where_it_does() {
+        // Each angle's passes across the bar's ends go to the part's bottom,
+        // 10 mm past the A axis: after A 90 and 180° nothing joins the part
+        // to the bar on the axis, between the passes at X-46.06 and X-40.06
+        // (the Ø12 cutter's edges at X-52.06 and X-40.06, to the 1.25 mm
+        // voxels). Said once, at the angle that parts it.
+        let (_, _, said) = four_angles("0");
+        assert_eq!(said, vec![PARTED.to_string()]);
+    }
+
+    #[test]
+    fn a_web_wider_than_a_voxel_keeps_the_part_on_the_bar() {
+        // Down to 2 mm over the axis at all four angles: a 4 mm square web
+        // (the demo job now); 1 mm over it: a 2 mm one, 1.6 voxels across.
+        for bottom in ["12", "11"] {
+            let (_, _, said) = four_angles(bottom);
+            assert!(said.is_empty(), "{bottom}: {said:?}");
+        }
+        // Down to the axis: no web. The opposite angle cuts it through.
+        // Half a millimetre over it the 1 mm web holds no voxel's centre: it
+        // counts as cut through, as the message says.
+        for bottom in ["10", "10.5"] {
+            let (_, _, said) = four_angles(bottom);
+            assert_eq!(said, vec![PARTED.replace("A 180°", "A 270°")], "{bottom}");
+        }
+    }
+
+    #[test]
+    fn the_export_the_plan_check_and_the_run_refuse_a_cut_that_parts_the_bar() {
+        for (bottom, parts) in [("0", true), ("12", false)] {
+            let (mut doc, mesh, _) = four_angles(bottom);
+            let posted = crate::post::post_job(&doc, &mesh);
+            match parts {
+                true => {
+                    let refused = posted.setups[1].result.as_ref().unwrap_err();
+                    assert!(refused.contains(&PARTED.to_string()), "{refused:?}");
+                }
+                false => assert!(
+                    posted.setups[1].result.is_ok(),
+                    "{:?}",
+                    posted.setups[1].result
+                ),
+            }
+            crate::proposal::tests::aluminium(&mut doc);
+            doc.active = doc.setups[0].id.clone();
+            let report = crate::analysis::report(&doc, &mesh).unwrap();
+            let check = crate::plan_check::check_built(&doc, &mesh, &report);
+            let said = check.problems.iter().filter(|p| p.message == PARTED);
+            assert_eq!(said.count(), usize::from(parts), "{:?}", check.problems);
+            // A run's admission on a UC100 too, once: the machine with the
+            // CNC4030's UC100 profile.
+            let dir = tempfile::tempdir().unwrap();
+            let uc100 = crate::control::rotary_machine(dir.path()).unwrap();
+            for k in ["controller", "uc100_profile"] {
+                let v = get(&uc100.p, k).to_string();
+                doc.setups[0].machine.p.insert(k.into(), v);
+            }
+            doc.sync_indexed();
+            let ready = crate::run::ready(&doc, &mesh, 1, 0);
+            let said = ready.problems.iter().filter(|m| m.as_str() == PARTED);
+            assert_eq!(said.count(), usize::from(parts), "{:?}", ready.problems);
+        }
+    }
+
+    #[test]
+    fn a_cut_through_in_the_first_setup_in_the_chuck_is_refused_too() {
+        use crate::indexed::tests::on_the_bar;
+        // Setup 1, at A0 with no A, contours the part down to the bar's
+        // bottom: its passes across the bar's ends cut it through.
+        let mesh = prism(30.);
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90", on_the_bar(&cutter("12")));
+        let mut through = contour(&doc.tools[0]);
+        through.p.insert("bottom".into(), "-10".into());
+        doc.setups[0].operations = vec![through];
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
+        let said: Vec<String> = problems(&doc, &mesh, 0, &sims)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        let name = doc.setups[0].name();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with(&format!("{name} at A 0°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52.5 to X-40, and nothing else joins the 30 mm piece of it from X-40 to X-10")),
+            "{said:?}"
+        );
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 0,
+        });
+        let posted = crate::post::post_job(&doc, &mesh);
+        let refused = posted.setups[0].result.as_ref().unwrap_err();
+        assert!(refused.contains(&said[0]), "{refused:?}");
+        // The same cut in a 3-axis setup, the stock in a vise: not this
+        // check's, unchanged.
+        doc.setups.truncate(1);
+        doc.setups[0].p.insert("holding".into(), "Vise".into());
+        let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
+        assert!(sims.iter().all(|(_, r)| r.is_ok()));
+        assert!(problems(&doc, &mesh, 0, &sims).is_empty());
     }
 }

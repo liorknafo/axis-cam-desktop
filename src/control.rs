@@ -5021,11 +5021,11 @@ spindle_max_rpm = 24000
     /// still in setup 1 and turning alone in setup 2.
     #[test]
     fn a_bar_in_the_chuck_runs_setup_1_then_its_indexed_setup() {
-        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mesh = prism(30.);
-        let mut op = contour(&cutter("12"));
+        let mut op = on_the_bar(&cutter("12"));
         for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
             op.p.insert(k.into(), v.into());
         }
@@ -5189,14 +5189,14 @@ spindle_max_rpm = 24000
     /// planned. The longer tool's job then runs to its end.
     #[test]
     fn an_indexed_cut_is_as_deep_with_a_tool_longer_or_shorter_than_the_probe() {
-        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
         use crate::run::Action as R;
         for (longer, stickout, holder, run_it) in
             [(15., "50", "15", true), (-10., "40", "0", false)]
         {
             let dir = tempfile::tempdir().unwrap();
             let mesh = prism(30.);
-            let mut op = contour(&cutter("12"));
+            let mut op = on_the_bar(&cutter("12"));
             for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
                 op.p.insert(k.into(), v.into());
             }
@@ -5435,11 +5435,11 @@ spindle_max_rpm = 24000
     /// commanded to, back at A0.
     #[test]
     fn an_indexed_bar_runs_at_four_angles_turning_a_alone() {
-        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mesh = prism(30.);
-        let mut op = contour(&cutter("12"));
+        let mut op = on_the_bar(&cutter("12"));
         // A few seconds a pass: fast feeds, deep steps.
         for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
             op.p.insert(k.into(), v.into());
@@ -5680,7 +5680,9 @@ spindle_max_rpm = 24000
             c.snapshot.machine_pos
         );
         // The live carve followed A (LIO-190): the volume it cut at each
-        // angle leaves the square on the bar's axis, the bar round it gone.
+        // angle leaves the square on the bar's axis, the bar round it gone
+        // but within 2 mm of the planes through the axis, where the cuts stop
+        // to leave the web that keeps the part on the bar (LIO-208).
         let (carved, _) = run.carved_volume().expect("a live carve of the volume");
         assert!(run.stock().is_none(), "the top view is not carved");
         let base = crate::volume::Frame::new(&doc.setups[0], &mesh);
@@ -5689,7 +5691,7 @@ spindle_max_rpm = 24000
         for (dy, dz) in [(7., 0.), (-7., 0.), (0., 7.), (0., -7.), (6., -6.)] {
             assert!(filled(dy, dz), "inside the square at {dy} {dz}");
         }
-        for (dy, dz) in [(14., 0.), (-14., 0.), (0., 14.), (0., -14.)] {
+        for (dy, dz) in [(14., 4.), (-14., -4.), (4., 14.), (-4., -14.)] {
             assert!(!filled(dy, dz), "outside the square at {dy} {dz}");
         }
         // The same job from A0, its first angle: A turns to 90, 180, 270 and

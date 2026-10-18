@@ -1281,6 +1281,15 @@ pub(crate) mod tests {
         op.p.insert("allowance".into(), "0".into());
         op
     }
+    /// `contour` down to 2 mm over the A axis instead, the part's bottom
+    /// being 10 mm under it: at angles 180° apart its passes across the
+    /// bar's ends leave a 4 mm web on the axis, which keeps the part on the
+    /// bar in the chuck (LIO-208).
+    pub(crate) fn on_the_bar(tool: &crate::model::Tool) -> crate::model::Operation {
+        let mut op = contour(tool);
+        op.p.insert("bottom".into(), "12".into());
+        op
+    }
     /// The angles the moves of `plan` are made at, each once, in order.
     fn angle_order(plan: &crate::simulation::Plan) -> Vec<f32> {
         let mut v: Vec<f32> = vec![];
@@ -1863,7 +1872,14 @@ pub(crate) mod tests {
         // The part 20 mm along the bar and 100 mm of it out of the jaws:
         // the holder stays clear of them round the part at each angle.
         let mesh = prism(30.);
-        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180", contour(&cutter("12")));
+        let mut doc = bar_job(
+            &mesh,
+            20.,
+            "100",
+            "-150",
+            "90, 180",
+            on_the_bar(&cutter("12")),
+        );
         doc.tools[0].p.insert("number".into(), "1".into());
         doc.file = Some(crate::model::ModelFile {
             name: "bar.stl".into(),
@@ -1936,10 +1952,18 @@ pub(crate) mod tests {
         assert!(notes[0].ends_with(LEGACY), "{notes:?}");
     }
 
-    /// `bar_job` with a numbered tool and a part file, so it posts.
+    /// `bar_job` with a numbered tool and a part file, so it posts, its
+    /// contour leaving a web on the A axis (`on_the_bar`).
     fn posting_bar_job(x0: f32, stickout: &str, angles: &str) -> (Document, Mesh) {
         let mesh = prism(30.);
-        let mut doc = bar_job(&mesh, x0, stickout, "-150", angles, contour(&cutter("12")));
+        let mut doc = bar_job(
+            &mesh,
+            x0,
+            stickout,
+            "-150",
+            angles,
+            on_the_bar(&cutter("12")),
+        );
         doc.tools[0].p.insert("number".into(), "1".into());
         doc.file = Some(crate::model::ModelFile {
             name: "bar.stl".into(),
