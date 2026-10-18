@@ -185,7 +185,7 @@ const ROTARY_PART: &str =
 const ROTARY: &str = "ROTARY A AXIS
 - `rotary` in the part report is the machine's A axis, a chuck on the table that turns the stock about X: `centre_height` is the A centreline above the table, `max_diameter` the widest stock (across its corners) and `max_length` the longest (from the chuck's face) that fits, `a_min` and `a_max` the A limits in degrees, `grip_min` and `grip_max` what the jaws grip (a round bar's diameter; a box's thinner side up to its diagonal), and `centreline` says whether the A centreline was `measured` by the operator or is only `assumed`. When it is `assumed`, add a warning that the centreline must be probed on the Control page before cutting.
 - Hold the stock in the chuck instead of a vise when the part is long and slim, or has features on several sides that A can turn to instead of re-clamping. Then give `chuck`, otherwise null: `stock` is `Round bar` (give `diameter`) or `Box` (give `width` across Y and `height` in Z), `length` long along X; `jaws` `3-jaw` for a round bar and `4-jaw` for a box; `stickout` is how much of the stock reaches out of the jaws, `tailstock` is `Retracted`, `Supports the stock` or `Off the table`; `free_end` is the stock left beyond the part's free end (null: 2 mm). The program turns setup 1 to its `orientation`, which may be any of the six, and places the part on the stock's axis in the stick-out: the part must lie within the stick-out and the jaws must grip at least half their length of the stock, so cut only the stick-out. The report's orientations and stock margins are made for the project's own stock; the check report's `stocks` have the chuck's. Setup 1's `origin` is `A axis at stock end` or `A axis at chuck face` (X0 on the stock's free end face, or on the chuck's face; Y0 Z0 on the A centreline).
-- A later setup with `a_angles` (degrees, within `a_min` to `a_max`, such as [0, 90, 180, -90] on a -180 to 180 range) is not re-clamped: A turns the stock in setup 1's chuck, which it keeps along with its work zero. Every operation of that setup runs at each of its angles in turn, on the stock the angles before left. Its `orientation` is the part axis that faces up at its first angle; a different one is refused, with the right one. Positive A turns +Y towards +Z (the right-hand rule about +X), so with `+Z` up in setup 1 the first angle 90 brings `+Y` up, 180 brings `-Z` up and -90 brings `-Y` up (0 keeps `+Z`; 270, where the A range reaches it, is the same as -90). Its `origin` is ignored and its `holder` is null; it uses no work offset of its own. Use it instead of a flip: when the same operations are right for every angle (an outside Contour all round, a Parallel or Waterline finish) list the angles in one setup and keep `surfaces` empty; when each side needs its own operations make one setup per side with a single angle. Give a setup after the last indexed one `a_angles` null to clamp again (usually not needed).
+- A later setup with `a_angles` (degrees, within `a_min` to `a_max`, such as [0, 90, 180, -90] on a -180 to 180 range) is not re-clamped: A turns the stock in setup 1's chuck, which it keeps along with its work zero. Every operation of that setup runs at each of its angles in turn, on the stock the angles before left. Its `orientation` is the part axis that faces up at its first angle; a different one is refused, with the right one. Positive A turns +Y towards +Z (the right-hand rule about +X), so with `+Z` up in setup 1 the first angle 90 brings `+Y` up, 180 brings `-Z` up and -90 brings `-Y` up (0 keeps `+Z`; 270, where the A range reaches it, is the same as -90). Its `origin` is ignored and its `holder` is null; it uses no work offset of its own. Use it instead of a flip: when the same operations are right for every angle (an outside Contour all round, a Parallel or Waterline finish) list the angles in one setup and keep `surfaces` empty; to turn the bar into a square (or any prism) face its sides: one Face in a setup of all the angles, whose `surfaces` are the top plane's IDs of every orientation those angles bring up (+Z, +Y, -Z and -Y for [0, 90, 180, 270] with `+Z` up in setup 1), which the program faces at each angle where it is on top, with the tool's centre out to each face's edges (`facing_area` and the stock's `stock_margin` do not apply). Size the chuck's box so that the faces leave 2 mm or more to cut, and give the part a shoulder to the bar: the part's end face towards the jaws is left covered, so list it in `unmachined` as joined to the bar, never part it off the bar there (the program refuses a loose piece, a web under 3 mm or too weak for the cut, and a part-off the jaws do not hold); when each side needs its own operations make one setup per side with a single angle. Give a setup after the last indexed one `a_angles` null to clamp again (usually not needed).
 - The program refuses a plan that does not fit, with the check's message and the stage `export` or `workholding`, by setup and operation: the cut's depth below the Z travel and the retract above it (turning A needs room over everything that swings, the stock, the part and the jaws), X Y and Z travel, the A range, the stock too big for the unit or the jaws, and the tool or its holder within `gap` of the chuck, its jaws, the rotary head and the tailstock, at each angle and while A turns. Answer those with a smaller or shorter stock, a shorter stick-out, a shorter tool or `Off the table`, a lower `clearance`, or leave the feature in `unmachined`. Check a draft with `check_plan`, as for the other setups.
 
 ";
@@ -5021,11 +5021,12 @@ pub(crate) mod tests {
             ),
             "{shown:?}"
         );
-        // ... which the model is sent, and the second plan passes. Its
-        // contour stops 7 mm over the axis, leaving the web that holds the
-        // part (LIO-211), so the middle of the square's sides is still
-        // covered: the planner asks once to machine it, and the same plan,
-        // answered again, stands.
+        // ... which the model is sent, and the second plan passes. Its four
+        // sides are faced, at the angle each is up, to a square joined to the
+        // bar at a shoulder (LIO-214): all that stock still covers is the
+        // part's end face on the bar, which the plan lists as gripped, so the
+        // planner asks once to machine it, and the same plan, answered
+        // again, stands.
         assert_eq!((outcome.requests, outcome.chosen), (3, 3), "{events:?}");
         assert!(events.contains(&Event::Stage(Progress::Extending(3))));
         let sent = fake.seen("/v1/responses");
@@ -5036,6 +5037,17 @@ pub(crate) mod tests {
         assert!(
             schema.contains("a_angles") && schema.contains("\"chuck\""),
             "{schema}"
+        );
+        let covered = sent[2].json();
+        let covered = covered["input"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            covered.contains(r#""covered_planes":[{"orientation":"-X""#)
+                && covered.contains(r#""covered_other":[]"#)
+                && covered.matches(r#""orientation""#).count() == 1,
+            "{covered}"
         );
         let again = sent[1].json().to_string();
         assert!(
@@ -5050,6 +5062,12 @@ pub(crate) mod tests {
         assert_eq!(first.p["stock_type"], "Fixed size box");
         assert_eq!(first.p["origin"], crate::indexed::ORIGINS[0]);
         assert!(crate::indexed::is_indexed(second));
+        // Its one operation faces the square's four sides, each where it is
+        // on top, with the tool's centre out to the face's edges.
+        let face = &second.operations[0];
+        assert_eq!(face.strategy, crate::model::Strategy::Face);
+        assert_eq!(face.surfaces.as_ref().unwrap().ids.len(), 4);
+        assert_eq!(face.p["containment"], "Tool center on boundary");
         assert_eq!(
             crate::indexed::angles(second).unwrap(),
             [0., 90., 180., 270.]

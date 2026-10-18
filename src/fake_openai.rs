@@ -311,7 +311,7 @@ pub mod rotary {
         analysis::{self, PartReport},
         mesh::Mesh,
         model::{Document, Setup},
-        proposal::{Proposal, ProposedChuck, ProposedSetup, Unmachined, tests::op},
+        proposal::{Proposal, ProposedChuck, ProposedOp, ProposedSetup, Unmachined, tests::op},
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -379,15 +379,14 @@ pub mod rotary {
             free_end: None,
         }
     }
-    /// One setup of the bar's plan: an outside contour at `angles`, down
-    /// to 7 mm over the A axis (17 mm over the part's bottom), so that its
-    /// passes across the bar's ends leave a web on the axis that holds the
-    /// part on the bar (LIO-208, LIO-211).
-    fn setup(name: &str, up: &str, origin: &str, angles: Option<Vec<f32>>) -> ProposedSetup {
-        let mut contour = op("Contour", 1, vec![]);
-        contour.contour_mode = Some("outside".into());
-        contour.stepdown = Some(6.);
-        contour.bottom_offset = Some(17.);
+    /// One setup of the bar's plan: `operation` at `angles`.
+    fn setup(
+        name: &str,
+        up: &str,
+        origin: &str,
+        angles: Option<Vec<f32>>,
+        operation: ProposedOp,
+    ) -> ProposedSetup {
         ProposedSetup {
             orientation: up.into(),
             name: name.into(),
@@ -395,22 +394,61 @@ pub mod rotary {
             workholding: "The bar in the chuck.".into(),
             holder: None,
             a_angles: angles,
-            operations: vec![contour],
+            operations: vec![operation],
         }
     }
+    /// An outside contour down to 7 mm over the A axis (17 mm over the
+    /// part's bottom), so that its passes across the bar's ends leave a web
+    /// on the axis that holds the part on the bar (LIO-208, LIO-211).
+    fn contour() -> ProposedOp {
+        let mut contour = op("Contour", 1, vec![]);
+        contour.contour_mode = Some("outside".into());
+        contour.stepdown = Some(6.);
+        contour.bottom_offset = Some(17.);
+        contour
+    }
+    /// A Facing of the square's four sides: the surface IDs of the top plane
+    /// of each orientation A 0, 90, 180 and 270 brings up (+Z, +Y, -Z, -Y),
+    /// each faced at the angle where it is up, out to its edges, which
+    /// leaves a square joined to the bar at a shoulder (LIO-214).
+    fn four_sides() -> ProposedOp {
+        let (_, _, report) = report();
+        let ids = ["+Z", "+Y", "-Z", "-Y"]
+            .iter()
+            .flat_map(|up| {
+                let orientation = report.orientations.iter().find(|o| o.up == *up).unwrap();
+                orientation
+                    .planes
+                    .iter()
+                    .find(|p| p.kind == "top")
+                    .unwrap()
+                    .surfaces
+                    .clone()
+            })
+            .collect();
+        op("Face", 1, ids)
+    }
     /// The plan the scenario ends with: the bar in a 4-jaw chuck as a
-    /// 24 mm box, its sides contoured at A 0, 90, 180 and 270.
+    /// 24 mm box, its top contoured, then its four sides faced at A 0, 90,
+    /// 180 and 270.
     pub fn good() -> Proposal {
         Proposal {
             summary: "Square bar in the chuck, all four sides by indexing A.".into(),
             chuck: Some(chuck(24.)),
             setups: vec![
-                setup("Bar in the chuck", "+Z", crate::indexed::ORIGINS[0], None),
+                setup(
+                    "Bar in the chuck",
+                    "+Z",
+                    crate::indexed::ORIGINS[0],
+                    None,
+                    contour(),
+                ),
                 setup(
                     "Four sides",
                     "+Z",
                     "Model origin",
                     Some(vec![0., 90., 180., 270.]),
+                    four_sides(),
                 ),
             ],
             unmachined: vec![Unmachined {
