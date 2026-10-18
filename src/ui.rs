@@ -6778,7 +6778,7 @@ pub(crate) fn running_text(app: &App, stage: crate::planner::Progress) -> String
 }
 /// Whether the run, or the preview or failure it left, is an asked change to
 /// an existing plan: the job's or the open preview's.
-fn edits_plan(app: &App) -> bool {
+pub(crate) fn edits_plan(app: &App) -> bool {
     app.plan_asked.is_some()
         && (app.plan_refined.is_some() || app.doc.setups.iter().any(|s| !s.operations.is_empty()))
 }
@@ -7110,6 +7110,9 @@ pub(crate) fn apply_note(doc: &crate::model::Document, job: &crate::model::Docum
         plural(job.setups.len(), "setup"),
     )
 }
+/// What Apply does with a change asked of the planner: the job becomes the
+/// preview, which kept what the request did not mention.
+pub(crate) const CHANGE_NOTE: &str = "Applying makes the changes listed above; everything else stays as it is. The previous job is kept in History and can be undone here.";
 /// The planner's workholding note on a setup's card, saying where it goes:
 /// setup 1's ends its notes on Apply, in place of an earlier planner note
 /// that is unchanged; a later setup's are its notes.
@@ -7604,9 +7607,12 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
                     .style(panel_style),
             );
     }
-    c.push(note(apply_note(&app.doc, job)))
-        .push(actions())
-        .into()
+    let applying = if app.plan_asked.is_some() && has_operations(app) {
+        CHANGE_NOTE.to_string()
+    } else {
+        apply_note(&app.doc, job)
+    };
+    c.push(note(applying)).push(actions()).into()
 }
 /// A failed run's problems as page lines.
 pub(crate) fn problem_lines(problems: &[crate::proposal::Problem]) -> Vec<String> {
@@ -8007,9 +8013,11 @@ fn running_view(app: &App, stage: crate::planner::Progress) -> Element<'_, Messa
         pinned = pinned.push(muted(format!("You asked: {}", clip(asked, 300))));
     }
     pinned = pinned
-        .push(muted(
-            "This can take a few minutes. Nothing changes until you apply a plan.",
-        ))
+        .push(muted(if edits_plan(app) {
+            "This can take a few minutes. Nothing changes until you apply it."
+        } else {
+            "This can take a few minutes. Nothing changes until you apply a plan."
+        }))
         .push(secondary("Cancel", Message::PlanCancel));
     let pictures = app
         .plan_overview
@@ -8158,7 +8166,14 @@ fn plan_result(app: &App) -> Element<'_, Message> {
         Planner::Failed(failure) => {
             let mut c = column![
                 plan_chat(app),
-                bold("No plan this time", 21),
+                bold(
+                    if edits_plan(app) {
+                        "The change could not be made"
+                    } else {
+                        "No plan this time"
+                    },
+                    21
+                ),
                 text(failure.message.clone()).size(13)
             ]
             .spacing(12);

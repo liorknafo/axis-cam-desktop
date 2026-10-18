@@ -11537,11 +11537,21 @@ flood = { pin = 8 }
         view: bool,
         edit: impl FnOnce(&mut crate::proposal::Proposal),
     ) -> std::sync::Arc<crate::PlanPreview> {
+        checked_preview_on(a, &a.doc, view, edit)
+    }
+    /// `checked_preview_of` planned from `base`, a job other than the app's:
+    /// what a change asked of an open preview is planned from.
+    fn checked_preview_on(
+        a: &App,
+        base: &Document,
+        view: bool,
+        edit: impl FnOnce(&mut crate::proposal::Proposal),
+    ) -> std::sync::Arc<crate::PlanPreview> {
         let mesh = a.imported_mesh.as_ref().unwrap();
-        let report = crate::analysis::report(&a.doc, mesh).unwrap();
+        let report = crate::analysis::report(base, mesh).unwrap();
         let mut proposal = crate::proposal::tests::good(&report);
         edit(&mut proposal);
-        let (check, job) = crate::plan_check::check(&a.doc, mesh, &report, &proposal);
+        let (check, job) = crate::plan_check::check(base, mesh, &report, &proposal);
         assert!(check.passed, "{:?}", check.problems);
         let job = job.unwrap();
         // Draft is enough to build the page; the app meshes at Standard.
@@ -13480,7 +13490,12 @@ flood = { pin = 8 }
                 "Here is the plan to review.".into()
             )
         );
-        // A run that found no plan answers with why.
+        // A change that found no plan answers with why. It was asked of the
+        // open preview, so the preview stays and the chat says why.
+        let crate::Planner::Preview(shown) = &a.planner else {
+            panic!("no preview is open")
+        };
+        let shown = shown.clone();
         let failure = crate::planner::Failure {
             message:
                 "The planner could not change the plan so that it passes every check in 4 attempts."
@@ -13490,25 +13505,43 @@ flood = { pin = 8 }
             requests: 4,
         };
         finish(&mut a, "Use a 20 mm cutter", Err(failure.clone()));
-        assert!(matches!(a.planner, crate::Planner::Failed(_)));
-        let turns = chat_state(&a).2;
+        let crate::Planner::Preview(kept) = &a.planner else {
+            panic!("the preview is back after a failed change")
+        };
+        assert!(std::sync::Arc::ptr_eq(kept, &shown));
+        let (box_, asked, turns) = chat_state(&a);
+        assert_eq!(
+            (box_.as_str(), asked.as_deref()),
+            ("", Some("And face it twice"))
+        );
         assert_eq!(turns.len(), 3);
         assert_eq!(
             turns[2],
             ("Use a 20 mm cutter".into(), failure.message.clone())
         );
+        // A run with no preview open that found no plan fails, and adds its turn too.
+        let _ = a.update(Message::DiscardPlan);
+        finish(&mut a, "Use a 40 mm cutter", Err(failure.clone()));
+        assert!(matches!(a.planner, crate::Planner::Failed(_)));
+        let turns = chat_state(&a).2;
+        assert_eq!(turns.len(), 4);
+        assert_eq!(
+            turns[3],
+            ("Use a 40 mm cutter".into(), failure.message.clone())
+        );
+        let _ = a.update(Message::DiscardPlan);
         // A run of Plan this job, and a result of an older run, add nothing.
         let _ = a.update(Message::Plan);
         let epoch = a.plan_epoch;
         let result = ok(&a, "Plain plan.");
         let _ = a.update(Message::PlanFinished(epoch, result));
-        assert_eq!(a.plan_chat.len(), 3);
+        assert_eq!(a.plan_chat.len(), 4);
         let _ = a.update(Message::PlanAsk("Late".into()));
         let _ = a.update(Message::PlanSend);
         let old = a.plan_epoch.wrapping_sub(1);
         let result = ok(&a, "Old.");
         let _ = a.update(Message::PlanFinished(old, result));
-        assert_eq!(a.plan_chat.len(), 3);
+        assert_eq!(a.plan_chat.len(), 4);
         assert!(matches!(a.planner, crate::Planner::Running(_)));
     }
     #[test]
@@ -13546,6 +13579,359 @@ flood = { pin = 8 }
         let _ = a.update(Message::Plan);
         let _ = a.update(Message::PlanCancel);
         assert_eq!(chat_state(&a), ("Kept".into(), None, vec![]));
+    }
+    /// Asks `request` of the planner and finishes the run with a preview
+    /// saying `summary`, after a timeline and an overview: the preview a
+    /// later change starts from.
+    fn open_change_preview(
+        a: &mut App,
+        request: &str,
+        summary: &str,
+    ) -> std::sync::Arc<crate::PlanPreview> {
+        use crate::planner::{Event, Look, Progress, StepResult};
+        let _ = a.update(Message::PlanAsk(request.into()));
+        let _ = a.update(Message::PlanSend);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        let epoch = a.plan_epoch;
+        for event in [
+            Event::Stage(Progress::Analyzing),
+            Event::Stage(Progress::Asking(1)),
+            Event::Stage(Progress::Checking(1)),
+            Event::Checked(1, StepResult::Passed),
+            Event::Stage(Progress::Previewing),
+        ] {
+            send(a, epoch, event);
+        }
+        a.record_plan_event(Event::Overview(Look {
+            description: "The part from above.".into(),
+            purpose: String::new(),
+            png: Some(std::sync::Arc::new(vec![1, 2, 3])),
+        }));
+        let preview = preview_saying(a, summary);
+        let _ = a.update(Message::PlanFinished(epoch, Ok(preview.clone())));
+        assert!(matches!(a.planner, crate::Planner::Preview(_)));
+        assert!(!a.plan_timeline.is_empty() && a.plan_overview.is_some());
+        preview
+    }
+    /// The preview in view, which must be `preview` itself.
+    fn assert_shows(a: &App, preview: &std::sync::Arc<crate::PlanPreview>) {
+        let crate::Planner::Preview(shown) = &a.planner else {
+            panic!("no preview in view, status: {}", a.status)
+        };
+        assert!(std::sync::Arc::ptr_eq(shown, preview), "another preview");
+    }
+    fn plan_page_texts(a: &App) -> Vec<String> {
+        crate::ui::probe::texts(crate::ui::plan_side(a), PAGE)
+    }
+    #[test]
+    fn a_failed_change_from_an_open_preview_restores_that_preview_its_timeline_and_request() {
+        use crate::planner::{Event, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let first = open_change_preview(&mut a, "Drill first", "Drilled first.");
+        let (timeline, overview) = (a.plan_timeline.clone(), a.plan_overview.clone());
+        let (job, doc) = (json(&first.outcome.job), json(&a.doc));
+        assert_eq!(a.plan_asked.as_deref(), Some("Drill first"));
+        // A change asked of this preview starts from it, with nothing of it shown.
+        let _ = a.update(Message::PlanAsk("Use a 20 mm cutter".into()));
+        let _ = a.update(Message::PlanSend);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        assert!(a.plan_timeline.is_empty() && a.plan_overview.is_none());
+        assert_eq!(a.plan_asked.as_deref(), Some("Use a 20 mm cutter"));
+        let epoch = a.plan_epoch;
+        send(&mut a, epoch, Event::Stage(Progress::Analyzing));
+        send(&mut a, epoch, Event::Stage(Progress::Asking(1)));
+        assert_eq!(a.plan_timeline.len(), 2);
+        let failure = crate::planner::Failure {
+            message:
+                "The planner could not change the plan so that it passes every check in 4 attempts."
+                    .into(),
+            problems: vec![],
+            api: None,
+            requests: 4,
+        };
+        let _ = a.update(Message::PlanFinished(epoch, Err(failure.clone())));
+        // The same preview is back, with its job, timeline, overview and request.
+        assert_shows(&a, &first);
+        assert_eq!(json(&first.outcome.job), job);
+        assert_eq!(a.plan_timeline, timeline, "the first run's timeline");
+        assert_eq!(a.plan_overview, overview);
+        assert_eq!(a.plan_asked.as_deref(), Some("Drill first"));
+        assert_eq!(
+            a.status,
+            format!("{} The preview is as it was.", failure.message)
+        );
+        assert!(a.plan_refined.is_none() && a.plan_run.is_none());
+        assert_eq!(json(&a.doc), doc, "the job stays as it was");
+        // The chat has both exchanges, the second with the failure as its answer.
+        let (boxed, _, turns) = chat_state(&a);
+        assert_eq!(boxed, "");
+        assert_eq!(
+            turns,
+            [
+                ("Drill first".to_string(), "Drilled first.".to_string()),
+                ("Use a 20 mm cutter".into(), failure.message.clone()),
+            ]
+        );
+        // The page is the preview's, not a failed run's.
+        let texts = plan_page_texts(&a);
+        assert!(texts.iter().any(|t| t == "Change ready to review"));
+        assert!(!texts.iter().any(|t| t == "The change could not be made"));
+        assert!(!texts.iter().any(|t| t == "No plan this time"));
+        // Apply still applies the first preview.
+        let _ = a.update(Message::ApplyPlan);
+        assert_eq!(
+            json(&a.doc.setups),
+            json(&crate::planner::applied(&first.outcome).setups)
+        );
+    }
+    #[test]
+    fn cancel_during_a_change_from_an_open_preview_restores_the_preview_and_adds_no_turn() {
+        use crate::planner::{Event, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let first = open_change_preview(&mut a, "Drill first", "Drilled first.");
+        let (timeline, overview) = (a.plan_timeline.clone(), a.plan_overview.clone());
+        let turns = chat_state(&a).2;
+        assert_eq!(turns.len(), 1);
+        let doc = json(&a.doc);
+        for typed_since in [None, Some("Typed since")] {
+            let _ = a.update(Message::PlanAsk("Pocket deeper".into()));
+            let _ = a.update(Message::PlanSend);
+            assert!(matches!(a.planner, crate::Planner::Running(_)));
+            let handle = a.plan_run.clone().expect("the run's handle");
+            let epoch = a.plan_epoch;
+            send(&mut a, epoch, Event::Stage(Progress::Analyzing));
+            assert_eq!(a.plan_request, "", "the box is emptied by the send");
+            if let Some(text) = typed_since {
+                let _ = a.update(Message::PlanAsk(text.into()));
+            }
+            let _ = a.update(Message::PlanCancel);
+            assert!(handle.is_aborted() && a.plan_run.is_none());
+            assert_shows(&a, &first);
+            assert_eq!(a.plan_timeline, timeline);
+            assert_eq!(a.plan_overview, overview);
+            assert_eq!(a.plan_asked.as_deref(), Some("Drill first"));
+            assert_eq!(a.status, "Change cancelled. The preview is as it was.");
+            // The request is back in an empty box; text typed since is kept.
+            assert_eq!(a.plan_request, typed_since.unwrap_or("Pocket deeper"));
+            assert_eq!(chat_state(&a).2, turns, "a cancelled change adds no turn");
+            assert!(a.plan_refined.is_none());
+            assert_eq!(json(&a.doc), doc);
+            // The cancelled run's late result is ignored.
+            let late = preview_saying(&a, "Late.");
+            let _ = a.update(Message::PlanFinished(epoch, Ok(late)));
+            assert_shows(&a, &first);
+            assert_eq!(chat_state(&a).2, turns);
+            let _ = a.update(Message::PlanAsk(String::new()));
+        }
+    }
+    #[test]
+    fn two_chained_changes_apply_the_second_preview_and_replace_the_planner_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        let first = open_change_preview(&mut a, "Clamp it differently", "First.");
+        let doc = json(&a.doc);
+        // The change is planned from what Apply would make of the first preview.
+        let base = crate::planner::applied(&first.outcome);
+        let second = checked_preview_on(&a, &base, false, |p| {
+            p.summary = "Second.".into();
+            p.setups[0].workholding = "Clamp it instead.".into();
+            p.setups[1].name = "Underside 2".into();
+        });
+        let _ = a.update(Message::PlanAsk("Clamp it instead".into()));
+        let _ = a.update(Message::PlanSend);
+        assert!(a.plan_refined.is_some());
+        let epoch = a.plan_epoch;
+        let _ = a.update(Message::PlanFinished(epoch, Ok(second.clone())));
+        assert_shows(&a, &second);
+        assert_eq!(json(&a.doc), doc, "nothing is applied before Apply");
+        assert_eq!(a.plan_chat.len(), 2);
+        let _ = a.update(Message::ApplyPlan);
+        assert!(matches!(a.planner, crate::Planner::Idle));
+        let want = crate::planner::applied(&second.outcome);
+        assert_eq!(json(&a.doc.setups), json(&want.setups));
+        assert_ne!(
+            json(&a.doc.setups),
+            json(&crate::planner::applied(&first.outcome).setups),
+            "the first preview's job is not the one applied"
+        );
+        assert_eq!(
+            a.doc.setups[1].p.get("name").map(String::as_str),
+            Some("Underside 2")
+        );
+        // Setup 1's planner note is the second's alone, once.
+        let p = &a.doc.setups[0].p;
+        let notes = crate::model::get(p, "notes");
+        assert_eq!(notes.matches("Planner: ").count(), 1, "{notes}");
+        assert!(notes.ends_with("Planner: Clamp it instead."), "{notes}");
+        assert!(!notes.contains("Vise on the long sides."), "{notes}");
+        assert_eq!(
+            crate::model::get(p, crate::planner::PLANNER_NOTE_KEY),
+            "Clamp it instead."
+        );
+    }
+    /// Runs `task` to its end, feeding each message it produces to the app.
+    async fn run_to_end(a: &mut App, task: Task<Message>) {
+        use futures_util::StreamExt;
+        let mut stream = iced_runtime::task::into_stream(task).expect("a run to wait for");
+        while let Some(action) = stream.next().await {
+            if let iced_runtime::Action::Output(message) = action {
+                let _ = a.update(message);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn try_again_after_a_failed_change_resends_the_same_request_to_the_model() {
+        use crate::fake_openai::{Fake, Resp};
+        use crate::session::SessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = signed_in_planning_app(&dir);
+        a.settings.plan_pictures_off = true;
+        // The model never answers with a plan.
+        let fake = Fake::start(|_| Resp::answer("I cannot help with that.")).await;
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        a.client = Some(std::sync::Arc::new(crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        )));
+        let ask = "Use a 20 mm cutter";
+        let change = format!("The user asks for this change: {ask}");
+        let earlier = format!("Earlier the user asked: {ask}");
+        let _ = a.update(Message::PlanAsk(ask.into()));
+        let task = a.update(Message::PlanSend);
+        run_to_end(&mut a, task).await;
+        assert!(
+            matches!(a.planner, crate::Planner::Failed(_)),
+            "{}",
+            a.status
+        );
+        assert_eq!(a.plan_asked.as_deref(), Some(ask));
+        assert_eq!(a.plan_chat.len(), 1);
+        let texts = plan_page_texts(&a);
+        assert!(texts.iter().any(|t| t == "The change could not be made"));
+        let sent = fake.seen("/v1/responses");
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|r| r.body.contains(&change)));
+        assert!(
+            sent.iter()
+                .all(|r| r.body.contains("The job's current plan:"))
+        );
+        assert!(sent.iter().all(|r| !r.body.contains(&earlier)));
+        // Try again asks the same change, now with the chat so far.
+        fake.requests.lock().unwrap().clear();
+        let task = a.update(Message::Plan);
+        assert!(matches!(a.planner, crate::Planner::Running(_)));
+        assert_eq!(a.plan_asked.as_deref(), Some(ask));
+        assert_eq!(
+            a.status,
+            "Asking the planner for the change. Nothing changes until you apply it."
+        );
+        run_to_end(&mut a, task).await;
+        assert!(
+            matches!(a.planner, crate::Planner::Failed(_)),
+            "{}",
+            a.status
+        );
+        let resent = fake.seen("/v1/responses");
+        assert!(!resent.is_empty());
+        assert!(
+            resent.iter().all(|r| r.body.contains(&change)),
+            "same request"
+        );
+        assert!(
+            resent
+                .iter()
+                .all(|r| r.body.contains("The job's current plan:"))
+        );
+        assert!(
+            resent.iter().all(|r| r.body.contains(&earlier)),
+            "chat history"
+        );
+        assert_eq!(a.plan_asked.as_deref(), Some(ask));
+        assert_eq!(a.plan_chat.len(), 2, "the second failure is a turn too");
+    }
+    #[test]
+    fn a_change_preview_on_a_job_with_operations_shows_the_change_note_not_the_replace_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let replaces = |texts: &[String]| texts.iter().any(|t| t.starts_with("Applying replaces"));
+        let has = |texts: &[String], line: &str| texts.iter().any(|t| t == line);
+        // A change asked of a job with operations.
+        let mut a = signed_in_planning_app(&dir);
+        assert!(a.doc.setups.iter().any(|s| !s.operations.is_empty()));
+        let _ = open_change_preview(&mut a, "Drill first", "Drilled first.");
+        let texts = plan_page_texts(&a);
+        assert!(has(&texts, "Change ready to review"));
+        assert!(has(&texts, crate::ui::CHANGE_NOTE));
+        assert!(!replaces(&texts));
+        // So is a change asked of the open preview.
+        let _ = a.update(Message::PlanAsk("Pocket deeper".into()));
+        let _ = a.update(Message::PlanSend);
+        let epoch = a.plan_epoch;
+        let second = preview_saying(&a, "Deeper.");
+        let _ = a.update(Message::PlanFinished(epoch, Ok(second)));
+        let texts = plan_page_texts(&a);
+        assert!(has(&texts, "Change ready to review"));
+        assert!(has(&texts, crate::ui::CHANGE_NOTE) && !replaces(&texts));
+        // Plan this job replaces the plan: the old note, with its counts.
+        let _ = a.update(Message::DiscardPlan);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let plain = preview_saying(&a, "Plain.");
+        let old = crate::ui::apply_note(&a.doc, &plain.outcome.job);
+        let _ = a.update(Message::PlanFinished(epoch, Ok(plain)));
+        let texts = plan_page_texts(&a);
+        assert!(has(&texts, "Plan ready to review"));
+        assert!(has(&texts, &old) && old.starts_with("Applying replaces"));
+        assert!(!has(&texts, crate::ui::CHANGE_NOTE));
+        // A request on a job with no operation plans from zero: the old note.
+        let mut b = signed_in_planning_app(&dir);
+        b.doc.setups.iter_mut().for_each(|s| s.operations.clear());
+        let _ = b.update(Message::PlanAsk("Drill first".into()));
+        let _ = b.update(Message::PlanSend);
+        let epoch = b.plan_epoch;
+        let zero = preview_saying(&b, "From zero.");
+        let old = crate::ui::apply_note(&b.doc, &zero.outcome.job);
+        let _ = b.update(Message::PlanFinished(epoch, Ok(zero)));
+        assert_eq!(b.plan_asked.as_deref(), Some("Drill first"));
+        let texts = plan_page_texts(&b);
+        assert!(has(&texts, "Plan ready to review"));
+        assert!(has(&texts, &old) && !has(&texts, crate::ui::CHANGE_NOTE));
+    }
+    #[test]
+    fn the_status_after_a_change_says_change_and_after_a_plan_says_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        // A change asked of a job with operations.
+        let mut a = signed_in_planning_app(&dir);
+        let _ = open_change_preview(&mut a, "Drill first", "Drilled first.");
+        assert_eq!(a.status, "Change ready to review: 2 setups, 6 operations.");
+        // A change asked of the open preview.
+        let _ = a.update(Message::PlanAsk("Pocket deeper".into()));
+        let _ = a.update(Message::PlanSend);
+        let epoch = a.plan_epoch;
+        let second = preview_saying(&a, "Deeper.");
+        let _ = a.update(Message::PlanFinished(epoch, Ok(second)));
+        assert_eq!(a.status, "Change ready to review: 2 setups, 6 operations.");
+        // Plan this job is a plan, also with operations to replace.
+        let _ = a.update(Message::DiscardPlan);
+        let _ = a.update(Message::Plan);
+        let epoch = a.plan_epoch;
+        let plain = preview_saying(&a, "Plain.");
+        let _ = a.update(Message::PlanFinished(epoch, Ok(plain)));
+        assert_eq!(a.status, "Plan ready to review: 2 setups, 6 operations.");
+        // A request on a job with no operation plans from zero.
+        let mut b = signed_in_planning_app(&dir);
+        b.doc.setups.iter_mut().for_each(|s| s.operations.clear());
+        let _ = b.update(Message::PlanAsk("Drill first".into()));
+        let _ = b.update(Message::PlanSend);
+        let epoch = b.plan_epoch;
+        let zero = preview_saying(&b, "From zero.");
+        let _ = b.update(Message::PlanFinished(epoch, Ok(zero)));
+        assert_eq!(b.status, "Plan ready to review: 2 setups, 6 operations.");
     }
     #[test]
     fn discard_forgets_the_request_of_the_preview_or_failure_but_not_the_chat() {

@@ -4660,7 +4660,12 @@ impl App {
                 match result {
                     Ok(preview) => {
                         self.status = format!(
-                            "Plan ready to review: {}, {}.",
+                            "{} ready to review: {}, {}.",
+                            if ui::edits_plan(self) {
+                                "Change"
+                            } else {
+                                "Plan"
+                            },
                             ui::plural(preview.outcome.job.setups.len(), "setup"),
                             ui::plural(preview.outcome.check.operations.len(), "operation")
                         );
@@ -4744,6 +4749,7 @@ impl App {
                     self.plan_timeline.clear();
                     self.plan_expanded.clear();
                     self.plan_asked = None;
+                    self.plan_refined = None;
                 }
             }
             Message::ApplyPlan => {
