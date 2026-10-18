@@ -109,6 +109,10 @@ pub struct Run {
     zero: Option<(String, [f32; 3])>,
     /// The reference surface's work Z.
     pub reference: Option<f64>,
+    /// A's work position when the reference was recorded, on a machine
+    /// with A: a surface that turns with A is touched off at that angle
+    /// again (`reference_a_problem`).
+    pub reference_a: Option<f64>,
     /// The tool of the last tool run started and the Z work offset then.
     last: Option<(String, f64)>,
     /// Z was touched off on the Control page since the last tool run started.
@@ -171,6 +175,7 @@ impl Run {
             xy: None,
             zero: None,
             reference: None,
+            reference_a: None,
             last: None,
             touched: false,
             outcome: None,
@@ -247,6 +252,14 @@ impl Run {
     fn start_carving(&mut self) -> bool {
         if self.carving.is_some() {
             return true;
+        }
+        // The stock seen from above is the first angle's: moves at others
+        // would carve it where they do not cut.
+        if self
+            .running_blocks()
+            .is_some_and(|b| !a_angles(b).is_empty())
+        {
+            return false;
         }
         let first = (self.running.as_ref())
             .and_then(|r| self.checked()?.get(r.index)?.indexes.get(r.from).copied());
@@ -392,6 +405,28 @@ impl Run {
         self.pictures.iter().find(|(i, _)| *i == op).map(|(_, p)| p)
     }
 
+    /// Keeps the tool tip's work Z as the reference surface, and on a
+    /// machine with A where A is (`reference_a`).
+    pub fn record_reference(&mut self, c: &Connection, z: f64) {
+        let s = &c.snapshot;
+        self.reference = Some(z);
+        self.reference_a = (c.axis(3) && s.referenced[3]).then_some(s.work_pos[3]);
+    }
+
+    /// Why Set Z from reference (or its probe) cannot be made now: A is not
+    /// at the angle the reference was recorded at, so a reference surface
+    /// that turns with A (the stock, the chuck) is not where it was. None
+    /// when it can, or nothing was recorded of A.
+    pub fn reference_a_problem(&self, c: &Connection) -> Option<String> {
+        let ra = self.reference_a?;
+        let s = &c.snapshot;
+        (!s.referenced[3] || (s.work_pos[3] - ra).abs() > A_AT).then(|| {
+            format!(
+                "Turn A to {ra:.3}° first, where the reference surface was recorded: a surface that turns with A is touched off at the same angle."
+            )
+        })
+    }
+
     /// The next tool run, when its tool is not the one the last tool run
     /// used: the operator changes the tool and touches off its Z first.
     pub fn tool_change(&self) -> Option<&Checked> {
@@ -522,6 +557,9 @@ impl Run {
             }
         }
         e.extend(a_problems(&setup.machine, &c.config));
+        if let Some(blocks) = blocks {
+            e.extend(rotary_problems(c, doc, setup, p, blocks));
+        }
         match OFFSETS.iter().position(|o| *o == p.offset) {
             Some(i) if i < 6 => {
                 if i != s.active_wcs {
@@ -848,6 +886,157 @@ fn a_problems(
     vec![]
 }
 
+/// How far the work zero's Y and Z may be off the measured A centreline
+/// for an indexed setup to run (mm): a feature cut at A 180° lands twice
+/// as far off as the one cut at A 0°, 0.04 mm at most, under the 0.05 mm
+/// over which the Control page's alignment checks warn (`ALIGN_LIMIT`).
+pub const ON_CENTRELINE: f64 = 0.02;
+
+/// How near its angle A must be for a setup that does not turn A (at A0)
+/// and for a touch-off on a reference that turns with A (degrees): about
+/// a step of the rotary unit's A.
+pub const A_AT: f64 = 0.01;
+
+/// The A angles (degrees, as commanded) program `blocks` turns A to or
+/// makes moves at, each once, in order; empty for one that never commands
+/// A.
+pub fn a_angles(blocks: &[Block]) -> Vec<f32> {
+    let mut v: Vec<f32> = vec![];
+    for b in blocks {
+        let a = match b {
+            Block::Index { a, .. } => *a,
+            Block::Move { a: Some(a), .. } => *a,
+            _ => continue,
+        };
+        if !v.iter().any(|b| (a - b).abs() < 1e-4) {
+            v.push(a);
+        }
+    }
+    v
+}
+
+/// The A angles of operation `op` (index in the program) of `blocks`, in
+/// the order it is cut at them: those of its moves.
+pub fn op_angles(blocks: &[Block], op: usize) -> Vec<f32> {
+    let mut v: Vec<f32> = vec![];
+    for b in blocks {
+        if let Block::Move {
+            op: o, a: Some(a), ..
+        } = b
+            && *o == op
+            && !v.iter().any(|b| (a - b).abs() < 1e-4)
+        {
+            v.push(*a);
+        }
+    }
+    v
+}
+
+/// What stands in the way of running program `blocks` of `setup` on the
+/// machine with A (LIO-192). A program that turns A (an indexed setup's)
+/// needs the rotary calibration current, the measured A centreline the
+/// Control page keeps neither assumed nor gone stale; the work zero where
+/// the setup has the A centreline, within `ON_CENTRELINE`; and every A it
+/// turns to inside A's soft limits at A's work offset. One that does not
+/// turn A cuts at A0, where the setup's work zero was found: A must be
+/// there. Nothing for a machine without A.
+fn rotary_problems(
+    c: &Connection,
+    doc: &Document,
+    setup: &crate::model::Setup,
+    p: &Checked,
+    blocks: &[Block],
+) -> Vec<String> {
+    let m = &setup.machine;
+    if !m.has_a() || !c.axis(3) {
+        return vec![];
+    }
+    let s = &c.snapshot;
+    let wcs = 54 + s.active_wcs;
+    let angles = a_angles(blocks);
+    if angles.is_empty() {
+        return if s.referenced[3] && s.work_pos[3].abs() > A_AT {
+            vec![format!(
+                "This setup cuts at A0 and does not turn A, but A is at {:.3}° in G{wcs}. Turn A to A0 first (G0 A0 by MDI).",
+                s.work_pos[3]
+            )]
+        } else {
+            vec![]
+        };
+    }
+    let mut e = vec![];
+    let unit = c.rotary.as_ref().and(doc.rotary_unit(m));
+    let marks = [
+        c.rotary.as_ref().map_or("", |r| r.mark.as_str()),
+        doc.centre_mark(m),
+    ];
+    match marks.iter().find(|k| **k != crate::control::MEASURED) {
+        _ if unit.is_none() => e.push(
+            "The machine's rotary unit geometry is not recorded, so where A turns the stock is not known: fill it in in the Machine library, then probe the A centreline under Control → Rotary A.".into(),
+        ),
+        None => {}
+        Some(&"") => e.push(
+            "The A centreline is assumed, not measured: an indexed setup runs only about a measured one. Probe it under Control → Rotary A (Probe the centreline, then Save the centreline).".into(),
+        ),
+        Some(why) => e.push(format!(
+            "The measured A centreline went {why}: probe it again under Control → Rotary A before running an indexed setup."
+        )),
+    }
+    // The work zero where the setup has the A centreline: the plan's
+    // centreline (`Turn::axis`, Y and Z) on the machine's.
+    match (unit, setup.turn) {
+        (Some(_), None) => e.push(
+            "Where the A centreline is in this setup is not known: check the first setup's stock."
+                .into(),
+        ),
+        (Some(u), Some(turn)) if s.referenced[1] && s.referenced[2] => {
+            let want = [
+                u.centre_y as f64 + p.datum[1] as f64 - turn.axis[0] as f64,
+                u.centre_z as f64 + p.datum[2] as f64 - turn.axis[1] as f64,
+            ];
+            let off = (s.work_offset[1] - want[0]).hypot(s.work_offset[2] - want[1]);
+            if off > ON_CENTRELINE {
+                e.push(format!(
+                    "The work zero is {off:.3} mm off the A centreline (within {ON_CENTRELINE} mm is needed): its Y and Z offsets in {} are {:.3} and {:.3}, but this setup's work zero on the measured centreline (machine Y {:.3} Z {:.3}) is at Y {:.3} Z {:.3}. Set them there (G10 L2 P{} Y{:.3} Z{:.3} by MDI), or probe the centreline again.",
+                    p.offset,
+                    s.work_offset[1],
+                    s.work_offset[2],
+                    u.centre_y,
+                    u.centre_z,
+                    want[0],
+                    want[1],
+                    s.active_wcs + 1,
+                    want[0],
+                    want[1],
+                ));
+            }
+        }
+        _ => {}
+    }
+    if s.referenced[3]
+        && let Some((lo, hi)) = c
+            .config
+            .axes
+            .get(3)
+            .and_then(|x| x.soft_min.zip(x.soft_max))
+    {
+        let out: Vec<String> = angles
+            .iter()
+            .map(|a| *a as f64 + s.work_offset[3])
+            .filter(|a| *a < lo - 1e-6 || *a > hi + 1e-6)
+            .map(|a| format!("{a:.3}°"))
+            .collect();
+        if !out.is_empty() {
+            e.push(format!(
+                "At A's work offset in G{wcs} ({:.3}°) A would turn to machine A {}, outside its soft limits {lo:.3} to {hi:.3}°. Zero A where Find A zero on a flat puts it (Control → Rotary A).",
+                s.work_offset[3],
+                out.join(", ")
+            ));
+        }
+    }
+    e
+}
+
 /// The operation a block belongs to, if it names one.
 fn op_of(b: &Block) -> Option<usize> {
     match b {
@@ -887,6 +1076,12 @@ const REMOVED: &str = "This setup was removed from the project.";
 /// simulation of the job up to the end of that setup.
 fn simulated(doc: &Document, mesh: &Mesh, si: usize) -> Sims {
     simulated_with(doc, mesh, si).0
+}
+
+/// `simulated`, for tests elsewhere that check a setup as export does.
+#[cfg(test)]
+pub(crate) fn simulated_for_tests(doc: &Document, mesh: &Mesh, si: usize) -> Sims {
+    simulated(doc, mesh, si)
 }
 
 /// A setup's `sequence` results, by its operations' index in the setup.
@@ -1134,6 +1329,14 @@ pub(crate) fn plan_problems(
 /// Cycle Start is pressed: the first retract moves Z alone there, and A, B
 /// and C stay where they are. Each action's line is its block's index + 1.
 ///
+/// An indexed program's A angles become machine A the same way (machine A =
+/// A + A's work offset). A turns only in its index blocks (`Block::Index`),
+/// a rapid of A alone at A's speed with X, Y and Z still, made where the
+/// program has put the tool: above all that A swings, which the check
+/// proved (LIO-193). A move that would turn A while X, Y or Z moves is
+/// refused, and so is any action list that would (`combined`): a run never
+/// moves A together with X, Y or Z (LIO-192).
+///
 /// `k` is the operation (index in the program) it starts at: from a later
 /// one than the first it is lowered from that operation's own program
 /// (`Checked::from`), with its safe start and nothing of the operations
@@ -1146,14 +1349,15 @@ pub fn lower(
 ) -> Result<Vec<Located>, Vec<String>> {
     let blocks = p.from(k)?;
     let plane = clearance_plane(blocks);
-    let machine = |q: [f32; 3]| -> [f64; 6] {
-        let mut m = start;
+    // X, Y and Z of plan point `q`; A, B and C where the tool is (`at`).
+    let machine = |q: [f32; 3], at: [f64; 6]| -> [f64; 6] {
+        let mut m = at;
         for k in 0..3 {
             m[k] = q[k] as f64 - p.datum[k] as f64 + offset[k];
         }
         m
     };
-    let high = machine([0., 0., plane])[2];
+    let high = machine([0., 0., plane], start)[2];
     let mut out = vec![];
     let mut at = start;
     let (mut spindle, mut coolant) = (false, (false, false));
@@ -1212,10 +1416,12 @@ pub fn lower(
                 seconds: *seconds as f64,
             }),
             Block::Approach { xy, .. } => {
-                go(&mut at, machine([xy[0], xy[1], plane]), None, &mut actions)
+                let to = machine([xy[0], xy[1], plane], at);
+                go(&mut at, to, None, &mut actions)
             }
             Block::Descend { xy, z, .. } => {
-                go(&mut at, machine([xy[0], xy[1], *z]), None, &mut actions)
+                let to = machine([xy[0], xy[1], *z], at);
+                go(&mut at, to, None, &mut actions)
             }
             Block::Move {
                 kind: Kind::Dwell,
@@ -1224,21 +1430,60 @@ pub fn lower(
             } => actions.push(Do::Dwell {
                 seconds: *seconds as f64,
             }),
-            Block::Move { kind, to, feed, .. } => {
+            Block::Move {
+                kind, to, feed, a, ..
+            } => {
                 let feed = (*kind == Kind::Feed).then(|| *feed as f64 / 60.);
-                go(&mut at, machine(*to), feed, &mut actions)
+                let mut target = machine(*to, at);
+                if let Some(a) = a {
+                    target[3] = *a as f64 + offset[3];
+                }
+                if (target[3] - at[3]).abs() > A_SAME {
+                    return Err(vec![format!(
+                        "Block {line} would turn A from {:.3}° to {:.3}° while X, Y or Z moves. A run turns A only by itself, in an index move.",
+                        at[3], target[3]
+                    )]);
+                }
+                target[3] = at[3];
+                go(&mut at, target, feed, &mut actions)
             }
-            // A run does not turn A yet (`post::not_run`).
-            Block::Index { .. } => {
-                return Err(vec![
-                    "A run does not turn A yet: this program indexes A.".into(),
-                ]);
+            // A alone, at A's rapid: X, Y and Z stay where the tool is.
+            Block::Index { a, .. } => {
+                let mut to = at;
+                to[3] = *a as f64 + offset[3];
+                go(&mut at, to, None, &mut actions)
             }
             Block::End => actions.push(Do::End),
         }
         out.extend(actions.into_iter().map(|action| Located { line, action }));
     }
+    if let Some(line) = combined(&out, start) {
+        return Err(vec![format!(
+            "Block {line} would move A together with X, Y or Z. A run turns A only by itself, in an index move."
+        )]);
+    }
     Ok(out)
+}
+
+/// Within this of each other, two A positions are the same (degrees): far
+/// below A's step, so a move that keeps A computes it a hair off at most.
+const A_SAME: f64 = 1e-6;
+
+/// The line of the first move of `actions` that turns A while X, Y or Z
+/// moves, from `start`; None when A always turns alone.
+pub fn combined(actions: &[Located], start: [f64; 6]) -> Option<u32> {
+    let mut at = start;
+    for l in actions {
+        if let Do::Move { target, .. } = l.action {
+            let turns = (target[3] - at[3]).abs() > A_SAME;
+            let moves = (0..3).any(|k| (target[k] - at[k]).abs() > 1e-9);
+            if turns && moves {
+                return Some(l.line);
+            }
+            at = target;
+        }
+    }
+    None
 }
 
 /// A move to `to`, unless the tool is there already.
@@ -1514,6 +1759,105 @@ mod tests {
         ));
     }
 
+    /// A facing tool run made at A90 then A180 as an indexed setup's
+    /// operation is: from the swing height (plan Z40), turning A there.
+    fn indexed_program() -> Checked {
+        let moves = [
+            (Motion::Index, [-15., -15., 40.], 3600., 90.),
+            (Motion::Rapid, [-15., -15., 11.], 6000., 90.),
+            (Motion::Feed, [15., -15., 9.], 1000., 90.),
+            (Motion::Rapid, [15., -15., 40.], 6000., 90.),
+            (Motion::Index, [15., -15., 40.], 3600., 180.),
+            (Motion::Rapid, [15., -15., 11.], 6000., 180.),
+            (Motion::Feed, [-15., -15., 9.], 1000., 180.),
+            (Motion::Rapid, [-15., -15., 40.], 6000., 180.),
+        ];
+        let steps: Vec<_> = moves.iter().map(|m| (m.0, m.1, m.2)).collect();
+        let mut plan = fixture::plan([-15., -15., 40.], &steps);
+        for (m, step) in plan.moves.iter_mut().zip(&moves) {
+            m.a = Some(step.3);
+        }
+        checked(vec![fixture::facing_op()], &[&plan])
+    }
+
+    #[test]
+    fn an_indexed_tool_run_turns_a_alone_at_its_work_offset() {
+        let p = indexed_program();
+        assert_eq!(a_angles(&p.blocks), [90., 180., 0.]);
+        assert_eq!(op_angles(&p.blocks, 0), [90., 180.]);
+        // A's work offset is 5°: machine A = A + 5. A starts at machine 30°.
+        let offset = [100., 50., -30., 5., 0., 0.];
+        let start = [7., 8., -2., 30., 0., 0.];
+        let actions = lower(&p, 0, offset, start).unwrap();
+        assert_eq!(combined(&actions, start), None);
+        let moves: Vec<[f64; 6]> = actions
+            .iter()
+            .filter_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        // The first retract moves Z alone, to the clearance plane (plan Z40,
+        // machine Z0), and leaves A where it is.
+        assert_eq!(moves[0], [7., 8., 0., 30., 0., 0.]);
+        // Each turn: X, Y and Z where the move before left them, A alone.
+        let mut turns = vec![];
+        for w in moves.windows(2) {
+            if w[1][3] != w[0][3] {
+                assert_eq!(w[1][..3], w[0][..3], "{w:?}");
+                assert!(
+                    actions.iter().any(|l| l.action
+                        == Do::Move {
+                            target: w[1],
+                            feed: None
+                        }),
+                    "a turn is a rapid"
+                );
+                turns.push(w[1][3]);
+            }
+        }
+        assert_eq!(turns, [95., 185., 5.]);
+        // Every move between two turns is made at the A of the first.
+        assert!(moves[1..].iter().all(|m| [95., 185., 5.].contains(&m[3])));
+        // The turn to A90 is the index block after the tool's retract, and
+        // the second is made at the swing height, plan Z40: machine Z0.
+        let second = actions
+            .iter()
+            .find(|l| matches!(l.action, Do::Move { target, .. } if target[3] == 185.))
+            .unwrap();
+        assert!(matches!(
+            p.blocks[second.line as usize - 1],
+            Block::Index { a, .. } if a == 180.
+        ));
+        assert!(matches!(second.action, Do::Move { target, .. } if (target[2] - 0.).abs() < 1e-4));
+        // A program whose move turns A as it goes is refused, not run.
+        let mut bad = p.clone();
+        let i = (bad.blocks.iter())
+            .position(|b| matches!(b, Block::Move { a: Some(a), .. } if *a == 180.))
+            .unwrap();
+        if let Block::Move { a, .. } = &mut bad.blocks[i] {
+            *a = Some(200.);
+        }
+        let why = lower(&bad, 0, offset, start).unwrap_err();
+        assert!(why[0].contains("would turn A"), "{why:?}");
+        // An action list that does it is caught too.
+        let both = [Located {
+            line: 3,
+            action: Do::Move {
+                target: [1., 0., 0., 10., 0., 0.],
+                feed: None,
+            },
+        }];
+        assert_eq!(combined(&both, [0.; 6]), Some(3));
+        // A 3-axis tool run never commands A: it stays where it is.
+        let flat = lower(&program(), 0, offset, start).unwrap();
+        assert!(flat.iter().all(|l| match l.action {
+            Do::Move { target, .. } => target[3] == 30.,
+            _ => true,
+        }));
+        assert!(a_angles(&program().blocks).is_empty());
+    }
+
     #[test]
     fn the_running_block_names_its_operation() {
         let p = program();
@@ -1543,6 +1887,7 @@ mod tests {
             xy: None,
             zero: None,
             reference: None,
+            reference_a: None,
             last: None,
             touched: false,
             outcome: None,

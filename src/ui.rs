@@ -6008,6 +6008,39 @@ pub(crate) fn run_panel<'a>(
     body = body.push(muted(
         "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green. Start here makes Cycle Start begin with that operation, those before it taken as cut.",
     ));
+    // Where A is, on a machine with A, and while an index move turns it.
+    let with_a = app
+        .doc
+        .setups
+        .get(run.setup)
+        .is_some_and(|x| x.machine.has_a())
+        && c.axis(3);
+    if with_a {
+        let turning = run
+            .progress(s.current_line)
+            .and_then(|(_, _, b)| match run.running_blocks()?.get(b)? {
+                crate::post::Block::Index { a, .. } => Some(*a),
+                _ => None,
+            })
+            .filter(|_| running);
+        let mut line = if s.referenced[3] {
+            format!(
+                "A now: {:.3}° in G{} (machine A {:.3}°)",
+                s.work_pos[3],
+                54 + s.active_wcs,
+                s.machine_pos[3]
+            )
+        } else {
+            "A now: no machine position".to_string()
+        };
+        if let Some(a) = turning {
+            line += &format!(
+                " · index move: turning A alone to {}°, X Y Z still",
+                crate::indexed::degrees(a)
+            );
+        }
+        body = body.push(bold(line, 13));
+    }
     // Operations are numbered through the setup, across its tool runs.
     let mut number = 0;
     for (i, p) in programs.iter().enumerate() {
@@ -6055,7 +6088,17 @@ pub(crate) fn run_panel<'a>(
             use crate::run::Stage;
             let start = (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing())
                 .then_some(msg(!running, R::From(i, k)));
-            cards = cards.push(op_card(number, o, run.picture(oi), stage, start));
+            // The setup and the A angles the operation is cut at.
+            let angles = crate::run::op_angles(&p.blocks, k);
+            let at = with_a.then(|| {
+                let a = if angles.is_empty() {
+                    "A 0°".to_string()
+                } else {
+                    crate::indexed::angles_text(&angles)
+                };
+                format!("Setup {} · {a}", run.setup + 1)
+            });
+            cards = cards.push(op_card(number, o, run.picture(oi), stage, start, at));
         }
         body = body.push(cards.wrap().vertical_spacing(8));
     }
@@ -6077,25 +6120,60 @@ pub(crate) fn run_panel<'a>(
             o.stickout,
             o.tool
         )));
+        if with_a {
+            // A turns the stock and the chuck: a reference on them is
+            // touched off at the angle it was recorded at.
+            let first = crate::run::a_angles(&p.blocks);
+            let back = match first.first() {
+                Some(a) => format!(
+                    "Cycle Start's first moves retract Z, then turn A alone back to {}° for this tool run.",
+                    crate::indexed::degrees(*a)
+                ),
+                None => {
+                    "This tool run does not turn A: turn A back to A0 before Cycle Start.".into()
+                }
+            };
+            body = body.push(note(match run.reference_a {
+                Some(ra) => format!(
+                    "A axis: the reference was recorded with A at {ra:.3}°. Touch the new tool off with A there (Set Z from reference waits for it), then {}",
+                    back[..1].to_lowercase() + &back[1..]
+                ),
+                None => format!(
+                    "A axis: record the reference and touch both tools off at the same A angle; A where it is now ({:.3}°) will do. {back}",
+                    s.work_pos[3]
+                ),
+            }));
+        }
     }
     if count > 1 {
         let manual = c.manual() && !running;
         body = body.push(
             row![
-                muted(match run.reference {
-                    Some(z) => format!("Reference surface: Z {z:.3} (G{})", 54 + s.active_wcs),
-                    None => "Reference surface: not recorded".into(),
+                muted(match (run.reference, run.reference_a) {
+                    (Some(z), Some(a)) => format!(
+                        "Reference surface: Z {z:.3} (G{}) at A {a:.3}°",
+                        54 + s.active_wcs
+                    ),
+                    (Some(z), None) =>
+                        format!("Reference surface: Z {z:.3} (G{})", 54 + s.active_wcs),
+                    (None, _) => "Reference surface: not recorded".into(),
                 }),
                 act("Record reference", msg(manual, R::RecordReference), false),
                 act(
                     "Set Z from reference",
-                    msg(manual && run.reference.is_some(), R::ZFromReference),
+                    msg(
+                        manual && run.reference.is_some() && run.reference_a_problem(c).is_none(),
+                        R::ZFromReference
+                    ),
                     false
                 ),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
+        if let Some(why) = run.reference_a_problem(c).filter(|_| !running) {
+            body = body.push(muted(why));
+        }
         if c.config.inputs.probe.is_some() {
             let probe = c.probe_blocked().is_none() && !running;
             body = body.push(
@@ -6103,7 +6181,12 @@ pub(crate) fn run_panel<'a>(
                     act("Probe reference", msg(probe, R::ProbeReference), false),
                     act(
                         "Probe Z from reference",
-                        msg(probe && run.reference.is_some(), R::ProbeFromReference),
+                        msg(
+                            probe
+                                && run.reference.is_some()
+                                && run.reference_a_problem(c).is_none(),
+                            R::ProbeFromReference
+                        ),
                         false
                     ),
                     muted(if c.direct() {
@@ -6194,6 +6277,7 @@ fn op_card<'a>(
     picture: Option<&widget::image::Handle>,
     stage: crate::run::Stage,
     start: Option<Option<Message>>,
+    angles: Option<String>,
 ) -> Element<'a, Message> {
     use crate::run::Stage;
     let (w, h) = OP_CARD_PICTURE;
@@ -6234,6 +6318,9 @@ fn op_card<'a>(
     ]
     .spacing(4)
     .width(w);
+    if let Some(angles) = angles {
+        card = card.push(muted(angles).size(11).wrapping(Wrapping::Word));
+    }
     if let Some(start) = start {
         card = card.push(act("Start here", start, false));
     }
