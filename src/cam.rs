@@ -2940,7 +2940,7 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|s| s.imported_preview())
                 .count(),
-            8
+            9
         );
     }
     /// FNV-1a over every bit of every move, and the move count and duration.
