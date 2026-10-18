@@ -1308,6 +1308,114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_rest_analysis_at_the_last_angle_sees_what_the_earlier_angles_removed() {
+        use crate::simulation::{Motion, prepare};
+        let mesh = prism(30.);
+        let doc = bar_job(
+            &mesh,
+            0.,
+            "80",
+            "-150",
+            "0, 90, 180, 270",
+            contour(&cutter("12")),
+        );
+        let mut sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        // The stock as A turns to 270°: cut at 0, 90 and 180 only.
+        let last = sim
+            .plan
+            .moves
+            .iter()
+            .rfind(|m| m.motion == Motion::Index)
+            .unwrap()
+            .clone();
+        assert_eq!(last.a, Some(270.));
+        sim.seek(last.start / sim.plan.duration);
+        let volume = sim.volume.clone().unwrap();
+        let at = doc.at_angle(1, 270., &mesh).unwrap();
+        // Halfway along the part, on the A centreline.
+        let [x, y, z] = at.frame.map([0., 0., centre_z(&mesh)]);
+        let axis = doc.setups[1].turn.unwrap().axis;
+        assert!((y - axis[0]).abs() < 1e-3 && (z - axis[1]).abs() < 1e-3);
+        // In the frame at 270° the bar round the square is gone on every
+        // side, the side 270° itself is to cut too (180° cut it as well),
+        // and the square is still there.
+        let removed = crate::rest::Removed::new(&volume, at.frame);
+        for (dy, dz) in [(15., 0.), (-15., 0.), (0., 15.), (0., -15.)] {
+            assert!(removed.at([x, y + dy, z + dz]), "removed at {dy} {dz}");
+            assert!(!volume.filled([x, y + dy, z + dz], at.frame));
+        }
+        for (dy, dz) in [(5., 5.), (-5., -5.), (0., 0.)] {
+            assert!(!removed.at([x, y + dy, z + dz]), "kept at {dy} {dz}");
+            assert!(volume.filled([x, y + dy, z + dz], at.frame));
+        }
+        // The stock the setup starts 270° from is told it: its start height
+        // over the square's +Z side at 270° is the square's top, not the
+        // bar's, since 90° cut there before.
+        let rest = crate::rest::RestStock::new(&volume, at.frame);
+        let over = crate::mesh::Bounds {
+            min: [x - 5., y - 4., z + 10.],
+            max: [x + 5., y + 4., z + 20.],
+        };
+        let top = rest.top(over, z + 10.5, z + 20.);
+        assert!(top < z + 12., "{top}");
+        // The whole job leaves none of the square's four sides under stock.
+        sim.seek(1.);
+        let left = crate::uncut::uncut(sim.volume.as_ref().unwrap(), &doc.setups[0], &mesh);
+        for (i, f) in mesh.faces.iter().enumerate() {
+            let [a, b, c] = [f.points[0], f.points[1], f.points[2]];
+            let (u, v) = ([b[1] - a[1], b[2] - a[2]], [c[1] - a[1], c[2] - a[2]]);
+            // A side's normal lies across X.
+            if (u[0] * v[1] - u[1] * v[0]).abs() < 1e-6 {
+                assert!(!left.faces[i], "side face {i} under stock");
+            }
+        }
+    }
+
+    #[test]
+    fn the_simulated_a_turns_through_each_index_move() {
+        use crate::simulation::{Motion, prepare};
+        let mesh = prism(30.);
+        let doc = bar_job(
+            &mesh,
+            0.,
+            "80",
+            "-150",
+            "0, 90, 180, 270",
+            contour(&cutter("12")),
+        );
+        let mut sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        let duration = sim.plan.duration;
+        assert_eq!(sim.a_now(), Some(0.));
+        let index: Vec<_> = (sim.plan.moves.iter())
+            .filter(|m| m.motion == Motion::Index)
+            .cloned()
+            .collect();
+        for (k, m) in index.iter().enumerate() {
+            let from = 90. * k as f32;
+            sim.seek((m.start + 0.25 * (m.end - m.start)) / duration);
+            let a = sim.a_now().unwrap();
+            assert!((a - (from + 22.5)).abs() < 0.05, "{a} turning from {from}");
+            sim.seek(m.end / duration + 1e-6);
+            assert_eq!(sim.a_now(), Some(from + 90.));
+        }
+        sim.seek(1.);
+        assert_eq!(sim.a_now(), Some(270.));
+        // Back to the start, A is where it began.
+        sim.seek(0.);
+        assert_eq!(sim.a_now(), Some(0.));
+        // A 3-axis operation has no A.
+        let flat = crate::simulation::prepare(
+            &crate::model::Document::sample(),
+            &crate::mesh::sample(),
+            0,
+            0,
+        );
+        if let Ok(flat) = flat {
+            assert_eq!(flat.a_now(), None);
+        }
+    }
+
+    #[test]
     fn an_index_move_retracts_above_the_swing_before_a_turns() {
         use crate::simulation::{Motion, prepare};
         let mesh = prism(30.);

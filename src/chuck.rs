@@ -203,6 +203,35 @@ fn mm(v: f32) -> String {
     }
 }
 impl Rig {
+    /// The rotary unit `unit` alone, in machine coordinates (mm, as the tool
+    /// tip's: the chuck's face at its chuck X, the centreline at its Y and
+    /// Z), its 3 jaws closed halfway through their grip range and the
+    /// tailstock drawn back: the Control page's machine view draws its
+    /// `solids` at the controller's A. `sign` as `indexed::sign`.
+    pub fn on_machine(unit: RotaryUnit, sign: f32) -> Self {
+        let r = (unit.grip_min + unit.grip_max) / 4.;
+        let (face, axis) = (unit.chuck_x, [unit.centre_y, unit.centre_z]);
+        let front = face + unit.jaw_length;
+        Self {
+            unit,
+            jaws: 3,
+            stock: Bounds {
+                min: [face, axis[0] - r, axis[1] - r],
+                max: [front, axis[0] + r, axis[1] + r],
+            },
+            round: true,
+            axis,
+            face,
+            front,
+            inner: r,
+            outer: r,
+            phase: 0.,
+            sign,
+            tail: Tail::Retracted(unit.tail_x),
+            table: axis[1] - unit.centre_height,
+            stickout: 0.,
+        }
+    }
     /// How long the jaws grip the stock, mm.
     pub fn grip(&self) -> f32 {
         self.unit.jaw_length.min(self.front - self.stock.min[0])

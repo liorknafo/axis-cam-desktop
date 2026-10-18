@@ -1041,7 +1041,7 @@ The Machine library could save 4 axes but not where the rotary sits; the owner's
 - `the_swing_takes_the_centreline_the_control_page_measured`: a centreline measured at Z −150 in the machine library clears the refusal that the setup's copy (Z −40) gives; once marked stale the copy is used again.
 - `an_indexed_setups_cuts_are_checked_against_the_chuck_at_each_angle` (changed by LIO-191): a contour 90 mm out of the jaws with 40 mm of clearance, at A 0 and 90, is clear of the chuck: the workholding check says nothing, not "Holding not checked".
 - `a_disabled_indexed_operation_at_an_angle_stays_where_it_is`: a disabled Indexed operation at A 90° does not split its setup.
-- Not validated: the removal drawn at other angles (LIO-190), anything on the machine.
+- Not validated: anything on the machine (the removal at other angles is drawn by LIO-190).
 
 ## Checks with the part on the rotary axis: travel, Z reach and the chuck at each angle (LIO-191, 18 October 2026)
 
@@ -1087,6 +1087,21 @@ A run refused every machine that was not 3-axis (`post::not_run`) and lowered X,
 - Every 3-axis run test is unchanged.
 - Found: started at the A the machine is at, an indexed setup's first approach comes down over the stock's corner in the chuck (filed separately); the run refuses it as export does, since it uses the same check.
 - Not validated: anything on the real machine; the live carve and the 3D view at angles other than the first.
+
+## Simulation and 3D views with A (LIO-190, 18 October 2026)
+
+The simulation already cut each angle's moves in that angle's frame (LIO-189), but the Job view drew the part, the stock and the chuck at the setup's first angle, the live carve was not drawn for a tool run that turns A, and the machine view had no rotary unit.
+
+- `indexed::tests::a_square_milled_at_0_90_180_270_comes_out_square_on_the_axis` (LIO-189, unchanged) is the simulation's key test: the square on the bar's axis in the final stock.
+- `indexed::tests::the_rest_analysis_at_the_last_angle_sees_what_the_earlier_angles_removed`: the stock as A turns to 270° (cut at 0, 90 and 180° only), seen in the frame at 270°: the bar round the square is removed on all four sides for `rest::Removed` and the volume, the square kept; `RestStock::top` over the square's +Z side starts at the square's top, not the bar's; after the job `uncut` leaves none of the square's four sides under stock.
+- `indexed::tests::the_simulated_a_turns_through_each_index_move`: a quarter of the way through each index move A is 22.5° on from the angle before, at its end on the next angle, 270° at the end, 0° back at the start; a 3-axis simulation has no A.
+- `viewport::tests::an_indexed_setups_part_and_stock_turn_to_the_a_shown`: the job played to its end is drawn at 270°; with the machine at A0 the part is where the setup places it, at A90 every point is turned 90° about the centreline; the camera's fit is the same at every angle and the picture at 45° is not the one at 0°; halfway through the first index move the view is at 45°.
+- `machine_view::tests::the_rotary_unit_stands_where_the_library_puts_it_and_its_chuck_turns_with_a`: the chuck's face at the library's chuck X, round its centreline Y and Z, the table and the rotary head's foot the centre height under it; the jaws at A90 are those at A0 turned 90° about the centreline (+Y up to +Z); the head and the tailstock do not move; the tool stays above the table and the beam above the chuck; without the unit the machine is as before.
+- `uncut::tests::a_round_bars_box_corners_are_no_stock`: points in a round bar's box but outside the bar were counted as stock left.
+- `control::tests::an_indexed_bar_runs_at_four_angles_turning_a_alone` (simulated UC100, extended): after the run at A 90, 180, 270 and 0 the live carve is a volume, not the top view, and leaves the square on the bar's axis, the bar round it gone.
+- `smoke::tests::render_the_four_axis_scene` (ignored, for review): the Job view after that job and halfway through the turn from 270° to 0°, in ISO, end-on and close, and the machine view with the rotary unit at A0 and A30, inspected: the square comes out square-on at A0 and diamond-wise mid-turn, with the jaws turned.
+- Every 3-axis test and pixel digest is unchanged.
+- Not validated: anything on the real machine; the live carve's voxels are as coarse as the simulation's volume (at most 96 a side).
 
 ## Rotary calibration: the A centreline, A zero and the line to the tailstock (LIO-186, 18 October 2026)
 

@@ -688,6 +688,25 @@ impl Simulation {
         })
         .or(self.frame)
     }
+    /// The A (degrees, as the machine is commanded) at the playback time:
+    /// the current move's, turning from the move before's to its own during
+    /// an index move. None for a 3-axis operation.
+    pub fn a_now(&self) -> Option<f32> {
+        let moves = &self.plan.moves;
+        let i = self.current.min(moves.len().checked_sub(1)?);
+        let m = &moves[i];
+        let to = m.a?;
+        if m.motion != Motion::Index || self.seconds >= m.end {
+            return Some(to);
+        }
+        let from = i
+            .checked_sub(1)
+            .and_then(|j| moves[j].a)
+            .or(self.turns.first().map(|t| t.0))
+            .unwrap_or(to);
+        let t = ((self.seconds - m.start) / (m.end - m.start).max(1e-6)).clamp(0., 1.);
+        Some(from + (to - from) * t)
+    }
     /// `forces::bites` of this simulation, worked out once.
     pub fn bites(&self) -> &[crate::forces::Bite] {
         self.bites.get_or_init(|| crate::forces::bites(self))

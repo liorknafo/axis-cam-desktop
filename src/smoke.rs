@@ -3628,6 +3628,14 @@ flood = { pin = 8 }
 
     /// Draws `a`'s whole window, `size` px, headless (tiny-skia) to `path`.
     fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
+        render_element(a.view(), size, path);
+    }
+    /// Draws `element`, `size` px, headless (tiny-skia) to `path`.
+    fn render_element(
+        element: iced::Element<'_, Message>,
+        size: iced::Size,
+        path: &std::path::Path,
+    ) {
         use futures_util::FutureExt;
         use iced::advanced::renderer::{self, Headless};
         let mut renderer = <iced::Renderer as Headless>::new(
@@ -3639,7 +3647,7 @@ flood = { pin = 8 }
         .flatten()
         .expect("tiny-skia renderer");
         let mut ui = iced_runtime::UserInterface::build(
-            a.view(),
+            element,
             size,
             iced_runtime::user_interface::Cache::new(),
             &mut renderer,
@@ -3882,6 +3890,118 @@ flood = { pin = 8 }
             let _ = a.update(Message::SetupStep(step));
             let _ = a.view();
             render_png(&a, size, &out.join(name));
+        }
+    }
+    /// The 4-axis scene (LIO-190), to $AXIS_RENDER_DIR (/tmp/four-axis-renders):
+    /// the Job view after a square is milled on a bar at A 90, 180, 270 and
+    /// 0°, and while A turns from 270° to 0°, and the Control page's machine view
+    /// with the rotary unit at A 0 and 30°. Not a check: `cargo test
+    /// render_the_four_axis_scene -- --ignored`.
+    #[test]
+    #[ignore]
+    fn render_the_four_axis_scene() {
+        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/four-axis-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mesh = prism(30.);
+        let mut doc = bar_job(
+            &mesh,
+            20.,
+            "100",
+            "-150",
+            "90, 180, 270, 0",
+            contour(&cutter("12")),
+        );
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: dir.path().join("square-bar.stl"),
+            format: "stl".into(),
+            bytes: 0,
+        });
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a.selected = None;
+        a.stock = true;
+        a.camera.zoom = 3.;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let detail = crate::stock_surface::Detail::Draft;
+        let mesh = a.part_mesh().unwrap().clone();
+        let mut sim = crate::planner::view_after(&a.doc, &mesh, 1, 0, detail).unwrap();
+        let size = iced::Size::new(1600., 1000.);
+        a.simulation = Some(sim.clone());
+        assert_eq!(a.shown_a(), Some(0.));
+        // Each picture also seen from the bar's free end, along the A axis.
+        let end = crate::viewport::Camera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.,
+            zoom: 3.,
+            pan: [0., 0.],
+        };
+        let iso = a.camera;
+        let close = crate::viewport::Camera {
+            zoom: 7.,
+            pan: [230., 0.],
+            ..iso
+        };
+        let shots = |a: &mut App, name: &str| {
+            for (camera, view) in [(iso, ""), (end, "-end-on"), (close, "-close")] {
+                a.camera = camera;
+                let _ = a.view();
+                render_png(a, size, &out.join(format!("{name}{view}.png")));
+            }
+        };
+        shots(&mut a, "1-job-after-four-angles");
+        // Halfway through the index move from 270° back to 0°: the stock cut
+        // at 90, 180 and 270° turning, the chuck's jaws with it.
+        let last = (sim.plan.moves.iter())
+            .rfind(|m| m.motion == crate::simulation::Motion::Index)
+            .unwrap()
+            .clone();
+        sim.seek((last.start + last.end) / 2. / sim.plan.duration);
+        let volume = sim.volume.clone().unwrap();
+        let surface = crate::stock_surface::Snapshot {
+            bounds: volume.bounds,
+            frame: volume.frame,
+            cuts: volume.cuts.clone(),
+            round: volume.round,
+            detail,
+        }
+        .build()
+        .unwrap();
+        sim.stock_surface = Some(std::sync::Arc::new(surface));
+        sim.stock_surface_version = volume.version;
+        a.simulation = Some(sim);
+        assert_eq!(a.shown_a(), Some(135.));
+        shots(&mut a, "2-job-turning-from-270-to-0");
+        // The machine view with the rotary unit the machine library places.
+        let mut m = Machine::new(4);
+        m.fill_rotary_defaults();
+        let rig = crate::chuck::Rig::on_machine(m.rotary_unit().unwrap(), 1.);
+        for (angle, name) in [
+            (0., "3-machine-rotary-a0.png"),
+            (30., "4-machine-rotary-a30.png"),
+        ] {
+            let view = crate::machine_view::MachineView {
+                pos: [150., 120., -10.],
+                known: true,
+                envelope: [[0., 0., -55.], [390., 280., 0.]],
+                assumed: false,
+                block: None,
+                zero: [40., 140., -40.],
+                rotary: Some(rig.clone()),
+                a: angle,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
         }
     }
     #[test]
@@ -5164,6 +5284,8 @@ flood = { pin = 8 }
                 assumed,
                 block: None,
                 zero: [0.; 3],
+                rotary: None,
+                a: 0.,
             }
         };
         // No soft limits: the warning of the unreferenced machine, with its

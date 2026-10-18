@@ -159,10 +159,18 @@ pub struct Viewport<'a> {
     /// The machine's tool while a tool run of this setup cuts: its tip in
     /// plan coordinates (mm), radius and stickout. Drawn over the scene.
     pub live: Option<([f32; 3], f32, f32)>,
+    /// The machine's A (degrees, as commanded) while a tool run of this
+    /// setup cuts: an indexed setup's part, stock and chuck are drawn
+    /// turned to it, else to the simulation's (`shown_a`).
+    pub a: Option<f32>,
     /// The stock a run of this setup has carved, or starts from, in plan
     /// coordinates (`run::Run::stock`) with its version: drawn instead of the
     /// setup's stock when no simulation is shown.
     pub live_stock: Option<(&'a crate::simulation::StockGrid, u64)>,
+    /// The stock a run of this setup that turns A has carved, as a volume
+    /// (`run::Run::carved_volume`) with its version: drawn, turned to the
+    /// machine's A, instead of the setup's stock when no simulation is shown.
+    pub live_volume: Option<(&'a crate::volume::Volume, u64)>,
     /// Per face of the part (`Mesh::faces`): whether the whole job still
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
@@ -273,6 +281,33 @@ impl Viewport<'_> {
     fn projector(&self, b: Rectangle) -> Projector {
         Projector::fit(self.camera, (b.width, b.height), self.scene_bounds())
     }
+    /// The A (degrees, as commanded) an indexed setup's part, stock and
+    /// chuck are drawn at: the machine's while a run of it cuts, else the
+    /// simulation's (`Simulation::a_now`), which turns through each index
+    /// move. None for a setup that is not indexed.
+    pub(crate) fn shown_a(&self) -> Option<f32> {
+        self.setup?.turn?;
+        self.a.or_else(|| self.simulation?.a_now())
+    }
+    /// The turn (degrees, about +X by the right-hand rule) from where the
+    /// setup's placement puts the part and its stock, at its first A angle,
+    /// to `shown_a`, and the A centreline it is about (Y, Z, mm, the setup's
+    /// frame). None when they are not turned.
+    fn extra_turn(&self) -> Option<([f32; 2], f32)> {
+        let setup = self.setup?;
+        let t = setup.turn?;
+        let turn = crate::indexed::sign(&setup.machine) * self.shown_a()? - t.turn;
+        (turn.abs() > 1e-4).then_some((t.axis, turn))
+    }
+    /// A point in display units turned by `extra_turn`.
+    fn turner(&self) -> impl Fn([f32; 3]) -> [f32; 3] + use<> {
+        let scale = self.mesh.display_scale();
+        let turn = self.extra_turn();
+        move |v| match turn {
+            Some((axis, t)) => crate::indexed::turn_point(v, axis.map(|n| n * scale), t),
+            None => v,
+        }
+    }
     /// What the camera must contain, in display units: the part, the stock,
     /// the jaws or clamps and, when simulating, the stock and every move.
     pub(crate) fn scene_bounds(&self) -> crate::mesh::Bounds {
@@ -334,6 +369,24 @@ impl Viewport<'_> {
         {
             boxes.push(stock.stock.scaled(stock.display_scale));
         }
+        // An indexed setup's part and stock turn with A: the camera holds
+        // still round all they sweep about the centreline.
+        if let Some(t) = self.setup.and_then(|s| s.turn) {
+            let [y, z] = t.axis.map(|n| n * self.mesh.display_scale());
+            let swept: Vec<_> = (boxes.iter())
+                .map(|b| {
+                    let r = [b.min[1] - y, b.max[1] - y]
+                        .into_iter()
+                        .flat_map(|dy| [b.min[2] - z, b.max[2] - z].map(|dz| dy.hypot(dz)))
+                        .fold(0., f32::max);
+                    crate::mesh::Bounds {
+                        min: [b.min[0], y - r, z - r],
+                        max: [b.max[0], y + r, z + r],
+                    }
+                })
+                .collect();
+            boxes.extend(swept);
+        }
         let scale = self.mesh.display_scale();
         boxes.extend(self.holding.iter().map(|hold| hold.bounds.scaled(scale)));
         if let Some(sim) = self.simulation {
@@ -369,11 +422,14 @@ impl Viewport<'_> {
     }
     fn transformed(&self) -> Vec<Face> {
         let placement = Placement::new(self.mesh, self.setup);
+        let turned = self.turner();
         self.mesh
             .faces
             .iter()
             .map(|f| Face {
-                points: f.points.iter().map(|p| placement.transform(*p)).collect(),
+                points: (f.points.iter())
+                    .map(|p| turned(placement.transform(*p)))
+                    .collect(),
                 feature: f.feature,
                 tone: f.tone,
             })
@@ -442,12 +498,14 @@ impl Viewport<'_> {
             self.sample,
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
+        let key = format!("{key}|{:?}", self.shown_a());
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             self.holding,
             self.leftover,
             self.live,
             self.live_stock.map(|(g, v)| (std::ptr::from_ref(g), v)),
+            self.live_volume.map(|(g, v)| (std::ptr::from_ref(g), v)),
             self.uncut.first().map(std::ptr::from_ref),
             self.uncut.len(),
             self.show_uncut
@@ -492,7 +550,9 @@ impl Viewport<'_> {
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
         // Only the faces still under stock are drawn then, after the stock.
-        let carved = self.simulation.is_none() && self.show_stock && self.live_stock.is_some();
+        let carved = self.simulation.is_none()
+            && self.show_stock
+            && (self.live_stock.is_some() || self.live_volume.is_some());
         let behind_stock = (self.simulation.is_some() && self.show_stock) || carved;
         let faces = if behind_stock && !self.show_uncut {
             vec![]
@@ -623,7 +683,27 @@ impl Viewport<'_> {
                     };
                     grid_faces(grid, &mut face);
                 }
-                (None, None) => {}
+                (None, None) => {
+                    if let (Some((volume, _)), Some(setup)) = (self.live_volume, self.setup) {
+                        // Seen in the setup's frame turned to the machine's A.
+                        let frame = crate::volume::Frame::new(setup, self.mesh);
+                        let current = match self.extra_turn() {
+                            Some((axis, turn)) => frame.turned(axis, turn),
+                            None => frame,
+                        };
+                        let scale = self.mesh.display_scale();
+                        for (points, color) in voxel_faces(volume, current) {
+                            let v = points.map(|v| {
+                                let v = v.map(|n| n * scale);
+                                let q = p.p(v);
+                                (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
+                            });
+                            for t in [[v[0], v[1], v[2]], [v[0], v[2], v[3]]] {
+                                raster_triangle(&mut rgba, &mut depths, w, h, t, color);
+                            }
+                        }
+                    }
+                }
             }
             for (fi, face) in faces.iter().enumerate() {
                 if !behind_stock || self.uncut.get(fi) != Some(&true) {
@@ -650,6 +730,7 @@ impl Viewport<'_> {
             && self.stock_is_known(setup)
             && let Some(stock) = self.resolved_stock()
         {
+            let turned = self.turner();
             if let Some(bar) = stock::round(setup, stock.stock)
                 .filter(|_| crate::model::get(&setup.p, "stock_source") == "fresh")
             {
@@ -660,8 +741,10 @@ impl Viewport<'_> {
                     (0..sides)
                         .map(|i| {
                             let t = (i as f32 * 360. / sides as f32).to_radians();
-                            let v = [x, bar.axis[0] + r * t.cos(), bar.axis[1] + r * t.sin()]
-                                .map(|n| n * stock.display_scale);
+                            let v = turned(
+                                [x, bar.axis[0] + r * t.cos(), bar.axis[1] + r * t.sin()]
+                                    .map(|n| n * stock.display_scale),
+                            );
                             let q = p.p(v);
                             (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
                         })
@@ -681,6 +764,7 @@ impl Viewport<'_> {
                 );
             } else {
                 let projected = box_vertices(stock.stock.scaled(stock.display_scale)).map(|v| {
+                    let v = turned(v);
                     let q = p.p(v);
                     (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
                 });
@@ -877,8 +961,13 @@ impl Viewport<'_> {
                 );
             }
         };
+        // An indexed setup's stock is drawn turned to the A shown.
+        let current = match (sim.frame, self.extra_turn()) {
+            (Some(frame), Some((axis, turn))) => Some(frame.turned(axis, turn)),
+            (frame, _) => frame,
+        };
         if self.show_stock
-            && let (Some(volume), Some(current)) = (&sim.volume, sim.frame)
+            && let (Some(volume), Some(current)) = (&sim.volume, current)
             && let Some(surface) = &sim.stock_surface
         {
             for (points, color) in stock_triangles(volume, surface, current) {
@@ -1465,6 +1554,64 @@ fn shade(points: &[[f32; 3]], base: [f32; 3]) -> [u8; 4] {
         (base[2] * light) as u8,
         255,
     ]
+}
+/// The faces between the voxels of `volume` that hold material and those
+/// that do not (or the outside), as quads in the frame `current` (mm), each
+/// with the colour the view gives stock: the block's own colour where the
+/// side beyond it never held material, the cut colour where it was cut.
+pub(crate) fn voxel_faces(
+    volume: &crate::volume::Volume,
+    current: crate::volume::Frame,
+) -> Vec<([[f32; 3]; 4], [u8; 4])> {
+    let n = volume.n;
+    let filled = |c: [i64; 3]| {
+        (0..3).all(|k| c[k] >= 0 && (c[k] as usize) < n[k])
+            && volume.occupied[volume.index(c.map(|v| v as usize))] != 0
+    };
+    // Whether the voxel at `c` was ever material: inside the block, and
+    // the bar when it is one.
+    let stock = |c: [i64; 3]| {
+        (0..3).all(|k| c[k] >= 0 && (c[k] as usize) < n[k])
+            && volume
+                .round
+                .is_none_or(|bar| bar.contains(volume.point(c.map(|v| v as usize), 0.5)))
+    };
+    let corner = |c: [i64; 3]| {
+        let p = std::array::from_fn(|k| volume.bounds.min[k] + c[k] as f32 * volume.cell[k]);
+        volume.frame.transfer(p, current)
+    };
+    let mut out = vec![];
+    for z in 0..n[2] as i64 {
+        for y in 0..n[1] as i64 {
+            for x in 0..n[0] as i64 {
+                let c = [x, y, z];
+                if !filled(c) {
+                    continue;
+                }
+                for k in 0..3 {
+                    for side in [0, 1] {
+                        let mut beyond = c;
+                        beyond[k] += if side == 0 { -1 } else { 1 };
+                        if filled(beyond) {
+                            continue;
+                        }
+                        let (u, v) = ((k + 1) % 3, (k + 2) % 3);
+                        let at = |du: i64, dv: i64| {
+                            let mut q = c;
+                            q[k] += side;
+                            q[u] += du;
+                            q[v] += dv;
+                            corner(q)
+                        };
+                        let quad = [at(0, 0), at(1, 0), at(1, 1), at(0, 1)];
+                        let base = if stock(beyond) { CUT } else { BLOCK };
+                        out.push((quad, shade(&quad, base)));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 /// The triangles of `surface`, the simulated stock of `volume`, in the frame
 /// `current` (mm), each with the colour the view gives it.
@@ -2124,7 +2271,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2170,6 +2319,94 @@ mod tests {
             .count()
     }
     #[test]
+    fn an_indexed_setups_part_and_stock_turn_to_the_a_shown() {
+        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        let mesh = prism(30.);
+        let doc = bar_job(
+            &mesh,
+            0.,
+            "80",
+            "-150",
+            "0, 90, 180, 270",
+            contour(&cutter("12")),
+        );
+        let mut sim =
+            crate::planner::view_after(&doc, &mesh, 1, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        let base = Viewport {
+            setup: doc.setups.get(1),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            pin_holes: Default::default(),
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+            live: None,
+            a: None,
+            live_stock: None,
+            live_volume: None,
+            uncut: &[],
+            show_uncut: false,
+        };
+        let view = |sim, a| Viewport {
+            simulation: Some(sim),
+            a,
+            ..base.clone()
+        };
+        let t = doc.setups[1].turn.unwrap();
+        let scale = mesh.display_scale();
+        // The job played to its end is shown at its last angle.
+        let done = view(&sim, None);
+        assert_eq!(done.shown_a(), Some(270.));
+        assert_eq!(done.extra_turn(), Some((t.axis, 270.)));
+        // At its first angle the part is where the setup's placement puts it.
+        let at_start = view(&sim, Some(0.));
+        assert_eq!(at_start.extra_turn(), None);
+        let placed = at_start.transformed();
+        // The machine's A, while a run cuts, turns it about the centreline.
+        let live = view(&sim, Some(90.));
+        assert_eq!(live.extra_turn(), Some((t.axis, 90.)));
+        for (f, g) in placed.iter().zip(live.transformed()) {
+            for (p, q) in f.points.iter().zip(&g.points) {
+                let want = crate::indexed::turn_point(*p, t.axis.map(|v| v * scale), 90.);
+                assert!(
+                    (0..3).all(|k| (want[k] - q[k]).abs() < 1e-3),
+                    "{want:?} {q:?}"
+                );
+            }
+        }
+        // The camera holds still as it turns; the picture does not.
+        assert_eq!(at_start.scene_bounds(), live.scene_bounds());
+        let size = (240, 180);
+        let draw = |v: &Viewport| {
+            let p = Projector::fit(v.camera, (240., 180.), v.scene_bounds());
+            v.render(&p, size, 1., None, &[]).0
+        };
+        // (The square left on the bar looks the same a quarter turn on.)
+        let eighth = view(&sim, Some(45.));
+        assert_eq!(at_start.scene_bounds(), eighth.scene_bounds());
+        assert_ne!(draw(&at_start), draw(&eighth));
+        // Playing the job, A turns through the first index move and the
+        // stock with it.
+        let first = (sim.plan.moves.iter())
+            .find(|m| m.motion == crate::simulation::Motion::Index)
+            .unwrap()
+            .clone();
+        sim.seek((first.start + first.end) / 2. / sim.plan.duration);
+        let midway = Viewport {
+            simulation: Some(&sim),
+            ..base.clone()
+        };
+        assert!((midway.shown_a().unwrap() - 45.).abs() < 1e-3);
+        assert!((midway.extra_turn().unwrap().1 - 45.).abs() < 1e-3);
+    }
+    #[test]
     fn faces_under_stock_are_magenta_over_the_simulated_stock_when_shown() {
         let (doc, mesh, report) = crate::proposal::tests::block();
         let good = crate::proposal::tests::good(&report);
@@ -2193,7 +2430,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &all,
             show_uncut: true,
         };
@@ -2243,7 +2482,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &all,
             show_uncut: true,
         };
@@ -2304,7 +2545,9 @@ mod tests {
                 holding: vec![],
                 leftover: None,
                 live: None,
+                a: None,
                 live_stock: None,
+                live_volume: None,
                 uncut,
                 show_uncut: true,
             }
@@ -2347,7 +2590,9 @@ mod tests {
             holding: vec![],
             leftover,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2423,7 +2668,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2557,7 +2804,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2652,7 +2901,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2712,7 +2963,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2758,7 +3011,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2805,7 +3060,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2843,7 +3100,9 @@ mod tests {
             holding: vec![],
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -2937,7 +3196,9 @@ mod tests {
             holding,
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };

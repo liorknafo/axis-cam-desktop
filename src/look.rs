@@ -289,7 +289,9 @@ impl View {
             holding: holding.clone(),
             leftover: None,
             live: None,
+            a: None,
             live_stock: None,
+            live_volume: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -372,7 +374,9 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         holding: view.holding.clone(),
         leftover: None,
         live: None,
+        a: None,
         live_stock: None,
+        live_volume: None,
         uncut: &[],
         show_uncut: true,
     };

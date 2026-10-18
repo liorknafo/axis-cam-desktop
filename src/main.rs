@@ -1755,6 +1755,21 @@ impl App {
         let setup = self.doc.setups.get(live.setup)?;
         (setup.id == self.doc.active).then_some((live.tip, live.radius, live.stickout))
     }
+    /// The machine's A (degrees, in work coordinates, as programs command
+    /// it) while a tool run of the active setup cuts, on a machine with A.
+    pub fn live_a(&self) -> Option<f32> {
+        let c = self.control.as_ref()?;
+        let live = c.run.as_ref()?.live(&c.snapshot)?;
+        let setup = self.doc.setups.get(live.setup)?;
+        (setup.id == self.doc.active && c.axis(3)).then_some(c.snapshot.work_pos[3] as f32)
+    }
+    /// The A the Job view draws the active indexed setup's part, stock and
+    /// chuck at: the machine's while a run of it cuts (`live_a`), else the
+    /// simulation's (`Simulation::a_now`). None for a setup not indexed.
+    pub fn shown_a(&self) -> Option<f32> {
+        self.doc.active_setup()?.turn?;
+        self.live_a().or_else(|| self.active_simulation()?.a_now())
+    }
     /// The stock the run of the active setup has carved (`run::Run::stock`),
     /// for the Control page's 3D view: MANUFACTURE keeps the part and the
     /// planned stock.
@@ -1768,6 +1783,19 @@ impl App {
             return None;
         }
         r.stock()
+    }
+    /// The stock a run of the active setup that turns A has carved, as a
+    /// volume (`run::Run::carved_volume`), for the Control page's 3D view.
+    pub fn live_volume(&self) -> Option<(&volume::Volume, u64)> {
+        if self.page != Page::Control {
+            return None;
+        }
+        let r = self.control.as_ref()?.run.as_ref()?;
+        let setup = self.doc.setups.get(r.setup)?;
+        if setup.id != self.doc.active {
+            return None;
+        }
+        r.carved_volume()
     }
     /// The machine moves, or a tool run of the Run panel or a probe is under way:
     /// planning is locked (`while_locked`) and no preview or check is worked
