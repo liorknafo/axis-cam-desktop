@@ -234,6 +234,10 @@ pub struct Probe {
     /// The probe tip's diameter, for Probe corner and Probe centre; None
     /// until it is set.
     pub tip: Option<f64>,
+    /// The probe's length from the spindle nose to its tip (LIO-207), for
+    /// the checks' estimate of where a tool of another length puts the
+    /// spindle on an A centreline probed with it; None until it is set.
+    pub length: Option<f64>,
     pub feed: f64,
     /// How far down a probe goes at most.
     pub distance: f64,
@@ -249,7 +253,9 @@ pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
         let text = post_setting(p, key).trim();
         match text.parse::<f64>() {
             Ok(v) if (lo..=hi).contains(&v) => Some(v),
-            _ if text.is_empty() && matches!(key, "probe_plate" | "probe_tip") => None,
+            _ if text.is_empty() && matches!(key, "probe_plate" | "probe_tip" | "probe_length") => {
+                None
+            }
             _ => {
                 e.push(format!("{what} must be from {lo} to {hi} {unit}."));
                 None
@@ -259,6 +265,7 @@ pub fn probe_settings(p: &Fields) -> Result<Probe, Vec<String>> {
     let probe = Probe {
         plate: value("probe_plate", "Touch plate thickness", 0., 100., "mm"),
         tip: value("probe_tip", "Probe tip diameter", 0., 50., "mm"),
+        length: value("probe_length", "Probe length", 0., 300., "mm"),
         feed: value("probe_feed", "Probe feed", 1., 1000., "mm/min").unwrap_or(0.),
         distance: value("probe_distance", "Maximum probe distance", 0.1, 200., "mm").unwrap_or(0.),
         retract: value("probe_retract", "Retract after the probe", 0., 100., "mm").unwrap_or(0.),
@@ -388,6 +395,19 @@ pub enum Touch {
     Reference,
     /// The surface is the reference, at this work Z.
     FromReference(f64),
+    /// The probe the A centreline was just probed with touches the Z
+    /// reference itself, no plate (LIO-207): kept with the centreline.
+    CentreReference,
+    /// The tool of tool run `run` touches the A centreline's Z reference
+    /// (LIO-207), whose surface the probe's tip found at machine Z
+    /// `reference`: how much longer than the probe the tool is, and the
+    /// Z work offset that puts the work zero on the centreline for it,
+    /// `on_centre` (the probe's) plus that.
+    ToolReference {
+        run: usize,
+        reference: f64,
+        on_centre: f64,
+    },
 }
 
 /// A probe move sent and not reported yet.
@@ -1013,6 +1033,7 @@ impl Routine {
         Probe {
             plate: None,
             tip: Some(self.radius * 2.),
+            length: None,
             feed: self.feed,
             distance: self.distance,
             retract: 0.,
@@ -1322,6 +1343,11 @@ pub const ALIGN_LIMIT: f64 = 0.05;
 /// The machine field that says how the centreline was found: empty while it
 /// is assumed, `MEASURED` once probed and saved, or why it went stale.
 pub const CENTRE_MARK: &str = "a_centre_measured";
+/// Why a centreline without its Z reference is not saved or run (LIO-207).
+pub const NO_CENTRE_REFERENCE: &str = "The A centreline's Z is where the probe's tip was, and the probe's length is not a tool's: with the probe still in the spindle, touch a surface that stays put (the table, a block on it, not on A) with Touch the Z reference, then Save the centreline. Each tool is touched off on that surface.";
+/// How near the spot the probe touched the Z reference a tool is touched
+/// off on it (mm, machine X Y): a table or block is flat only so far.
+pub const REFERENCE_SPOT: f64 = 1.;
 pub const MEASURED: &str = "measured";
 
 /// The A centreline found at one place along the bar (machine mm).
@@ -1341,6 +1367,11 @@ pub struct Centre {
     pub across: f64,
     /// The A angles it was probed at.
     pub angles: [f64; 2],
+    /// The Z reference the probe touched since (LIO-207): machine X, Y and
+    /// the machine Z of its tip on the surface (`Touch::CentreReference`).
+    /// Saved with the centreline: a tool touched off on the same surface
+    /// is related to the centreline by it, whatever its length.
+    pub reference: Option<[f64; 3]>,
 }
 
 impl Centre {
@@ -1655,6 +1686,7 @@ impl Turning {
             runout: [(first[0] - second[0]) / 2., (first[1] - second[1]) / 2.],
             across: (first[2] + second[2]) / 2.,
             angles: [self.angles[0], self.angles[1]],
+            reference: None,
         })
     }
 }
@@ -1686,8 +1718,9 @@ impl Rotary {
 /// app to keep in the Machine library (`take`n there).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RotaryKeep {
-    /// The centreline's machine Y and Z, probed: it is measured.
-    Centreline([f64; 2]),
+    /// The centreline's machine Y and Z, probed: it is measured; and the
+    /// Z reference the probe touched with it (`Centre::reference`).
+    Centreline([f64; 2], [f64; 3]),
     /// The measured centreline went stale: why (`CENTRE_MARK`).
     Stale(&'static str),
 }
@@ -1925,6 +1958,9 @@ pub enum Action {
     SpacingText(String),
     /// Start a rotary calibration from where the tip is (`Calibrate`).
     Calibrate(Calibrate),
+    /// The probe the centreline was probed with touches a Z reference
+    /// straight down, with no plate (LIO-207), to be saved with it.
+    TouchCentreReference,
     /// Keep the centreline found near the chuck in the machine's rotary
     /// geometry, as measured.
     SaveCentreline,
@@ -2078,6 +2114,13 @@ pub struct Connection {
     yz_set: bool,
     /// Simulated: where the test bar really is.
     pub sim_axis: SimAxis,
+    /// Simulated: how much longer than the probe the tool in the spindle is
+    /// (mm, LIO-207). Its tip is that much under the simulator's point, so
+    /// the simulator's blocks and bars stand that much higher.
+    pub sim_longer: f64,
+    /// Simulated: a gauge block on the table for a Z reference (LIO-207),
+    /// None without one.
+    pub sim_gauge: Option<Block>,
     /// Simulated: the bars last sent to the driver.
     sim_bars_sent: Vec<Bar>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
@@ -2176,6 +2219,8 @@ impl Connection {
             rotary_keep: None,
             yz_set: false,
             sim_axis: SimAxis::default(),
+            sim_longer: 0.,
+            sim_gauge: None,
             sim_bars_sent: vec![],
         };
         c.send_sim_blocks();
@@ -2237,12 +2282,20 @@ impl Connection {
         if !self.simulated {
             return;
         }
-        let world = self.sim_world();
+        let up = self.sim_longer;
+        let mut world = self.sim_world();
+        world.extend(self.sim_gauge);
+        for b in &mut world {
+            (b.min[2], b.max[2]) = (b.min[2] + up, b.max[2] + up);
+        }
         if world != self.sim_sent {
             self.send(Command::SimBlocks(world.clone()));
             self.sim_sent = world;
         }
-        let bars: Vec<Bar> = self.sim_bar().into_iter().collect();
+        let mut bars: Vec<Bar> = self.sim_bar().into_iter().collect();
+        for b in &mut bars {
+            b.axis[1] += up;
+        }
         if bars != self.sim_bars_sent {
             self.send(Command::SimBars(bars.clone()));
             self.sim_bars_sent = bars;
@@ -2718,6 +2771,9 @@ impl Connection {
             Action::SpacingText(text) if self.turning.is_none() => self.spacing_text = text,
             Action::Calibrate(what) => self.start_turning(what),
             Action::SaveCentreline => self.save_centre(),
+            Action::TouchCentreReference if self.centre_reference_blocked().is_none() => {
+                self.start_probe(Touch::CentreReference)
+            }
             Action::Remounted if self.turning.is_none() => {
                 self.centre = None;
                 self.stale("a remount");
@@ -2737,6 +2793,12 @@ impl Connection {
     /// Picking and checking a setup is the app's: it needs the part.
     pub fn run_act(&mut self, action: crate::run::Action, doc: &crate::model::Document) {
         use crate::run::Action as R;
+        if let R::ProbeCentreReference = action {
+            if let Ok(touch) = self.a_reference(doc) {
+                self.start_probe(touch);
+            }
+            return;
+        }
         let Some(mut run) = self.run.take() else {
             return;
         };
@@ -2915,8 +2977,14 @@ impl Connection {
     }
 
     /// Probes straight down, up to the maximum distance or the bottom of Z.
+    /// The probe touches the A centreline's Z reference itself, no plate.
     fn start_probe(&mut self, touch: Touch) {
-        let (None, Ok(probe)) = (self.probe_blocked(), self.probe.clone()) else {
+        let itself = touch == Touch::CentreReference;
+        let blocked = match itself {
+            true => self.probe_ready(&[2]),
+            false => self.probe_blocked(),
+        };
+        let (None, Ok(probe)) = (blocked, self.probe.clone()) else {
             return;
         };
         let mut target = self.snapshot.machine_pos;
@@ -2927,7 +2995,7 @@ impl Connection {
         self.probing = Some(Probing {
             touch,
             probe,
-            plate: probe.plate.filter(|_| !self.direct()),
+            plate: probe.plate.filter(|_| !self.direct() && !itself),
             target: target[2],
             seq: self.seq(),
         });
@@ -2981,6 +3049,53 @@ impl Connection {
                         format!("Reference surface recorded: Z {surface:.3}, touched directly.")
                     }
                 }
+            }
+            Touch::CentreReference => {
+                let at = [s.machine_pos[0], s.machine_pos[1], trip];
+                let said = match self.centre.as_mut() {
+                    Some(c) => {
+                        c.reference = Some(at);
+                        self.centre_saved = false;
+                        format!(
+                            "Z reference touched with the probe at machine X {:.3} Y {:.3} Z {trip:.3}, {:.3} mm under the centreline. Save the centreline to keep both; each tool is then touched off on this surface (Run panel → Touch off on the A reference).",
+                            at[0],
+                            at[1],
+                            c.z - trip
+                        )
+                    }
+                    None => "The centreline went before the reference was touched: probe it again."
+                        .into(),
+                };
+                self.rotary_said = Some((self.centre.is_some(), said.clone()));
+                said
+            }
+            Touch::ToolReference {
+                run: i,
+                reference,
+                on_centre,
+            } => {
+                // How much longer than the probe the tool is: its tip on the
+                // surface the probe's tip found at `reference`.
+                let longer = trip - plate - reference;
+                let offset = on_centre + longer;
+                self.send(Command::SetWork {
+                    axis: 2,
+                    value: now - offset,
+                });
+                let tool = (self.run.as_ref())
+                    .and_then(|r| r.checked()?.get(i))
+                    .map(|p| (p.ops[0].tool_id.clone(), p.ops[0].tool));
+                if let (Some(run), Some((id, _))) = (&mut self.run, &tool) {
+                    run.length = Some((id.clone(), longer, reference));
+                    run.touched = true;
+                    run.zeroed = true;
+                }
+                format!(
+                    "Work Z set on the A centreline for T{}: its tip is {:.3} mm {} the probe's (Z offset {offset:.3}).",
+                    tool.map_or(0, |t| t.1),
+                    longer.abs(),
+                    if longer >= 0. { "under" } else { "over" },
+                )
             }
             Touch::WorkZ(at) | Touch::FromReference(at) => {
                 self.send(Command::SetWork {
@@ -3550,6 +3665,62 @@ impl Connection {
         }
     }
 
+    /// Why the probe cannot touch the A centreline's Z reference now
+    /// (LIO-207); None when it can.
+    pub fn centre_reference_blocked(&self) -> Option<String> {
+        if self.rotary.is_none() || !self.axis(3) {
+            return Some(
+                "This machine has no rotary A axis with its rotary unit's geometry.".into(),
+            );
+        }
+        if self.turning.is_some() {
+            return Some("A calibration is under way.".into());
+        }
+        if self.centre.is_none() {
+            return Some("Probe the centreline first: the Z reference is touched with the same probe, before it comes out of the spindle.".into());
+        }
+        self.probe_ready(&[0, 1, 2])
+    }
+
+    /// The touch of the next tool run's tool on the A centreline's Z
+    /// reference (LIO-207), or why it cannot be made now: only for a tool
+    /// run that turns A, about a measured centreline saved with its
+    /// reference, with the tool over the spot the probe touched.
+    pub fn a_reference(&self, doc: &crate::model::Document) -> Result<Touch, String> {
+        let run = self.run.as_ref().ok_or("Pick a setup in the Run panel.")?;
+        let p = (run.checked())
+            .and_then(|p| p.get(run.next))
+            .ok_or("The setup cannot run: see the Run panel.")?;
+        let setup = (doc.setups.get(run.setup)).ok_or(crate::run::REMOVED)?;
+        if crate::run::a_angles(&p.blocks).is_empty() {
+            return Err("This tool run does not turn A: touch it off as for any setup.".into());
+        }
+        if doc.centre_mark(&setup.machine) != MEASURED {
+            return Err("The A centreline is not measured and current: probe it under Control → Rotary A first.".into());
+        }
+        let unit = doc.rotary_unit(&setup.machine);
+        let at = unit.and_then(|u| u.reference).ok_or(NO_CENTRE_REFERENCE)?;
+        let on_centre = crate::run::on_centre(doc, setup, p).ok_or(
+            "Where the A centreline is in this setup is not known: check the first setup's stock.",
+        )?[1];
+        let s = &self.snapshot;
+        let off = (s.machine_pos[0] - at[0] as f64).hypot(s.machine_pos[1] - at[1] as f64);
+        if !(s.referenced[0] && s.referenced[1]) || off > REFERENCE_SPOT {
+            return Err(format!(
+                "Jog over the Z reference first, to machine X {:.3} Y {:.3} (within {REFERENCE_SPOT} mm), where the probe touched it.",
+                at[0], at[1]
+            ));
+        }
+        if let Some(why) = self.probe_blocked() {
+            return Err(why);
+        }
+        Ok(Touch::ToolReference {
+            run: run.next,
+            reference: at[2] as f64,
+            on_centre,
+        })
+    }
+
     /// Starts a rotary calibration from where the tip is.
     fn start_turning(&mut self, what: Calibrate) {
         if self.calibrate_blocked(what).is_some() {
@@ -3787,15 +3958,26 @@ impl Connection {
         if self.turning.is_some() {
             return;
         }
+        // Its Z is the probe's: kept only with the reference that relates
+        // each tool to the probe (LIO-207).
+        let Some(reference) = c.reference else {
+            self.rotary_said = Some((false, NO_CENTRE_REFERENCE.into()));
+            return;
+        };
         rot.unit.centre_y = c.y as f32;
         rot.unit.centre_z = c.z as f32;
+        rot.unit.reference = Some(reference.map(|v| v as f32));
         rot.mark = MEASURED.into();
         let fit = rot.unit.fit_diameter as f64;
-        self.rotary_keep = Some(RotaryKeep::Centreline([c.y, c.z]));
+        self.rotary_keep = Some(RotaryKeep::Centreline([c.y, c.z], reference));
         self.centre_saved = true;
         let mut said = format!(
-            "Centreline saved in the machine as measured: Y {:.3}, Z {:.3}.",
-            c.y, c.z
+            "Centreline saved in the machine as measured: Y {:.3}, Z {:.3}, {:.3} mm over the Z reference at X {:.3} Y {:.3}.",
+            c.y,
+            c.z,
+            c.z - reference[2],
+            reference[0],
+            reference[1]
         );
         let warn = self.z_top().and_then(|top| retract_room(top, c.z, fit).1);
         if let Some(w) = &warn {
@@ -4868,6 +5050,7 @@ spindle_max_rpm = 24000
             ("feed", "60000"),
             ("post_dwell", "0.2"),
             (CENTRE_MARK, MEASURED),
+            (crate::model::CENTRE_REF, "10 10 -200"),
         ] {
             m.p.insert(k.into(), v.into());
         }
@@ -4899,6 +5082,8 @@ spindle_max_rpm = 24000
                 std::sync::Arc::new(Ok(programs)),
                 Some(std::sync::Arc::new(left)),
             );
+            // Touched off on the A reference, as long as the probe.
+            run.length = Some((doc.tools[0].id.clone(), 0., -200.));
             c.run = Some(run);
             let problems = c.run.as_ref().unwrap().problems(&c, &doc);
             assert!(problems.is_empty(), "{si}: {problems:?}");
@@ -4968,6 +5153,280 @@ spindle_max_rpm = 24000
             assert!(c.snapshot.machine_pos[3].abs() < 0.03);
         }
     }
+    /// Runs `c` until the probe straight down under way has ended and the
+    /// machine is Idle again, its lift done: whether it touched, and what
+    /// it said.
+    fn probe_ended(c: &mut Connection) -> (bool, String) {
+        let cap = Instant::now() + Duration::from_secs(30);
+        loop {
+            c.refresh();
+            if c.probing.is_none()
+                && c.snapshot.state == Some(State::Idle)
+                && let Some(said) = c.probed.clone()
+            {
+                wait(c, 300);
+                return said;
+            }
+            assert!(
+                Instant::now() < cap,
+                "the probe did not end: {:?}",
+                c.snapshot.log
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// LIO-207 on the simulated UC100: the A centreline is probed with a
+    /// 50 mm probe, whose tip touches a gauge block on the table as the Z
+    /// reference, saved with it. The cutter is 15 mm longer than the probe
+    /// (50 mm out of a 15 mm holder), then 10 mm shorter (40 mm, no
+    /// holder): the simulator's tip is that much under its point. With the
+    /// work zero on the probe's centreline, as LIO-192 asked for, the run is
+    /// refused: how the tool's tip relates to it is not known, and it would
+    /// cut 15 mm deep. Touched off on the reference with the plate, work Z
+    /// is set that much higher (lower), and every cut at A 90 and A 180 is
+    /// as deep under the bar's real top, and as far from its real axis, as
+    /// planned. The longer tool's job then runs to its end.
+    #[test]
+    fn an_indexed_cut_is_as_deep_with_a_tool_longer_or_shorter_than_the_probe() {
+        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        use crate::run::Action as R;
+        for (longer, stickout, holder, run_it) in
+            [(15., "50", "15", true), (-10., "40", "0", false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mesh = prism(30.);
+            let mut op = contour(&cutter("12"));
+            for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+                op.p.insert(k.into(), v.into());
+            }
+            let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180", op);
+            for (k, v) in [
+                ("number", "1"),
+                ("stickout", stickout),
+                ("holder_length", holder),
+            ] {
+                doc.tools[0].p.insert(k.into(), v.into());
+            }
+            doc.file = Some(crate::model::ModelFile {
+                name: "bar.stl".into(),
+                path: "bar.stl".into(),
+                format: "STL".into(),
+                bytes: 1,
+            });
+            let path = dir.path().join("profile.toml");
+            let m = &mut doc.setups[0].machine;
+            for (k, v) in [
+                ("controller", "UC100"),
+                ("uc100_profile", &*path.display().to_string()),
+                ("uc100_connection", "Simulated"),
+                ("feed", "60000"),
+                ("post_dwell", "0.2"),
+                (CENTRE_MARK, MEASURED),
+                ("probe_tip", "2"),
+                ("probe_feed", "1000"),
+                ("probe_distance", "20"),
+                ("probe_plate", "5"),
+                ("probe_length", "50"),
+            ] {
+                m.p.insert(k.into(), v.into());
+            }
+            doc.machines = vec![doc.setups[0].machine.clone()];
+            doc.sync_stock_sources();
+            doc.sync_indexed();
+            doc.sync_turns(Some(&mesh));
+            let m = doc.setups[0].machine.clone();
+            let profile =
+                format!("{ROTARY_SIM}[inputs]\nprobe = {{ pin = 13, active_low = true }}\n");
+            let mut c = zeroed_sim(dir.path(), &profile, Some(&m), 4);
+            // The probe found the centreline where the project has it: its
+            // tip is on the bar's axis at machine Y 140 Z -150.
+            let unit = doc.rotary_unit(&m).unwrap();
+            let (cy, cz) = (unit.centre_y as f64, unit.centre_z as f64);
+            c.centre = Some(Centre {
+                x: unit.chuck_x as f64 + 10.,
+                y: cy,
+                z: cz,
+                runout: [0.; 2],
+                across: 40.,
+                angles: [0., 180.],
+                reference: None,
+            });
+            // Not saved without the reference that relates a tool to it.
+            c.act(Action::SaveCentreline);
+            assert_eq!(c.rotary_said, Some((false, NO_CENTRE_REFERENCE.into())));
+            assert!(c.rotary_keep.is_none() && !c.centre_saved);
+            // The probe touches the gauge block's top, at machine Z -200.
+            c.sim_gauge = Some(Block {
+                min: [20., 20., -300.],
+                max: [60., 60., -200.],
+            });
+            rapid_a(&mut c, [40., 40., -190., 0.]);
+            c.act(Action::TouchCentreReference);
+            let (ok, said) = probe_ended(&mut c);
+            assert!(ok, "{said}");
+            let at = c.centre.unwrap().reference.expect("the probe's reference");
+            assert!(
+                (at[2] + 200.).abs() < 0.051 && (at[0] - 40.).abs() < 0.03,
+                "{at:?}"
+            );
+            c.act(Action::SaveCentreline);
+            let Some(RotaryKeep::Centreline(_, kept)) = c.rotary_keep.take() else {
+                panic!("{:?}", c.rotary_said);
+            };
+            assert_eq!(kept, at);
+            // The app keeps it in the library (`App::keep_rotary`).
+            (doc.machines[0].p).insert(
+                crate::model::CENTRE_REF.into(),
+                format!("{:.3} {:.3} {:.3}", at[0], at[1], at[2]),
+            );
+            // The work zero on the probe's centreline, A0 at machine A0.
+            let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
+            let here = c.snapshot.machine_pos;
+            for (axis, z) in zero.iter().map(|z| *z as f64).chain([0.]).enumerate() {
+                c.send(Command::SetWork {
+                    axis,
+                    value: here[axis] - z,
+                });
+                until(&mut c, 2.0, "the work offset", |s| {
+                    (s.work_offset[axis] - z).abs() < 1e-6
+                });
+            }
+            // The cutter goes in: its tip `longer` under the probe's.
+            c.sim_longer = longer;
+            let (programs, left) = crate::run::check(&doc, &mesh, 1);
+            let programs = programs.unwrap_or_else(|e| panic!("{longer}: {e:?}"));
+            let p = programs[0].clone();
+            let mut run = crate::run::Run::new(&doc, 1, 0);
+            run.checked_as(
+                std::sync::Arc::new(Ok(programs)),
+                Some(std::sync::Arc::new(left)),
+            );
+            c.run = Some(run);
+            let on_centre = crate::run::on_centre(&doc, &doc.setups[1], &p).unwrap();
+            assert!((c.snapshot.work_offset[2] - on_centre[1]).abs() < 1e-6);
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(
+                problems.len() == 1
+                    && problems[0]
+                        .contains("T1 Flat is not touched off on the A centreline's Z reference"),
+                "{longer}: {problems:?}"
+            );
+            // The plate on the gauge block; the tool 10 mm over it.
+            let plate = 5.;
+            c.sim_gauge.as_mut().unwrap().max[2] += plate;
+            rapid_a(&mut c, [40.5, 40., -185. + longer, 0.]);
+            assert!(c.a_reference(&doc).is_ok(), "{:?}", c.a_reference(&doc));
+            c.run_act(R::ProbeCentreReference, &doc);
+            let (ok, said) = probe_ended(&mut c);
+            assert!(ok, "{said}");
+            let (id, d, from) = c.run.as_ref().unwrap().length.clone().unwrap();
+            assert!((from - at[2]).abs() < 1e-3, "{from} {at:?}");
+            assert!(
+                id == doc.tools[0].id && (d - longer).abs() < 0.051,
+                "{d} {said}"
+            );
+            let want = on_centre[1] + d;
+            until(&mut c, 2.0, "work Z on the centreline", |s| {
+                (s.work_offset[2] - want).abs() < 1e-6
+            });
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(problems.is_empty(), "{longer}: {problems:?}");
+            // Another tool touched off last is no relation for this one.
+            let run = c.run.as_mut().unwrap();
+            let kept = run.length.replace(("another tool".into(), d, from));
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("is not touched off on the A centreline's Z reference")),
+                "{problems:?}"
+            );
+            c.run.as_mut().unwrap().length = kept;
+            // Nor is a length measured from a reference saved before.
+            let saved = doc.machines[0].p[crate::model::CENTRE_REF].clone();
+            (doc.machines[0].p).insert(
+                crate::model::CENTRE_REF.into(),
+                format!("{:.3} {:.3} {:.3}", at[0], at[1], at[2] + 1.),
+            );
+            let problems = c.run.as_ref().unwrap().problems(&c, &doc);
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("is not touched off on the A centreline's Z reference")),
+                "{problems:?}"
+            );
+            doc.machines[0]
+                .p
+                .insert(crate::model::CENTRE_REF.into(), saved);
+            assert!(c.run.as_ref().unwrap().problems(&c, &doc).is_empty());
+            // Every cut at A 90 and A 180: the tip, `longer` under the
+            // machine's point, is as deep under the bar's real top (the
+            // probe's centreline + its 20 mm radius) and as far across from
+            // its axis as planned.
+            let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+            let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+            let axis = doc.setups[1].turn.unwrap().axis;
+            for a in [90., 180.] {
+                let cuts: Vec<[f64; 6]> = (actions.iter())
+                    .filter_map(|l| match l.action {
+                        Do::Move {
+                            target,
+                            feed: Some(_),
+                        } if (target[3] - a).abs() < 1e-6 => Some(target),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!cuts.is_empty(), "{longer}: no cut at A {a}");
+                for t in &cuts {
+                    // The plan's point, in the setup's frame.
+                    let plan = [
+                        t[1] - offset[1] + p.datum[1] as f64,
+                        t[2] - offset[2] + p.datum[2] as f64,
+                    ];
+                    let tip = [t[1], t[2] - longer];
+                    let depth = [cz + 20. - tip[1], axis[1] as f64 + 20. - plan[1]];
+                    let across = [tip[0] - cy, plan[0] - axis[0] as f64];
+                    assert!(
+                        (depth[0] - depth[1]).abs() < 0.06 && (across[0] - across[1]).abs() < 1e-6,
+                        "{longer} at A {a}: {t:?} {depth:?} {across:?}"
+                    );
+                }
+                // At the probe's work zero the same cut would have been
+                // `longer` deeper: 15 mm at A 90 and at A 180, which puts a
+                // feature cut at A 180 30 mm from the one at A 0.
+                let deepest = cuts.iter().map(|t| t[2]).fold(f64::INFINITY, f64::min);
+                let planned = axis[1] as f64 + 20. - (deepest - offset[2] + p.datum[2] as f64);
+                let at_probes = cz + 20. - (deepest - (offset[2] - on_centre[1]) - longer);
+                assert!(
+                    (at_probes - planned - longer).abs() < 0.06,
+                    "{at_probes} {planned}"
+                );
+            }
+            if !run_it {
+                continue;
+            }
+            let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+            c.run_act(R::CycleStart, &doc);
+            assert!(c.run.as_ref().unwrap().running.is_some());
+            let cap = Instant::now() + Duration::from_secs(600);
+            while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
+                c.refresh();
+                if let Some(r) = &mut c.run {
+                    r.refresh(c.snapshot.program_outcome.as_ref());
+                }
+                assert!(
+                    Instant::now() < cap,
+                    "the job did not end: {:?}",
+                    c.snapshot.log
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let o = c.snapshot.program_outcome.clone().unwrap();
+            assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        }
+    }
+
     /// A Ø40 bar milled square at A 0, 90, 180 and 270 in one job on the
     /// simulated UC100 (LIO-192): admitted only on a measured, current A
     /// centreline with the work zero on it and every A inside its soft
@@ -5004,6 +5463,7 @@ spindle_max_rpm = 24000
             ("feed", "60000"),
             ("post_dwell", "0.2"),
             (CENTRE_MARK, MEASURED),
+            (crate::model::CENTRE_REF, "10 10 -200"),
         ] {
             m.p.insert(k.into(), v.into());
         }
@@ -5056,6 +5516,8 @@ spindle_max_rpm = 24000
             std::sync::Arc::new(Ok(programs)),
             Some(std::sync::Arc::new(left)),
         );
+        // Touched off on the A reference, as long as the probe.
+        run.length = Some((doc.tools[0].id.clone(), 0., -200.));
         c.run = Some(run);
         let problems =
             |c: &Connection, doc: &crate::model::Document| c.run.as_ref().unwrap().problems(c, doc);
@@ -5235,6 +5697,7 @@ spindle_max_rpm = 24000
         // at or above all that A swings, straight down to its feed.
         let mut run = crate::run::Run::new(&at_zero, 1, 0);
         run.checked_as(std::sync::Arc::new(Ok(at_zero_programs)), None);
+        run.length = Some((doc.tools[0].id.clone(), 0., -200.));
         c.run = Some(run);
         assert!(
             problems(&c, &at_zero).is_empty(),
@@ -5586,6 +6049,7 @@ spindle_max_rpm = 24000
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -5686,6 +6150,7 @@ spindle_max_rpm = 24000
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -5823,6 +6288,7 @@ spindle_max_rpm = 24000
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 30.,
             retract: 5.,
@@ -5945,6 +6411,7 @@ spindle_max_rpm = 24000
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 30.,
             retract: 5.,
@@ -6038,6 +6505,7 @@ spindle_max_rpm = 24000
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -6383,6 +6851,7 @@ probe = { pin = 13, active_low = true }
         let probe = Probe {
             plate: None,
             tip: Some(4.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 5.,
@@ -6838,13 +7307,28 @@ probe = { pin = 13, active_low = true }
             .parse()
             .unwrap();
         assert!((runs - off).abs() < 0.01, "{said} not {off:.3}");
+        // Not saved before the probe touches the Z reference (LIO-207): a
+        // gauge block on the table, its top at machine Z -50.
+        c.act(Action::SaveCentreline);
+        assert_eq!(c.rotary_said, Some((false, NO_CENTRE_REFERENCE.into())));
+        assert!(c.rotary_keep.is_none());
+        c.sim_gauge = Some(Block {
+            min: [20., 20., -55.],
+            max: [60., 60., -50.],
+        });
+        rapid_a(&mut c, [40., 40., -45., 0.]);
+        c.act(Action::TouchCentreReference);
+        let (ok, said) = probe_ended(&mut c);
+        assert!(ok, "{said}");
+        let reference = c.centre.unwrap().reference.unwrap();
+        assert!((reference[2] + 50.).abs() < 0.03, "{reference:?}");
         // Save: measured, kept for the app, and Ø80 on it reaches the top.
         c.act(Action::SaveCentreline);
         let (ok, said) = c.rotary_said.clone().unwrap();
         assert!(!ok && said.contains("less than the 5 mm"), "{said}");
         assert_eq!(
             c.rotary_keep.take(),
-            Some(RotaryKeep::Centreline([found.y, found.z]))
+            Some(RotaryKeep::Centreline([found.y, found.z], reference))
         );
         assert!(c.rotary.as_ref().unwrap().measured() && c.centre_saved);
         // Every E-stop leaves it stale: the machine position is gone.
@@ -6931,6 +7415,7 @@ probe = { pin = 13, active_low = true }
         let probe = Probe {
             plate: None,
             tip: Some(2.),
+            length: None,
             feed: 100.,
             distance: 20.,
             retract: 0.,

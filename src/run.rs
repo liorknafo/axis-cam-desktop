@@ -42,6 +42,10 @@ pub enum Action {
     /// the reference surface: probes down onto it.
     ProbeReference,
     ProbeFromReference,
+    /// For a tool run that turns A: the tool touches the A centreline's Z
+    /// reference with the touch plate, which sets its work Z on the
+    /// centreline (LIO-207, `Connection::a_reference`).
+    ProbeCentreReference,
     /// Set Off the coolant the profile has no output for (`coolant_off`),
     /// then check again.
     CoolantOff,
@@ -115,6 +119,13 @@ pub struct Run {
     pub reference_a: Option<f64>,
     /// The tool of the last tool run started and the Z work offset then.
     last: Option<(String, f64)>,
+    /// The tool last touched off on the A centreline's Z reference, how
+    /// much longer than the probe the centreline was probed with it is
+    /// (mm, LIO-207), and the reference's machine Z it was measured from:
+    /// the only relation of a tool's tip to the centreline that a tool run
+    /// turning A runs with (`rotary_problems`), while that reference is the
+    /// one kept with the centreline.
+    pub length: Option<(String, f64, f64)>,
     /// Z was touched off on the Control page since the last tool run started.
     pub touched: bool,
     /// How the last tool run ended (ok, the driver's message).
@@ -189,6 +200,7 @@ impl Run {
             reference: None,
             reference_a: None,
             last: None,
+            length: None,
             touched: false,
             outcome: None,
             pictures: vec![],
@@ -592,7 +604,14 @@ impl Run {
         }
         e.extend(a_problems(&setup.machine, &c.config));
         if let Some(blocks) = blocks {
-            e.extend(rotary_problems(c, doc, setup, p, blocks));
+            e.extend(rotary_problems(
+                c,
+                doc,
+                setup,
+                p,
+                blocks,
+                self.length.as_ref(),
+            ));
         }
         match OFFSETS.iter().position(|o| *o == p.offset) {
             Some(i) if i < 6 => {
@@ -966,6 +985,18 @@ pub fn op_angles(blocks: &[Block], op: usize) -> Vec<f32> {
     v
 }
 
+/// The Y and Z work offsets that put program `p`'s work zero on the A
+/// centreline of `setup`'s machine for the probe it was probed with: the
+/// plan's centreline (`Turn::axis`) on the machine's (`RotaryUnit`).
+/// None without the rotary geometry or the setup's turn.
+pub fn on_centre(doc: &Document, setup: &crate::model::Setup, p: &Checked) -> Option<[f64; 2]> {
+    let (u, turn) = (doc.rotary_unit(&setup.machine)?, setup.turn?);
+    Some([
+        u.centre_y as f64 + p.datum[1] as f64 - turn.axis[0] as f64,
+        u.centre_z as f64 + p.datum[2] as f64 - turn.axis[1] as f64,
+    ])
+}
+
 /// What stands in the way of running program `blocks` of `setup` on the
 /// machine with A (LIO-192). A program that turns A (an indexed setup's)
 /// needs the rotary calibration current, the measured A centreline the
@@ -974,12 +1005,23 @@ pub fn op_angles(blocks: &[Block], op: usize) -> Vec<f32> {
 /// turns to inside A's soft limits at A's work offset. One that does not
 /// turn A cuts at A0, where the setup's work zero was found: A must be
 /// there. Nothing for a machine without A.
+///
+/// The Z sent for a cut at work Z `w` is `w` + the Z work offset; with no
+/// tool length offset on the UC100, the tip is then the tool's length
+/// under it. The centreline's machine Z (`RotaryUnit::centre_z`) is where
+/// the probe's tip was on it, so the offset `on_centre` gives is right for
+/// a tool as long as the probe only. A tool `d` mm longer needs it `d` mm
+/// higher, or every cut is `d` deeper and a feature cut at A 180° lands
+/// `2d` off (LIO-207). `d` is known only from the tool's touch-off on the
+/// Z reference the probe touched with the centreline (`length`): without
+/// one for this tool run's tool, it is refused.
 fn rotary_problems(
     c: &Connection,
     doc: &Document,
     setup: &crate::model::Setup,
     p: &Checked,
     blocks: &[Block],
+    length: Option<&(String, f64, f64)>,
 ) -> Vec<String> {
     let m = &setup.machine;
     if !m.has_a() || !c.axis(3) {
@@ -1016,27 +1058,47 @@ fn rotary_problems(
             "The measured A centreline went {why}: probe it again under Control → Rotary A before running an indexed setup."
         )),
     }
-    // The work zero where the setup has the A centreline: the plan's
-    // centreline (`Turn::axis`, Y and Z) on the machine's.
-    match (unit, setup.turn) {
-        (Some(_), None) => e.push(
+    // The work zero where the setup has the A centreline, for this tool:
+    // the probe's, its Z as much higher as the tool is longer.
+    let tool = &p.ops[0];
+    let measured = unit.is_some() && marks.iter().all(|k| *k == crate::control::MEASURED);
+    let longer = match (unit.and_then(|u| u.reference), length) {
+        _ if !measured => None,
+        (None, _) => {
+            e.push(crate::control::NO_CENTRE_REFERENCE.into());
+            None
+        }
+        (Some(at), Some((id, d, from)))
+            if *id == tool.tool_id && (*from - at[2] as f64).abs() < 1e-6 =>
+        {
+            Some(*d)
+        }
+        (Some(at), _) => {
+            e.push(format!(
+                "T{} {} is not touched off on the A centreline's Z reference, so where its tip is on the centreline is not known: the centreline was probed with the probe, and a tool longer or shorter than it cuts that much deeper or shallower. With T{} in the spindle, jog over the reference (machine X {:.3} Y {:.3}), put the touch plate on it and press Touch off on the A reference.",
+                tool.tool, tool.tool_name, tool.tool, at[0], at[1]
+            ));
+            None
+        }
+    };
+    match (on_centre(doc, setup, p), longer) {
+        (None, _) if unit.is_some() => e.push(
             "Where the A centreline is in this setup is not known: check the first setup's stock."
                 .into(),
         ),
-        (Some(u), Some(turn)) if s.referenced[1] && s.referenced[2] => {
-            let want = [
-                u.centre_y as f64 + p.datum[1] as f64 - turn.axis[0] as f64,
-                u.centre_z as f64 + p.datum[2] as f64 - turn.axis[1] as f64,
-            ];
+        (Some([y, z]), Some(d)) if s.referenced[1] && s.referenced[2] => {
+            let want = [y, z + d];
             let off = (s.work_offset[1] - want[0]).hypot(s.work_offset[2] - want[1]);
             if off > ON_CENTRELINE {
                 e.push(format!(
-                    "The work zero is {off:.3} mm off the A centreline (within {ON_CENTRELINE} mm is needed): its Y and Z offsets in {} are {:.3} and {:.3}, but this setup's work zero on the measured centreline (machine Y {:.3} Z {:.3}) is at Y {:.3} Z {:.3}. Set them there (G10 L2 P{} Y{:.3} Z{:.3} by MDI), or probe the centreline again.",
+                    "The work zero is {off:.3} mm off the A centreline (within {ON_CENTRELINE} mm is needed): its Y and Z offsets in {} are {:.3} and {:.3}, but this setup's work zero on the measured centreline (machine Y {:.3} Z {:.3} for the probe; T{}'s tip is {:.3} mm under the probe's) is at Y {:.3} Z {:.3}. Touch the tool off on the A reference again, or set them there (G10 L2 P{} Y{:.3} Z{:.3} by MDI).",
                     p.offset,
                     s.work_offset[1],
                     s.work_offset[2],
-                    u.centre_y,
-                    u.centre_z,
+                    unit.map_or(0., |u| u.centre_y),
+                    unit.map_or(0., |u| u.centre_z),
+                    tool.tool,
+                    d,
                     want[0],
                     want[1],
                     s.active_wcs + 1,
@@ -1104,7 +1166,7 @@ pub fn check(doc: &Document, mesh: &Mesh, si: usize) -> (Result<Vec<Checked>, Ve
 }
 
 const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
-const REMOVED: &str = "This setup was removed from the project.";
+pub const REMOVED: &str = "This setup was removed from the project.";
 
 /// The `sequence` results of setup `si`'s enabled operations, from a
 /// simulation of the job up to the end of that setup.
@@ -1926,6 +1988,7 @@ mod tests {
             reference: None,
             reference_a: None,
             last: None,
+            length: None,
             touched: false,
             outcome: None,
             pictures: vec![],

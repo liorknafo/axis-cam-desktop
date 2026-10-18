@@ -4738,6 +4738,7 @@ fn wizard(app: &App) -> Element<'_, Message> {
                     .push(row![
                         field(p, "probe_distance", "Maximum probe distance · mm", t),
                         field(p, "probe_retract", "Retract after the probe · mm", t),
+                        field(p, "probe_length", "Probe length, spindle nose to tip · mm", t),
                     ].spacing(8))
                     .push(warnings(crate::control::probe_settings(p).err().unwrap_or_default()))
                     .push(bold("Fixture pins", 15))
@@ -6141,7 +6142,7 @@ pub(crate) fn run_panel<'a>(
             let first = crate::run::a_angles(&p.blocks);
             let back = match first.first() {
                 Some(a) => format!(
-                    "Cycle Start's first moves retract Z, then turn A alone back to {}° for this tool run.",
+                    "Cycle Start's first moves retract Z, then turn A alone back to {}° for this tool run. It turns A, so touch the new tool off with Touch off on the A reference: Set Z from reference does not relate it to the probed centreline.",
                     crate::indexed::degrees(*a)
                 ),
                 None => {
@@ -6158,6 +6159,41 @@ pub(crate) fn run_panel<'a>(
                     s.work_pos[3]
                 ),
             }));
+        }
+    }
+    // A tool run that turns A runs only with its tool touched off on the
+    // Z reference the probe touched with the centreline (LIO-207).
+    if let Some(p) =
+        (programs.get(run.next)).filter(|p| !crate::run::a_angles(&p.blocks).is_empty())
+    {
+        let o = &p.ops[0];
+        let ready = c.a_reference(&app.doc);
+        let said = match run.length.as_ref().filter(|(id, ..)| *id == o.tool_id) {
+            Some((_, d, _)) => format!(
+                "T{} is touched off on the A centreline's Z reference: its tip is {:.3} mm {} the probe's, and its work Z is on the centreline.",
+                o.tool,
+                d.abs(),
+                if *d >= 0. { "under" } else { "over" }
+            ),
+            None => format!(
+                "T{} {}: with it in the spindle, jog over the Z reference the probe touched with the A centreline, put the touch plate on it and press Touch off on the A reference. That sets its work Z on the centreline, whatever its length.",
+                o.tool, o.tool_name
+            ),
+        };
+        body = body.push(
+            row![
+                act(
+                    "Touch off on the A reference",
+                    msg(ready.is_ok() && !running, R::ProbeCentreReference),
+                    false
+                ),
+                muted(said),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        if let (Err(why), false) = (&ready, running) {
+            body = body.push(muted(why.clone()));
         }
     }
     if count > 1 {
@@ -6871,8 +6907,15 @@ fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Messag
         probe(Calibrate::Alignment),
         probe(Calibrate::AZero),
         act(
+            "Touch the Z reference",
+            c.centre_reference_blocked()
+                .is_none()
+                .then_some(Message::Machine(Action::TouchCentreReference)),
+            false
+        ),
+        act(
             "Save the centreline",
-            (idle && c.centre.is_some() && !c.centre_saved)
+            (idle && c.centre.is_some_and(|x| x.reference.is_some()) && !c.centre_saved)
                 .then_some(Message::Machine(Action::SaveCentreline)),
             false
         ),
@@ -6891,6 +6934,9 @@ fn rotary_panel<'a>(c: &crate::control::Connection) -> Option<Element<'a, Messag
         },
     };
     let mut col = column![state, fields, buttons, muted(how)].spacing(8);
+    if c.centre.is_some_and(|x| x.reference.is_none()) && idle {
+        col = col.push(muted(crate::control::NO_CENTRE_REFERENCE));
+    }
     if let Some((ok, said)) = &c.rotary_said {
         col = col.push(
             text(said.clone())

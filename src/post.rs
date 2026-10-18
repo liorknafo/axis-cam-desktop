@@ -2674,8 +2674,22 @@ pub(crate) fn a_axis_note(doc: &Document, si: usize) -> Option<String> {
                     "measured, but it went {why}: probe it again with Rotary A on the Control page before running this program"
                 ),
             };
+            // Its Z is the probe's tip's (LIO-207): a tool's is its own.
+            let tip = match u.reference {
+                _ if doc.centre_mark(m) != crate::control::MEASURED => String::new(),
+                Some(r) => format!(
+                    " Z is the probe's tip's: set each tool's Z0 that much over the Z reference the probe touched at machine X{} Y{} Z{}, touching the tool off there.",
+                    exact_mm(r[0]),
+                    exact_mm(r[1]),
+                    exact_mm(r[2])
+                ),
+                None => {
+                    " Z is the probe's tip's: set each tool's Z0 by its length against the probe's."
+                        .into()
+                }
+            };
             format!(
-                "The A centreline is at machine Y{} Z{} mm, {how}.",
+                "The A centreline is at machine Y{} Z{} mm, {how}.{tip}",
                 exact_mm(u.centre_y),
                 exact_mm(u.centre_z)
             )
