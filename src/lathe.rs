@@ -62,6 +62,9 @@ pub const TOOLS: [&str; 5] = [
 
 /// Why a strategy other than Turn and Drill is dimmed on a lathe setup.
 pub const ONLY_TURN: &str = "The lathe turns and drills on the centre.";
+/// Why a lathe's Drill refuses Helical milling (a copied operation's).
+pub const HELICAL_ON_LATHE: &str =
+    "The lathe drills on the centre: Helical milling is for a mill. Choose another drilling cycle.";
 /// Why Turn is dimmed, and refused, on a setup of a mill.
 pub const TURN_ON_MILL: &str = "Turn runs on a lathe.";
 /// What a lathe Drill without a hole selection says when it is given one.

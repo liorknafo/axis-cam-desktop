@@ -1294,6 +1294,8 @@ impl Operation {
                             .into(),
                     )
                 }
+            } else if self.helical() && crate::lathe::is_lathe(m) {
+                // Its own issue below: the tool is not what is wrong.
             } else if self.helical() && get(&t.p, "type") != "Flat end mill" {
                 e.push("Choose a flat end mill for Helical milling.".into())
             } else if self.strategy == Strategy::Drill
@@ -1371,6 +1373,9 @@ impl Operation {
         if s == Strategy::Drill {
             if manual::is_manual(m) && self.helical() {
                 e.push(manual::HELICAL_ON_MANUAL.into())
+            }
+            if crate::lathe::is_lathe(m) && self.helical() {
+                e.push(crate::lathe::HELICAL_ON_LATHE.into())
             }
             if self.helical() {
                 positive(&self.p, "stepdown", &mut e);
@@ -2949,6 +2954,13 @@ mod tests {
             o.issues(&manual, &tools, &[])
                 .contains(&crate::manual::HELICAL_ON_MANUAL.to_string())
         );
+        // A lathe drills on the centre (a Drill copied from a mill): the
+        // cycle is what is wrong, whatever the tool.
+        let lathe = crate::lathe::defaults();
+        for tool in [&drill, &mill] {
+            o.tool = tool.id.clone();
+            assert_eq!(only(&o, &lathe), [crate::lathe::HELICAL_ON_LATHE]);
+        }
     }
     #[test]
     fn incompatible_pick_ignored() {

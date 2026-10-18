@@ -554,7 +554,8 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("name") | None => {
             return if issue.contains("feature or surface") {
                 Some("Geometry")
-            } else if issue == manual::HELICAL_ON_MANUAL {
+            } else if issue == manual::HELICAL_ON_MANUAL || issue == crate::lathe::HELICAL_ON_LATHE
+            {
                 Some("Cycle")
             } else if issue.starts_with("Choose a tool")
                 || issue.starts_with("Choose a drill")
@@ -2871,8 +2872,9 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             ));
         }
         "Cycle" => {
-            // A lathe drills on its axis: it does not mill holes.
-            let cycles = if lathe {
+            // A lathe drills on its axis, and a drill drills the pin holes:
+            // neither mills holes.
+            let cycles = if lathe || o.drills_pin_holes() {
                 &DRILL_CYCLES[..4]
             } else {
                 &DRILL_CYCLES[..]
@@ -9833,6 +9835,10 @@ mod tests {
         );
         assert_eq!(
             super::operation_issue_tab(Strategy::Drill, crate::manual::HELICAL_ON_MANUAL),
+            Some("Cycle")
+        );
+        assert_eq!(
+            super::operation_issue_tab(Strategy::Drill, crate::lathe::HELICAL_ON_LATHE),
             Some("Cycle")
         );
         assert_eq!(
