@@ -12,8 +12,8 @@ use crate::{
 };
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, difference, intersect, union};
 
-type Polygon = Vec<(f64, f64)>;
-type Region = Paths<Milli>;
+pub(crate) type Polygon = Vec<(f64, f64)>;
+pub(crate) type Region = Paths<Milli>;
 /// A loop to cut and, when the tool reaches it at depth from the loop
 /// before, the points it feeds through to its start (`step`).
 type Loop = (Polygon, Option<Vec<(f64, f64)>>);
@@ -24,12 +24,12 @@ type Planned = (Vec<Vec<Polygon>>, Vec<Polygon>, f32, f32, bool);
 const MAX_MOVES: usize = 30_000;
 /// How far above the level before, mm, a loop's rapid descent stops below
 /// the first level.
-const ENTRY: f32 = 0.5;
+pub(crate) const ENTRY: f32 = 0.5;
 /// The most times a profile ramp goes round its loop; a shorter loop plunges.
 const RAMP_LAPS: f32 = 10.;
 /// `RAMP_LAPS` in what earlier cuts left.
 const REST_RAMP_LAPS: f32 = 2.;
-fn area(p: &Polygon) -> f64 {
+pub(crate) fn area(p: &Polygon) -> f64 {
     p.iter()
         .zip(p.iter().cycle().skip(1))
         .take(p.len())
@@ -50,7 +50,7 @@ fn positive(tool: &Tool, key: &str) -> Result<f32, String> {
         .ok_or_else(|| format!("Enter a positive tool {key}."))
 }
 /// Clip a triangle to the half-space above the floor before projecting it.
-fn above(points: &[[f32; 3]], z: f32) -> Polygon {
+pub(crate) fn above(points: &[[f32; 3]], z: f32) -> Polygon {
     let mut result = Vec::new();
     for (a, b) in points
         .iter()
@@ -71,7 +71,7 @@ fn above(points: &[[f32; 3]], z: f32) -> Polygon {
     result
 }
 /// Whether `p` is inside `region` (even-odd over all its paths).
-fn inside(region: &[Polygon], p: (f64, f64)) -> bool {
+pub(crate) fn inside(region: &[Polygon], p: (f64, f64)) -> bool {
     let mut odd = false;
     for path in region {
         for (a, b) in path
@@ -87,7 +87,16 @@ fn inside(region: &[Polygon], p: (f64, f64)) -> bool {
     odd
 }
 /// Whether the segment `a`–`b` crosses or touches an edge of `region`.
-fn crosses(region: &[Polygon], a: (f64, f64), b: (f64, f64)) -> bool {
+pub(crate) fn crosses(region: &[Polygon], a: (f64, f64), b: (f64, f64)) -> bool {
+    region.iter().any(|path| {
+        path.iter()
+            .zip(path.iter().cycle().skip(1))
+            .take(path.len())
+            .any(|(&c, &d)| meets(a, b, c, d))
+    })
+}
+/// Whether the segments `a`–`b` and `c`–`d` cross or touch.
+pub(crate) fn meets(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
     let turn = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
         (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
     };
@@ -95,24 +104,17 @@ fn crosses(region: &[Polygon], a: (f64, f64), b: (f64, f64)) -> bool {
     let between = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
         r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
     };
-    region.iter().any(|path| {
-        path.iter()
-            .zip(path.iter().cycle().skip(1))
-            .take(path.len())
-            .any(|(&c, &d)| {
-                let (d1, d2) = (turn(c, d, a), turn(c, d, b));
-                let (d3, d4) = (turn(a, b, c), turn(a, b, d));
-                (d1 * d2 < 0. && d3 * d4 < 0.)
-                    || (d1 == 0. && between(c, d, a))
-                    || (d2 == 0. && between(c, d, b))
-                    || (d3 == 0. && between(a, b, c))
-                    || (d4 == 0. && between(a, b, d))
-            })
-    })
+    let (d1, d2) = (turn(c, d, a), turn(c, d, b));
+    let (d3, d4) = (turn(a, b, c), turn(a, b, d));
+    (d1 * d2 < 0. && d3 * d4 < 0.)
+        || (d1 == 0. && between(c, d, a))
+        || (d2 == 0. && between(c, d, b))
+        || (d3 == 0. && between(a, b, c))
+        || (d4 == 0. && between(a, b, d))
 }
 /// The point of the closed `path` nearest `p`: its distance, the point, and
 /// the edge it lies on (from vertex `edge` to the next).
-fn nearest(path: &[(f64, f64)], p: (f64, f64)) -> (f64, (f64, f64), usize) {
+pub(crate) fn nearest(path: &[(f64, f64)], p: (f64, f64)) -> (f64, (f64, f64), usize) {
     let n = path.len();
     let mut best = (f64::INFINITY, p, 0);
     for i in 0..n {
@@ -133,7 +135,7 @@ fn nearest(path: &[(f64, f64)], p: (f64, f64)) -> (f64, (f64, f64), usize) {
     best
 }
 /// The closed `path` begun at `at`, a point on its edge `edge`.
-fn begun(path: &[(f64, f64)], at: (f64, f64), edge: usize) -> Polygon {
+pub(crate) fn begun(path: &[(f64, f64)], at: (f64, f64), edge: usize) -> Polygon {
     let n = path.len();
     let mut out = vec![at];
     out.extend((1..=n).map(|k| path[(edge + k) % n]));
@@ -590,7 +592,7 @@ fn outline(region: &Region) -> Region {
     )
 }
 /// The box the tool sweeps with its centre in `centres`, at every height.
-fn envelope(centres: &Region, radius: f32) -> crate::mesh::Bounds {
+pub(crate) fn envelope(centres: &Region, radius: f32) -> crate::mesh::Bounds {
     let mut b = crate::mesh::Bounds {
         min: [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY],
         max: [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY],
@@ -605,7 +607,7 @@ fn envelope(centres: &Region, radius: f32) -> crate::mesh::Bounds {
     b
 }
 /// Where a pocket's tool centre may go.
-enum Centres {
+pub(crate) enum Centres {
     /// Within `reach` of `area` and `keepout` from `above`: offset by `d`,
     /// `area` grown by `reach - d` less `above` grown by `keepout + d`, each
     /// ring built from the outlines themselves as a single offset would be.
@@ -619,7 +621,7 @@ enum Centres {
 }
 impl Centres {
     /// The centres at least `d` inside these.
-    fn at(&self, d: f64) -> Result<Region, String> {
+    pub(crate) fn at(&self, d: f64) -> Result<Region, String> {
         let grown = |r: &Region, by: f64| r.inflate(by, JoinType::Round, EndType::Polygon, 2.);
         Ok(match self {
             Centres::Floor {
@@ -659,10 +661,10 @@ fn components(region: &Region) -> Vec<Region> {
 }
 /// One region a pocket clears: where the tool centre may go, from the
 /// height its material starts at down to its target.
-struct Zone {
-    centres: Centres,
-    top: f32,
-    target: f32,
+pub(crate) struct Zone {
+    pub(crate) centres: Centres,
+    pub(crate) top: f32,
+    pub(crate) target: f32,
 }
 /// The part of `centres` within the tool's reach of material that earlier
 /// cuts did not provably remove between `low` and `high`: the tool goes
@@ -707,10 +709,79 @@ fn remaining(
     .map_err(|e| e.to_string())
 }
 
+/// What a selected pocket floor gives the motion that clears it: Pocket's
+/// offset loops, an inside Contour's profile and Adaptive clearing's walk
+/// all go through the same zones within the same limits.
+pub(crate) struct Job {
+    /// Each floor, highest first, then each opening cut through.
+    pub(crate) zones: Vec<Zone>,
+    pub(crate) stock: crate::mesh::Bounds,
+    pub(crate) scale: f32,
+    /// The original stock top, mm: clearance and retract are above it.
+    pub(crate) top: f32,
+    pub(crate) radius: f32,
+    pub(crate) flute_length: f32,
+    pub(crate) tool_length: f32,
+    pub(crate) holder_radius: f32,
+    pub(crate) feed: f32,
+    pub(crate) stepdown: f32,
+    pub(crate) clearance: f32,
+    pub(crate) retract: f32,
+    /// The small conservative margin each zone's centres keep from its walls.
+    pub(crate) margin: f32,
+}
+/// The height `zone` starts cutting at, its tool of `radius` over
+/// `centres`: below what earlier cuts cleared, plus a positive Top offset
+/// where the zone starts at the stock top (`top`).
+pub(crate) fn zone_start(
+    setup: &Setup,
+    op: &Operation,
+    top: f32,
+    radius: f32,
+    zone: &Zone,
+    centres: &Region,
+) -> f32 {
+    let offset = num(&op.p, "top").unwrap_or(0.);
+    crate::rest::start(
+        setup,
+        envelope(centres, radius),
+        zone.target,
+        zone.top,
+        if zone.top == top { offset } else { 0. },
+    )
+}
 pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
+    let job = job(setup, op, tool, mesh)?;
+    finish_plan(setup, op, job)
+}
+/// The zones and limits of `op`'s selected floor (`Job`), checked.
+pub(crate) fn job(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Job, String> {
+    let adaptive = op.strategy == Strategy::Adaptive;
+    // Adaptive clearing shares these checks; its messages name it.
+    let named = |e: String| {
+        if adaptive {
+            e.replace("Pocket preview", "Adaptive clearing")
+        } else {
+            e
+        }
+    };
     if !op.enabled {
-        return Err("Enable this Pocket operation before simulation.".into());
+        return Err(if adaptive {
+            "Enable this Adaptive clearing operation before simulation."
+        } else {
+            "Enable this Pocket operation before simulation."
+        }
+        .into());
     }
+    floor_job(setup, op, tool, mesh, adaptive).map_err(named)
+}
+fn floor_job(
+    setup: &Setup,
+    op: &Operation,
+    tool: &Tool,
+    mesh: &Mesh,
+    adaptive: bool,
+) -> Result<Job, String> {
     if let Some(issue) = pocket_setting_issues(&op.p).first() {
         return Err(issue.clone());
     }
@@ -788,34 +859,28 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let holder_radius = positive(tool, "holder")? / 2.;
     let feed = number(op, "feed")?;
     let stepdown = number(op, "stepdown")?;
-    let stepover = number(op, "stepover")? / 100. * radius * 2.;
-    if feed <= 0.
-        || stepdown <= 0.
-        || stepdown > flute_length
-        || stepover <= 0.
-        || stepover > radius
-    {
-        return Err("Use positive feed/step sizes, stepdown within flute length, and Pocket stepover up to 50% for overlapping offset contours.".into());
+    if adaptive {
+        if feed <= 0. || stepdown <= 0. || stepdown > flute_length {
+            return Err(
+                "Use a positive feed and a positive stepdown within the flute length.".into(),
+            );
+        }
+    } else {
+        let stepover = number(op, "stepover")? / 100. * radius * 2.;
+        if feed <= 0.
+            || stepdown <= 0.
+            || stepdown > flute_length
+            || stepover <= 0.
+            || stepover > radius
+        {
+            return Err("Use positive feed/step sizes, stepdown within flute length, and Pocket stepover up to 50% for overlapping offset contours.".into());
+        }
     }
     let clearance = top + number(op, "clearance")?;
     let retract = top + number(op, "retract")?;
     if retract <= top || clearance < retract {
         return Err("Set positive retract and clearance at or above retract.".into());
     }
-    let finish = number(op, "finish_passes")?;
-    if !(0. ..=20.).contains(&finish) || finish.fract() != 0. {
-        return Err("Finishing passes must be a whole number from 0 to 20.".into());
-    }
-    let ramp = pocket_setting(&op.p, "pocket_entry") == "Profile ramp";
-    let ramp_slope = if ramp {
-        let angle = number(op, "ramp_angle")?;
-        if !(0.1..=15.).contains(&angle) {
-            return Err("Pocket profile ramp angle must be between 0.1° and 15°.".into());
-        }
-        angle.to_radians().tan()
-    } else {
-        0.
-    };
     let profile_only = op.strategy == Strategy::Contour;
     // A small conservative margin covers integer rounding and offset arc chords.
     let margin = (radius * 0.01).max(0.02);
@@ -898,18 +963,59 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if tool_length < flute_length || top - deepest >= tool_length {
         return Err("Pocket depth must be less than tool stickout, with stickout at least the flute length. Choose a tool with adequate reach.".into());
     }
-    let offset = number(op, "top")?;
+    number(op, "top")?;
+    Ok(Job {
+        zones,
+        stock: stock.stock,
+        scale,
+        top,
+        radius,
+        flute_length,
+        tool_length,
+        holder_radius,
+        feed,
+        stepdown,
+        clearance,
+        retract,
+        margin,
+    })
+}
+/// Pocket's and an inside Contour's offset loops through `job`'s zones.
+fn finish_plan(setup: &Setup, op: &Operation, job: Job) -> Result<Plan, String> {
+    let finish = number(op, "finish_passes")?;
+    if !(0. ..=20.).contains(&finish) || finish.fract() != 0. {
+        return Err("Finishing passes must be a whole number from 0 to 20.".into());
+    }
+    let ramp = pocket_setting(&op.p, "pocket_entry") == "Profile ramp";
+    let ramp_slope = if ramp {
+        let angle = number(op, "ramp_angle")?;
+        if !(0.1..=15.).contains(&angle) {
+            return Err("Pocket profile ramp angle must be between 0.1° and 15°.".into());
+        }
+        angle.to_radians().tan()
+    } else {
+        0.
+    };
+    let profile_only = op.strategy == Strategy::Contour;
+    let Job {
+        zones,
+        stock,
+        scale,
+        top,
+        radius,
+        flute_length,
+        tool_length,
+        holder_radius,
+        feed,
+        stepdown,
+        clearance,
+        retract,
+        margin,
+    } = job;
+    let stepover = number(op, "stepover")? / 100. * radius * 2.;
     let rest = setup.preview_remaining.as_deref();
     // Each zone's offset loops, outermost first, and its first cutting height.
-    let start = |zone: &Zone, centres: &Region| {
-        crate::rest::start(
-            setup,
-            envelope(centres, radius),
-            zone.target,
-            zone.top,
-            if zone.top == top { offset } else { 0. },
-        )
-    };
+    let start = |zone: &Zone, centres: &Region| zone_start(setup, op, top, radius, zone, centres);
     // Each zone only where earlier cuts left material between its heights;
     // where they left none anywhere, the whole pocket, as without them.
     let mut left = vec![];
@@ -996,7 +1102,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         operation: op.id.clone(),
         setup: setup.id.clone(),
         moves: vec![],
-        stock: stock.stock,
+        stock,
         radius,
         flute_length,
         tool_length,

@@ -1,3 +1,4 @@
+mod adaptive;
 mod analysis;
 mod cam;
 mod choice_diagram;
@@ -1908,7 +1909,8 @@ impl App {
         self.selected
             .and_then(|i| {
                 self.doc.setup().operations.get(i).map(|o| {
-                    let mut issues = o.issues(
+                    let mut issues = o.issues_in(
+                        self.is_sample(),
                         &self.doc.setup().machine,
                         &self.doc.tools,
                         &self.doc.setup().operations[..i],
@@ -3205,6 +3207,21 @@ impl App {
                 }
                 if !self.is_sample() {
                     operation.geometry.clear();
+                }
+                // Adaptive clearing starts sized to its cutter: a load of
+                // 15 % of its diameter and a stepdown of two diameters,
+                // within its flutes.
+                if strategy == Strategy::Adaptive && !self.is_sample() {
+                    if let Some(d) = num(&tool.p, "diameter").filter(|d| *d > 0.) {
+                        let load = ((d * 0.15 / 0.05).round() * 0.05).max(0.05);
+                        let flutes = num(&tool.p, "length").unwrap_or(2. * d);
+                        operation
+                            .p
+                            .insert("optimal_load".into(), format!("{load:.2}"));
+                        operation
+                            .p
+                            .insert("stepdown".into(), format!("{:.1}", (2. * d).min(flutes)));
+                    }
                 }
                 self.doc.setup_mut().operations.push(operation);
                 self.selected = Some(self.doc.setup().operations.len() - 1);

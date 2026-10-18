@@ -3920,6 +3920,69 @@ flood = { pin = 8 }
         render_png(&a, tall, &out.join("8-pin-holes-milled-close.png"));
     }
 
+    /// The example block's pocket cleared adaptively, its editor tabs and
+    /// the stock it leaves drawn to $AXIS_RENDER_DIR (/tmp/adaptive-renders):
+    /// for looking at, with --ignored.
+    #[test]
+    #[ignore]
+    fn render_an_adaptive_clearing() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/adaptive-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            op.strategy = Strategy::Adaptive;
+            op.p.insert("name".into(), Strategy::Adaptive.name().into());
+            op.p.insert("optimal_load".into(), "1.5".into());
+            op.p.insert("stepdown".into(), "12".into());
+            op.p.insert("feed".into(), "1500".into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let size = iced::Size::new(1600., 1100.);
+        for tab in ["Geometry", "Heights", "Passes", "Linking"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            let _ = a.view();
+            render_png(
+                &a,
+                size,
+                &out.join(format!("tab-{}.png", tab.to_lowercase())),
+            );
+        }
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        // The stock surface, built in line rather than in the background.
+        let mesh = |a: &mut App| {
+            a.stock_mesh_job = None;
+            let key = a.stock_mesh_key().expect("a simulation with stock");
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let snapshot = crate::stock_surface::Snapshot {
+                bounds: volume.bounds,
+                frame: volume.frame,
+                cuts: volume.cuts.clone(),
+                detail: a.stock_detail,
+            };
+            let seconds = sim.seconds;
+            let result = snapshot.build().map(std::sync::Arc::new);
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        for (at, name) in [(0.5, "halfway.png"), (1., "done.png")] {
+            let _ = a.update(Message::Scrub(at));
+            mesh(&mut a);
+            render_png(&a, size, &out.join(name));
+        }
+        eprintln!("{}", a.status);
+    }
+
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/fp-renders) for a look: the Machine library's pins, the flipped
     /// setup's Work zero step before and after its holes are chosen for the
@@ -11199,7 +11262,7 @@ flood = { pin = 8 }
         assert!(a.playing);
         let _ = a.update(Message::Tab("Geometry".into()));
         assert!(!a.playing && a.simulation.is_none());
-        let _ = a.update(Message::AddOp(Strategy::Adaptive));
+        let _ = a.update(Message::AddOp(Strategy::Scallop));
         let _ = a.update(Message::Play);
         assert!(!a.playing && !a.playback_ready() && a.selected.is_none());
         assert_eq!(a.page, Page::Audit);
@@ -11580,7 +11643,7 @@ flood = { pin = 8 }
                 .all(|o| o.geometry.is_empty() && o.surfaces.is_none())
         );
         let count = a.doc.setup().operations.len();
-        let _ = a.update(Message::AddOp(Strategy::Adaptive));
+        let _ = a.update(Message::AddOp(Strategy::Scallop));
         assert_eq!(a.doc.setup().operations.len(), count);
         assert!(!a.picking && !a.is_sample());
         assert!(a.selected.is_none());
