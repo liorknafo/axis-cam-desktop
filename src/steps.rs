@@ -2752,6 +2752,22 @@ pub(crate) mod tests {
         send(&mut a, GuideAction::Open(0));
         assert!(a.steps_page());
     }
+    #[test]
+    fn a_cnc_machine_on_the_lathe_steps_page_shows_its_control_page_and_back() {
+        let mut a = lathe_app("Diameter", |doc| {
+            let mut m = crate::model::Machine::new(3);
+            m.p.insert("name".into(), "Router".into());
+            m.p.insert("controller".into(), "UC100".into());
+            doc.machines.push(m);
+        });
+        let id = a.doc.machines.last().unwrap().id.clone();
+        assert!(a.steps_page() && has(&a, "Router ▶"));
+        let _ = a.update(Message::ControlMachine(id));
+        assert!(!a.steps_page());
+        assert!(has(&a, "Not connected.") && has(&a, "Manual lathe steps"));
+        let _ = a.update(Message::ShowGuide);
+        assert!(a.steps_page());
+    }
     /// Draws the window's view on tiny-skia into a PNG.
     fn render(a: &App, (w, h): (u32, u32), path: &std::path::Path) {
         use iced::{

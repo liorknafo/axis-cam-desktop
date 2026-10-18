@@ -3866,8 +3866,7 @@ impl App {
                 }
             }
             Message::ControlMachine(id) => {
-                if let Some(s) = (self.doc.active_setup()).filter(|s| manual::is_manual(&s.machine))
-                {
+                if let Some(s) = (self.doc.active_setup()).filter(|s| manual::is_hand(&s.machine)) {
                     self.cnc_over_guide = Some(s.id.clone());
                 }
                 match &self.control {

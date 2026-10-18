@@ -5477,8 +5477,13 @@ fn control(app: &App) -> Element<'_, Message> {
             .style(panel_style),
         );
     }
-    if (app.doc.active_setup()).is_some_and(|s| crate::manual::is_manual(&s.machine)) {
-        left = left.push(secondary("Manual mill steps", Message::ShowGuide));
+    if let Some(s) = (app.doc.active_setup()).filter(|s| crate::manual::is_hand(&s.machine)) {
+        let steps = if crate::lathe::is_lathe(&s.machine) {
+            "Manual lathe steps"
+        } else {
+            "Manual mill steps"
+        };
+        left = left.push(secondary(steps, Message::ShowGuide));
     }
     if let Some(m) = target {
         let sim = crate::control::simulated(m);
