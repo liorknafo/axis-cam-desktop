@@ -544,7 +544,7 @@ pub enum Block {
         a: Option<f32>,
     },
     /// G0 A alone: A turns to `a` (degrees, as commanded) with X, Y and Z
-    /// still, where the tool is: after the retract that starts an indexed
+    /// still, where the tool is: over the first point of an indexed
     /// operation's tool run, or at an index move's height above all that A
     /// swings (`indexed::generate`).
     Index {
@@ -554,9 +554,10 @@ pub enum Block {
     End,
 }
 /// One program's blocks from its operations' plans. An indexed setup's
-/// moves carry A: after the retract that starts each tool run, A turns to
-/// the A of its operation's first move before the spindle starts (the A the
-/// machine is at is not known when a program starts), each index move of
+/// moves carry A: after the retract that starts each tool run, its spindle
+/// start and the rapid across over its operation's first point, A turns to
+/// the A of that operation's first move before the tool comes down (the A
+/// the machine is at is not known when a program starts), each index move of
 /// the plans turns A alone, and after the last retract A turns back to A0.
 /// A move whose A differs from the last turn's keeps its A, for the checks
 /// to refuse.
@@ -591,10 +592,6 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
         if change {
             // The new tool's tip (after G43 or a manual touch-off) goes to a safe height first.
             out.push(Block::Retract);
-            if let Some(a) = plan.moves[0].a.filter(|a| a_now != Some(*a)) {
-                out.push(Block::Index { op: k, a });
-                a_now = Some(a);
-            }
         }
         out.push(Block::Run {
             op: k,
@@ -611,6 +608,13 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 op: k,
                 xy: [first[0], first[1]],
             });
+            // A turns with the tool over the operation's first point, where
+            // its index height clears what A swings under it
+            // (`Document::index_height`), never where the tool was left.
+            if let Some(a) = plan.moves[0].a.filter(|a| a_now != Some(*a)) {
+                out.push(Block::Index { op: k, a });
+                a_now = Some(a);
+            }
             out.push(Block::Descend {
                 op: k,
                 xy: [first[0], first[1]],
@@ -650,7 +654,7 @@ pub fn blocks(ops: &[OpState], plans: &[&Plan], settings: &PostSettings) -> Vec<
                 Motion::Feed => Kind::Feed,
                 Motion::Dwell => Kind::Dwell,
                 // A alone, where the tool is: nothing when A is there
-                // already (the turn after the retract made it).
+                // already (the turn over its first point made it).
                 Motion::Index if m.from == m.to => {
                     if let Some(a) = m.a.filter(|a| a_now != Some(*a)) {
                         out.push(Block::Index { op: k, a });
@@ -2220,6 +2224,25 @@ struct Walk<'a> {
     /// the spindle nose over its holder (LIO-204).
     tools: Vec<(Vec<crate::holding::Part>, String)>,
 }
+/// The parts of tool `id` that made `plan` of `setup` as the workholding
+/// checks and the index height (`Document::index_height`) take it, and what
+/// of it is assumed: in a chuck, with the spindle nose over its holder
+/// (LIO-204), else the cutter and the holder.
+pub(crate) fn tool_parts(
+    doc: &Document,
+    setup: &Setup,
+    id: &str,
+    plan: &Plan,
+) -> (Vec<crate::holding::Part>, String) {
+    if crate::chuck::holds(setup) {
+        use crate::chuck::ToolParts;
+        let unit = doc.rotary_unit(&setup.machine);
+        let (tool, assumed) = crate::rotary_check::in_spindle(doc, id, plan, unit);
+        return (tool.parts(), assumed);
+    }
+    let parts = crate::holding::parts(plan.radius, plan.tool_length, plan.holder_radius);
+    (parts.to_vec(), String::new())
+}
 /// How a setup's machine turns into post settings: `PostSettings::from_machine`
 /// for G-code export, `PostSettings::for_uc100` for a UC100 run.
 pub(crate) type Settings = fn(&Machine) -> Result<PostSettings, Vec<String>>;
@@ -2287,22 +2310,8 @@ fn walk<'a>(
         }
     }
     let indexes: Vec<usize> = sims.iter().map(|(oi, _)| *oi).collect();
-    let unit = doc.rotary_unit(&setup.machine);
     let tools = (simulations.iter().zip(&indexes))
-        .map(|(sim, &oi)| {
-            let p = &sim.plan;
-            match crate::chuck::holds(setup) {
-                true => {
-                    use crate::chuck::ToolParts;
-                    let (tool, assumed) = crate::rotary_check::in_spindle(doc, setup, oi, p, unit);
-                    (tool.parts(), assumed)
-                }
-                false => {
-                    let parts = crate::holding::parts(p.radius, p.tool_length, p.holder_radius);
-                    (parts.to_vec(), String::new())
-                }
-            }
-        })
+        .map(|(sim, &oi)| tool_parts(doc, setup, &setup.operations[oi].tool, &sim.plan))
         .collect();
     Ok(Walk {
         settings,
@@ -2455,11 +2464,12 @@ fn pushed(doc: &Document, si: usize, walk: &Walk, held: crate::holding::Gripped)
 }
 /// Where indexed program `blocks` of setup `si` turn A (`Block::Index`):
 /// each turn with the tool tip at or above its operation's index height
-/// (`Document::swing`: the A centreline, the farthest that A swings reaches
-/// from it and the operation's clearance), where nothing A swings reaches
-/// the tool, whatever A the machine is at when the program starts. The
-/// program is made of `walk`'s operations `range`. Plan Z, said in work
-/// coordinates.
+/// (`Document::index_height`: over what A swings under the tool where the
+/// operation keeps it, `indexed::cut_span`, and wherever the tool is when
+/// A turns; anywhere along A when that is not known), where nothing A
+/// swings reaches the tool, whatever A the machine is at when the program
+/// starts. The program is made of `walk`'s operations `range`. Plan Z,
+/// said in work coordinates.
 fn index_problems(
     doc: &Document,
     mesh: &Mesh,
@@ -2479,20 +2489,32 @@ fn index_problems(
         plane
     };
     let mut tip: Option<f32> = None;
+    // The tool tip's X; None until the program moves it.
+    let mut x: Option<f32> = None;
     let mut out = vec![];
     for block in blocks {
         match block {
-            Block::Retract | Block::Approach { .. } => tip = Some(retract),
-            Block::Descend { z, .. } => tip = Some(*z),
-            Block::Move { kind, to, .. } if *kind != Kind::Dwell => tip = Some(to[2]),
+            Block::Retract => tip = Some(retract),
+            Block::Approach { xy, .. } => (tip, x) = (Some(retract), Some(xy[0])),
+            Block::Descend { z, xy, .. } => (tip, x) = (Some(*z), Some(xy[0])),
+            Block::Move { kind, to, .. } if *kind != Kind::Dwell => {
+                (tip, x) = (Some(to[2]), Some(to[0]))
+            }
             Block::Index { op, a } => {
                 let name = &ops[*op].name;
+                let k = range.start + *op;
+                let plan = &walk.simulations[k].plan;
+                let over = x
+                    .zip(crate::indexed::cut_span([&plan.moves[..]]))
+                    .map(|(x, [lo, hi])| [lo.min(x), hi.max(x)]);
                 let swing = setup
                     .operations
                     .get(indexes[*op])
                     .ok_or_else(|| "The operation was removed.".to_string())
                     .and_then(|o| crate::cam::number(o, "clearance"))
-                    .and_then(|clearance| doc.swing(si, mesh, clearance));
+                    .and_then(|clearance| {
+                        doc.index_height(si, mesh, clearance, over, &walk.tools[k].0)
+                    });
                 let problem = match (swing, tip) {
                     (Err(e), _) => Some(format!("{name}: {e}")),
                     (Ok(s), Some(z)) if z >= s.z - EPS_INDEX => None,
@@ -2696,7 +2718,7 @@ pub(crate) fn a_axis_note(doc: &Document, si: usize) -> Option<String> {
         }
     };
     Some(format!(
-        "indexed to {angles} degrees in the clamping of setup {}; {sense}. Each turn is G0 A alone, X Y Z still, with the tool above all that A swings, and the program ends back at A0; no move turns A. {centre} {zero}.",
+        "indexed to {angles} degrees in the clamping of setup {}; {sense}. Each turn is G0 A alone, X Y Z still, with the tool above what A swings under it, and the program ends back at A0; no move turns A. {centre} {zero}.",
         base + 1
     ))
 }
@@ -4009,8 +4031,8 @@ M2
 (Machine: Rotary Mill v1)
 (Work zero: Stock top center in G54, as the setup this one indexes from set it. Do not touch it off again: A has turned the stock.)
 (Stock: 20.000 x 20.000 x 10.000 mm. Part rotation X0 Y0 Z0 deg.)
-(A axis: indexed to A90 degrees in the clamping of setup 1; positive A turns +Y up to +Z, the right-hand rule about +X. Each turn is G0 A alone, X Y Z still, with the tool above all that A swings, and)
-(A axis, continued: the program ends back at A0; no move turns A. The A centreline is at machine Y140 Z-40 mm, assumed, not measured: probe it with Rotary A on the Control page before running this)
+(A axis: indexed to A90 degrees in the clamping of setup 1; positive A turns +Y up to +Z, the right-hand rule about +X. Each turn is G0 A alone, X Y Z still, with the tool above what A swings under it,)
+(A axis, continued: and the program ends back at A0; no move turns A. The A centreline is at machine Y140 Z-40 mm, assumed, not measured: probe it with Rotary A on the Control page before running this)
 (A axis, continued: program. A0 is where Find A zero on a flat set it, with Rotary A on the Control page.)
 (Requested fixture clearance, not checked: 15.000 mm)
 (T1: Flat end mill - D10 - diameter 10.000 mm - stickout 35.000 mm)
@@ -4025,11 +4047,11 @@ G53 G0 Z0
 T1 M6
 G43 H1
 G53 G0 Z0
-G0 A90.000
 S8000 M3
 M8
 G4 P2.000
 G0 X-15.000 Y-15.000
+G0 A90.000
 G0 Z30.000
 Z1.000
 G1 Z-1.000 F250.0
@@ -4042,7 +4064,7 @@ G0 A0.000
 M2
 ";
     #[test]
-    fn an_indexed_program_retracts_then_turns_a_alone_then_approaches_and_cuts() {
+    fn an_indexed_program_retracts_approaches_then_turns_a_alone_and_cuts() {
         let plan = indexed_plan(&AT_A90);
         let (text, blocks, settings) = indexed_program(&plan);
         assert_eq!(text, INDEXED_GOLDEN);

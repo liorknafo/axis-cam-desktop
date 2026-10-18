@@ -19,7 +19,7 @@ use crate::holding::{Hit, message, plane_message};
 use crate::indexed::{angles, degrees, is_indexed};
 use crate::mesh::Mesh;
 use crate::model::{
-    Document, HOLDER_LENGTH, Machine, NOSE_DEFAULT, POST_RETRACT, RotaryUnit, Setup, get, num,
+    Document, HOLDER_LENGTH, Machine, NOSE_DEFAULT, POST_RETRACT, RotaryUnit, get, num,
     post_setting,
 };
 use crate::post::Held;
@@ -50,13 +50,11 @@ fn mm(v: f32) -> String {
 /// ending a message ("" when nothing is).
 pub(crate) fn in_spindle(
     doc: &Document,
-    setup: &Setup,
-    oi: usize,
+    id: &str,
     plan: &Plan,
     unit: Option<RotaryUnit>,
 ) -> (InSpindle, String) {
-    let id = &setup.operations[oi].tool;
-    let (holder_length, holder_assumed) = (doc.tools.iter().find(|t| &t.id == id))
+    let (holder_length, holder_assumed) = (doc.tools.iter().find(|t| t.id == id))
         .map_or((HOLDER_LENGTH, true), crate::model::Tool::holder_length);
     let (nose, nose_assumed) = unit.map_or((NOSE_DEFAULT[0], true), |u| {
         (u.nose_diameter, u.nose_assumed)
@@ -251,33 +249,15 @@ fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
     let name = setup.name();
     let machine = &doc.setups[base].machine;
     let mut out = vec![];
-    // Room to turn A over all it swings, with no clearance at all.
-    let swing = match doc.swing(si, mesh, 0.) {
-        Ok(swing) => Some(swing),
-        Err(e) => {
-            out.push((None, format!("{name}: {e}")));
-            None
-        }
-    };
+    // The stock and the chuck must be known to tell what A swings; how
+    // high each operation turns A is told at its own cuts below.
+    if let Err(e) = doc.swing_unchecked(si, mesh, 0.) {
+        out.push((None, format!("{name}: {e}")));
+    }
     let bar = Bar::of(doc, base, mesh);
     let words = bar.as_ref().map_or("stock".into(), |b| b.words.clone());
     let unit = doc.rotary_unit(machine);
     let travel_z = machine_mm(machine, "z");
-    if let (Some(swing), Some(unit)) = (swing, unit) {
-        let room = -swing.machine_z;
-        let least = crate::control::RETRACT_ROOM as f32;
-        if room < least {
-            out.push((None, format!(
-                "{name}: A turns all within {} mm of its centreline (the {words}, the part and the chuck's jaws at any angle), which at machine Z {} reaches machine Z {}: {} mm under the top of the machine's {} mm Z travel (Z 0), less than the {} mm a retract over it needs. There is no room to lift the tool over it between angles. Measure the A centreline (Rotary A on the Control page), or use smaller stock.",
-                mm(swing.radius),
-                mm(unit.centre_z),
-                mm(swing.machine_z),
-                mm(room),
-                mm(travel_z),
-                mm(least),
-            )));
-        }
-    }
     let first = angles(setup)
         .ok()
         .and_then(|v| v.first().copied())
@@ -327,7 +307,35 @@ fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
     {
         let op = setup.operations[oi].name();
         let plan = &sim.plan;
-        let (tool, assumed) = in_spindle(doc, setup, oi, plan, unit);
+        let (tool, assumed) = in_spindle(doc, &setup.operations[oi].tool, plan, unit);
+        // Room to turn A over what it swings under the tool where the
+        // operation keeps it, with no clearance at all, as its index moves
+        // are made (`Document::index_height`).
+        let (parts, _) = crate::post::tool_parts(doc, setup, &setup.operations[oi].tool, plan);
+        let over = crate::indexed::cut_span([&plan.moves[..]]);
+        let swing = match doc.index_height(si, mesh, 0., over, &parts) {
+            Ok(swing) => Some(swing),
+            Err(e) => {
+                out.push((Some(oi), format!("{name}, {op}: {e}")));
+                None
+            }
+        };
+        if let (Some(swing), Some(unit)) = (swing, unit) {
+            let room = -swing.machine_z;
+            let least = crate::control::RETRACT_ROOM as f32;
+            if room < least {
+                out.push((Some(oi), format!(
+                    "{name}, {op}: A turns all within {} mm of its centreline under the tool ({} that far at any angle), which at machine Z {} reaches machine Z {}: {} mm under the top of the machine's {} mm Z travel (Z 0), less than the {} mm a retract over it needs. There is no room to lift the tool over it between angles. Measure the A centreline (Rotary A on the Control page), or use smaller stock.",
+                    mm(swing.radius),
+                    swing.what,
+                    mm(unit.centre_z),
+                    mm(swing.machine_z),
+                    mm(room),
+                    mm(travel_z),
+                    mm(least),
+                )));
+            }
+        }
         // The centreline's Z is the probe's tip's: a tool longer than the
         // probe holds the spindle that much higher over the same cut
         // (LIO-207). The cut's depth comes from its touch-off on the Z
@@ -373,8 +381,12 @@ fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
             }
             keep(3, a, a);
             if m.motion == Motion::Index {
-                if let Some(s) = swing
-                    && index.is_none()
+                // Its height wherever the tool turns A, the operation's
+                // cuts and where the index move is (`post::index_problems`).
+                let at = over.map(|[lo, hi]| [lo.min(m.from[0]), hi.max(m.from[0])]);
+                if index.is_none()
+                    && swing.is_some()
+                    && let Ok(s) = doc.index_height_unchecked(si, mesh, 0., at, &parts)
                     && m.from[2] < s.z - 1e-3
                 {
                     index = Some((a_now, a, m.from[2], s));
@@ -876,7 +888,12 @@ pub fn held(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Result<Vec<H
     let m = &clamped.machine;
     let tools = sims
         .iter()
-        .map(|(oi, sim)| (*oi, in_spindle(doc, setup, *oi, &sim.plan, Some(rig.unit))))
+        .map(|(oi, sim)| {
+            (
+                *oi,
+                in_spindle(doc, &setup.operations[*oi].tool, &sim.plan, Some(rig.unit)),
+            )
+        })
         .collect();
     let walk = Walk {
         rig: &rig,
@@ -1484,32 +1501,31 @@ mod tests {
 
     #[test]
     fn too_little_room_over_what_a_swings_is_refused_with_the_numbers() {
-        // The jaws reach 55.9 mm from the centreline: a retract over them
-        // needs 5 mm under the top of the Z travel.
-        let (mut doc, mesh, _) = job("-150", "90");
-        let radius = doc.swing(1, &mesh, 0.).unwrap().radius;
-        for (centre, room) in [
-            (-(5. + radius) + 0.01, Some("4.99")),
-            (-(5. + radius) - 0.01, None),
-        ] {
+        // 80 mm out of the jaws, A swings only the Ø40 bar under the tool:
+        // a retract over its 20 mm needs 5 mm under the top of the Z travel.
+        let (mut doc, mesh, sim) = job("-150", "90");
+        let swing = crate::indexed::tests::height(&doc, &mesh, 1, &sim.plan, 0.);
+        assert_eq!((swing.what, swing.radius), ("the stock reaches", 20.));
+        for (centre, room) in [(-25. + 0.01, Some("4.99")), (-25. - 0.01, None)] {
             doc.setups[0]
                 .machine
                 .p
                 .insert("a_centre_z".into(), centre.to_string());
             doc.sync_indexed();
             // Its operation is refused when generated (15 mm of clearance
-            // over the jaws is above the Z travel): the room is said anyway.
+            // over the bar is above the Z travel): the room is said anyway.
             assert!(prepare(&doc, &mesh, 1, 0).is_err());
-            let said: Vec<String> = problems(&doc, &mesh, 1, &[])
-                .into_iter()
-                .map(|(_, m)| m)
-                .collect();
+            let said = found(&doc, &mesh, sim.clone());
+            let room_said = format!(
+                "Flats, Contour: A turns all within 20 mm of its centreline under the tool (the stock reaches that far at any angle), which at machine Z {} reaches machine Z -4.99: 4.99 mm under the top of the machine's 300 mm Z travel (Z 0), less than the 5 mm a retract over it needs.",
+                mm(centre)
+            );
             match room {
-                Some(room) => {
-                    assert_eq!(said.len(), 1, "{said:?}");
-                    assert!(said[0].starts_with(&format!("Flats: A turns all within 55.9 mm of its centreline (the Ø40 mm bar, the part and the chuck's jaws at any angle), which at machine Z {} reaches machine Z -4.99: {room} mm under the top of the machine's 300 mm Z travel (Z 0), less than the 5 mm a retract over it needs.", mm(centre))), "{said:?}");
-                }
-                None => assert!(said.is_empty(), "{said:?}"),
+                Some(_) => assert!(said.iter().any(|s| s.starts_with(&room_said)), "{said:?}"),
+                None => assert!(
+                    said.iter().all(|s| !s.contains("A turns all within")),
+                    "{said:?}"
+                ),
             }
         }
     }
@@ -1542,10 +1558,12 @@ mod tests {
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
         // At A0 alone it is generated: its retract over the bar is refused.
+        // The tool is 20 mm from the jaws, which A swings 75.66 mm out:
+        // under it A swings only the bar, which leaves no room either.
         let sim = prepare(&doc, &mesh, 1, 0).unwrap();
         let said = found(&doc, &mesh, sim);
         assert!(
-            said[0].starts_with("Flats: Index moves turn A with the tool above all that A swings: at machine Z 35.66 (the A centreline at Z -40 + 75.66 mm, as far as the chuck's jaws reach from it at any angle, + 0 mm clearance). That is 35.66 mm above the top of the machine's 55 mm Z travel (Z 0)"),
+            said[0].starts_with("Flats, Contour: A turns all within 40 mm of its centreline under the tool (the stock reaches that far at any angle), which at machine Z -40 reaches machine Z 0: 0 mm under the top of the machine's 55 mm Z travel (Z 0), less than the 5 mm a retract over it needs."),
             "{said:?}"
         );
         assert!(
@@ -1559,7 +1577,8 @@ mod tests {
         doc.sync_turns(Some(&mesh));
         let refused = prepare(&doc, &mesh, 1, 0).unwrap_err();
         assert!(
-            refused.contains("at machine Z 50.66 (the A centreline at Z -40 + 75.66 mm"),
+            refused.contains("at machine Z 15 with the tool over X")
+                && refused.contains("(the A centreline at Z -40 + 40 mm, as far as the stock reaches from it at any angle, + 15 mm clearance)"),
             "{refused}"
         );
         assert!(

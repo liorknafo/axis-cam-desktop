@@ -5016,7 +5016,8 @@ pub(crate) mod tests {
         assert!(
             shown.iter().any(
                 |l| l.starts_with("Setup 2, operation 1: Index moves turn A")
-                    && l.contains("above the top of the machine's 100 mm Z travel")
+                    && l.contains("as far as the stock reaches from it at any angle")
+                    && l.contains("1.11 mm above the top of the machine's 100 mm Z")
             ),
             "{shown:?}"
         );

@@ -1918,10 +1918,15 @@ mod tests {
             }
         }
         assert_eq!(turns, [95., 185., 5.]);
+        // Then across over the first cut at that height, A still where it
+        // was: A turns only with the tool over the operation (LIO-209).
+        assert_eq!((moves[1][2], moves[1][3]), (0., 30.));
+        assert_eq!(moves[2][..3], moves[1][..3]);
         // Every move between two turns is made at the A of the first.
-        assert!(moves[1..].iter().all(|m| [95., 185., 5.].contains(&m[3])));
-        // The turn to A90 is the index block after the tool's retract, and
-        // the second is made at the swing height, plan Z40: machine Z0.
+        assert!(moves[2..].iter().all(|m| [95., 185., 5.].contains(&m[3])));
+        // The turn to A90 is the index block after the tool's retract and
+        // its approach, and the second is made at the swing height, plan
+        // Z40: machine Z0.
         let second = actions
             .iter()
             .find(|l| matches!(l.action, Do::Move { target, .. } if target[3] == 185.))

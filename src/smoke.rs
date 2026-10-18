@@ -4010,6 +4010,121 @@ flood = { pin = 8 }
             render_element(element, iced::Size::new(900., 640.), &out.join(name));
         }
     }
+    /// LIO-209: the Ø40 bar's 4-angle job on the library CNC4030 + rotary
+    /// (55 mm of Z, the A centreline at machine Z -40, a Ø100 chuck), in
+    /// the Job view after its four angles and halfway through its last
+    /// index move, and in the machine view with the tool where A turns:
+    /// 15 mm over the bar, below the top of the Z travel, the jaws turning
+    /// beside it.
+    #[test]
+    #[ignore]
+    fn render_the_index_height_on_the_library_rotary() {
+        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/index-height-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        let mesh = prism(30.);
+        let mut doc = bar_job(
+            &mesh,
+            20.,
+            "100",
+            "-40",
+            "0, 90, 180, -90",
+            on_the_bar(&cutter("12")),
+        );
+        doc.setups[0].machine = crate::control::rotary_machine(dir.path()).unwrap();
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_indexed();
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        doc.file = Some(crate::model::ModelFile {
+            name: "square-bar.stl".into(),
+            path: dir.path().join("square-bar.stl"),
+            format: "stl".into(),
+            bytes: 0,
+        });
+        let at = doc.at_angle(1, 0., &mesh).unwrap();
+        let machine_zero = at.machine_zero.unwrap();
+        let on_machine = |p: [f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|k| p[k] - at.zero[k] + machine_zero[k])
+        };
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        a.selected = None;
+        a.stock = true;
+        a.camera.zoom = 3.;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SelectOp(0));
+        let detail = crate::stock_surface::Detail::Draft;
+        let mesh = a.part_mesh().unwrap().clone();
+        let mut sim = crate::planner::view_after(&a.doc, &mesh, 1, 0, detail).unwrap();
+        let size = iced::Size::new(1600., 1000.);
+        a.simulation = Some(sim.clone());
+        let end = crate::viewport::Camera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.,
+            zoom: 3.,
+            pan: [0., 0.],
+        };
+        let iso = a.camera;
+        let shots = |a: &mut App, name: &str| {
+            for (camera, view) in [(iso, ""), (end, "-end-on")] {
+                a.camera = camera;
+                let _ = a.view();
+                render_png(a, size, &out.join(format!("{name}{view}.png")));
+            }
+        };
+        shots(&mut a, "1-job-after-four-angles");
+        let last = (sim.plan.moves.iter())
+            .rfind(|m| m.motion == crate::simulation::Motion::Index)
+            .unwrap()
+            .clone();
+        sim.seek((last.start + last.end) / 2. / sim.plan.duration);
+        let volume = sim.volume.clone().unwrap();
+        let surface = crate::stock_surface::Snapshot {
+            bounds: volume.bounds,
+            frame: volume.frame,
+            cuts: volume.cuts.clone(),
+            round: volume.round,
+            detail,
+        }
+        .build()
+        .unwrap();
+        sim.stock_surface = Some(std::sync::Arc::new(surface));
+        sim.stock_surface_version = volume.version;
+        a.simulation = Some(sim);
+        shots(&mut a, "2-job-turning-to-a0");
+        // The machine view: the tool where A turns, the jaws at 45° and at
+        // 90° beside it.
+        let m = &a.doc.setups[0].machine;
+        let rig = crate::chuck::Rig::on_machine(m.rotary_unit().unwrap(), 1.);
+        let pos = on_machine(last.from);
+        assert!(pos[2] < 0., "{pos:?}");
+        for (angle, name) in [
+            (45., "3-machine-turning-a45.png"),
+            (90., "4-machine-a90.png"),
+        ] {
+            let view = crate::machine_view::MachineView {
+                pos,
+                known: true,
+                envelope: [[0., 0., -55.], [390., 280., 0.]],
+                assumed: false,
+                block: None,
+                zero: machine_zero,
+                rotary: Some(rig.clone()),
+                a: angle,
+            };
+            let element: iced::Element<'_, Message> = iced::widget::canvas(view)
+                .width(iced::Fill)
+                .height(iced::Fill)
+                .into();
+            render_element(element, iced::Size::new(900., 640.), &out.join(name));
+        }
+    }
     #[test]
     #[ignore]
     fn render_the_fixture_pins() {

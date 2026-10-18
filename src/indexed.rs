@@ -307,20 +307,62 @@ impl Document {
         Ok(s)
     }
     /// What an index move of setup `si` clears with `clearance` (mm, the
-    /// operation's): the farthest the stock, the part or the chuck's jaws
-    /// reach from the A centreline, at any angle, and the height above it.
-    /// Refused when that height is above the machine's Z travel: it is
-    /// never cut short to fit. For a setup that is not indexed, its own
-    /// clamping's.
+    /// operation's), with the tool anywhere along A: the farthest the
+    /// stock, the part or the chuck reaches from the A centreline, at any
+    /// angle, and the height above it (`index_height` over no span).
+    /// Refused when that height is above the machine's Z travel. For a
+    /// setup that is not indexed, its own clamping's.
     pub fn swing(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
-        let swing = self.swing_unchecked(si, mesh, clearance)?;
+        self.index_height(si, mesh, clearance, None, &[])
+    }
+    /// `swing`, though its height is above the machine's Z travel.
+    pub fn swing_unchecked(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
+        self.index_height_unchecked(si, mesh, clearance, None, &[])
+    }
+    /// The height an index move of setup `si` turns A at, with the tool
+    /// (`parts`, as `post::tool_parts` gives them; none: a point) over X
+    /// span `over` of the setup's frame (`cut_span`: where the operation
+    /// keeps the tool; None: anywhere along A) and `clearance` (mm, the
+    /// operation's): each part of the tool, its radius and the setup's gap
+    /// to either side, clears by `clearance` all that A swings under it at
+    /// any angle: the stock it starts from, the part, the chuck's body and
+    /// jaws and the tailstock's centre, each where it is along X. Over the
+    /// bar, away from the chuck, that is the bar; over the jaws, the jaws.
+    /// The export check, the run and the generated index moves all take
+    /// this height. Refused when it is above the machine's Z travel: it is
+    /// never cut short to fit.
+    pub fn index_height(
+        &self,
+        si: usize,
+        mesh: &Mesh,
+        clearance: f32,
+        over: Option<[f32; 2]>,
+        parts: &[crate::holding::Part],
+    ) -> Result<Swing, String> {
+        let swing = self.index_height_unchecked(si, mesh, clearance, over, parts)?;
         // Machine Z is zero at the top of its travel and negative down.
         if swing.machine_z > 0. {
             let clamped = &self.setups[self.index_base(si).unwrap_or(si)];
             let unit = self.rotary_unit(&clamped.machine).ok_or(NO_GEOMETRY)?;
             let travel = crate::post_check::machine_mm(&clamped.machine, "z");
+            let (place, fix) = match swing.over {
+                Some([x0, x1]) => (
+                    format!(
+                        " with the {} over X {} to {} of the setup",
+                        swing.part,
+                        mm(x0),
+                        mm(x1)
+                    ),
+                    if swing.what == JAWS {
+                        "keep the cuts farther from the jaws (more stick-out), "
+                    } else {
+                        ""
+                    },
+                ),
+                None => (String::new(), ""),
+            };
             return Err(format!(
-                "Index moves turn A with the tool above all that A swings: at machine Z {} (the A centreline at Z {} + {} mm, as far as {} from it at any angle, + {} mm clearance). That is {} mm above the top of the machine's {} mm Z travel (Z 0), so it cannot be reached and is not cut short. Measure the A centreline (Rotary A on the Control page) or reach less far from it: a smaller stock or chuck, or less clearance.",
+                "Index moves turn A with the tool above all that A swings under it: at machine Z {}{place} (the A centreline at Z {} + {} mm, as far as {} from it at any angle, + {} mm clearance). That is {} mm above the top of the machine's {} mm Z travel (Z 0), so it cannot be reached and is not cut short. Measure the A centreline (Rotary A on the Control page) or reach less far from it: {fix}a smaller stock or chuck, or less clearance.",
                 mm(swing.machine_z),
                 mm(unit.centre_z),
                 mm(swing.radius),
@@ -332,46 +374,73 @@ impl Document {
         }
         Ok(swing)
     }
-    /// `swing`, though its height is above the machine's Z travel.
-    pub fn swing_unchecked(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
+    /// `index_height`, though it is above the machine's Z travel.
+    pub fn index_height_unchecked(
+        &self,
+        si: usize,
+        mesh: &Mesh,
+        clearance: f32,
+        over: Option<[f32; 2]>,
+        parts: &[crate::holding::Part],
+    ) -> Result<Swing, String> {
         let base = self.index_base(si).unwrap_or(si);
         let clamped = self.setups.get(base).ok_or("There is no such setup.")?;
         let stock = self.setup_stock(base, Some(mesh)).ok_or(STOCK_UNKNOWN)?;
         let unit = self.rotary_unit(&clamped.machine).ok_or(NO_GEOMETRY)?;
         let axis = axis_of(stock);
         let [_, dy, dz] = stock.dimensions();
-        let mut reach = vec![("the stock reaches", dy.hypot(dz) / 2.)];
+        // What turns with A: what reaches, how far, and from X to X.
+        let along = [stock.min[0], stock.max[0]];
+        let mut reach = vec![(STOCK, dy.hypot(dz) / 2., along)];
         if crate::chuck::holds(clamped) {
             let rig = self.chuck_rig(clamped, stock)?;
             reach[0].1 = rig.outer;
-            let jaws = rig
-                .solids(0.)
-                .into_iter()
-                .filter(|(label, _, _)| label.starts_with("chuck jaw"))
-                .filter_map(|(_, _, r)| r)
-                .fold(0., f32::max);
-            reach.push(("the chuck's jaws reach", jaws));
+            for (label, prism, r) in rig.solids(0.) {
+                let what = match label.as_str() {
+                    "chuck body" => "the chuck's body reaches",
+                    l if l.starts_with("chuck jaw") => JAWS,
+                    l if l.starts_with("tailstock") => "the tailstock's centre reaches",
+                    _ => continue,
+                };
+                let (Some(r), b) = (r, prism.bounds()) else {
+                    continue;
+                };
+                reach.push((what, r, [b.min[0], b.max[0]]));
+            }
         }
         let placed = crate::stock::Placement::new(mesh, Some(clamped));
         let scale = mesh.display_scale();
-        let part = mesh
-            .faces
-            .iter()
-            .flat_map(|f| &f.points)
-            .map(|p| {
-                let q = placed.transform(*p).map(|v| v / scale);
-                (q[1] - axis[0]).hypot(q[2] - axis[1])
-            })
-            .fold(0., f32::max);
-        reach.push(("the part reaches", part));
-        let (what, radius) =
-            reach.into_iter().fold(
-                ("the stock reaches", 0.),
-                |m, r| if r.1 > m.1 { r } else { m },
-            );
+        reach.extend(mesh.faces.iter().flat_map(|f| &f.points).map(|p| {
+            let q = placed.transform(*p).map(|v| v / scale);
+            (PART, (q[1] - axis[0]).hypot(q[2] - axis[1]), [q[0], q[0]])
+        }));
+        let gap = match over {
+            Some(_) => crate::holding::gap(clamped)?,
+            None => 0.,
+        };
+        let point = [("tool", 0., 0., f32::INFINITY)];
+        let parts = if parts.is_empty() { &point[..] } else { parts };
+        // Each part needs the tip that far over the axis: what reaches
+        // farthest under it, less how far over the tip it starts.
+        let mut need = (STOCK, "tool", f32::NEG_INFINITY);
+        for &(part, r, low, _) in parts {
+            let under = over.map(|[x0, x1]| [x0 - r - gap, x1 + r + gap]);
+            for &(what, reach, [x0, x1]) in &reach {
+                if under.is_some_and(|[lo, hi]| x1 < lo || x0 > hi) {
+                    continue;
+                }
+                if reach - low > need.2 {
+                    need = (what, part, reach - low);
+                }
+            }
+        }
+        let (what, part, radius) = need;
+        let radius = radius.max(0.);
         Ok(Swing {
             radius,
             what,
+            part,
+            over,
             clearance,
             z: axis[1] + radius + clearance,
             machine_z: unit.centre_z + radius + clearance,
@@ -638,6 +707,31 @@ fn mm(v: f32) -> String {
         t => t.into(),
     }
 }
+/// What reaches from the A centreline, as the index height says it.
+const STOCK: &str = "the stock reaches";
+const PART: &str = "the part reaches";
+const JAWS: &str = "the chuck's jaws reach";
+/// The X span (the setup's frame) the tool tip is kept in from the first
+/// feed of each of `plans` on: where an operation's index moves turn A
+/// (`Document::index_height`). The moves before the first feed, the
+/// kernels' lead-in or an index move's entry, are over the cuts or left
+/// out. None without a feed.
+pub fn cut_span<'a>(
+    plans: impl IntoIterator<Item = &'a [crate::simulation::Move]>,
+) -> Option<[f32; 2]> {
+    use crate::simulation::Motion;
+    let mut span: Option<[f32; 2]> = None;
+    for moves in plans {
+        let Some(first) = moves.iter().position(|m| m.motion == Motion::Feed) else {
+            continue;
+        };
+        for x in moves[first..].iter().flat_map(|m| [m.from[0], m.to[0]]) {
+            let [lo, hi] = span.unwrap_or([x, x]);
+            span = Some([lo.min(x), hi.max(x)]);
+        }
+    }
+    span
+}
 /// Why an index move cannot be planned without the base's stock.
 const STOCK_UNKNOWN: &str =
     "The stock the setup starts from is not known: check the first setup's stock.";
@@ -650,11 +744,15 @@ pub const INDEX_RATE: f32 = 3600.;
 /// The retract of an indexed setup's index moves (`Document::swing`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Swing {
-    /// The farthest the stock, the part or the chuck's jaws reach from the
-    /// A centreline at any angle, what reaches that far, and the clearance
-    /// kept above it, mm.
+    /// How far over the A centreline the tool tip must be for what A swings
+    /// to clear the tool, at any angle: what reaches farthest under it,
+    /// less how far the part of the tool over it (`part`) is over the tip;
+    /// what reaches that far, the X span of the setup the tool is over
+    /// (None: anywhere along A), and the clearance kept above it, mm.
     pub radius: f32,
     pub what: &'static str,
+    pub part: &'static str,
+    pub over: Option<[f32; 2]>,
     pub clearance: f32,
     /// The tool tip's height while A turns: in the setup's frame, and in
     /// machine coordinates (zero at the top of the Z travel).
@@ -735,13 +833,18 @@ pub fn generate(
         turns.push((a, at.frame));
     }
     let clearance = crate::cam::number(op, "clearance")?;
-    let swing = if list.len() > 1 || (list[0] - start.a).abs() > 1e-4 {
-        doc.swing(si, mesh, clearance)?
-    } else {
-        doc.swing_unchecked(si, mesh, clearance)?
-    };
     let bi = doc.index_base(si).ok_or(NOT_INDEXED)?;
     let base = &doc.setups[bi];
+    // The height over what A swings under the tool where this operation
+    // keeps it, its holder and the spindle nose included, as the export
+    // check and the run take it.
+    let (parts_of, _) = crate::post::tool_parts(doc, setup, &tool.id, &parts[0].1);
+    let over = cut_span(parts.iter().map(|(_, p)| &p.moves[..]));
+    let swing = if list.len() > 1 || (list[0] - start.a).abs() > 1e-4 {
+        doc.index_height(si, mesh, clearance, over, &parts_of)?
+    } else {
+        doc.index_height_unchecked(si, mesh, clearance, over, &parts_of)?
+    };
     let rig = if crate::chuck::holds(base) {
         let stock = doc.setup_stock(bi, Some(mesh)).ok_or(STOCK_UNKNOWN)?;
         Some((doc.chuck_rig(base, stock)?, crate::holding::gap(base)?))
@@ -1301,6 +1404,21 @@ pub(crate) mod tests {
         v
     }
 
+    /// The height `plan` of setup `si` turns A at with `clearance`: over
+    /// what A swings under its tool where it keeps it (`index_height`).
+    pub(crate) fn height(
+        doc: &Document,
+        mesh: &Mesh,
+        si: usize,
+        plan: &crate::simulation::Plan,
+        clearance: f32,
+    ) -> Swing {
+        let (parts, _) = crate::post::tool_parts(doc, &doc.setups[si], &doc.tools[0].id, plan);
+        let over = cut_span([&plan.moves[..]]);
+        doc.index_height_unchecked(si, mesh, clearance, over, &parts)
+            .unwrap()
+    }
+
     #[test]
     fn a_flat_on_the_parts_plus_y_face_is_cut_on_top_at_a_plus_90() {
         use crate::model::{Operation, Strategy};
@@ -1552,12 +1670,18 @@ pub(crate) mod tests {
             contour(&cutter("12")),
         );
         let plan = prepare(&doc, &mesh, 1, 0).unwrap().plan;
-        // The jaws reach farthest: the Ø40 bar's radius and 35 mm of jaw,
-        // 20 mm wide; 15 mm of clearance over them.
-        let swing = doc.swing(1, &mesh, 15.).unwrap();
-        assert!((swing.radius - 55f32.hypot(10.)).abs() < 1e-3, "{swing:?}");
-        assert!((swing.z - (20. + swing.radius + 15.)).abs() < 1e-3);
-        assert!((swing.machine_z - (-150. + swing.radius + 15.)).abs() < 1e-3);
+        // Along all of A the jaws reach farthest: the Ø40 bar's radius and
+        // 35 mm of jaw, 20 mm wide; 15 mm of clearance over them.
+        let all = doc.swing(1, &mesh, 15.).unwrap();
+        assert!((all.radius - 55f32.hypot(10.)).abs() < 1e-3, "{all:?}");
+        assert!((all.z - (20. + all.radius + 15.)).abs() < 1e-3);
+        assert!((all.machine_z - (-150. + all.radius + 15.)).abs() < 1e-3);
+        // The part is 80 mm out of the jaws: under the tool, its holder and
+        // the spindle nose A swings only the Ø40 bar, so the tool turns A
+        // 15 mm over the bar's top (LIO-209).
+        let swing = height(&doc, &mesh, 1, &plan, 15.);
+        assert_eq!((swing.what, swing.radius), ("the stock reaches", 20.));
+        assert!((swing.z - (20. + 20. + 15.)).abs() < 1e-3, "{swing:?}");
         let index: Vec<usize> = (0..plan.moves.len())
             .filter(|&i| plan.moves[i].motion == Motion::Index)
             .collect();
@@ -1604,28 +1728,73 @@ pub(crate) mod tests {
 
     #[test]
     fn an_index_retract_above_the_z_travel_is_refused_with_its_numbers() {
-        let mesh = prism(30.);
-        // The assumed centreline, Z -40: the jaws' 55.9 mm and 15 mm of
-        // clearance over it end 30.9 mm above the top of the Z travel.
-        let doc = bar_job(&mesh, 0., "80", "-40", "0, 90", contour(&cutter("12")));
+        // The assumed centreline, Z -40, and a 10 mm part over the jaws:
+        // the jaws' 55.9 mm and 15 mm of clearance over them end 30.9 mm
+        // above the top of the Z travel.
+        let mesh = prism(10.);
+        let doc = bar_job(&mesh, -17., "60", "-40", "0, 90", contour(&cutter("12")));
         let refused = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap_err();
         for words in [
-            "at machine Z 30.9 (the A centreline at Z -40 + 55.9 mm, as far as the chuck's jaws reach from it at any angle, + 15 mm clearance)",
+            "at machine Z 30.9 with the tool over X",
+            "(the A centreline at Z -40 + 55.9 mm, as far as the chuck's jaws reach from it at any angle, + 15 mm clearance)",
             "30.9 mm above the top of the machine's 300 mm Z travel (Z 0)",
             "not cut short",
+            "keep the cuts farther from the jaws",
         ] {
             assert!(refused.contains(words), "{refused}");
         }
         // Even one angle away from A0.
-        let doc = bar_job(&mesh, 0., "80", "-40", "90", contour(&cutter("12")));
+        let doc = bar_job(&mesh, -17., "60", "-40", "90", contour(&cutter("12")));
         assert!(
             crate::simulation::prepare(&doc, &mesh, 1, 0)
                 .unwrap_err()
                 .contains("machine Z 30.9")
         );
         // At A0 alone A does not turn: nothing to retract for.
-        let doc = bar_job(&mesh, 0., "80", "-40", "0", contour(&cutter("12")));
+        let doc = bar_job(&mesh, -17., "60", "-40", "0", contour(&cutter("12")));
         assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_ok());
+        // Away from the jaws the tool turns A over the Ø40 bar: 20 mm and
+        // 15 mm of clearance end at machine Z -5, inside the travel.
+        let mesh = prism(30.);
+        let doc = bar_job(&mesh, 0., "80", "-40", "0, 90", contour(&cutter("12")));
+        let plan = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap().plan;
+        let swing = height(&doc, &mesh, 1, &plan, 15.);
+        assert!((swing.machine_z - -5.).abs() < 1e-3, "{swing:?}");
+    }
+
+    #[test]
+    fn a_tool_over_the_jaws_lifts_above_them_and_one_over_the_bar_above_the_bar() {
+        use crate::simulation::{Motion, prepare};
+        // A 10 mm part 3 mm from the jaws (LIO-209): the Ø12 tool round it
+        // is over them, and under the tool A swings the jaws, 55.9 mm out,
+        // so A turns 15 mm above them.
+        let mesh = prism(10.);
+        let doc = bar_job(&mesh, 3., "60", "-150", "90, 180", contour(&cutter("12")));
+        let plan = prepare(&doc, &mesh, 1, 0).unwrap().plan;
+        let swing = height(&doc, &mesh, 1, &plan, 15.);
+        assert_eq!(swing.what, "the chuck's jaws reach");
+        assert!((swing.radius - 55f32.hypot(10.)).abs() < 1e-3, "{swing:?}");
+        let all = doc.swing(1, &mesh, 15.).unwrap();
+        assert_eq!((swing.what, swing.z), (all.what, all.z));
+        let index: Vec<_> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Index)
+            .collect();
+        assert_eq!(index.len(), 2);
+        for m in index {
+            assert!(
+                (m.from[2] - (20. + swing.radius + 15.)).abs() < 1e-3,
+                "{m:?}"
+            );
+        }
+        // The same part 60 mm along the bar is over the bar alone: A turns
+        // 15 mm over its 20 mm, 30.9 mm lower, whatever the jaws reach.
+        let far = bar_job(&mesh, 43., "60", "-150", "90, 180", contour(&cutter("12")));
+        let plan = prepare(&far, &mesh, 1, 0).unwrap().plan;
+        let bar = height(&far, &mesh, 1, &plan, 15.);
+        assert_eq!((bar.what, bar.radius), ("the stock reaches", 20.));
+        for m in plan.moves.iter().filter(|m| m.motion == Motion::Index) {
+            assert!((m.from[2] - (20. + 20. + 15.)).abs() < 1e-3, "{m:?}");
+        }
     }
 
     #[test]
@@ -1818,7 +1987,8 @@ pub(crate) mod tests {
     fn the_swing_takes_the_centreline_the_control_page_measured() {
         let mesh = prism(30.);
         let mut doc = bar_job(&mesh, 0., "80", "-40", "0, 90", contour(&cutter("12")));
-        assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_err());
+        // Along all of A the jaws reach above the Z travel at Z -40.
+        assert!(doc.swing(1, &mesh, 15.).is_err());
         // Measured at Z -150 in the machine library; the setup's copy still
         // says -40.
         let mut library = doc.setups[0].machine.clone();
@@ -1831,13 +2001,17 @@ pub(crate) mod tests {
         assert_eq!(get(&doc.setups[1].machine.p, "a_centre_z"), "-40");
         let swing = doc.swing(1, &mesh, 15.).unwrap();
         assert!((swing.machine_z - (-150. + swing.radius + 15.)).abs() < 1e-3);
-        assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_ok());
+        let plan = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap().plan;
+        let over = height(&doc, &mesh, 1, &plan, 15.);
+        assert!((over.machine_z - (-150. + 20. + 15.)).abs() < 1e-3);
         // Gone stale, it is not trusted: the setup's copy is used again.
         doc.machines[0].p.insert(
             crate::control::CENTRE_MARK.into(),
             "stale after an E-stop".into(),
         );
-        assert!(crate::simulation::prepare(&doc, &mesh, 1, 0).is_err());
+        assert!(doc.swing(1, &mesh, 15.).is_err());
+        let over = height(&doc, &mesh, 1, &plan, 15.);
+        assert!((over.machine_z - (-40. + 20. + 15.)).abs() < 1e-3);
     }
 
     #[test]
@@ -1898,17 +2072,20 @@ pub(crate) mod tests {
             "{text}"
         );
         let code: Vec<&str> = text.lines().filter(|l| !l.starts_with('(')).collect();
-        // A90 after the tool change's retract, A180 at the index move's
-        // height, A0 after the last retract; no other line has an A word.
+        // A90 after the tool change's retract and the rapid across over the
+        // first cut, A180 at the index move's height, A0 after the last
+        // retract; no other line has an A word.
         let turns: Vec<usize> = (0..code.len()).filter(|&i| code[i].contains('A')).collect();
         assert_eq!(turns.len(), 3, "{code:?}");
         assert_eq!(code[turns[0]], "G0 A90.000");
-        assert_eq!(code[turns[0] - 1], "G53 G0 Z0");
+        assert!(code[turns[0] - 1].starts_with("G0 X"), "{code:?}");
+        assert!(code[..turns[0]].contains(&"G53 G0 Z0"), "{code:?}");
         assert_eq!(code[turns[1]], "G0 A180.000");
         assert_eq!(code[turns[2] - 1..], ["G53 G0 Z0", "G0 A0.000", "M2"]);
-        // The tool is above all that A swings when A turns: the jaws'
-        // reach from the axis and 15 mm clearance.
-        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        // The tool is above all that A swings under it when A turns: the
+        // bar's reach from the axis and 15 mm clearance.
+        let plan = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap().plan;
+        let swing = height(&doc, &mesh, 1, &plan, 15.);
         let z = |line: &str| -> f32 {
             let w = line.split(' ').find(|w| w.starts_with('Z')).unwrap();
             w[1..].parse().unwrap()
@@ -1986,10 +2163,13 @@ pub(crate) mod tests {
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
         // Setup 3 starts at the angle setup 2 left, and comes down from
-        // above all A swings as an index move does (LIO-205): its program
-        // turns A at machine Z home, or at the clearance plane, which is at
-        // that height now, and is exported either way.
-        for mode in &POST_RETRACT[..2] {
+        // above what A swings under the tool as an index move does
+        // (LIO-205): its program turns A at machine Z home over the first
+        // cut, and is exported. At the clearance plane, now over the bar
+        // and not the jaws (LIO-209), a program that starts with the tool
+        // wherever it was is refused, as on a 3-axis setup: it could arrive
+        // over the jaws below their reach.
+        for (mode, exported) in POST_RETRACT.iter().zip([true, false]) {
             doc.setups[0]
                 .machine
                 .p
@@ -1997,11 +2177,16 @@ pub(crate) mod tests {
             doc.sync_indexed();
             let posted = crate::post::post_job(&doc, &mesh);
             for k in [1, 2] {
-                assert!(
-                    posted.setups[k].result.is_ok(),
-                    "{mode}: {:?}",
-                    posted.setups[k].result
-                );
+                let result = &posted.setups[k].result;
+                match exported {
+                    true => assert!(result.is_ok(), "{mode}: {result:?}"),
+                    false => assert!(
+                        result.as_ref().is_err_and(|e| e
+                            .iter()
+                            .any(|e| e.contains("is not above the chuck jaw"))),
+                        "{mode}: {result:?}"
+                    ),
+                }
             }
         }
         // Its plans checked once the operation's clearance is raised to
@@ -2116,12 +2301,13 @@ pub(crate) mod tests {
         let (doc, mesh) = posting_bar_job(20., "100", "0, 90, 180, 270");
         let sim = prepare(&doc, &mesh, 1, 0).unwrap();
         assert_eq!(angle_order(&sim.plan), [0., 90., 180., 270.]);
-        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        let swing = height(&doc, &mesh, 1, &sim.plan, 15.);
         enters_from_above(&doc, &mesh, &sim.plan, swing.z, 0.);
         let index = sim.plan.moves.iter().filter(|m| m.motion == Motion::Index);
         assert_eq!(index.count(), 3);
         // The checks find nothing, and it exports: A0 after the tool
-        // change's retract, then down over the first cut.
+        // change's retract and the rapid across over the first cut, then
+        // down to it.
         let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim.clone()))]);
         assert!(held.is_empty(), "{held:?}");
         let found = crate::rotary_check::problems(&doc, &mesh, 1, &[(0, Ok(sim))]);
@@ -2134,7 +2320,10 @@ pub(crate) mod tests {
             .filter(|l| !l.starts_with('('))
             .collect();
         let turns: Vec<usize> = (0..code.len()).filter(|&i| code[i].contains('A')).collect();
-        assert_eq!(code[turns[0] - 1..=turns[0]], ["G53 G0 Z0", "G0 A0.000"]);
+        assert_eq!(code[turns[0]], "G0 A0.000");
+        assert!(code[turns[0] - 1].starts_with("G0 X"), "{code:?}");
+        assert!(code[turns[0] + 1].starts_with("G0 Z"), "{code:?}");
+        assert!(code[..turns[0]].contains(&"G53 G0 Z0"), "{code:?}");
         assert_eq!(turns.len(), 5, "{code:?}");
     }
     #[test]
@@ -2150,7 +2339,7 @@ pub(crate) mod tests {
         ops.push(finish);
         let sim = prepare(&doc, &mesh, 1, 1).unwrap();
         assert!(sim.plan.moves.iter().all(|m| m.motion != Motion::Index));
-        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        let swing = height(&doc, &mesh, 1, &sim.plan, 15.);
         enters_from_above(&doc, &mesh, &sim.plan, swing.z, 90.);
         let posted = crate::post::post_job(&doc, &mesh);
         assert!(
@@ -2196,7 +2385,8 @@ pub(crate) mod tests {
         // swing height of setup 1's own clamping, with no A, clear of the
         // jaws (LIO-206).
         let swing = doc.swing(0, &mesh, 15.).unwrap();
-        assert_eq!(swing, doc.swing(1, &mesh, 15.).unwrap());
+        let all = doc.swing(1, &mesh, 15.).unwrap();
+        assert_eq!((swing.what, swing.z), (all.what, all.z));
         assert!(corner[2] < swing.z - 30., "{corner:?} {swing:?}");
         let gap = crate::holding::gap(&doc.setups[0]).unwrap();
         for oi in 0..2 {
