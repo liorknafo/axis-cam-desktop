@@ -2409,6 +2409,147 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("3-tool-change.png"));
     }
 
+    /// Renders the operation editor's Cycle tab with Helical milling, and
+    /// its Geometry tab, to `$AXIS_RENDER_DIR` (default /tmp/helical): the
+    /// fixture job's Drilling with a Ø3 flat end mill (45 mm of flute), its
+    /// four Ø6.6 holes milled 4 mm a turn in rings, and its preview. Not a
+    /// check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_helical_milling_cycle() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/helical".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        let mut mill = crate::model::Tool::new("T5 Flat end mill 3", "Flat end mill", "3");
+        for (k, v) in [("number", "5"), ("length", "45"), ("stickout", "55")] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let id = mill.id.clone();
+        a.doc.tools.push(mill);
+        let op = &mut a.doc.setups[0].operations[3];
+        op.tool = id;
+        for (k, v) in [
+            ("cycle", crate::model::HELICAL_MILLING),
+            ("hole_diameter", "6.6"),
+            ("through", "No"),
+            ("stepdown", "4"),
+        ] {
+            op.p.insert(k.into(), v.into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(3));
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1600., 1000.),
+            &out.join("helical-cycle.png"),
+        );
+        // The Geometry tab lists the holes as the end mill cuts them.
+        let _ = a.update(Message::Tab("Geometry".into()));
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1600., 1400.),
+            &out.join("helical-geometry.png"),
+        );
+    }
+
+    /// Not a check: draws a Pocket that picked the plate's two holes by a
+    /// click on a wall of each (`pocket::hole_plate`), its Geometry tab
+    /// listing them and its preview, as `pocket-holes-*.png` in
+    /// `$AXIS_RENDER_DIR` (default /tmp/pocket-holes).
+    #[test]
+    #[ignore]
+    fn render_a_pocket_of_holes_picked_by_their_walls() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/pocket-holes".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = app();
+        let mesh = crate::mesh::normalize(crate::pocket::hole_plate(false)).unwrap();
+        let file = ModelFile {
+            name: "plate.stl".into(),
+            path: "plate.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        let mut mill = crate::model::Tool::new("T7 Flat end mill 2", "Flat end mill", "2");
+        for (k, v) in [("number", "7"), ("length", "12"), ("stickout", "30")] {
+            mill.p.insert(k.into(), v.into());
+        }
+        let tool = mill.id.clone();
+        a.doc.tools.push(mill);
+        let setup = a.doc.setup_mut();
+        setup
+            .p
+            .insert("stock_type".into(), "Relative size box".into());
+        for (k, _) in crate::stock::OFFSETS {
+            setup.p.insert(k.into(), "0".into());
+        }
+        setup.operations[0] = Operation::new(Strategy::Pocket, tool);
+        setup.operations[0].p.insert("stepdown".into(), "2".into());
+        a.selected = Some(0);
+        a.page = Page::Work;
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let at = |x: f32, y: f32, r: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    crate::pocket::is_wall(&setup, &mesh, id) && (c[0] - x).hypot(c[1] - y) < r
+                })
+                .unwrap()
+        };
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        let _ = a.update(Message::Surface(at(-10., 0., 3.1)));
+        let _ = a.update(Message::Surface(at(13., 0., 0.1)));
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1600., 1100.),
+            &out.join("pocket-holes-geometry.png"),
+        );
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        let _ = a.update(Message::Scrub(1.));
+        // The stock as cut, meshed here rather than in the background.
+        let key = a.stock_mesh_key().unwrap();
+        let sim = a.active_simulation().unwrap();
+        let volume = sim.volume.as_ref().unwrap();
+        let surface = crate::stock_surface::Snapshot {
+            bounds: volume.bounds,
+            frame: volume.frame,
+            cuts: volume.cuts.clone(),
+            detail: a.stock_detail,
+        }
+        .build()
+        .unwrap();
+        let seconds = sim.seconds;
+        let _ = a.update(Message::StockMeshed {
+            key,
+            seconds,
+            result: Ok(std::sync::Arc::new(surface)),
+        });
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1600., 1100.),
+            &out.join("pocket-holes-cut.png"),
+        );
+    }
+
     /// The operation of a block of a program, if it names one.
     fn op_of(b: &crate::post::Block) -> Option<usize> {
         use crate::post::Block;
@@ -10967,6 +11108,490 @@ flood = { pin = 8 }
         };
         let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
         a
+    }
+    #[test]
+    fn a_click_on_a_wall_picks_or_drops_its_whole_hole_in_a_pocket() {
+        // A pocket and a slot down its west wall (`pocket::pocket_with_slot`).
+        let mut a = app();
+        let mesh = crate::mesh::normalize(crate::pocket::pocket_with_slot()).unwrap();
+        let file = ModelFile {
+            name: "part.stl".into(),
+            path: "part.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Pocket, tool);
+        a.selected = Some(0);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let at = |x: f32, y: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    crate::pocket::is_wall(&setup, &mesh, id)
+                        && (c[0] - x).abs() < 0.01
+                        && (c[1] - y).abs() < 0.01
+                })
+                .unwrap()
+        };
+        let ids = |a: &App| {
+            let mut ids = a
+                .operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map_or(vec![], |s| s.ids.clone());
+            ids.sort();
+            ids
+        };
+        let floors = |a: &App| {
+            let set = ids(a).into_iter().collect();
+            let mut floors: Vec<f32> = crate::pocket::holes(a.doc.setup(), &set, &mesh)
+                .unwrap()
+                .iter()
+                .map(|h| h.levels.last().unwrap().floor.unwrap())
+                .collect();
+            floors.sort_by(f32::total_cmp);
+            floors
+        };
+        // One click on the pocket's north wall picks its four walls; one on
+        // the slot's east wall adds the slot's other three.
+        let _ = a.update(Message::Surface(at(0., 5.)));
+        assert_eq!(ids(&a).len(), 4, "{}", a.status);
+        assert!(a.status.starts_with("Picked the hole at X"), "{}", a.status);
+        let _ = a.update(Message::Surface(at(-2., 0.)));
+        assert_eq!(ids(&a).len(), 7);
+        let both = floors(&a);
+        assert_eq!(both.len(), 2);
+        // A click on the pocket again drops it but keeps the wall the slot
+        // shares: the slot is still picked whole.
+        let _ = a.update(Message::Surface(at(0., 5.)));
+        assert_eq!(ids(&a).len(), 4);
+        assert!(
+            a.status.starts_with("Dropped the hole at X"),
+            "{}",
+            a.status
+        );
+        assert_eq!(floors(&a), vec![both[0]]);
+        // The plate's outside is no hole: nothing changes, and the status says why.
+        let _ = a.update(Message::Surface(at(10., 0.)));
+        assert_eq!(ids(&a).len(), 4);
+        assert!(a.status.contains("not a hole"), "{}", a.status);
+        let _ = a.update(Message::Surface(at(-2., 0.)));
+        assert!(ids(&a).is_empty());
+    }
+    /// An app with `tris` imported and its first operation a Pocket.
+    fn pocket_app(tris: Vec<[[f32; 3]; 3]>) -> App {
+        let mut a = app();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let file = ModelFile {
+            name: "part.stl".into(),
+            path: "part.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Pocket, tool);
+        a.selected = Some(0);
+        a
+    }
+    /// The first surface of the part `test` takes, by its id and its centre
+    /// (X and Y as placed, Z over the part's bottom).
+    fn surface_at(a: &App, test: impl Fn(usize, [f32; 3]) -> bool) -> usize {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let setup = a.doc.setup();
+        let placement = crate::stock::Placement::new(mesh, Some(setup));
+        let scale = mesh.display_scale();
+        let low = placement.bounds.min[2] / scale;
+        (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                test(id, [c[0], c[1], c[2] - low])
+            })
+            .unwrap()
+    }
+    #[test]
+    fn a_click_on_a_holes_chamfer_picks_it_and_the_pocket_names_what_its_cutter_leaves() {
+        // `pocket::chamfered_hole`: a click on the chamfer picks the Ø6
+        // hole, and another drops it.
+        let mut a = pocket_app(crate::pocket::chamfered_hole());
+        let chamfer = surface_at(&a, |_, c| (c[2] - 9.5).abs() < 0.1 && c[0].hypot(c[1]) < 4.);
+        let count = |a: &App| {
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map_or(0, |s| s.ids.len())
+        };
+        let _ = a.update(Message::Surface(chamfer));
+        assert_eq!(count(&a), 24, "{}", a.status);
+        let _ = a.update(Message::Surface(chamfer));
+        assert_eq!(count(&a), 0);
+        // `pocket::pocket_with_slot` with a Ø3 end mill: the 2 mm slot and
+        // the pocket's level down it are named, left uncut.
+        let mut a = pocket_app(crate::pocket::pocket_with_slot());
+        let id = a.operation().unwrap().tool.clone();
+        let tool = a.doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+        tool.p.insert("type".into(), "Flat end mill".into());
+        tool.p.insert("diameter".into(), "3".into());
+        let setup = a.doc.setup().clone();
+        let mesh = a.imported_mesh.clone().unwrap();
+        let wall = |x: f32, y: f32| {
+            surface_at(&a, |id, c| {
+                crate::pocket::is_wall(&setup, &mesh, id)
+                    && (c[0] - x).abs() < 0.01
+                    && (c[1] - y).abs() < 0.01
+            })
+        };
+        let (north, slot) = (wall(0., 5.), wall(-2., 0.));
+        let _ = a.update(Message::Surface(north));
+        let _ = a.update(Message::Surface(slot));
+        let warnings: Vec<String> = crate::ui::op_checks(&a)
+            .into_iter()
+            .filter(|c| !c.error && c.text.contains("too narrow for the Ø3"))
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.starts_with("Part of the hole")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("The hole") && w.contains("left uncut"))
+        );
+    }
+    #[test]
+    fn a_holes_remove_button_drops_that_hole_alone() {
+        // The pocket and the slot down its wall, picked; the pocket's remove
+        // button leaves the slot whole, the slot's then leaves nothing.
+        let mut a = pocket_app(crate::pocket::pocket_with_slot());
+        let setup = a.doc.setup().clone();
+        let mesh = a.imported_mesh.clone().unwrap();
+        let wall = |a: &App, x: f32, y: f32| {
+            surface_at(a, |id, c| {
+                crate::pocket::is_wall(&setup, &mesh, id)
+                    && (c[0] - x).abs() < 0.01
+                    && (c[1] - y).abs() < 0.01
+            })
+        };
+        let (north, slot) = (wall(&a, 0., 5.), wall(&a, -2., 0.));
+        let _ = a.update(Message::Surface(north));
+        let _ = a.update(Message::Surface(slot));
+        let holes = |a: &App| {
+            let o = a.operation().unwrap();
+            match &*a.pocket_holes(o, &mesh) {
+                Ok(h) => h.iter().map(|h| h.levels.len()).collect::<Vec<_>>(),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let levels = holes(&a);
+        assert_eq!(levels.len(), 2);
+        let pocket = levels.iter().position(|&n| n == 2).unwrap();
+        let _ = a.update(Message::DropHole(pocket));
+        assert_eq!(holes(&a), vec![1]);
+        assert!(
+            a.status.starts_with("Dropped the hole at X"),
+            "{}",
+            a.status
+        );
+        assert_eq!(
+            a.operation().unwrap().surfaces.as_ref().unwrap().ids.len(),
+            4
+        );
+        let _ = a.update(Message::DropHole(0));
+        assert!(holes(&a).is_empty());
+    }
+    #[test]
+    fn a_click_on_another_facet_of_a_picked_hole_drops_it() {
+        // `pocket::split_hole`: a Ø6 hole's wall faceted below Z 1 and above
+        // it apart. A click on either half picks the hole; one on the other
+        // half drops it, not picking it twice.
+        let mut a = app();
+        let mesh = crate::mesh::normalize(crate::pocket::split_hole()).unwrap();
+        let file = ModelFile {
+            name: "part.stl".into(),
+            path: "part.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Pocket, tool);
+        a.selected = Some(0);
+        let mesh = a.imported_mesh.clone().unwrap();
+        let setup = a.doc.setup().clone();
+        let placement = crate::stock::Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let (low, high) = (
+            placement.bounds.min[2] / scale,
+            placement.bounds.max[2] / scale,
+        );
+        let facet = |upper: bool| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    crate::pocket::is_wall(&setup, &mesh, id)
+                        && c[0].hypot(c[1]) < 3.1
+                        && (c[2] > (low + high) / 2.) == upper
+                })
+                .unwrap()
+        };
+        let count = |a: &App| {
+            a.operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map_or(0, |s| s.ids.len())
+        };
+        let _ = a.update(Message::Surface(facet(false)));
+        assert_eq!(count(&a), 24, "{}", a.status);
+        let _ = a.update(Message::Surface(facet(true)));
+        assert_eq!(count(&a), 0);
+        let _ = a.update(Message::Surface(facet(true)));
+        assert_eq!(count(&a), 24);
+    }
+    #[test]
+    fn generating_runs_off_the_window_with_progress_cancel_and_stale_results_dropped() {
+        // As the window runs it: Generate starts work it does not wait for.
+        let mut a = imported_app();
+        a.generate_inline = false;
+        let mesh = a.imported_mesh.clone().unwrap();
+        let top = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2].abs() > 0.99999)
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        // What the thread makes, made here, with its progress.
+        let made = |a: &App| {
+            let progress = a.generating.as_ref().unwrap().progress.clone();
+            let (doc, si, oi) = (a.doc.clone(), a.doc.index(), a.selected.unwrap());
+            let sim = progress.run(|| crate::simulation::prepare(&doc, &mesh, si, oi));
+            (progress, crate::Made(std::sync::Arc::new(sim)))
+        };
+        let _ = a.update(Message::Generate);
+        let epoch = a.generating.as_ref().map(|g| g.epoch).unwrap();
+        assert!(
+            a.simulation.is_none() && a.status.starts_with("Generating"),
+            "{}",
+            a.status
+        );
+        assert!(a.ticks_fast());
+        let (progress, result) = made(&a);
+        assert_eq!(progress.fraction(), 1.);
+        assert!(progress.label().contains(" / "), "{}", progress.label());
+        let _ = a.update(Message::Generated(epoch, result.clone()));
+        assert!(
+            a.simulation.is_some() && a.generating.is_none(),
+            "{}",
+            a.status
+        );
+        assert!(!a.playing);
+        // An edit while it runs cancels it: what it makes comes back stale.
+        let _ = a.update(Message::Generate);
+        let epoch = a.generating.as_ref().unwrap().epoch;
+        let (progress, result) = made(&a);
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "9".into()));
+        assert!(a.generating.is_none() && progress.cancelled());
+        let _ = a.update(Message::Generated(epoch, result));
+        assert!(a.simulation.is_none());
+        // Cancel stops it the same way and says so.
+        let _ = a.update(Message::Generate);
+        let epoch = a.generating.as_ref().unwrap().epoch;
+        let (_, result) = made(&a);
+        let _ = a.update(Message::CancelGenerate);
+        assert_eq!(a.status, crate::progress::CANCELLED);
+        let _ = a.update(Message::Generated(epoch, result));
+        assert!(a.simulation.is_none() && a.generating.is_none());
+        // Generate & play plays once it is done.
+        let _ = a.update(Message::Play);
+        let epoch = a.generating.as_ref().unwrap().epoch;
+        assert!(a.generating.as_ref().unwrap().play && !a.playing);
+        let (_, result) = made(&a);
+        let _ = a.update(Message::Generated(epoch, result));
+        assert!(a.playing && a.playback_ready(), "{}", a.status);
+        // Choosing a vise generates the setup's toolpaths off the window too;
+        // an edit meanwhile drops them, and done inline the jaws are placed.
+        a.doc.adopt_holders();
+        let vise = first_of(&a, "Vise");
+        let _ = a.update(Message::Edit(Target::Setup, "holder", vise));
+        let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
+        let layout = a.generating.as_ref().map(|g| g.what);
+        assert_eq!(
+            layout,
+            Some(crate::Generation::Layout(a.doc.index())),
+            "{}",
+            a.status
+        );
+        assert!(!crate::holding::placed(a.doc.setup()));
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "8".into()));
+        assert!(a.generating.is_none());
+        assert!(a.status.contains("Suggest layout"), "{}", a.status);
+        a.generate_inline = true;
+        let _ = a.update(Message::SuggestLayout);
+        assert!(crate::holding::placed(a.doc.setup()), "{}", a.status);
+        a.generate_inline = false;
+        // A cancelled thread ends with `CANCELLED` and nothing more.
+        let progress = std::sync::Arc::new(crate::progress::Progress::default());
+        progress.cancel();
+        let (doc, si, oi) = (a.doc.clone(), a.doc.index(), a.selected.unwrap());
+        let mut fine = doc.clone();
+        fine.setups[si].operations[oi]
+            .p
+            .insert("stepdown".into(), "0.001".into());
+        let cancelled = progress.run(|| crate::simulation::prepare(&fine, &mesh, si, oi));
+        assert_eq!(cancelled.err().as_deref(), Some(crate::progress::CANCELLED));
+        // A new project drops what the old one was generating.
+        let mut b = imported_app();
+        b.generate_inline = false;
+        let _ = b.update(Message::Surface(top));
+        let _ = b.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        let _ = b.update(Message::Generate);
+        let epoch = b.generating.as_ref().unwrap().epoch;
+        let (_, result) = made(&b);
+        let _ = b.update(Message::NewProject);
+        assert!(b.generating.is_none());
+        let _ = b.update(Message::Generated(epoch, result));
+        assert!(b.simulation.is_none() && b.doc.setups.is_empty());
+    }
+    #[test]
+    fn a_long_scrub_waits_for_the_slider_to_be_let_go() {
+        let mut a = imported_app();
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let top = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2].abs() > 0.99999)
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Edit(Target::Setup, "stock_top", "10".into()));
+        let _ = a.update(Message::Generate);
+        let moves = a.simulation.as_ref().unwrap().plan.moves.len();
+        assert!(moves > 20, "{moves}");
+        let current = |a: &App| a.simulation.as_ref().unwrap().current;
+        // Short scrubs replay as the slider moves.
+        let _ = a.update(Message::Scrub(0.1));
+        let near = current(&a);
+        assert!(near > 0 && !a.scrub_pending);
+        // With a scrub longer than the window replays live: the slider
+        // moves, the stock waits for it to be let go.
+        a.scrub_live = 5;
+        let _ = a.update(Message::Scrub(0.9));
+        assert!(a.scrub_pending && current(&a) == near && (a.progress - 0.9).abs() < 1e-6);
+        let _ = a.update(Message::ScrubDone);
+        assert!(!a.scrub_pending && current(&a) > near);
+        // Back: replayed from the start, so it waits too; Play catches up.
+        let _ = a.update(Message::Scrub(0.5));
+        assert!(a.scrub_pending);
+        let _ = a.update(Message::Play);
+        assert!(!a.scrub_pending && a.playing);
+        let sim = a.simulation.as_ref().unwrap();
+        assert!((sim.seconds / sim.plan.duration - 0.5).abs() < 1e-3);
+        // Off the window's thread (as it runs): the slider let go replays a
+        // copy; it is put back when done, unless the slider moved again.
+        a.generate_inline = false;
+        a.scrub_live = 0;
+        let _ = a.update(Message::Play);
+        let _ = a.update(Message::Scrub(0.2));
+        assert!(a.scrub_pending);
+        let _ = a.update(Message::ScrubDone);
+        let (epoch, at, play) = a.catching_up.unwrap();
+        assert!(!a.scrub_pending && !play && at == a.progress);
+        let replay = |a: &App| {
+            let mut copy = a.simulation.clone().unwrap();
+            copy.seek(at);
+            crate::Replayed(std::sync::Arc::new(copy))
+        };
+        let before = current(&a);
+        let _ = a.update(Message::Replayed(epoch, replay(&a)));
+        assert!(a.catching_up.is_none() && current(&a) != before);
+        let _ = a.update(Message::Scrub(0.9));
+        let _ = a.update(Message::ScrubDone);
+        let epoch = a.catching_up.unwrap().0;
+        let stale = replay(&a);
+        let _ = a.update(Message::Scrub(0.95));
+        assert!(a.catching_up.is_none());
+        let at = current(&a);
+        let _ = a.update(Message::Replayed(epoch, stale));
+        assert_eq!(current(&a), at);
+        // Play while it replays waits for it: a tick replays nothing on the
+        // window's thread, and the replay put back starts playback.
+        let _ = a.update(Message::Scrub(0.3));
+        let _ = a.update(Message::ScrubDone);
+        let (epoch, at, _) = a.catching_up.unwrap();
+        let mut copy = a.simulation.clone().unwrap();
+        copy.seek(at);
+        let _ = a.update(Message::Play);
+        assert!(a.catching_up.unwrap().2 && !a.playing);
+        let still = current(&a);
+        a.last_tick = std::time::Instant::now() - std::time::Duration::from_millis(100);
+        let _ = a.update(Message::Tick);
+        assert_eq!(current(&a), still);
+        let _ = a.update(Message::Replayed(
+            epoch,
+            crate::Replayed(std::sync::Arc::new(copy)),
+        ));
+        assert!(a.playing && a.catching_up.is_none() && current(&a) != still);
+        let _ = a.update(Message::Play);
+        assert!(!a.playing);
+        // Play again during the replay takes the queued playback back.
+        let _ = a.update(Message::Scrub(0.4));
+        let _ = a.update(Message::ScrubDone);
+        let _ = a.update(Message::Play);
+        let _ = a.update(Message::Play);
+        assert!(!a.catching_up.unwrap().2);
+        // A failed replay leaves nothing waiting.
+        let epoch = a.catching_up.unwrap().0;
+        let _ = a.update(Message::ReplayFailed(epoch));
+        assert!(
+            a.catching_up.is_none() && a.status.contains("failed"),
+            "{}",
+            a.status
+        );
+        // A scrub not let go (the arrow keys, the wheel) is replayed once the
+        // slider has been still a moment.
+        let _ = a.update(Message::Scrub(0.6));
+        assert!(a.scrub_pending);
+        let _ = a.update(Message::Tick);
+        assert!(a.scrub_pending, "not yet");
+        a.last_scrub = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let _ = a.update(Message::Tick);
+        assert!(!a.scrub_pending && a.catching_up.is_some_and(|c| (c.1 - 0.6).abs() < 1e-6));
+        // Play with a scrub to replay plays once it is replayed.
+        let _ = a.update(Message::Scrub(0.95));
+        let _ = a.update(Message::Play);
+        let (epoch, at, play) = a.catching_up.unwrap();
+        assert!(play && !a.playing);
+        let mut copy = a.simulation.clone().unwrap();
+        copy.seek(at);
+        let _ = a.update(Message::Replayed(
+            epoch,
+            crate::Replayed(std::sync::Arc::new(copy)),
+        ));
+        assert!(a.playing);
+        // What a seek replays: from where it stands going on, from the
+        // start going back.
+        let sim = a.simulation.as_ref().unwrap();
+        // (at most the move under way).
+        assert!(sim.replay(sim.seconds / sim.plan.duration) <= 1);
+        assert!(sim.replay(0.25) <= sim.current && sim.replay(1.) == moves - sim.current);
     }
     #[test]
     fn imported_play_generates_animates_pauses_rewinds_and_edits_invalidate_it() {

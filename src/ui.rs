@@ -476,6 +476,21 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     {
         checks.extend(problems.into_iter().map(|text| Check::new(text, false)));
     }
+    // Holes a Pocket picked by their walls that its cutter cannot get into.
+    if let Some(o) = app.operation()
+        && matches!(o.strategy, Strategy::Pocket | Strategy::Contour)
+        && let Some(mesh) = &app.imported_mesh
+        && let Some((diameter, fits)) = app.pocket_fits(o, mesh).as_ref()
+        && let Ok(holes) = app.pocket_holes(o, mesh).as_ref()
+    {
+        for (h, fits) in holes.iter().zip(fits) {
+            checks.extend(
+                h.uncut(*diameter, fits)
+                    .into_iter()
+                    .map(|text| Check::new(text, false)),
+            );
+        }
+    }
     // A generated outside Contour that goes through the stock's bottom all
     // the way round leaves the part loose for the cutter to throw.
     if let Some(o) = app.operation()
@@ -492,6 +507,15 @@ pub(crate) fn op_checks(app: &App) -> Vec<Check> {
     }
     checks
 }
+/// `issue_tab` for an operation of `strategy`: a Drill operation has no
+/// Passes tab, and Helical milling's stepdown, stepover and tolerance are on
+/// its Cycle tab.
+pub(crate) fn operation_issue_tab(strategy: Strategy, issue: &str) -> Option<&'static str> {
+    match issue_tab(issue) {
+        Some("Passes") if strategy == Strategy::Drill => Some("Cycle"),
+        tab => tab,
+    }
+}
 /// The operation editor's tab a check's message is about: the one with the
 /// field it names, Geometry for the selection it asks for, Tool for a tool;
 /// None for a message about no tab, such as the operation's name.
@@ -500,8 +524,11 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
         Some("name") | None => {
             return if issue.contains("feature or surface") {
                 Some("Geometry")
+            } else if issue == manual::HELICAL_ON_MANUAL {
+                Some("Cycle")
             } else if issue.starts_with("Choose a tool")
                 || issue.starts_with("Choose a drill")
+                || issue.starts_with("Choose a flat end mill")
                 || issue.contains(" is not on ")
             {
                 Some("Tool")
@@ -2000,15 +2027,27 @@ fn workspace(app: &App) -> Element<'_, Message> {
         };
         playback = playback.push(said);
     }
+    // A generation under way, off the window's thread: how far it has got,
+    // and Cancel.
+    if let Some(generating) = generation_progress(app) {
+        playback = playback.push(generating);
+    }
     if ready {
         playback = playback.push(row![
-            btn(if app.playing { "Pause" } else if app.progress >= 1. { "Replay" } else { "Play" }, Message::Play, app.playing),
+            btn(if app.playing || app.catching_up.is_some_and(|c| c.2) { "Pause" } else if app.progress >= 1. { "Replay" } else { "Play" }, Message::Play, app.playing),
             btn("Restart", Message::Scrub(0.), false),
-            help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
+            help::wrap(slider(0.0..=1.0, app.progress, Message::Scrub).on_release(Message::ScrubDone).step(0.001_f32).width(Fill), Help::text("Simulation progress", "Scrub forward or backward. Playback recomputes the remaining stock and cutter position at that time. Restart restores the stock left by all preceding enabled operations and setups."), widget::tooltip::Position::Top),
             muted(format!("{:03}%", (app.progress * 100.) as u32)),
             help::wrap(pick_list(if app.active_simulation().is_some() { vec![1f32, 10., 30., 60., 120.] } else { vec![0.5f32, 1., 2., 4.] }, Some(app.speed), Message::Speed).text_size(12).style(choice_style).padding(5),crate::choice_help::selected("speed","Playback speed",&app.speed.to_string(),Target::Operation,&Fields::new()),widget::tooltip::Position::Top),
             muted("×")
         ].spacing(8).align_y(Alignment::Center));
+        if app.scrub_pending {
+            playback = playback.push(
+                muted("A long toolpath: the stock catches up when the slider stops.").size(12),
+            );
+        } else if app.catching_up.is_some() {
+            playback = playback.push(muted("Replaying the toolpath to here…").size(12));
+        }
         if let Some(sim) = app.active_simulation() {
             playback = playback.push(
                 muted(format!(
@@ -2052,7 +2091,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
             }
             playback = playback.push(detail.push(muted(surface_status).size(12)));
         }
-    } else {
+    } else if app.generating.is_none() {
         let mut empty = row![muted(app.playback_reason()).size(12).width(Fill)]
             .spacing(10)
             .align_y(Alignment::Center);
@@ -2285,7 +2324,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or click any wall of a hole: that picks the whole hole, and its outline is cut down to its floor, or through the part if nothing is under it. Click a picked wall again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -2301,12 +2340,75 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         );
                     }
                     let selection = o.surfaces.as_ref();
-                    let count = selection.map_or(0, |s| s.ids.len());
-                    c = c.push(muted(format!("{} selected", plural(count, "surface"))));
+                    // A Pocket or an inside Contour lists the holes its
+                    // selected walls pick, and its floors as surfaces.
+                    let picks_holes = matches!(o.strategy, Strategy::Pocket | Strategy::Contour);
+                    let wall = |id: usize| {
+                        picks_holes
+                            && app
+                                .imported_mesh
+                                .as_ref()
+                                .is_some_and(|m| crate::pocket::is_wall(app.doc.setup(), m, id))
+                    };
+                    let count =
+                        selection.map_or(0, |s| s.ids.iter().filter(|&&id| !wall(id)).count());
+                    let walls = selection.is_some_and(|s| s.ids.iter().any(|&id| wall(id)));
+                    // Floors are surfaces; holes are listed by their walls.
+                    if !picks_holes {
+                        c = c.push(muted(format!("{} selected", plural(count, "surface"))));
+                    } else if count > 0 || !walls {
+                        c = c.push(muted(format!(
+                            "{} selected",
+                            plural(count, "floor surface")
+                        )));
+                    }
+                    if let (true, Some(selected), Some(mesh)) =
+                        (walls, selection, &app.imported_mesh)
+                        && selected.matches(mesh)
+                    {
+                        match &*app.pocket_holes(o, mesh) {
+                            Ok(holes) => {
+                                c = c.push(muted(format!(
+                                    "{} picked by their walls",
+                                    plural(holes.len(), "hole")
+                                )));
+                                for (i, h) in holes.iter().enumerate().take(64) {
+                                    let (x, y) = h.centre();
+                                    let (w, d) = h.size();
+                                    let mut depth = (h.levels.iter())
+                                        .map(|l| h.depth(l))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    // What the cutter cannot get into.
+                                    if let Some((diameter, fits)) =
+                                        app.pocket_fits(o, mesh).as_ref()
+                                    {
+                                        let fits = &fits[i];
+                                        if fits.iter().all(|f| !f) {
+                                            depth += &format!(
+                                                " · too narrow for Ø{diameter}: left uncut"
+                                            );
+                                        } else if fits.iter().any(|f| !f) {
+                                            depth += &format!(" · part too narrow for Ø{diameter}");
+                                        }
+                                    }
+                                    c = c.push(
+                                        btn(
+                                            format!("✓ Hole X{x:.2} Y{y:.2} · {w:.2} × {d:.2} mm · {depth} · remove"),
+                                            Message::DropHole(i),
+                                            true,
+                                        )
+                                        .width(Fill),
+                                    );
+                                }
+                            }
+                            Err(error) => c = c.push(note(error.clone())),
+                        }
+                    }
                     if let (Some(selected), Some(mesh)) = (selection, &app.imported_mesh)
                         && selected.matches(mesh)
                     {
-                        for &id in selected.ids.iter().take(64) {
+                        for &id in selected.ids.iter().filter(|&&id| !wall(id)).take(64) {
                             if let Some(surface) = mesh.surfaces.get(id) {
                                 c = c.push(
                                     btn(
@@ -2352,8 +2454,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         }
                     }
                     c = c.push(note(match o.strategy {
-                        Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
-                        Strategy::Contour => "Inside contour offsets only the walls and islands of this floor. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
+                        Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
+                        Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
                         _ => fixture_note(app, Note::Facing),
                     }));
@@ -2516,6 +2618,22 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         .push(checks.field(p, "tab_height", "Tab height · mm"));
                 }
             }
+            // A hole picked by its walls that nothing is under goes through,
+            // as an opening does.
+            let through = !app.is_sample()
+                && matches!(o.strategy, Strategy::Pocket | Strategy::Contour)
+                && app.imported_mesh.as_ref().is_some_and(|mesh| {
+                    o.surfaces.as_ref().is_some_and(|s| {
+                        s.matches(mesh)
+                            && s.ids
+                                .iter()
+                                .any(|&id| crate::pocket::is_wall(app.doc.setup(), mesh, id))
+                    }) && app
+                        .pocket_holes(o, mesh)
+                        .as_ref()
+                        .as_ref()
+                        .is_ok_and(|holes| holes.iter().any(|h| h.through()))
+                });
             if !app.is_sample() && o.strategy == Strategy::Pocket {
                 c = c.push(choice_value(
                     p,
@@ -2525,15 +2643,23 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     &POCKET_OPENINGS,
                     t,
                 ));
-                if pocket_setting(p, "openings") == POCKET_OPENINGS[1] {
-                    c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
-                }
+            }
+            if through
+                || (!app.is_sample()
+                    && o.strategy == Strategy::Pocket
+                    && pocket_setting(p, "openings") == POCKET_OPENINGS[1])
+            {
+                c = c.push(checks.field(p, "breakthrough", "Breakthrough · mm"));
             }
             if o.strategy == Strategy::Drill {
                 c = c.push(choice(
                     p,
                     "through",
-                    "Drill tip through bottom",
+                    if o.helical() {
+                        "Cutter through bottom"
+                    } else {
+                        "Drill tip through bottom"
+                    },
                     &["Yes", "No"],
                     t,
                 ));
@@ -2589,18 +2715,13 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             _ => {}
         },
         "Cycle" => {
-            c = c.push(choice(
-                p,
-                "cycle",
-                "Drilling cycle",
-                &[
-                    "Drilling",
-                    "Chip breaking",
-                    "Deep drilling",
-                    "Counterboring",
-                ],
-                t,
-            ));
+            c = c.push(choice(p, "cycle", "Drilling cycle", &DRILL_CYCLES, t));
+            if o.helical() {
+                c = c
+                    .push(checks.field(p, "stepdown", "Stepdown per turn · mm"))
+                    .push(checks.field(p, "stepover", "Ring stepover · % of tool diameter"))
+                    .push(checks.field(p, "tolerance", "Tolerance · mm"));
+            }
             if ["Chip breaking", "Deep drilling"].contains(&get(p, "cycle")) {
                 c = c.push(checks.field(p, "peck", "Peck depth · mm"));
             }
@@ -2619,6 +2740,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     "Chip breaking" => "Retract slightly after each peck to break the chip.",
                     "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
                     "Counterboring" => "Feed to depth and dwell before retracting.",
+                    HELICAL_MILLING => "Mill each hole with a flat end mill narrower than it: down a helix to a flat bottom, once round there, in rings out to the hole's size when it is over twice the cutter's.",
                     _ => "Feed to the bottom in one move, then retract.",
                 }));
         }
@@ -7110,6 +7232,8 @@ pub(crate) fn operation_lines(
             let cycle = get(p, "cycle");
             push(if ["Chip breaking", "Deep drilling"].contains(&cycle) {
                 format!("{cycle}, peck {} mm", n(value("peck")))
+            } else if cycle == HELICAL_MILLING {
+                format!("{cycle}, {} mm per turn", n(value("stepdown")))
             } else {
                 cycle.into()
             });
@@ -8570,10 +8694,53 @@ fn audit_row(status: button::Status) -> button::Style {
         ..Default::default()
     }
 }
+/// The generation under way off the window's thread, if any: what is being
+/// generated, how far it has got, a progress bar and Cancel. The simulation
+/// panel and the operation audit show it.
+fn generation_progress(app: &App) -> Option<Element<'_, Message>> {
+    let g = app.generating.as_ref()?;
+    let done = g.progress.fraction();
+    let doing = g.progress.label();
+    let what = match g.what {
+        crate::Generation::All => "Generating every enabled operation",
+        crate::Generation::Operation(..) => "Generating",
+        crate::Generation::Layout(..) => "Generating the setup's toolpaths for its holding",
+    };
+    Some(
+        column![
+            row![
+                muted(if doing.is_empty() {
+                    format!("{what}…")
+                } else {
+                    format!("{what} · {doing}")
+                })
+                .size(12)
+                .width(Fill),
+                muted(format!("{:.0}%", done * 100.)).size(12),
+                secondary("Cancel", Message::CancelGenerate),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            widget::progress_bar(0.0..=1.0, done).girth(6),
+        ]
+        .spacing(8)
+        .into(),
+    )
+}
 fn operation_audit(app: &App) -> Element<'_, Message> {
     let mut c=column![bold("Operation support & job checks",24),note("Available means an imported-mesh preview is implemented and regression-tested within the scope below. Their moves can be exported as LinuxCNC 3-axis programs after checks for limits, rapids into material and holder clearance, and, in a setup that models a vise or clamps, for the jaws and clamps as boxes with a clearance gap. Parallels, bolts, the table, the machine body and other fixtures are not checked. A sample animation does not establish operation support."),row![primary("Check all enabled operations",Message::GenerateAll),secondary("Back to machining",Message::Page(Page::Work))].spacing(12)].spacing(14).max_width(1020);
+    if let Some(generating) = generation_progress(app) {
+        c = c.push(generating);
+    }
     for (i, row) in app.audit_report.iter().enumerate() {
-        let where_ = match issue_tab(&row.detail) {
+        let strategy = (app.doc.setups.get(row.setup))
+            .and_then(|s| s.operations.get(row.operation))
+            .map(|o| o.strategy);
+        let tab = match strategy {
+            Some(strategy) => operation_issue_tab(strategy, &row.detail),
+            None => issue_tab(&row.detail),
+        };
+        let where_ = match tab {
             Some(tab) => format!(
                 "Opens {} in the editor, on its {tab} tab, where the setting its line names is.",
                 row.name
@@ -8731,6 +8898,32 @@ mod tests {
     use crate::model::Strategy;
     use std::path::Path;
 
+    #[test]
+    fn a_drill_operations_pass_and_helical_checks_open_its_cycle_tab() {
+        // A Drill operation has no Passes tab: Helical milling's settings
+        // are on its Cycle tab, as is why a manual mill cannot run it.
+        let stepdown = "stepdown must be greater than zero.";
+        assert_eq!(super::issue_tab(stepdown), Some("Passes"));
+        assert_eq!(
+            super::operation_issue_tab(Strategy::Pocket, stepdown),
+            Some("Passes")
+        );
+        assert_eq!(
+            super::operation_issue_tab(Strategy::Drill, stepdown),
+            Some("Cycle")
+        );
+        assert_eq!(
+            super::operation_issue_tab(Strategy::Drill, crate::manual::HELICAL_ON_MANUAL),
+            Some("Cycle")
+        );
+        assert_eq!(
+            super::operation_issue_tab(
+                Strategy::Drill,
+                "Choose a flat end mill for Helical milling."
+            ),
+            Some("Tool")
+        );
+    }
     // Written as escapes so this file does not contain the text it hunts for.
     const MOJIBAKE: [&str; 3] = ["\u{e2}\u{20ac}", "\u{c3}", "\u{c2}"];
 

@@ -244,9 +244,10 @@ pub fn instructions_with(pictures: bool, tool: bool, overview: bool) -> String {
     let holding = holding_rules(tool);
     let (per_setup, total) = (proposal::MAX_SETUP_OPERATIONS, proposal::MAX_OPERATIONS);
     let samples = format!(
-        "{},{:03}",
-        crate::cam::LIMIT / 1000,
-        crate::cam::LIMIT % 1000
+        "{},{:03},{:03}",
+        crate::cam::CEILING / 1_000_000,
+        crate::cam::CEILING / 1000 % 1000,
+        crate::cam::CEILING % 1000
     );
     format!("You plan CNC milling jobs for AXIS CAM Studio, a 3-axis CAM program. You receive a JSON part report and reply with one JSON proposal that matches the given schema. The program then generates every operation, simulates the stock, runs its export safety checks and tells you what failed, so you can correct the proposal.
 
@@ -261,14 +262,15 @@ THE PART REPORT
 - `workholding_library` lists the vises and clamps you may choose from, by `number`, with their sizes (see PLANNING THE HOLDING).
 
 STRATEGIES (the only six)
-- Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only the model's outline. Face makes levels × passes strokes, at most 2,000: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`. For example, 4 mm of stock above the face of an 84 mm wide stock and a Ø10 mill at `stepover_percent` 5 need a `stepdown` of 0.4 mm or more.
-- Pocket: clears from the stock top down to each floor it lists, each to its own depth, the highest first; a deeper floor inside a shallower one starts where that one stops. `surfaces` = all IDs of one or more floor planes of the orientation. Tool: a flat end mill no wider than the largest `max_cutter_diameter` of those floors; a floor it does not fit is skipped. A Pocket only goes where earlier operations left material, so the same Pocket again with a smaller cutter is a rest pass: it cleans the corners and narrow places a larger cutter could not reach, in a fraction of the time; give it `finish_passes` 0. `through` true also cuts each of the floors' `openings` down to where its walls end plus `breakthrough` (null means 1 mm), and the ones narrower than the cutter are left for a smaller one; their corners keep the cutter's radius, so finish cut-outs that need tight corners (switch cut-outs) with a rest pass of the smallest cutter that reaches; with `through` false or null the openings are cleared over at the floor's height only. `stepover_percent` at most 50, `stepdown` at most the flute length. The floor's depth plus the stock above the top must be less than the tool's stickout. `radial_allowance` and `axial_allowance` leave stock. `pocket_entry` is `Profile ramp` or `Plunge`; `ramp_angle` null or 0.1-15 degrees, also with `Plunge`. `finish_passes` a whole number 0-20. Its moves are about levels × the points of all its offset rings, and three settings multiply them: a smaller `stepover_percent` adds rings, each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot) (see the move limit under RULES).
-- Contour, `contour_mode` `outside`: one path around the whole model outline, from the stock top down to the model's bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length, `finish_passes` a whole number 0-20. The cut depth from the stock top must be less than the stickout; for a tall part use `bottom_offset` to stop higher and finish from the opposite side. It removes one tool width around the outline, not all surrounding stock. Its moves are about levels × the outline's points (see the move limit under RULES).
-- Contour, `contour_mode` `inside_floor`: the walls of one floor. `surfaces` = that floor's IDs. The tool and depth rules of Pocket apply: a flat end mill no wider than the floor's `max_cutter_diameter`, depth within the stickout, `stepdown` at most the flute length, `finish_passes` a whole number 0-20; `pocket_entry` and `ramp_angle` work as for Pocket, but its stepover is fixed at 40 %, so `stepover_percent` changes nothing. Its moves are about levels × the points of its rings, as for Pocket: each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot) (see the move limit under RULES).
-- Drill: drills the holes of one plane. `surfaces` = that plane's IDs. Tool: a drill no wider than the hole's `diameter` (one of exactly that diameter fits). With a chamfer mill instead it countersinks each hole: its point goes down until its cone is as wide as the hole's `opening_diameter` at the plane, so choose one at least that wide whose `tip_angle` is the countersink's, and drill the holes before it. `hole_diameter` limits it to holes whose `diameter` equals it (not `opening_diameter`); null drills every hole of the plane. The drill's depth is measured from the stock top: `stock_margin[0]` + the plane's `depth_below_top` + the hole's `depth` + `breakthrough` must be less than the drill's flute length. `drill_cycle` is `Drilling`, `Chip breaking`, `Deep drilling` (both need `peck`) or `Counterboring`. `peck` must be at least the drilling depth from the stock top ÷ 1,000: at most 1,000 pecks per hole.
+- Face: flattens the top. `surfaces` = the top plane's IDs. Tool: flat end mill or face mill. `stepdown` at most the flute length, `stepover_percent` 1-100. Facing needs stock above the face: use it only where the orientation's `stock_margin[0]` is greater than `bottom_offset`. `bottom_offset` above 0 leaves that much stock on the face. `facing_area` `stock` (or null) faces the whole stock top, `model` only the model's outline. Face makes levels × passes strokes: levels = (`stock_margin[0]` − `bottom_offset`) ÷ `stepdown`, rounded up; passes = (the faced width in Y + the tool diameter) ÷ the stepover in mm, rounded up, plus 1. The faced width is the stock's (the model's Y size + `stock_margin[4]` + `stock_margin[5]`), or the model's Y size with `facing_area` `model`.
+- Pocket: clears from the stock top down to each floor it lists, each to its own depth, the highest first; a deeper floor inside a shallower one starts where that one stops. `surfaces` = all IDs of one or more floor planes of the orientation. Tool: a flat end mill no wider than the largest `max_cutter_diameter` of those floors; a floor it does not fit is skipped. A Pocket only goes where earlier operations left material, so the same Pocket again with a smaller cutter is a rest pass: it cleans the corners and narrow places a larger cutter could not reach, in a fraction of the time; give it `finish_passes` 0. `through` true also cuts each of the floors' `openings` down to where its walls end plus `breakthrough` (null means 1 mm), and the ones narrower than the cutter are left for a smaller one; their corners keep the cutter's radius, so finish cut-outs that need tight corners (switch cut-outs) with a rest pass of the smallest cutter that reaches; with `through` false or null the openings are cleared over at the floor's height only. `stepover_percent` at most 50, `stepdown` at most the flute length. The floor's depth plus the stock above the top must be less than the tool's stickout. `radial_allowance` and `axial_allowance` leave stock. `pocket_entry` is `Profile ramp` or `Plunge`; `ramp_angle` null or 0.1-15 degrees, also with `Plunge`. `finish_passes` a whole number 0-20. Its moves are about levels × the points of all its offset rings, and three settings multiply them: a smaller `stepover_percent` adds rings, each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot).
+- Contour, `contour_mode` `outside`: one path around the whole model outline, from the stock top down to the model's bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length, `finish_passes` a whole number 0-20. The cut depth from the stock top must be less than the stickout; for a tall part use `bottom_offset` to stop higher and finish from the opposite side. It removes one tool width around the outline, not all surrounding stock. Its moves are about levels × the outline's points.
+- Contour, `contour_mode` `inside_floor`: the walls of one floor. `surfaces` = that floor's IDs. The tool and depth rules of Pocket apply: a flat end mill no wider than the floor's `max_cutter_diameter`, depth within the stickout, `stepdown` at most the flute length, `finish_passes` a whole number 0-20; `pocket_entry` and `ramp_angle` work as for Pocket, but its stepover is fixed at 40 %, so `stepover_percent` changes nothing. Its moves are about levels × the points of its rings, as for Pocket: each finish pass repeats the outermost ring at every level, and a smaller `ramp_angle` adds ramp moves at every entry (the tool stays down from ring to ring and enters again only for the deepest loop of each separate spot).
+- Drill: drills the holes of one plane. `surfaces` = that plane's IDs. Tool: a drill no wider than the hole's `diameter` (one of exactly that diameter fits). With a chamfer mill instead it countersinks each hole: its point goes down until its cone is as wide as the hole's `opening_diameter` at the plane, so choose one at least that wide whose `tip_angle` is the countersink's, and drill the holes before it. `hole_diameter` limits it to holes whose `diameter` equals it (not `opening_diameter`); null drills every hole of the plane. The drill's depth is measured from the stock top: `stock_margin[0]` + the plane's `depth_below_top` + the hole's `depth` + `breakthrough` must be less than the drill's flute length. `drill_cycle` is `Drilling`, `Chip breaking`, `Deep drilling` (both need `peck`), `Counterboring` or `Helical milling`.
+- Drill, `drill_cycle` `Helical milling`: mills each hole of the plane with a flat end mill instead of a drill, down a helix of `stepdown` per turn to a flat floor, so one end mill cuts holes of any size it fits and blind holes keep flat bottoms (a drill leaves its 118° point). Tool: a flat end mill no wider than the smallest selected hole's `diameter`; use `hole_diameter` to leave out the holes it does not fit. A hole over twice the cutter's diameter is cut in rings `stepover_percent` (1-100) apart. `stepdown` at most the flute length; the depth rule of drilling applies with the flute length. Not on a manual mill.
 - Drill, through holes: `through` may be true only in setup 1, and only when every hole the operation selects is a through hole in the report; use `hole_diameter` to select only those. Setups after the first rest on the face where a drill would exit, so drill through holes in setup 1, or set `through` false and list the exit in `unmachined`. With `through` true, `breakthrough` extends the drill below the hole; null means 1 mm. It is at most half the drill diameter plus 1 mm and never more than the stock below the model (`stock_margin[1]`).
-- Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm. On a 120 × 80 mm part with a Ø6 ball end mill this means a `surface_stepover` of about 0.6 mm or more with `tolerance` 0.02.
-- Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. It cuts that height ÷ `stepdown` layers, at most 300, but its moves (about layers × the outline's points) usually reach the move limit first: on a part of about 120 × 80 mm keep `stepdown` at or above about 0.5 mm (see RULES).
+- Parallel: surface-following finishing of the whole model from above. `surfaces` empty. Ball or flat end mill. `surface_stepover` at most the tool radius, `tolerance` 0.01-1. The pass count times the samples per pass must stay under {samples}: (the model's Y size ÷ `surface_stepover`) × (the model's X size ÷ step), where step = min(`surface_stepover`, √(8 × tool radius × `tolerance`), 1 mm) and must be at least 0.05 mm.
+- Waterline: constant-height passes around the model, always from the model's top down to its bottom plus `bottom_offset`. `surfaces` empty. Flat end mill, `stepdown` at most the flute length. That height must be less than the tool's stickout. It cuts that height ÷ `stepdown` layers, its moves about layers × the outline's points.
 
 WORKHOLDING
 - `workholding` in the part report, when present, describes what holds the stock in setup 1. `kind` is `Vise` (two jaws on opposite sides of the stock) or `Clamps`. `boxes` lists each jaw or clamp as [x0, y0, z0, x1, y1, z1] in setup 1's axes, in mm from the model's -X/-Y/bottom corner. A clamp lies over the stock top; a jaw reaches from the stock's bottom up to its top, which is its z1.
@@ -289,7 +291,7 @@ WORKHOLDING
 - Use only tool numbers from `tools` and surface IDs from the chosen orientation's `planes`. Never invent either.
 - Every setup needs at least one operation. At most {per_setup} operations per setup and {total} in total. Spindle speed is at least 100 rpm and feed at least 1 mm/min, both within the machine's maximums.
 - Every number must be finite.
-- Every operation is limited to {samples} moves (Parallel to {samples} samples, as above), and a finer stepdown or stepover multiplies them: Waterline makes about layers × the outline's points, Pocket and an inside-floor Contour about levels × the points of their rings (more with each finish pass and a smaller `ramp_angle`), an outside Contour about levels × the outline's points. On a part of about 120 × 80 mm, with Face first, keep `stepdown` at or above about 0.5 mm for Pocket, Contour and Waterline; a deeper cut needs a larger one. The 0.5 mm guide assumes `stepover_percent` 40, 1 finish pass and a `ramp_angle` of 1° or more; curved walls and round islands add hundreds of moves per level. With more finish passes, a smaller stepover or curved walls, use a larger `stepdown`, and keep `ramp_angle` at 1° or more.
+- Every operation is limited to {samples} moves (Parallel to {samples} samples, as above): what memory holds, far past any real job. A finer stepdown or stepover multiplies the moves and the cutting time: choose them for the cut, not to stay under the limit.
 - The program refuses any move whose tool centre line passes through the part, and any move below the bottom of the stock. In setups after the first, nothing may go below the part's underside.
 - `bottom_offset`, `radial_allowance` and `axial_allowance` cannot be negative. Only a through drill's breakthrough in setup 1 goes below the model, into the stock beneath it.
 - Order operations in a setup: Face, then Pocket (larger cutters before the rest passes of smaller ones), then Contour, then Drill (drills before chamfer mills), then finishing.
@@ -1496,7 +1498,7 @@ pub(crate) mod tests {
     #[test]
     fn the_instructions_state_the_limits_the_program_enforces() {
         let text = instructions();
-        let limit = crate::cam::LIMIT;
+        let limit = crate::cam::CEILING;
         for needed in [
             // Setups and orientations.
             "Each orientation may be used by one setup only".to_string(),
@@ -1522,10 +1524,15 @@ pub(crate) mod tests {
             "null means 1 mm".into(),
             "half the drill diameter plus 1 mm".into(),
             "`stock_margin[1]`".into(),
-            format!("{},{:03}", limit / 1000, limit % 1000),
+            format!(
+                "{},{:03},{:03}",
+                limit / 1_000_000,
+                limit / 1000 % 1000,
+                limit % 1000
+            ),
             "√(8 × tool radius × `tolerance`)".into(),
             "at least 0.05 mm".into(),
-            "layers, at most 300".into(),
+            "layers, its moves about layers × the outline's points".into(),
             // The report and the check report.
             "`truncated`".into(),
             "setup 1's frame".into(),
@@ -1739,7 +1746,9 @@ pub(crate) mod tests {
         assert_eq!((vc.round(), (fz * 1000.).round() / 1000.), (251., 0.042));
     }
     #[test]
-    fn the_parallel_example_in_the_instructions_holds_on_the_fixture() {
+    fn a_parallel_stepover_the_old_sample_limit_refused_now_generates() {
+        // At 0.5 mm on the 120 × 80 mm fixture: some 38,000 samples, past
+        // the 30,000 the preview once allowed.
         let (doc, mesh, report) = block();
         let generate = |stepover: f32| {
             let mut proposal = good(&report);
@@ -1753,11 +1762,9 @@ pub(crate) mod tests {
             let tool = job.tools.iter().find(|t| t.id == op.tool).unwrap();
             crate::cam::generate(setup, op, tool, &mesh)
         };
-        assert!(instructions().contains("On a 120 × 80 mm part with a Ø6 ball end mill"));
-        let size = &report.orientations[0].model_size;
-        assert_eq!((size[0].round(), size[1].round()), (120., 80.));
+        assert!(!instructions().contains("On a 120 × 80 mm part with a Ø6 ball end mill"));
         assert!(generate(0.6).is_ok());
-        assert!(generate(0.5).unwrap_err().contains("30,000"));
+        assert!(generate(0.5).is_ok());
     }
     /// Builds `edit`'s change to the passing plan and generates operation
     /// `oi` of setup 1 with the stock the operations before it leave, as the
@@ -1779,17 +1786,13 @@ pub(crate) mod tests {
         crate::simulation::prepare(&job, mesh, 0, oi).map(|s| s.plan.moves.len())
     }
     #[test]
-    fn the_move_limits_in_the_instructions_hold_on_the_fixture() {
+    fn fine_stepdowns_the_old_move_limit_refused_now_generate() {
         let fixture = block();
-        let size = &fixture.2.orientations[0].model_size;
-        assert_eq!((size[0].round(), size[1].round()), (120., 80.));
         let text = instructions();
-        assert!(text.contains("Every operation is limited to 30,000 moves"));
-        assert!(text.contains(
-            "On a part of about 120 × 80 mm, with Face first, keep `stepdown` at or above about 0.5 mm for Pocket, Contour and Waterline"
-        ));
-        // Pocket, outside Contour and Waterline at 0.5 mm pass in the order the
-        // instructions give; finer stepdowns that meet every other rule fail.
+        assert!(text.contains("Every operation is limited to 5,000,000 moves"));
+        assert!(!text.contains("keep `stepdown` at or above about 0.5 mm"));
+        // Pocket, outside Contour and Waterline at the stepdowns the 30,000
+        // move limit refused on the fixture.
         let stepdown = |strategy: &'static str, value: f32| {
             generated_in_setup_1(&fixture, |p| {
                 let ops = &mut p.setups[0].operations;
@@ -1805,18 +1808,8 @@ pub(crate) mod tests {
                 oi
             })
         };
-        for (strategy, passes, fails) in [
-            ("Pocket", 0.25, 0.2),
-            ("Contour", 0.35, 0.3),
-            ("Waterline", 0.45, 0.4),
-        ] {
-            assert_eq!(stepdown(strategy, 0.5), Ok(()), "{strategy} at 0.5 mm");
-            assert_eq!(stepdown(strategy, passes), Ok(()), "{strategy} {passes}");
-            let error = stepdown(strategy, fails).unwrap_err();
-            assert!(
-                error.contains("30,000 moves"),
-                "{strategy} {fails}: {error}"
-            );
+        for (strategy, refused) in [("Pocket", 0.2), ("Contour", 0.3), ("Waterline", 0.4)] {
+            assert_eq!(stepdown(strategy, refused), Ok(()), "{strategy} {refused}");
         }
     }
     #[test]
@@ -1845,9 +1838,6 @@ pub(crate) mod tests {
         assert!(
             inside.contains("its stepover is fixed at 40 %, so `stepover_percent` changes nothing")
         );
-        assert!(text.contains(
-            "The 0.5 mm guide assumes `stepover_percent` 40, 1 finish pass and a `ramp_angle` of 1° or more; curved walls and round islands add hundreds of moves per level"
-        ));
         // On the fixture, with Face first, at a 0.5 mm stepdown: a Pocket, or
         // an inside-floor Contour of the same floor after it.
         let at_half = |inside_floor: bool, edit: &dyn Fn(&mut proposal::ProposedOp)| {
@@ -1866,9 +1856,8 @@ pub(crate) mod tests {
                 oi
             })
         };
-        // The finish passes that go over the limit, with the tool staying
-        // down from ring to ring. No ramp angle allowed takes either over
-        // it: a loop the ramp would go round more than ten times plunges.
+        // The finish passes that went over the old 30,000 move limit
+        // generate now, as does every ramp angle.
         for (inside_floor, finish) in [(false, 4), (true, 5)] {
             let name = if inside_floor {
                 "inside floor"
@@ -1887,10 +1876,10 @@ pub(crate) mod tests {
                 Ok(()),
                 "{name}, ramp 1°"
             );
-            let error = at_half(inside_floor, &|o| o.finish_passes = Some(finish)).unwrap_err();
-            assert!(
-                error.contains("30,000 moves"),
-                "{name}, {finish} finish passes: {error}"
+            assert_eq!(
+                at_half(inside_floor, &|o| o.finish_passes = Some(finish)),
+                Ok(()),
+                "{name}, {finish} finish passes"
             );
             assert_eq!(
                 at_half(inside_floor, &|o| o.ramp_angle = Some(0.1)),
@@ -1900,8 +1889,7 @@ pub(crate) mod tests {
         }
         // A smaller stepover adds Pocket rings; an inside-floor Contour keeps 40 %.
         assert_eq!(at_half(false, &|o| o.stepover_percent = Some(12.)), Ok(()));
-        let error = at_half(false, &|o| o.stepover_percent = Some(10.)).unwrap_err();
-        assert!(error.contains("30,000 moves"), "{error}");
+        assert_eq!(at_half(false, &|o| o.stepover_percent = Some(10.)), Ok(()));
         assert_eq!(
             at_half(true, &|o| o.stepover_percent = Some(10.)),
             Ok(()),
@@ -1909,58 +1897,33 @@ pub(crate) mod tests {
         );
     }
     #[test]
-    fn the_facing_peck_and_setup_limits_in_the_instructions_hold_on_the_fixture() {
+    fn the_facing_peck_and_setup_rules_in_the_instructions_hold_on_the_fixture() {
         let fixture = block();
         let report = &fixture.2;
         let text = instructions();
-        // Face: levels × passes strokes, at most 2,000.
-        assert!(text.contains("Face makes levels × passes strokes, at most 2,000"));
-        assert!(text.contains(
-            "4 mm of stock above the face of an 84 mm wide stock and a Ø10 mill at `stepover_percent` 5 need a `stepdown` of 0.4 mm or more"
-        ));
+        // Face and drilling: the strokes and pecks the old limits refused
+        // generate, and the instructions no longer set them.
+        assert!(text.contains("Face makes levels × passes strokes: levels"));
+        assert!(!text.contains("at most 2,000") && !text.contains("÷ 1,000"));
         let o = &report.orientations[0];
-        let width = o.model_size[1] + o.stock_margin[4] + o.stock_margin[5];
-        assert_eq!((o.stock_margin[0], width.round()), (4., 84.));
-        let strokes = |stepdown: f32| {
-            let levels = (o.stock_margin[0] / stepdown).ceil();
-            let passes = ((width + 10.) / 0.5).ceil() + 1.;
-            levels * passes
-        };
-        for (stepdown, ok) in [(0.4, true), (0.38, false)] {
-            assert_eq!(strokes(stepdown) <= 2000., ok, "the formula at {stepdown}");
-            let result = generated_in_setup_1(&fixture, |p| {
-                let face = &mut p.setups[0].operations[0];
-                face.stepdown = Some(stepdown);
-                face.stepover_percent = Some(5.);
-                0
-            });
-            assert_eq!(result.is_ok(), ok, "Face at {stepdown}: {result:?}");
-            if !ok {
-                assert!(result.unwrap_err().contains("2,000 facing strokes"));
-            }
-        }
-        // Drill: `peck` at least the drilling depth from the stock top ÷ 1,000.
-        assert!(
-            text.contains("`peck` must be at least the drilling depth from the stock top ÷ 1,000")
-        );
+        let face = generated_in_setup_1(&fixture, |p| {
+            let face = &mut p.setups[0].operations[0];
+            face.stepdown = Some(0.38);
+            face.stepover_percent = Some(5.);
+            0
+        });
+        assert_eq!(face, Ok(()), "Face at 0.38 mm and 5 %");
         let top = o.planes.iter().find(|p| p.kind == "top").unwrap();
         let deepest = top.holes.iter().map(|h| h.depth).fold(0., f32::max);
         let depth = o.stock_margin[0] + top.depth_below_top + deepest;
-        assert_eq!(depth.round(), 44.);
-        for (factor, ok) in [(1.02, true), (0.98, false)] {
-            // The drill runs first, so it starts at the stock top.
-            let result = generated_in_setup_1(&fixture, |p| {
-                let ops = &mut p.setups[0].operations;
-                let mut drill = ops.remove(3);
-                drill.peck = Some(depth / 1000. * factor);
-                ops.insert(0, drill);
-                0
-            });
-            assert_eq!(result.is_ok(), ok, "peck × {factor}: {result:?}");
-            if !ok {
-                assert!(result.unwrap_err().contains("1,000 steps per hole"));
-            }
-        }
+        let pecks = generated_in_setup_1(&fixture, |p| {
+            let ops = &mut p.setups[0].operations;
+            let mut drill = ops.remove(3);
+            drill.peck = Some(depth / 1000. * 0.98);
+            ops.insert(0, drill);
+            0
+        });
+        assert_eq!(pecks, Ok(()), "over 1,000 pecks a hole");
         // Every setup needs at least one operation.
         assert!(text.contains("Every setup needs at least one operation."));
         let mut empty = good(report);
@@ -1979,74 +1942,19 @@ pub(crate) mod tests {
         ));
     }
     #[test]
-    fn the_face_formula_and_the_waterline_layer_limit_hold_exactly() {
-        let fixture = block();
-        let o = &fixture.2.orientations[0];
-        // Face strokes as the instructions state them, for a faced width in
-        // Y, a Ø10 mill and a stepover in percent.
-        let strokes = |width: f32, percent: f32, stepdown: f32, plus_one: f32| {
-            let levels = (o.stock_margin[0] / stepdown).ceil();
-            let passes = ((width + 10.) / (10. * percent / 100.)).ceil() + plus_one;
-            levels * passes
-        };
-        let face = |area: &'static str, percent: f32, stepdown: f32| {
-            generated_in_setup_1(&fixture, |p| {
-                let face = &mut p.setups[0].operations[0];
-                face.stepdown = Some(stepdown);
-                face.stepover_percent = Some(percent);
-                face.facing_area = Some(area.into());
-                0
-            })
-        };
-        let stock = o.model_size[1] + o.stock_margin[4] + o.stock_margin[5];
-        let model = o.model_size[1];
-        assert_eq!((stock.round(), model.round()), (84., 80.));
-        for (area, width, percent, stepdown, ok) in [
-            // The "+1" decides this pair: 26 levels × 76 rows is 1,976, but
-            // 26 × (76 + 1) is 2,002.
-            ("stock", stock, 12.5, 0.155, false),
-            ("stock", stock, 12.5, 0.165, true),
-            // `facing_area` `model` faces the model's Y size, not the stock's.
-            ("model", model, 5., 0.38, true),
-            ("model", model, 5., 0.36, false),
-            ("stock", stock, 5., 0.38, false),
-        ] {
-            let label = format!("Face {area} {percent}% at {stepdown}");
-            assert_eq!(
-                strokes(width, percent, stepdown, 1.) <= 2000.,
-                ok,
-                "{label}"
-            );
-            let result = face(area, percent, stepdown);
-            assert_eq!(result.is_ok(), ok, "{label}: {result:?}");
-            if !ok {
-                assert!(result.unwrap_err().contains("2,000 facing strokes"));
-            }
-        }
-        assert!(
-            strokes(stock, 12.5, 0.155, 0.) <= 2000.,
-            "without the +1 the formula would allow 0.155"
-        );
-        // Waterline: 300 layers generate and 301 are refused, on a 20 mm high
-        // box whose outline is short enough that the move limit does not
-        // bind first.
+    fn a_waterline_past_the_old_300_layers_generates() {
+        // A 20 mm high box: 301 layers, once refused.
         let (doc, mesh, report) = open_box();
-        let waterline = |stepdown: f32| {
-            let mut proposal = complete(&report);
-            let mut op = proposal::tests::op("Waterline", 1, vec![]);
-            op.stepdown = Some(stepdown);
-            proposal.setups[0].operations.push(op);
-            let job = proposal::build(&doc, &mesh, &report, &proposal).unwrap();
-            crate::simulation::prepare(&job, &mesh, 0, 2)
-                .map(|s| (s.plan.levels, s.plan.moves.len()))
-        };
-        assert_eq!(report.orientations[0].model_size[2], 20.);
-        let (levels, moves) = waterline(20. / 299.8).unwrap();
-        assert_eq!(levels, 300);
-        // About 59 moves a layer: 301 layers would still be far below 30,000.
-        assert!(moves < crate::cam::LIMIT * 2 / 3, "{moves} moves");
-        let error = waterline(20. / 300.5).unwrap_err();
-        assert!(error.contains("exceeds 300 layers"), "{error}");
+        let mut proposal = complete(&report);
+        let mut op = proposal::tests::op("Waterline", 1, vec![]);
+        op.stepdown = Some(20. / 300.5);
+        proposal.setups[0].operations.push(op);
+        let job = proposal::build(&doc, &mesh, &report, &proposal).unwrap();
+        let levels = crate::simulation::prepare(&job, &mesh, 0, 2)
+            .unwrap()
+            .plan
+            .levels;
+        assert_eq!(levels, 301);
     }
     #[tokio::test]
     async fn a_failed_check_is_sent_back_and_the_repair_is_accepted() {

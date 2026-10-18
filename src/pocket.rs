@@ -21,7 +21,6 @@ type Loop = (Polygon, Option<Vec<(f64, f64)>>);
 /// depth, its first cutting height, its target and whether it is what
 /// earlier cuts left.
 type Planned = (Vec<Vec<Polygon>>, Vec<Polygon>, f32, f32, bool);
-const MAX_MOVES: usize = 30_000;
 /// How far above the level before, mm, a loop's rapid descent stops below
 /// the first level.
 const ENTRY: f32 = 0.5;
@@ -50,7 +49,7 @@ fn positive(tool: &Tool, key: &str) -> Result<f32, String> {
         .ok_or_else(|| format!("Enter a positive tool {key}."))
 }
 /// Clip a triangle to the half-space above the floor before projecting it.
-fn above(points: &[[f32; 3]], z: f32) -> Polygon {
+pub(crate) fn above(points: &[[f32; 3]], z: f32) -> Polygon {
     let mut result = Vec::new();
     for (a, b) in points
         .iter()
@@ -322,12 +321,10 @@ fn push(
     rate: f32,
     cutting: bool,
 ) -> Result<(), String> {
-    if plan.moves.len() >= MAX_MOVES {
-        return Err(
-            "Pocket preview exceeds 30,000 moves. Increase stepover, stepdown or ramp angle."
-                .into(),
-        );
+    if plan.moves.len() >= crate::cam::CEILING {
+        return Err(crate::cam::too_many("moves"));
     }
+    crate::progress::step(plan.moves.len())?;
     let distance = (0..3)
         .map(|i| (position[i] - to[i]).powi(2))
         .sum::<f32>()
@@ -353,6 +350,12 @@ fn push(
 /// counts as overhung: the chord deviation of the STEP reader's tessellation,
 /// by which a curved vertical wall's triangles stand off it.
 const LEAN: f64 = 0.05;
+/// A floor overhung past `LEAN` only in bands narrower than this, mm, is not
+/// refused: the cutter keeps clear of everything above it (`Floor::above`),
+/// so such a band is left uncut, as a corner too tight for the cutter is.
+/// The TOTEM case's socket floors run a few hundredths of a millimetre under
+/// the walls over them in their STEP, in slivers about 0.01 mm wide.
+const SHALLOW_OVERHANG: f64 = 0.2;
 /// Material earlier cuts left in a band thinner than twice this, mm, is not
 /// cut again: two cutters' margins along a wall, and the outlines' chords,
 /// differ by about this much.
@@ -424,13 +427,20 @@ pub fn floor(
     }
     let above = region(obstacles)?;
     // Reject overhanging/tapered geometry rather than assuming vertical
-    // access; a wall's tessellation may lean over the floor by `LEAN`.
+    // access; a wall's tessellation may lean over the floor by `LEAN`, and
+    // bands narrower than `SHALLOW_OVERHANG` beyond that are left uncut.
     let blocked = intersect::<Milli>(
         area.clone(),
         above.inflate(-LEAN, JoinType::Round, EndType::Polygon, 2.),
         FillRule::NonZero,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    .inflate(
+        -SHALLOW_OVERHANG / 2.,
+        JoinType::Round,
+        EndType::Polygon,
+        2.,
+    );
     if blocked.signed_area().abs() > 0.05 {
         return Err("Geometry above this floor obstructs vertical access. Pocket preview supports open, vertical-wall 2.5D pockets; choose another floor or setup.".into());
     }
@@ -544,6 +554,681 @@ impl Floor {
             })
             .collect()
     }
+}
+/// How far a surface may lean from vertical and still be a wall that picks
+/// its hole: the z of its unit normal in the setup's frame (30°). A wall
+/// that leans is cut at its outline at one height (`ring`); whatever of the
+/// part comes over that outline is kept clear of (`hole`). Short curved walls are tessellated with facets several
+/// degrees off vertical though the wall moves only hundredths of a mm.
+pub const WALL: f32 = 0.5;
+/// A hole picked by its walls, as `setup` places the part (mm): what a Pocket
+/// or an inside Contour cuts when the walls of a hole are selected instead
+/// of a floor.
+pub struct Hole {
+    /// The walls' outline seen from above, at the height `ring` takes it.
+    pub outline: Region,
+    /// How deep it is cut where, highest first: each region of the outline
+    /// that nothing of the part is over down to a floor under it, cut to
+    /// that floor, and last where nothing of the part is under it at all,
+    /// cut through. Each region holds those after it.
+    pub levels: Vec<Level>,
+    /// How high and low the part goes at its outline: its rim, and where
+    /// a cut through it goes past (by Breakthrough).
+    pub top: f32,
+    pub bottom: f32,
+    /// The mesh surfaces of its walls.
+    pub walls: Vec<usize>,
+}
+/// A region of a hole (`Hole::levels`) and how deep it is cut.
+#[derive(Clone)]
+pub struct Level {
+    /// What of the outline nothing of the part is over down to `floor`.
+    pub open: Region,
+    /// The part near the hole over that height, seen from above: what the
+    /// cutter keeps clear of, as of a floor's `above`.
+    pub over: Region,
+    /// The floor it is cut to; None where it goes through.
+    pub floor: Option<f32>,
+}
+impl Level {
+    /// Where the centre of a cutter `inset` from the part may go to cut this
+    /// level of `hole`: inside its outline, and clear of anything of the
+    /// part over the level.
+    fn centres(&self, hole: &Hole, inset: f64) -> Result<Region, String> {
+        Ok(difference::<Milli>(
+            Centres::Region(hole.outline.clone()).at(inset)?,
+            (self.over).inflate(inset, JoinType::Round, EndType::Polygon, 2.),
+            FillRule::NonZero,
+        )
+        .map_err(|e| e.to_string())?
+        .simplify(0.001, false))
+    }
+}
+impl Hole {
+    /// The box of what of it is open from above.
+    fn reach(&self) -> ((f64, f64), (f64, f64)) {
+        let loops: Vec<Polygon> = self.levels[0].open.clone().into();
+        extent(&loops.concat())
+    }
+    /// The middle of what of it is open from above (x, y).
+    pub fn centre(&self) -> (f64, f64) {
+        let (low, high) = self.reach();
+        ((low.0 + high.0) / 2., (low.1 + high.1) / 2.)
+    }
+    /// The width and depth of what of it is open from above.
+    pub fn size(&self) -> (f64, f64) {
+        let (low, high) = self.reach();
+        (high.0 - low.0, high.1 - low.1)
+    }
+    /// Which of its levels a flat cutter of `diameter` cuts with `radial`
+    /// allowance left, as `generate` places it: the others are left uncut.
+    pub fn fits(&self, diameter: f32, radial: f32) -> Vec<bool> {
+        let radius = diameter / 2.;
+        let inset = (radius + radial + (radius * 0.01).max(0.02)) as f64;
+        (self.levels.iter())
+            .map(|l| l.centres(self, inset).is_ok_and(|c| c.contains_points()))
+            .collect()
+    }
+    /// What `fits` leaves uncut, as warnings: the hole, or each part of it,
+    /// too narrow for the cutter.
+    pub fn uncut(&self, diameter: f32, fits: &[bool]) -> Vec<String> {
+        let (x, y) = self.centre();
+        let (w, d) = self.size();
+        if fits.iter().all(|f| !f) {
+            return vec![format!(
+                "The hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm) is too narrow for the Ø{diameter} cutter with this radial allowance: it is left uncut. Pick it in a Pocket with a smaller cutter."
+            )];
+        }
+        (self.levels.iter().zip(fits))
+            .filter(|(_, fits)| !**fits)
+            .map(|(l, _)| {
+                format!(
+                    "Part of the hole at X{x:.2} Y{y:.2}, {}, is too narrow for the Ø{diameter} cutter: it is left uncut.",
+                    self.depth(l)
+                )
+            })
+            .collect()
+    }
+    /// How deep a level of it goes, below its rim.
+    pub fn depth(&self, level: &Level) -> String {
+        match level.floor {
+            Some(floor) => format!("{:.2} mm deep to a floor", self.top - floor),
+            None => format!("through, {:.2} mm deep", self.top - self.bottom),
+        }
+    }
+    /// Whether some of it goes through the part.
+    pub fn through(&self) -> bool {
+        self.levels.iter().any(|l| l.floor.is_none())
+    }
+    /// Whether `other` is this hole: their outlines differ by no more than
+    /// a hairline (one crossed at another height, through other facets).
+    pub fn same_place(&self, other: &Hole) -> bool {
+        let thin = |a: &Region, b: &Region| {
+            difference::<Milli>(a.clone(), b.clone(), FillRule::NonZero).is_ok_and(|d| {
+                d.inflate(
+                    -(LEAN + SHALLOW_OVERHANG / 2.),
+                    JoinType::Round,
+                    EndType::Polygon,
+                    2.,
+                )
+                .signed_area()
+                .abs()
+                    <= 0.05
+            })
+        };
+        thin(&self.outline, &other.outline) && thin(&other.outline, &self.outline)
+    }
+}
+/// Whether mesh surface `id` is a wall, as `setup` turns the part: what a
+/// click on it picks in a Pocket or a Contour is the hole it is a wall of.
+pub fn is_wall(setup: &Setup, mesh: &Mesh, id: usize) -> bool {
+    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    mesh.surfaces
+        .get(id)
+        .is_some_and(|s| crate::mesh::rotation(s.normal, angles)[2].abs() < WALL)
+}
+/// Where triangle `p` crosses the height `z`: the points on its two edges
+/// that pass it. Each is worked out from its edge's ends in one order, so
+/// the two triangles on an edge find the same point.
+fn crossing(p: &[[f32; 3]; 3], z: f32) -> Option<[(f64, f64); 2]> {
+    let mut found = vec![];
+    for k in 0..3 {
+        let (mut a, mut b) = (p[k], p[(k + 1) % 3]);
+        if (a[2] >= z) == (b[2] >= z) {
+            continue;
+        }
+        if a.partial_cmp(&b) == Some(std::cmp::Ordering::Greater) {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let t = (z - a[2]) / (b[2] - a[2]);
+        found.push((
+            (a[0] + t * (b[0] - a[0])) as f64,
+            (a[1] + t * (b[1] - a[1])) as f64,
+        ));
+    }
+    (found.len() == 2 && found[0] != found[1]).then(|| [found[0], found[1]])
+}
+/// Surfaces of the part, by index: a hole's walls.
+type Walls = std::collections::BTreeSet<usize>;
+/// Where a point of a `Section` is, to 10 nm.
+fn spot(p: (f64, f64)) -> (i64, i64) {
+    ((p.0 * 1e5).round() as i64, (p.1 * 1e5).round() as i64)
+}
+/// The part's faces cut at one height: each face's segment there, and the
+/// segments at each of their ends.
+struct Section<'a> {
+    segments: Vec<([(f64, f64); 2], &'a crate::cam::Triangle)>,
+    at: std::collections::HashMap<(i64, i64), Vec<usize>>,
+}
+impl<'a> Section<'a> {
+    fn new(g: &'a crate::cam::Geometry, z: f32) -> Self {
+        let mut segments = vec![];
+        let mut at: std::collections::HashMap<_, Vec<usize>> = Default::default();
+        for t in &g.triangles {
+            if let Some(s) = crossing(&t.p, z) {
+                for p in s {
+                    at.entry(spot(p)).or_default().push(segments.len());
+                }
+                segments.push((s, t));
+            }
+        }
+        Self { segments, at }
+    }
+    /// The closed loop through segment `first`: its outline (counterclockwise),
+    /// the surfaces it passes through and its segments.
+    fn walk(&self, first: usize) -> Result<(Polygon, Walls, Vec<usize>), String> {
+        let (mut path, mut walls, mut passed) = (vec![], Walls::new(), vec![]);
+        let (mut i, mut p) = (first, self.segments[first].0[1]);
+        loop {
+            let t = self.segments[i].1;
+            if facing(&t.p) >= WALL {
+                return Err(LEANING.into());
+            }
+            walls.extend(t.feature);
+            passed.push(i);
+            path.push(p);
+            if path.len() > self.segments.len() {
+                return Err(OPEN.into());
+            }
+            let [next] = (self.at[&spot(p)].iter())
+                .filter(|&&j| j != i)
+                .collect::<Vec<_>>()[..]
+            else {
+                return Err(OPEN.into());
+            };
+            i = *next;
+            let [a, b] = self.segments[i].0;
+            p = if spot(a) == spot(p) { b } else { a };
+            if i == first {
+                break;
+            }
+        }
+        if area(&path) < 0. {
+            path.reverse();
+        }
+        Ok((path, walls, passed))
+    }
+}
+const OPEN: &str = "The walls there do not close round one hole at one height: select the floor of the pocket instead.";
+/// The loop the part's faces make at height `z` through a wall of surface
+/// `start`: its outline and the surfaces it passes through.
+fn ring(g: &crate::cam::Geometry, start: usize, z: f32) -> Result<(Polygon, Walls), String> {
+    let section = Section::new(g, z);
+    let first = (section.segments.iter())
+        .position(|(_, t)| t.feature == Some(start))
+        .ok_or(OPEN)?;
+    section.walk(first).map(|(path, walls, _)| (path, walls))
+}
+/// The outline of the hole whose walls are exactly `walls`: the loop at
+/// their `level` that passes through them all and nothing else. A wall can
+/// be in loops at other heights too (a pocket's wall that goes on down the
+/// side of a slot in its floor), so the loop is found from all of them.
+fn loop_of(g: &crate::cam::Geometry, spans: &Spans, walls: &Walls) -> Result<Polygon, String> {
+    let section = Section::new(g, level(spans, walls)?);
+    let mut passed = std::collections::HashSet::new();
+    for (i, (_, t)) in section.segments.iter().enumerate() {
+        if passed.contains(&i) || !t.feature.is_some_and(|f| walls.contains(&f)) {
+            continue;
+        }
+        let Ok((path, found, through)) = section.walk(i) else {
+            passed.insert(i);
+            continue;
+        };
+        if found == *walls {
+            return Ok(path);
+        }
+        passed.extend(through);
+    }
+    Err(OPEN.into())
+}
+/// The z of triangle `p`'s unit normal, unsigned.
+fn facing(p: &[[f32; 3]; 3]) -> f32 {
+    let a: [f32; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
+    let b: [f32; 3] = std::array::from_fn(|i| p[2][i] - p[0][i]);
+    let n = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if length > 0. { n[2].abs() / length } else { 1. }
+}
+/// Each surface's lowest and highest point, by surface.
+type Spans = std::collections::HashMap<usize, (f32, f32)>;
+fn spans(g: &crate::cam::Geometry) -> Spans {
+    let mut spans = Spans::new();
+    for t in &g.triangles {
+        if let Some(id) = t.feature {
+            let span = spans
+                .entry(id)
+                .or_insert((f32::INFINITY, f32::NEG_INFINITY));
+            for p in t.p {
+                *span = (span.0.min(p[2]), span.1.max(p[2]));
+            }
+        }
+    }
+    spans
+}
+/// The height a hole made of `walls` is taken at: a little under the middle
+/// of the heights every one of them reaches, so not on a corner.
+fn level(spans: &Spans, walls: &Walls) -> Result<f32, String> {
+    let (mut low, mut high) = (f32::NEG_INFINITY, f32::INFINITY);
+    for id in walls {
+        let (lo, hi) = spans
+            .get(id)
+            .copied()
+            .unwrap_or((f32::INFINITY, f32::NEG_INFINITY));
+        low = low.max(lo);
+        high = high.min(hi);
+    }
+    if high.partial_cmp(&low) != Some(std::cmp::Ordering::Greater) {
+        return Err(
+            "The walls of that hole do not share a height: select its floor instead.".into(),
+        );
+    }
+    Ok(low + 0.4813 * (high - low))
+}
+/// The walls of the hole a wall of surface `id` belongs to: the loop of
+/// walls at a height they all reach, found again from those walls until it
+/// stays the same. The outline is that loop, as `loop_of` finds it again
+/// from the walls alone.
+fn walls_of(
+    g: &crate::cam::Geometry,
+    spans: &Spans,
+    id: usize,
+) -> Result<(Polygon, Walls), String> {
+    let mut walls = Walls::from([id]);
+    for _ in 0..6 {
+        let found = ring(g, id, level(spans, &walls)?)?.1;
+        if found == walls {
+            return Ok((loop_of(g, spans, &walls)?, walls));
+        }
+        walls = found;
+    }
+    Err("The walls of that hole do not settle at one height: select its floor instead.".into())
+}
+/// The surfaces a click on wall `id` adds or removes in a Pocket or Contour:
+/// the walls of its hole, checked as `holes` cuts it.
+pub fn hole_walls(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Vec<usize>, String> {
+    let g = crate::cam::Geometry::new(setup, mesh);
+    let spans = spans(&g);
+    let (path, walls) = walls_of(&g, &spans, id)?;
+    hole(&g, &spans, path, walls).map(|h| h.walls)
+}
+/// Why a wall picks no hole when its outline crosses a sloping face: a
+/// chamfer's, a fillet's, a cone's (`hole_near` looks past it).
+pub const LEANING: &str = "At that wall's height the hole's outline runs over a face leaning more than 30° (a chamfer, a fillet or a cone): click a straighter wall of the hole.";
+/// For a click in a Pocket or Contour on a face that is neither a floor nor
+/// a wall (a screw hole's cone, a chamfer, a fillet), or on a wall whose
+/// outline crosses one (`LEANING`, a screw hole's lip): the walls of the
+/// nearest hole past it, across the sloping faces joined to it. The walls
+/// they border are tried nearest first, up to 64 faces away. None when they
+/// border no wall.
+pub fn hole_near(setup: &Setup, mesh: &Mesh, id: usize) -> Option<Result<Vec<usize>, String>> {
+    let g = crate::cam::Geometry::new(setup, mesh);
+    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
+    let floor = |f: usize| {
+        mesh.surfaces.get(f).is_some_and(|s| {
+            crate::mesh::rotation(s.normal, angles)[2].abs() >= 0.5f32.to_radians().cos()
+        })
+    };
+    // The surfaces at each corner, and each surface's corners: faces meet
+    // at a corner where a mesher left a T where an edge would be.
+    let corner = |p: [f32; 3]| p.map(|v| (v as f64 * 1e5).round() as i64);
+    let mut at: std::collections::HashMap<[i64; 3], Vec<usize>> = Default::default();
+    let mut corners: std::collections::HashMap<usize, Vec<[i64; 3]>> = Default::default();
+    for t in &g.triangles {
+        let Some(f) = t.feature else { continue };
+        for p in t.p {
+            let c = corner(p);
+            at.entry(c).or_default().push(f);
+            corners.entry(f).or_default().push(c);
+        }
+    }
+    let (mut queue, mut seen, mut walls) = (
+        std::collections::VecDeque::from([id]),
+        std::collections::HashSet::from([id]),
+        vec![],
+    );
+    while let Some(f) = queue.pop_front() {
+        for c in corners.get(&f).into_iter().flatten() {
+            for &next in &at[c] {
+                if seen.len() >= 64 || !seen.insert(next) {
+                    continue;
+                }
+                if is_wall(setup, mesh, next) {
+                    walls.push(next);
+                } else if !floor(next) {
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+    // The nearest few: each is a section of the whole part.
+    let spans = spans(&g);
+    let mut last = None;
+    for wall in walls.into_iter().take(8) {
+        match walls_of(&g, &spans, wall).and_then(|(path, walls)| hole(&g, &spans, path, walls)) {
+            Ok(found) => return Some(Ok(found.walls)),
+            Err(e) => last = Some(Err(e)),
+        }
+    }
+    last
+}
+/// What a click on surface `n` drops from a Pocket's selection `picked`,
+/// whose holes are `now`, and what of it stays (walls another picked hole
+/// shares); None when it drops nothing. `clicked` is what the click alone
+/// picks (None when its own outline picks no hole) and `this` its holes. It
+/// drops each picked hole `n` is a wall of, in the same place as one it
+/// picks, or (when all it picks is picked) whose walls it picks, with all
+/// it picks: a click picks and drops the same walls.
+#[allow(clippy::type_complexity)]
+pub fn dropped(
+    now: &[Hole],
+    picked: &std::collections::HashSet<usize>,
+    n: usize,
+    clicked: Option<&std::collections::HashSet<usize>>,
+    this: &[Hole],
+) -> Option<(
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<usize>,
+)> {
+    let again = clicked.is_some_and(|c| c.is_subset(picked));
+    let on: Vec<usize> = (0..now.len())
+        .filter(|&i| {
+            let h = &now[i];
+            h.walls.contains(&n)
+                || this.iter().any(|t| t.same_place(h))
+                || (again && clicked.is_some_and(|c| h.walls.iter().all(|w| c.contains(w))))
+        })
+        .collect();
+    if on.is_empty() && !again && !picked.contains(&n) {
+        return None;
+    }
+    let mut drop: std::collections::HashSet<usize> = on
+        .iter()
+        .flat_map(|&i| now[i].walls.iter().copied())
+        .collect();
+    drop.insert(n);
+    if again {
+        drop.extend(clicked.into_iter().flatten().copied());
+    }
+    let keep = (0..now.len())
+        .filter(|i| !on.contains(i))
+        .flat_map(|i| now[i].walls.iter().copied())
+        .collect();
+    Some((drop, keep))
+}
+/// The holes the selected walls among `ids` pick (a Pocket's surfaces), as
+/// `setup` places the part: the hole of each wall not in one found before,
+/// as a click on it picks it. Two holes may share a wall (a pocket's wall
+/// that goes on down the side of a slot in its floor).
+pub fn holes(
+    setup: &Setup,
+    ids: &std::collections::HashSet<usize>,
+    mesh: &Mesh,
+) -> Result<Vec<Hole>, String> {
+    let selected: Walls = (ids.iter().copied())
+        .filter(|&id| is_wall(setup, mesh, id))
+        .collect();
+    if selected.is_empty() {
+        return Ok(vec![]);
+    }
+    let g = crate::cam::Geometry::new(setup, mesh);
+    let spans = spans(&g);
+    let (mut found, mut covered, mut waiting) = (vec![], Walls::new(), vec![]);
+    for &id in &selected {
+        if covered.contains(&id) {
+            continue;
+        }
+        // A shared wall can pick a hole that is not selected: it waits for
+        // the hole it is in that is.
+        match walls_of(&g, &spans, id) {
+            Ok((path, walls)) if walls.iter().all(|w| ids.contains(w)) => {
+                covered.extend(&walls);
+                found.push(hole(&g, &spans, path, walls)?);
+            }
+            Ok((path, _)) => {
+                let (x, y) = extent(&path).0;
+                waiting.push((id, format!(
+                    "The hole near X{x:.2} Y{y:.2} is selected only in part: clear the selection and click the hole again."
+                )));
+            }
+            Err(e) => waiting.push((id, e)),
+        }
+    }
+    if let Some((_, e)) = waiting.into_iter().find(|(id, _)| !covered.contains(id)) {
+        return Err(e);
+    }
+    Ok(found)
+}
+/// The height of triangle `p` over `xy` when `xy` is strictly inside its
+/// outline seen from above: on an edge, neither triangle there counts.
+fn over(p: &[[f32; 3]; 3], xy: [f32; 2]) -> Option<f32> {
+    let a = [p[1][0] - p[0][0], p[1][1] - p[0][1]];
+    let b = [p[2][0] - p[0][0], p[2][1] - p[0][1]];
+    let v = [xy[0] - p[0][0], xy[1] - p[0][1]];
+    let det = a[0] * b[1] - a[1] * b[0];
+    if det.abs() < 1e-8 {
+        return None;
+    }
+    let u = (v[0] * b[1] - v[1] * b[0]) / det;
+    let w = (a[0] * v[1] - a[1] * v[0]) / det;
+    (u > 0. && w > 0. && u + w < 1.)
+        .then_some(p[0][2] + u * (p[1][2] - p[0][2]) + w * (p[2][2] - p[0][2]))
+}
+/// A triangle's part below height `z`, as `above` keeps the part above.
+fn below(points: &[[f32; 3]], z: f32) -> Polygon {
+    let flipped: Vec<[f32; 3]> = points.iter().map(|p| [p[0], p[1], -p[2]]).collect();
+    above(&flipped, -z)
+}
+/// The hole with outline `path` and `walls`: its floor, the bottom of its
+/// walls, and what of it is open from above down to where it is cut. One
+/// the part covers is not a hole (the outside of the part or of an island).
+fn hole(
+    g: &crate::cam::Geometry,
+    spans: &Spans,
+    path: Polygon,
+    walls: Walls,
+) -> Result<Hole, String> {
+    let z = level(spans, &walls)?;
+    let (low, high) = extent(&path);
+    // Just inside the walls, at the height they were picked at, a hole is
+    // empty: a ray up from there crosses the part's faces an even number of
+    // times (none, or under and over a lip). The outside of the part or of
+    // an island has the part there. A few places round the outline vote.
+    let (mut empty, mut votes) = (0, 0);
+    for k in (0..path.len()).step_by((path.len() / 8).max(1)) {
+        let (a, b) = (path[k], path[(k + 1) % path.len()]);
+        let length = (b.0 - a.0).hypot(b.1 - a.1);
+        if length < 0.001 {
+            continue;
+        }
+        // The outline goes counterclockwise: its inside is on the left.
+        let q = [
+            ((a.0 + b.0) / 2. - (b.1 - a.1) / length * 0.01) as f32,
+            ((a.1 + b.1) / 2. + (b.0 - a.0) / length * 0.01) as f32,
+        ];
+        let crossings = (g.triangles.iter())
+            .filter(|t| over(&t.p, q).is_some_and(|h| h > z))
+            .count();
+        votes += 1;
+        if crossings % 2 == 0 {
+            empty += 1;
+        }
+    }
+    let (x, y) = ((low.0 + high.0) / 2., (low.1 + high.1) / 2.);
+    if empty * 2 <= votes {
+        return Err(format!(
+            "The part is inside the outline at X{x:.2} Y{y:.2}: it is the outside of the part or of an island, not a hole. Click the wall of a hole."
+        ));
+    }
+    let outline = Paths::<Milli>::from(vec![path.clone()]);
+    let inside = outline.inflate(-LEAN, JoinType::Round, EndType::Polygon, 2.);
+    if !inside.contains_points() {
+        return Err(format!("The hole at X{x:.2} Y{y:.2} is too small to cut."));
+    }
+    let near: Vec<&crate::cam::Triangle> = (g.triangles.iter())
+        .filter(|t| {
+            let (xs, ys) = (t.p.map(|p| p[0] as f64), t.p.map(|p| p[1] as f64));
+            xs.iter().copied().fold(f64::INFINITY, f64::min) <= high.0
+                && xs.iter().copied().fold(f64::NEG_INFINITY, f64::max) >= low.0
+                && ys.iter().copied().fold(f64::INFINITY, f64::min) <= high.1
+                && ys.iter().copied().fold(f64::NEG_INFINITY, f64::max) >= low.1
+        })
+        .collect();
+    // How high and low the part goes at the outline: the corners on it
+    // (give or take a faceted wall's lean) of every face that runs along it
+    // (two corners on it), not only of the walls picked (a wall's facets may
+    // stop part way down, the rest crossed elsewhere). A face's corner off
+    // the outline is not the hole's: a slope beside it may run far down.
+    let on = |p: &[f32; 3]| distance(&path, (p[0] as f64, p[1] as f64)) <= 0.15;
+    let heights = (near.iter())
+        .filter(|t| t.p.iter().filter(|p| on(p)).count() >= 2)
+        .flat_map(|t| t.p.into_iter().filter(|p| on(p)).map(|p| p[2]));
+    let top = heights.clone().fold(f32::NEG_INFINITY, f32::max);
+    let bottom = heights.fold(f32::INFINITY, f32::min);
+    // The floors under the outline: each face's (not a wall's) highest over
+    // the outline's inside. A faceted wall's facets lean a few degrees, and
+    // one leaning in is kept clear of as the part over the hole.
+    let mut floors: Vec<f32> = vec![];
+    for t in &near {
+        if facing(&t.p) < WALL {
+            continue;
+        }
+        let mut p = below(&t.p, z);
+        if area(&p).abs() < 0.000001 {
+            continue;
+        }
+        if area(&p) < 0. {
+            p.reverse();
+        }
+        let under = intersect::<Milli>(inside.clone(), vec![p], FillRule::NonZero)
+            .map_err(|e| e.to_string())?;
+        if under.signed_area().abs() < 0.001 {
+            continue;
+        }
+        let loops: Vec<Polygon> = under.into();
+        let highest = (loops.iter().flatten())
+            .filter_map(|q| crate::cam::plane_height(&t.p, [q.0 as f32, q.1 as f32]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        if highest.is_finite() {
+            floors.push(highest.min(z));
+        }
+    }
+    floors.sort_by(|a, b| b.total_cmp(a));
+    floors.dedup_by(|lower, higher| *higher - *lower < 0.01);
+    // The part near the hole over a height, seen from above, and what of
+    // the outline it leaves open.
+    let over = |h: f32| -> Result<Region, String> {
+        let mut parts = vec![];
+        for t in &near {
+            let mut p = above(&t.p, h);
+            if area(&p) < 0. {
+                p.reverse();
+            }
+            if area(&p).abs() >= 0.000001 {
+                parts.push(p);
+            }
+        }
+        region(parts)
+    };
+    let open = |over: &Region| -> Result<Region, String> {
+        Ok(
+            difference::<Milli>(outline.clone(), over.clone(), FillRule::NonZero)
+                .map_err(|e| e.to_string())?
+                .simplify(0.001, false),
+        )
+    };
+    let mut candidates = vec![];
+    for &floor in &floors {
+        let over = over(floor + 0.01)?;
+        candidates.push(Level {
+            open: open(&over)?,
+            over,
+            floor: Some(floor),
+        });
+    }
+    // Where nothing of the part is over or under it at all: through.
+    let all = over(f32::NEG_INFINITY)?;
+    candidates.push(Level {
+        open: open(&all)?,
+        over: all,
+        floor: None,
+    });
+    // A region wider than a hairline is cut; one only a hairline wider
+    // than the deeper one under it is cut with it, to that depth (a fillet's
+    // facets, a faceted wall's lean). A hole narrower at its top than where
+    // it was clicked (a screw hole's lip over its bore) is cut through its
+    // opening; the bore under the lip is left to a setup from below.
+    let wide = |r: &Region| {
+        r.inflate(
+            -(LEAN + SHALLOW_OVERHANG / 2.),
+            JoinType::Round,
+            EndType::Polygon,
+            2.,
+        )
+        .signed_area()
+        .abs()
+            > 0.05
+    };
+    let mut levels: Vec<Level> = vec![];
+    for level in candidates.into_iter().rev() {
+        if !wide(&level.open) {
+            continue;
+        }
+        if let Some(deeper) = levels.last() {
+            let more =
+                difference::<Milli>(level.open.clone(), deeper.open.clone(), FillRule::NonZero)
+                    .map_err(|e| e.to_string())?;
+            if !wide(&more) {
+                continue;
+            }
+        }
+        levels.push(level);
+    }
+    levels.reverse();
+    if levels.is_empty() {
+        return Err(format!(
+            "Nothing of the hole at X{x:.2} Y{y:.2} is open from above in this setup: the part covers it. Cut it from another side."
+        ));
+    }
+    // Its rim is the top of what runs round its opening too: a screw hole's
+    // lip over its bore.
+    let opening: Vec<Polygon> = levels[0].open.clone().into();
+    let rim =
+        |p: &[f32; 3]| (opening.iter()).any(|o| distance(o, (p[0] as f64, p[1] as f64)) <= 0.15);
+    let top = (near.iter())
+        .filter(|t| t.p.iter().filter(|p| rim(p)).count() >= 2)
+        .flat_map(|t| t.p.into_iter().filter(|p| rim(p)).map(|p| p[2]))
+        .fold(top, f32::max);
+    Ok(Hole {
+        outline,
+        levels,
+        top,
+        bottom,
+        walls: walls.into_iter().collect(),
+    })
 }
 fn area_of(p: &Polygon) -> f64 {
     area(p)
@@ -717,11 +1402,9 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if let Some(issue) = surface::issues(op, setup, Some(mesh)).first() {
         return Err(issue.clone());
     }
-    let selection = op
-        .surfaces
-        .as_ref()
-        .filter(|s| !s.ids.is_empty())
-        .ok_or("Select a recessed planar pocket floor in Geometry first.")?;
+    let selection = op.surfaces.as_ref().filter(|s| !s.ids.is_empty()).ok_or(
+        "Select a recessed planar pocket floor, or the wall of a hole, in Geometry first.",
+    )?;
     if get(&tool.p, "type") != "Flat end mill" {
         return Err("Pocket preview requires a flat end mill.".into());
     }
@@ -737,10 +1420,13 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let placement = Placement::new(mesh, Some(setup));
     let scale = stock.display_scale;
     let ids: std::collections::HashSet<_> = selection.ids.iter().copied().collect();
+    // The selected walls pick holes, each cut down its outline.
+    let picked = holes(setup, &ids, mesh)?;
     // The selected faces by height, highest first: each floor is cleared to
     // its own height, as one pocket.
     let mut heights: Vec<(f32, usize)> = ids
         .iter()
+        .filter(|&&id| !is_wall(setup, mesh, id))
         .filter_map(|&id| {
             let s = mesh.surfaces.get(id)?;
             Some((placement.transform(s.center)[2] / scale, id))
@@ -760,7 +1446,7 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         .iter()
         .map(|g| floor(setup, g, mesh))
         .collect::<Result<Vec<_>, _>>()?;
-    if floors.is_empty() {
+    if floors.is_empty() && picked.is_empty() {
         return Err("The selected floor contains no triangles.".into());
     }
     if floors
@@ -776,9 +1462,31 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     if axial < 0. || radial < 0. || bottom + axial < -0.0001 {
         return Err("Pocket target cannot cut below the selected floor; use nonnegative stock allowances and review Bottom offset.".into());
     }
+    // Each level of each picked hole is cut to its floor, as a floor is, or
+    // through.
+    let breakthrough = if picked.iter().any(|h| h.through()) {
+        number(op, "breakthrough")?
+    } else {
+        0.
+    };
+    let hole_targets: Vec<Vec<f32>> = (picked.iter())
+        .map(|h| {
+            (h.levels.iter())
+                .map(|l| match l.floor {
+                    Some(floor) => floor + bottom + axial,
+                    None => (h.bottom - breakthrough).max(stock.stock.min[2] - breakthrough),
+                })
+                .collect()
+        })
+        .collect();
     if floors.iter().any(|f| {
         let target = f.plane + bottom + axial;
         target < stock.stock.min[2] || target >= stock.stock.max[2] - 0.0001
+    }) || (picked.iter().zip(&hole_targets)).any(|(h, targets)| {
+        (h.levels.iter().zip(targets)).any(|(l, &target)| {
+            (l.floor.is_some() && target < stock.stock.min[2])
+                || target >= stock.stock.max[2] - 0.0001
+        })
     }) {
         return Err("No pocket stock exists above the requested target. Review stock and bottom/axial offsets.".into());
     }
@@ -824,15 +1532,15 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     let breakthrough = if through {
         number(op, "breakthrough")?
     } else {
-        0.
+        breakthrough
     };
     if breakthrough < 0. {
         return Err("Breakthrough cannot be negative.".into());
     }
-    if through && floors.iter().all(|f| f.openings.is_empty()) {
+    if through && !floors.is_empty() && floors.iter().all(|f| f.openings.is_empty()) {
         return Err("The selected floor has no openings that go through the part. Set Openings to Leave, or select the floor around the openings.".into());
     }
-    let several = floors.len() > 1;
+    let several = floors.len() + picked.len() > 1;
     let mut zones = vec![];
     let mut openings = vec![];
     // Where each floor zone's tool reaches, with its target: a deeper floor
@@ -887,8 +1595,43 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
             }
         }
     }
+    for (h, targets) in picked.iter().zip(&hole_targets) {
+        let mut fitted = 0;
+        for (level, &target) in h.levels.iter().zip(targets) {
+            let centres = level.centres(h, inset)?;
+            // A level too narrow for this tool is left, as a corner is.
+            if !centres.contains_points() {
+                continue;
+            }
+            fitted += 1;
+            // A level under a floor this pocket clears, or under the hole's
+            // level above it, starts where that cut stops.
+            let reach = centres.inflate(radius as f64, JoinType::Round, EndType::Polygon, 2.);
+            let mut start = top;
+            for (above, height) in &cleared {
+                let outside = difference::<Milli>(reach.clone(), above.clone(), FillRule::NonZero)
+                    .map_err(|e| e.to_string())?;
+                if outside.signed_area().abs() < 0.01 {
+                    start = start.min(*height);
+                }
+            }
+            cleared.push((reach, target));
+            zones.push(Zone {
+                centres: Centres::Region(centres),
+                top: start,
+                target,
+            });
+        }
+        // As a floor too narrow for this tool, left to a smaller one.
+        if fitted == 0 && !several {
+            let (x, y) = h.centre();
+            return Err(format!(
+                "The hole at X{x:.2} Y{y:.2} is too narrow for this tool and radial allowance. Choose a smaller cutter."
+            ));
+        }
+    }
     if zones.is_empty() {
-        return Err("Every selected floor is too narrow for this tool and radial allowance. Choose a smaller cutter.".into());
+        return Err("Every selected floor and hole is too narrow for this tool and radial allowance. Choose a smaller cutter.".into());
     }
     if through && openings.is_empty() {
         return Err("Every opening in the selected floor is too narrow for this tool and radial allowance. Choose a smaller cutter.".into());
@@ -950,18 +1693,21 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     for (zone, trimmed) in pieces {
         let cutting_top = start(&zone, &zone.centres.at(0.)?);
         let mut rings: Vec<Vec<Polygon>> = Vec::new();
-        for ring in 0..=if profile_only { 0 } else { 256 } {
+        // Inward a stepover at a time until nothing is left; their points
+        // count against the ceiling as their moves will.
+        let mut points = 0usize;
+        for ring in 0.. {
             let paths = zone.centres.at(ring as f64 * stepover as f64)?;
-            if !paths.contains_points() {
+            if !paths.contains_points() || (profile_only && ring > 0) {
                 break;
             }
-            if ring == 256 {
-                return Err(
-                    "Pocket preview exceeds 256 offset rings. Increase stepover or reduce pocket size."
-                        .into(),
-                );
+            crate::progress::step(ring)?;
+            let paths: Vec<Polygon> = paths.into();
+            points += paths.iter().map(Vec::len).sum::<usize>();
+            if points > crate::cam::CEILING {
+                return Err(crate::cam::too_many("moves"));
             }
-            rings.push(paths.into());
+            rings.push(paths);
         }
         if !rings.is_empty() {
             // Clear of every wall and island, half the margin outside the
@@ -981,9 +1727,10 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
         let loops: usize = rings.iter().flatten().map(|p| p.len() + 5).sum();
         segments = segments.saturating_add(loops.saturating_mul(levels));
     }
-    if total_levels > 1000 || segments > MAX_MOVES {
-        return Err("Pocket preview exceeds its move limit. Increase stepdown or stepover.".into());
+    if segments > crate::cam::CEILING {
+        return Err(crate::cam::too_many("moves"));
     }
+    crate::progress::expect(segments);
     let clockwise = facing_setting(&op.p, "spindle_rotation") == "Clockwise (CW)";
     let climb = pocket_setting(&op.p, "pocket_milling") == "Climb";
     let highest = planned
@@ -1141,6 +1888,217 @@ pub fn generate(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Resu
     Ok(plan)
 }
 
+/// A 40 × 20 × 10 mm plate (Z −4 to 6) with a Ø6 round hole 5 mm deep at
+/// X −10, its floor at Z 1, and a 6 mm square hole through it at X 10,
+/// each wall a facet of its own: what a Pocket picks holes by their walls on.
+/// `shelf` adds a 2 mm square face at Z 4 in the round hole, over its floor.
+#[cfg(test)]
+pub(crate) fn hole_plate(shelf: bool) -> Vec<[[f32; 3]; 3]> {
+    let mut tris = vec![];
+    let mut quad = |a: (f32, f32), b: (f32, f32), c: (f32, f32), d: (f32, f32), z: f32| {
+        tris.push([[a.0, a.1, z], [b.0, b.1, z], [c.0, c.1, z]]);
+        tris.push([[a.0, a.1, z], [c.0, c.1, z], [d.0, d.1, z]]);
+    };
+    let rect = |x: f32, y: f32, xx: f32, yy: f32| ((x, y), (xx, y), (xx, yy), (x, yy));
+    // The top and the bottom round the two holes' squares.
+    for (z, under) in [(6., false), (-4., true)] {
+        for (x, y, xx, yy) in [
+            (-20., -10., -15., 10.),
+            (15., -10., 20., 10.),
+            (-15., 5., 15., 10.),
+            (-15., -10., 15., -5.),
+            (-5., -5., 5., 5.),
+        ] {
+            let (a, b, c, d) = rect(x, y, xx, yy);
+            quad(a, b, c, d, z);
+        }
+        // Round the square hole: the bottom has it too.
+        for (x, y, xx, yy) in [
+            (5., -5., 15., -3.),
+            (5., 3., 15., 5.),
+            (5., -3., 7., 3.),
+            (13., -3., 15., 3.),
+        ] {
+            let (a, b, c, d) = rect(x, y, xx, yy);
+            quad(a, b, c, d, z);
+        }
+        // The round hole's square: an annulus on top, whole underneath.
+        let (cx, n) = (-10f32, 24);
+        let ray = |i: usize| {
+            let t = std::f32::consts::FRAC_PI_4 + i as f32 * std::f32::consts::TAU / n as f32;
+            let (s, c) = t.sin_cos();
+            let edge = 5. / c.abs().max(s.abs());
+            ((cx + 3. * c, 3. * s), (cx + edge * c, edge * s))
+        };
+        for i in 0..n {
+            let ((a, outer_a), (b, outer_b)) = (ray(i), ray(i + 1));
+            if under {
+                quad((cx, 0.), outer_a, outer_b, (cx, 0.), z);
+            } else {
+                quad(a, outer_a, outer_b, b, z);
+            }
+        }
+    }
+    let mut wall = |a: (f32, f32), b: (f32, f32), low: f32, high: f32| {
+        tris.push([[a.0, a.1, low], [b.0, b.1, low], [b.0, b.1, high]]);
+        tris.push([[a.0, a.1, low], [b.0, b.1, high], [a.0, a.1, high]]);
+    };
+    // The round hole: its walls and its floor.
+    let n = 24;
+    let at = |i: usize| {
+        let t = std::f32::consts::FRAC_PI_4 + i as f32 * std::f32::consts::TAU / n as f32;
+        (-10. + 3. * t.cos(), 3. * t.sin())
+    };
+    for i in 0..n {
+        wall(at(i), at(i + 1), 1., 6.);
+    }
+    // The square hole's walls, and the plate's outside.
+    for (a, b) in [
+        ((7., -3.), (13., -3.)),
+        ((13., -3.), (13., 3.)),
+        ((13., 3.), (7., 3.)),
+        ((7., 3.), (7., -3.)),
+    ] {
+        wall(a, b, -4., 6.);
+    }
+    for (a, b) in [
+        ((-20., -10.), (20., -10.)),
+        ((20., -10.), (20., 10.)),
+        ((20., 10.), (-20., 10.)),
+        ((-20., 10.), (-20., -10.)),
+    ] {
+        wall(a, b, -4., 6.);
+    }
+    for i in 0..n {
+        tris.push([
+            [-10., 0., 1.],
+            [at(i).0, at(i).1, 1.],
+            [at(i + 1).0, at(i + 1).1, 1.],
+        ]);
+    }
+    if shelf {
+        tris.push([[-11., -1., 4.], [-9., -1., 4.], [-9., 1., 4.]]);
+        tris.push([[-11., -1., 4.], [-9., 1., 4.], [-11., 1., 4.]]);
+    }
+    tris
+}
+/// A 20 mm square block (Z −4 to 6) with a 10 mm square pocket down to
+/// Z 2 and, in its floor along its west wall, a slot 3 × 2 mm down to Z 0.
+/// The pocket's west wall goes on down the side of the slot as one face:
+/// both holes' wall.
+#[cfg(test)]
+pub(crate) fn pocket_with_slot() -> Vec<[[f32; 3]; 3]> {
+    let mut tris = vec![];
+    // The west wall at X −5: the pocket's, Z 2 to 6, and on down the slot's
+    // side to Z 0, its edges shared. First, so it is the lowest surface.
+    let w = |y: f32, z: f32| [-5., y, z];
+    tris.extend([
+        [w(-1., 0.), w(1., 0.), w(1., 2.)],
+        [w(-1., 0.), w(1., 2.), w(-1., 2.)],
+        [w(-5., 2.), w(-1., 2.), w(-5., 6.)],
+        [w(-1., 2.), w(5., 6.), w(-5., 6.)],
+        [w(-1., 2.), w(1., 2.), w(5., 6.)],
+        [w(1., 2.), w(5., 2.), w(5., 6.)],
+    ]);
+
+    let mut quad = |x: f32, y: f32, xx: f32, yy: f32, z: f32| {
+        tris.push([[x, y, z], [xx, y, z], [xx, yy, z]]);
+        tris.push([[x, y, z], [xx, yy, z], [x, yy, z]]);
+    };
+    for (x, y, xx, yy) in [
+        (-10., -10., 10., -5.),
+        (-10., 5., 10., 10.),
+        (-10., -5., -5., 5.),
+        (5., -5., 10., 5.),
+    ] {
+        quad(x, y, xx, yy, 6.);
+    }
+    for (x, y, xx, yy) in [(-5., -5., 5., -1.), (-5., 1., 5., 5.), (-2., -1., 5., 1.)] {
+        quad(x, y, xx, yy, 2.);
+    }
+    quad(-5., -1., -2., 1., 0.);
+    quad(-10., -10., 10., 10., -4.);
+    let mut wall = |a: (f32, f32), b: (f32, f32), low: f32, high: f32| {
+        tris.push([[a.0, a.1, low], [b.0, b.1, low], [b.0, b.1, high]]);
+        tris.push([[a.0, a.1, low], [b.0, b.1, high], [a.0, a.1, high]]);
+    };
+    // The pocket's north, east and south walls, the slot's, the outside.
+    for (a, b, low, high) in [
+        ((5., 5.), (-5., 5.), 2., 6.),
+        ((5., -5.), (5., 5.), 2., 6.),
+        ((-5., -5.), (5., -5.), 2., 6.),
+        ((-5., -1.), (-2., -1.), 0., 2.),
+        ((-2., -1.), (-2., 1.), 0., 2.),
+        ((-2., 1.), (-5., 1.), 0., 2.),
+        ((-10., -10.), (10., -10.), -4., 6.),
+        ((10., -10.), (10., 10.), -4., 6.),
+        ((10., 10.), (-10., 10.), -4., 6.),
+        ((-10., 10.), (-10., -10.), -4., 6.),
+    ] {
+        wall(a, b, low, high);
+    }
+    tris
+}
+/// A 20 mm round plate (Z −4 to 6) with a Ø6 hole through it whose 24
+/// walls are faceted twice: below Z 1, and above it half a facet round, as
+/// a STEP tessellates a long wall in pieces. A click on either half's
+/// facets crosses that half only.
+#[cfg(test)]
+pub(crate) fn split_hole() -> Vec<[[f32; 3]; 3]> {
+    let at = |r: f32, start: f32, i: usize, z: f32| {
+        let t = (start + 15. * i as f32).to_radians();
+        [r * t.cos(), r * t.sin(), z]
+    };
+    let mut tris = vec![];
+    for i in 0..24 {
+        // The lower facets, the upper ones, and the outside the same way.
+        for (r, start, low, high) in [
+            (3., 0., -4., 1.),
+            (3., 7.5, 1., 6.),
+            (10., 0., -4., 1.),
+            (10., 7.5, 1., 6.),
+        ] {
+            let (a, b) = (at(r, start, i, low), at(r, start, i + 1, low));
+            let (c, d) = (at(r, start, i, high), at(r, start, i + 1, high));
+            tris.extend([[a, b, d], [a, d, c]]);
+        }
+        // The top and the bottom round the hole.
+        let (a, b) = (at(3., 7.5, i, 6.), at(3., 7.5, i + 1, 6.));
+        let (c, d) = (at(10., 7.5, i, 6.), at(10., 7.5, i + 1, 6.));
+        tris.extend([[a, d, b], [a, c, d]]);
+        let (a, b) = (at(3., 0., i, -4.), at(3., 0., i + 1, -4.));
+        let (c, d) = (at(10., 0., i, -4.), at(10., 0., i + 1, -4.));
+        tris.extend([[a, b, d], [a, d, c]]);
+    }
+    tris
+}
+/// A 20 mm round plate (Z −4 to 6) with a 24-sided Ø6 hole through it,
+/// chamfered 1 mm at 45° round its top: a click on the chamfer is a click
+/// on no floor and no wall.
+#[cfg(test)]
+pub(crate) fn chamfered_hole() -> Vec<[[f32; 3]; 3]> {
+    let at = |r: f32, i: usize, z: f32| {
+        let t = (15. * i as f32).to_radians();
+        [r * t.cos(), r * t.sin(), z]
+    };
+    let mut tris = vec![];
+    for i in 0..24 {
+        // From the inside out: the wall, the chamfer, the top; the outside;
+        // the bottom.
+        for (r0, z0, r1, z1) in [
+            (3., -4., 3., 5.),
+            (3., 5., 4., 6.),
+            (4., 6., 10., 6.),
+            (10., 6., 10., -4.),
+            (10., -4., 3., -4.),
+        ] {
+            let (a, b) = (at(r0, i, z0), at(r0, i + 1, z0));
+            let (c, d) = (at(r1, i, z1), at(r1, i + 1, z1));
+            tris.extend([[a, b, d], [a, d, c]]);
+        }
+    }
+    tris
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,7 +2539,7 @@ mod tests {
         for (key, value, expected) in [
             ("bottom", "-1", "below"),
             ("stepover", "100", "50%"),
-            ("stepdown", "0.000001", "limit"),
+            ("stepdown", "0.000001", "5 million moves"),
             ("pocket_milling", "unknown", "valid"),
             ("pocket_entry", "Helix", "valid"),
             ("containment", "Tool outside boundary", "inside"),
@@ -1854,6 +2812,557 @@ mod tests {
             let result = generate(&setup, &op, &tool, &mesh);
             assert_eq!(result.is_ok(), accepted, "{lean}: {result:?}");
         }
+    }
+    #[test]
+    fn a_floor_overhung_only_in_a_hairline_band_is_pocketed_clear_of_it() {
+        // The TOTEM case's socket floor ran 0.06 mm under the wall over it and
+        // was refused, so nothing after that Pocket could be simulated.
+        let (_, _, _, base) = fixture();
+        let scale = base.display_scale();
+        let floor_z = base.surfaces[0].center[2] / scale;
+        let tris: Vec<[[f32; 3]; 3]> = base
+            .faces
+            .iter()
+            .map(|f| std::array::from_fn(|i| f.points[i].map(|v| v / scale)))
+            .collect();
+        // Past `LEAN`, an overhang under `SHALLOW_OVERHANG` wide is not one.
+        for (lean, accepted) in [(0.1, true), (0.2, true), (0.3, false)] {
+            let mut leaning = tris.clone();
+            // A ledge 3 mm over the floor, `lean` over its west edge.
+            quad(&mut leaning, -10., -8., -10. + lean, 8., floor_z + 3.);
+            let (setup, op, tool, mesh, dz) = part(leaning, &[floor_z], 2.);
+            let result = generate(&setup, &op, &tool, &mesh);
+            assert_eq!(result.is_ok(), accepted, "{lean}: {result:?}");
+            // The cutter keeps clear of the ledge, as of every wall.
+            if let Ok(plan) = result {
+                let west = -10. + lean + 1. - 0.01;
+                assert!(
+                    plan.moves
+                        .iter()
+                        .filter(|m| m.cutting_pass && m.to[2] - dz < floor_z + 3.)
+                        .all(|m| m.to[0] >= west),
+                    "{lean}"
+                );
+            }
+        }
+    }
+    /// The plate (`hole_plate`) set up for a Ø2 Pocket, the surface of a
+    /// wall of its round hole and one of its square hole, and how far the
+    /// setup lifts the part.
+    fn plate(shelf: bool) -> (Setup, Operation, Tool, Mesh, usize, usize, f32) {
+        let (setup, op, tool, mesh, dz) = part(hole_plate(shelf), &[], 2.);
+        let scale = mesh.display_scale();
+        let placement = Placement::new(&mesh, Some(&setup));
+        let near = |x: f32, y: f32, r: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    is_wall(&setup, &mesh, id) && (c[0] - x).hypot(c[1] - y) < r
+                })
+                .unwrap()
+        };
+        let round = near(-10., 0., 3.1);
+        let square = near(13., 0., 0.1);
+        (setup, op, tool, mesh, round, square, dz)
+    }
+    fn pick(op: &mut Operation, mesh: &Mesh, ids: Vec<usize>) {
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids,
+        });
+    }
+    #[test]
+    fn a_wall_picks_its_whole_hole_and_the_pocket_cuts_it_to_its_floor_or_through() {
+        let (setup, mut op, tool, mesh, round, square, dz) = plate(false);
+        // A click on one facet picks all 24 of the round hole's, and one of
+        // the square hole's four walls picks all four.
+        let round_walls = hole_walls(&setup, &mesh, round).unwrap();
+        let square_walls = hole_walls(&setup, &mesh, square).unwrap();
+        assert_eq!((round_walls.len(), square_walls.len()), (24, 4));
+        assert!(round_walls.contains(&round) && square_walls.contains(&square));
+        let ids = round_walls.iter().chain(&square_walls).copied().collect();
+        let found = holes(&setup, &ids, &mesh).unwrap();
+        assert_eq!(found.len(), 2);
+        let blind = found.iter().find(|h| !h.through()).unwrap();
+        assert_eq!(blind.levels.len(), 1);
+        assert!((blind.levels[0].floor.unwrap() - dz - 1.).abs() < 0.001);
+        assert!((blind.centre().0 + 10.).abs() < 0.01);
+        let through = found.iter().find(|h| h.through()).unwrap();
+        assert_eq!(through.levels.len(), 1);
+        assert!((through.bottom - dz + 4.).abs() < 0.001);
+        assert!((through.size().0 - 6.).abs() < 0.001);
+        // The walls are no floor: surface checks pass them.
+        pick(&mut op, &mesh, round_walls.clone());
+        assert!(surface::issues(&op, &setup, Some(&mesh)).is_empty());
+        // The round hole is cut inside its wall down to its floor.
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz - 1.).abs() < 0.001, "{}", plan.target);
+        let points = cutting(&plan);
+        assert!(
+            points
+                .iter()
+                .all(|p| (p[0] + 10.).hypot(p[1]) <= 3. - 1. + 0.001)
+        );
+        assert!(points.iter().any(|p| (p[0] + 10.).hypot(p[1]) > 1.9));
+        // The square hole through the part, past its bottom by Breakthrough.
+        pick(&mut op, &mesh, square_walls.clone());
+        op.p.insert("breakthrough".into(), "0.5".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz + 4.5).abs() < 0.001, "{}", plan.target);
+        assert!(
+            cutting(&plan)
+                .iter()
+                .all(|p| (p[0] - 10.).abs() <= 2.001 && p[1].abs() <= 2.001)
+        );
+        // Both at once, each to its own depth; too narrow for a Ø8 cutter.
+        pick(
+            &mut op,
+            &mesh,
+            round_walls.iter().chain(&square_walls).copied().collect(),
+        );
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let points = cutting(&plan);
+        assert!(
+            points
+                .iter()
+                .any(|p| (p[2] - dz - 1.).abs() < 0.001 && p[0] < 0.)
+        );
+        assert!(
+            points
+                .iter()
+                .any(|p| (p[2] - dz + 4.5).abs() < 0.001 && p[0] > 0.)
+        );
+        assert!(points.iter().all(|p| p[0] > 0. || p[2] - dz >= 1. - 0.001));
+        let mut wide = tool.clone();
+        wide.p.insert("diameter".into(), "8".into());
+        assert!(
+            generate(&setup, &op, &wide, &mesh)
+                .unwrap_err()
+                .contains("too narrow")
+        );
+    }
+    /// A 20 mm square block (Z −4 to 6) with a 6 mm square bore up from its
+    /// bottom to Z 4, under a 4 mm square opening through its top: a screw
+    /// hole's lip over its bore.
+    fn lipped() -> Vec<[[f32; 3]; 3]> {
+        let mut tris = vec![];
+        let ring = |tris: &mut Vec<[[f32; 3]; 3]>, inner: f32, outer: f32, z: f32| {
+            for (x, y, xx, yy) in [
+                (-outer, -outer, outer, -inner),
+                (-outer, inner, outer, outer),
+                (-outer, -inner, -inner, inner),
+                (inner, -inner, outer, inner),
+            ] {
+                quad(tris, x, y, xx, yy, z);
+            }
+        };
+        ring(&mut tris, 2., 10., 6.);
+        ring(&mut tris, 2., 3., 4.);
+        ring(&mut tris, 3., 10., -4.);
+        let mut box_walls = |half: f32, low: f32, high: f32| {
+            let c = [(-half, -half), (half, -half), (half, half), (-half, half)];
+            for k in 0..4 {
+                let (a, b) = (c[k], c[(k + 1) % 4]);
+                tris.push([[a.0, a.1, low], [b.0, b.1, low], [b.0, b.1, high]]);
+                tris.push([[a.0, a.1, low], [b.0, b.1, high], [a.0, a.1, high]]);
+            }
+        };
+        box_walls(2., 4., 6.);
+        box_walls(3., -4., 4.);
+        box_walls(10., -4., 6.);
+        tris
+    }
+    #[test]
+    fn a_hole_under_a_lip_is_cut_through_its_opening() {
+        let (setup, mut op, tool, mesh, dz) = part(lipped(), &[], 2.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let bore = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                is_wall(&setup, &mesh, id) && (c[0] - 3.).abs() < 0.01 && c[2] - dz < 4.
+            })
+            .unwrap();
+        // A click on the bore picks it; what a cutter from above reaches is
+        // the 4 mm opening, through the part.
+        let walls = hole_walls(&setup, &mesh, bore).unwrap();
+        let ids = walls.iter().copied().collect();
+        let hole = &holes(&setup, &ids, &mesh).unwrap()[0];
+        assert!(hole.levels.len() == 1 && hole.through());
+        let (w, d) = hole.size();
+        assert!((w - 4.).abs() < 0.01 && (d - 4.).abs() < 0.01, "{w} {d}");
+        pick(&mut op, &mesh, walls);
+        op.p.insert("breakthrough".into(), "0.5".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz + 4.5).abs() < 0.001, "{}", plan.target);
+        assert!(
+            cutting(&plan)
+                .iter()
+                .all(|p| p[0].abs() <= 1.001 && p[1].abs() <= 1.001)
+        );
+    }
+    #[test]
+    fn a_through_hole_with_leaning_facets_goes_through() {
+        // A Ø6 hole through a 1.5 mm plate, its 8 sides' top corners midway
+        // round from their bottom ones: each facet leans about 8°, as the
+        // TOTEM case's socket walls lean a few degrees. Read as floors, they
+        // made most clicks on those sockets blind, 0.75 to 4 mm short.
+        let ring = |r: f32, start: f32, i: usize, z: f32| {
+            let t = (start + 45. * i as f32).to_radians();
+            [r * t.cos(), r * t.sin(), z]
+        };
+        let mut tris = vec![];
+        for i in 0..8 {
+            let (b0, b1) = (ring(3., 0., i, 0.), ring(3., 0., i + 1, 0.));
+            let (t0, t1) = (ring(3., 22.5, i, 1.5), ring(3., 22.5, i + 1, 1.5));
+            let (bo0, bo1) = (ring(10., 0., i, 0.), ring(10., 0., i + 1, 0.));
+            let (to0, to1) = (ring(10., 22.5, i, 1.5), ring(10., 22.5, i + 1, 1.5));
+            tris.extend([[b0, b1, t0], [t0, b1, t1]]);
+            tris.extend([[t0, t1, to1], [t0, to1, to0], [b0, bo1, b1], [b0, bo0, bo1]]);
+            tris.extend([[bo0, to0, bo1], [bo1, to0, to1]]);
+        }
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[], 2.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let wall = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                is_wall(&setup, &mesh, id) && c[0].hypot(c[1]) < 3.1
+            })
+            .unwrap();
+        let walls = hole_walls(&setup, &mesh, wall).unwrap();
+        assert_eq!(walls.len(), 16);
+        let ids = walls.iter().copied().collect();
+        let hole = &holes(&setup, &ids, &mesh).unwrap()[0];
+        assert!(hole.levels.len() == 1 && hole.through());
+        pick(&mut op, &mesh, walls);
+        op.p.insert("breakthrough".into(), "0.5".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz + 0.5).abs() < 0.001, "{}", plan.target);
+    }
+    #[test]
+    fn a_hole_faceted_in_pieces_is_cut_through_from_either_piece() {
+        // A click on the upper facets picks those alone: the cut still goes
+        // through the plate, not to where they stop.
+        let (setup, mut op, tool, mesh, dz) = part(split_hole(), &[], 2.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let facet = |z: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    is_wall(&setup, &mesh, id)
+                        && c[0].hypot(c[1]) < 3.1
+                        && (c[2] - dz - z).abs() < 0.1
+                })
+                .unwrap()
+        };
+        let upper = hole_walls(&setup, &mesh, facet(3.5)).unwrap();
+        let lower = hole_walls(&setup, &mesh, facet(-1.5)).unwrap();
+        assert_eq!((upper.len(), lower.len()), (24, 24));
+        assert!(upper.iter().all(|w| !lower.contains(w)));
+        let found = |walls: &[usize]| {
+            let ids = walls.iter().copied().collect();
+            holes(&setup, &ids, &mesh).unwrap().remove(0)
+        };
+        let (a, b) = (found(&upper), found(&lower));
+        assert!(a.same_place(&b) && b.same_place(&a));
+        assert!((a.top - dz - 6.).abs() < 0.001 && (a.bottom - dz + 4.).abs() < 0.001);
+        pick(&mut op, &mesh, upper);
+        op.p.insert("breakthrough".into(), "0.5".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((plan.target - dz + 4.5).abs() < 0.001, "{}", plan.target);
+        // A hole elsewhere is not in the same place.
+        let (_, _, _, plate, round, square, _) = plate(false);
+        let (s, m) = (part(hole_plate(false), &[], 2.).0, plate);
+        let one = |id| {
+            let ids = hole_walls(&s, &m, id).unwrap().into_iter().collect();
+            holes(&s, &ids, &m).unwrap().remove(0)
+        };
+        assert!(!one(round).same_place(&one(square)));
+    }
+    #[test]
+    fn a_through_hole_beside_a_slope_is_cut_to_its_own_bottom() {
+        // A face sloping away from the square hole's north edge, two corners
+        // on it at the top and the third 6 mm off and 5 mm under the plate:
+        // on the TOTEM case a slope beside a socket made it 4.1 mm too deep.
+        let mut tris = hole_plate(false);
+        tris.push([[7., 3., 6.], [13., 3., 6.], [10., 9., -9.]]);
+        let (setup, mut op, tool, mesh, dz) = part(tris, &[], 2.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let wall = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                is_wall(&setup, &mesh, id) && (c[0] - 13.).abs() < 0.01 && c[1].abs() < 0.1
+            })
+            .unwrap();
+        let walls = hole_walls(&setup, &mesh, wall).unwrap();
+        let ids = walls.iter().copied().collect();
+        let hole = &holes(&setup, &ids, &mesh).unwrap()[0];
+        assert!(hole.through());
+        assert!(
+            (hole.bottom - dz + 4.).abs() < 0.001,
+            "{}",
+            hole.bottom - dz
+        );
+        assert!((hole.top - dz - 6.).abs() < 0.001);
+        pick(&mut op, &mesh, walls);
+        op.p.insert("breakthrough".into(), "0.5".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!(
+            (plan.target - dz + 4.5).abs() < 0.001,
+            "{}",
+            plan.target - dz
+        );
+    }
+    #[test]
+    fn a_click_on_a_holes_chamfer_picks_the_hole() {
+        let (setup, _, _, mesh, dz) = part(chamfered_hole(), &[], 2.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let chamfer = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                (c[2] - dz - 5.5).abs() < 0.1 && c[0].hypot(c[1]) < 4.
+            })
+            .unwrap();
+        assert!(!is_wall(&setup, &mesh, chamfer));
+        let walls = hole_near(&setup, &mesh, chamfer).unwrap().unwrap();
+        assert_eq!(walls.len(), 24);
+        let ids = walls.iter().copied().collect();
+        assert!(holes(&setup, &ids, &mesh).unwrap()[0].through());
+        // From the plate's outside nothing crosses its top or bottom to
+        // the hole: not a hole.
+        let side = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                is_wall(&setup, &mesh, id) && c[0].hypot(c[1]) > 9.
+            })
+            .unwrap();
+        let outside = hole_near(&setup, &mesh, side).unwrap().unwrap_err();
+        assert!(outside.contains("not a hole"), "{outside}");
+    }
+    #[test]
+    fn a_picked_hole_too_narrow_for_the_cutter_is_named() {
+        // The pocket and the 2 mm slot down its wall, with a Ø3 cutter: the
+        // pocket is cut, the slot (and the pocket's level down it) left.
+        let (setup, mut op, mut tool, mesh, _) = part(pocket_with_slot(), &[], 3.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let at = |x: f32, y: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    is_wall(&setup, &mesh, id) && (c[0] - x).abs() < 0.01 && (c[1] - y).abs() < 0.01
+                })
+                .unwrap()
+        };
+        let mut ids = hole_walls(&setup, &mesh, at(0., 5.)).unwrap();
+        ids.extend(hole_walls(&setup, &mesh, at(-2., 0.)).unwrap());
+        ids.sort();
+        ids.dedup();
+        let set = ids.iter().copied().collect();
+        let found = holes(&setup, &set, &mesh).unwrap();
+        let fits: Vec<Vec<bool>> = found.iter().map(|h| h.fits(3., 0.)).collect();
+        let mut warnings: Vec<String> = (found.iter().zip(&fits))
+            .flat_map(|(h, f)| h.uncut(3., f))
+            .collect();
+        warnings.sort();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("Part of the hole") && warnings[0].contains("Ø3"));
+        assert!(warnings[1].starts_with("The hole") && warnings[1].contains("left uncut"));
+        // As `generate` cuts it: the pocket's floor, nothing under it.
+        pick(&mut op, &mesh, ids);
+        tool.p.insert("length".into(), "8".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!(
+            (plan.target - (plan.stock.max[2] - 4.)).abs() < 0.001,
+            "{}",
+            plan.target
+        );
+        // With a Ø1 cutter, nothing is left.
+        assert!(
+            found
+                .iter()
+                .all(|h| h.uncut(1., &h.fits(1., 0.)).is_empty())
+        );
+    }
+    #[test]
+    fn a_click_drops_the_picked_hole_its_wall_is_in_even_when_its_own_outline_fails() {
+        // On the TOTEM case a socket's wall whose own outline is refused did
+        // not drop the socket it was picked in, nor did its remove button.
+        let (setup, _, _, mesh, round, square, _) = plate(false);
+        let walls = hole_walls(&setup, &mesh, round).unwrap();
+        let picked: std::collections::HashSet<usize> = walls.iter().copied().collect();
+        let now = holes(&setup, &picked, &mesh).unwrap();
+        let (drop, keep) = dropped(&now, &picked, walls[3], None, &[]).unwrap();
+        assert!(picked.is_subset(&drop) && keep.is_empty());
+        // A wall of no picked hole whose own outline fails drops nothing.
+        assert!(dropped(&now, &picked, square, None, &[]).is_none());
+        // One click picking what lists as two holes (the pocket and the slot
+        // down its wall) drops both when clicked again.
+        let (setup, _, _, mesh, _) = part(pocket_with_slot(), &[], 1.);
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let at = |x: f32, y: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    is_wall(&setup, &mesh, id) && (c[0] - x).abs() < 0.01 && (c[1] - y).abs() < 0.01
+                })
+                .unwrap()
+        };
+        let north = at(0., 5.);
+        let mut both: std::collections::HashSet<usize> = hole_walls(&setup, &mesh, north)
+            .unwrap()
+            .into_iter()
+            .collect();
+        both.extend(hole_walls(&setup, &mesh, at(-2., 0.)).unwrap());
+        let now = holes(&setup, &both, &mesh).unwrap();
+        assert_eq!(now.len(), 2);
+        let (drop, keep) = dropped(&now, &both, north, Some(&both), &now).unwrap();
+        assert!(both.is_subset(&drop) && keep.is_empty());
+        // The pocket's own click drops the pocket and keeps the slot whole,
+        // the wall they share with it.
+        let pocket: std::collections::HashSet<usize> = hole_walls(&setup, &mesh, north)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let this = holes(&setup, &pocket, &mesh).unwrap();
+        let (drop, keep) = dropped(&now, &both, north, Some(&pocket), &this).unwrap();
+        let left: std::collections::HashSet<usize> = (both.iter())
+            .filter(|w| !drop.contains(w) || keep.contains(w))
+            .copied()
+            .collect();
+        let slot = holes(&setup, &left, &mesh).unwrap();
+        assert!(
+            slot.len() == 1 && slot[0].levels.len() == 1,
+            "{}",
+            slot.len()
+        );
+    }
+    #[test]
+    fn a_hole_is_picked_whole_and_cut_only_where_it_is_open_from_above() {
+        let (setup, mut op, tool, mesh, round, _, _) = plate(false);
+        // The plate's outside: its inside is the part.
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        let outside = (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement
+                    .transform(mesh.surfaces[id].center)
+                    .map(|v| v / scale);
+                is_wall(&setup, &mesh, id) && (c[0] - 20.).abs() < 0.01
+            })
+            .unwrap();
+        let refused = hole_walls(&setup, &mesh, outside).unwrap_err();
+        assert!(refused.contains("not a hole"), "{refused}");
+        // Half a hole's walls are not a hole.
+        let walls = hole_walls(&setup, &mesh, round).unwrap();
+        pick(&mut op, &mesh, walls[..12].to_vec());
+        let partly = generate(&setup, &op, &tool, &mesh).unwrap_err();
+        assert!(partly.contains("selected only in part"), "{partly}");
+        // A 2 mm shelf over the round hole's floor: the 2 mm either side of
+        // it are too narrow for the Ø2 cutter, and a Ø1 one cuts round it,
+        // down to the floor, and never under it.
+        let (setup, mut op, mut tool, mesh, round, _, dz) = plate(true);
+        let walls = hole_walls(&setup, &mesh, round).unwrap();
+        pick(&mut op, &mesh, walls);
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap_err()
+                .contains("too narrow")
+        );
+        tool.p.insert("diameter".into(), "1".into());
+        let points = cutting(&generate(&setup, &op, &tool, &mesh).unwrap());
+        assert!(points.iter().any(|p| (p[2] - dz - 1.).abs() < 0.001));
+        assert!(
+            points
+                .iter()
+                .all(|p| p[2] - dz >= 4. || clear(p, (-11., -1., -9., 1.), 0.5))
+        );
+    }
+    #[test]
+    fn a_pocket_and_a_slot_down_its_wall_are_picked_and_cut_together() {
+        // On the TOTEM case, a socket pocket's wall goes on down the side of
+        // the pin pocket in its floor: a click on either found the other.
+        let (setup, mut op, mut tool, mesh, dz) = part(pocket_with_slot(), &[], 1.);
+        let scale = mesh.display_scale();
+        let placement = Placement::new(&mesh, Some(&setup));
+        let at = |x: f32, y: f32| {
+            (0..mesh.surfaces.len())
+                .find(|&id| {
+                    let c = placement
+                        .transform(mesh.surfaces[id].center)
+                        .map(|v| v / scale);
+                    is_wall(&setup, &mesh, id) && (c[0] - x).abs() < 0.01 && (c[1] - y).abs() < 0.01
+                })
+                .unwrap()
+        };
+        let (north, slot_east) = (at(0., 5.), at(-2., 0.));
+        let pocket = hole_walls(&setup, &mesh, north).unwrap();
+        let slot = hole_walls(&setup, &mesh, slot_east).unwrap();
+        assert_eq!((pocket.len(), slot.len()), (4, 4));
+        let west: Vec<_> = pocket.iter().filter(|w| slot.contains(w)).collect();
+        assert_eq!(west.len(), 1);
+        // Either hole from its walls alone, or both: the pocket down to its
+        // floor and, where the slot is, on down to the slot's; the slot to
+        // its floor.
+        for (ids, floors) in [
+            (pocket.clone(), vec![vec![2., 0.]]),
+            (slot.clone(), vec![vec![0.]]),
+            (
+                pocket.iter().chain(&slot).copied().collect(),
+                vec![vec![2., 0.], vec![0.]],
+            ),
+        ] {
+            let set = ids.iter().copied().collect();
+            let found = holes(&setup, &set, &mesh).unwrap();
+            let mut got: Vec<Vec<f32>> = (found.iter())
+                .map(|h| h.levels.iter().map(|l| l.floor.unwrap() - dz).collect())
+                .collect();
+            got.sort_by_key(|levels| std::cmp::Reverse(levels.len()));
+            assert_eq!(got.len(), floors.len());
+            assert!(
+                got.iter().zip(&floors).all(|(a, b)| a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.001)),
+                "{got:?}"
+            );
+        }
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: pocket.iter().chain(&slot).copied().collect(),
+        });
+        tool.p.insert("length".into(), "8".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let points = cutting(&plan);
+        // The slot to Z 0 and nowhere else under the pocket's floor; the
+        // pocket inside its walls.
+        assert!(points.iter().any(|p| (p[2] - dz).abs() < 0.001));
+        assert!(points.iter().all(|p| {
+            p[0].abs() <= 4.5 + 0.001
+                && p[1].abs() <= 4.5 + 0.001
+                && (p[2] - dz >= 2. - 0.001 || (p[0] <= -2.5 + 0.001 && p[1].abs() <= 0.5 + 0.001))
+        }));
     }
     #[test]
     fn a_smaller_cutter_after_a_larger_one_cuts_only_the_corners_it_left() {

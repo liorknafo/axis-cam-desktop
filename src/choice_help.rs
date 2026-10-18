@@ -122,6 +122,13 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 "",
             )
         }
+        ("cycle", crate::model::HELICAL_MILLING) => {
+            diagram = Some(Diagram::DrillCycle(4));
+            (
+                "Mill each hole with a flat end mill narrower than the hole: down a helix of Stepdown per turn to the hole's flat floor, once round there, then to the centre and out. A hole over twice the cutter's size is cut in rings, the innermost first, each Ring stepover wider. The cutter climbs. Holes and their diameter filter are found as for drilling; the floor is flat, where a drill leaves its point.",
+                "The Through and Breakthrough settings work as for drilling. A manual mill cannot mill a hole round.",
+            )
+        }
         ("on_pins", "Yes") => (
             "The part drops over the machine's fixture pins by holes in it, so its place and turn are known: the pins give this setup's X and Y work offset (Set X Y from the pins on the Control page), with no probing. Z is still touched off on the stock. The pins are kept clear of as workholding; the vise or clamps still hold the part down.",
             "Cycle Start waits until X and Y are referenced from pin 1 since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
@@ -743,15 +750,7 @@ mod tests {
             ("facing_pattern", vec!["Both ways (zigzag)", "One way"]),
             ("facing_link", vec!["Keep tool down", "Retract each pass"]),
             ("pocket_entry", vec!["Profile ramp", "Plunge"]),
-            (
-                "cycle",
-                vec![
-                    "Drilling",
-                    "Chip breaking",
-                    "Deep drilling",
-                    "Counterboring",
-                ],
-            ),
+            ("cycle", crate::model::DRILL_CYCLES.to_vec()),
             (
                 "containment",
                 vec![
