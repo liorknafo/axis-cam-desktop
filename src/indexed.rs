@@ -296,6 +296,27 @@ impl Document {
     /// Refused when that height is above the machine's Z travel: it is
     /// never cut short to fit.
     pub fn swing(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
+        let swing = self.swing_unchecked(si, mesh, clearance)?;
+        // Machine Z is zero at the top of its travel and negative down.
+        if swing.machine_z > 0. {
+            let clamped = &self.setups[self.index_base(si).ok_or(NOT_INDEXED)?];
+            let unit = self.rotary_unit(&clamped.machine).ok_or(NO_GEOMETRY)?;
+            let travel = crate::post_check::machine_mm(&clamped.machine, "z");
+            return Err(format!(
+                "Index moves turn A with the tool above all that A swings: at machine Z {} (the A centreline at Z {} + {} mm, as far as {} from it at any angle, + {} mm clearance). That is {} mm above the top of the machine's {} mm Z travel (Z 0), so it cannot be reached and is not cut short. Measure the A centreline (Rotary A on the Control page) or reach less far from it: a smaller stock or chuck, or less clearance.",
+                mm(swing.machine_z),
+                mm(unit.centre_z),
+                mm(swing.radius),
+                swing.what,
+                mm(swing.clearance),
+                mm(swing.machine_z),
+                mm(travel),
+            ));
+        }
+        Ok(swing)
+    }
+    /// `swing`, though its height is above the machine's Z travel.
+    pub fn swing_unchecked(&self, si: usize, mesh: &Mesh, clearance: f32) -> Result<Swing, String> {
         let base = self.index_base(si).ok_or(NOT_INDEXED)?;
         let clamped = &self.setups[base];
         let stock = self.setup_stock(base, Some(mesh)).ok_or(STOCK_UNKNOWN)?;
@@ -331,26 +352,13 @@ impl Document {
                 ("the stock reaches", 0.),
                 |m, r| if r.1 > m.1 { r } else { m },
             );
-        let swing = Swing {
+        Ok(Swing {
             radius,
+            what,
             clearance,
             z: axis[1] + radius + clearance,
             machine_z: unit.centre_z + radius + clearance,
-        };
-        // Machine Z is zero at the top of its travel and negative down.
-        if swing.machine_z > 0. {
-            let travel = crate::post_check::machine_mm(&clamped.machine, "z");
-            return Err(format!(
-                "Index moves turn A with the tool above all that A swings: at machine Z {} (the A centreline at Z {} + {} mm, as far as {what} from it at any angle, + {} mm clearance). That is {} mm above the top of the machine's {} mm Z travel (Z 0), so it cannot be reached and is not cut short. Measure the A centreline (Rotary A on the Control page) or reach less far from it: a smaller stock or chuck, or less clearance.",
-                mm(swing.machine_z),
-                mm(unit.centre_z),
-                mm(radius),
-                mm(clearance),
-                mm(swing.machine_z),
-                mm(travel),
-            ));
-        }
-        Ok(swing)
+        })
     }
     /// Setup `si` at A angle `a` (degrees): its clamping's frame (its base's
     /// when it is indexed, else its own) turned about the A centreline by
@@ -625,8 +633,10 @@ pub const INDEX_RATE: f32 = 3600.;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Swing {
     /// The farthest the stock, the part or the chuck's jaws reach from the
-    /// A centreline at any angle, and the clearance kept above it, mm.
+    /// A centreline at any angle, what reaches that far, and the clearance
+    /// kept above it, mm.
     pub radius: f32,
+    pub what: &'static str,
     pub clearance: f32,
     /// The tool tip's height while A turns: in the setup's frame, and in
     /// machine coordinates (zero at the top of the Z travel).
@@ -661,8 +671,11 @@ pub struct Start<'a> {
 /// move; each carries its A. Between two angles, and from the A the
 /// machine is at to the first, the tool retracts above all A swings
 /// (`Document::swing`), A turns, and the tool comes over the next first cut
-/// and down to it. The chuck is checked along each of those moves and the
-/// whole turn (`chuck::Rig::hits_turning`).
+/// and down to it. The operation enters that way even when A is already at
+/// its first angle (LIO-205): the kernels' own lead-in starts at the stock
+/// box's -X -Y corner at their clearance plane, which on a bar in the chuck
+/// is over the jaws and below what they reach. The chuck is checked along
+/// each of those moves and the whole turn (`chuck::Rig::hits_turning`).
 pub fn generate(
     doc: &Document,
     si: usize,
@@ -703,20 +716,27 @@ pub fn generate(
         parts.push((a, plan));
         turns.push((a, at.frame));
     }
-    let turning = list.len() > 1 || (list[0] - start.a).abs() > 1e-4;
-    let swing = if turning {
-        Some(doc.swing(si, mesh, crate::cam::number(op, "clearance")?)?)
+    let clearance = crate::cam::number(op, "clearance")?;
+    let swing = if list.len() > 1 || (list[0] - start.a).abs() > 1e-4 {
+        doc.swing(si, mesh, clearance)?
     } else {
-        None
+        doc.swing_unchecked(si, mesh, clearance)?
     };
     let bi = doc.index_base(si).ok_or(NOT_INDEXED)?;
     let base = &doc.setups[bi];
-    let rig = if turning && crate::chuck::holds(base) {
+    let rig = if crate::chuck::holds(base) {
         let stock = doc.setup_stock(bi, Some(mesh)).ok_or(STOCK_UNKNOWN)?;
         Some((doc.chuck_rig(base, stock)?, crate::holding::gap(base)?))
     } else {
         None
     };
+    // Where A does not turn, the entry comes down from the top of the Z
+    // travel when the swing is above it. That is not checked against the
+    // chuck here: the program's first turn of A, below the swing, refuses
+    // it on export and on a run (`post::index_problems`), and the rotary
+    // checks say why.
+    let top = swing.z - swing.machine_z.max(0.);
+    let rig = rig.filter(|_| swing.machine_z <= 0.);
     let mut plan = parts[0].1.clone();
     plan.moves.clear();
     plan.duration = 0.;
@@ -752,10 +772,10 @@ pub fn generate(
         }
     };
     let (mut a_now, mut at): (f32, Option<[f32; 3]>) = (start.a, None);
-    for (a, part) in &parts {
+    for (k, (a, part)) in parts.iter().enumerate() {
         let mut moves = &part.moves[..];
-        if (a - a_now).abs() > 1e-4 {
-            let swing = swing.ok_or(NOT_INDEXED)?;
+        let turning = (a - a_now).abs() > 1e-4;
+        if k == 0 || turning {
             // The plan's own approach is replaced: over its first cut at the
             // swing height, straight down to where that cut starts.
             let first = moves
@@ -764,8 +784,8 @@ pub fn generate(
                 .unwrap_or(0);
             let to = moves[first].from;
             // Before the first angle the tool waits over its first cut.
-            let from = at.unwrap_or([to[0], to[1], swing.z]);
-            let (up, over) = ([from[0], from[1], swing.z], [to[0], to[1], swing.z]);
+            let from = at.unwrap_or([to[0], to[1], top]);
+            let (up, over) = ([from[0], from[1], top], [to[0], to[1], top]);
             if let Some((rig, gap)) = &rig {
                 let tool = (part.radius, part.tool_length, part.holder_radius);
                 let hits = [
@@ -774,10 +794,17 @@ pub fn generate(
                     rig.hits_at(*a, &[(up, over), (over, to)], tool, *gap),
                 ];
                 if let Some(hit) = hits.iter().flatten().next() {
+                    let what = if turning {
+                        format!(
+                            "index move from A {}° to A {}°",
+                            degrees(a_now),
+                            degrees(*a)
+                        )
+                    } else {
+                        format!("approach at A {}°", degrees(*a))
+                    };
                     return Err(format!(
-                        "The index move from A {}° to A {}° brings the {} within the {} mm gap of the {} at X {} Y {} Z {}.",
-                        degrees(a_now),
-                        degrees(*a),
+                        "The {what} brings the {} within the {} mm gap of the {} at X {} Y {} Z {}.",
                         hit.part,
                         mm(*gap),
                         hit.label,
@@ -788,19 +815,21 @@ pub fn generate(
                 }
             }
             rapid(&mut plan, from, up, a_now);
-            push(
-                &mut plan,
-                Move {
-                    from: up,
-                    to: up,
-                    motion: Motion::Index,
-                    cutting_pass: false,
-                    feed: INDEX_RATE,
-                    start: 0.,
-                    end: (a - a_now).abs() / INDEX_RATE * 60.,
-                    a: Some(*a),
-                },
-            );
+            if turning {
+                push(
+                    &mut plan,
+                    Move {
+                        from: up,
+                        to: up,
+                        motion: Motion::Index,
+                        cutting_pass: false,
+                        feed: INDEX_RATE,
+                        start: 0.,
+                        end: (a - a_now).abs() / INDEX_RATE * 60.,
+                        a: Some(*a),
+                    },
+                );
+            }
             rapid(&mut plan, up, over, *a);
             rapid(&mut plan, over, to, *a);
             moves = &moves[first..];
@@ -1512,10 +1541,19 @@ pub(crate) mod tests {
         let mut op = contour(&cutter("12"));
         op.p.insert("clearance".into(), "1".into());
         op.p.insert("retract".into(), "1".into());
-        let doc = bar_job(&mesh, -17., "60", "-150", "0, 90", op);
+        let doc = bar_job(&mesh, -17., "60", "-150", "90, 180", op.clone());
         let refused = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap_err();
         assert!(
             refused.starts_with("The index move from A 0° to A 90° brings the tool within the 2 mm gap of the chuck jaw"),
+            "{refused}"
+        );
+        // From A0 at A0 the approach waits there too, though A does not turn.
+        let doc = bar_job(&mesh, -17., "60", "-150", "0, 90", op);
+        let refused = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap_err();
+        assert!(
+            refused.starts_with(
+                "The approach at A 0° brings the tool within the 2 mm gap of the chuck jaw"
+            ),
             "{refused}"
         );
     }
@@ -1799,37 +1837,55 @@ pub(crate) mod tests {
         doc.setups.push(third);
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
-        // Setup 3 starts at the angle setup 2 left, so its kernel's own
-        // approach, over the stock's corner in the chuck body, is refused
-        // too. At machine Z home, above everything, its turn is not.
-        let turn = "A turns to A 90° with the tool tip at Z";
-        let posted = crate::post::post_job(&doc, &mesh);
-        assert!(
-            posted.setups[1].result.is_ok(),
-            "{:?}",
-            posted.setups[1].result
-        );
-        let home = posted.setups[2].result.as_ref().unwrap_err();
-        assert!(home.iter().all(|e| !e.contains(turn)), "{home:?}");
-        // At the clearance plane, below the jaws' swing, the turn is
-        // refused; setup 2's turns are at its index move's height and pass.
-        doc.setups[0]
-            .machine
-            .p
-            .insert("post_retract".into(), POST_RETRACT[1].into());
-        doc.sync_indexed();
-        let posted = crate::post::post_job(&doc, &mesh);
-        assert!(
-            posted.setups[1].result.is_ok(),
-            "{:?}",
-            posted.setups[1].result
-        );
-        let refused = posted.setups[2].result.as_ref().unwrap_err();
-        assert!(
-            refused.iter().any(|e| e.contains(turn)
-                && e.contains("below Z70.902 where nothing A swings reaches it")),
-            "{refused:?}"
-        );
+        // Setup 3 starts at the angle setup 2 left, and comes down from
+        // above all A swings as an index move does (LIO-205): its program
+        // turns A at machine Z home, or at the clearance plane, which is at
+        // that height now, and is exported either way.
+        for mode in &POST_RETRACT[..2] {
+            doc.setups[0]
+                .machine
+                .p
+                .insert("post_retract".into(), (*mode).into());
+            doc.sync_indexed();
+            let posted = crate::post::post_job(&doc, &mesh);
+            for k in [1, 2] {
+                assert!(
+                    posted.setups[k].result.is_ok(),
+                    "{mode}: {:?}",
+                    posted.setups[k].result
+                );
+            }
+        }
+        // Its plans checked once the operation's clearance is raised to
+        // 40 mm put the swing above where its program turns A, the
+        // clearance plane: that turn is refused. At machine Z home it is not.
+        let sims = crate::run::simulated_for_tests(&doc, &mesh, 2);
+        let mut raised = doc.clone();
+        (raised.setups[2].operations[0].p).insert("clearance".into(), "40".into());
+        let below = "A turns to A 90° with the tool tip at Z";
+        for (mode, refused) in POST_RETRACT.iter().zip([false, true]) {
+            raised.setups[0]
+                .machine
+                .p
+                .insert("post_retract".into(), (*mode).into());
+            raised.sync_indexed();
+            let found = crate::post::checked(
+                &raised,
+                &mesh,
+                2,
+                &sims,
+                crate::post::PostSettings::from_machine,
+            )
+            .err()
+            .unwrap_or_default();
+            assert_eq!(
+                found
+                    .iter()
+                    .any(|e| e.contains(below) && e.contains("where nothing A swings reaches it")),
+                refused,
+                "{mode}: {found:?}"
+            );
+        }
     }
     #[test]
     fn each_angles_cuts_are_checked_against_the_jaws_at_that_angle() {
@@ -1869,5 +1925,90 @@ pub(crate) mod tests {
         for (_, message) in &found {
             assert!(refused.contains(message), "{message} not in {refused:?}");
         }
+    }
+    /// That `plan` enters straight down over its first cut from the swing
+    /// height `z`, at A `a`, with no index move first, clear of the chuck.
+    fn enters_from_above(
+        doc: &Document,
+        mesh: &Mesh,
+        plan: &crate::simulation::Plan,
+        z: f32,
+        a: f32,
+    ) {
+        use crate::simulation::Motion;
+        let first = plan
+            .moves
+            .iter()
+            .position(|m| m.motion == Motion::Feed)
+            .unwrap();
+        let (down, over) = (&plan.moves[..first], plan.moves[first].from);
+        assert!(
+            !down.is_empty() && (down[0].from[2] - z).abs() < 1e-3,
+            "{down:?} {z}"
+        );
+        for m in down {
+            assert_eq!((m.motion, m.a), (Motion::Rapid, Some(a)), "{m:?}");
+            for p in [m.from, m.to] {
+                assert!(close([p[0], p[1], 0.], [over[0], over[1], 0.]), "{m:?}");
+            }
+        }
+        let stock = doc.setup_stock(0, Some(mesh)).unwrap();
+        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+        let gap = crate::holding::gap(&doc.setups[0]).unwrap();
+        let segments: Vec<_> = down.iter().map(|m| (m.from, m.to)).collect();
+        let tool = (plan.radius, plan.tool_length, plan.holder_radius);
+        assert!(rig.hits_at(a, &segments, tool, gap).is_empty());
+    }
+    #[test]
+    fn an_indexed_setup_at_the_angle_a_is_at_comes_down_from_above_the_swing() {
+        use crate::simulation::{Motion, prepare};
+        // Setup 1 leaves A at 0, the first angle: no index move comes first,
+        // and the kernel's own lead-in, from the stock's -X corner in the
+        // jaws at its clearance plane, is replaced all the same (LIO-205).
+        let (doc, mesh) = posting_bar_job(20., "100", "0, 90, 180, 270");
+        let sim = prepare(&doc, &mesh, 1, 0).unwrap();
+        assert_eq!(angle_order(&sim.plan), [0., 90., 180., 270.]);
+        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        enters_from_above(&doc, &mesh, &sim.plan, swing.z, 0.);
+        let index = sim.plan.moves.iter().filter(|m| m.motion == Motion::Index);
+        assert_eq!(index.count(), 3);
+        // The checks find nothing, and it exports: A0 after the tool
+        // change's retract, then down over the first cut.
+        let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim.clone()))]);
+        assert!(held.is_empty(), "{held:?}");
+        let found = crate::rotary_check::problems(&doc, &mesh, 1, &[(0, Ok(sim))]);
+        assert!(found.is_empty(), "{found:?}");
+        let posted = crate::post::post_job(&doc, &mesh);
+        let programs = posted.setups[1].result.as_ref().unwrap();
+        let code: Vec<&str> = programs[0]
+            .text
+            .lines()
+            .filter(|l| !l.starts_with('('))
+            .collect();
+        let turns: Vec<usize> = (0..code.len()).filter(|&i| code[i].contains('A')).collect();
+        assert_eq!(code[turns[0] - 1..=turns[0]], ["G53 G0 Z0", "G0 A0.000"]);
+        assert_eq!(turns.len(), 5, "{code:?}");
+    }
+    #[test]
+    fn a_later_operation_at_the_same_angle_comes_down_from_above_the_swing() {
+        use crate::simulation::{Motion, prepare};
+        // Two contours at A90: the second starts where the first left A.
+        let (mut doc, mesh) = posting_bar_job(20., "100", "90");
+        let ops = &mut doc.setups[1].operations;
+        ops[0].p.insert("allowance".into(), "1".into());
+        let mut finish = ops[0].clone();
+        finish.id = crate::model::id();
+        finish.p.insert("allowance".into(), "0".into());
+        ops.push(finish);
+        let sim = prepare(&doc, &mesh, 1, 1).unwrap();
+        assert!(sim.plan.moves.iter().all(|m| m.motion != Motion::Index));
+        let swing = doc.swing(1, &mesh, 15.).unwrap();
+        enters_from_above(&doc, &mesh, &sim.plan, swing.z, 90.);
+        let posted = crate::post::post_job(&doc, &mesh);
+        assert!(
+            posted.setups[1].result.is_ok(),
+            "{:?}",
+            posted.setups[1].result
+        );
     }
 }
