@@ -367,9 +367,11 @@ pub enum LatheStep {
         peck: f32,
         quill: Dial,
     },
-    /// A 45° chamfer of leg `size` on `edge`: the carriage at `carriage`
-    /// (on a shoulder; the end edges are touched), locked, the top slide in
-    /// `top` from the touch on the corner.
+    /// A 45° chamfer of leg `size` on `edge` with a tool that has a 45°
+    /// edge: the carriage at `carriage` (on a shoulder: the tool's point
+    /// `size` short of it; the end edges are touched), locked; the 45° edge
+    /// brought to the corner, then the top slide, set along the bed (0°),
+    /// in `top` (`size`) toward the chuck, so both legs are `size`.
     Chamfer {
         op: usize,
         tool: String,
@@ -2797,9 +2799,13 @@ pub(crate) mod tests {
         else {
             panic!()
         };
+        // The top slide, along the bed, feeds the 45° edge the leg: 1.00.
+        assert_eq!(top.slide, Slide::Top);
+        close(top.distance, 1.);
         reads(top, 0, 1.);
-        // The shoulder at −65: 64 from the faced end.
-        close(carriage.distance, 64.);
+        // The shoulder at −65 is 64 from the faced end: the point stops 1
+        // short of it, at 63, for the top slide to feed it the last 1.
+        close(carriage.distance, 63.);
         // The top slide was fed in: the next chamfer's carriage zero no
         // longer holds, but an end chamfer needs none.
         assert_eq!(of(4), ["Chamfer"]);

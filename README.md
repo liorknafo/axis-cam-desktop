@@ -558,7 +558,7 @@ A lathe setup opens in MACHINE on its **Steps** page, like the manual mill's: th
 | Pass | One screen per pass of an Outside or a Bore: the cross-slide dial in (out, boring) for this pass, the carriage dial where to stop, the power feed and "last 1 mm by hand", and the pass tiles with their diameters |
 | Measure | Before the last pass: type the measured diameter; the last pass's cross-slide reading is worked out again from it and is shown at once |
 | Drill | The tailstock: centre drill first, then the drill; the quill dial for the depth and the point, a peck every diameter |
-| Chamfer | The top slide dial from the touch on the corner (a shoulder one reads the carriage dial), carriage locked |
+| Chamfer | A tool with a **45° edge**, the top slide set **0°, along the bed**: the edge on the corner, zero the top slide, then in the chamfer's size toward the chuck, so both legs are the size (a shoulder one first sets the carriage with the tool's point that size short of the shoulder); carriage locked |
 | Groove, Part off | The carriage dial for the tool's left side, the cross-slide dial for the depth (to the centre for a part off), "lock the carriage", and "catch the part" |
 | Thread pass | One screen per pass: the gearbox pitch, the top slide, the top slide dial for the infeed of this pass, the cross slide back to its zero, and the half-nuts rule |
 | Hand over | The bar as it leaves, the next setup and how it is held |

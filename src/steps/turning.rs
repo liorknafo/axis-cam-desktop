@@ -147,6 +147,8 @@ enum Cutter {
     /// A drill of this radius, from the tailstock.
     Drill(f32),
     Thread,
+    /// A tool with a 45° edge up to its point (down to it, inside a hole).
+    Chamfer(bool),
 }
 /// What a side view shows over the bar, at `[z, r]` points (work Z, mm from
 /// the axis; a negative radius is the half below the axis).
@@ -482,6 +484,25 @@ fn tool(f: &mut canvas::Frame, kind: Cutter, tip: Point, cy: f32, s: f32) {
         Cutter::Thread => {
             draw(f, bar(x - 7., y - 42., 14., 26.));
             draw(f, poly(&[(x, y), (x - 7., y - 16.), (x + 7., y - 16.)]));
+        }
+        Cutter::Chamfer(inside) => {
+            // The 45° edge runs from the point toward the chuck and out
+            // (in, inside a hole), drawn bold.
+            let l = 18.;
+            let v = if inside { 1. } else { -1. };
+            draw(
+                f,
+                poly(&[(x, y), (x - l, y + v * l), (x + 0.5 * l, y + v * l)]),
+            );
+            if inside {
+                draw(f, bar(x - l, y + l, 90., 8.));
+            } else {
+                draw(f, bar(x - l, y - l - 24., 1.5 * l, 24.));
+            }
+            f.stroke(
+                &canvas::Path::line(Point::new(x, y), Point::new(x - l, y + v * l)),
+                stroke(ACCENT, 2.5),
+            );
         }
     }
 }
@@ -1669,12 +1690,19 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let e = extent(&pieces).unwrap_or([end - size, end, 0., outer_of(bar)]);
             let mut marks: Vec<Mark> = pieces.iter().map(|g| Mark::Cut(*g)).collect();
             let inside = edge == "End inside";
+            // The tool's point at the foot of its 45° edge, where the top
+            // slide leaves it: `size` from the corner.
             marks.push(Mark::Tool(
-                if inside { Cutter::Bore } else { Cutter::Turn },
-                if inside { [e[1], e[2]] } else { [e[1], e[3]] },
+                Cutter::Chamfer(inside),
+                if inside {
+                    [e[1], e[2] + size]
+                } else {
+                    [e[1], e[3] - size]
+                },
             ));
+            // Left of the tool drawn at the corner.
             marks.push(Mark::Word(
-                [e[0] - 3., e[3] + 5.],
+                [e[0] - 8., e[3] + 5.],
                 format!("{} × 45°", mm(*size)),
                 ACCENT,
                 Align::Right,
@@ -1683,12 +1711,20 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let mut rows = vec![];
             if let Some(c) = carriage {
                 let at = reading(p, c);
-                d.push(dial_box(p, c, format!("the corner at {}", at.short), 130.));
+                d.push(dial_box(
+                    p,
+                    c,
+                    format!("the point {} short", mm(*size)),
+                    130.,
+                ));
                 rows.push(line(
                     Some(1),
                     "carriage",
                     big(at.short, lit(0, item)),
-                    vec!["then lock it".into()],
+                    vec![
+                        format!("the point {} short", mm(*size)),
+                        "of the corner, lock it".into(),
+                    ],
                     lit(0, item),
                     reached(0),
                 ));
@@ -1697,14 +1733,14 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             d.push(dial_box(
                 p,
                 top,
-                format!("in {} from the touch", mm(*size)),
+                format!("in {} toward the chuck", mm(*size)),
                 130.,
             ));
             rows.push(line(
                 Some(n as u8 + 1),
                 "top slide",
                 big(reading(p, top).total, lit(n, item)),
-                vec!["touch the corner, zero".into(), "then in".into()],
+                vec!["45° edge on the corner".into(), "zero, then in".into()],
                 lit(n, item),
                 reached(n),
             ));
@@ -1714,13 +1750,17 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     rpm_chip(*rpm),
                     chip(edge.to_lowercase())
                 ]),
+                chips(vec![
+                    chip("45° tool edge"),
+                    chip("top slide 0°, along the bed"),
+                    warn_chip("lock the carriage"),
+                ]),
                 dials(d),
-                chips(vec![warn_chip("lock the carriage")]),
             ]
             .extend(rows);
             (
                 "Chamfer".into(),
-                "45° on the top slide",
+                "a 45° tool edge, fed along the bed",
                 view(bar, marks, 380.),
                 right,
             )

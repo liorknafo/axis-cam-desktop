@@ -705,8 +705,11 @@ impl Lathe<'_> {
         cut.rapid(outer + CLEAR, z + CLEAR)
     }
     /// Chamfer: a 45° chamfer of leg `size` on the end's outside or inside
-    /// edge, or on the first shoulder from the end, by hand; simulated as
-    /// thin rings inside the chamfer, never past it.
+    /// edge, or on the first shoulder from the end, by hand: a tool with a
+    /// 45° edge touches the corner, then the top slide, set along the bed,
+    /// feeds it `size` toward the chuck, so both legs are `size`. The moves
+    /// are the tool's point, at the foot of the 45° edge. Simulated as thin
+    /// rings inside the chamfer, never past it.
     fn chamfer(&self, cut: &mut Cut) -> Result<(), String> {
         let size = above_zero(self.op, "size")?;
         let edge = get(&self.op.p, "edge");
@@ -747,17 +750,19 @@ impl Lathe<'_> {
                 if sections.iter().any(|s| s.inner >= big - size - ON) {
                     return Err("The chamfer is bigger than the wall.".into());
                 }
-                cut.rapid(big + CLEAR, end + CLEAR)?;
-                cut.rapid(big - size, end + CLEAR)?;
-                cut.rapid(big - size, z)?;
+                // The edge on the corner puts the point `size` below it and
+                // `size` toward the tailstock; it feeds `size` along the bed.
+                cut.rapid(big + CLEAR, end + CLEAR + size)?;
+                cut.rapid(big - size, end + CLEAR + size)?;
+                cut.rapid(big - size, z + size)?;
                 cut.pass();
-                cut.go(big, z - size, Motion::Feed, self.hand())?;
+                cut.go(big - size, z, Motion::Feed, self.hand())?;
                 for k in 1..n {
                     let low = z - size + k as f32 * s;
                     cut.ring([low, low + s, big - k as f32 * s, rim], 0.)?;
                 }
-                cut.rapid(big + CLEAR, z - size)?;
-                cut.rapid(big + CLEAR, end + CLEAR)
+                cut.rapid(big + CLEAR, z)?;
+                cut.rapid(big + CLEAR, end + CLEAR + size)
             }
             "End inside" => {
                 let (z, hole) = (top.z[1], top.inner);
@@ -772,17 +777,19 @@ impl Lathe<'_> {
                     return Err("The chamfer is bigger than the wall.".into());
                 }
                 let back = (hole - BACK_OFF).max(0.);
-                cut.rapid(back, end + CLEAR)?;
-                cut.rapid(hole + size, end + CLEAR)?;
-                cut.rapid(hole + size, z)?;
+                // The edge on the hole's corner puts the point `size` out
+                // from it and `size` toward the tailstock.
+                cut.rapid(back, end + CLEAR + size)?;
+                cut.rapid(hole + size, end + CLEAR + size)?;
+                cut.rapid(hole + size, z + size)?;
                 cut.pass();
-                cut.go(hole, z - size, Motion::Feed, self.hand())?;
+                cut.go(hole + size, z, Motion::Feed, self.hand())?;
                 for k in 1..n {
                     let low = z - size + k as f32 * s;
                     cut.ring([low, low + s, 0., hole + k as f32 * s], 0.)?;
                 }
-                cut.rapid(back, z - size)?;
-                cut.rapid(back, end + CLEAR)
+                cut.rapid(back, z)?;
+                cut.rapid(back, end + CLEAR + size)
             }
             _ => Err("edge must be End outside, End inside or Shoulder.".into()),
         }
@@ -1974,9 +1981,11 @@ pub(crate) mod tests {
             .iter()
             .find(|m| m.motion == Motion::Feed)
             .unwrap();
-        // From (Ø28, the end) to (Ø30, 1 mm in): the 45° leg.
-        assert!(near(feed.from[0], 14.) && near(feed.from[2], 100.));
-        assert!(near(feed.to[0], 15.) && near(feed.to[2], 99.));
+        // The 45° edge on the corner (Ø30, the end) puts the point at Ø28,
+        // 1 mm out from the end; the top slide feeds it 1 mm along the bed,
+        // to the end: both legs 1.
+        assert!(near(feed.from[0], 14.) && near(feed.from[2], 101.));
+        assert!(near(feed.to[0], 14.) && near(feed.to[2], 100.));
         assert_eq!(outside.rings.len(), 9);
         let error = results[2].as_ref().unwrap_err();
         assert!(error.contains("needs a hole"), "{error}");
@@ -1989,8 +1998,18 @@ pub(crate) mod tests {
             .iter()
             .find(|m| m.motion == Motion::Feed)
             .unwrap();
-        assert!(near(feed.from[0], 24.) && near(feed.from[2], 80.));
-        assert!(near(feed.to[0], 25.) && near(feed.to[2], 79.));
+        assert!(near(feed.from[0], 24.) && near(feed.from[2], 81.));
+        assert!(near(feed.to[0], 24.) && near(feed.to[2], 80.));
+        // The rings fill the 45° triangle of legs 1 at the shoulder: none
+        // past Z -21 or below Ø48.
+        for ring in &shoulder.rings {
+            assert!(
+                ring.z[0] >= 79. - 1e-4 && ring.z[1] <= 80. + 1e-4,
+                "{ring:?}"
+            );
+            assert!(ring.r[0] >= 24. - 1e-4, "{ring:?}");
+            assert!(ring.r[0] >= 25. - (ring.z[0] - 79.) - 1e-4, "{ring:?}");
+        }
     }
 
     #[test]
