@@ -681,6 +681,131 @@ impl canvas::Program<Message> for DialFace {
     }
 }
 
+/// The top slide seen from above, you at the front, the chuck on the left:
+/// the cross slide's line (toward the axis, up), the bed's, and the top
+/// slide at `from_cross`° from the cross slide (90 = along the bed), its
+/// arrow the way the tool goes as its dial is wound (`out`: wound out,
+/// inside a hole).
+struct TopAngle {
+    from_cross: f32,
+    out: bool,
+}
+impl canvas::Program<Message> for TopAngle {
+    type State = ();
+    fn draw(
+        &self,
+        _: &(),
+        renderer: &iced::Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        _: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut f = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (bounds.width, bounds.height);
+        let c = Point::new(w * 0.62, h * 0.6);
+        let l = (h * 0.5).min(w * 0.45);
+        // The bed, along the axis, and the cross slide, toward it.
+        f.stroke(
+            &canvas::Path::line(Point::new(6., c.y), Point::new(w - 6., c.y)),
+            dashed(MUTED, 1.),
+        );
+        f.stroke(
+            &canvas::Path::line(Point::new(c.x, c.y + l * 0.55), Point::new(c.x, c.y - l)),
+            stroke(INK, 1.4),
+        );
+        word(
+            &mut f,
+            "cross slide",
+            Point::new(c.x + 5., c.y - l + 6.),
+            MUTED,
+            11.,
+            Align::Left,
+            Font::DEFAULT,
+        );
+        word(
+            &mut f,
+            "◀ chuck",
+            Point::new(6., c.y + 10.),
+            MUTED,
+            11.,
+            Align::Left,
+            Font::DEFAULT,
+        );
+        // The top slide, at its angle toward the chuck: in and toward the
+        // chuck winding in, out and toward the chuck winding out.
+        let a = self.from_cross.to_radians();
+        let v = if self.out { 1. } else { -1. };
+        let tip = Point::new(c.x - a.sin() * l, c.y + v * a.cos() * l);
+        arrow(&mut f, c, tip, ACCENT, 3.);
+        let along = self.from_cross > 89.9;
+        // The angle between the cross slide and the top slide.
+        if self.from_cross > 0.5 && !along {
+            let up = if self.out {
+                std::f32::consts::FRAC_PI_2
+            } else {
+                -std::f32::consts::FRAC_PI_2
+            };
+            let far = up + v * a;
+            let (a0, a1) = if far < up { (far, up) } else { (up, far) };
+            let arc = canvas::Path::new(|b| {
+                b.arc(canvas::path::Arc {
+                    center: c,
+                    radius: l * 0.45,
+                    start_angle: iced::Radians(a0),
+                    end_angle: iced::Radians(a1),
+                })
+            });
+            f.stroke(&arc, stroke(ACCENT, 1.4));
+        }
+        // The number left of the top slide's arrow, the arc showing which
+        // angle it is.
+        let mid = Point::new(c.x - a.sin() * l * 0.55, c.y + v * a.cos() * l * 0.55);
+        let (label, at) = if along {
+            ("0°".to_string(), Point::new(c.x - l * 0.55, c.y - 12.))
+        } else {
+            (
+                format!("{}°", trimmed(self.from_cross)),
+                Point::new(mid.x - 8., mid.y),
+            )
+        };
+        word(&mut f, &label, at, ACCENT, 13., Align::Right, bold_font());
+        vec![f.into_geometry()]
+    }
+}
+/// The top slide's angle as a small picture over its words: "29.5° from
+/// the cross slide", or "0°, along the bed".
+fn top_angle<'a>(from_cross: f32, out: bool) -> Element<'a, Message> {
+    let along = (from_cross - 90.).abs() < 1e-3;
+    let words = if along {
+        "top slide 0°, along the bed".to_string()
+    } else {
+        format!("{}° from the cross slide", trimmed(from_cross))
+    };
+    column![
+        canvas(TopAngle {
+            from_cross: if along { 90. } else { from_cross },
+            out,
+        })
+        .width(150)
+        .height(110),
+        text(words).size(12).color(MUTED).center()
+    ]
+    .spacing(2)
+    .align_x(Alignment::Center)
+    .width(170)
+    .into()
+}
+/// The chip of the top slide's setting for a Face or a Chamfer: along the
+/// bed, or set back to it from the angle a thread left it at.
+fn set_back<'a>(swung: Option<f32>) -> Element<'a, Message> {
+    match swung {
+        Some(a) => warn_chip(format!(
+            "top slide back from {}° to 0°, along the bed",
+            mm(a)
+        )),
+        None => chip("top slide 0°, along the bed"),
+    }
+}
 /// A slide's name on the screens.
 fn slide_name(slide: Slide) -> &'static str {
     match slide {
@@ -1304,7 +1429,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 rows.push(next(
                     "top slide",
                     format!("{}°", mm(*a)),
-                    vec!["swing it".into(), "zero it on the touch".into()],
+                    vec!["from the cross slide".into(), "zero it on the touch".into()],
                 ));
             }
             if *carriage {
@@ -1333,11 +1458,13 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 tags.push("zero the cross dial".into());
                 rows.push(next("cross slide", "0".into(), tags));
             }
-            let right = column![
-                chips(vec![tool_chip(p, tool), rpm_chip(*rpm)]),
-                label("Touch, then zero"),
-            ]
-            .extend(rows);
+            let mut right = column![chips(vec![tool_chip(p, tool), rpm_chip(*rpm)])];
+            if let Some(a) = top {
+                // Swing the top slide first: its angle from the cross slide.
+                let out = cross.as_ref().is_some_and(|c| c.inside);
+                right = right.push(dials(vec![top_angle(*a, out)]));
+            }
+            let right = right.push(label("Touch, then zero")).extend(rows);
             (
                 "Touch".into(),
                 "zero the dials for this tool",
@@ -1352,6 +1479,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             face_off,
             to_diameter,
             top,
+            swung,
             ..
         } => {
             let bar = bar_of(*op);
@@ -1369,15 +1497,19 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ACCENT,
                 Align::Right,
             ));
+            let mut face_dials = vec![dial_box(
+                p,
+                top,
+                format!("in {} from the touch", fixed(*face_off, 2)),
+                150.,
+            )];
+            if swung.is_some() {
+                face_dials.push(top_angle(90., false));
+            }
             let right = column![
                 chips(vec![tool_chip(p, tool), rpm_chip(*rpm)]),
-                dials(vec![dial_box(
-                    p,
-                    top,
-                    format!("in {} from the touch", fixed(*face_off, 2)),
-                    150.
-                )]),
-                chips(vec![warn_chip("lock the carriage")]),
+                chips(vec![set_back(*swung), warn_chip("lock the carriage")]),
+                dials(face_dials),
                 line(
                     Some(1),
                     "top slide",
@@ -1705,6 +1837,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             size,
             top,
             carriage,
+            swung,
         } => {
             let bar = bar_of(*op);
             let pieces = all(*op);
@@ -1729,6 +1862,12 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ACCENT,
                 Align::Right,
             ));
+            // Three pictures in a row are smaller.
+            let size_of = if swung.is_some() && carriage.is_some() {
+                104.
+            } else {
+                130.
+            };
             let mut d = vec![];
             let mut rows = vec![];
             if let Some(c) = carriage {
@@ -1737,7 +1876,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     p,
                     c,
                     format!("the point {} short", mm(*size)),
-                    130.,
+                    size_of,
                 ));
                 rows.push(line(
                     Some(1),
@@ -1756,8 +1895,11 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 p,
                 top,
                 format!("in {} toward the chuck", mm(*size)),
-                130.,
+                size_of,
             ));
+            if swung.is_some() {
+                d.push(top_angle(90., false));
+            }
             rows.push(line(
                 Some(n as u8 + 1),
                 "top slide",
@@ -1774,7 +1916,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ]),
                 chips(vec![
                     chip("45° tool edge"),
-                    chip("top slide 0°, along the bed"),
+                    set_back(*swung),
                     warn_chip("lock the carriage"),
                 ]),
                 dials(d),
@@ -1952,23 +2094,25 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let right = column![
                 chips(vec![
                     tool_chip(p, &p.setup.operations[*op].tool),
-                    chip(format!("top slide {}°", mm(*angle))),
                     rpm_chip(*rpm),
                     warn_chip(format!("gearbox {}", mm(*pitch))),
                 ]),
-                dials(vec![dial_box(
-                    p,
-                    top,
-                    if top.out {
-                        format!(
-                            "pass {index}: out, reads {}",
-                            fixed(top.reads.unwrap_or(0.), places_of(p, Slide::Top))
-                        )
-                    } else {
-                        format!("pass {index}: in to {}", t.total)
-                    },
-                    118.
-                )]),
+                dials(vec![
+                    dial_box(
+                        p,
+                        top,
+                        if top.out {
+                            format!(
+                                "pass {index}: out, reads {}",
+                                fixed(top.reads.unwrap_or(0.), places_of(p, Slide::Top))
+                            )
+                        } else {
+                            format!("pass {index}: in to {}", t.total)
+                        },
+                        118.
+                    ),
+                    top_angle(*angle, top.out),
+                ]),
                 line(
                     Some(1),
                     "cross slide",

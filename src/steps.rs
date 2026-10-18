@@ -2941,6 +2941,7 @@ pub(crate) mod tests {
                 "Face",
                 "top slide",
                 "in 1.00 from the touch",
+                "top slide 0°, along the bed",
                 "lock the carriage",
                 "on the new end",
                 "Section done ▶",
@@ -3025,13 +3026,23 @@ pub(crate) mod tests {
         );
         let thread = nth(&a, 2, |l| matches!(l, L::ThreadPass { .. }));
         send(&mut a, GuideAction::Go(thread - 3));
-        shows(&a, &["Touch", "top slide", "29.5°", "zero it on the touch"]);
+        shows(
+            &a,
+            &[
+                "Touch",
+                "top slide",
+                "29.5°",
+                "from the cross slide",
+                "29.5° from the cross slide",
+                "zero it on the touch",
+            ],
+        );
         send(&mut a, GuideAction::Go(thread));
         shows(
             &a,
             &[
                 "Thread pass 3 of 8",
-                "top slide 29.5°",
+                "29.5° from the cross slide",
                 "gearbox 1.5",
                 "pass 3: in to 0.64",
                 "0.64",
@@ -3109,6 +3120,22 @@ pub(crate) mod tests {
         let mut a = lathe_app("Diameter", |_| {});
         send(&mut a, GuideAction::Next);
         shows(&a, &["zero the cross dial"]);
+    }
+    #[test]
+    fn after_a_thread_a_chamfer_shows_the_top_slide_set_back() {
+        let mut a = lathe_app("Diameter", |doc| {
+            doc.setups[0].operations.truncate(5);
+            crate::turn::tests::add(doc, "Chamfer", &[("edge", "End outside"), ("size", "0.5")]);
+        });
+        let chamfer = nth(&a, 0, |l| matches!(l, L::Chamfer { .. }));
+        send(&mut a, GuideAction::Go(chamfer));
+        shows(
+            &a,
+            &[
+                "45° tool edge",
+                "top slide back from 29.5° to 0°, along the bed",
+            ],
+        );
     }
     #[test]
     fn until_the_dial_check_is_answered_the_cross_slide_shows_no_number() {
@@ -3299,6 +3326,19 @@ pub(crate) mod tests {
         let chamfer = nth(&a, 0, |l| matches!(l, L::Chamfer { .. }));
         shot(&mut a, "18-chamfer-shoulder", chamfer, 0);
         shot(&mut a, "19-chamfer-end", chamfer + 1, 0);
+        // After the thread, a chamfer and a face set the top slide back.
+        let mut a = lathe_app("Diameter", |doc| {
+            doc.setups[0].operations.truncate(5);
+            crate::turn::tests::add(doc, "Chamfer", &[("edge", "End outside"), ("size", "0.5")]);
+        });
+        let chamfer = nth(&a, 0, |l| matches!(l, L::Chamfer { .. }));
+        shot(&mut a, "23-chamfer-after-thread", chamfer, 0);
+        let mut a = lathe_app("Diameter", |doc| {
+            doc.setups[0].operations.truncate(5);
+            crate::turn::tests::add(doc, "Face", &[("face_off", "0.5"), ("to_diameter", "36")]);
+        });
+        let face = nth(&a, 1, |l| matches!(l, L::Face { .. }));
+        shot(&mut a, "24-face-after-thread", face, 0);
         // A bore: the cross slide winds out, its collar counting down.
         let mut a = bore_app(|_| {});
         let fifth = nth(&a, 4, |l| matches!(l, L::Pass { .. }));

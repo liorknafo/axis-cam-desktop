@@ -319,7 +319,9 @@ pub enum LatheStep {
     /// One screen: lock the carriage, touch the end, the top slide (along
     /// the bed) in `face_off` on its dial, face across to `to_diameter`;
     /// then, the tool on the new end at `new_end`: zero the carriage dial
-    /// there. Every later carriage reading is from the new end.
+    /// there. Every later carriage reading is from the new end. The top
+    /// slide is set 0°, along the bed; `swung` is the angle from the cross
+    /// slide a thread before left it at, to set back.
     Face {
         op: usize,
         tool: String,
@@ -328,6 +330,7 @@ pub enum LatheStep {
         to_diameter: f32,
         top: Dial,
         new_end: f32,
+        swung: Option<f32>,
     },
     /// Pass `index` of `of` of an Outside (or Bore, `bore`) to `diameter`:
     /// the cross dial in (out, boring) to `cross`, power feed at `feed`
@@ -383,6 +386,9 @@ pub enum LatheStep {
         size: f32,
         top: Dial,
         carriage: Option<Dial>,
+        /// The angle from the cross slide a thread before left the top
+        /// slide at, to set back to 0°, along the bed.
+        swung: Option<f32>,
     },
     /// A groove (or a part off, `part_off`) with a `width` blade: the
     /// carriage locked with the tool's left side at each of `carriages`, the
@@ -1080,6 +1086,9 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
 
     // One section per operation.
     let mut last_tool: Option<String> = None;
+    // The top slide's angle from the cross slide while a thread left it
+    // swung; None while it is along the bed.
+    let mut swung: Option<f32> = None;
     let mut done_ops: Vec<Done> = vec![];
     for ((oi, plan), after) in done.into_iter().zip(afters) {
         let op = &setup.operations[oi];
@@ -1127,6 +1136,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     to_diameter: num(&op.p, "to_diameter").unwrap_or(0.),
                     top: zeroes.dial(Slide::Top, face_off),
                     new_end: mm(turn::work_z(stock, z)),
+                    swung: swung.take(),
                 }));
                 // The tool is on the new end: the carriage is zeroed there.
                 zeroes.end = z;
@@ -1241,6 +1251,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     size,
                     top: zeroes.dial(Slide::Top, size),
                     carriage: shoulder.then(|| zeroes.dial(Slide::Carriage, zc - cut.from[2])),
+                    swung: swung.take(),
                 }));
                 // The top slide was fed in: the carriage zero no longer holds.
                 zeroes.carriage = None;
@@ -1310,6 +1321,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 // The top slide is swung and fed in: the carriage zero no
                 // longer holds.
                 zeroes.carriage = None;
+                swung = Some(angle);
                 n
             }
             other => return Err(format!("\"{other}\" does not run on the manual lathe.")),
@@ -2881,6 +2893,38 @@ pub(crate) mod tests {
             panic!()
         };
         reads(top, 0, 0.5);
+    }
+    #[test]
+    fn after_a_thread_the_top_slide_is_set_back_along_the_bed() {
+        let (doc, mesh) = sample("Diameter");
+        let guide = build(&doc, &mesh, 0).unwrap();
+        // The Face comes first: the top slide is along the bed already.
+        assert!(matches!(
+            guide.steps[2],
+            Step::Lathe(LatheStep::Face { swung: None, .. })
+        ));
+        // A chamfer and a face after the thread set it back from 29.5°;
+        // the face after the chamfer finds it along the bed.
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations.truncate(5);
+        add(
+            &mut doc,
+            "Chamfer",
+            &[("edge", "End outside"), ("size", "0.5")],
+        );
+        add(
+            &mut doc,
+            "Face",
+            &[("face_off", "0.5"), ("to_diameter", "36")],
+        );
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let swung: Vec<Option<f32>> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::Face { swung, .. } | LatheStep::Chamfer { swung, .. } => Some(*swung),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(swung, [None, Some(29.5), None]);
     }
     #[test]
     fn the_measurements_and_the_place_survive_save_and_load() {
