@@ -7664,7 +7664,35 @@ fn account_panel(app: &App) -> Element<'_, Message> {
 }
 /// The stage of the current run, naming the model it asks.
 pub(crate) fn running_text(app: &App, stage: crate::planner::Progress) -> String {
-    stage_text(stage, &app.plan_model)
+    use crate::planner::{MAX_REQUESTS, Progress};
+    match stage {
+        Progress::Asking(n) if edits_plan(app) => format!(
+            "Asking {} for the change ({n} of {MAX_REQUESTS})…",
+            app.plan_model
+        ),
+        _ => stage_text(stage, &app.plan_model),
+    }
+}
+/// Whether the run, or the preview or failure it left, is an asked change to
+/// an existing plan: the job's or the open preview's.
+pub(crate) fn edits_plan(app: &App) -> bool {
+    app.plan_asked.is_some()
+        && (app.plan_refined.is_some() || app.doc.setups.iter().any(|s| !s.operations.is_empty()))
+}
+/// A timeline step that has ended or is running, in the words of the run:
+/// `done_text` or `stage_text`, but a change asked of the planner is not
+/// "a plan".
+fn step_text(app: &App, step: &crate::Step) -> String {
+    use crate::planner::{MAX_REQUESTS, Progress};
+    let ended = step.ended.is_some();
+    match step.stage {
+        Progress::Asking(n) if ended && edits_plan(app) => format!(
+            "Asked {} for the change ({n} of {MAX_REQUESTS})",
+            app.plan_model
+        ),
+        stage if ended => done_text(stage, &app.plan_model),
+        stage => running_text(app, stage),
+    }
 }
 pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String {
     use crate::planner::{MAX_REQUESTS, Progress};
@@ -7687,7 +7715,7 @@ pub(crate) fn stage_text(stage: crate::planner::Progress, model: &str) -> String
 }
 const GOOD: Color = Color::from_rgb(0.15, 0.51, 0.36);
 const WARN: Color = Color::from_rgb8(166, 101, 32);
-pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes), and the app's check reports and tool answers while the model works. The CAD file, file paths, the project title and your setup names are not sent.";
+pub(crate) const SENT_TO_OPENAI: &str = "Sent to OpenAI: the part's dimensions and feature list, your tools, machine limits, the project material (its name, group, hardness, notes and cutting data), stock size, the sizes and positions of setup 1's vise jaws or clamps and their clearance gap (not their names), the sizes of every vise and clamp in your workholding library (sizes only, never their names or notes), and the app's check reports and tool answers while the model works. The CAD file, file paths, the project title and your setup names are not sent. What you type in the chat with the planner is sent too, and, when you ask for a change, the current plan's setups and operations, with their names.";
 pub(crate) const PICTURES_SENT: &str = " With the box below ticked, pictures the app draws of the part, the stock and setup 1's vise or clamps, with surface and hole labels, are sent too, and, when the model asks, pictures of its own toolpaths.";
 /// What the timeline says when OpenAI refused a request carrying `what`
 /// and the run sends it again without: the line under the request while
@@ -7758,7 +7786,7 @@ fn planner_controls(app: &App) -> Element<'_, Message> {
 }
 /// Model text is shown as plain text, shortened to keep the layout stable.
 /// One character more than shown is read, to know whether to add "…".
-fn clip(s: &str, limit: usize) -> String {
+pub(crate) fn clip(s: &str, limit: usize) -> String {
     let flat = crate::proposal::clip(s, limit.saturating_add(1));
     if flat.chars().count() > limit {
         format!("{}…", flat.chars().take(limit).collect::<String>())
@@ -8000,6 +8028,9 @@ pub(crate) fn apply_note(doc: &crate::model::Document, job: &crate::model::Docum
         plural(job.setups.len(), "setup"),
     )
 }
+/// What Apply does with a change asked of the planner: the job becomes the
+/// preview, which kept what the request did not mention.
+pub(crate) const CHANGE_NOTE: &str = "Applying makes the changes listed above; everything else stays as it is. The previous job is kept in History and can be undone here.";
 /// The planner's workholding note on a setup's card, saying where it goes:
 /// setup 1's ends its notes on Apply, in place of an earlier planner note
 /// that is unchanged; a later setup's are its notes.
@@ -8321,9 +8352,30 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
         ]
         .spacing(10)
     };
-    let mut c = column![bold("Plan ready to review", 21)].spacing(12);
+    let mut c = column![bold(
+        if edits_plan(app) {
+            "Change ready to review"
+        } else {
+            "Plan ready to review"
+        },
+        21
+    )]
+    .spacing(12);
     for line in preview_totals(outcome) {
         c = c.push(muted(line));
+    }
+    if let Some(asked) = &app.plan_asked {
+        c = c.push(muted(format!("You asked: {}", clip(asked, 300))));
+    }
+    if app.plan_asked.is_some() {
+        let lines = crate::plan_changes::changes(&app.doc, job);
+        if !lines.is_empty() {
+            let mut block = column![bold("What changes against the current job", 15)].spacing(4);
+            for line in lines {
+                block = block.push(text(format!("• {line}")).size(13));
+            }
+            c = c.push(block);
+        }
     }
     let mut checks = column![].spacing(4);
     // Every setup of a plan uses setup 1's machine.
@@ -8483,9 +8535,12 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
                     .style(panel_style),
             );
     }
-    c.push(note(apply_note(&app.doc, job)))
-        .push(actions())
-        .into()
+    let applying = if app.plan_asked.is_some() && has_operations(app) {
+        CHANGE_NOTE.to_string()
+    } else {
+        apply_note(&app.doc, job)
+    };
+    c.push(note(applying)).push(actions()).into()
 }
 /// A failed run's problems as page lines.
 pub(crate) fn problem_lines(problems: &[crate::proposal::Problem]) -> Vec<String> {
@@ -8681,10 +8736,7 @@ pub(crate) fn timeline_rows(
                 .ended
                 .unwrap_or(now)
                 .saturating_duration_since(step.started);
-            let head = match step.ended {
-                Some(_) => done_text(step.stage, &app.plan_model),
-                None => stage_text(step.stage, &app.plan_model),
-            };
+            let head = step_text(app, step);
             let mut text = format!("{head} · {:.0} s", took.as_secs_f32());
             let mut notes = vec![];
             if open_request(step) {
@@ -8883,10 +8935,18 @@ fn running_view(app: &App, stage: crate::planner::Progress) -> Element<'_, Messa
     let mut pinned = column![
         bold(running_text(app, stage), 20),
         muted(format!("{elapsed:.0} s since the run started")),
-        muted("This can take a few minutes. Nothing changes until you apply a plan."),
-        secondary("Cancel", Message::PlanCancel)
     ]
     .spacing(10);
+    if let Some(asked) = &app.plan_asked {
+        pinned = pinned.push(muted(format!("You asked: {}", clip(asked, 300))));
+    }
+    pinned = pinned
+        .push(muted(if edits_plan(app) {
+            "This can take a few minutes. Nothing changes until you apply it."
+        } else {
+            "This can take a few minutes. Nothing changes until you apply a plan."
+        }))
+        .push(secondary("Cancel", Message::PlanCancel));
     let pictures = app
         .plan_overview
         .as_ref()
@@ -8927,10 +8987,85 @@ fn running_view(app: &App, stage: crate::planner::Progress) -> Element<'_, Messa
     .style(panel_style)
     .into()
 }
+/// Whether the open job has an operation, so the planner can change a plan.
+fn has_operations(app: &App) -> bool {
+    app.doc.setups.iter().any(|s| !s.operations.is_empty())
+}
+/// The intro card's last element: the Plan button, with a line saying it
+/// replaces a plan the job already has, or what the checklist still lacks.
+fn plan_this_job(app: &App) -> Element<'_, Message> {
+    if !app.plan_checklist().iter().all(|line| line.ok) {
+        return muted("Complete the checklist on the left to plan.").into();
+    }
+    let button = primary("Plan this job", Message::Plan);
+    if has_operations(app) {
+        column![
+            muted("Plan this job replaces the current plan; to change it instead, ask below."),
+            button
+        ]
+        .spacing(8)
+        .into()
+    } else {
+        button.into()
+    }
+}
+/// The chat with the planner: the exchanges so far, the box for the next
+/// request and Send. Shown while no run goes.
+fn plan_chat(app: &App) -> Element<'_, Message> {
+    let ready = app.plan_checklist().iter().all(|line| line.ok);
+    let send = (ready && !app.plan_request.trim().is_empty()).then_some(Message::PlanSend);
+    let previewing = matches!(app.planner, crate::Planner::Preview(_));
+    let editing = previewing || has_operations(app);
+    let mut c = column![bold("Talk to the planner", 15)].spacing(8);
+    for turn in &app.plan_chat {
+        c = c
+            .push(text(format!("You: {}", clip(&turn.request, 400))).size(13))
+            .push(muted(format!("Planner: {}", clip(&turn.answer, 400))));
+    }
+    let mut input = text_input(
+        if editing {
+            "Ask for a change, e.g. use T3 for the pocket, or add a finishing pass"
+        } else {
+            "Tell the planner what to plan, then Send"
+        },
+        &app.plan_request,
+    )
+    .on_input(Message::PlanAsk)
+    .padding([7, 9])
+    .size(13);
+    if let Some(send) = &send {
+        input = input.on_submit(send.clone());
+    }
+    c = c
+        .push(
+            row![
+                input,
+                match send {
+                    Some(send) => Element::from(primary("Send", send)),
+                    None => act("Send", None, false),
+                }
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .push(muted(if previewing {
+            "A change asked now starts from this preview. Nothing changes until you apply."
+        } else if editing {
+            "The planner changes the current plan and keeps what you do not mention. Nothing changes until you apply."
+        } else {
+            "Or press Plan this job to plan without a request."
+        }));
+    container(c)
+        .padding(16)
+        .width(Fill)
+        .style(panel_style)
+        .into()
+}
 fn plan_result(app: &App) -> Element<'_, Message> {
     use crate::Planner;
     match &app.planner {
-        Planner::Idle => container(
+        Planner::Idle => column![
+            container(
             column![
                 bold("One click plans the whole job", 22),
                 muted(
@@ -8942,24 +9077,31 @@ fn plan_result(app: &App) -> Element<'_, Message> {
                 ),
                 muted("4. Problems go back to the model for correction, up to four requests"),
                 muted("5. You review the result and apply it; nothing changes before that"),
-                if app.plan_checklist().iter().all(|line| line.ok) {
-                    Element::from(primary("Plan this job", Message::Plan))
-                } else {
-                    muted("Complete the checklist on the left to plan.").into()
-                }
+                plan_this_job(app)
             ]
             .spacing(16),
         )
         .padding(35)
         .width(Fill)
-        .style(panel_style)
+        .style(panel_style),
+            plan_chat(app)
+        ]
+        .spacing(12)
         .into(),
         Planner::Running(stage) => running_view(app, *stage),
         // A finished run puts its outcome and the actions first and the
         // timeline under them.
         Planner::Failed(failure) => {
             let mut c = column![
-                bold("No plan this time", 21),
+                plan_chat(app),
+                bold(
+                    if edits_plan(app) {
+                        "The change could not be made"
+                    } else {
+                        "No plan this time"
+                    },
+                    21
+                ),
                 text(failure.message.clone()).size(13)
             ]
             .spacing(12);
@@ -8979,8 +9121,12 @@ fn plan_result(app: &App) -> Element<'_, Message> {
             c.into()
         }
         Planner::Preview(preview) => match finished_timeline(app, "How the plan was made") {
-            Some(made) => column![plan_preview(app, preview), made].spacing(12).into(),
-            None => plan_preview(app, preview),
+            Some(made) => column![plan_chat(app), plan_preview(app, preview), made]
+                .spacing(12)
+                .into(),
+            None => column![plan_chat(app), plan_preview(app, preview)]
+                .spacing(12)
+                .into(),
         },
     }
 }

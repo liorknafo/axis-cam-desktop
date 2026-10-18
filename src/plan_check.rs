@@ -2174,6 +2174,7 @@ mod tests {
                     workholding: String::new(),
                     holder: None,
                     operations,
+                    from: None,
                 })
                 .collect(),
             unmachined: vec![],
@@ -3148,6 +3149,7 @@ mod totem {
                         }),
                         cut("Contour", 2, &[], 700., &outline(2.)),
                     ],
+                    from: None,
                 },
                 ProposedSetup {
                     orientation: "-Z".into(),
@@ -3164,6 +3166,7 @@ mod totem {
                         // Last, it cuts the skin and frees the part.
                         cut("Contour", 2, &[], 700., &outline(0.)),
                     ],
+                    from: None,
                 },
             ],
             unmachined: vec![],
