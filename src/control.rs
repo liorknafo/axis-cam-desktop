@@ -5716,9 +5716,9 @@ spindle_max_rpm = 24000
     /// moves. From wherever the machine is the run goes up (never down),
     /// across, turns A and comes down, each move checked against the chuck
     /// at the A it is made at: parked over the jaws at machine X25 Z0 A30,
-    /// or beside the chuck, Cycle Start is refused with what it would hit,
-    /// at the start and from a later operation alike; from over the bar's
-    /// free end it starts, at any A.
+    /// Cycle Start is refused with what it would hit; beside the chuck the
+    /// run goes along X first (LIO-213), at the start and from a later
+    /// operation alike; from over the bar's free end it starts, at any A.
     #[test]
     fn a_run_on_the_library_rotary_machine_retracts_up_as_export_does_and_checks_its_way_in() {
         use crate::indexed::tests::prism;
@@ -5867,22 +5867,24 @@ spindle_max_rpm = 24000
         c.run_act(R::CycleStart, &doc);
         assert!(c.run.as_ref().unwrap().running.is_none());
         // Beside the chuck's body, off to +Y and down: up to the top of Z,
-        // then across over the body, which reaches above it. From beside
-        // the jaws, 20 mm farther along X, the way across is clear of it.
+        // then across would pass over the body, which reaches above it. From
+        // beside the jaws, 20 mm farther along X, the way across is clear of
+        // it. From beside the body the run goes along X first, beside it,
+        // to the first cut's X, then across (LIO-213).
         go_to(&mut c, [30., 205., -30., 0.]);
         assert!(refused(&c).is_empty(), "{:?}", problems(&c));
         go_to(&mut c, [10., 205., -30., 0.]);
         let here = c.snapshot.machine_pos;
-        assert_eq!(way(&moves(0, here), here), ["up", "across", "down"]);
-        let said = refused(&c);
-        assert!(
-            said.len() == 1 && said[0].contains("chuck body on the way across at A 0°"),
-            "{said:?}"
-        );
+        let found = moves(0, here);
+        assert_eq!(way(&found, here), ["up", "across", "across", "down"]);
+        assert_eq!(found[1][1], 205.);
+        assert_eq!(found[2][0], found[1][0]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
         // So from the second operation, as after a Stop.
         c.run_act(R::From(0, 1), &doc);
-        assert_eq!(way(&moves(1, here), here), ["up", "across", "down"]);
-        assert!(refused(&c).len() == 1, "{:?}", problems(&c));
+        let found = moves(1, here);
+        assert_eq!(way(&found, here), ["up", "across", "across", "down"]);
+        assert!(refused(&c).is_empty(), "{:?}", problems(&c));
         c.run_act(R::From(0, 0), &doc);
         // Over the bar's free end, down at -10 at A -120: up to the top of
         // Z, across, A turned to A0 over the first cut, down; all clear.
@@ -5890,6 +5892,149 @@ spindle_max_rpm = 24000
         let here = c.snapshot.machine_pos;
         assert_eq!(way(&moves(0, here), here), ["up", "across", "turn", "down"]);
         assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+    }
+
+    /// LIO-213: on the library CNC4030 + rotary, a run started from machine
+    /// home (X0 Y0 Z0 A0) goes across at the top of Z, clear of the chuck,
+    /// and runs to the end on the simulated UC100. From beside the chuck's
+    /// body, where the usual way across would pass over the body (which
+    /// reaches above the top of Z), it goes up, along X alone beside it to
+    /// the first cut's X, then across in Y, and runs to the end. Where the
+    /// program ends, at the top of Z over its last cut with A at A0, the
+    /// next Cycle Start is clear, by the usual way. Over the jaws with jaw 1
+    /// at A 30°, no way out is clear (A turned first sweeps the jaw through
+    /// the tool, X first passes along it): the refusal says how to jog
+    /// clear. With the clearance plane, export and the run refuse a setup
+    /// in the chuck.
+    #[test]
+    fn a_run_on_the_library_rotary_machine_starts_from_machine_home_and_ends_where_it_starts_again()
+    {
+        use crate::indexed::tests::prism;
+        use crate::model::POST_RETRACT;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        let doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., "UC100");
+        let mut c = library_run(dir.path(), &doc, &mesh);
+        let length = c.run.as_ref().unwrap().length.clone();
+        let problems = |c: &Connection| c.run.as_ref().unwrap().problems(c, &doc);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let offset = c.snapshot.work_offset;
+        let moves = |start: Vec6| -> Vec<Vec6> {
+            (crate::run::lower(&p, 0, offset, start).unwrap().iter())
+                .filter_map(|l| match l.action {
+                    Do::Move { target, .. } => Some(target),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Cycle Start, the job run to its end, and a new run of the setup
+        // picked as after it.
+        let run_to_end = |c: &mut Connection| {
+            let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+            c.run_act(R::CycleStart, &doc);
+            assert!(
+                c.run.as_ref().unwrap().running.is_some(),
+                "{:?}",
+                problems(c)
+            );
+            let cap = Instant::now() + Duration::from_secs(600);
+            while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
+                c.refresh();
+                if let Some(r) = &mut c.run {
+                    r.refresh(c.snapshot.program_outcome.as_ref());
+                }
+                assert!(
+                    Instant::now() < cap,
+                    "the job did not end: {:?}",
+                    c.snapshot.log
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let o = c.snapshot.program_outcome.clone().unwrap();
+            assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+            until(c, 3.0, "Idle after the job", |s| {
+                s.state == Some(State::Idle)
+            });
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            assert!(c.run.as_ref().unwrap().done[0]);
+            let (programs, left) = crate::run::check(&doc, &mesh, 1);
+            let mut again = crate::run::Run::new(&doc, 1, 0);
+            again.checked_as(
+                std::sync::Arc::new(Ok(programs.unwrap())),
+                Some(std::sync::Arc::new(left)),
+            );
+            again.length = length.clone();
+            c.run = Some(again);
+        };
+        // From machine home: across at Z0, X and Y together, then down onto
+        // the first cut; A is at its angle already.
+        go_to(&mut c, [0., 0., 0., 0.]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        let found = moves(c.snapshot.machine_pos);
+        let first = found[1];
+        assert_eq!(found[0][..4], [first[0], first[1], 0., 0.]);
+        assert!(first[2] < 0. && first[0] > 100., "{first:?}");
+        run_to_end(&mut c);
+        // It ends at the top of Z over its last cut, A at A0: started again
+        // from there, the usual way in is clear.
+        let end = c.snapshot.machine_pos;
+        assert!(
+            end[2].abs() < 1e-3 && end[3].abs() < 0.03 && end[0] > 100.,
+            "{end:?}"
+        );
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        assert_eq!(moves(end)[0][..2], first[..2]);
+        // From beside the chuck's body, down: up, X alone at Y205, Y alone,
+        // down; it runs to the end, which is clear again.
+        go_to(&mut c, [10., 205., -30., 0.]);
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        let found = moves(c.snapshot.machine_pos);
+        assert_eq!(found[0][..4], [10., 205., 0., 0.]);
+        assert_eq!(found[1][..4], [first[0], 205., 0., 0.]);
+        assert_eq!(found[2][..4], [first[0], first[1], 0., 0.]);
+        run_to_end(&mut c);
+        let again = c.snapshot.machine_pos;
+        assert!(
+            (0..4).all(|k| (again[k] - end[k]).abs() < 0.03),
+            "{again:?}"
+        );
+        assert!(problems(&c).is_empty(), "{:?}", problems(&c));
+        // Over the jaws, jaw 1 at A 30°: refused, saying how to jog clear.
+        go_to(&mut c, [35., 140., 0., 30.]);
+        let said = problems(&c);
+        assert!(
+            said.iter()
+                .any(|e| e.contains("chuck jaw 1 on the way across at A 30°")),
+            "{said:?}"
+        );
+        let jog = said
+            .iter()
+            .find(|e| e.starts_with("No other way out is clear either"));
+        let jog = jog.unwrap_or_else(|| panic!("{said:?}"));
+        assert!(
+            jog.contains("Jog the tool up to machine Z 0.000, A to machine A 60.000° (no jaw up), X to machine X ")
+                && jog.contains("over the first cut, watching the chuck, then press Cycle Start."),
+            "{jog}"
+        );
+        c.run_act(R::CycleStart, &doc);
+        assert!(c.run.as_ref().unwrap().running.is_none());
+        // With the clearance plane, the run and export refuse it alike.
+        let wants = "a setup in the chuck retracts to machine Z home";
+        let mut plane = doc.clone();
+        (plane.setups[0].machine.p).insert("post_retract".into(), POST_RETRACT[1].into());
+        plane.sync_indexed();
+        let refused = crate::run::check(&plane, &mesh, 1).0.unwrap_err();
+        assert!(refused.iter().any(|e| e.contains(wants)), "{refused:?}");
+        (plane.setups[0].machine.p).insert("controller".into(), "LinuxCNC".into());
+        plane.sync_indexed();
+        let refused = (crate::post::post_job(&plane, &mesh).setups[1]
+            .result
+            .clone())
+        .unwrap_err();
+        assert!(refused.iter().any(|e| e.contains(wants)), "{refused:?}");
     }
 
     /// A Ø40 bar milled square at A 0, 90, 180 and 270 in one job on the

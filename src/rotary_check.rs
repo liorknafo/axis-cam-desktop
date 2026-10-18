@@ -1270,13 +1270,15 @@ pub fn held(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Result<Vec<H
 /// `run::way_in_problems`): the chuck round the stock the setup starts
 /// from, each operation's tool in the spindle (by its index in the
 /// program) and what of it is assumed, and the setup's gap, to which the
-/// machine's blend tolerance is added.
+/// machine's blend tolerance is added; and the machine's A range (machine
+/// degrees), which a way out that turns A first keeps to (LIO-213).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chuck {
     pub rig: Rig,
     pub tools: Vec<(InSpindle, String)>,
     pub gap: f32,
     pub blend: f32,
+    pub range: [f32; 2],
 }
 
 /// The `Chuck` of setup `si`, indexed or not, whose operations `ops` (index
@@ -1309,15 +1311,37 @@ pub fn chuck(
         .iter()
         .map(|(oi, plan)| in_spindle(doc, &setup.operations[*oi].tool, plan, Some(rig.unit)))
         .collect();
+    let range = ["rotary_min", "rotary_max"]
+        .map(|k| crate::model::num(&setup.machine.p, k).unwrap_or(f32::NAN));
     Ok(Some(Chuck {
         rig,
         tools,
         gap: crate::holding::gap(clamped)?,
         blend,
+        range,
     }))
 }
 
 impl Chuck {
+    /// The A angles (commanded) nearest A `a` at which no jaw stands up, the
+    /// jaws even on both sides of straight up (with 3 jaws at ±60° and 180°,
+    /// with 4 at ±45° and ±135°): the one each way, inside the machine's A
+    /// range at machine A = angle + `offset`, the shorter turn first.
+    /// Nothing when no jaw is up at `a` already (LIO-213).
+    pub fn jaws_down(&self, a: f32, offset: f32) -> Vec<f32> {
+        let pitch = 360. / self.rig.jaws as f32;
+        let base = self.rig.sign * (pitch / 2. - self.rig.phase);
+        let below = base + ((a - base) / pitch).floor() * pitch;
+        let each = [below, below + pitch];
+        if each.iter().any(|t| (t - a).abs() <= 1e-3) {
+            return vec![];
+        }
+        let mut out: Vec<f32> = (each.into_iter())
+            .filter(|t| (self.range[0]..=self.range[1]).contains(&(t + offset)))
+            .collect();
+        out.sort_by(|p, q| (p - a).abs().total_cmp(&(q - a).abs()));
+        out
+    }
     /// Why a run cannot take operation `op`'s tool along `moves` (from, to
     /// and the A at each end, commanded, in the setup's frame): its way in
     /// from where the machine is. Each move is checked at the A it is made
@@ -1599,6 +1623,40 @@ mod tests {
         let from = frame(doc, mesh, [300., 300., -100.]);
         let to = frame(doc, mesh, to);
         found(doc, mesh, with(sim, &[(from, to, Motion::Feed, a)]))
+    }
+
+    #[test]
+    fn the_angles_with_no_jaw_up_are_the_nearest_each_way_inside_a_range() {
+        // LIO-213: a 3-jaw chuck, jaw 1 straight up at A0: no jaw is up at
+        // ±60° and 180°; a 4-jaw one at ±45° and ±135°.
+        let (doc, mesh, sim) = job("-150", "90");
+        let tools = [(0, &sim.plan)];
+        let held = doc.setup_stock(0, Some(&mesh)).unwrap();
+        let mut chuck = chuck(&doc, &mesh, 1, held, &tools, 0.).unwrap().unwrap();
+        assert_eq!(
+            (chuck.rig.jaws, chuck.rig.phase, chuck.rig.sign),
+            (3, 0., 1.)
+        );
+        assert_eq!(chuck.range, [-360., 360.]);
+        assert_eq!(chuck.jaws_down(0., 0.), [-60., 60.]);
+        assert_eq!(chuck.jaws_down(30., 0.), [60., -60.]);
+        assert_eq!(chuck.jaws_down(-100., 0.), [-60., -180.]);
+        assert_eq!(chuck.jaws_down(150., 0.), [180., 60.]);
+        // Already with no jaw up: nothing to turn to.
+        assert!(chuck.jaws_down(60., 0.).is_empty());
+        assert!(chuck.jaws_down(-180., 0.).is_empty());
+        // Inside A's range, at machine A = angle + A's work offset.
+        chuck.range = [-180., 180.];
+        assert_eq!(chuck.jaws_down(170., 0.), [180., 60.]);
+        assert_eq!(chuck.jaws_down(170., 10.), [60.]);
+        assert_eq!(chuck.jaws_down(10., 150.), [-60.]);
+        // The other way round, Direction Negative, and with jaw 1 at 30°.
+        chuck.range = [-360., 360.];
+        (chuck.rig.sign, chuck.rig.phase) = (-1., 30.);
+        assert_eq!(chuck.jaws_down(0., 0.), [-30., 90.]);
+        chuck.rig.jaws = 4;
+        (chuck.rig.sign, chuck.rig.phase) = (1., 0.);
+        assert_eq!(chuck.jaws_down(10., 0.), [45., -45.]);
     }
 
     #[test]
