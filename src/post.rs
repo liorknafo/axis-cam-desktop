@@ -363,6 +363,8 @@ pub(crate) fn probe_spots(refs: [At; 2], stock: Bounds) -> String {
 }
 /// What the header says of the retracts the jaws and clamps check leaves out.
 const MACHINE_HOME: &str = "Retracts to machine home are assumed to clear everything.";
+/// What a program of a setup on the bar in the chuck had checked (LIO-210).
+const CHUCK_CHECKED: &str = "Not checked: the table, the machine body and tool-change motion. The chuck, its jaws, the rotary head, the tailstock (when there is one) and the gripped stock were checked as boxes with a clearance gap.";
 /// What the header says last of what was not checked.
 const SOFT_LIMITS: &str =
     "LinuxCNC soft limits check absolute position. Preview in LinuxCNC and air-cut first.";
@@ -931,7 +933,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
         work(e.max[2], d[2])
     ));
     // The program is only written once its jaws or clamps have been checked.
-    if h.holding.is_some() {
+    // An indexed setup holds the stock in its base's chuck.
+    if crate::chuck::holds(h.setup) || h.setup.turn.is_some() {
+        w.note(CHUCK_CHECKED);
+        w.note(MACHINE_HOME);
+        w.note(SOFT_LIMITS);
+    } else if h.holding.is_some() {
         w.note("Not checked: parallels, bolts, the table, the machine body and tool-change motion. Vise jaws and clamps were checked as boxes with a clearance gap.");
         w.note(MACHINE_HOME);
         w.note(SOFT_LIMITS);

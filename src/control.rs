@@ -1311,7 +1311,7 @@ impl Calibrate {
                 self.label()
             ),
             Calibrate::AZero => format!(
-                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found, and again until the two are level, then zeroes A there.",
+                "Turn A until a flat on the stock (or a jaw face) is about level and on top, jog the tip over its middle a few mm above it and press {}: it touches the flat at the spacing typed either side of the tip along Y, lifts {TURN_CLEAR:.0} mm over the stock, turns A by the slope found (by {DIRECTION_TURN:.0}° or more the first time, to check that +A turns the top of the part toward −Y, the front; it stops if A turns backwards), and again until the two are level, then zeroes A there.",
                 self.label()
             ),
         }
@@ -1337,6 +1337,18 @@ const LEVEL_TRIES: usize = 6;
 /// The most A zero turns A at once (degrees): a flat farther off level is
 /// turned about level by hand first.
 const LEVEL_TURN: f64 = 20.;
+/// The least A zero's first turn (degrees), even when the flat is level
+/// already: enough for the touches to show which way A turns.
+const DIRECTION_TURN: f64 = 1.;
+
+/// Why A zero stops when A turned the flat the wrong way: by `turned` (°)
+/// for a turn of A by `turn` (°), of the other sign. +A is the right-hand rule about +X: it
+/// turns the top of the part toward −Y, the front of the machine.
+fn a_backwards(turn: f64, turned: f64) -> String {
+    format!(
+        "A turns backwards: turning A by {turn:+.3}° turned the flat by {turned:+.3}°, the top of the part toward +Y, the back. +A must turn the top of the part toward −Y, the front (the right-hand rule about +X), or a flat cut at A 90° lands on the opposite face and the jaw checks at each angle are wrong. Invert A's direction in the machine's profile (Reverse the direction, in the A axis of Setup), save it, jog A+ to check the top now moves toward the front, and find A zero again. AXIS CAM does not adapt to A turning the other way."
+    )
+}
 /// Misalignment over which a check warns (mm), as the fixture plate's
 /// squareness check does.
 pub const ALIGN_LIMIT: f64 = 0.05;
@@ -1632,25 +1644,48 @@ impl Turning {
                     ));
                 }
                 self.found.push([a, slope, rise]);
-                // Level, or as level as one step of A sets it.
-                let turn = match self.found.len() {
-                    _ if rise.abs() <= LEVEL => None,
-                    // Positive A turns +Y up toward +Z: a flat high on +Y
-                    // turns back by its slope, unless the first turn shows
-                    // the machine turns it the other way.
-                    1 => Some(-slope),
-                    k => {
-                        let [a0, s0, _] = self.found[k - 2];
-                        let gain = (slope - s0) / (a - a0);
-                        if gain.abs() < 0.3 {
-                            return Err(format!(
-                                "Turning A by {:.3}° turned the flat by {:.3}°: it does not turn with A. Is the stock held in the chuck?",
-                                a - a0,
-                                slope - s0
-                            ));
-                        }
-                        Some(-slope / gain)
+                // How the flat turned with A, from the last two angles:
+                // checked after the first turn, and while it is not level.
+                let k = self.found.len();
+                let gain = (k >= 2).then(|| {
+                    let [a0, s0, _] = self.found[k - 2];
+                    (a - a0, slope - s0)
+                });
+                if let Some((turn, turned)) = gain.filter(|_| k == 2 || rise.abs() > LEVEL) {
+                    if (turned / turn).abs() < 0.3 {
+                        return Err(format!(
+                            "Turning A by {turn:.3}° turned the flat by {turned:.3}°: it does not turn with A. Is the stock held in the chuck?"
+                        ));
                     }
+                    // A wired backwards is refused, never adapted to: every
+                    // A angle a program commands would turn the part the
+                    // other way. The first turn, of `DIRECTION_TURN` or
+                    // more, tells.
+                    if k == 2 && turned / turn < 0. {
+                        return Err(a_backwards(turn, turned));
+                    }
+                }
+                // Level, or as level as one step of A sets it.
+                let turn = match gain {
+                    // Positive A turns +Y up toward +Z (the right-hand rule
+                    // about +X): a flat high on +Y turns back by its slope.
+                    // The first turn is always made, and by at least
+                    // `DIRECTION_TURN`, so that the touches after it show
+                    // which way A really turns.
+                    None if slope.abs() >= DIRECTION_TURN => Some(-slope),
+                    None => {
+                        let turn = if slope > 0. {
+                            -DIRECTION_TURN
+                        } else {
+                            DIRECTION_TURN
+                        };
+                        let inside = |t: f64| {
+                            (self.a_range).is_none_or(|(lo, hi)| (lo..=hi).contains(&(a + t)))
+                        };
+                        Some(if inside(turn) { turn } else { -turn })
+                    }
+                    _ if rise.abs() <= LEVEL => None,
+                    Some((turn, turned)) => Some(-slope * turn / turned),
                 }
                 .filter(|turn| turn.abs() >= self.a_step);
                 if let Some(turn) = turn {
@@ -7548,7 +7583,8 @@ probe = { pin = 13, active_low = true }
 
     /// A zero on the simulator: a flat on the stock 2° off level at A −45°
     /// is levelled by turning A, and A is zeroed where it is level, at
-    /// machine A −47°.
+    /// machine A −47°. The simulated A turns the convention's way, so its
+    /// direction check passes.
     #[test]
     fn a_zero_levels_a_flat_and_zeroes_a_there() {
         let dir = tempfile::tempdir().unwrap();
@@ -7709,6 +7745,97 @@ probe = { pin = 13, active_low = true }
             (c.runout[0] - 0.2).abs() < 1e-6 && (c.runout[1] - 0.1).abs() < 1e-6,
             "{c:?}"
         );
+    }
+
+    /// A zero walked over a model of a bar with a flat `flat_at` degrees
+    /// from +Z toward −Y at A 0 (as `SimAxis::flat`), its A wired `wired`:
+    /// 1 the convention's way, −1 backwards. The A it levels the flat at,
+    /// or why it stops.
+    fn a_zero_walk(flat_at: f64, wired: f64) -> Result<f64, String> {
+        let t = flat_at.to_radians();
+        let bar = Bar {
+            x: [20., 270.],
+            axis: [140., -40.],
+            tilt: [0.; 2],
+            runout: [0.; 2],
+            runout_tilt: [0.; 2],
+            radius: 12.,
+            flat: Some(([-t.sin(), t.cos()], 10.)),
+        };
+        let mut t = Turning {
+            what: Calibrate::AZero,
+            start: [40., 140., -27., 0., 0., 0.],
+            radius: 12.,
+            tip: 0.,
+            feed: 100.,
+            distance: 20.,
+            clear: Some(-20.),
+            top: 0.,
+            angles: vec![0.],
+            a_range: Some((-180., 180.)),
+            a_step: 0.0225,
+            touches: vec![],
+            found: vec![],
+            spacing: 6.,
+            backed: false,
+            legs: VecDeque::new(),
+            sent: None,
+        };
+        let mut at = t.start;
+        while let Some(legs) = t.plan() {
+            for leg in legs {
+                let to = match leg {
+                    Leg::Rapid(to) | Leg::Guard(to) | Leg::Touch(to) => to,
+                };
+                if matches!(leg, Leg::Touch(_)) {
+                    let xyz = |p: Vec6| [p[0], p[1], p[2]];
+                    let f = bar
+                        .entry(wired * at[3], xyz(at), xyz(to), 0.)
+                        .ok_or("no contact")?;
+                    at = std::array::from_fn(|a| at[a] + (to[a] - at[a]) * f);
+                    t.touches.push(at);
+                    t.settle()?;
+                } else {
+                    at = to;
+                }
+            }
+        }
+        Ok(t.angle())
+    }
+
+    /// +A is the right-hand rule about +X (LIO-210): the simulator's bar
+    /// turns that way, A zero levels a flat by it, and an A wired
+    /// backwards is refused, even on a flat level already, never adapted
+    /// to.
+    #[test]
+    fn a_zero_refuses_an_a_that_turns_backwards() {
+        // The simulator's bar, its centre 1 mm up at A 0, has it 1 mm
+        // toward −Y at A 90: the top of the part moves toward the front.
+        let bar = Bar {
+            x: [20., 270.],
+            axis: [140., -40.],
+            tilt: [0.; 2],
+            runout: [0., 1.],
+            runout_tilt: [0.; 2],
+            radius: 1.,
+            flat: None,
+        };
+        let down = |y: f64| bar.entry(90., [100., y, 0.], [100., y, -80.], 0.);
+        assert!(down(139.).is_some() && down(141.).is_none());
+        for (flat, level) in [(2., -2.), (0.4, -0.4), (0., 0.), (-3., 3.)] {
+            let a = a_zero_walk(flat, 1.).unwrap();
+            assert!((a - level).abs() < 0.03, "{flat}°: A {a}");
+        }
+        for flat in [2., 0.4, 0., -3.] {
+            let why = a_zero_walk(flat, -1.).unwrap_err();
+            assert!(
+                why.starts_with("A turns backwards")
+                    && why.contains("toward +Y")
+                    && why.contains("Reverse the direction")
+                    && why.contains("does not adapt"),
+                "{flat}°: {why}"
+            );
+        }
     }
 
     #[test]

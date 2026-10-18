@@ -2402,7 +2402,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Orientation),
         ),
         (_, "a_angles") => (
-            "The A angles this indexed setup turns the stock to, in degrees: one (90), or several for the same operations at each (0, 90, 180, 270). Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck looking along +X, +Y up to +Z at A90.",
+            "The A angles this indexed setup turns the stock to, in degrees: one (90), or several for the same operations at each (0, 90, 180, −90), within the machine's A range. Positive A turns the part by the right-hand rule about +X: clockwise seen from the chuck looking along +X, +Y up to +Z at A90.",
             "Each angle must be inside the machine's A range. The stock turns about the A centreline in the clamping of the setup before, so the work zero stays where that setup has it. Every operation of the setup runs at each angle, in the order listed, with A held still while it cuts; between angles the tool retracts above the swing radius of the stock, part and jaws plus the operation's clearance before A turns.",
             Some(Orientation),
         ),

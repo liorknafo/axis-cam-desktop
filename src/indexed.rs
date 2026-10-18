@@ -65,7 +65,7 @@ pub fn angles(setup: &Setup) -> Result<Vec<f32>, String> {
             .ok()
             .filter(|a| a.is_finite())
             .ok_or_else(|| {
-                format!("\"{word}\" is not an A angle: list them in degrees, as 0, 90, 180, 270.")
+                format!("\"{word}\" is not an A angle: list them in degrees, as 0, 90, 180, -90.")
             })?;
         if out.iter().any(|b| (a - b).abs() < 1e-3) {
             return Err(format!("A {}° is listed twice.", degrees(a)));
@@ -73,7 +73,7 @@ pub fn angles(setup: &Setup) -> Result<Vec<f32>, String> {
         out.push(a);
     }
     if out.is_empty() {
-        return Err("List the A angles to index to, in degrees: 90, or 0, 90, 180, 270.".into());
+        return Err("List the A angles to index to, in degrees: 90, or 0, 90, 180, -90.".into());
     }
     Ok(out)
 }
@@ -2423,6 +2423,15 @@ pub(crate) mod tests {
         let program = &posted.setups[0].result.as_ref().unwrap()[0].text;
         let code = program.lines().filter(|l| !l.starts_with('('));
         assert!(code.clone().all(|l| !l.contains('A')), "{program}");
+        // Both headers say the chuck was checked, not a vise (LIO-210).
+        for k in [0, 1] {
+            let program = &posted.setups[k].result.as_ref().unwrap()[0].text;
+            assert!(
+                program.contains("(Not checked: the table, the machine body and tool-change motion. The chuck, its jaws, the rotary head,")
+                    && !program.contains("Vise jaws"),
+                "{program}"
+            );
+        }
     }
     #[test]
     fn a_plain_setup_in_the_chuck_at_the_assumed_centreline_enters_from_the_top_of_the_z_travel() {
