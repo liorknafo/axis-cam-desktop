@@ -509,10 +509,6 @@ fn tool_axis(plan: &Plan, index: &Index, top: f32) -> (f32, [f32; 3], f32) {
     }
     (worst, at, lowest)
 }
-/// The tool axis problems of one generated operation in setup `si` (from 0):
-/// more than 0.1 mm of part above the tool tip, whatever the strategy, and
-/// moves below the floor. The floor is the stock's bottom in setup 1; later
-/// setups rest on the part, whose underside may be all that is left there.
 /// `axis_problems` of `sim`, setup `si`'s: an indexed setup's at each of
 /// its A angles, against the part posed there (`indexed`), each said with
 /// its angle; another's against the part as `geometry` places it.
@@ -549,6 +545,10 @@ pub(crate) fn angle_problems(
     }
     out
 }
+/// The tool axis problems of one generated operation in setup `si` (from 0):
+/// more than 0.1 mm of part above the tool tip, whatever the strategy, and
+/// moves below the floor. The floor is the stock's bottom in setup 1; later
+/// setups rest on the part, whose underside may be all that is left there.
 pub(crate) fn axis_problems(
     plan: &Plan,
     geometry: &Geometry,
