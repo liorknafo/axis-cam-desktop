@@ -2964,6 +2964,16 @@ fn checked_with(
             .map_err(|e| problems.push(format!("{}: {e}", setup.name())))
             .ok()
             .flatten();
+        // A program's first retract starts wherever the tool was left, which
+        // it cannot know: only machine Z home, the top of Z, is sure to move
+        // it up there, not down over the chuck (LIO-213).
+        if chuck.is_some() && !settings.machine_home {
+            problems.push(format!(
+                "{}: a setup in the chuck retracts to machine Z home. With the setup clearance plane, the program's first retract starts wherever the tool was left, which the program cannot know, and can move it down over the chuck. Set Safe retract to \"{}\" on the machine.",
+                setup.name(),
+                crate::model::POST_RETRACT[0]
+            ));
+        }
         // An indexed setup's jaws were checked at each angle above.
         if !indexed {
             problems.extend(

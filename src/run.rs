@@ -1454,6 +1454,11 @@ pub(crate) fn plan_problems(
 /// wherever the machine is, the way in goes up, across, turns A and comes
 /// down, each move alone, as `way_in_problems` checks it.
 ///
+/// On a setup in the chuck, when that way is refused but another is not,
+/// the run leaves where the machine is by it (`way_out`, LIO-213): after
+/// the retract, A turns alone first so that no jaw stands up, or the tool
+/// moves along X alone first to the first point's X before Y, or both.
+///
 /// An indexed program's A angles become machine A the same way (machine A =
 /// A + A's work offset). A turns only in its index blocks (`Block::Index`),
 /// a rapid of A alone at A's speed with X, Y and Z still, made where the
@@ -1473,17 +1478,29 @@ pub fn lower(
     start: [f64; 6],
 ) -> Result<Vec<Located>, Vec<String>> {
     let blocks = p.from(k)?;
-    lower_blocks(p, blocks, blocks.len(), offset, start)
+    let leave = way_out(p, blocks, offset, start).unwrap_or_default();
+    lower_blocks(p, blocks, blocks.len(), offset, start, leave)
+}
+
+/// How a run leaves where the machine is before its approach (LIO-213),
+/// at the height of its first retract: A turned first, alone, to machine A
+/// `a`; and X first, alone, to the first point's X, before Y.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Leave {
+    a: Option<f64>,
+    x_first: bool,
 }
 
 /// `lower` of program `p`'s `blocks` (its own, or from one of its
-/// operations on) up to block `end`.
+/// operations on) up to block `end`, leaving where the machine is as
+/// `leave` says.
 fn lower_blocks(
     p: &Checked,
     blocks: &[Block],
     end: usize,
     offset: [f64; 6],
     start: [f64; 6],
+    leave: Leave,
 ) -> Result<Vec<Located>, Vec<String>> {
     let plane = clearance_plane(blocks);
     // X, Y and Z of plan point `q`; A, B and C where the tool is (`at`).
@@ -1501,6 +1518,7 @@ fn lower_blocks(
     };
     let mut out = vec![];
     let mut at = start;
+    let mut left = false;
     let (mut spindle, mut coolant) = (false, (false, false));
     for (i, block) in blocks[..end].iter().enumerate() {
         let line = i as u32 + 1;
@@ -1556,10 +1574,25 @@ fn lower_blocks(
             Block::Wait { seconds } | Block::Standstill { seconds } => actions.push(Do::Dwell {
                 seconds: *seconds as f64,
             }),
-            // X and Y alone, at the retract's height.
+            // X and Y alone, at the retract's height; the first after A
+            // and X alone when the way out says so.
             Block::Approach { xy, .. } => {
                 let mut to = machine([xy[0], xy[1], 0.], at);
                 to[2] = at[2];
+                if !left {
+                    left = true;
+                    if let Some(a) = leave.a {
+                        let mut turned = at;
+                        turned[3] = a;
+                        go(&mut at, turned, None, &mut actions);
+                    }
+                    if leave.x_first {
+                        let mut along = at;
+                        along[0] = to[0];
+                        go(&mut at, along, None, &mut actions);
+                    }
+                    to[3] = at[3];
+                }
                 go(&mut at, to, None, &mut actions)
             }
             Block::Descend { xy, z, .. } => {
@@ -1610,30 +1643,46 @@ fn lower_blocks(
 
 /// Why Cycle Start cannot take the tool from where the machine is, `start`,
 /// into program `p` at the first operation of its `blocks`, with the live
-/// work `offset`, on a setup in the chuck (`Checked::chuck`, LIO-212): its
-/// way in as `lower` makes it (up to the retract height, across, A turning
-/// and down onto the first point), each move checked at the A it is made
-/// at (`rotary_check::Chuck::way_in`). Wherever the machine stands, at any
-/// X, Z and A, after a Stop or before a later operation alike. Nothing for
-/// a setup not in the chuck: its clearance plane, checked over all its
-/// clamping, is clear from wherever the tool comes to it.
+/// work `offset`, on a setup in the chuck (`Checked::chuck`, LIO-212): no
+/// way out of there (`way_out`) passes the checks.
 fn way_in_problems(
     p: &Checked,
     blocks: &[Block],
     offset: [f64; 6],
     start: [f64; 6],
 ) -> Vec<String> {
+    way_out(p, blocks, offset, start).err().unwrap_or_default()
+}
+
+/// How a run takes the tool from where the machine is, `start`, into
+/// program `p` at the first operation of its `blocks`, with the live work
+/// `offset`: its way in as `lower` makes it (up to the retract height,
+/// across, A turning and down onto the first point), each move checked at
+/// the A it is made at (`rotary_check::Chuck::way_in`). Wherever the
+/// machine stands, at any X, Z and A, after a Stop or before a later
+/// operation alike. Refused, another way is tried (LIO-213), checked the
+/// same: A turned first, at the retract height over where the tool is, to
+/// the nearest angle each way at which no jaw stands up (the shorter turn
+/// first, inside A's range), the turn checked against all it sweeps; the
+/// tool moved along X first, at the retract height, to the first point's X
+/// before it crosses in Y; and the two together. The first accepted, or
+/// the usual way's problems and how to jog clear. The usual way, with
+/// nothing to check, for a setup not in the chuck: its clearance plane,
+/// checked over all its clamping, is clear from wherever the tool comes to
+/// it.
+fn way_out(
+    p: &Checked,
+    blocks: &[Block],
+    offset: [f64; 6],
+    start: [f64; 6],
+) -> Result<Leave, Vec<String>> {
     let Some(chuck) = &p.chuck else {
-        return vec![];
+        return Ok(Leave::default());
     };
     let end = blocks
         .iter()
         .position(|b| matches!(b, Block::Descend { .. }))
         .map_or(blocks.len(), |i| i + 1);
-    let actions = match lower_blocks(p, blocks, end, offset, start) {
-        Ok(actions) => actions,
-        Err(why) => return why,
-    };
     let op = blocks[..end].iter().find_map(|b| match b {
         Block::Start { op, .. } => Some(*op),
         _ => None,
@@ -1645,16 +1694,62 @@ fn way_in_problems(
             (m[3] - offset[3]) as f32,
         )
     };
-    let mut at = start;
-    let mut moves = vec![];
-    for l in &actions {
-        if let Do::Move { target, .. } = l.action {
-            let ((from, a), (to, b)) = (frame(at), frame(target));
-            moves.push((from, to, a, b));
-            at = target;
+    let check = |leave: Leave| -> Result<Vec<String>, Vec<String>> {
+        let actions = lower_blocks(p, blocks, end, offset, start, leave)?;
+        let mut at = start;
+        let mut moves = vec![];
+        for l in &actions {
+            if let Do::Move { target, .. } = l.action {
+                let ((from, a), (to, b)) = (frame(at), frame(target));
+                moves.push((from, to, a, b));
+                at = target;
+            }
+        }
+        Ok(chuck.way_in(op.unwrap_or(0), &moves, p.datum))
+    };
+    let mut refused = check(Leave::default())?;
+    if refused.is_empty() {
+        return Ok(Leave::default());
+    }
+    let turns = chuck.jaws_down(frame(start).1, offset[3] as f32);
+    let ways = std::iter::once(None)
+        .chain(turns.iter().map(|a| Some(*a as f64 + offset[3])))
+        .flat_map(|a| [(a, false), (a, true)])
+        .skip(1)
+        .map(|(a, x_first)| Leave { a, x_first });
+    for leave in ways {
+        if check(leave).is_ok_and(|e| e.is_empty()) {
+            return Ok(leave);
         }
     }
-    chuck.way_in(op.unwrap_or(0), &moves, p.datum)
+    refused.push(jog(p, blocks, offset, start, turns.first().copied()));
+    Err(refused)
+}
+
+/// How to jog clear when no way out of where the machine is, `start`, is
+/// accepted: up to the height of the first retract, A to `a` (where no jaw
+/// stands up) when there is one, then over the first point of `blocks`.
+fn jog(p: &Checked, blocks: &[Block], offset: [f64; 6], start: [f64; 6], a: Option<f32>) -> String {
+    let top = match p.settings.machine_home {
+        true => 0.,
+        false => clearance_plane(blocks) as f64 - p.datum[2] as f64 + offset[2],
+    };
+    let over = blocks.iter().find_map(|b| match b {
+        Block::Approach { xy, .. } => {
+            Some([0, 1].map(|k| xy[k] as f64 - p.datum[k] as f64 + offset[k]))
+        }
+        _ => None,
+    });
+    let turn = a.map_or(String::new(), |a| {
+        format!("A to machine A {:.3}° (no jaw up), ", a as f64 + offset[3])
+    });
+    let across = over.map_or("over the stock".into(), |[x, y]| {
+        format!("X to machine X {x:.3} and then Y to Y {y:.3}, over the first cut")
+    });
+    format!(
+        "No other way out is clear either: neither turning A first so that no jaw stands up, nor moving along X first at the top. Jog the tool up to machine Z {:.3}, {turn}{across}, watching the chuck, then press Cycle Start.",
+        top.max(start[2])
+    )
 }
 
 /// Within this of each other, two A positions are the same (degrees): far
@@ -2104,6 +2199,46 @@ mod tests {
             _ => true,
         }));
         assert!(a_angles(&program().blocks).is_empty());
+    }
+
+    #[test]
+    fn a_way_out_turns_a_then_moves_x_alone_before_the_approach() {
+        // LIO-213: A first, then X, each alone at the retract height, then Y
+        // over the first point and down; never two axes together, and only
+        // before the first approach.
+        let p = program();
+        let start = [-20., -30., -40., 15., 0., 0.];
+        let leave = Leave {
+            a: Some(60.),
+            x_first: true,
+        };
+        let blocks = &p.blocks;
+        let actions = lower_blocks(&p, blocks, blocks.len(), [0.; 6], start, leave).unwrap();
+        let moves: Vec<[f64; 6]> = (actions.iter())
+            .filter_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        let top = moves[0][2];
+        assert_eq!(moves[0], [-20., -30., top, 15., 0., 0.]);
+        assert_eq!(moves[1], [-20., -30., top, 60., 0., 0.]);
+        assert_eq!(moves[2], [0., -30., top, 60., 0., 0.]);
+        assert_eq!(moves[3], [0., 0., top, 60., 0., 0.]);
+        assert!(moves[3..].iter().all(|m| m[3] == 60.));
+        assert_eq!(combined(&actions, start), None);
+        // Without a way out the approach moves X and Y together.
+        let usual = lower_blocks(&p, blocks, blocks.len(), [0.; 6], start, Leave::default());
+        let usual = usual.unwrap();
+        let second = (usual.iter())
+            .filter_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target),
+                _ => None,
+            })
+            .nth(1);
+        assert_eq!(second, Some([0., 0., top, 15., 0., 0.]));
+        // A program without a chuck has nothing to leave: the usual way.
+        assert_eq!(way_out(&p, blocks, [0.; 6], start), Ok(Leave::default()));
     }
 
     #[test]
