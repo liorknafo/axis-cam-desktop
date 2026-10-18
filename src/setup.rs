@@ -33,7 +33,16 @@ pub struct Draft {
     pub checked: Result<MachineConfig, String>,
     /// What the last Save did.
     pub note: Option<String>,
+    /// A was jogged A+ and the top of the part seen to move toward −Y
+    /// (`A_DIRECTION`): the pins-and-polarity tick waits for it once A is
+    /// in the profile. Not in the file, whose sections the driver reads;
+    /// a profile opened with that tick already on has it.
+    pub a_direction: bool,
 }
+
+/// The A axis' commissioning step for its direction (LIO-210): +A is the
+/// right-hand rule about +X.
+pub const A_DIRECTION: &str = "Jogged A+ and the top of the part moved toward −Y, the front (+A is the right-hand rule about +X; if it moved toward the back, tick Reverse the direction)";
 
 /// What the Setup view asks.
 #[derive(Debug, Clone)]
@@ -62,6 +71,8 @@ pub enum Edit {
     AddAxis(String),
     /// Take an axis out of the profile; its section and comments go with it.
     RemoveAxis(String),
+    /// A was jogged A+ and turned the top of the part toward −Y, or not.
+    ADirection(bool),
 }
 
 impl Draft {
@@ -96,7 +107,9 @@ impl Draft {
             typed: BTreeMap::new(),
             checked: Err(String::new()),
             note: None,
+            a_direction: false,
         };
+        d.a_direction = d.has("axes.a") && d.flag(PINOUT) == Some(true);
         d.check();
         Ok(d)
     }
@@ -138,9 +151,26 @@ impl Draft {
                     self.put(parent, key, text.trim().into());
                 }
             }
+            Edit::Flag(path, on)
+                if path == PINOUT && on && self.has("axes.a") && !self.a_direction =>
+            {
+                self.note = Some("Check A's direction first: jog A+, see that the top of the part moves toward −Y, the front, and tick that under the A axis.".into());
+            }
             Edit::Flag(path, on) => {
                 let (parent, key) = split(&path);
                 self.put(parent, key, on.into());
+                // A turning the other way now must be seen again.
+                if path == "axes.a.reversed" && self.a_direction {
+                    self.a_direction = false;
+                    self.put("commissioning", "pinout_verified", false.into());
+                    self.note = Some("A's direction changed: jog A+ and check that the top of the part moves toward −Y, the front, then tick the pins and polarity again.".into());
+                }
+            }
+            Edit::ADirection(on) => {
+                self.a_direction = on;
+                if !on && self.flag(PINOUT) == Some(true) {
+                    self.put("commissioning", "pinout_verified", false.into());
+                }
             }
             Edit::Pin(path, pin) => {
                 let (parent, key) = split(&path);
@@ -255,6 +285,7 @@ impl Draft {
         for key in ["pinout_verified", "steps_per_unit_verified"] {
             self.put("commissioning", key, false.into());
         }
+        self.a_direction = false;
         self.note = Some(format!(
             "A axis added on pins {} and {}. Reset is refused, for every axis, until the commissioning checks are ticked again: check A's pins and calibrate its steps per degree first.",
             A_PINS[0], A_PINS[1]
@@ -404,6 +435,8 @@ impl Draft {
 }
 
 const AXES: [&str; 6] = ["x", "y", "z", "a", "b", "c"];
+/// The pins-and-polarity tick.
+const PINOUT: &str = "commissioning.pinout_verified";
 /// The A axis' step and direction pins: the free pair on this UC100
 /// (`control::ROTARY_AXIS` is the section added).
 const A_PINS: [u8; 2] = [8, 9];
@@ -620,7 +653,7 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
         "Commissioning",
         column![
             flag(d, "commissioning.required".into(), "Require the checks below before Reset", false),
-            flag(d, "commissioning.pinout_verified".into(), "Step and direction pins and polarity checked (A included, once it is added)", false),
+            flag(d, PINOUT.into(), "Step and direction pins and polarity checked (A included once it is added, after its direction)", false),
             flag(d, "commissioning.estop_verified".into(), "E-stop input and polarity checked", false),
             flag(d, "commissioning.drive_enable_verified".into(), "Drive enable and charge pump need checked", false),
             flag(d, "commissioning.steps_per_unit_verified".into(), "Steps per mm checked (steps per degree for A)", false),
@@ -696,6 +729,12 @@ fn form<'a>(app: &'a App, d: &'a Draft) -> Element<'a, Message> {
         let mut body = column![row![numbers, pins].spacing(24)].spacing(10);
         if rotary {
             body = body
+                .push(
+                    checkbox(d.a_direction)
+                        .label(A_DIRECTION)
+                        .on_toggle(|b| edit(Edit::ADirection(b)))
+                        .text_size(12),
+                )
                 .push(muted(format!(
                     "Rotary axis, in degrees. Steps per ° = 200 × microsteps × gear ratio ÷ 360: {} for 16 microsteps and a 4:1 unit, {} for 6:1. Calibrate it below. A has no switches: declare its position with Set machine. With soft limits no program starts until A is declared.",
                     steps_text(steps_per_degree(200., 16., 4.)),
@@ -1443,7 +1482,8 @@ order = \"X\"\n";
                 .to_string()
                 .contains("required = true # the JY5800 is gated")
         );
-        // Only ticking them again opens it.
+        // Only ticking them again opens it, A's direction first.
+        d.edit(Edit::ADirection(true));
         d.edit(Edit::Flag("commissioning.pinout_verified".into(), true));
         assert!(
             d.checked
@@ -1541,8 +1581,15 @@ order = \"X\"\n";
             (d.number("axes.a.soft_min"), d.number("axes.a.soft_max")),
             ("-180".into(), "180".into())
         );
+        // The pins and polarity wait for A's direction (LIO-210).
+        assert!(!d.a_direction);
+        d.edit(Edit::Flag(PINOUT.into(), true));
+        assert_eq!(d.flag(PINOUT), Some(false));
+        assert!(d.note.as_ref().unwrap().contains("toward −Y, the front"));
+        d.edit(Edit::ADirection(true));
         // The form's own gate stays shut until both are ticked.
-        d.edit(Edit::Flag("commissioning.pinout_verified".into(), true));
+        d.edit(Edit::Flag(PINOUT.into(), true));
+        assert_eq!(d.flag(PINOUT), Some(true));
         assert!(
             d.checked
                 .as_ref()
@@ -1561,6 +1608,15 @@ order = \"X\"\n";
                 .commissioning_blocker()
                 .is_none()
         );
+        // Reversing A unticks its direction and the pins and polarity.
+        d.edit(Edit::Flag("axes.a.reversed".into(), true));
+        assert!(!d.a_direction && d.flag(PINOUT) == Some(false));
+        assert!(d.note.as_ref().unwrap().contains("direction changed"));
+        d.edit(Edit::ADirection(true));
+        d.edit(Edit::Flag(PINOUT.into(), true));
+        // Unticking the direction unticks them too.
+        d.edit(Edit::ADirection(false));
+        assert_eq!(d.flag(PINOUT), Some(false));
         // Taking A out leaves the owner's XYZ profile text.
         d.edit(Edit::RemoveAxis("a".into()));
         assert!(d.checked.as_ref().unwrap().axes.a.is_none());

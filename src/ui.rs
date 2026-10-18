@@ -3618,7 +3618,7 @@ fn setup_holding<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message
             c = c.push(caution("Not ready to index", warned));
         }
         c = c.push(muted(
-            "Not exported or run yet: programs do not command A. Its frame, work zero and A angles are kept for when they do.",
+            "Its programs turn A to each angle, A alone with the tool above all that A swings: LinuxCNC exports them, and a run on the UC100 turns its A once the A centreline is measured.",
         ));
     } else if crate::indexed::is_label_only(s) {
         c = c.push(note(

@@ -7036,6 +7036,7 @@ soft_max = 180.0
         assert_eq!(conn(&a).snapshot.state, Some(State::EStop));
         // Check them in the form and save: the machine reconnects.
         let _ = a.update(Message::ControlSetup(true));
+        setup_edit(&mut a, Edit::ADirection(true));
         for flag in ["pinout_verified", "steps_per_unit_verified"] {
             setup_edit(&mut a, Edit::Flag(format!("commissioning.{flag}"), true));
         }

@@ -376,7 +376,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("mode", "Indexed (3+1)") => (
-            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. Index a setup (Reposition → Index rotary axis) to run its operations at each A angle it lists. The rotary unit's place and chuck and tailstock sizes are saved with the machine (Rotary unit); programs do not command A yet.",
+            "Save a single rotary axis that positions before cutting and stays fixed during XYZ motion. Index a setup (Reposition → Index rotary axis) to run its operations at each A angle it lists. The rotary unit's place and chuck and tailstock sizes are saved with the machine (Rotary unit); programs and UC100 runs turn A alone.",
             "",
         ),
         ("mode", "Indexed (3+2)") => (
