@@ -19136,6 +19136,40 @@ flood = { pin = 8 }
         assert_eq!(tabs, Strategy::Drill.tabs());
         let _ = a.update(Message::Tab("Cycle".into()));
         shows(&a, &["Hole order"]);
+        // Helical milling where it is not run: the note says what is, and
+        // the issue says why (a lathe, then a drill's pin holes).
+        let helical = |a: &mut App| {
+            let op = a.operation_mut().unwrap();
+            op.p.insert("cycle".into(), crate::model::HELICAL_MILLING.into());
+        };
+        let plunge = "Feed to the bottom in one move, then retract.";
+        let mills = "Mill each hole with a flat end mill narrower than it: down a helix to a flat bottom, once round there, in rings out to the hole's size when it is over twice the cutter's.";
+        a.doc.active = a.doc.setups[0].id.clone();
+        a.selected = Some(0);
+        helical(&mut a);
+        shows(&a, &[plunge]);
+        lacks(&a, &[mills]);
+        assert!(
+            a.op_issues()
+                .contains(&crate::lathe::HELICAL_ON_LATHE.to_string())
+        );
+        a.doc.active = a.doc.setups[1].id.clone();
+        let _ = a.update(Message::AddOp(Strategy::Drill));
+        let mut small = crate::model::Tool::new("Drill 5", "Drill", "5");
+        small.id = "pin-drill".into();
+        a.doc.tools.push(small);
+        let _ = a.update(Message::Tab("Cycle".into()));
+        helical(&mut a);
+        shows(&a, &[mills]);
+        let op = a.operation_mut().unwrap();
+        op.p.insert("holes".into(), crate::model::DRILL_HOLES[1].into());
+        op.tool = "pin-drill".into();
+        shows(&a, &[plunge]);
+        lacks(&a, &[mills]);
+        assert!(
+            a.op_issues()
+                .contains(&crate::model::HELICAL_PIN_DRILL.to_string())
+        );
     }
     #[test]
     fn adding_a_box_on_the_big_mill_takes_a_fitting_tool_and_a_gear() {

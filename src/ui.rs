@@ -2906,7 +2906,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     t,
                 ));
             }
+            // A drill plunges the pin holes whatever the cycle says (its
+            // issue says so when the cycle is Helical milling), and a lathe drills
+            // on the centre.
+            let milled = o.helical() && !lathe;
             c = c.push(note(match get(p, "cycle") {
+                HELICAL_MILLING if !milled => "Feed to the bottom in one move, then retract.",
                 "Chip breaking" => "Retract slightly after each peck to break the chip.",
                 "Deep drilling" => "Retract clear of the hole between pecks to evacuate chips.",
                 "Counterboring" => "Feed to depth and dwell before retracting.",
