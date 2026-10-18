@@ -28,6 +28,7 @@ mod post;
 mod post_check;
 mod proposal;
 mod rest;
+mod rotary_check;
 mod run;
 mod session;
 mod settings;

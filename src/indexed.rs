@@ -461,9 +461,6 @@ impl Document {
         }
     }
 }
-/// Why an indexed setup's cuts are not checked against its workholding: its
-/// index moves are, as they are generated (`generate`).
-pub const NOT_HELD: &str = "it indexes A, and its cuts are checked against the chuck at each A angle only once programs command A; its index moves are checked as they are made";
 /// Why an indexed setup has no program yet.
 pub const NOT_POSTED: &str =
     "it indexes A, which programs do not command yet, so it is not exported or run.";
@@ -822,19 +819,19 @@ pub fn generate(
 /// The rapid rate of the index moves, mm/min: the 3-axis kernels'.
 const RAPID: f32 = 6000.;
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{Document, Machine, Setup};
 
     /// A machine with A and its rotary geometry.
-    fn rotary() -> Machine {
+    pub(crate) fn rotary() -> Machine {
         let mut m = Machine::new(4);
         m.fill_rotary_defaults();
         m
     }
     /// A job on a Ø40 × 120 bar in the chuck, A axis at stock end, and a
     /// second setup indexed to `angles`.
-    fn job(angles: &str) -> (Document, Mesh) {
+    pub(crate) fn job(angles: &str) -> (Document, Mesh) {
         let mesh = crate::mesh::sample();
         let mut doc = Document::sample();
         doc.file = None;
@@ -1099,11 +1096,11 @@ mod tests {
     /// A square bar `len` mm long, 20 × 20, as the part: the frames' part
     /// coordinates (`volume::Frame::map`) put it about X with its middle at
     /// Y0, Z `centre_z`.
-    fn prism(len: f32) -> Mesh {
+    pub(crate) fn prism(len: f32) -> Mesh {
         block(len, 20., 20.)
     }
     /// A block `l` × `w` (Y) × `h` (Z) as the part.
-    fn block(l: f32, w: f32, h: f32) -> Mesh {
+    pub(crate) fn block(l: f32, w: f32, h: f32) -> Mesh {
         let mut t = vec![];
         let mut quad = |p: [[f32; 3]; 4]| {
             t.push([p[0], p[1], p[2]]);
@@ -1121,7 +1118,7 @@ mod tests {
         4. / mesh.display_scale() + mesh.dimensions[2] / 2.
     }
     /// A flat end mill: Ø`d`, 35 mm of flute, 50 mm out of its holder.
-    fn cutter(d: &str) -> crate::model::Tool {
+    pub(crate) fn cutter(d: &str) -> crate::model::Tool {
         let mut t = crate::model::Tool::new("Flat", "Flat end mill", d);
         t.p.insert("length".into(), "35".into());
         t.p.insert("stickout".into(), "50".into());
@@ -1131,7 +1128,7 @@ mod tests {
     /// chuck, its square on the bar's axis (Y0 Z20) from X `x0`, on a rotary
     /// unit whose centreline is at machine Z `centre_z`; setup 2 is indexed
     /// to `angles` with the one operation `op` (a Ø12 flat end mill's).
-    fn bar_job(
+    pub(crate) fn bar_job(
         mesh: &Mesh,
         x0: f32,
         stickout: &str,
@@ -1166,7 +1163,7 @@ mod tests {
         doc
     }
     /// An outside contour round the part from the stock's top to its bottom.
-    fn contour(tool: &crate::model::Tool) -> crate::model::Operation {
+    pub(crate) fn contour(tool: &crate::model::Tool) -> crate::model::Operation {
         let mut op = crate::model::Operation::new(crate::model::Strategy::Contour, tool.id.clone());
         op.geometry.clear();
         op.p.insert("allowance".into(), "0".into());
@@ -1581,13 +1578,17 @@ mod tests {
     }
 
     #[test]
-    fn an_indexed_setups_cuts_are_not_said_held_by_the_chuck_at_its_first_angle() {
+    fn an_indexed_setups_cuts_are_checked_against_the_chuck_at_each_angle() {
+        // 90 mm out of the jaws, with 40 mm of clearance over the bar: clear
+        // of the chuck at both angles, so nothing is said, not even that the
+        // holding was not checked (LIO-191).
         let mesh = prism(30.);
-        let doc = bar_job(&mesh, 0., "80", "-150", "0, 90", contour(&cutter("12")));
+        let mut op = contour(&cutter("12"));
+        op.p.insert("clearance".into(), "40".into());
+        let doc = bar_job(&mesh, 0., "90", "-150", "0, 90", op);
         let sim = crate::simulation::prepare(&doc, &mesh, 1, 0).unwrap();
         let held = crate::post::held(&doc, &mesh, 1, &[(0, Ok(sim))]);
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0].message, format!("Holding not checked: {NOT_HELD}."));
+        assert!(held.is_empty(), "{held:?}");
     }
 
     #[test]

@@ -1051,6 +1051,12 @@ pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
     // A setup that cannot be walked: its holding was not checked. Said as a
     // problem, not as a refusal of its jaws or clamps.
     let mut problems = problems.err().unwrap_or_default();
+    // An indexed setup's moves on the machine: its travel, Z reach and A.
+    problems.extend(
+        crate::rotary_check::problems(doc, mesh, si, &sims)
+            .into_iter()
+            .map(|(_, message)| message),
+    );
     let held = match crate::post::held_walked(doc, mesh, si, &sims) {
         Ok(held) => held,
         Err(errors) => {

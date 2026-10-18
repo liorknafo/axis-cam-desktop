@@ -1104,6 +1104,16 @@ fn run(
                 });
             }
         }
+        // An indexed setup's moves on the machine: its travel, Z reach and A.
+        for (si, sims) in results.iter().enumerate() {
+            let found = crate::rotary_check::problems(job_doc, mesh, si, sims);
+            export.extend(found.into_iter().map(|(oi, message)| Problem {
+                setup: si + 1,
+                operation: oi.map(|oi| oi + 1),
+                stage: "export",
+                message,
+            }));
+        }
         if export.is_empty() && held.is_empty() {
             out.zeros = built
                 .setups
