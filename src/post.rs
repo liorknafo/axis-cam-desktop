@@ -49,8 +49,8 @@ impl PostSettings {
     /// stock and the jaws, and the machine's spindle start dwell and Air
     /// output. The driver blends corners with the profile's own setting:
     /// nothing writes it, and the checks allow for it as export's do. A
-    /// 4-axis machine with A around X is accepted, as export accepts it; a
-    /// run still refuses it (`run::not_run`).
+    /// 4-axis machine with A around X is accepted, as export accepts it, and
+    /// a run turns its A (`run::lower`).
     pub fn for_uc100(m: &Machine) -> Result<Self, Vec<String>> {
         let mut e = vec![];
         if get(&m.p, "controller") != "UC100" {
@@ -2430,17 +2430,6 @@ fn pushed(doc: &Document, si: usize, walk: &Walk, held: crate::holding::Gripped)
         })
         .collect()
 }
-/// Why a UC100 run refuses machine `m`: one that is not 3-axis. Its
-/// settings (`PostSettings::for_uc100`) take a 4-axis machine with A, as
-/// export's do, but a run does not turn A yet.
-pub(crate) fn not_run(m: &Machine) -> Option<String> {
-    (m.axes() != 3 || get(&m.p, "mode") != "3-axis").then(|| {
-        format!(
-            "{} is not a 3-axis machine. Only 3-axis runs are implemented.",
-            m.name()
-        )
-    })
-}
 /// Where indexed program `blocks` of setup `si` turn A (`Block::Index`):
 /// each turn with the tool tip at or above its operation's index height
 /// (`Document::swing`: the A centreline, the farthest that A swings reaches
@@ -2832,12 +2821,6 @@ fn checked_with(
     let setup = &doc.setups[si];
     if crate::manual::is_manual(&setup.machine) {
         return Ok(vec![]);
-    }
-    // A UC100 setup is only checked for a run, which does not turn A yet.
-    if get(&setup.machine.p, "controller") == "UC100"
-        && let Some(why) = not_run(&setup.machine)
-    {
-        return Err(vec![why]);
     }
     let indexed = crate::indexed::is_indexed(setup);
     let offset = get(&setup.p, "offset").to_string();
@@ -3918,7 +3901,7 @@ M2
         assert!(PostSettings::from_machine(&a).is_ok());
         a.p.insert("mode".into(), "Continuous 4-axis".into());
         assert!(PostSettings::from_machine(&a).is_ok());
-        // The UC100's settings take its axes too; a run still refuses it.
+        // The UC100's settings take its axes too: a run turns A.
         a.p.insert("controller".into(), "UC100".into());
         let uc100 = PostSettings::for_uc100(&a).err().unwrap_or_default();
         assert!(uc100.iter().all(|e| !e.contains("axis")), "{uc100:?}");
@@ -3930,8 +3913,6 @@ M2
                 .iter()
                 .any(|e| e.contains("Only 3-axis and indexed A output"))
         );
-        assert!(not_run(&a).is_some_and(|e| e.contains("Only 3-axis runs")));
-        assert!(not_run(&Machine::new(3)).is_none());
     }
     /// The golden Facing pass made at A90 as an indexed setup's operation
     /// is, from A0: the index move at the swing height (Z40) first.

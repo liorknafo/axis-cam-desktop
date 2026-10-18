@@ -2756,8 +2756,10 @@ impl Connection {
                 self.send(Command::Resume)
             }
             R::Stop if crate::run::busy(state.as_ref()) => self.send(Command::Stop),
-            R::RecordReference if self.manual() => run.reference = Some(self.snapshot.work_pos[2]),
-            R::ZFromReference if self.manual() => {
+            R::RecordReference if self.manual() => {
+                run.record_reference(self, self.snapshot.work_pos[2])
+            }
+            R::ZFromReference if self.manual() && run.reference_a_problem(self).is_none() => {
                 if let Some(z) = run.reference {
                     self.send(Command::SetWork { axis: 2, value: z });
                     run.touched = true;
@@ -2765,7 +2767,7 @@ impl Connection {
                 }
             }
             R::ProbeReference => self.start_probe(Touch::Reference),
-            R::ProbeFromReference => {
+            R::ProbeFromReference if run.reference_a_problem(self).is_none() => {
                 if let Some(z) = run.reference {
                     self.start_probe(Touch::FromReference(z));
                 }
@@ -2967,8 +2969,9 @@ impl Connection {
             Touch::Reference => {
                 // The surface under the plate, at today's work offset.
                 let surface = trip - now + s.work_pos[2] - plate;
-                if let Some(run) = &mut self.run {
-                    run.reference = Some(surface);
+                if let Some(mut run) = self.run.take() {
+                    run.record_reference(self, surface);
+                    self.run = Some(run);
                 }
                 match p.plate {
                     Some(plate) => format!(
@@ -4651,6 +4654,430 @@ soft_max = 0.0
         assert!(o.ok, "{} at {at:?}", o.message);
         assert!((at[3] - 90.).abs() < 0.03, "{at:?}");
         assert!((at[0] - 30.).abs() < 1e-3 && at[2].abs() < 1e-3, "{at:?}");
+    }
+
+    /// A connection to the simulated UC100 with `profile`, Idle with Set
+    /// machine zero here made on its first `axes` axes.
+    fn zeroed_sim(dir: &Path, profile: &str, m: Option<&Machine>, axes: usize) -> Connection {
+        let path = dir.join("profile.toml");
+        std::fs::write(&path, profile).unwrap();
+        let mut m = m.cloned().unwrap_or_else(|| Machine::new(3));
+        for (k, v) in [
+            ("controller", "UC100"),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        let mut c = Connection::open(&m, dir).unwrap();
+        until(&mut c, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        c.send(Command::Reset);
+        until(&mut c, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        c.act(Action::MachineZero(None));
+        until(&mut c, 3.0, "the axes set", |s| {
+            s.state == Some(State::Idle) && s.referenced[..axes].iter().all(|r| *r)
+        });
+        c
+    }
+
+    /// Waits until the machine stands still: the same position 200 ms
+    /// apart. A Hold first runs out what the controller has buffered
+    /// (`buffer_ms`), then decelerates. Where it stopped.
+    fn settled(c: &mut Connection) -> [f64; 6] {
+        let cap = Instant::now() + Duration::from_secs(60);
+        let mut last = c.snapshot.machine_pos;
+        loop {
+            wait(c, 200);
+            let now = c.snapshot.machine_pos;
+            if now == last {
+                return now;
+            }
+            assert!(Instant::now() < cap, "the machine did not stop: {now:?}");
+            last = now;
+        }
+    }
+
+    /// Machine Z where `actions` leave the tool before action `i`.
+    fn at_z(actions: &[Located], i: usize) -> f64 {
+        (actions[..i].iter().rev())
+            .find_map(|l| match l.action {
+                Do::Move { target, .. } => Some(target[2]),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// Lets the simulator run for `ms` milliseconds.
+    fn wait(c: &mut Connection, ms: u64) {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            c.refresh();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Hold in the middle of an index move stops A where it is, and Resume
+    /// finishes the turn at its angle; Stop ends one there, A keeping its
+    /// machine position. X, Y and Z never move (LIO-192).
+    #[test]
+    fn hold_resume_and_stop_work_while_a_turns_alone() {
+        let a = "[axes.a]\nsteps_per_unit = 40.0\nmax_velocity = 3600.0\nacceleration = 360.0\nstep = { pin = 8 }\ndir = { pin = 9 }\nsoft_min = -360.0\nsoft_max = 360.0\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = zeroed_sim(dir.path(), &format!("{LIMITED}{a}"), None, 4);
+        // An index block lowers to a rapid of A alone (`run::lower`).
+        let turn = |a: f64| Do::Move {
+            target: [0., 0., 0., a, 0., 0.],
+            feed: None,
+        };
+        let still = |s: &Snapshot| s.machine_pos[..3].iter().all(|v| v.abs() < 1e-9);
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.send(job("index", vec![turn(180.), Do::End]));
+        until(&mut c, 5.0, "A partway to 180", |s| {
+            s.state == Some(State::Run) && (40.0..120.0).contains(&s.machine_pos[3])
+        });
+        c.send(Command::FeedHold);
+        until(&mut c, 5.0, "Hold", |s| s.state == Some(State::Hold));
+        let held = settled(&mut c)[3];
+        wait(&mut c, 300);
+        assert_eq!(c.snapshot.state, Some(State::Hold));
+        assert!(
+            (c.snapshot.machine_pos[3] - held).abs() < 1e-9,
+            "A moved while held"
+        );
+        assert!(held > 40. && held < 179.9, "{held}");
+        assert!(still(&c.snapshot));
+        c.send(Command::Resume);
+        until(&mut c, 10.0, "the turn's end", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{}", o.message);
+        until(&mut c, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(
+            (c.snapshot.machine_pos[3] - 180.).abs() < 0.03,
+            "{:?}",
+            c.snapshot.machine_pos
+        );
+        assert!(still(&c.snapshot));
+        // Stop partway back: A stops between, and keeps its position.
+        let seq = o.seq;
+        c.send(job("back", vec![turn(0.), Do::End]));
+        until(&mut c, 5.0, "A partway back", |s| {
+            s.state == Some(State::Run) && (60.0..140.0).contains(&s.machine_pos[3])
+        });
+        c.send(Command::Stop);
+        until(&mut c, 5.0, "the stop", |s| {
+            s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+        });
+        assert!(!c.snapshot.program_outcome.as_ref().unwrap().ok);
+        until(&mut c, 3.0, "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        let stopped = settled(&mut c)[3];
+        wait(&mut c, 300);
+        assert!((c.snapshot.machine_pos[3] - stopped).abs() < 1e-9);
+        assert!(stopped > 0.1 && stopped < 140., "{stopped}");
+        assert!(c.snapshot.referenced[3] && still(&c.snapshot));
+    }
+
+    /// The simulated rotary mill for `an_indexed_bar_runs_at_four_angles`:
+    /// the travel of `Machine::new(4)` (600 × 400 × 300) as soft limits, A
+    /// from -360 to 360 degrees as `bar_job` has it.
+    const ROTARY_SIM: &str = r#"
+[controller]
+step_rate = "100kHz"
+[motion]
+junction_deviation = 0.02
+arc_tolerance = 0.002
+buffer_ms = 400
+default_feed = 500
+[axes.x]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 2 }
+dir = { pin = 3 }
+soft_min = 0.0
+soft_max = 600.0
+[axes.y]
+steps_per_unit = 20.0
+max_velocity = 60000.0
+acceleration = 20000.0
+step = { pin = 4 }
+dir = { pin = 5 }
+soft_min = 0.0
+soft_max = 400.0
+[axes.z]
+steps_per_unit = 20.0
+max_velocity = 30000.0
+acceleration = 20000.0
+step = { pin = 6 }
+dir = { pin = 7 }
+soft_min = -300.0
+soft_max = 0.0
+[axes.a]
+steps_per_unit = 40.0
+max_velocity = 7200.0
+acceleration = 720.0
+step = { pin = 8 }
+dir = { pin = 9 }
+soft_min = -360.0
+soft_max = 360.0
+[outputs]
+spindle_pwm = { pin = 16 }
+spindle_max_rpm = 24000
+"#;
+
+    /// A Ø40 bar milled square at A 0, 90, 180 and 270 in one job on the
+    /// simulated UC100 (LIO-192): admitted only on a measured, current A
+    /// centreline with the work zero on it and every A inside its soft
+    /// limits; lowered with A turning alone between the angles; held and
+    /// resumed in the middle of a turn; it ends with A at the angles it was
+    /// commanded to, back at A0.
+    #[test]
+    fn an_indexed_bar_runs_at_four_angles_turning_a_alone() {
+        use crate::indexed::tests::{bar_job, contour, cutter, prism};
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = prism(30.);
+        let mut op = contour(&cutter("12"));
+        // A few seconds a pass: fast feeds, deep steps.
+        for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
+            op.p.insert(k.into(), v.into());
+        }
+        // From A0 the first turn is to A90; a job whose first angle is 0
+        // starts with a rapid from the stock's corner over the chuck, which
+        // the check refuses.
+        let mut doc = bar_job(&mesh, 20., "100", "-150", "90, 180, 270, 0", op);
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.file = Some(crate::model::ModelFile {
+            name: "bar.stl".into(),
+            path: "bar.stl".into(),
+            format: "STL".into(),
+            bytes: 1,
+        });
+        let path = dir.path().join("profile.toml");
+        let m = &mut doc.setups[0].machine;
+        for (k, v) in [
+            ("controller", "UC100"),
+            ("uc100_profile", &*path.display().to_string()),
+            ("uc100_connection", "Simulated"),
+            ("feed", "60000"),
+            ("post_dwell", "0.2"),
+            (CENTRE_MARK, MEASURED),
+        ] {
+            m.p.insert(k.into(), v.into());
+        }
+        doc.machines = vec![doc.setups[0].machine.clone()];
+        doc.sync_stock_sources();
+        doc.sync_turns(Some(&mesh));
+        let m = doc.setups[1].machine.clone();
+        assert_eq!(m.id, doc.setups[0].machine.id);
+        let mut c = zeroed_sim(dir.path(), ROTARY_SIM, Some(&m), 4);
+        // Started at the angle A is at, the approach comes down over the
+        // stock's corner in the chuck: the run refuses it, as export does.
+        let mut at_zero = doc.clone();
+        (at_zero.setups[1].p).insert(crate::indexed::ANGLES.into(), "0, 90, 180, 270".into());
+        at_zero.sync_turns(Some(&mesh));
+        let refused = crate::run::check(&at_zero, &mesh, 1).0.unwrap_err();
+        assert!(refused.iter().any(|e| e.contains("chuck")), "{refused:?}");
+        let sims = crate::run::simulated_for_tests(&at_zero, &mesh, 1);
+        assert!(
+            crate::post::checked(
+                &at_zero,
+                &mesh,
+                1,
+                &sims,
+                crate::post::PostSettings::from_machine
+            )
+            .is_err()
+        );
+        let (programs, _) = crate::run::check(&doc, &mesh, 1);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(programs.len(), 1);
+        // The work zero on the measured centreline, A0 at machine A0.
+        let zero = doc.at_angle(1, 0., &mesh).unwrap().machine_zero.unwrap();
+        let here = c.snapshot.machine_pos;
+        let set = |c: &mut Connection, axis: usize, offset: f64| {
+            c.send(Command::SetWork {
+                axis,
+                value: here[axis] - offset,
+            });
+            until(c, 2.0, "the work offset", |s| {
+                (s.work_offset[axis] - offset).abs() < 1e-6
+            });
+        };
+        for (axis, z) in zero.iter().enumerate() {
+            set(&mut c, axis, *z as f64);
+        }
+        set(&mut c, 3, 0.);
+        let mut run = crate::run::Run::new(&doc, 1, 0);
+        run.checked_as(std::sync::Arc::new(Ok(programs)), None);
+        c.run = Some(run);
+        let problems =
+            |c: &Connection, doc: &crate::model::Document| c.run.as_ref().unwrap().problems(c, doc);
+        let has = |c: &Connection, doc: &crate::model::Document, t: &str| {
+            problems(c, doc).iter().any(|p| p.contains(t))
+        };
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        // An assumed centreline refuses the run and says where to measure
+        // it; so does one gone stale, on the Control page or in the library.
+        c.rotary.as_mut().unwrap().mark = String::new();
+        assert!(has(&c, &doc, "assumed, not measured") && has(&c, &doc, "Control → Rotary A"));
+        c.rotary.as_mut().unwrap().mark = "stale after an E-stop".into();
+        assert!(has(&c, &doc, "went stale after an E-stop"));
+        c.rotary.as_mut().unwrap().mark = MEASURED.into();
+        doc.machines[0]
+            .p
+            .insert(CENTRE_MARK.into(), "stale after a remount".into());
+        assert!(has(&c, &doc, "went stale after a remount"));
+        doc.machines[0]
+            .p
+            .insert(CENTRE_MARK.into(), MEASURED.into());
+        // The work zero within 0.02 mm of the centreline, not 0.03.
+        set(&mut c, 1, zero[1] as f64 + 0.03);
+        assert!(
+            has(&c, &doc, "off the A centreline"),
+            "{:?}",
+            problems(&c, &doc)
+        );
+        set(&mut c, 2, zero[2] as f64 - 0.01);
+        set(&mut c, 1, zero[1] as f64 + 0.01);
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        set(&mut c, 1, zero[1] as f64);
+        set(&mut c, 2, zero[2] as f64);
+        // A 100° work offset would turn A to machine 370°, past 360.
+        set(&mut c, 3, 100.);
+        assert!(
+            has(&c, &doc, "machine A 370.000°"),
+            "{:?}",
+            problems(&c, &doc)
+        );
+        set(&mut c, 3, 0.);
+        assert!(problems(&c, &doc).is_empty(), "{:?}", problems(&c, &doc));
+        // Lowered: A turns alone, to each angle in order, then back to A0.
+        let (start, offset) = (c.snapshot.machine_pos, c.snapshot.work_offset);
+        let p = c.run.as_ref().unwrap().checked().unwrap()[0].clone();
+        let actions = crate::run::lower(&p, 0, offset, start).unwrap();
+        assert_eq!(crate::run::combined(&actions, start), None);
+        let mut turns = vec![];
+        let mut at = start;
+        for l in &actions {
+            if let Do::Move { target, feed } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    assert!(feed.is_none() && target[..3] == at[..3], "{l:?}");
+                    turns.push(target[3]);
+                }
+                at = target;
+            }
+        }
+        assert_eq!(turns, [90., 180., 270., 0.]);
+        // Each turn as export makes it: the tool up at or above all that A
+        // swings, A alone, then on. The first follows the tool run's Z-only
+        // retract and comes before the spindle starts, its dwell and the
+        // approach in X and Y.
+        let clearance = crate::cam::number(&doc.setups[1].operations[0], "clearance").unwrap();
+        let swing = doc.swing(1, &mesh, clearance).unwrap();
+        let plan_z = |m: [f64; 6]| m[2] - offset[2] + p.datum[2] as f64;
+        let mut at = start;
+        let mut first = None;
+        for (i, l) in actions.iter().enumerate() {
+            if let Do::Move { target, .. } = l.action {
+                if (target[3] - at[3]).abs() > 1e-9 {
+                    assert!(plan_z(target) >= swing.z as f64 - 1e-3, "{l:?} {swing:?}");
+                    first.get_or_insert(i);
+                }
+                at = target;
+            }
+        }
+        let i = first.unwrap();
+        assert!(
+            matches!(actions[i - 1].action, Do::Move { target, .. } if target[..2] == start[..2] && target[3] == start[3])
+        );
+        let next = (i + 1..actions.len())
+            .find(|&k| matches!(actions[k].action, Do::Move { .. }))
+            .unwrap();
+        let between: Vec<&Do> = actions[i + 1..next].iter().map(|l| &l.action).collect();
+        assert!(
+            matches!(between.first(), Some(Do::Spindle { .. }))
+                && matches!(between.last(), Some(Do::Dwell { .. }))
+                && between.iter().all(|a| matches!(
+                    a,
+                    Do::Spindle { .. } | Do::Coolant { .. } | Do::Dwell { .. }
+                )),
+            "{between:?}"
+        );
+        assert!(
+            matches!(actions[next].action, Do::Move { target, feed: None } if target[2] == at_z(&actions, i) && target[3] == 90.),
+            "{:?}",
+            actions[next]
+        );
+        // Cycle Start; Hold in the middle of the turn to 180, then Resume.
+        let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
+        c.run_act(R::CycleStart, &doc);
+        assert!(
+            c.run.as_ref().unwrap().running.is_some(),
+            "{:?}",
+            problems(&c, &doc)
+        );
+        let mut reached = [false; 4];
+        let mut held = None;
+        let cap = Instant::now() + Duration::from_secs(600);
+        loop {
+            c.refresh();
+            if let Some(r) = &mut c.run {
+                r.refresh(c.snapshot.program_outcome.as_ref());
+            }
+            let s = c.snapshot.clone();
+            for (k, a) in [0., 90., 180., 270.].iter().enumerate() {
+                reached[k] |= s.state == Some(State::Run) && (s.machine_pos[3] - a).abs() < 0.03;
+            }
+            if held.is_none()
+                && s.state == Some(State::Run)
+                && (92.0..110.0).contains(&s.machine_pos[3])
+            {
+                c.run_act(R::Hold, &doc);
+                until(&mut c, 5.0, "Hold", |s| s.state == Some(State::Hold));
+                let a = settled(&mut c);
+                wait(&mut c, 300);
+                assert_eq!(c.snapshot.machine_pos, a, "the machine moved while held");
+                assert_eq!(c.snapshot.state, Some(State::Hold));
+                // Stopped short of 180, X, Y and Z where the turn began.
+                assert!(a[3] < 179.9 && a[..3] == s.machine_pos[..3], "{a:?}");
+                held = Some(a[3]);
+                c.run_act(R::Resume, &doc);
+            }
+            if c.snapshot
+                .program_outcome
+                .as_ref()
+                .is_some_and(|o| o.seq > seq)
+            {
+                break;
+            }
+            assert!(Instant::now() < cap, "the job did not end: {:?}", s.log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let o = c.snapshot.program_outcome.clone().unwrap();
+        assert!(o.ok, "{} {:?}", o.message, c.snapshot.log);
+        assert!(held.is_some(), "A was never caught turning");
+        assert_eq!(reached, [true; 4]);
+        until(&mut c, 3.0, "Idle after the job", |s| {
+            s.state == Some(State::Idle)
+        });
+        if let Some(r) = &mut c.run {
+            r.refresh(c.snapshot.program_outcome.as_ref());
+        }
+        let run = c.run.as_ref().unwrap();
+        assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
+        assert!(
+            c.snapshot.machine_pos[3].abs() < 0.03,
+            "{:?}",
+            c.snapshot.machine_pos
+        );
     }
 
     #[test]

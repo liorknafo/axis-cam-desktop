@@ -1063,7 +1063,7 @@ The Machine library could save 4 axes but not where the rotary sits; the owner's
 
 The post refused every machine but a 3-axis one, refused indexed setups, and the replay read X, Y and Z only.
 
-- `post::tests::controller_and_axes_are_refused_before_any_output`: a 4-axis machine with A around X posts, in Indexed (3+1) or Continuous 4-axis mode, with LinuxCNC or the UC100's settings; a 5-axis machine and a 4-axis one with B around Y are refused; a run (`post::not_run`, in the checks a UC100 run makes) still refuses the 4-axis machine.
+- `post::tests::controller_and_axes_are_refused_before_any_output`: a 4-axis machine with A around X posts, in Indexed (3+1) or Continuous 4-axis mode, with LinuxCNC or the UC100's settings; a 5-axis machine and a 4-axis one with B around Y are refused (a run has taken it since LIO-192).
 - `an_indexed_program_retracts_then_turns_a_alone_then_approaches_and_cuts`: the golden Facing pass made at A90, from A0, posts exactly: the header's A note (A90, the sense of A, the centreline at machine Y140 Z-40 assumed, not measured, and A0), then the tool change's retract, `G0 A90.000` before the spindle starts, the approach, the descent, the cut, the last retract and `G0 A0.000` before M2, and it replays. With a second angle, `G0 A180.000` follows the retract to the swing height, alone, and the program turns A three times: A90, A180, A0.
 - `the_replay_fails_a_program_whose_a_is_not_the_simulated_a`: A-90 or A89 in place of A90 fails with "does not match the simulated A90.000", a missing `G0 A90.000` fails, A on a line with X and Y or on a G1 is not read, and an A word in a 3-axis program fails.
 - `a_turning_during_a_move_is_refused_before_any_output`: a feed whose A differs from the turn before is refused as a continuous A move, naming both angles and where; an index move that also moves Z is refused too.
@@ -1076,6 +1076,17 @@ The post refused every machine but a 3-axis one, refused indexed setups, and the
 - The 3-axis golden programs and every other post test are unchanged.
 - Found in testing: the same contour with the part 20 mm from the jaws and starting at A0 is refused: the holder comes within the gap of the jaws, and the kernel's approach at A0 comes down over the stock's corner, in the chuck body.
 - Not validated: anything on a real LinuxCNC machine; running on the UC100 (LIO-192).
+
+## Running indexed setups on the UC100 (LIO-192, 18 October 2026)
+
+A run refused every machine that was not 3-axis (`post::not_run`) and lowered X, Y and Z only.
+
+- `run::tests::an_indexed_tool_run_turns_a_alone_at_its_work_offset`: a facing pass at A90 then A180, lowered with A's work offset 5° from machine A30: the first retract moves Z alone, the turns are rapids of A alone to machine A95, A185 and A5 with X, Y and Z where the move before left them, the turn to A180 is its index block at the swing height; a move whose A differs from the last turn is refused, `combined` catches an action that moves A with X; a 3-axis tool run leaves A where it is.
+- `control::tests::hold_resume_and_stop_work_while_a_turns_alone` (simulated UC100): Hold in the middle of a turn to A180 stops A short of it (after the controller's buffer and deceleration) and keeps it still; Resume finishes the turn at 180 within 0.03°; Stop partway back stops A between, with its machine position kept. X, Y and Z do not move.
+- `control::tests::an_indexed_bar_runs_at_four_angles_turning_a_alone` (simulated UC100): a contour round a 20 × 20 part in a Ø40 bar in the chuck, indexed to A 90, 180, 270 and 0 in one job. Started at A 0 (the angle the machine is at), the same job is refused by the run's check and by export. Cycle Start admits it only on a measured centreline: assumed, stale after an E-stop on the Control page or after a remount in the library, each refuses with the reason and Control → Rotary A; the work zero 0.03 mm off the centreline is refused, 0.01 mm accepted; a 100° A work offset (machine A 370°) is refused. The lowered actions turn A alone to 90, 180, 270 and 0, each at or above the swing height; the first after the Z-only retract, before the spindle, its dwell and the approach. Hold in the turn to 180 stops the machine, Resume finishes; the job ends done with A at 0, having stood at each angle.
+- Every 3-axis run test is unchanged.
+- Found: started at the A the machine is at, an indexed setup's first approach comes down over the stock's corner in the chuck (filed separately); the run refuses it as export does, since it uses the same check.
+- Not validated: anything on the real machine; the live carve and the 3D view at angles other than the first.
 
 ## Rotary calibration: the A centreline, A zero and the line to the tailstock (LIO-186, 18 October 2026)
 
