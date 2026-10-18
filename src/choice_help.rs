@@ -126,6 +126,22 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "The part drops over the machine's fixture pins by holes in it, so its place and turn are known: the pins give this setup's X and Y work offset (Set X Y from the pins on the Control page), with no probing. Z is still touched off on the stock. The pins are kept clear of as workholding; the vise or clamps still hold the part down.",
             "Cycle Start waits until X and Y are referenced from pin 1 since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
         ),
+        ("pin_source", "Part's holes") => (
+            "The part drops over the pins by round holes in its own design, opening on the face this setup sits on: choose them from the list, or pick them in the 3D view.",
+            "",
+        ),
+        ("pin_source", "Stock leftover") => (
+            "The pins go into holes in the stock beside the part, which is cut away later: place the pins by a click on the leftover in the 3D view, and an earlier setup with that face up drills them (Add the pin holes). The part needs no holes of its own.",
+            "Milled with a flat end mill, pin 1's hole is round and places the part, and each other pin's hole is a slot along the line from pin 1, so the pins turn the part without binding; a drill makes them all round. Each hole goes 1 mm deeper than the pins stand. Keep the leftover joined to the part in this setup, with tabs or a skin.",
+        ),
+        ("holes", "Part's holes") => (
+            "Drill the round holes of the part in the selected face.",
+            "",
+        ),
+        ("holes", "Pin holes") => (
+            "Make the holes a later setup stands on the fixture pins by, in the stock's leftover where its Work zero step places the pins. They follow the pins when they move; no surfaces are selected.",
+            "A drill from the pins' diameter to 0.2 mm over drills them all round. A flat end mill mills them 0.05 mm over the pins: pin 1's hole round on a helix, a slot along the line from pin 1 for each of the others.",
+        ),
         ("on_pins", "No") => (
             "The part does not sit on the fixture pins: its X and Y work zero is touched off or probed on the stock.",
             "",
@@ -163,7 +179,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("boundary", "Selected geometry") => (
-            "Use the regions selected on the current imported part. Facing uses their XY bounding rectangle. Pocket and Inside Contour use selected recessed floor boundaries and preserve islands. Select geometry appropriate to this operation.",
+            "Use the regions selected on the current imported part. Facing uses their XY bounding rectangle. Pocket, Adaptive clearing and Inside Contour use selected recessed floor boundaries and preserve islands. Select geometry appropriate to this operation.",
             "",
         ),
         ("boundary", "Stock silhouette") => (
@@ -447,24 +463,24 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ("thread_angle", "60") => ("A 60° thread form: metric and unified threads.", ""),
         ("thread_angle", "55") => ("A 55° thread form: Whitworth threads.", ""),
         ("ramp", "Helix") => (
-            "Record a circular descending entry. This sample-only preference is not an imported helix generator; imported Pocket offers Profile ramp or Plunge.",
+            "Descend in a circle at the ramp angle (0.1° to 15°) where Adaptive clearing cannot reach the material from the side. Where the floor runs off the stock, or earlier cuts opened it, the cutter comes in from the side with no entry. Imported Pocket does not use this setting: it offers Profile ramp or Plunge in Contour entry.",
             "",
         ),
         ("ramp", "Zigzag") => (
-            "Record a back-and-forth descending entry. This illustrative preference is not implemented in imported Pocket generation.",
+            "Record a back-and-forth descending entry. This illustrative preference is not implemented for imported parts: Adaptive clearing enters with a Helix or a Plunge.",
             "",
         ),
         ("ramp", "Plunge") => {
             diagram = Some(Diagram::Entry(false));
             (
-                "Record a straight vertical entry requiring a plunge-capable cutter. Imported Pocket uses its separate Contour entry setting.",
+                "Feed straight down where Adaptive clearing cannot reach the material from the side. This needs a plunge-capable cutter. Imported Pocket uses its separate Contour entry setting.",
                 "",
             )
         }
         ("ramp", "Profile") => {
             diagram = Some(Diagram::Entry(true));
             (
-                "Record a descending entry along a contour. Imported Pocket's implemented Profile ramp is selected in Contour entry.",
+                "Record a descending entry along a contour. This sample preference is not implemented for imported Adaptive clearing, which enters with a Helix or a Plunge; imported Pocket's Profile ramp is selected in Contour entry.",
                 "",
             )
         }
@@ -477,7 +493,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("rest", "Yes") => (
-            "Record the intention to machine material remaining from an earlier operation. Fully cleared top layers are skipped automatically. This saved preference does not yet isolate leftover islands or corners; other air cuts can remain.",
+            "Record the intention to machine material remaining from an earlier operation. Fully cleared top layers are skipped automatically. This saved preference does not yet isolate leftover islands or corners; other air cuts can remain. Imported Pocket and Adaptive clearing need no setting: they cut only where earlier operations left material.",
             "",
         ),
         ("rest", "No") => (

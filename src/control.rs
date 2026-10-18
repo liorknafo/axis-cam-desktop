@@ -839,6 +839,10 @@ pub const BOSS_DEPTH: f64 = 3.;
 const BOSS_SIDES: [(usize, f64); 4] = [(0, 1.), (0, -1.), (1, 1.), (1, -1.)];
 
 /// Where to put the tip for Pin centre, with its button for `{}`.
+/// Why a run that starts partway cannot touch off or probe its work zero
+/// when the check did not work out the stock its start leaves.
+const PARTWAY_UNKNOWN: &str =
+    "The check did not work out the stock the start leaves: check the setup again.";
 const PIN_HOW: &str = "Take the part off the pins, jog the tip over the middle of pin 1, a few mm above its top, and press {} again.";
 
 /// What a `Routine` is for.
@@ -1700,6 +1704,7 @@ impl Connection {
     fn observe(&mut self) {
         if let Some(run) = &mut self.run {
             run.refresh(self.snapshot.program_outcome.as_ref());
+            run.carve(&self.snapshot);
         }
         if let Some(st) = &self.snapshot.status {
             self.inputs.observe(self.opened.elapsed(), st);
@@ -1952,15 +1957,20 @@ impl Connection {
             Action::TouchOff if self.manual() && self.run_program().is_ok() => {
                 if let Some((_, work)) = self.touch_off() {
                     // On the pins, the pins set X and Y: the touch-off is Z's.
+                    // So it is for a run that starts partway: X and Y stay
+                    // those the operations before it were cut with, as a
+                    // tip jogged over a spot by eye would not find them.
                     let pins = self.run_program().is_ok_and(|p| p.pins.is_some());
+                    let partway = self.run.as_ref().is_some_and(|r| r.partway());
                     for (a, value) in work.into_iter().enumerate() {
-                        if pins && a < 2 {
+                        if (pins || partway) && a < 2 {
                             continue;
                         }
                         self.send(Command::SetWork { axis: a, value });
                     }
                     if let Some(run) = &mut self.run {
                         run.touched = true;
+                        run.zeroed = true;
                     }
                 }
             }
@@ -2013,7 +2023,10 @@ impl Connection {
         };
         let state = self.snapshot.state.clone();
         match action {
-            R::Next(i) if run.running.is_none() && i < run.done.len() => run.next = i,
+            // A probe under way sets the work zero for the start it began with.
+            R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
+            R::From(i, k) if !self.probing() => run.start_at(i, k),
+            R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
             R::CycleStart => {
                 if let Some(job) = run.cycle_start(self, doc) {
                     self.send(job);
@@ -2029,6 +2042,7 @@ impl Connection {
                 if let Some(z) = run.reference {
                     self.send(Command::SetWork { axis: 2, value: z });
                     run.touched = true;
+                    run.zeroed = true;
                 }
             }
             R::ProbeReference => self.start_probe(Touch::Reference),
@@ -2085,6 +2099,16 @@ impl Connection {
             return Ok(0.);
         }
         self.run_program()?;
+        if let Some(why) = self.partway_blocked() {
+            return Err(format!("{why} Probe Z cannot set it."));
+        }
+        // The plate lies wherever it is put on the top, which the check
+        // knows only at the touch-off spot.
+        if let Some(run) = self.run.as_ref().filter(|r| r.partway())
+            && run.partly().is_some_and(|p| p.top_cut)
+        {
+            return Err("The operations before the start cut into the stock top, so a touch plate laid on it may not lie at a height the check knows: Probe Z cannot set Z. Touch the tool tip off at the touch-off spot instead.".into());
+        }
         self.touch_off()
             .map(|(_, work)| work[2])
             .ok_or_else(|| format!("{} Probe Z cannot set it.", crate::post::STOCK_TOP_CUT))
@@ -2239,6 +2263,7 @@ impl Connection {
                 });
                 if let Some(run) = &mut self.run {
                     run.touched = true;
+                    run.zeroed = true;
                 }
                 match p.plate {
                     Some(_) => format!(
@@ -2290,20 +2315,74 @@ impl Connection {
             return Err("Probe corner, Probe edge and Probe centre set the work zero of the setup picked in the Run panel, from its stock.".into());
         }
         let p = self.run_program()?;
+        let spots = self.probe_spots();
         // A spot picked that a new check of the setup finds blocked is
         // left for the zero's own, as the grid shows it.
         if let Some(refs) = self.probe_spot
-            && p.probe_from.iter().any(|(r, ok)| *r == refs && ok.is_ok())
+            && spots.iter().any(|(r, ok)| *r == refs && ok.is_ok())
         {
             return Ok((refs, p));
         }
-        match &p.probe {
-            Ok(refs) => Ok((*refs, p)),
-            Err(why) if p.probe_from.iter().any(|(_, ok)| ok.is_ok()) => Err(format!(
+        // A run that starts partway probes the stock the operations before
+        // it leave: the zero's own spot only where they left it.
+        let own = match self
+            .run
+            .as_ref()
+            .filter(|r| r.partway())
+            .map(|r| r.partly())
+        {
+            Some(None) => Err(PARTWAY_UNKNOWN.to_string()),
+            Some(Some(partly)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
+                "The operations before the start cut the stock's {}, where a probe finds this work zero.",
+                partly.cut.join(", ")
+            )),
+            _ => p.probe.clone(),
+        };
+        match own {
+            Ok(refs) => Ok((refs, p)),
+            Err(why) if spots.iter().any(|(_, ok)| ok.is_ok()) => Err(format!(
                 "{why} Pick a spot under Probe from that a probe can reach."
             )),
-            Err(why) => Err(why.clone()),
+            Err(why) => Err(why),
         }
+    }
+
+    /// The stock-top spots a probe can find the work zero of the setup to
+    /// run from (`post::Checked::probe_from`), each with why it cannot: on
+    /// the stock the operations before the start leave, for a run that
+    /// starts partway (`post::Partly::probe_from`).
+    pub fn probe_spots(&self) -> &[([crate::post::At; 2], Result<(), String>)] {
+        let (Some(run), Ok(p)) = (&self.run, self.run_program()) else {
+            return &[];
+        };
+        if run.partway() {
+            run.partly().map_or(&[], |x| &x.probe_from)
+        } else {
+            &p.probe_from
+        }
+    }
+
+    /// Why Zero Z on the stock top and Probe Z cannot set the work Z of a
+    /// run that starts partway (`run::Run::partway`): the check cannot tell
+    /// the surface the operations before its start leave where the stock
+    /// top is touched off. None when it can, or the run starts at the
+    /// setup's first operation.
+    pub fn partway_blocked(&self) -> Option<String> {
+        let run = self.run.as_ref().filter(|r| r.partway())?;
+        let Some(partly) = run.partly() else {
+            return Some(PARTWAY_UNKNOWN.into());
+        };
+        if partly.surface.is_some() {
+            return None;
+        }
+        Some(if partly.cut.is_empty() {
+            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
+        } else {
+            format!(
+                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                partly.cut.join(", ")
+            )
+        })
     }
 
     /// An axis's Set field, when it is a number.
@@ -2652,11 +2731,17 @@ impl Connection {
     /// None when it is not on the stock top: a Model origin whose stock top
     /// an earlier setup cut.
     pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
-        let p = self.run.as_ref()?.checked()?.first()?;
+        let run = self.run.as_ref()?;
+        let p = run.checked()?.first()?;
         if p.located.is_some_and(|(_, top)| top.is_none()) {
             return None;
         }
-        let at = crate::post::touch_point(&p.origin, p.stock)?;
+        let mut at = crate::post::touch_point(&p.origin, p.stock)?;
+        // A run that starts partway touches off on the surface the
+        // operations before it leave there, when the check knows it.
+        if run.partway() {
+            at[2] = run.partly()?.surface?;
+        }
         Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
     }
 
@@ -2823,6 +2908,7 @@ impl Connection {
         }
         if let Some(run) = &mut self.run {
             run.touched = true;
+            run.zeroed = true;
         }
         let mut up = e.from;
         up[2] = e.high(w);

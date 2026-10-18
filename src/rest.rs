@@ -205,19 +205,17 @@ pub fn coaxial(volume: &Volume, current: Frame) -> Coaxial {
 /// Box, in `current`, around each earlier cut of any cutter shape: material can
 /// only have been removed inside these boxes.
 pub fn cut_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
-    volume
-        .cuts
-        .iter()
-        .map(|c| {
-            let b = c.ring().unwrap_or_else(|| Bounds {
-                min: std::array::from_fn(|k| c.a[k].min(c.b[k]) - c.radius),
-                max: std::array::from_fn(|k| {
-                    c.a[k].max(c.b[k]) + c.radius + if k == 2 { c.flute } else { 0. }
-                }),
-            });
-            transformed(b, c.frame, current)
-        })
-        .collect()
+    volume.cuts.iter().map(|c| cut_box(c, current)).collect()
+}
+/// `cut_boxes`' box of one cut: a lathe's ring's own box.
+pub fn cut_box(c: &Cut, current: Frame) -> Bounds {
+    let b = c.ring().unwrap_or_else(|| Bounds {
+        min: std::array::from_fn(|k| c.a[k].min(c.b[k]) - c.radius),
+        max: std::array::from_fn(|k| {
+            c.a[k].max(c.b[k]) + c.radius + if k == 2 { c.flute } else { 0. }
+        }),
+    });
+    transformed(b, c.frame, current)
 }
 /// Box, in `current`, around the material each earlier cut can have
 /// removed: within the tool radius of its path, from its lowest tip up to
@@ -227,22 +225,24 @@ pub fn removal_boxes(volume: &Volume, current: Frame) -> Vec<Bounds> {
     volume
         .cuts
         .iter()
-        .map(|c| {
-            let b = c.ring().unwrap_or(Bounds {
-                min: [
-                    c.a[0].min(c.b[0]) - c.radius,
-                    c.a[1].min(c.b[1]) - c.radius,
-                    c.a[2].min(c.b[2]),
-                ],
-                max: [
-                    c.a[0].max(c.b[0]) + c.radius,
-                    c.a[1].max(c.b[1]) + c.radius,
-                    c.a[2].max(c.b[2]) + c.flute,
-                ],
-            });
-            transformed(b, c.frame, current)
-        })
+        .map(|c| removal_box(c, current))
         .collect()
+}
+/// `removal_boxes`' box of one cut: a lathe's ring's own box.
+pub fn removal_box(c: &Cut, current: Frame) -> Bounds {
+    let b = c.ring().unwrap_or(Bounds {
+        min: [
+            c.a[0].min(c.b[0]) - c.radius,
+            c.a[1].min(c.b[1]) - c.radius,
+            c.a[2].min(c.b[2]),
+        ],
+        max: [
+            c.a[0].max(c.b[0]) + c.radius,
+            c.a[1].max(c.b[1]) + c.radius,
+            c.a[2].max(c.b[2]) + c.flute,
+        ],
+    });
+    transformed(b, c.frame, current)
 }
 /// Where earlier cuts can have removed material, for single points: within
 /// the tool radius of each cut's path, from its tip up to its flute top,
@@ -359,35 +359,62 @@ impl<'a> Removed<'a> {
     /// The operation whose cut removed material at `p` (`at`), as its
     /// `Cut::source`: the first such cut's, in the order they were made.
     pub fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
-        const GUARD: f32 = 0.001;
         self.cuts
             .iter()
             .zip(&self.boxes)
-            .find(|(cut, b)| {
-                (0..3).all(|k| p[k] >= b.min[k] - 2. * GUARD && p[k] <= b.max[k] + 2. * GUARD) && {
-                    let q = transfer(p, self.current, cut.frame);
-                    if cut.shape == CutterShape::Revolve {
-                        // The ring grown by the guard on every side.
-                        return crate::volume::swept(
-                            q,
-                            [cut.a[0] - GUARD, cut.a[1] - GUARD, 0.],
-                            [cut.b[0] + GUARD, cut.b[1] + GUARD, 0.],
-                            0.,
-                            0.,
-                            cut.shape,
-                        );
-                    }
-                    // Raised by the guard against a flute top raised twice as far.
-                    crate::volume::swept(
-                        [q[0], q[1], q[2] + GUARD],
-                        cut.a,
-                        cut.b,
-                        cut.radius + GUARD,
-                        cut.flute + 2. * GUARD,
-                        cut.shape,
-                    )
-                }
-            })
+            .find(|(cut, b)| removes(cut, b, self.current, p))
+            .map(|(cut, _)| cut.source)
+    }
+}
+/// Whether `cut`, whose `removal_box` is `b`, can have removed material at
+/// `p` (current frame), as `Removed::at` tests it.
+fn removes(cut: &Cut, b: &Bounds, current: Frame, p: [f32; 3]) -> bool {
+    const GUARD: f32 = 0.001;
+    (0..3).all(|k| p[k] >= b.min[k] - 2. * GUARD && p[k] <= b.max[k] + 2. * GUARD) && {
+        let q = transfer(p, current, cut.frame);
+        if cut.shape == CutterShape::Revolve {
+            // The ring grown by the guard on every side.
+            return crate::volume::swept(
+                q,
+                [cut.a[0] - GUARD, cut.a[1] - GUARD, 0.],
+                [cut.b[0] + GUARD, cut.b[1] + GUARD, 0.],
+                0.,
+                0.,
+                cut.shape,
+            );
+        }
+        // Raised by the guard against a flute top raised twice as far.
+        crate::volume::swept(
+            [q[0], q[1], q[2] + GUARD],
+            cut.a,
+            cut.b,
+            cut.radius + GUARD,
+            cut.flute + 2. * GUARD,
+            cut.shape,
+        )
+    }
+}
+/// `Removed::by` over some of a volume's cuts, in the order they were made:
+/// the operation whose cut first removed material at a point.
+pub struct FirstCut<'a> {
+    cuts: Vec<&'a Cut>,
+    current: Frame,
+    boxes: Vec<Bounds>,
+}
+impl<'a> FirstCut<'a> {
+    pub fn new(cuts: Vec<&'a Cut>, current: Frame) -> Self {
+        let boxes = cuts.iter().map(|c| removal_box(c, current)).collect();
+        Self {
+            cuts,
+            current,
+            boxes,
+        }
+    }
+    pub fn by(&self, p: [f32; 3]) -> Option<(u16, u16)> {
+        self.cuts
+            .iter()
+            .zip(&self.boxes)
+            .find(|(cut, b)| removes(cut, b, self.current, p))
             .map(|(cut, _)| cut.source)
     }
 }

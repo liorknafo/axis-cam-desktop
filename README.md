@@ -2,7 +2,7 @@
 
 A working native desktop **CAM workflow prototype**, built with Rust and Iced 0.14. It carries the web prototype's Manufacture-style layout into a native application, with local persistence, editable operation parameters and a 3D model viewport. There is no embedded browser.
 
-**G-code output is LinuxCNC 3-axis only.** Six imported-part operations have bounded motion previews with approximate stock removal: Facing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Adaptive, Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Vise jaws and clamps that a setup models are checked as boxes with a clearance gap (see **Workholding**); parallels, bolts, the table and the machine body are not checked, and production CAM remains pending. The example project's other paths are demonstrations. The AI planner signs in with a ChatGPT account and proposes a whole job for an imported part; the app generates, simulates and checks every proposal before it can be applied (see **Plan a job with AI**).
+**G-code output is LinuxCNC 3-axis only.** Seven imported-part operations have bounded motion previews with approximate stock removal: Facing, Adaptive clearing, Pocket, inside/outside Contour, Drilling, Parallel and Waterline. Their exact simulated moves can be exported as one .ngc program per setup after checks and a round-trip replay (see below). Scallop, Indexed, Rotary and 5-axis remain explicitly unavailable for imported machining. Vise jaws and clamps that a setup models are checked as boxes with a clearance gap (see **Workholding**); parallels, bolts, the table and the machine body are not checked, and production CAM remains pending. The example project's other paths are demonstrations. The AI planner signs in with a ChatGPT account and proposes a whole job for an imported part; the app generates, simulates and checks every proposal before it can be applied (see **Plan a job with AI**).
 
 ![Native workspace](docs/workspace.png)
 
@@ -50,15 +50,15 @@ The script (rewritten for #32 and untested on a Mac since) builds the release bi
 | Tool library | Editable tool types, diameter, flutes, flute length, stickout and holder diameter; in-use tool deletion protection |
 | Material library | Saved materials with group, hardness, notes and cutting data for carbide tools (surface speed and chip load per tooth by tool diameter); fifteen starter materials marked as starting points; a project material picked from the library; warnings when an operation's speed or feed is outside the material's data |
 | Workholding library | Saved vises and toe clamps with their sizes (two starters); a setup models a vise or clamps from the library, the app suggests where they go, the 3D view draws them, and every move is checked against them as boxes with a clearance gap; a later setup starts from the stock the earlier setups left, and its holder is checked on that stock (see **Workholding**) |
-| Operations | Six implemented imported-mesh preview strategies, Box for a manual mill and Turn for a manual lathe; explicit status for all thirteen strategies; unavailable operations cannot be added to imported jobs |
-| Geometry | Imported planar surface selection for Facing, Pocket and Drilling; whole-model Contour/Parallel/Waterline; separate selectable example housing; depth-tested rendering; orbit, pan, zoom and orthographic views |
+| Operations | Seven implemented imported-mesh preview strategies, Box for a manual mill and Turn for a manual lathe; explicit status for all thirteen strategies; unavailable operations cannot be added to imported jobs |
+| Geometry | Imported planar surface selection for Facing, Adaptive clearing, Pocket and Drilling; whole-model Contour/Parallel/Waterline; separate selectable example housing; depth-tested rendering; orbit, pan, zoom and orthographic views |
 | STL | Real binary and ASCII mesh preview |
 | OBJ | Real mesh preview; polygon fan triangulation and negative face indices |
 | STEP / STP | Open CASCADE CAD import and complete tessellated preview, assembly placements, source units converted to mm |
 | 3MF | ZIP/XML mesh reader, declared units, build items, nested components, mirrored/placed instances and Production extension external model references |
 | Hover help | Descriptions for every app button/input; choice help follows the selected value and related settings; matching native concept animations; F1 pins the focused field's card |
 | Planner | One click asks an OpenAI model, on your ChatGPT plan, for setups, operations, tools and cutting parameters; the app checks every proposal with its generators, simulation, export checks and the speeds and feeds against the project material's cutting data, sends failures back for correction, and shows a passing plan for review, apply and undo; while it runs, a timeline lists each step with its time, the size of the reply received and each check's result |
-| Simulation | Six imported strategies with cumulative stock across operations/setups, adaptive octree surface meshing, background detail updates, pause/replay/scrub; separate example motion |
+| Simulation | Seven imported strategies with cumulative stock across operations/setups, adaptive octree surface meshing, background detail updates, pause/replay/scrub; separate example motion |
 | Operation audit | Generate all checks every enabled operation across every setup, reports generated paths and actionable failures, skips suppressed operations |
 | Saving | Automatic local workspace saving; explicit JSON project save/open; complete machine, setup, tool, material and operation data |
 | Export | LinuxCNC 3-axis `.ngc` per setup (checked and replayed) and a Markdown setup sheet |
@@ -69,7 +69,7 @@ Facing, adaptive clearing, pocket, contour, drilling, parallel finishing, waterl
 
 Milling operations use **Tool → Geometry → Heights → Passes → Linking**. Drilling replaces Passes with Cycle. Indexed, rotary and 5-axis strategies add Orientation.
 
-Fields are specific to each strategy: optimal load/rest machining for adaptive clearing; compensation for contours; pecks/dwell for drilling; slopes and surface spacing for finishing; rotary ranges, lead/lean and tilt limits for multi-axis work.
+Fields are specific to each strategy: optimal load and minimum cutting radius for adaptive clearing; compensation for contours; pecks/dwell for drilling; slopes and surface spacing for finishing; rotary ranges, lead/lean and tilt limits for multi-axis work.
 
 ## Operation coverage and checking a whole job
 
@@ -79,17 +79,17 @@ Open **Operation support** in the toolbar for the complete support list. **Gener
 | --- | --- |
 | Facing | Highest planar face; rectangular raster; flat/face cutter; one-way or zigzag |
 | Pocket | One or more selected recessed planar floors, each to its own height; offset loops keep clear of everything above the floor, may stand over a lower area past an open edge, and go only where earlier cuts left material (rest passes); openings through a floor optionally cut through; flat cutter; plunge/profile ramp |
+| Adaptive | The same selected recessed planar floors, walls and islands as Pocket (each floor to its own height, highest first; openings optionally cut through; rest passes automatic); the path holds the cutter's side load near the optimal load (2% to 50% of the diameter), so the stepdown can be deep; each level ends with one pass round the walls and islands at the radial stock to leave; helix or plunge entry, or from the side where the floor is open; flat end mill |
 | Contour | Outside model silhouette or Inside walls/islands of a selected recessed floor; In computer compensation; depth layers and repeat passes |
 | Drilling | Circular openings in selected horizontal rim(s), including counterbores; narrowest vertical bore check; drilling, chip breaking, deep peck and bottom-dwell cycles; with a chamfer mill, countersinks each opening to its diameter at the rim |
 | Parallel | Whole-model vertical flat/ball cutter envelope; angled zigzag passes, surface spacing, slope range, vertical stock allowance |
 | Waterline | Constant-Z contours around geometry projected above each level; flat cutter, radial allowance and Climb/Conventional |
-| Adaptive | Unavailable: engagement-controlled clearing kernel pending |
 | Scallop | Unavailable: constant surface-spacing kernel pending |
 | Indexed | Unavailable: indexed tool frames / rotary kinematics pending |
 | Rotary | Unavailable: continuous rotary paths and stock simulation pending |
 | 5-axis | Unavailable: tool-axis planning / machine kinematics pending |
 
-The five unavailable strategies retain their educational illustrations in the explicit example project. Those illustrations are not machining calculations. Existing imported projects containing those operations retain their settings and report a failure when checked.
+The four unavailable strategies retain their educational illustrations in the explicit example project. Those illustrations are not machining calculations. Existing imported projects containing those operations retain their settings and report a failure when checked.
 
 ### Contour, drilling and finishing flow
 
@@ -182,7 +182,7 @@ An ordinary **Drill** operation in an earlier setup drills the holes, from the f
 
 The same point is used everywhere: the program's coordinates (plan point − work zero), the simulation and a run's moves (plan point − work zero + the machine's work offset), the 3D view's **X0 Y0 Z0** marker (drawn on the stock the simulation starts from, or the box the editor knows for the setup), the header's touch-off words, the Run panel's steps and the probe.
 
-Six operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks beyond the vise jaws and clamps a setup models (see **Workholding**) and the five explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
+Seven operations generate imported-part motion and approximate stock removal within the scopes below. Production toolpaths, collision checks beyond the vise jaws and clamps a setup models (see **Workholding**) and the four explicitly unavailable strategies remain future work. To try the illustrative paths, choose **Start → Explore example project** explicitly.
 
 ## Try the example workflow
 
@@ -929,6 +929,35 @@ panel, at once when that machine is connected, or when you press
    the run panel on screen, not in the Controller configuration view. The
    Run strip shows the tool run, operation and block being cut, and how the
    tool run ended.
+
+   Each tool run in the Tool runs panel shows its operations as cards, each
+   with a picture of the stock it leaves and where it stands. **Start here**
+   on a card makes Cycle Start begin with that operation, in any tool run,
+   for operations already cut in an earlier session or before a Stop or
+   E-stop (LIO-177): the operations before it say "Skipped: taken as cut"
+   and the card "Next: Cycle Start cuts it". Nothing of the skipped
+   operations is sent: the tool run starts as after a tool change, with Z up
+   to the clearance plane where the tool stands, the spindle and coolant as
+   that operation sets them, the start dwell, then across at the clearance
+   plane and down, and that program is checked as the whole one is (rapids
+   into the stock the earlier operations leave, holder, jaws and clamps).
+   The checks before Cycle Start (soft limits, spindle and coolant outputs)
+   cover only what is sent. Before the setup's first tool run starts this
+   way, Work zero on the stock names the operations taken as cut and the
+   tool to load, and finds the work zero on the stock they leave: where they
+   cut the stock top's touch-off spot, and as far around it as that tool
+   reaches, down to one flat floor the check knows (a facing pass), the
+   touch-off button sets Z alone on that floor (**Set Z-4** after a 4 mm
+   facing pass): X and Y stay those the operations were cut with, which a
+   tip jogged by eye would not find again. Where the check cannot tell the
+   surface they left, it is off; Probe Z is off once they cut into the top
+   anywhere, since the plate may lie elsewhere on it; and probes from the
+   stock-top spots run only where those operations left the stock. Cycle
+   Start waits until the work zero is set this way after the start was
+   chosen, set from a recorded reference, or **Keep this work zero** is
+   pressed (it is still the one those operations were cut with, or Z was
+   set by hand on a surface they left); each new start, and each new check
+   of the setup, asks again.
 4. Between tool runs with different tools, the Tool runs panel gives the
    steps: the last one ended with the spindle and coolant off at the setup's
    clearance plane. Touch the old tool
@@ -1163,7 +1192,7 @@ The explicit smoke-test mode uses an isolated workspace, exercises ninety-nine s
 ## Next engineering stages
 
 1. Keep exact CAD topology in the application, extend imported geometry selection beyond tessellated patches, and implement exact stock/fixture placement.
-2. Extend the six bounded operation previews into a production 3-axis CAM engine with exact boundaries, robust linking, additional strategies, rest-aware path optimization and fixture collision checks beyond vise jaws and clamps.
+2. Extend the seven bounded operation previews into a production 3-axis CAM engine with exact boundaries, robust linking, additional strategies, rest-aware path optimization and fixture collision checks beyond vise jaws and clamps.
 3. Implement rotary and 5-axis kinematics, limit checking, singularity handling and machine simulation.
 4. Add more postprocessors (GRBL, Fanuc…), arcs and canned cycles, each with the same replay verification, and validate them on known machines.
 5. Extend the planner as more strategies become available for imported parts, and make it aware of fixtures beyond vise jaws and clamps.

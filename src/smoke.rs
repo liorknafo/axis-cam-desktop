@@ -2483,6 +2483,374 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("3-tool-change.png"));
     }
 
+    /// The operation of a block of a program, if it names one.
+    fn op_of(b: &crate::post::Block) -> Option<usize> {
+        use crate::post::Block;
+        match b {
+            Block::Start { op, .. }
+            | Block::Run { op, .. }
+            | Block::Approach { op, .. }
+            | Block::Descend { op, .. }
+            | Block::Move { op, .. } => Some(*op),
+            _ => None,
+        }
+    }
+
+    /// A run started at the Pocket, the second operation of tool run 1,
+    /// after the Facing was cut: nothing of the Facing is sent, the program
+    /// starts safely (Z up alone, the Pocket's spindle speed and coolant,
+    /// the dwell, across at the clearance plane and down), the cards say
+    /// Skipped and Next, the checks before Cycle Start cover only what runs,
+    /// Z is touched off on the floor the Facing left, and Cycle Start cuts
+    /// from the Pocket on the simulated UC100 (LIO-177).
+    #[test]
+    fn a_run_starts_at_a_chosen_operation_with_a_safe_start_and_nothing_before_it() {
+        use crate::post::Block;
+        use crate::run::{Action as R, Stage::*};
+        use crate::ui::work_zero_steps;
+        use uc100::controller::State;
+        use uc100::gcode::{Action as Do, Spindle};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        // The Facing asks for mist, which the profile has no output for.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("coolant".into(), "Mist".into());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        assert!(has(&a, "Facing: uses mist coolant"), "{:?}", problems(&a));
+        let p = run_of(&a).checked().unwrap()[0].clone();
+        let names: Vec<&str> = p.ops.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Facing", "Pocket", "Contour"]);
+        assert!(p.starts.iter().all(Result::is_ok), "{:?}", p.starts);
+        // The program from the Pocket: the tool change's safe start, then
+        // the same blocks as the whole program, with nothing of the Facing.
+        let from = p.from(1).unwrap();
+        assert!(from.iter().all(|b| op_of(b) != Some(0)));
+        assert!(
+            matches!(
+                from[..8],
+                [
+                    Block::Stop,
+                    Block::Retract,
+                    Block::Start {
+                        op: 1,
+                        change: true
+                    },
+                    Block::Retract,
+                    Block::Run {
+                        op: 1,
+                        spindle: true,
+                        coolant: true
+                    },
+                    Block::Wait { .. },
+                    Block::Approach { op: 1, .. },
+                    Block::Descend { op: 1, .. },
+                ]
+            ),
+            "{:?}",
+            &from[..8]
+        );
+        let of = |blocks: &[Block], op| {
+            let at = blocks
+                .iter()
+                .position(|b| matches!(b, Block::Start { op: k, .. } if *k == op))
+                .unwrap();
+            blocks[at..].to_vec()
+        };
+        // The Pocket's own moves are all there; the whole program's link
+        // from the Facing (up, across and down) is not.
+        let pocket = |blocks: &[Block]| -> Vec<Block> {
+            blocks
+                .iter()
+                .filter(|b| matches!(b, Block::Move { op: 1, .. }))
+                .cloned()
+                .collect()
+        };
+        let (own, whole) = (pocket(from), pocket(&p.blocks));
+        assert!(whole.ends_with(&own) && whole.len() - own.len() <= 3);
+        assert_eq!(of(from, 2), of(&p.blocks, 2));
+        // Lowered where the machine stands: Z up alone to the clearance
+        // plane, the Pocket's spindle and coolant, the dwell, across, down.
+        let s = conn(&a).snapshot.clone();
+        let actions = crate::run::lower(&p, 1, s.work_offset, s.machine_pos).unwrap();
+        let o = &p.ops[1];
+        let high = crate::post::clearance_plane(from) as f64 - p.datum[2] as f64 + s.work_offset[2];
+        let Do::Move {
+            target: up,
+            feed: None,
+        } = actions[0].action
+        else {
+            panic!("{:?}", actions[0])
+        };
+        assert_eq!(up[..2], s.machine_pos[..2]);
+        assert!((up[2] - high).abs() < 1e-9);
+        // Plan times are f32: a dwell is its seconds to a few µs.
+        let rounded = |l: &uc100::gcode::Located| match l.action {
+            Do::Dwell { seconds } => Do::Dwell {
+                seconds: (seconds * 1e3).round() / 1e3,
+            },
+            ref a => a.clone(),
+        };
+        assert_eq!(
+            actions[1..4].iter().map(rounded).collect::<Vec<_>>(),
+            [
+                Do::Spindle {
+                    state: Spindle::Cw,
+                    rpm: o.rpm as f64
+                },
+                Do::Coolant {
+                    flood: o.coolant.1,
+                    mist: o.coolant.0
+                },
+                Do::Dwell { seconds: 0.2 },
+            ]
+        );
+        assert!(o.coolant.1 && !o.coolant.0);
+        let Do::Move {
+            target: over,
+            feed: None,
+        } = actions[4].action
+        else {
+            panic!("{:?}", actions[4])
+        };
+        let Block::Descend { xy, z, .. } = from[7] else {
+            unreachable!()
+        };
+        // Across at the clearance plane to over the Pocket's first point,
+        // then down to it unless it is at the plane.
+        assert!((over[2] - high).abs() < 1e-9);
+        for k in 0..2 {
+            assert!((over[k] - (xy[k] - p.datum[k]) as f64 - s.work_offset[k]).abs() < 1e-4);
+        }
+        let first = (z - p.datum[2]) as f64 + s.work_offset[2];
+        assert!(first <= high + 1e-9);
+        if first < high - 1e-9 {
+            let Do::Move {
+                target: down,
+                feed: None,
+            } = actions[5].action
+            else {
+                panic!("{:?}", actions[5])
+            };
+            assert_eq!(over[..2], down[..2]);
+            assert!((down[2] - first).abs() < 1e-4);
+        }
+        assert!(
+            actions
+                .iter()
+                .all(|l| op_of(&from[l.line as usize - 1]) != Some(0))
+        );
+        // The cards: the Facing skipped, the Pocket next.
+        let line = |a: &App| conn(a).snapshot.current_line;
+        let stages = |a: &App, i| run_of(a).stages(i, line(a));
+        assert_eq!(stages(&a, 0), [Next, ToCome, ToCome]);
+        let _ = a.update(Message::Run(R::From(1, 0)));
+        assert_eq!(stages(&a, 0), [Skipped, Skipped, Skipped]);
+        assert_eq!(stages(&a, 1), [Next]);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        assert_eq!(stages(&a, 0), [Skipped, Next, ToCome]);
+        assert_eq!(stages(&a, 1), [ToCome]);
+        let _ = a.view();
+        // The Facing's mist is not sent, so it is not refused; Cycle Start
+        // waits for the work zero on the stock the Facing left.
+        assert!(!has(&a, "mist"), "{:?}", problems(&a));
+        assert!(
+            has(&a, "after operations taken as cut"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // The Facing took the top down to the part's, 4 mm: Z is touched
+        // off on that floor at the stock top's centre.
+        let partly = run_of(&a).partly().unwrap();
+        assert!(
+            partly.cut.iter().any(|c| c == "top face"),
+            "{:?}",
+            partly.cut
+        );
+        let floor = partly.surface.unwrap() - p.datum[2];
+        assert!((floor + 4.).abs() < 1e-3, "{floor}");
+        let (_, work) = conn(&a).touch_off().unwrap();
+        assert!((work[2] - floor as f64).abs() < 1e-9);
+        // A plate laid anywhere on the top might lie on the Pocket's floor:
+        // Probe Z is off.
+        assert!(
+            conn(&a)
+                .stock_top()
+                .unwrap_err()
+                .contains("Probe Z cannot set Z")
+        );
+        let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains("This run starts at Pocket (tool run 1), taking Facing as cut")
+                && steps.contains("at Z-4 (the stock top was Z0)")
+                && steps.contains("pinches a sheet of paper on the floor there")
+                && steps.contains("4. Set Z-4: that point becomes Z-4. X and Y stay as they are"),
+            "{steps}"
+        );
+        // The stock top was at machine Z-20 (`zeroed`): the tip 4 mm below
+        // it, on the Facing's floor, and over the centre within a few mm by
+        // eye. Set Z-4 there sets Z alone, which stays: X and Y stay too.
+        // (The simulator's block, 47 mm tall with its top at Z-40, would put
+        // the Contour below the soft limits, which Cycle Start refuses.)
+        let offset = conn(&a).snapshot.work_offset;
+        mdi(&mut a, "G0 X3 Y-2 Z-4");
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.work_offset, offset);
+        assert!(run_of(&a).zeroed);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Cycle Start cuts from the Pocket: the job is the program from it.
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        assert_eq!(run_of(&a).running_blocks(), Some(from));
+        let mut deadline = Deadline::new(30.);
+        while stages(&a, 0) != [Skipped, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "{:?}", stages(&a, 0));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (_, op, _) = run_of(&a).progress(line(&a)).unwrap();
+        assert_eq!(op, 1);
+        run_until(&mut a, 30.0, "tool run 1 from the Pocket", |r| r.done[0]);
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            ok && message.contains("tool run 1 of 2 from Pocket"),
+            "{message}"
+        );
+        assert_eq!((run_of(&a).next, run_of(&a).from), (1, 0));
+        assert_eq!(stages(&a, 0), [Done, Done, Done]);
+        assert_eq!(stages(&a, 1), [Next]);
+        // Started: the work zero is kept from here, as after any first tool run.
+        assert!(!run_of(&a).partway() && work_zero_steps(&a, conn(&a)).is_none());
+        // The Contour picked again in the tool run done: cut again from it.
+        let _ = a.update(Message::Run(R::From(0, 2)));
+        assert_eq!(stages(&a, 0), [Done, Done, Next]);
+        assert_eq!(stages(&a, 1), [ToCome]);
+    }
+
+    /// A run started at the Drilling with the work zero on the stock top's
+    /// front-left corner, which the Contour cut down in part: the check
+    /// cannot tell one surface there, so Zero Z on the stock top and Probe Z
+    /// are off and touch off nothing, and Cycle Start waits until the work
+    /// zero is kept or set from a reference, for each start chosen (LIO-177).
+    #[test]
+    fn a_partway_start_whose_surface_is_not_known_waits_for_the_work_zero() {
+        use crate::run::Action as R;
+        use crate::ui::work_zero_steps;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
+        let waits = "after operations taken as cut";
+        assert!(!has(&a, waits) && conn(&a).partway_blocked().is_none());
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(run_of(&a).partway());
+        let blocked = conn(&a).partway_blocked().unwrap();
+        assert!(
+            blocked.contains("cannot tell the surface they left"),
+            "{blocked}"
+        );
+        assert!(conn(&a).touch_off().is_none());
+        assert!(
+            conn(&a)
+                .stock_top()
+                .unwrap_err()
+                .contains("Probe Z cannot set it")
+        );
+        assert!(conn(&a).edges_setup().is_err());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let steps = work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains("taking Facing, Pocket, Contour as cut")
+                && steps.contains("Load T3")
+                && steps.contains("Zero Z on the stock top and Probe Z are off")
+                && !steps.contains("Zero all"),
+            "{steps}"
+        );
+        // Touch off does nothing; Cycle Start waits.
+        let offset = conn(&a).snapshot.work_offset;
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.work_offset, offset);
+        assert!(has(&a, waits), "{:?}", problems(&a));
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // Kept: Cycle Start may start.
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Another start asks again.
+        let _ = a.update(Message::Run(R::From(0, 2)));
+        assert!(has(&a, waits));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(!has(&a, waits));
+        // A check of the setup again asks again, and keeps the start.
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 2));
+        assert!(has(&a, waits));
+        // From the setup's first operation the work zero is found as ever.
+        let _ = a.update(Message::Run(R::Next(0)));
+        assert!(!run_of(&a).partway() && !has(&a, waits));
+    }
+
+    /// Renders the Tool runs panel with an operation chosen to PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/run-from-op): the Pocket chosen
+    /// before Z is touched off on the floor the Facing left, the Pocket
+    /// being cut, and the Drilling chosen with the work zero on a corner
+    /// whose surface the check cannot tell. Not a check: run it with
+    /// --ignored.
+    #[test]
+    #[ignore]
+    fn render_a_run_started_at_a_chosen_operation() {
+        use crate::run::{Action as R, Stage::*};
+        use uc100::controller::State;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/run-from-op".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1600., 1700.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-pocket-chosen.png"));
+        mdi(&mut a, "G0 X0 Y0 Z-4");
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let mut deadline = Deadline::new(30.);
+        while run_of(&a).stages(0, conn(&a).snapshot.current_line) != [Skipped, Cutting, ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-cutting-from-the-pocket.png"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock top front-left".into());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-drilling-chosen-surface-unknown.png"));
+    }
+
     /// The driver refuses a job sent while it is not idle for it: for a few
     /// milliseconds after a work or machine zero it re-anchors its position,
     /// while the app's snapshot still says Idle. Such a Cycle Start ran
@@ -2725,8 +3093,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(Ok(many))));
         assert_eq!(run_of(&a).checked().map(<[_]>::len), Some(12));
         let _ = a.view();
-        // The strip is the same; the ten more tool runs are in the list under it.
-        assert_eq!(counts(&a), (strip, runs + 10));
+        // The strip is the same; the ten more tool runs are in the list under
+        // it, each of one operation: its button and the card's Start here.
+        assert_eq!(counts(&a), (strip, runs + 20));
     }
 
     #[test]
@@ -3423,9 +3792,9 @@ flood = { pin = 8 }
             a.status
         );
         assert_eq!(pick(&mut a, end), 2);
-        let datum =
-            crate::post::datum(&a.doc.setups[1], a.known_stock(1).0.unwrap(), &mesh).unwrap();
-        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, datum).unwrap();
+        let stock = a.known_stock(1).0.unwrap();
+        let datum = crate::post::datum(&a.doc.setups[1], stock, &mesh).unwrap();
+        let on = crate::post::placed_on_pins(&a.doc.setups[1], &mesh, stock, datum).unwrap();
         assert!(
             (on.places[0][0] - holes[0].center[0]).abs() < 0.01,
             "{on:?}"
@@ -3436,6 +3805,247 @@ flood = { pin = 8 }
         let _ = a.update(Message::SetupStep("Stock"));
         assert!(!a.picking_pin_holes());
         assert_eq!(pick(&mut a, wall), 1);
+    }
+
+    /// `post::fixture::leftover_flip("rx", tool)` in the app: the cube
+    /// flipped onto pins in its leftover, on the flipped setup's Work zero
+    /// step.
+    fn leftover_pins_app(tool: Option<&str>) -> App {
+        let mut a = app();
+        let (doc, mesh) = crate::post::fixture::leftover_flip("rx", tool);
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectSetup(1));
+        let _ = a.update(Message::SetupStep("Work zero"));
+        a
+    }
+
+    #[test]
+    fn the_work_zero_step_places_the_pins_on_the_leftover_in_the_3d_view() {
+        use crate::viewport::Event;
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 0.01;
+        let mut a = leftover_pins_app(None);
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[1], &mesh);
+        let placed = crate::post::leftover_places(&a.doc, &mesh, 1).unwrap();
+        // Not placing: the pointer and a click move nothing.
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([0., 0.]))));
+        let _ = a.update(Message::Viewport(Event::PlacePins([0., 0.])));
+        assert_eq!(a.pin_aim, None);
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            placed[0]
+        ));
+        assert!(!crate::ui::pin_aim(&a).on);
+        let _ = a.update(Message::PlacePins);
+        assert!(a.placing_leftover_pins());
+        assert!(!a.picking_pin_holes());
+        // Over the part they are red, with why.
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            part.min[0] + 5.,
+            y,
+        ]))));
+        let aim = crate::ui::pin_aim(&a);
+        assert!(aim.on && aim.offsets.len() == 2, "{aim:?}");
+        assert!(near(aim.placed.unwrap(), placed[0]), "{aim:?}");
+        assert_eq!(
+            aim.ghost.unwrap().1,
+            Err(
+                "Pin 1 would stand under the part: place the pins on the leftover beside it."
+                    .into()
+            )
+        );
+        // A click there leaves them where they were, and says why.
+        let _ = a.update(Message::Viewport(Event::PlacePins([part.min[0] + 5., y])));
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            placed[0]
+        ));
+        assert_eq!(
+            a.status,
+            "The pins do not fit there: Pin 1 would stand under the part: place the pins on the leftover beside it."
+        );
+        // On the leftover they fit, 2 mm further from the part, and a click
+        // puts pin 1 there.
+        let to = [placed[0][0] - 2., placed[0][1]];
+        let _ = a.update(Message::Viewport(Event::AimPins(Some(to))));
+        let (_, fit) = crate::ui::pin_aim(&a).ghost.unwrap();
+        let (gap, _) = fit.unwrap();
+        assert!((gap - 11.95).abs() < 0.01, "{gap}");
+        let _ = a.view();
+        let _ = a.update(Message::Viewport(Event::PlacePins(to)));
+        assert!(near(
+            crate::post::leftover_places(&a.doc, &mesh, 1).unwrap()[0],
+            to
+        ));
+        // Add the pin holes to Top: a Drill of them with the Ø4.1 drill,
+        // its holes where the pins are.
+        let _ = a.update(Message::AddPinDrilling);
+        assert!(
+            a.status
+                .starts_with("Added Pin holes to Top, with Drill 4.1."),
+            "{}",
+            a.status
+        );
+        let op = a.doc.setups[0].operations.last().unwrap().clone();
+        assert!(op.drills_pin_holes());
+        assert_eq!(
+            a.doc.tools.iter().find(|t| t.id == op.tool).unwrap().name(),
+            "Drill 4.1"
+        );
+        assert_eq!(crate::post::pin_drillings(&a.doc, 1), vec![(0, 1)]);
+        let points = crate::post::drill_pin_points(&op);
+        assert_eq!(points.len(), 2);
+        let _ = a.view();
+        // Moving the pins moves their holes.
+        let _ = a.update(Message::Viewport(Event::PlacePins([to[0], to[1] + 1.])));
+        let moved = crate::post::drill_pin_points(&a.doc.setups[0].operations[1]);
+        assert!(moved.len() == 2 && moved != points, "{moved:?} {points:?}");
+        // Away from the Work zero step the pointer places nothing.
+        let _ = a.update(Message::SetupStep("Stock"));
+        assert!(!a.placing_leftover_pins());
+        assert!(!crate::ui::pin_aim(&a).on);
+    }
+
+    /// Renders the pins placed in the stock's leftover to PNGs in
+    /// `$AXIS_RENDER_DIR` (default /tmp/leftover-pins): the flipped setup's
+    /// Work zero step with the pins under the pointer where they fit and
+    /// where they do not, then placed; setup 1's Drill of their holes, its
+    /// drilled and its milled holes; the pins seen from below. Not a check:
+    /// run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_pins_in_the_leftover() {
+        use crate::viewport::Event;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/leftover-pins".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let tall = iced::Size::new(1600., 1300.);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_pins_app(None);
+        a.smoke_dir = Some(dir.path().to_path_buf());
+        let _ = a.refresh_left_stock();
+        a.smoke_dir = None;
+        let mesh = a.part_mesh().unwrap().clone();
+        let part = crate::simulation::part_box(&a.doc.setups[1], &mesh);
+        let placed = crate::post::leftover_places(&a.doc, &mesh, 1).unwrap();
+        let _ = a.update(Message::PlacePins);
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            placed[0][0] - 1.,
+            placed[0][1] + 3.,
+        ]))));
+        render_png(&a, tall, &out.join("1-aim-fits.png"));
+        let y = (part.min[1] + part.max[1]) / 2.;
+        let _ = a.update(Message::Viewport(Event::AimPins(Some([
+            part.min[0] - 5.,
+            y,
+        ]))));
+        render_png(&a, tall, &out.join("2-aim-too-near-the-part.png"));
+        let _ = a.update(Message::PlacePins);
+        render_png(&a, tall, &out.join("3-placed.png"));
+        a.camera.pitch = -0.6;
+        render_png(&a, tall, &out.join("4-placed-from-below.png"));
+        a.camera = Default::default();
+        let _ = a.update(Message::AddPinDrilling);
+        let _ = a.view();
+        render_png(&a, tall, &out.join("5-add-the-pin-holes.png"));
+        let _ = a.update(Message::SelectSetup(0));
+        let _ = a.update(Message::SelectOp(1));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        // At the end of each, with the stock it leaves meshed in line.
+        let ended = |a: &mut App| {
+            let _ = a.update(Message::Generate);
+            let _ = a.update(Message::Scrub(1.));
+            let key = a.stock_mesh_key().unwrap();
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let result =
+                crate::stock_surface::Snapshot::of(volume, crate::stock_surface::Detail::Fine)
+                    .build()
+                    .map(std::sync::Arc::new);
+            let seconds = sim.seconds;
+            a.stock_mesh_job = None;
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        ended(&mut a);
+        render_png(&a, tall, &out.join("6-pin-holes-drilled.png"));
+        a.camera.zoom = 2.5;
+        render_png(&a, tall, &out.join("7-pin-holes-drilled-close.png"));
+        a.camera = Default::default();
+        let flat = (a.doc.tools.iter())
+            .find(|t| t.name() == "Flat 3")
+            .unwrap()
+            .id
+            .clone();
+        let _ = a.update(Message::SetOpTool(flat));
+        ended(&mut a);
+        a.camera.zoom = 2.5;
+        render_png(&a, tall, &out.join("8-pin-holes-milled-close.png"));
+    }
+
+    /// The example block's pocket cleared adaptively, its editor tabs and
+    /// the stock it leaves drawn to $AXIS_RENDER_DIR (/tmp/adaptive-renders):
+    /// for looking at, with --ignored.
+    #[test]
+    #[ignore]
+    fn render_an_adaptive_clearing() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/adaptive-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        {
+            let op = &mut a.doc.setups[0].operations[1];
+            op.strategy = Strategy::Adaptive;
+            op.p.insert("name".into(), Strategy::Adaptive.name().into());
+            op.p.insert("optimal_load".into(), "1.5".into());
+            op.p.insert("stepdown".into(), "12".into());
+            op.p.insert("feed".into(), "1500".into());
+        }
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(1));
+        let size = iced::Size::new(1600., 1100.);
+        for tab in ["Geometry", "Heights", "Passes", "Linking"] {
+            let _ = a.update(Message::Tab(tab.into()));
+            let _ = a.view();
+            render_png(
+                &a,
+                size,
+                &out.join(format!("tab-{}.png", tab.to_lowercase())),
+            );
+        }
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        // The stock surface, built in line rather than in the background.
+        let mesh = |a: &mut App| {
+            a.stock_mesh_job = None;
+            let key = a.stock_mesh_key().expect("a simulation with stock");
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let snapshot = crate::stock_surface::Snapshot::of(volume, a.stock_detail);
+            let seconds = sim.seconds;
+            let result = snapshot.build().map(std::sync::Arc::new);
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        for (at, name) in [(0.5, "halfway.png"), (1., "done.png")] {
+            let _ = a.update(Message::Scrub(at));
+            mesh(&mut a);
+            render_png(&a, size, &out.join(name));
+        }
+        eprintln!("{}", a.status);
     }
 
     /// Renders the fixture pins to PNGs in `$AXIS_RENDER_DIR` (default
@@ -4415,6 +5025,90 @@ flood = { pin = 8 }
         assert!(!a.locked());
         // Nothing was set.
         work_offset(&a, [195., 140., -20.]);
+    }
+
+    /// The Control page's 3D view shows the stock a run cuts, where the
+    /// machine's tool has gone and not ahead of it; MANUFACTURE keeps the
+    /// planned view, and picking the start again drops the carve (LIO-181).
+    #[test]
+    fn a_run_cuts_the_stock_where_the_machines_tool_goes() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run_pictured(&mut a, dir.path(), 0);
+        a.page = Page::Control;
+        // Nothing is shown before the tool moves: the view keeps the part.
+        assert!(a.live_stock().is_none());
+        let start = (run_of(&a).before.iter())
+            .find(|b| b.op == 0)
+            .expect("the stock before the facing")
+            .stock
+            .clone();
+        let top = start.bounds.max[2];
+        assert!(
+            start.heights.iter().all(|h| (h - top).abs() < 1e-3),
+            "uncut"
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 20.0, "a cut into the stock", |r| {
+            r.carving
+                .as_ref()
+                .is_some_and(|c| c.stock.heights.iter().any(|h| *h < top - 0.05))
+        });
+        // The passes go along X, stepping over in +Y: nothing past the tool
+        // in Y is cut while it faces, though the driver's line runs ahead.
+        let mut seen = 0;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while run_of(&a).done.first() != Some(&true) {
+            assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
+            assert!(
+                std::time::Instant::now() < end,
+                "the facing tool run did not end"
+            );
+            let _ = a.update(Message::Tick);
+            let (Some((tip, radius, _)), Some((g, _))) = (a.live_tool(), a.live_stock()) else {
+                continue;
+            };
+            if tip[2] > top {
+                continue;
+            }
+            seen += 1;
+            for y in 0..g.ny {
+                let cy = g.bounds.min[1] + (y as f32 + 0.5) * g.dy;
+                if cy > tip[1] + radius + 2. * g.dy {
+                    let row = &g.heights[y * g.nx..(y + 1) * g.nx];
+                    assert!(
+                        row.iter().all(|h| (h - top).abs() < 1e-3),
+                        "Y {cy} cut, tool at {tip:?}"
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(seen > 3, "{seen}");
+        // MANUFACTURE keeps its planned view.
+        a.page = Page::Work;
+        assert!(a.live_stock().is_none());
+        a.page = Page::Control;
+        let _ = a.view();
+        // The facing tool run done, its passes have cut the whole top, every
+        // pass however late the ticks came.
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let faced = a.live_stock().unwrap().0;
+        assert!(
+            faced.heights.iter().all(|h| *h < top - 0.05),
+            "{:?}",
+            faced.heights
+        );
+        // Jogging between tool runs cuts nothing; the carve is kept.
+        let kept = faced.heights.clone();
+        mdi(&mut a, "G0 X5 Y5 Z-5");
+        assert_eq!(a.live_stock().unwrap().0.heights, kept);
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        assert!(run_of(&a).carving.is_none() && a.live_stock().is_none());
     }
 
     #[test]
@@ -6086,6 +6780,69 @@ flood = { pin = 8 }
         // The machine position counted with 200 steps per mm is gone.
         assert!(conn(&a).snapshot.referenced.iter().all(|r| !r));
         let _ = a.view();
+    }
+
+    #[test]
+    fn picking_another_machine_while_connected_asks_then_switches() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        let mut other = a.doc.machines[0].clone();
+        other.id = "other".into();
+        other.p.insert("name".into(), "Second router".into());
+        a.doc.machines.push(other);
+        let first = a.doc.machines[0].id.clone();
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        // The connected machine itself asks nothing.
+        let _ = a.update(Message::ControlMachine(first.clone()));
+        assert!(a.switch_machine.is_none());
+        let _ = a.update(Message::ControlMachine("other".into()));
+        assert_eq!(conn(&a).machine_id, first);
+        shows(&a, &["Switch to Second router?", "Disconnect and switch"]);
+        let _ = a.update(Message::SwitchMachine(false));
+        assert!(a.switch_machine.is_none() && conn(&a).machine_id == first);
+        lacks(&a, &["Switch to Second router?"]);
+        let _ = a.update(Message::ControlMachine("other".into()));
+        let _ = a.update(Message::SwitchMachine(true));
+        assert_eq!(conn(&a).machine_id, "other");
+        assert_eq!(a.control_target().unwrap().id, "other");
+        tick_until(&mut a, 3.0, "E-stop after switching", |s| {
+            s.state == Some(State::EStop)
+        });
+        // A Disconnect drops a question still open.
+        let _ = a.update(Message::ControlMachine(first));
+        let _ = a.update(Message::Disconnect);
+        assert!(a.switch_machine.is_none() && a.control.is_none());
+    }
+
+    #[test]
+    fn the_real_or_simulated_switch_saves_the_machines_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = uc100_app(dir.path());
+        a.page = Page::Control;
+        a.machine_draft = a.doc.machines[0].clone();
+        shows(&a, &["Real (USB)", "Simulated"]);
+        let _ = a.update(Message::MachineConnection(false));
+        assert!(!crate::control::simulated(&a.doc.machines[0]));
+        assert!(!crate::control::simulated(&a.machine_draft));
+        assert_eq!(a.doc.machines[0].version, 1, "not a planning change");
+        assert!(a.control.is_none(), "choosing does not connect");
+        let _ = a.update(Message::MachineConnection(true));
+        assert!(crate::control::simulated(&a.doc.machines[0]));
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).simulated);
+        // The way it is connected already keeps the connection.
+        a.control.as_mut().unwrap().mdi = "G0 X1".into();
+        let _ = a.update(Message::MachineConnection(true));
+        assert_eq!(conn(&a).mdi, "G0 X1");
+        shows(
+            &a,
+            &["Real (USB) disconnects the simulator and connects to the machine itself."],
+        );
     }
 
     #[test]
@@ -10648,7 +11405,7 @@ flood = { pin = 8 }
         assert!(a.playing);
         let _ = a.update(Message::Tab("Geometry".into()));
         assert!(!a.playing && a.simulation.is_none());
-        let _ = a.update(Message::AddOp(Strategy::Adaptive));
+        let _ = a.update(Message::AddOp(Strategy::Scallop));
         let _ = a.update(Message::Play);
         assert!(!a.playing && !a.playback_ready() && a.selected.is_none());
         assert_eq!(a.page, Page::Audit);
@@ -11029,7 +11786,7 @@ flood = { pin = 8 }
                 .all(|o| o.geometry.is_empty() && o.surfaces.is_none())
         );
         let count = a.doc.setup().operations.len();
-        let _ = a.update(Message::AddOp(Strategy::Adaptive));
+        let _ = a.update(Message::AddOp(Strategy::Scallop));
         assert_eq!(a.doc.setup().operations.len(), count);
         assert!(!a.picking && !a.is_sample());
         assert!(a.selected.is_none());

@@ -265,7 +265,7 @@ impl View {
                         .unwrap_or_default();
                     let on = crate::post::datum(&setup, stock, mesh)
                         .ok()
-                        .and_then(|datum| crate::post::on_pins(&setup, mesh, datum));
+                        .and_then(|datum| crate::post::on_pins(&setup, mesh, stock, datum));
                     boxes.extend(crate::holding::pin_boxes(on.as_ref(), stock));
                     boxes
                 }
@@ -283,12 +283,14 @@ impl View {
             camera,
             picking: false,
             pin_holes: Default::default(),
+            pin_aim: Default::default(),
             show_stock: args.show_stock,
             show_paths: false,
             progress: None,
             holding: holding.clone(),
             leftover: None,
             live: None,
+            live_stock: None,
             uncut: &[],
             show_uncut: true,
         };
@@ -365,12 +367,14 @@ fn paint(scene: &Scene, args: &Args, view: &View) -> Picture {
         camera: Camera::default(),
         picking: false,
         pin_holes: Default::default(),
+        pin_aim: Default::default(),
         show_stock: args.show_stock,
         show_paths: view.operation.is_some(),
         progress: None,
         holding: view.holding.clone(),
         leftover: None,
         live: None,
+        live_stock: None,
         uncut: &[],
         show_uncut: true,
     };

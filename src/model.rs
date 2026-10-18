@@ -41,6 +41,7 @@ impl Strategy {
         matches!(
             self,
             Self::Face
+                | Self::Adaptive
                 | Self::Pocket
                 | Self::Contour
                 | Self::Drill
@@ -51,7 +52,10 @@ impl Strategy {
         )
     }
     pub fn needs_surfaces(self) -> bool {
-        matches!(self, Self::Face | Self::Pocket | Self::Drill)
+        matches!(
+            self,
+            Self::Face | Self::Adaptive | Self::Pocket | Self::Drill
+        )
     }
     pub fn availability(self) -> &'static str {
         match self {
@@ -64,7 +68,7 @@ impl Strategy {
             Self::Parallel => "Available · sampled vertical flat/ball cutter surface finishing",
             Self::Waterline => "Available · constant-Z contours with a vertical flat cutter",
             Self::Adaptive => {
-                "Unavailable · engagement-controlled adaptive kernel is not implemented"
+                "Available · planar pocket with islands, cleared at a controlled radial engagement"
             }
             Self::Scallop => "Unavailable · constant surface-spacing kernel is not implemented",
             Self::Indexed => {
@@ -598,6 +602,9 @@ pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
 pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
+/// How Adaptive clearing enters material it cannot reach from the side
+/// (its `ramp` setting).
+pub const ADAPTIVE_ENTRIES: [&str; 2] = ["Helix", "Plunge"];
 /// What a Pocket does with the holes through its floor that nothing of the
 /// part covers or underlies: clears over them at the floor's height, or
 /// cuts them through, Breakthrough past the bottom of their walls.
@@ -606,6 +613,10 @@ pub const POCKET_OPENINGS: [&str; 2] = ["Leave", "Cut through"];
 /// across its cut, near its bottom, that keep the part joined to the stock
 /// around it when the cut goes through.
 pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
+/// What a Drill makes (`holes`): the round holes of the part's surfaces it
+/// selects, or the holes a later setup drops over the fixture pins by in
+/// the stock's leftover (`pin_points`), as its Work zero step placed them.
+pub const DRILL_HOLES: [&str; 2] = ["Part's holes", "Pin holes"];
 /// The tab settings an operation starts with, and takes when tabs are
 /// turned on in a project saved before them: tabs on each outline, each
 /// one's width at its narrowest (mm) and its thickness (mm).
@@ -922,8 +933,13 @@ impl Operation {
     pub fn name(&self) -> &str {
         get(&self.p, "name")
     }
+    /// Whether this is a Drill of the pin holes in the stock's leftover
+    /// (`DRILL_HOLES`), which selects no surfaces.
+    pub fn drills_pin_holes(&self) -> bool {
+        self.strategy == Strategy::Drill && get(&self.p, "holes") == DRILL_HOLES[1]
+    }
     pub fn needs_surfaces(&self) -> bool {
-        self.strategy.needs_surfaces()
+        (self.strategy.needs_surfaces() && !self.drills_pin_holes())
             || (self.strategy == Strategy::Contour
                 && get(&self.p, "boundary") == "Selected geometry")
     }
@@ -1153,12 +1169,61 @@ impl Operation {
         }
         e
     }
+    /// What is wrong with an Adaptive clearing's own settings, in the words
+    /// of the generator (`adaptive::generate`): the optimal load and the
+    /// minimum cutting radius against the tool, and the entry.
+    fn adaptive_issues(&self, tool: Option<&Tool>, e: &mut Vec<String>) {
+        let p = &self.p;
+        let radius = tool.and_then(|t| num(&t.p, "diameter")).map(|d| d / 2.);
+        match radius {
+            Some(r) if r > 0. => {
+                if !num(p, "optimal_load").is_some_and(|n| n >= 0.04 * r && n <= r) {
+                    e.push(format!(
+                        "Optimal load must be from 2% to 50% of the tool diameter: {:.3} to {:.3} mm for this tool.",
+                        0.04 * r,
+                        r
+                    ))
+                }
+                if !num(p, "minimum_radius").is_some_and(|n| (0. ..=r).contains(&n)) {
+                    e.push(format!(
+                        "Minimum cutting radius must be from 0 to the tool radius, {r:.3} mm."
+                    ))
+                }
+            }
+            _ => {
+                positive(p, "optimal_load", e);
+                nonnegative(p, "minimum_radius", e)
+            }
+        }
+        let entry = get(p, "ramp");
+        if !ADAPTIVE_ENTRIES.contains(&entry) {
+            e.push(
+                "Adaptive clearing enters with a Helix or a Plunge; choose one in Linking.".into(),
+            )
+        } else if entry == ADAPTIVE_ENTRIES[0]
+            && !num(p, "ramp_angle").is_some_and(|n| (0.1..=15.).contains(&n))
+        {
+            e.push("Adaptive clearing helix ramp angle must be between 0.1° and 15°.".into())
+        }
+    }
     pub fn issues(&self, m: &Machine, tools: &[Tool], preceding: &[Operation]) -> Vec<String> {
+        self.issues_in(false, m, tools, preceding)
+    }
+    /// `issues`, for the demonstration document (`sample`) or an imported
+    /// part: the sample's Adaptive clearing keeps its illustrative entry
+    /// choices and checks, the imported one is held to the generator's.
+    pub fn issues_in(
+        &self,
+        sample: bool,
+        m: &Machine,
+        tools: &[Tool],
+        preceding: &[Operation],
+    ) -> Vec<String> {
         let mut e = vec![];
         if self.strategy == Strategy::Face {
             e.extend(facing_setting_issues(&self.p));
         }
-        if self.strategy == Strategy::Pocket {
+        if matches!(self.strategy, Strategy::Pocket | Strategy::Adaptive) {
             e.extend(pocket_setting_issues(&self.p));
             nonnegative(&self.p, "axial_allowance", &mut e);
         }
@@ -1202,7 +1267,14 @@ impl Operation {
                     get(&t.p, "length")
                 ))
             }
-            if self.strategy == Strategy::Drill
+            if self.drills_pin_holes() {
+                if !["Drill", "Flat end mill"].contains(&get(&t.p, "type")) {
+                    e.push(
+                        "Choose a drill, or a flat end mill to mill them, for the pin holes."
+                            .into(),
+                    )
+                }
+            } else if self.strategy == Strategy::Drill
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
             {
                 e.push(
@@ -1284,7 +1356,7 @@ impl Operation {
                 nonnegative(&self.p, "breakthrough", &mut e)
             }
         } else {
-            if s == Strategy::Parallel || !s.imported_preview() {
+            if matches!(s, Strategy::Parallel | Strategy::Adaptive) || !s.imported_preview() {
                 positive(&self.p, "tolerance", &mut e);
             }
             nonnegative(&self.p, "allowance", &mut e);
@@ -1330,11 +1402,6 @@ impl Operation {
             if s == Strategy::Turn {
                 e.extend(self.turn_issues(tool, m));
             }
-            if s == Strategy::Adaptive {
-                positive(&self.p, "optimal_load", &mut e);
-                nonnegative(&self.p, "minimum_radius", &mut e);
-                nonnegative(&self.p, "axial_allowance", &mut e)
-            }
             if matches!(s, Strategy::Pocket | Strategy::Contour) {
                 bounded(&self.p, "finish_passes", 0., 20., &mut e);
                 if num(&self.p, "finish_passes").is_some_and(|x| x.fract() != 0.) {
@@ -1349,14 +1416,20 @@ impl Operation {
                 positive(&self.p, "tab_width", &mut e);
                 positive(&self.p, "tab_height", &mut e)
             }
-            if matches!(s, Strategy::Adaptive | Strategy::Pocket)
+            if s == Strategy::Adaptive && !sample {
+                self.adaptive_issues(tool, &mut e)
+            } else if matches!(s, Strategy::Adaptive | Strategy::Pocket)
                 && get(&self.p, "ramp") != "Plunge"
             {
                 bounded(&self.p, "ramp_angle", 0.01, 90., &mut e)
             }
+            if s == Strategy::Adaptive && sample {
+                positive(&self.p, "optimal_load", &mut e);
+                nonnegative(&self.p, "minimum_radius", &mut e)
+            }
         }
         if get(&self.p, "rest") == "Yes"
-            && matches!(s, Strategy::Adaptive | Strategy::Scallop)
+            && (s == Strategy::Scallop || (s == Strategy::Adaptive && sample))
             && !preceding
                 .iter()
                 .any(|o| o.id == get(&self.p, "rest_source") && o.enabled)
@@ -1475,10 +1548,15 @@ impl Setup {
     /// What is wrong with operation `i`: its own checks (`Operation::issues`)
     /// and those the setup's stock adds (`Operation::stock_issues`).
     pub fn operation_issues(&self, i: usize, tools: &[Tool]) -> Vec<String> {
+        self.operation_issues_in(i, tools, false)
+    }
+    /// `operation_issues`, for the demonstration document (`sample`) or an
+    /// imported part (`Operation::issues_in`).
+    pub fn operation_issues_in(&self, i: usize, tools: &[Tool], sample: bool) -> Vec<String> {
         let Some(o) = self.operations.get(i) else {
             return vec![];
         };
-        let mut e = o.issues(&self.machine, tools, &self.operations[..i]);
+        let mut e = o.issues_in(sample, &self.machine, tools, &self.operations[..i]);
         e.extend(o.stock_issues(self));
         e
     }
@@ -2402,7 +2480,7 @@ impl Document {
             }
             for (i, o) in s.operations.iter().enumerate().filter(|(_, o)| o.enabled) {
                 e.extend(
-                    s.operation_issues(i, &self.tools)
+                    s.operation_issues_in(i, &self.tools, self.sample_model && self.file.is_none())
                         .into_iter()
                         .map(|x| format!("{} / {}: {x}", s.name(), o.name())),
                 );
@@ -2683,6 +2761,12 @@ pub fn issue_field(issue: &str) -> Option<&'static str> {
     }
     if m == "give this operation a name." {
         return Some("name");
+    }
+    if m.starts_with("minimum cutting radius ") {
+        return Some("minimum_radius");
+    }
+    if m.starts_with("adaptive clearing helix ramp angle ") {
+        return Some("ramp_angle");
     }
     OPERATION_FIELDS.into_iter().find(|k| {
         m.strip_prefix(label(k).as_str()).is_some_and(|rest| {
@@ -5902,5 +5986,113 @@ mod manual_setups {
             ),
             ("25", "75")
         );
+    }
+    /// An Adaptive clearing on a Ø10 flat end mill (radius 5), and its issues.
+    fn adaptive_with(settings: &[(&str, &str)]) -> Vec<String> {
+        let d = Document::sample();
+        let tool = Tool::new("Flat end mill · Ø10", "Flat end mill", "10");
+        let mut o = Operation::new(Strategy::Adaptive, tool.id.clone());
+        for (k, v) in settings {
+            o.p.insert((*k).into(), (*v).into());
+        }
+        o.issues(&d.setup().machine, &[tool], &[])
+    }
+    #[test]
+    fn an_adaptive_clearing_with_its_defaults_has_no_issue() {
+        assert!(adaptive_with(&[]).is_empty());
+        assert!(adaptive_with(&[("ramp", "Plunge"), ("ramp_angle", "")]).is_empty());
+    }
+    #[test]
+    fn an_adaptive_optimal_load_must_be_from_2_to_50_percent_of_the_diameter() {
+        let message = "Optimal load must be from 2% to 50% of the tool diameter: 0.200 to 5.000 mm for this tool.";
+        for ok in ["0.2", "1", "5"] {
+            assert!(adaptive_with(&[("optimal_load", ok)]).is_empty(), "{ok}");
+        }
+        for bad in ["0.1", "0", "5.5", "", "x"] {
+            let issues = adaptive_with(&[("optimal_load", bad)]);
+            assert_eq!(issues, [message], "{bad:?}");
+            assert_eq!(issue_field(&issues[0]), Some("optimal_load"));
+        }
+    }
+    #[test]
+    fn an_adaptive_minimum_cutting_radius_must_be_from_0_to_the_tool_radius() {
+        let message = "Minimum cutting radius must be from 0 to the tool radius, 5.000 mm.";
+        for ok in ["0", "2", "5"] {
+            assert!(adaptive_with(&[("minimum_radius", ok)]).is_empty(), "{ok}");
+        }
+        for bad in ["-1", "5.1", ""] {
+            let issues = adaptive_with(&[("minimum_radius", bad)]);
+            assert_eq!(issues, [message], "{bad:?}");
+            assert_eq!(issue_field(&issues[0]), Some("minimum_radius"));
+        }
+    }
+    #[test]
+    fn an_adaptive_clearing_enters_with_a_helix_or_a_plunge() {
+        let message = "Adaptive clearing enters with a Helix or a Plunge; choose one in Linking.";
+        for bad in ["Zigzag", "Profile", ""] {
+            assert_eq!(adaptive_with(&[("ramp", bad)]), [message], "{bad:?}");
+        }
+        assert_eq!(issue_field(message), None);
+        // A plunge has no angle to check.
+        assert!(adaptive_with(&[("ramp", "Plunge"), ("ramp_angle", "40")]).is_empty());
+    }
+    #[test]
+    fn an_adaptive_helix_ramp_angle_must_be_from_0_1_to_15_degrees() {
+        let message = "Adaptive clearing helix ramp angle must be between 0.1° and 15°.";
+        for ok in ["0.1", "2", "15"] {
+            assert!(adaptive_with(&[("ramp_angle", ok)]).is_empty(), "{ok}");
+        }
+        for bad in ["0.05", "15.5", "45", ""] {
+            let issues = adaptive_with(&[("ramp_angle", bad)]);
+            assert_eq!(issues, [message], "{bad:?}");
+            assert_eq!(issue_field(&issues[0]), Some("ramp_angle"));
+        }
+    }
+    #[test]
+    fn the_sample_adaptive_clearing_keeps_its_illustrative_entries() {
+        let d = Document::sample();
+        let mut o = Operation::new(Strategy::Adaptive, d.tools[0].id.clone());
+        o.p.insert("ramp".into(), "Zigzag".into());
+        o.p.insert("ramp_angle".into(), "40".into());
+        assert!(
+            o.issues_in(true, &d.setup().machine, &d.tools, &[])
+                .is_empty()
+        );
+        assert!(
+            o.issues_in(false, &d.setup().machine, &d.tools, &[])
+                .iter()
+                .any(|x| x.contains("enters with a Helix or a Plunge"))
+        );
+    }
+    #[test]
+    fn a_pocket_keeps_its_wider_ramp_angle_bound() {
+        let d = Document::sample();
+        let mut o = Operation::new(Strategy::Pocket, d.tools[0].id.clone());
+        o.p.insert("ramp_angle".into(), "40".into());
+        assert!(
+            !o.issues(&d.setup().machine, &d.tools, &[])
+                .iter()
+                .any(|x| x.contains("ramp angle"))
+        );
+        o.p.insert("ramp_angle".into(), "95".into());
+        assert!(
+            o.issues(&d.setup().machine, &d.tools, &[])
+                .iter()
+                .any(|x| x.contains("ramp angle"))
+        );
+    }
+    #[test]
+    fn only_a_scallop_or_a_sample_adaptive_needs_a_rest_source() {
+        let d = Document::sample();
+        let issues = |strategy, sample| {
+            let mut o = Operation::new(strategy, d.tools[0].id.clone());
+            o.p.insert("rest".into(), "Yes".into());
+            o.issues_in(sample, &d.setup().machine, &d.tools, &[])
+                .iter()
+                .any(|x| x.contains("Rest machining needs"))
+        };
+        assert!(issues(Strategy::Scallop, false));
+        assert!(issues(Strategy::Adaptive, true));
+        assert!(!issues(Strategy::Adaptive, false));
     }
 }
