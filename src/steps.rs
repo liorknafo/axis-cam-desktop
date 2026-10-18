@@ -3059,6 +3059,18 @@ pub(crate) mod tests {
                 "8 passes",
             ],
         );
+        assert!(!has(&a, "try the nut, then a spring pass"));
+        let last = nth(&a, 7, |l| matches!(l, L::ThreadPass { .. }));
+        send(&mut a, GuideAction::Go(last));
+        shows(
+            &a,
+            &[
+                "Thread pass 8 of 8",
+                "pass 8: in to 1.04",
+                "0.905 toward the axis",
+                "try the nut, then a spring pass",
+            ],
+        );
         let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
         send(&mut a, GuideAction::Go(part));
         shows(
@@ -3354,6 +3366,7 @@ pub(crate) mod tests {
         let thread = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
         shot(&mut a, "14-thread-touch", thread - 1, 0);
         shot(&mut a, "15-thread-pass-3", thread + 2, 1);
+        shot(&mut a, "15a-thread-pass-8", thread + 7, 1);
         let part = nth(&a, 0, |l| matches!(l, L::Plunge { part_off: true, .. }));
         shot(&mut a, "16a-part-off-touch", part - 1, 0);
         shot(&mut a, "16-part-off", part, 0);

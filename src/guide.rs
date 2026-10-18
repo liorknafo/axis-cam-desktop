@@ -409,7 +409,9 @@ pub enum LatheStep {
     /// Thread pass `index` of `of` at `pitch` on the gearbox, the top slide
     /// at `angle`°: the cross slide back to its zero, the top slide in to
     /// `top` (`infeed` toward the axis from the touch), the half-nuts closed
-    /// to `carriage`, then back out and reverse.
+    /// to `carriage`, then back out and reverse. The last pass is set to the
+    /// division below its travel, never deeper than planned (`infeed` is
+    /// what it feeds); then try the nut, and a spring pass.
     ThreadPass {
         op: usize,
         index: usize,
@@ -1306,9 +1308,30 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 let r0 = touch.diameter() / 2.;
                 let zc = zeroes.touch(&mut steps, (oi, tool, rpm), true, Some(touch), Some(angle));
                 let n = along.len();
-                for (i, m) in along.iter().enumerate() {
-                    // In toward the axis from the touch (out, inside).
-                    let infeed = mm(if inside { m.to[0] - r0 } else { r0 - m.to[0] }.max(0.));
+                // In toward the axis from the touch (out, inside), as
+                // planned.
+                let infeeds: Vec<f32> = (along.iter())
+                    .map(|m| mm(if inside { m.to[0] - r0 } else { r0 - m.to[0] }.max(0.)))
+                    .collect();
+                // The last pass is set to the top slide's division below
+                // its travel, never deeper than planned; the passes before
+                // it never past that, so the readings never go back.
+                let deepest = infeeds.last().map_or(0., |d| {
+                    lathe::floor(machine, Slide::Top, mm(top_travel(*d, angle)))
+                });
+                for (i, infeed) in infeeds.iter().enumerate() {
+                    let travel = if i + 1 == n {
+                        deepest
+                    } else {
+                        mm(top_travel(*infeed, angle)).min(deepest)
+                    };
+                    let top = zeroes.wound(Slide::Top, travel, inside);
+                    // What the top slide set there feeds in.
+                    let infeed = if i + 1 == n {
+                        mm(deepest * angle.to_radians().cos())
+                    } else {
+                        *infeed
+                    };
                     steps.push(Step::Lathe(LatheStep::ThreadPass {
                         op: oi,
                         index: i + 1,
@@ -1317,7 +1340,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                         pitch,
                         angle,
                         infeed,
-                        top: zeroes.wound(Slide::Top, top_travel(infeed, angle), inside),
+                        top,
                         carriage: zeroes.dial(Slide::Carriage, zc - z0),
                     }));
                 }
@@ -2846,22 +2869,64 @@ pub(crate) mod tests {
         let feeds: Vec<&Move> = (plan.moves.iter())
             .filter(|m| m.motion == Motion::Feed)
             .collect();
-        for ((infeed, angle, top, carriage), m) in threads.iter().zip(&feeds) {
-            // The infeed is the plan's, in from the touch on the Ø40 blank.
-            close(*infeed, mm(20. - m.to[0]));
+        let n = threads.len();
+        for (k, ((infeed, angle, top, carriage), m)) in threads.iter().zip(&feeds).enumerate() {
             assert_eq!(*angle, 29.5);
-            close(top.distance, mm(top_travel(*infeed, 29.5)));
+            if k + 1 < n {
+                // The infeed is the plan's, in from the touch on the Ø40
+                // blank.
+                close(*infeed, mm(20. - m.to[0]));
+                close(top.distance, mm(top_travel(*infeed, 29.5)));
+            }
             // The half-nuts stay closed to the thread's end at −40: 39 from
             // the faced end.
             close(carriage.distance, 39.);
             reads(carriage, 1, 19.);
         }
         // Pass 3: 0.560 in, 0.643 along the slide, 0.64 on its dial of
-        // 0.02s; the last 0.915 in, 1.051, 1.06.
+        // 0.02s.
         close(threads[2].0, 0.56);
         reads(threads[2].2, 0, 0.64);
-        close(threads[7].0, 0.915);
-        reads(threads[7].2, 0, 1.06);
+        // The last: 0.915 in is 1.0513 along the slide. Rounded to the
+        // nearest 0.02 it would be 1.06, 0.007 deeper than the thread; it is
+        // set at 1.04, 0.905 in, and the nut and a spring pass finish it.
+        close(threads[7].2.distance, 1.04);
+        reads(threads[7].2, 0, 1.04);
+        close(threads[7].0, 0.905);
+        assert!(threads[7].0 <= 0.915 + 1e-6);
+        // The readings never go back from one pass to the next.
+        let set: Vec<f32> = threads
+            .iter()
+            .map(|t| t.2.reading.clone().unwrap().1)
+            .collect();
+        assert!(set.windows(2).all(|w| w[1] >= w[0] - 1e-6), "{set:?}");
+        assert_eq!(
+            set.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>(),
+            [
+                "0.38", "0.52", "0.64", "0.74", "0.84", "0.92", "0.98", "1.04"
+            ]
+        );
+    }
+    #[test]
+    fn a_thread_never_goes_past_its_last_reading() {
+        // In 30 passes the last few are less than a division apart: none is
+        // set past the last, which is set below its travel, and the
+        // readings never go back.
+        let (mut doc, mesh) = sample("Diameter");
+        doc.setups[0].operations[4]
+            .p
+            .insert("passes".into(), "30".into());
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let set: Vec<f32> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::ThreadPass { top, .. } => Some(top.reading.clone().unwrap().1),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(set.len(), 30);
+        close(*set.last().unwrap(), 1.04);
+        assert!(set.iter().all(|r| *r <= 1.04 + 1e-6), "{set:?}");
+        assert!(set.windows(2).all(|w| w[1] >= w[0] - 1e-6), "{set:?}");
     }
     #[test]
     fn a_chamfer_feeds_the_top_slide_and_a_shoulder_one_reads_the_carriage() {

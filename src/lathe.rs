@@ -279,6 +279,27 @@ pub fn reads(m: &Machine, slide: Slide, reading: f32, out: bool) -> Option<f32> 
     let k = (reading as f64 / division).round() as u64 % div;
     Some((((div - k) % div) as f64 * division) as f32)
 }
+/// `distance` rounded down to the `slide`'s division (in the user's terms,
+/// as `dial` takes it): the farthest a dial can be set without going past
+/// it. `distance` itself when the dial is not usable.
+pub fn floor(m: &Machine, slide: Slide, distance: f32) -> f32 {
+    let (turn_key, div_key) = slide.keys();
+    let turn = num(&m.p, turn_key).filter(|v| *v > 0.);
+    let div = num(&m.p, div_key).filter(|v| *v >= 1. && v.fract() == 0.);
+    let per = match (slide, cross_reads(m)) {
+        (Slide::Cross, Some("Radius")) => 2.,
+        _ => 1.,
+    };
+    match (turn, div) {
+        (Some(turn), Some(div)) => {
+            let step = turn as f64 / div as f64 * per;
+            // A ten-thousandth of a division over, f32 noise, still counts.
+            ((distance as f64 / step + 1e-4).floor() * step) as f32
+        }
+        _ => distance,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +487,16 @@ mod tests {
         assert!(near(reads(&m, Slide::Top, 0.64, true).unwrap(), 1.36));
         with(&mut m, "top_div", "0");
         assert_eq!(reads(&m, Slide::Top, 0.64, true), None);
+    }
+    #[test]
+    fn floor_never_goes_past_the_distance() {
+        let mut m = defaults();
+        // The top slide's 0.02s: 1.0513 is set at 1.04, never 1.06.
+        assert!(near(floor(&m, Slide::Top, 1.0513), 1.04));
+        assert!(near(floor(&m, Slide::Top, 1.04), 1.04));
+        // A radius cross dial's division is 0.08 off the diameter.
+        with(&mut m, "cross_reads", "Radius");
+        assert!(near(floor(&m, Slide::Cross, 1.0), 0.96));
     }
     #[test]
     fn a_negative_or_unusable_distance_or_dial_is_refused() {

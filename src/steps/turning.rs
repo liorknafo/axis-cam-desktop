@@ -2146,15 +2146,19 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 ACCENT,
                 Align::Center,
             ));
-            let left = column![
+            let mut left = column![
                 view(bar, marks, 380.),
                 note(format!(
                     "gearbox {} · half-nuts stay closed: back the tool out, reverse the spindle to come back",
                     mm(*pitch)
                 ))
             ]
-            .spacing(4)
-            .into();
+            .spacing(4);
+            if index == of {
+                // The last pass is set short of the depth, never past it.
+                left = left.push(chips(vec![warn_chip("try the nut, then a spring pass")]));
+            }
+            let left = left.into();
             let t = reading(p, top);
             let right = column![
                 chips(vec![
