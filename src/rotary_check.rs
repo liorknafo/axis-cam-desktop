@@ -18,10 +18,7 @@ use crate::chuck::{InSpindle, Rig, ToolParts};
 use crate::holding::{Hit, message, plane_message};
 use crate::indexed::{angles, degrees, is_indexed};
 use crate::mesh::Mesh;
-use crate::model::{
-    Document, HOLDER_LENGTH, Machine, NOSE_DEFAULT, POST_RETRACT, RotaryUnit, get, num,
-    post_setting,
-};
+use crate::model::{Document, HOLDER_LENGTH, Machine, NOSE_DEFAULT, RotaryUnit, get, num};
 use crate::post::Held;
 use crate::post_check::machine_mm;
 use crate::simulation::{Motion, Plan, Simulation};
@@ -901,8 +898,11 @@ pub fn held(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Result<Vec<H
         gap,
         blend: crate::post::blend(m),
         datum: at.zero,
-        // Machine Z 0, the top of the Z travel, in the setup's frame.
-        home: (post_setting(&m.p, "post_retract") == POST_RETRACT[0])
+        // Machine Z 0, the top of the Z travel, in the setup's frame, when
+        // the programs retract there: the settings they are made with, a
+        // run's or export's (LIO-212).
+        home: crate::post::PostSettings::for_holding(m)
+            .is_ok_and(|s| s.machine_home)
             .then(|| at.machine_zero.map_or(f32::INFINITY, |z| at.zero[2] - z[2])),
     };
     for problem in walk.collisions(name, setup, &sims, a_before(doc, si)) {
@@ -911,6 +911,117 @@ pub fn held(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Result<Vec<H
         }
     }
     Ok(found)
+}
+
+/// What the way a run takes from wherever the machine is into a setup in
+/// the chuck is checked against when Cycle Start is pressed (LIO-212,
+/// `run::way_in_problems`): the chuck round the stock the setup starts
+/// from, each operation's tool in the spindle (by its index in the
+/// program) and what of it is assumed, and the setup's gap, to which the
+/// machine's blend tolerance is added.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chuck {
+    pub rig: Rig,
+    pub tools: Vec<(InSpindle, String)>,
+    pub gap: f32,
+    pub blend: f32,
+}
+
+/// The `Chuck` of setup `si`, indexed or not, whose operations `ops` (index
+/// in the setup, plan) make a program; `held` is the stock a setup that is
+/// not indexed grips (`post::gripped`). None for a setup not in the chuck;
+/// why it cannot be modelled otherwise.
+pub fn chuck(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    held: crate::mesh::Bounds,
+    ops: &[(usize, &Plan)],
+    blend: f32,
+) -> Result<Option<Chuck>, String> {
+    let setup = &doc.setups[si];
+    let (clamped, stock) = match doc.index_base(si) {
+        Some(base) => (
+            &doc.setups[base],
+            doc.setup_stock(base, Some(mesh)).ok_or(
+                "The stock the setup starts from is not known: check the first setup's stock.",
+            )?,
+        ),
+        None => (setup, held),
+    };
+    if !crate::chuck::holds(clamped) {
+        return Ok(None);
+    }
+    let rig = doc.chuck_rig(clamped, stock)?;
+    let tools = ops
+        .iter()
+        .map(|(oi, plan)| in_spindle(doc, &setup.operations[*oi].tool, plan, Some(rig.unit)))
+        .collect();
+    Ok(Some(Chuck {
+        rig,
+        tools,
+        gap: crate::holding::gap(clamped)?,
+        blend,
+    }))
+}
+
+impl Chuck {
+    /// Why a run cannot take operation `op`'s tool along `moves` (from, to
+    /// and the A at each end, commanded, in the setup's frame): its way in
+    /// from where the machine is. Each move is checked at the A it is made
+    /// at against the chuck, its jaws, the rotary head, the tailstock and
+    /// the stock gripped in the jaws; across, also against the whole stock
+    /// the setup starts from at that A; while A turns, against all that the
+    /// turn sweeps, the stock included. Straight up from where the tool is,
+    /// and down onto the first point, the free stock is not counted: the
+    /// tool is in it or over it there. Heights said in work coordinates
+    /// (`datum`, the work zero in the setup's frame).
+    pub fn way_in(
+        &self,
+        op: usize,
+        moves: &[([f32; 3], [f32; 3], f32, f32)],
+        datum: [f32; 3],
+    ) -> Vec<String> {
+        let Some((tool, assumed)) = self.tools.get(op) else {
+            return vec![];
+        };
+        let reach = self.gap + self.blend;
+        let mut out = vec![];
+        for &(from, to, a, b) in moves {
+            let segment = [(from, to)];
+            let (hits, what) = if (b - a).abs() > 1e-4 {
+                (
+                    self.rig.hits_turning(a, b, &segment, *tool, reach),
+                    format!("while A turns from A {}° to A {}°", degrees(a), degrees(b)),
+                )
+            } else if from[..2] != to[..2] {
+                (
+                    self.rig.hits_turning(a, a, &segment, *tool, reach),
+                    format!("on the way across at A {}°", degrees(a)),
+                )
+            } else {
+                let way = if to[2] > from[2] { "up" } else { "down" };
+                (
+                    self.rig.hits_at(a, &segment, *tool, reach),
+                    format!("on the way {way} at A {}°", degrees(a)),
+                )
+            };
+            if let Some(hit) = hits.first() {
+                let at = |k: usize| mm(hit.at[k] - datum[k]);
+                out.push(format!(
+                    "From where the machine is, Cycle Start would bring the {} within the {} mm gap of the {} {what}, at X{} Y{} Z{}.{} The way in goes up to the retract height, across, turns A and comes down: jog the tool and A to where that way is clear first.",
+                    hit.part,
+                    mm(self.gap),
+                    hit.label,
+                    at(0),
+                    at(1),
+                    at(2),
+                    if hit.part == "tool" { "" } else { assumed },
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// What the tool's way through an indexed setup is checked against.
