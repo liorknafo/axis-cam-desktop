@@ -10,12 +10,18 @@
 //! holder's column, as for a vise) are kept clear of the chuck, its jaws, the
 //! rotary head and the tailstock at each angle's cuts, during the index
 //! moves and between operations, and of the bar's top where the holder
-//! comes down onto it.
-use crate::chuck::Rig;
+//! comes down onto it. The spindle above the holder is as wide as the
+//! machine's spindle nose and starts the holder's length over the tool's
+//! stick-out (`chuck::InSpindle`, LIO-204); a tool without a holder length
+//! or a machine without a spindle nose takes an assumed one, and says so.
+use crate::chuck::{InSpindle, Rig, ToolParts};
 use crate::holding::{Hit, message, plane_message};
 use crate::indexed::{angles, degrees, is_indexed};
 use crate::mesh::Mesh;
-use crate::model::{Document, Machine, POST_RETRACT, get, num, post_setting};
+use crate::model::{
+    Document, HOLDER_LENGTH, Machine, NOSE_DEFAULT, POST_RETRACT, RotaryUnit, Setup, get, num,
+    post_setting,
+};
 use crate::post::Held;
 use crate::post_check::machine_mm;
 use crate::simulation::{Motion, Plan, Simulation};
@@ -37,6 +43,49 @@ fn mm(v: f32) -> String {
         "-0" => "0".into(),
         t => t.into(),
     }
+}
+
+/// The tool of operation `oi` of `setup`, whose plan is `plan`, in the
+/// spindle of `unit` (LIO-204); and what of it is assumed, as a sentence
+/// ending a message ("" when nothing is).
+pub(crate) fn in_spindle(
+    doc: &Document,
+    setup: &Setup,
+    oi: usize,
+    plan: &Plan,
+    unit: Option<RotaryUnit>,
+) -> (InSpindle, String) {
+    let id = &setup.operations[oi].tool;
+    let (holder_length, holder_assumed) = (doc.tools.iter().find(|t| &t.id == id))
+        .map_or((HOLDER_LENGTH, true), crate::model::Tool::holder_length);
+    let (nose, nose_assumed) = unit.map_or((NOSE_DEFAULT[0], true), |u| {
+        (u.nose_diameter, u.nose_assumed)
+    });
+    let mut assumed = vec![];
+    if holder_assumed {
+        assumed.push(format!(
+            "the holder's {} mm length (the tool gives none: enter it in the Tool library)",
+            mm(holder_length)
+        ));
+    }
+    if nose_assumed {
+        assumed.push(format!(
+            "the spindle nose's Ø{} mm (the machine gives none: enter it in the Machine library)",
+            mm(nose)
+        ));
+    }
+    let tool = InSpindle {
+        radius: plan.radius,
+        stickout: plan.tool_length,
+        holder_radius: plan.holder_radius,
+        holder_length,
+        nose_radius: nose / 2.,
+    };
+    let note = match assumed.is_empty() {
+        true => String::new(),
+        false => format!(" Assumed: {}.", assumed.join(" and ")),
+    };
+    (tool, note)
 }
 
 /// The stock an indexed setup's clamping starts from, as A turns it: its
@@ -95,6 +144,20 @@ impl Bar {
         let d = (near - r).max(0.);
         (d < self.radius).then(|| self.axis[1] + (self.radius.powi(2) - d.powi(2)).sqrt())
     }
+}
+
+/// A part over the tool (the holder or the spindle nose) coming down onto
+/// the bar: how much it needs lifting to keep the gap off the bar's top,
+/// which part, its height over the tip, the A, the bar's top under it, the
+/// cut's bottom and the tip there.
+struct Onto {
+    need: f32,
+    part: &'static str,
+    low: f32,
+    a: f32,
+    top: f32,
+    bottom: f32,
+    tip: [f32; 3],
 }
 
 /// The limits one machine axis is checked against: what they are, low, high.
@@ -161,7 +224,9 @@ fn a_before(doc: &Document, si: usize) -> f32 {
 /// outside the machine's A range or the profile's, a cut below the reach of
 /// the Z travel, a retract above it, an index move inside what A swings, the
 /// holder brought down onto the bar, and too little room over the stock to
-/// turn A at all. Each with the index of its operation in the setup (None
+/// turn A at all; the holder and the spindle nose above it as the tool's
+/// stick-out and holder length place them (`in_spindle`). Each with the
+/// index of its operation in the setup (None
 /// for the setup's), named by the setup, the A angle and the operation.
 /// Empty for a setup that is not indexed.
 pub fn problems(
@@ -250,6 +315,7 @@ pub fn problems(
     {
         let op = setup.operations[oi].name();
         let plan = &sim.plan;
+        let (tool, assumed) = in_spindle(doc, setup, oi, plan, unit);
         // Per axis the least and the most, with the A they are at.
         let mut low = [(f32::INFINITY, 0.); 4];
         let mut high = [(f32::NEG_INFINITY, 0.); 4];
@@ -261,7 +327,8 @@ pub fn problems(
                 high[k] = (v, a);
             }
         };
-        let mut holder = None;
+        // The part above the tool that most needs lifting off the bar's top.
+        let mut onto: Option<Onto> = None;
         let mut index = None;
         for m in &plan.moves {
             let a = m.a.unwrap_or(a_now);
@@ -283,21 +350,29 @@ pub fn problems(
                 continue;
             }
             a_now = a;
-            if holder.is_some() || m.motion == Motion::Dwell {
+            if m.motion == Motion::Dwell {
                 continue;
             }
             let bottom = m.from[2].min(m.to[2]);
-            if let Some(top) = bar
-                .as_ref()
-                .and_then(|b| b.top_under(m.from, m.to, plan.holder_radius + gap))
-                && bottom + plan.tool_length < top + gap - 1e-3
-            {
-                holder = Some((
-                    a,
-                    top,
-                    bottom,
-                    if m.from[2] <= m.to[2] { m.from } else { m.to },
-                ));
+            // The holder and the spindle nose, not the cutter.
+            for (part, r, low, _) in tool.parts().into_iter().skip(1) {
+                if let Some(top) = bar
+                    .as_ref()
+                    .and_then(|b| b.top_under(m.from, m.to, r + gap))
+                    && let need = top + gap - (bottom + low)
+                    && need > 1e-3
+                    && onto.as_ref().is_none_or(|o| need > o.need)
+                {
+                    onto = Some(Onto {
+                        need,
+                        part,
+                        low,
+                        a,
+                        top,
+                        bottom,
+                        tip: if m.from[2] <= m.to[2] { m.from } else { m.to },
+                    });
+                }
             }
         }
         let say = |a: f32, what: String| {
@@ -369,23 +444,70 @@ pub fn problems(
                 mm(s.radius),
             )));
         }
-        if let Some((a, top, bottom, p)) = holder {
-            let over = bottom + plan.tool_length - top;
-            let left = match over < 0. {
-                true => format!("{} mm into it", mm(-over)),
-                false => format!(
-                    "only {} mm over it, inside the {} mm gap",
-                    mm(over),
-                    mm(gap)
-                ),
-            };
-            out.push(say(a, format!(
-                "the holder, and the spindle above it, would come down onto the {words} at X{} Y{}: the cut goes {} mm below the bar's top there, and the tool's {} mm stick-out leaves the holder {left}. Use a longer stick-out or a shallower cut.",
+        if let Some(Onto {
+            need,
+            part,
+            low,
+            a,
+            top,
+            bottom,
+            tip: p,
+        }) = onto
+        {
+            // How far over the bar's top the part's bottom is at the cut's.
+            let over = bottom + low - top;
+            let place = format!(
+                "would come down onto the {words} at X{} Y{}: the cut goes {} mm below the bar's top there",
                 mm(p[0] - at.zero[0]),
                 mm(p[1] - at.zero[1]),
                 mm(top - bottom),
-                mm(plan.tool_length),
-            )));
+            );
+            // Where the holder ends and how wide the nose is matter only
+            // to the nose.
+            let fix = format!(
+                "The tool needs {} mm more stick-out{}, or a shallower cut.{}",
+                mm(need),
+                if part == "holder" {
+                    ""
+                } else {
+                    " (or a longer holder)"
+                },
+                if part == "holder" {
+                    ""
+                } else {
+                    assumed.as_str()
+                },
+            );
+            let line = match part {
+                "holder" => format!(
+                    "the holder {place}, and the tool's {} mm stick-out leaves the holder {}. {fix}",
+                    mm(plan.tool_length),
+                    match over < 0. {
+                        true => format!("{} mm into it", mm(-over)),
+                        false => format!(
+                            "only {} mm over it, inside the {} mm gap",
+                            mm(over),
+                            mm(gap)
+                        ),
+                    },
+                ),
+                _ => format!(
+                    "the spindle nose (Ø{} mm) {place}, and the nose is {} mm over the tip (the tool's {} mm stick-out and the holder's {} mm), so {}. {fix}",
+                    mm(2. * tool.nose_radius),
+                    mm(low),
+                    mm(plan.tool_length),
+                    mm(tool.holder_length),
+                    match over < 0. {
+                        true => format!("it hits the bar {} mm before the cut's bottom", mm(-over)),
+                        false => format!(
+                            "at the cut's bottom it is only {} mm over the bar, inside the {} mm gap",
+                            mm(over),
+                            mm(gap)
+                        ),
+                    },
+                ),
+            };
+            out.push(say(a, line));
         }
     }
     out
@@ -475,8 +597,13 @@ pub fn held(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Result<Vec<H
         }
     }
     let m = &clamped.machine;
+    let tools = sims
+        .iter()
+        .map(|(oi, sim)| (*oi, in_spindle(doc, setup, *oi, &sim.plan, Some(rig.unit))))
+        .collect();
     let walk = Walk {
         rig: &rig,
+        tools,
         gap,
         blend: crate::post::blend(m),
         datum: at.zero,
@@ -495,6 +622,9 @@ pub fn held(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Result<Vec<H
 /// What the tool's way through an indexed setup is checked against.
 struct Walk<'a> {
     rig: &'a Rig,
+    /// Each operation's tool in the spindle and what of it is assumed
+    /// (`in_spindle`), by its index in the setup.
+    tools: std::collections::HashMap<usize, (InSpindle, String)>,
     gap: f32,
     blend: f32,
     /// The work zero in the setup's frame, for the messages.
@@ -504,9 +634,17 @@ struct Walk<'a> {
     home: Option<f32>,
 }
 impl Walk<'_> {
-    fn hits_at(&self, a: f32, segments: &[([f32; 3], [f32; 3])], plan: &Plan) -> Vec<Hit> {
-        let tool = (plan.radius, plan.tool_length, plan.holder_radius);
-        self.rig.hits_at(a, segments, tool, self.gap + self.blend)
+    fn hits_at(&self, a: f32, segments: &[([f32; 3], [f32; 3])], oi: usize) -> Vec<Hit> {
+        self.rig
+            .hits_at(a, segments, self.tools[&oi].0, self.gap + self.blend)
+    }
+    /// What of operation `oi`'s tool is assumed, ending a message about a
+    /// hit by `part`: nothing when the cutter itself hits.
+    fn assumed(&self, oi: usize, part: &str) -> &str {
+        match part {
+            "tool" => "",
+            _ => &self.tools[&oi].1,
+        }
     }
     /// One problem per operation, kind of move, box and part of the tool.
     fn collisions(
@@ -519,13 +657,14 @@ impl Walk<'_> {
         // (operation, kind of move, hit, message), the first of each kept.
         let mut hits: Vec<(usize, &str, Hit, String)> = vec![];
         let mut planes = vec![];
-        let cut = |a: f32, op: &str, hit: &Hit| {
-            message(
+        let cut = |a: f32, oi: usize, op: &str, hit: &Hit| {
+            let said = message(
                 &format!("{name} at A {}°, {op}", degrees(a)),
                 hit,
                 self.gap,
                 self.datum,
-            )
+            );
+            format!("{said}{}", self.assumed(oi, hit.part))
         };
         let (mut a_now, mut tip): (f32, Option<[f32; 3]>) = (start, None);
         let last = sims.len().saturating_sub(1);
@@ -573,8 +712,8 @@ impl Walk<'_> {
                     vec![]
                 }
             };
-            for hit in self.hits_at(a_now, &way, plan) {
-                let message = cut(a_now, op, &hit);
+            for hit in self.hits_at(a_now, &way, oi) {
+                let message = cut(a_now, oi, op, &hit);
                 hits.push((oi, "way", hit, message));
             }
             // The moves, a run of them at each angle, and each turn of A.
@@ -583,7 +722,7 @@ impl Walk<'_> {
             while let Some(m) = moves.next() {
                 let a = m.a.unwrap_or(a_now);
                 if m.motion == Motion::Index || (a - a_now).abs() > 1e-4 {
-                    let tool = (plan.radius, plan.tool_length, plan.holder_radius);
+                    let tool = self.tools[&oi].0;
                     let turn = [(m.from, m.to)];
                     for hit in self
                         .rig
@@ -591,7 +730,7 @@ impl Walk<'_> {
                     {
                         let at = |k: usize| mm(hit.at[k] - self.datum[k]);
                         let message = format!(
-                            "{name}, {op}: the index move from A {}° to A {}° brings the {} within the {} mm gap of the {} at X{} Y{} Z{}.",
+                            "{name}, {op}: the index move from A {}° to A {}° brings the {} within the {} mm gap of the {} at X{} Y{} Z{}.{}",
                             degrees(a_now),
                             degrees(a),
                             hit.part,
@@ -600,6 +739,7 @@ impl Walk<'_> {
                             at(0),
                             at(1),
                             at(2),
+                            self.assumed(oi, hit.part),
                         );
                         hits.push((oi, "index", hit, message));
                     }
@@ -614,8 +754,8 @@ impl Walk<'_> {
                     next.motion == Motion::Index || next.a.is_some_and(|b| (b - a_now).abs() > 1e-4)
                 });
                 if ends {
-                    for hit in self.hits_at(a_now, &run, plan) {
-                        let message = cut(a_now, op, &hit);
+                    for hit in self.hits_at(a_now, &run, oi) {
+                        let message = cut(a_now, oi, op, &hit);
                         hits.push((oi, "cut", hit, message));
                     }
                     run.clear();
@@ -626,8 +766,8 @@ impl Walk<'_> {
             if n == last
                 && let (Some(end), Some(h)) = (tip, self.home)
             {
-                for hit in self.hits_at(a_now, &[(end, [end[0], end[1], h])], plan) {
-                    let message = cut(a_now, op, &hit);
+                for hit in self.hits_at(a_now, &[(end, [end[0], end[1], h])], oi) {
+                    let message = cut(a_now, oi, op, &hit);
                     hits.push((oi, "way", hit, message));
                 }
             }
@@ -859,30 +999,139 @@ mod tests {
         // The tool is 50 mm out of its holder and the gap is 2 mm; the Ø40
         // bar's top is at Z 40.
         let (doc, mesh, sim) = job("-150", "90");
-        let into = "the cut goes 50.01 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder 0.01 mm into it.";
-        let near = "the cut goes 48.01 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder only 1.99 mm over it, inside the 2 mm gap.";
+        let into = "the cut goes 50.01 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder 0.01 mm into it. The tool needs 2.01 mm more stick-out, or a shallower cut.";
+        let near = "the cut goes 48.01 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder only 1.99 mm over it, inside the 2 mm gap. The tool needs 0.01 mm more stick-out, or a shallower cut.";
         for (deep, refused) in [(50.01, Some(into)), (48.01, Some(near)), (47.99, None)] {
             let (from, to) = ([0., 0., 60.], [10., 0., 40. - deep]);
             let said = found(&doc, &mesh, with(&sim, &[(from, to, Motion::Feed, 90.)]));
             match refused {
                 Some(words) => {
                     assert_eq!(said.len(), 1, "{said:?}");
-                    let start = "Flats at A 90°, Contour: the holder, and the spindle above it, would come down onto the Ø40 mm bar at X-50 Y0: ";
-                    assert!(said[0].starts_with(&format!("{start}{words}")), "{said:?}");
+                    let start = "Flats at A 90°, Contour: the holder would come down onto the Ø40 mm bar at X-50 Y0: ";
+                    assert_eq!(said[0], format!("{start}{words}"));
                 }
                 None => assert!(said.is_empty(), "{said:?}"),
             }
         }
-        // Beside the bar, past the holder's reach and the gap, it is clear.
-        let r = sim.plan.holder_radius;
-        let beside = [0., 20. + r + 2.01, -20.];
-        assert!(
-            found(
+        // Beside the bar, past the spindle nose's reach (Ø65, the wider)
+        // and the gap, it is clear; inside it, the nose comes down onto it.
+        let r = 65. / 2.;
+        for (y, clear) in [(20. + r + 2.01, true), (20. + r + 1.99, false)] {
+            let beside = [0., y, -40.];
+            let said = found(
                 &doc,
                 &mesh,
-                with(&sim, &[(beside, beside, Motion::Feed, 90.)])
-            )
-            .is_empty()
+                with(&sim, &[(beside, beside, Motion::Feed, 90.)]),
+            );
+            match clear {
+                true => assert!(said.is_empty(), "{said:?}"),
+                false => assert!(
+                    said.len() == 1
+                        && said[0].contains(
+                            ": the spindle nose (Ø65 mm) would come down onto the Ø40 mm bar"
+                        ),
+                    "{said:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_out_of_the_holders_reach_is_reachable_with_more_stick_out() {
+        // A plunge over the bar's axis 55 mm under its top (Z 40): with 50
+        // mm of stick-out the holder comes 5 mm into the bar, 7 with the
+        // gap; with 7.01 mm more it is clear, the nose 10 mm higher still.
+        let (doc, mesh, sim) = job("-150", "90");
+        let plunge = |stickout: f32| {
+            let mut sim = with(
+                &sim,
+                &[([10., 0., 60.], [10., 0., -15.], Motion::Feed, 90.)],
+            );
+            sim.plan.tool_length = stickout;
+            found(&doc, &mesh, sim)
+        };
+        let said = plunge(50.);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].ends_with("the cut goes 55 mm below the bar's top there, and the tool's 50 mm stick-out leaves the holder 5 mm into it. The tool needs 7 mm more stick-out, or a shallower cut."),
+            "{said:?}"
+        );
+        let said = plunge(56.99);
+        assert!(
+            said.len() == 1
+                && said[0].ends_with("The tool needs 0.01 mm more stick-out, or a shallower cut."),
+            "{said:?}"
+        );
+        assert!(plunge(57.01).is_empty(), "{:?}", plunge(57.01));
+    }
+
+    #[test]
+    fn the_spindle_nose_coming_down_onto_the_bar_is_refused_on_both_sides() {
+        // A Ø10 holder 10 mm long (given), 50 mm of stick-out: the nose is
+        // 60 mm over the tip. A plunge 27 mm beside the bar's axis keeps
+        // the holder (5 + 2 mm of gap) off the Ø40 bar, not the Ø65 nose.
+        let (mut doc, mesh, sim) = job("-150", "90");
+        doc.tools[0].p.insert("holder_length".into(), "10".into());
+        let plunge_at = |doc: &Document, y: f32, bottom: f32| {
+            let mut sim = with(
+                &sim,
+                &[([10., y, 80.], [10., y, bottom], Motion::Feed, 90.)],
+            );
+            sim.plan.holder_radius = 5.;
+            found(doc, &mesh, sim)
+        };
+        let plunge = |doc: &Document, bottom: f32| plunge_at(doc, 27., bottom);
+        let start = "Flats at A 90°, Contour: the spindle nose (Ø65 mm) would come down onto the Ø40 mm bar at X-50 Y27: the cut goes ";
+        for (bottom, refused) in [
+            (
+                -20.01,
+                Some(
+                    "60.01 mm below the bar's top there, and the nose is 60 mm over the tip (the tool's 50 mm stick-out and the holder's 10 mm), so it hits the bar 0.01 mm before the cut's bottom. The tool needs 2.01 mm more stick-out (or a longer holder), or a shallower cut.",
+                ),
+            ),
+            (
+                -18.01,
+                Some(
+                    "58.01 mm below the bar's top there, and the nose is 60 mm over the tip (the tool's 50 mm stick-out and the holder's 10 mm), so at the cut's bottom it is only 1.99 mm over the bar, inside the 2 mm gap. The tool needs 0.01 mm more stick-out (or a longer holder), or a shallower cut.",
+                ),
+            ),
+            (-17.99, None),
+        ] {
+            let said = plunge(&doc, bottom);
+            match refused {
+                Some(words) => {
+                    assert_eq!(said.len(), 1, "{said:?}");
+                    assert_eq!(said[0], format!("{start}{words}"));
+                }
+                None => assert!(said.is_empty(), "{bottom}: {said:?}"),
+            }
+        }
+        // A longer holder lifts the nose by as much.
+        doc.tools[0]
+            .p
+            .insert("holder_length".into(), "12.02".into());
+        assert!(plunge(&doc, -20.01).is_empty());
+        // A tool without a holder length takes 10 mm, a machine without a
+        // spindle nose Ø65: both said to be assumed.
+        doc.tools[0].p.remove("holder_length");
+        for s in &mut doc.setups {
+            s.machine.p.remove("a_nose_diameter");
+        }
+        let said = plunge(&doc, -18.01);
+        assert!(
+            said.len() == 1 && said[0].ends_with("or a shallower cut. Assumed: the holder's 10 mm length (the tool gives none: enter it in the Tool library) and the spindle nose's Ø65 mm (the machine gives none: enter it in the Machine library)."),
+            "{said:?}"
+        );
+        // A wider nose reaches the bar from farther off: 55 mm beside its
+        // axis, past the Ø65 nose and the gap, the Ø80 one is over it.
+        assert!(plunge_at(&doc, 55., -30.).is_empty());
+        for s in &mut doc.setups {
+            s.machine.p.insert("a_nose_diameter".into(), "80".into());
+        }
+        let said = plunge_at(&doc, 55., -30.);
+        assert!(
+            said.len() == 1 && said[0].contains("the spindle nose (Ø80 mm)"),
+            "{said:?}"
         );
     }
 
@@ -1041,6 +1290,52 @@ mod tests {
             said.iter().any(|s| s.starts_with("Flats, Contour: the index move from A 0° to A 90° brings the tool within the 2 mm gap of the chuck jaw")),
             "{said:?}"
         );
+    }
+
+    #[test]
+    fn a_chuck_setup_at_a0_keeps_the_spindle_nose_off_the_jaws() {
+        // Setup 1 cuts the bar in the chuck at A0, with the contour's tool
+        // (50 mm out of a Ø32 holder, the holder 10 mm long, assumed): the
+        // Ø65 nose is 60 mm over the tip. A plunge to Z10 beside jaw 1's
+        // front (it stands up to Z75 at A0) brings the nose, not the tool
+        // or the holder, within the 2 mm gap of it.
+        let (mut doc, mesh, _) = job("-150", "90");
+        doc.tools[0].p.insert("number".into(), "1".into());
+        doc.setups[0].operations = doc.setups[1].operations.clone();
+        let sim = prepare(&doc, &mesh, 0, 0).unwrap();
+        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+        let jaw = rig
+            .boxes(0.)
+            .into_iter()
+            .find(|b| b.label == "chuck jaw 1")
+            .unwrap();
+        assert!((jaw.bounds.max[2] - 75.).abs() < 0.1, "{:?}", jaw.bounds);
+        let front = jaw.bounds.max[0];
+        // The gap and the machine's 0.01 mm blend.
+        for (x, hit) in [(front + 32.5 + 2.02, false), (front + 32.5 + 2., true)] {
+            let (high, low) = ([x, 0., 150.], [x, 0., 10.]);
+            let said: Vec<String> = crate::post::held(
+                &doc,
+                &mesh,
+                0,
+                &[(0, Ok(with(&sim, &[(high, low, Motion::Feed, 0.)])))],
+            )
+            .into_iter()
+            .map(|h| h.message)
+            .collect();
+            assert!(
+                !said
+                    .iter()
+                    .any(|s| s.contains("the tool hits") || s.contains("the holder hits")),
+                "{said:?}"
+            );
+            let nose = said.iter().any(|s| {
+                s.starts_with("Contour: the spindle nose hits the chuck jaw 1 at ")
+                    && s.ends_with("(within the 2 mm gap). Assumed: the holder's 10 mm length (the tool gives none: enter it in the Tool library).")
+            });
+            assert_eq!(nose, hit, "{said:?}");
+        }
     }
 
     #[test]

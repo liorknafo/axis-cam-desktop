@@ -17,7 +17,8 @@ const TABLE: [f32; 2] = [530., 320.];
 const BEAM_CLEARANCE: f32 = 70.;
 /// Table top to the tool tip at Z top, with the nominal tool.
 const TIP_HEIGHT: f32 = 60.;
-/// Spindle body diameter and length.
+/// Spindle body diameter and length, without a rotary unit (with one, its
+/// machine's spindle nose, `model::NOSE_DEFAULT` assumed).
 const SPINDLE: [f32; 2] = [65., 185.];
 /// Nominal tool: diameter and length below the collet nut.
 const TOOL: [f32; 2] = [6., 30.];
@@ -219,7 +220,11 @@ fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f3
     });
     let tx = [(TRAVEL[0] - TABLE[0]) / 2., (TRAVEL[0] + TABLE[0]) / 2.];
     let ty = [(TRAVEL[1] - TABLE[1]) / 2., (TRAVEL[1] + TABLE[1]) / 2.];
-    let r = SPINDLE[0] / 2.;
+    // On a machine with A, the spindle its rotary checks take (LIO-204).
+    let spindle = rotary.map_or(SPINDLE, |rig| {
+        [rig.unit.nose_diameter, rig.unit.nose_length]
+    });
+    let r = spindle[0] / 2.;
     let nose = z + TOOL[1] + 14.;
     // The gantry: spindle in front (toward the operator, −Y), then the Z
     // plate, the X carriage and the beam behind it.
@@ -308,7 +313,7 @@ fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f3
     boxed(
         &mut f,
         [x - 50., y + r, nose + 25.],
-        [x + 50., y + r + 15., nose + SPINDLE[1] + 15.],
+        [x + 50., y + r + 15., nose + spindle[1] + 15.],
         moving(rgb(110, 122, 136)),
         2,
         "z plate",
@@ -317,7 +322,7 @@ fn machine(pos: [f32; 3], known: bool, rotary: Option<&crate::chuck::Rig>, a: f3
         &mut f,
         [x, y],
         r,
-        [nose, nose + SPINDLE[1]],
+        [nose, nose + spindle[1]],
         moving(rgb(206, 210, 216)),
         "spindle",
     );

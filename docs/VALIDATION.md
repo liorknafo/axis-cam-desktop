@@ -1064,6 +1064,20 @@ The Machine library could save 4 axes but not where the rotary sits; the owner's
 - `a_setup_that_is_not_indexed_is_not_checked_here`: setup 1, the chuck at A0, gets none of these problems; every 3-axis test passes with its messages unchanged.
 - Not validated: anything on the machine; the program a post makes with A (LIO-193) must make its links between operations as checked here (straight up, across and down, or by machine Z home).
 
+## Rotary Z reach counts the stick-out and the spindle nose (LIO-204, 18 October 2026)
+
+The holder was the only part over the stick-out checked against the bar's top, and the spindle above it was taken as only as wide as the holder: the machine had no spindle nose.
+
+- `rotary_check::tests::the_holder_coming_down_onto_the_bar_is_refused_with_how_much`: the holder 0.01 mm into the Ø40 bar and 1.99 mm over it (inside the 2 mm gap) are refused, saying the tool needs 2.01 and 0.01 mm more stick-out; 47.99 mm under the top is clear. Beside the bar 0.01 mm inside the Ø65 nose's radius and the gap the nose comes down onto it; 0.01 mm outside, nothing is said.
+- `a_cut_out_of_the_holders_reach_is_reachable_with_more_stick_out`: a plunge 55 mm under the bar's top with 50 mm of stick-out puts the holder 5 mm into it ("needs 7 mm more stick-out"); 56.99 mm of stick-out is refused by 0.01 mm, 57.01 mm is clear.
+- `the_spindle_nose_coming_down_onto_the_bar_is_refused_on_both_sides`: with a Ø10 holder 10 mm long beside the bar, the Ø65 nose 60 mm over the tip hits the bar 0.01 mm before the cut's bottom, or is 1.99 mm over it inside the gap: both refused with the stick-out needed; 0.01 mm higher is clear, and so is the first with a 12.02 mm holder. Without a holder length and a spindle nose on the machine, 10 mm and Ø65 are taken and the message says both were assumed; 55 mm beside the axis an Ø80 nose reaches the bar where the Ø65 does not.
+- `chuck::tests::the_spindle_nose_is_kept_off_the_jaws_and_the_tailstock_on_both_sides`: the nose 0.01 mm inside its radius and the gap of jaw 1's front and of the tailstock body's side (at an angle and while A turns) is refused as "spindle nose", 0.01 mm outside is clear; the tool and holder alone are clear at both; a holder wider than the nose is taken as the spindle's width.
+- `rotary_check::tests::a_chuck_setup_at_a0_keeps_the_spindle_nose_off_the_jaws`: a setup that is not indexed, the bar in the chuck at A0, plunging beside jaw 1's front: within the Ø65 nose's radius, the gap and the 0.01 mm blend it is refused as "the spindle nose hits the chuck jaw 1" with the assumed holder length, 0.02 mm farther it is not; the tool and holder are never said to hit.
+- `indexed::tests::an_indexed_setups_cuts_are_checked_against_the_chuck_at_each_angle`: the contour 90 mm out of the jaws now brings the assumed nose (10 mm of holder) down beside jaw 1 and says the holder length was assumed; with a 40 mm holder it is clear.
+- `model::rotary_unit::a_machine_file_saved_before_the_spindle_nose_existed_takes_the_assumed_one` and `a_tool_without_a_holder_length_takes_a_short_assumed_one`: an old machine file loads with Ø65 × 185 mm, marked assumed, and no issues; a given nose is kept and a zero one refused; a tool without a holder length takes 10 mm, assumed, and a negative one is refused.
+- Every 3-axis test passes with its messages unchanged (the vise and clamp checks keep the holder upward without limit).
+- Not validated: anything on the machine. The Z travel check is still of the tip as the machine's Z is set for it: how much longer or shorter a tool is than the one the A centreline was probed with is not known, so it does not move the travel.
+
 ## Indexed programs: G0 A alone, A in the replay (LIO-193, 18 October 2026)
 
 The post refused every machine but a 3-axis one, refused indexed setups, and the replay read X, Y and Z only.

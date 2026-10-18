@@ -634,7 +634,8 @@ pub fn pin_boxes(on: Option<&crate::post::OnPins>, stock: Bounds) -> Vec<HoldBox
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub label: String,
-    /// "tool" (cutter and shank, tip to stickout) or "holder" (above the stickout).
+    /// "tool" (cutter and shank, tip to stickout) or "holder" (above the
+    /// stickout); on the rotary, also "spindle nose" (`chuck::InSpindle`).
     pub part: &'static str,
     /// The tip where the move, clipped to the heights at which the part can
     /// touch the box, first touches the box's footprint (the rectangle itself,
@@ -695,11 +696,13 @@ fn xy_closest(b: &Bounds, p: [f64; 2], q: [f64; 2]) -> (f64, f64) {
         .min_by(|x, y| x.0.total_cmp(&y.0))
         .unwrap_or((f64::INFINITY, 0.))
 }
-/// The parts of a tool that can touch workholding: (name, radius, lowest and
-/// highest height above the tip). The tool is a vertical cylinder of the
-/// cutter `radius` from the tip up by `stickout`, the holder one of
-/// `holder_radius` from there upward.
-fn parts(radius: f32, stickout: f32, holder_radius: f32) -> [(&'static str, f32, f32, f32); 2] {
+/// A part of a tool that can touch workholding: (name, radius, lowest and
+/// highest height above the tip), a vertical cylinder.
+pub type Part = (&'static str, f32, f32, f32);
+/// The parts of a tool that can touch workholding. The tool is a vertical
+/// cylinder of the cutter `radius` from the tip up by `stickout`, the holder
+/// one of `holder_radius` from there upward.
+pub fn parts(radius: f32, stickout: f32, holder_radius: f32) -> [Part; 2] {
     [
         ("tool", radius, 0., stickout),
         ("holder", holder_radius, stickout, f32::INFINITY),
@@ -741,9 +744,23 @@ pub fn hits_segments(
     boxes: &[HoldBox],
     gap: f32,
 ) -> Vec<Hit> {
+    hits_parts(
+        segments,
+        &parts(radius, stickout, holder_radius),
+        boxes,
+        gap,
+    )
+}
+/// `hits_segments` for a tool made of `tool`'s parts.
+pub fn hits_parts(
+    segments: &[([f32; 3], [f32; 3])],
+    tool: &[Part],
+    boxes: &[HoldBox],
+    gap: f32,
+) -> Vec<Hit> {
     let mut out = vec![];
     for b in boxes {
-        for (part, part_radius, low, high) in parts(radius, stickout, holder_radius) {
+        for &(part, part_radius, low, high) in tool {
             let reach = f64::from(part_radius) + f64::from(gap);
             let found = segments.iter().find_map(|&(from, to)| {
                 let (from, to) = (from.map(f64::from), to.map(f64::from));
