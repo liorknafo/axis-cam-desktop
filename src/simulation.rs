@@ -896,7 +896,11 @@ pub fn sequence_walk(
                     .ok_or_else(|| "Choose a saved tool.".to_string())
                     .and_then(|t| {
                         if !indexed {
-                            return generate(&setup, op, t, mesh).map(|plan| (plan, vec![]));
+                            return generate(&setup, op, t, mesh)
+                                .and_then(|plan| {
+                                    crate::indexed::enter_held(doc, si, op, mesh, plan)
+                                })
+                                .map(|plan| (plan, vec![]));
                         }
                         let start = crate::indexed::Start {
                             begin: began.as_ref(),
