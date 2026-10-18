@@ -1665,33 +1665,50 @@ pub(crate) mod tests {
                 _ => {}
             }
         }
-        let schema = schema();
-        let mut objects = 0;
-        walk(&schema, &mut objects);
-        assert_eq!(objects, 4);
-        // Every field of the Rust types is in the schema, and nothing else.
-        let (_, _, report) = block();
-        let value = serde_json::to_value(good(&report)).unwrap();
-        let fields = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-        let props = |v: &Value| {
-            v["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(fields(&value), props(&schema));
-        let setup = &schema["properties"]["setups"]["items"];
-        assert_eq!(fields(&value["setups"][0]), props(setup));
-        assert_eq!(
-            fields(&value["setups"][0]["operations"][0]),
-            props(&setup["properties"]["operations"]["items"])
-        );
-        assert_eq!(
-            setup["properties"]["orientation"]["enum"],
-            json!(["+Z", "-Z", "+X", "-X", "+Y", "-Y"])
-        );
+        // The plain schema and the one for changing a plan (with `from`).
+        for edit in [false, true] {
+            let schema = schema_for(edit);
+            let mut objects = 0;
+            walk(&schema, &mut objects);
+            assert_eq!(objects, 4);
+            // Every field of the Rust types is in the schema, and nothing else.
+            let (_, _, report) = block();
+            let mut plan = good(&report);
+            if edit {
+                for (n, setup) in plan.setups.iter_mut().enumerate() {
+                    setup.from = Some(n + 1);
+                    setup.operations.iter_mut().for_each(|o| o.from = Some(1));
+                }
+            }
+            let value = serde_json::to_value(plan).unwrap();
+            let fields = |v: &Value| {
+                let mut keys = v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys
+            };
+            let props = |v: &Value| {
+                let mut keys = v["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys
+            };
+            assert_eq!(fields(&value), props(&schema));
+            let setup = &schema["properties"]["setups"]["items"];
+            assert_eq!(fields(&value["setups"][0]), props(setup), "edit {edit}");
+            assert_eq!(
+                fields(&value["setups"][0]["operations"][0]),
+                props(&setup["properties"]["operations"]["items"]),
+                "edit {edit}"
+            );
+            assert_eq!(
+                setup["properties"]["orientation"]["enum"],
+                json!(["+Z", "-Z", "+X", "-X", "+Y", "-Y"])
+            );
+        }
     }
     #[test]
     fn a_plan_may_list_surfaces_of_coplanar_faces_a_few_microns_apart() {
@@ -2658,5 +2675,884 @@ pub(crate) mod tests {
             partial("{\"summary\": \"a  ").summary.as_deref(),
             Some("a  ")
         );
+    }
+    /// The block with the good plan built into it: the job a change starts from.
+    fn planned() -> (Document, Mesh, PartReport) {
+        let (doc, mesh, report) = block();
+        let job = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        (job, mesh, report)
+    }
+    /// The block with three setups built into it: +Z, -Z and -Y.
+    fn planned_three() -> (Document, Mesh, PartReport) {
+        let (doc, mesh, report) = block();
+        let mut plan = good(&report);
+        let mut third = side_up(&report, "-Y").setups.remove(1);
+        third.name = "Side".into();
+        plan.setups.push(third);
+        let job = build(&doc, &mesh, &report, &plan).unwrap();
+        (job, mesh, report)
+    }
+    /// What the planner is shown of `doc`, as the proposal it would answer
+    /// with when it changes nothing.
+    fn shown(doc: &Document, report: &PartReport) -> Proposal {
+        let mut plan = describe(doc, report).unwrap().current_plan;
+        plan.summary = "No change.".into();
+        plan
+    }
+    /// Whether two operations are one: same id, tool, selection and settings.
+    fn same_operation(a: &Operation, b: &Operation) -> bool {
+        a.id == b.id
+            && a.tool == b.tool
+            && a.enabled == b.enabled
+            && a.strategy == b.strategy
+            && a.geometry == b.geometry
+            && a.surfaces.as_ref().map(|s| &s.ids) == b.surfaces.as_ref().map(|s| &s.ids)
+            && a.p == b.p
+    }
+    /// The keys whose values differ between two sets of settings.
+    fn differing(a: &crate::model::Fields, b: &crate::model::Fields) -> Vec<String> {
+        let mut keys: Vec<String> = a.keys().chain(b.keys()).cloned().collect();
+        keys.sort();
+        keys.dedup();
+        keys.retain(|k| a.get(k) != b.get(k));
+        keys
+    }
+    /// The same job with its `index`th operation of setup `si` turned into
+    /// one the proposal format cannot carry.
+    fn with_adaptive(mut doc: Document, si: usize, index: usize) -> Document {
+        doc.setups[si].operations[index].strategy = Strategy::Adaptive;
+        doc
+    }
+    #[test]
+    fn describe_shows_the_current_plan_in_the_proposal_format_with_its_numbers() {
+        let (doc, _, report) = planned();
+        let current = describe(&doc, &report).unwrap();
+        assert!(current.kept_operations.is_empty());
+        let plan = &current.current_plan;
+        assert!(plan.summary.is_empty() && plan.unmachined.is_empty() && plan.warnings.is_empty());
+        assert_eq!(plan.setups.len(), 2);
+        // Setups count from 1, operations from 1 across the whole job.
+        let setup_numbers: Vec<_> = plan.setups.iter().map(|s| s.from).collect();
+        assert_eq!(setup_numbers, [Some(1), Some(2)]);
+        let op_numbers: Vec<Vec<_>> = plan
+            .setups
+            .iter()
+            .map(|s| s.operations.iter().map(|o| o.from).collect())
+            .collect();
+        assert_eq!(
+            op_numbers,
+            [
+                vec![Some(1), Some(2), Some(3), Some(4)],
+                vec![Some(5), Some(6)]
+            ]
+        );
+        let (first, second) = (&plan.setups[0], &plan.setups[1]);
+        assert_eq!(
+            (first.orientation.as_str(), first.name.as_str()),
+            ("+Z", "Top")
+        );
+        assert_eq!(first.origin, "Stock top center");
+        assert_eq!(first.holder, None);
+        assert_eq!(
+            (second.orientation.as_str(), second.name.as_str()),
+            ("-Z", "Underside")
+        );
+        assert_eq!(second.origin, "Model origin");
+        assert_eq!(
+            second.workholding,
+            "Flip about X; clamp on the machined walls."
+        );
+        let strategies: Vec<&str> = first
+            .operations
+            .iter()
+            .map(|o| o.strategy.as_str())
+            .collect();
+        assert_eq!(strategies, ["Face", "Pocket", "Contour", "Drill"]);
+        let face = &first.operations[0];
+        assert_eq!(face.name, "Face by planner");
+        let mut surfaces = ids(&report, "+Z", 0.);
+        surfaces.sort_unstable();
+        assert_eq!(face.surfaces, surfaces);
+        assert_eq!((face.tool, face.rpm, face.feed), (1, 8000., 1000.));
+        assert_eq!(face.coolant, "Flood");
+        assert_eq!(face.facing_area.as_deref(), Some("stock"));
+        assert!(face.reason.is_empty() && face.contour_mode.is_none());
+        assert_eq!(first.operations[2].contour_mode.as_deref(), Some("outside"));
+        let drill = &first.operations[3];
+        assert_eq!((drill.tool, drill.rpm), (3, 12000.));
+        assert_eq!(drill.drill_cycle.as_deref(), Some("Deep drilling"));
+        assert_eq!((drill.peck, drill.through), (Some(3.), Some(false)));
+        // A value the format has no word for reads as its neutral choice.
+        let mut odd = doc.clone();
+        odd.setups[0].operations[0]
+            .p
+            .insert("coolant".into(), "Oil".into());
+        let shown = describe(&odd, &report).unwrap();
+        assert_eq!(shown.current_plan.setups[0].operations[0].coolant, "Off");
+        // The JSON the planner is sent names both parts.
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["current_plan"]["setups"][1]["from"], 2);
+        assert_eq!(
+            json["current_plan"]["setups"][1]["operations"][1]["from"],
+            6
+        );
+        assert_eq!(json["kept_operations"], json!([]));
+    }
+    #[test]
+    fn describe_gives_setup_1_its_planner_note_as_the_workholding() {
+        let (mut doc, _, report) = planned();
+        doc.setups[0].p.insert(
+            crate::planner::PLANNER_NOTE_KEY.into(),
+            "Vise on the long sides.".into(),
+        );
+        let plan = describe(&doc, &report).unwrap().current_plan;
+        assert_eq!(plan.setups[0].workholding, "Vise on the long sides.");
+    }
+    #[test]
+    fn an_operation_the_format_cannot_carry_is_listed_and_still_counted() {
+        let (doc, _, report) = planned();
+        // A strategy that is not one of the six.
+        let adaptive = with_adaptive(doc.clone(), 0, 1);
+        let current = describe(&adaptive, &report).unwrap();
+        assert_eq!(
+            current.kept_operations,
+            [KeptOp {
+                setup: 1,
+                from: 2,
+                position: 2,
+                strategy: "Adaptive clearing",
+                name: get(&adaptive.setups[0].operations[1].p, "name").to_string(),
+            }]
+        );
+        let first = &current.current_plan.setups[0];
+        let numbers: Vec<_> = first.operations.iter().map(|o| o.from).collect();
+        assert_eq!(numbers, [Some(1), Some(3), Some(4)], "its number is spent");
+        assert_eq!(current.current_plan.setups[1].operations[0].from, Some(5));
+        // A tool without a number.
+        let mut bare = doc.clone();
+        bare.tools[2].p.insert("number".into(), String::new());
+        let current = describe(&bare, &report).unwrap();
+        let kept: Vec<_> = current
+            .kept_operations
+            .iter()
+            .map(|k| (k.setup, k.from, k.position, k.strategy))
+            .collect();
+        assert_eq!(kept, [(1, 4, 4, "Drilling")]);
+        // A contour that machines a selection that is not surfaces.
+        let mut geometry = doc.clone();
+        geometry.setups[1].operations[1].strategy = Strategy::Contour;
+        geometry.setups[1].operations[1].surfaces = None;
+        geometry.setups[1].operations[1].geometry = vec![3];
+        let current = describe(&geometry, &report).unwrap();
+        let kept: Vec<_> = current
+            .kept_operations
+            .iter()
+            .map(|k| (k.setup, k.from, k.position, k.strategy))
+            .collect();
+        assert_eq!(kept, [(2, 6, 2, "Contour")]);
+        assert_eq!(current.current_plan.setups[1].operations.len(), 1);
+        // A contour with no selection at all is carried.
+        assert!(
+            describe(&doc, &report).unwrap().current_plan.setups[0]
+                .operations
+                .iter()
+                .any(|o| o.strategy == "Contour")
+        );
+    }
+    #[test]
+    fn a_later_setup_that_is_not_turned_square_to_the_part_cannot_be_described() {
+        let (mut doc, _, report) = planned();
+        doc.setups[1].p.insert("rx".into(), "45".into());
+        let error = describe(&doc, &report).unwrap_err();
+        assert_eq!(
+            error,
+            "Setup 2 is not turned square to the part, so the planner cannot change this plan."
+        );
+        let mut none = doc.clone();
+        none.setups.clear();
+        assert_eq!(
+            describe(&none, &report).unwrap_err(),
+            "The project has no setup 1."
+        );
+    }
+    #[test]
+    fn building_what_describe_shows_keeps_every_setup_and_operation_identical() {
+        let (mut doc, mesh, report) = planned();
+        // What the user did to the plan since: settings the format does not
+        // carry, a renamed setup with its own notes, a renamed operation.
+        doc.setups[0].operations[0]
+            .p
+            .insert("retract".into(), "9".into());
+        doc.setups[0].operations[0]
+            .p
+            .insert("facing_pattern".into(), "One way".into());
+        doc.setups[0].operations[1]
+            .p
+            .insert("name".into(), "  Rough \"deep\" pocket  ".into());
+        doc.setups[1].p.insert("name".into(), "Flip over".into());
+        doc.setups[1]
+            .p
+            .insert("notes".into(), "Soft jaws, tap the part down.".into());
+        doc.setups[1].operations[1].enabled = false;
+        let rebuilt = build(&doc, &mesh, &report, &shown(&doc, &report)).unwrap();
+        assert_eq!(rebuilt.setups.len(), doc.setups.len());
+        for (kept, user) in rebuilt.setups.iter().zip(&doc.setups) {
+            assert_eq!(kept.id, user.id);
+            assert_eq!(kept.p, user.p, "setup {}", user.id);
+            assert_eq!(kept.operations.len(), user.operations.len());
+            for (kept, user) in kept.operations.iter().zip(&user.operations) {
+                assert!(same_operation(kept, user), "{}", user.id);
+            }
+        }
+        assert_eq!(
+            get(&rebuilt.setups[0].operations[0].p, "retract"),
+            "9",
+            "a key the format does not carry stays"
+        );
+        assert_eq!(rebuilt.active, doc.active);
+        assert!(rebuilt.validate_structure().is_ok());
+    }
+    #[test]
+    fn a_reason_a_cleaned_name_and_the_order_of_surfaces_do_not_change_a_kept_operation() {
+        let (mut doc, mesh, report) = planned();
+        doc.setups[0].operations[2]
+            .p
+            .insert("name".into(), "Outline \u{202e}\"fast\"".into());
+        let mut plan = shown(&doc, &report);
+        for setup in &mut plan.setups {
+            for op in &mut setup.operations {
+                op.reason = "I looked at it again.".into();
+                op.surfaces.reverse();
+            }
+        }
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        for (kept, user) in rebuilt.setups.iter().zip(&doc.setups) {
+            assert_eq!(kept.p, user.p);
+            for (kept, user) in kept.operations.iter().zip(&user.operations) {
+                assert!(same_operation(kept, user), "{}", user.id);
+            }
+        }
+    }
+    #[test]
+    fn a_change_keeps_the_active_setup_when_it_is_still_there() {
+        let (mut doc, mesh, report) = planned();
+        doc.active = doc.setups[1].id.clone();
+        let rebuilt = build(&doc, &mesh, &report, &shown(&doc, &report)).unwrap();
+        assert_eq!(rebuilt.active, doc.setups[1].id);
+        // The setup the user was on is gone: setup 1 is active.
+        let mut plan = shown(&doc, &report);
+        plan.setups.truncate(1);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        assert_eq!(rebuilt.active, doc.setups[0].id);
+        // Planning from zero (no `from`) goes back to setup 1 as before.
+        let fresh = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        assert_eq!(fresh.active, fresh.setups[0].id);
+    }
+    #[test]
+    fn changing_one_field_of_a_kept_operation_writes_only_that_key() {
+        let (mut doc, mesh, report) = planned();
+        doc.setups[0].operations[1]
+            .p
+            .insert("retract".into(), "9".into());
+        let change = |edit: &dyn Fn(&mut ProposedOp)| {
+            let mut plan = shown(&doc, &report);
+            edit(&mut plan.setups[0].operations[1]);
+            let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+            let (before, after) = (
+                &doc.setups[0].operations[1],
+                &rebuilt.setups[0].operations[1],
+            );
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.tool, before.tool);
+            assert_eq!(
+                after.surfaces.as_ref().map(|s| &s.ids),
+                before.surfaces.as_ref().map(|s| &s.ids)
+            );
+            assert_eq!(get(&after.p, "retract"), "9");
+            // Nothing else of the job moved.
+            for si in 0..2 {
+                for oi in 0..doc.setups[si].operations.len() {
+                    if (si, oi) != (0, 1) {
+                        assert!(same_operation(
+                            &rebuilt.setups[si].operations[oi],
+                            &doc.setups[si].operations[oi]
+                        ));
+                    }
+                }
+            }
+            (differing(&before.p, &after.p), after.p.clone())
+        };
+        let (keys, p) = change(&|o| o.rpm = 9000.);
+        assert_eq!((keys, get(&p, "rpm")), (vec!["rpm".to_string()], "9000"));
+        let (keys, p) = change(&|o| o.feed = 750.);
+        assert_eq!((keys, get(&p, "feed")), (vec!["feed".to_string()], "750"));
+        let (keys, p) = change(&|o| o.coolant = "Mist".into());
+        assert_eq!(
+            (keys, get(&p, "coolant")),
+            (vec!["coolant".to_string()], "Mist")
+        );
+        let (keys, p) = change(&|o| o.stepdown = Some(1.5));
+        assert_eq!(
+            (keys, get(&p, "stepdown")),
+            (vec!["stepdown".to_string()], "1.5")
+        );
+        let (keys, p) = change(&|o| o.name = "Rough pocket".into());
+        assert_eq!(
+            (keys, get(&p, "name")),
+            (vec!["name".to_string()], "Rough pocket")
+        );
+        let (keys, p) = change(&|o| o.finish_passes = Some(2));
+        assert_eq!(
+            (keys, get(&p, "finish_passes")),
+            (vec!["finish_passes".to_string()], "2")
+        );
+        // Two changes, two keys.
+        let (keys, _) = change(&|o| {
+            o.rpm = 9000.;
+            o.stepover_percent = Some(30.);
+        });
+        assert_eq!(keys, ["rpm", "stepover"]);
+    }
+    #[test]
+    fn leaving_an_operation_out_removes_it_and_a_null_from_adds_a_new_one() {
+        let (doc, mesh, report) = planned();
+        let originals: Vec<String> = doc.setups[0]
+            .operations
+            .iter()
+            .map(|o| o.id.clone())
+            .collect();
+        // Out: the Contour (operation 3).
+        let mut plan = shown(&doc, &report);
+        plan.setups[0].operations.remove(2);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let ids_now: Vec<&str> = rebuilt.setups[0]
+            .operations
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(
+            ids_now,
+            [&originals[0], &originals[1], &originals[3]],
+            "the others keep their ids, in order"
+        );
+        // In: a new operation with from null, between two kept ones.
+        let mut plan = shown(&doc, &report);
+        let mut added = op("Contour", 1, vec![]);
+        added.name = "Skim cut".into();
+        plan.setups[0].operations.insert(1, added);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let operations = &rebuilt.setups[0].operations;
+        assert_eq!(operations.len(), 5);
+        assert_eq!(get(&operations[1].p, "name"), "Skim cut");
+        assert!(
+            !doc.setups
+                .iter()
+                .flat_map(|s| &s.operations)
+                .any(|o| o.id == operations[1].id),
+            "a new operation has a new id"
+        );
+        for (now, was) in [(0, 0), (2, 1), (3, 2), (4, 3)] {
+            assert!(same_operation(
+                &operations[now],
+                &doc.setups[0].operations[was]
+            ));
+        }
+        // Reordered: the kept operations follow the proposal's order.
+        let mut plan = shown(&doc, &report);
+        plan.setups[0].operations.swap(1, 2);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let ids_now: Vec<&str> = rebuilt.setups[0]
+            .operations
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(
+            ids_now,
+            [&originals[0], &originals[2], &originals[1], &originals[3]]
+        );
+    }
+    #[test]
+    fn an_operation_of_another_strategy_or_contour_mode_is_built_fresh() {
+        let (mut doc, mesh, report) = planned();
+        doc.setups[0].operations[1]
+            .p
+            .insert("retract".into(), "9".into());
+        doc.setups[0].operations[2]
+            .p
+            .insert("retract".into(), "9".into());
+        // The Pocket becomes a Contour: nothing of the old settings stays.
+        let mut plan = shown(&doc, &report);
+        let mut contour = op("Contour", 1, vec![]);
+        contour.from = Some(2);
+        plan.setups[0].operations[1] = contour;
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let now = &rebuilt.setups[0].operations[1];
+        assert_eq!(now.strategy, Strategy::Contour);
+        assert_ne!(now.id, doc.setups[0].operations[1].id);
+        assert_eq!(get(&now.p, "retract"), "5");
+        // The outside Contour becomes an inside one.
+        let mut plan = shown(&doc, &report);
+        let mut inside = op("Contour", 1, ids(&report, "+Z", 12.));
+        inside.contour_mode = Some("inside_floor".into());
+        inside.from = Some(3);
+        plan.setups[0].operations[2] = inside;
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let now = &rebuilt.setups[0].operations[2];
+        assert_eq!(get(&now.p, "side"), "Inside");
+        assert_ne!(now.id, doc.setups[0].operations[2].id);
+        assert_eq!(get(&now.p, "retract"), "5");
+    }
+    /// What the problems of building `edit` of the planned job say.
+    fn from_problems(
+        doc: &Document,
+        mesh: &Mesh,
+        report: &PartReport,
+        edit: &dyn Fn(&mut Proposal),
+    ) -> Vec<String> {
+        let mut plan = shown(doc, report);
+        edit(&mut plan);
+        messages(build(doc, mesh, report, &plan))
+    }
+    #[test]
+    fn a_from_that_is_not_in_the_plan_is_a_problem() {
+        let (doc, mesh, report) = planned();
+        let problems = |edit: &dyn Fn(&mut Proposal)| from_problems(&doc, &mesh, &report, edit);
+        for number in [0, 3, 9] {
+            // Its operations, which name setup 2's, are refused with it.
+            let found = problems(&|p| p.setups[1].from = Some(number));
+            assert_eq!(
+                found[0],
+                format!("2/None: from {number} is not a setup of the current plan.")
+            );
+            assert_eq!(found.len(), 3, "{found:?}");
+        }
+        for number in [0, 7, 99] {
+            assert_eq!(
+                problems(&|p| p.setups[0].operations[0].from = Some(number)),
+                [format!(
+                    "1/Some(1): from {number} is not an operation of the current plan."
+                )]
+            );
+        }
+    }
+    #[test]
+    fn an_operation_keeps_its_from_only_in_its_own_setup() {
+        let (doc, mesh, report) = planned();
+        let problems = |edit: &dyn Fn(&mut Proposal)| from_problems(&doc, &mesh, &report, edit);
+        // Operation 5 belongs to setup 2.
+        let found = problems(&|p| p.setups[0].operations[0].from = Some(5));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with(
+                "1/Some(1): from 5 is an operation of setup 2 of the current plan, which this setup does not keep"
+            ),
+            "{found:?}"
+        );
+        // Moving an operation to the other setup keeps it from nowhere.
+        let found = problems(&|p| {
+            let moved = p.setups[0].operations.remove(0);
+            p.setups[1].operations.push(moved);
+        });
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("2/Some(3): from 1 is an operation of setup 1"),
+            "{found:?}"
+        );
+        // A setup that is not kept cannot keep operations.
+        let found = problems(&|p| p.setups[1].from = None);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|m| m.starts_with("2/Some(")), "{found:?}");
+        assert!(found.iter().all(|m| m.contains("of setup 2")), "{found:?}");
+        // Same when it is turned another way: it is a new setup.
+        let found = problems(&|p| p.setups[1].orientation = "-Y".into());
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+    #[test]
+    fn a_from_used_twice_is_a_problem() {
+        let (doc, mesh, report) = planned_three();
+        let problems = |edit: &dyn Fn(&mut Proposal)| from_problems(&doc, &mesh, &report, edit);
+        assert_eq!(
+            problems(&|p| p.setups[0].operations[1].from = Some(1)),
+            ["1/Some(2): from 1 is used by an earlier operation."]
+        );
+        let found = problems(&|p| p.setups[2].from = Some(2));
+        assert_eq!(found[0], "3/None: from 2 is used by an earlier setup.");
+    }
+    #[test]
+    fn setup_1_stays_first_and_keeps_from_1() {
+        let (doc, mesh, report) = planned();
+        let problems = |edit: &dyn Fn(&mut Proposal)| from_problems(&doc, &mesh, &report, edit);
+        let found = problems(&|p| p.setups[0].from = Some(2));
+        assert_eq!(
+            found[0],
+            "1/None: The first setup is the current setup 1: its from must be 1 or null."
+        );
+        let found = problems(&|p| p.setups[1].from = Some(1));
+        assert_eq!(
+            found[0],
+            "2/None: Setup 1 stays first: no later setup can have from 1."
+        );
+        // Null for setup 1 is fine: its operations are then new ones.
+        let mut plan = shown(&doc, &report);
+        plan.setups[0].from = None;
+        plan.setups[0]
+            .operations
+            .iter_mut()
+            .for_each(|o| o.from = None);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        assert_eq!(rebuilt.setups[0].id, doc.setups[0].id);
+        assert_ne!(
+            rebuilt.setups[0].operations[0].id,
+            doc.setups[0].operations[0].id
+        );
+    }
+    #[test]
+    fn an_operation_the_planner_cannot_see_cannot_be_named_in_a_proposal() {
+        let (doc, mesh, report) = planned();
+        let doc = with_adaptive(doc, 0, 1);
+        let found = from_problems(&doc, &mesh, &report, &|p| {
+            p.setups[0]
+                .operations
+                .insert(1, op("Pocket", 1, ids(&report, "+Z", 12.)));
+            p.setups[0].operations[1].from = Some(2);
+        });
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("1/Some(2): from 2 is one of the kept_operations"),
+            "{found:?}"
+        );
+    }
+    #[test]
+    fn a_kept_operation_returns_to_its_place_in_its_setup() {
+        let (doc, mesh, report) = planned();
+        let doc = with_adaptive(doc, 0, 1);
+        let originals: Vec<String> = doc.setups[0]
+            .operations
+            .iter()
+            .map(|o| o.id.clone())
+            .collect();
+        let current = describe(&doc, &report).unwrap();
+        assert_eq!(current.current_plan.setups[0].operations.len(), 3);
+        // Unchanged: the whole setup is as it was, the Adaptive in place.
+        let rebuilt = build(&doc, &mesh, &report, &shown(&doc, &report)).unwrap();
+        for (now, was) in rebuilt.setups[0]
+            .operations
+            .iter()
+            .zip(&doc.setups[0].operations)
+        {
+            assert!(same_operation(now, was), "{}", was.id);
+        }
+        assert_eq!(rebuilt.setups[0].operations.len(), 4);
+        // The Face before it is left out: it returns at its own index.
+        let mut plan = shown(&doc, &report);
+        plan.setups[0].operations.remove(0);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let ids_now: Vec<&str> = rebuilt.setups[0]
+            .operations
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(ids_now, [&originals[2], &originals[1], &originals[3]]);
+        // Only the last one kept: it stays at its index, past the end of what is there.
+        let mut plan = shown(&doc, &report);
+        plan.setups[0].operations.drain(..2);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let ids_now: Vec<&str> = rebuilt.setups[0]
+            .operations
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(ids_now, [&originals[3], &originals[1]]);
+    }
+    #[test]
+    fn a_setup_with_kept_operations_must_be_kept() {
+        let (doc, mesh, report) = planned();
+        let doc = with_adaptive(doc, 1, 1);
+        let problems = |edit: &dyn Fn(&mut Proposal)| from_problems(&doc, &mesh, &report, edit);
+        let needle = "Setup 2 of the current plan has kept_operations";
+        assert!(build(&doc, &mesh, &report, &shown(&doc, &report)).is_ok());
+        // Dropped.
+        let found = problems(&|p| p.setups.truncate(1));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with(&format!("0/None: {needle}")),
+            "{found:?}"
+        );
+        assert!(
+            found[0].contains("keep that setup with from 2 and orientation -Z"),
+            "{found:?}"
+        );
+        // Replaced by a new setup of the same orientation, or turned another way.
+        let found = problems(&|p| {
+            p.setups[1].from = None;
+            p.setups[1]
+                .operations
+                .iter_mut()
+                .for_each(|o| o.from = None);
+        });
+        assert!(found.iter().any(|m| m.contains(needle)), "{found:?}");
+        let found = problems(&|p| {
+            p.setups[1].orientation = "-Y".into();
+            p.setups[1]
+                .operations
+                .iter_mut()
+                .for_each(|o| o.from = None);
+        });
+        assert!(found.iter().any(|m| m.contains(needle)), "{found:?}");
+        // Planning from zero (no from anywhere) replaces the plan as it always did.
+        let rebuilt = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        assert!(
+            rebuilt
+                .setups
+                .iter()
+                .flat_map(|s| &s.operations)
+                .all(|o| o.strategy != Strategy::Adaptive)
+        );
+    }
+    /// The planned job with a vise that holds setup 1 and the placement of
+    /// setup 2 the user laid out by hand; its report lists the library.
+    fn planned_and_held() -> (Document, Mesh, PartReport) {
+        let (mut doc, mesh, _) = block();
+        hold(
+            &mut doc,
+            "Vise",
+            &[
+                ("vise_axis", "Y"),
+                ("vise_grip", "8"),
+                ("holding_gap", "3.5"),
+            ],
+        );
+        let report = analysis::report(&doc, &mesh).unwrap();
+        let mut job = build(&doc, &mesh, &report, &good(&report)).unwrap();
+        let p = &mut job.setups[1].p;
+        p.insert("name".into(), "Flip over".into());
+        p.insert("notes".into(), "Soft jaws.".into());
+        p.insert("offset".into(), "G57".into());
+        p.insert("vise_axis".into(), "Y".into());
+        p.insert("vise_offset".into(), "4".into());
+        p.insert("vise_grip".into(), "7".into());
+        p.insert("clamps".into(), "-X:0;+X:10".into());
+        (job, mesh, report)
+    }
+    #[test]
+    fn a_kept_later_setup_keeps_its_id_offset_notes_and_placement() {
+        let (doc, mesh, report) = planned_and_held();
+        let rebuilt = build(&doc, &mesh, &report, &shown(&doc, &report)).unwrap();
+        assert_eq!(rebuilt.setups[1].id, doc.setups[1].id);
+        assert_eq!(rebuilt.setups[1].p, doc.setups[1].p);
+        // Setup 1 held, setup 2 in a clamp of its own: that stays too.
+        let mut plan = shown(&doc, &report);
+        plan.setups[1].holder = Some(2);
+        let held = build(&doc, &mesh, &report, &plan).unwrap();
+        assert_eq!(get(&held.setups[1].p, "holding"), "Clamps");
+        let second = shown(&held, &report);
+        assert_eq!(second.setups[1].holder, Some(2));
+        let again = build(&held, &mesh, &report, &second).unwrap();
+        assert_eq!(again.setups[1].p, held.setups[1].p);
+    }
+    #[test]
+    fn changing_a_kept_setups_name_origin_or_notes_writes_only_that() {
+        let (doc, mesh, report) = planned_and_held();
+        let change = |edit: &dyn Fn(&mut ProposedSetup)| {
+            let mut plan = shown(&doc, &report);
+            edit(&mut plan.setups[1]);
+            let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+            assert_eq!(rebuilt.setups[1].id, doc.setups[1].id);
+            (
+                differing(&doc.setups[1].p, &rebuilt.setups[1].p),
+                rebuilt.setups[1].p.clone(),
+            )
+        };
+        let (keys, p) = change(&|s| s.name = "Underside, second".into());
+        assert_eq!(keys, ["name"]);
+        assert_eq!(get(&p, "name"), "Underside, second");
+        let (keys, p) = change(&|s| s.origin = "Stock top center".into());
+        assert_eq!(keys, ["origin"]);
+        assert_eq!(get(&p, "origin"), "Stock top center");
+        let (keys, p) = change(&|s| s.workholding = "Hold in the soft jaws.".into());
+        assert_eq!(keys, ["notes"]);
+        assert_eq!(get(&p, "notes"), "Hold in the soft jaws.");
+        // An origin that is not a choice is still refused.
+        let mut plan = shown(&doc, &report);
+        plan.setups[1].origin = "Somewhere".into();
+        assert!(
+            messages(build(&doc, &mesh, &report, &plan))
+                .iter()
+                .any(|m| m.contains("not a work zero choice"))
+        );
+    }
+    #[test]
+    fn a_holder_change_of_a_kept_setup_clears_its_placement() {
+        let (doc, mesh, report) = planned_and_held();
+        let (vise, clamp) = (doc.workholding[0].id.clone(), doc.workholding[1].id.clone());
+        let mut plan = shown(&doc, &report);
+        plan.setups[1].holder = Some(2);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let second = &rebuilt.setups[1];
+        assert_eq!(second.id, doc.setups[1].id);
+        assert_eq!(
+            (get(&second.p, "holding"), get(&second.p, "holder")),
+            ("Clamps", clamp.as_str())
+        );
+        for key in ["vise_axis", "vise_offset", "vise_grip", "clamps"] {
+            assert!(!second.p.contains_key(key), "{key}");
+        }
+        // The rest of the setup is as the user left it.
+        assert_eq!(
+            differing(&doc.setups[1].p, &second.p),
+            [
+                "clamps",
+                "holder",
+                "holding",
+                "vise_axis",
+                "vise_grip",
+                "vise_offset"
+            ]
+        );
+        assert_eq!(get(&second.p, "offset"), "G57");
+        assert_eq!(get(&second.p, "notes"), "Soft jaws.");
+        assert_eq!(get(&second.p, "name"), "Flip over");
+        // Back to setup 1's holder (null): the placement goes again.
+        let (mut doc, mesh, report) = (rebuilt, mesh, report);
+        doc.setups[1].p.insert("clamps".into(), "-X:0".into());
+        let mut plan = shown(&doc, &report);
+        assert_eq!(plan.setups[1].holder, Some(2));
+        plan.setups[1].holder = None;
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let second = &rebuilt.setups[1];
+        assert_eq!(
+            (get(&second.p, "holding"), get(&second.p, "holder")),
+            ("Vise", vise.as_str())
+        );
+        assert!(!second.p.contains_key("clamps"));
+    }
+    #[test]
+    fn a_new_setup_does_not_take_a_kept_setups_offset() {
+        let (doc, mesh, report) = planned_three();
+        let offsets: Vec<&str> = doc.setups.iter().map(|s| get(&s.p, "offset")).collect();
+        assert_eq!(offsets, ["G54", "G55", "G56"]);
+        // A new setup comes before the kept setup 2: it must not take G55.
+        let mut plan = shown(&doc, &report);
+        let kept = plan.setups.remove(1);
+        let mut new = plan.setups.pop().unwrap();
+        new.from = None;
+        new.name = "New side".into();
+        new.operations.iter_mut().for_each(|o| o.from = None);
+        plan.setups.push(new);
+        plan.setups.push(kept);
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        assert_eq!(rebuilt.setups.len(), 3);
+        assert_eq!(rebuilt.setups[2].id, doc.setups[1].id);
+        assert_eq!(get(&rebuilt.setups[2].p, "offset"), "G55");
+        assert_ne!(rebuilt.setups[1].id, doc.setups[2].id);
+        assert_eq!(get(&rebuilt.setups[1].p, "offset"), "G56");
+        let mut now: Vec<&str> = rebuilt.setups.iter().map(|s| get(&s.p, "offset")).collect();
+        now.sort_unstable();
+        now.dedup();
+        assert_eq!(now.len(), 3, "every setup has an offset of its own");
+        assert!(rebuilt.validate_structure().is_ok());
+    }
+    #[test]
+    fn a_setup_turned_another_way_is_a_new_setup() {
+        let (doc, mesh, report) = planned();
+        let mut plan = shown(&doc, &report);
+        let side = side_up(&report, "-Y").setups.remove(1);
+        plan.setups[1] = ProposedSetup {
+            from: Some(2),
+            name: "Side".into(),
+            ..side
+        };
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        let second = &rebuilt.setups[1];
+        assert_ne!(second.id, doc.setups[1].id);
+        assert_eq!(analysis::up_axis(second), Some("-Y"));
+        assert_ne!(
+            (get(&second.p, "rx"), get(&second.p, "ry")),
+            (get(&doc.setups[1].p, "rx"), get(&doc.setups[1].p, "ry"))
+        );
+        assert_eq!(get(&second.p, "name"), "Side");
+        assert_ne!(
+            get(&second.p, "offset"),
+            get(&doc.setups[1].p, "offset"),
+            "the kept setup's offset is not reused by a new one"
+        );
+        // Turned the same way again, it is kept.
+        plan.setups[1].orientation = "-Z".into();
+        plan.setups[1].operations = shown(&doc, &report).setups[1].operations.clone();
+        let rebuilt = build(&doc, &mesh, &report, &plan).unwrap();
+        assert_eq!(rebuilt.setups[1].id, doc.setups[1].id);
+    }
+    #[test]
+    fn the_edit_schema_asks_every_setup_and_operation_for_a_from() {
+        assert_eq!(schema(), schema_for(false));
+        assert_ne!(schema(), schema_for(true));
+        let nullable = json!({"type": ["integer", "null"]});
+        let plain = schema();
+        let edit = schema_for(true);
+        let setup = |s: &Value| s["properties"]["setups"]["items"].clone();
+        let operation = |s: &Value| setup(s)["properties"]["operations"]["items"].clone();
+        for part in [setup(&plain), operation(&plain)] {
+            assert!(part["properties"].get("from").is_none());
+            assert!(
+                !part["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("from"))
+            );
+        }
+        for part in [setup(&edit), operation(&edit)] {
+            assert_eq!(part["properties"]["from"], nullable);
+            assert!(
+                part["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("from"))
+            );
+        }
+        // Nothing else differs: the plain schema is the edit one less `from`.
+        let mut stripped = edit.clone();
+        for path in [
+            "/properties/setups/items",
+            "/properties/setups/items/properties/operations/items",
+        ] {
+            let part = stripped.pointer_mut(path).unwrap();
+            part["properties"].as_object_mut().unwrap().remove("from");
+            part["required"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|k| k != "from");
+        }
+        assert_eq!(stripped, plain);
+    }
+    #[test]
+    fn a_proposal_without_from_parses_and_none_is_not_written() {
+        let (_, _, report) = block();
+        let proposal = good(&report);
+        let text = serde_json::to_string(&proposal).unwrap();
+        assert!(!text.contains("\"from\""), "{text}");
+        assert_eq!(parse(&text).unwrap(), proposal);
+        // With numbers they are written, and read back.
+        let mut with = proposal.clone();
+        with.setups[0].from = Some(1);
+        with.setups[0].operations[1].from = Some(2);
+        let text = serde_json::to_string(&with).unwrap();
+        assert_eq!(text.matches("\"from\"").count(), 2, "{text}");
+        assert_eq!(parse(&text).unwrap(), with);
+        // What the planner answers in edit mode: null for new, or a number.
+        let mut value = serde_json::to_value(&proposal).unwrap();
+        value["setups"][0]["from"] = json!(1);
+        value["setups"][1]["from"] = Value::Null;
+        value["setups"][0]["operations"][0]["from"] = json!(3);
+        value["setups"][0]["operations"][1]["from"] = Value::Null;
+        let parsed = parse(&value.to_string()).unwrap();
+        assert_eq!(parsed.setups[0].from, Some(1));
+        assert_eq!(parsed.setups[1].from, None);
+        assert_eq!(parsed.setups[0].operations[0].from, Some(3));
+        assert_eq!(parsed.setups[0].operations[1].from, None);
+        // Not a count.
+        for bad in [json!(-1), json!(1.5), json!("1")] {
+            value["setups"][0]["from"] = bad;
+            assert!(parse(&value.to_string()).is_err());
+        }
     }
 }

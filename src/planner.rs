@@ -1426,6 +1426,7 @@ pub(crate) fn view_after(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::model::{Setup, get};
     use crate::openai::ToolCall;
     use crate::proposal::tests::{block, good};
     use std::sync::Mutex;
@@ -1439,6 +1440,11 @@ pub(crate) mod tests {
         pub turns: Mutex<Vec<(Vec<Item>, Option<ToolChoice>)>>,
         /// The names of the tools each send offered.
         pub offered: Mutex<Vec<Vec<&'static str>>>,
+        /// Whether each send was for changing the current plan.
+        pub edits: Mutex<Vec<bool>>,
+        /// The draft schema of each send's `check_plan` tool: None when it
+        /// was not offered.
+        pub check_schemas: Mutex<Vec<Option<serde_json::Value>>>,
         pictures: bool,
     }
     impl Script {
@@ -1456,6 +1462,8 @@ pub(crate) mod tests {
                 seen: Mutex::new(vec![]),
                 turns: Mutex::new(vec![]),
                 offered: Mutex::new(vec![]),
+                edits: Mutex::new(vec![]),
+                check_schemas: Mutex::new(vec![]),
                 pictures: false,
             }
         }
@@ -1473,6 +1481,8 @@ pub(crate) mod tests {
                 seen: Mutex::new(vec![]),
                 turns: Mutex::new(vec![]),
                 offered: Mutex::new(vec![]),
+                edits: Mutex::new(vec![]),
+                check_schemas: Mutex::new(vec![]),
                 pictures: false,
             }
         }
@@ -1483,8 +1493,15 @@ pub(crate) mod tests {
             messages: &[Item],
             tools: &[Tool],
             choice: ToolChoice,
-            _edit: bool,
+            edit: bool,
         ) -> Result<Reply, ApiError> {
+            self.edits.lock().unwrap().push(edit);
+            self.check_schemas.lock().unwrap().push(
+                tools
+                    .iter()
+                    .find(|t| t.name == "check_plan")
+                    .map(|t| t.parameters["properties"]["proposal"].clone()),
+            );
             let texts = messages.iter().filter_map(Item::as_text).collect();
             self.seen.lock().unwrap().push(texts);
             let offered = (!tools.is_empty()).then_some(choice);
@@ -5052,5 +5069,440 @@ pub(crate) mod tests {
             sent[4],
             Item::text(Role::User, "(cutting_data answered: {\"rpm\":1})")
         );
+    }
+    /// The block with the good plan built in, its setups named "Top" and
+    /// "Underside": a job a change can start from.
+    fn planned() -> (Document, Mesh, PartReport) {
+        let (doc, mesh, report) = block();
+        let job = proposal::build(&doc, &mesh, &report, &good(&report)).unwrap();
+        (job, mesh, report)
+    }
+    /// The reply that changes nothing: the current plan as the planner is
+    /// shown it (its setups named by number), with a summary.
+    fn unchanged(doc: &Document, report: &PartReport) -> Proposal {
+        let mut plan = proposal::describe(&anonymized(doc), report)
+            .unwrap()
+            .current_plan;
+        plan.summary = "Nothing to change.".into();
+        plan
+    }
+    /// `doc` with every operation taken out: a job nothing is planned in yet.
+    fn without_operations(mut doc: Document) -> Document {
+        doc.setups.iter_mut().for_each(|s| s.operations.clear());
+        doc
+    }
+    fn asking(request: &str) -> Chat {
+        Chat {
+            turns: vec![],
+            request: request.into(),
+        }
+    }
+    /// A run of `plan_with_chat` with the real plan check.
+    async fn change(
+        script: &Script,
+        doc: &Document,
+        mesh: &Mesh,
+        chat: Chat,
+    ) -> Result<Outcome, Failure> {
+        plan_with_chat(
+            script,
+            doc.clone(),
+            mesh.clone(),
+            chat,
+            &Busy::default(),
+            |_| {},
+            analysis::report,
+            check_or_boom,
+        )
+        .await
+    }
+    #[test]
+    fn a_run_changes_the_plan_when_the_user_asked_and_the_job_has_an_operation() {
+        let (planned, _, _) = planned();
+        let empty = without_operations(planned.clone());
+        assert!(editing(&planned, &asking("Drill the holes first.")));
+        // No request, or one with nothing in it.
+        for blank in ["", "   ", "\n\t", "\u{200b}\u{7}"] {
+            assert!(!editing(&planned, &asking(blank)), "{blank:?}");
+        }
+        assert!(!editing(&planned, &Chat::default()));
+        // No operation to change: a request is what to plan.
+        assert!(!editing(&empty, &asking("Drill the holes first.")));
+        // An operation in a later setup is enough.
+        let mut later = planned.clone();
+        later.setups[0].operations.clear();
+        assert!(editing(&later, &asking("Drill the holes first.")));
+        later.setups[1].operations.clear();
+        assert!(!editing(&later, &asking("Drill the holes first.")));
+        // Earlier exchanges alone do not ask for anything.
+        let turns = vec![Turn {
+            request: "Before.".into(),
+            answer: "Done.".into(),
+        }];
+        assert!(!editing(
+            &planned,
+            &Chat {
+                turns,
+                request: String::new()
+            }
+        ));
+    }
+    #[test]
+    fn the_chat_sends_the_latest_exchanges_then_the_request() {
+        let turns: Vec<Turn> = (0..KEPT_TURNS + 3)
+            .map(|i| Turn {
+                request: format!("ask {i}"),
+                answer: if i == KEPT_TURNS + 2 {
+                    String::new()
+                } else {
+                    format!("answer {i}")
+                },
+            })
+            .collect();
+        let chat = Chat {
+            turns,
+            request: "now".into(),
+        };
+        let items = chat.messages(Some("{\"current_plan\":{}}"));
+        let texts: Vec<(Role, String)> = items.iter().filter_map(Item::as_text).collect();
+        assert_eq!(texts.len(), 2 * KEPT_TURNS + 1);
+        for (n, i) in (3..KEPT_TURNS + 3).enumerate() {
+            assert_eq!(
+                texts[2 * n],
+                (Role::User, format!("Earlier the user asked: ask {i}"))
+            );
+            let answer = if i == KEPT_TURNS + 2 {
+                "(no answer)".to_string()
+            } else {
+                format!("answer {i}")
+            };
+            assert_eq!(texts[2 * n + 1], (Role::Assistant, answer));
+        }
+        assert_eq!(
+            texts.last().unwrap(),
+            &(
+                Role::User,
+                "The job's current plan: {\"current_plan\":{}}\n\nThe user asks for this change: now"
+                    .to_string()
+            )
+        );
+        // Without a plan to change, the request is what to plan.
+        let fresh = chat.messages(None);
+        let last = fresh.last().and_then(Item::as_text).unwrap();
+        assert_eq!(
+            last,
+            (
+                Role::User,
+                "Plan the job, and follow this request of the user where the rules allow it: now"
+                    .to_string()
+            )
+        );
+        // No request, nothing is sent; a long one is cut.
+        assert!(Chat::default().messages(Some("{}")).is_empty());
+        let blank = Chat {
+            request: " \n ".into(),
+            ..chat.clone()
+        };
+        assert!(blank.messages(Some("{}")).is_empty());
+        let long = Chat {
+            turns: vec![Turn {
+                request: "q".repeat(MAX_REQUEST_CHARS + 50),
+                answer: "a".repeat(MAX_REQUEST_CHARS + 50),
+            }],
+            request: "r".repeat(MAX_REQUEST_CHARS + 50),
+        };
+        for item in long.messages(None) {
+            let (_, text) = item.as_text().unwrap();
+            assert!(text.matches(['q', 'a', 'r']).count() >= MAX_REQUEST_CHARS);
+            assert!(!text.contains(&"q".repeat(MAX_REQUEST_CHARS + 1)));
+            assert!(!text.contains(&"a".repeat(MAX_REQUEST_CHARS + 1)));
+            assert!(!text.contains(&"r".repeat(MAX_REQUEST_CHARS + 1)));
+        }
+    }
+    #[tokio::test]
+    async fn a_change_sends_the_current_plan_and_the_request_after_the_part_report() {
+        let (doc, mesh, report) = planned();
+        let script = Script::new(vec![json(&unchanged(&doc, &report))]);
+        let outcome = change(&script, &doc, &mesh, asking("Drill the holes first."))
+            .await
+            .unwrap();
+        assert_eq!((outcome.requests, outcome.chosen), (1, 1));
+        let seen = script.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let roles: Vec<Role> = seen[0].iter().map(|(role, _)| *role).collect();
+        assert_eq!(roles, [Role::System, Role::User, Role::User]);
+        let (system, part, ask) = (&seen[0][0].1, &seen[0][1].1, &seen[0][2].1);
+        // The instructions end with the section on changing a plan.
+        assert!(system.ends_with(EDITING));
+        assert!(system.contains("CHANGING THE CURRENT PLAN"));
+        assert!(system.contains("`from`"));
+        let sent: serde_json::Value = serde_json::from_str(part).unwrap();
+        assert!(sent["orientations"].is_array());
+        // The plan as the planner is shown it, then the request.
+        let (plan, request) = ask
+            .strip_prefix("The job's current plan: ")
+            .unwrap()
+            .split_once("\n\nThe user asks for this change: ")
+            .unwrap();
+        assert_eq!(request, "Drill the holes first.");
+        let shown: serde_json::Value = serde_json::from_str(plan).unwrap();
+        let described = proposal::describe(&anonymized(&doc), &report).unwrap();
+        assert_eq!(shown, serde_json::to_value(&described).unwrap());
+        assert_eq!(shown["current_plan"]["setups"][0]["from"], 1);
+        assert_eq!(
+            shown["current_plan"]["setups"][1]["operations"][0]["from"],
+            5
+        );
+        assert_eq!(shown["kept_operations"], serde_json::json!([]));
+        // The user's own setup names do not leave the program.
+        assert!(!plan.contains("Underside") && plan.contains("Setup 2"));
+        // The reply follows the schema with `from`, and so do check_plan's drafts.
+        assert_eq!(*script.edits.lock().unwrap(), [true]);
+        let schemas = script.check_schemas.lock().unwrap();
+        assert_eq!(schemas[0], Some(proposal::schema_for(true)));
+        // The job keeps its setups: their ids and, as the user named them, their names.
+        let names: Vec<&str> = outcome.job.setups.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["Top", "Underside"]);
+        for (kept, user) in outcome.job.setups.iter().zip(&doc.setups) {
+            assert_eq!(kept.id, user.id);
+            for key in ["offset", "notes", "rx", "ry", "rz"] {
+                assert_eq!(get(&kept.p, key), get(&user.p, key), "{key}");
+            }
+            let ids =
+                |s: &Setup| -> Vec<String> { s.operations.iter().map(|o| o.id.clone()).collect() };
+            assert_eq!(ids(kept), ids(user));
+        }
+        assert_eq!(outcome.job.title, doc.title);
+    }
+    #[tokio::test]
+    async fn a_setup_the_planner_renamed_keeps_the_planners_name() {
+        let (doc, mesh, report) = planned();
+        let mut plan = unchanged(&doc, &report);
+        plan.setups[1].name = "Flipped over".into();
+        let script = Script::new(vec![json(&plan)]);
+        let outcome = change(&script, &doc, &mesh, asking("Rename setup 2."))
+            .await
+            .unwrap();
+        let names: Vec<&str> = outcome.job.setups.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["Top", "Flipped over"]);
+        assert_eq!(outcome.job.setups[1].id, doc.setups[1].id);
+    }
+    #[tokio::test]
+    async fn a_change_that_passes_gets_no_request_to_machine_more() {
+        let (doc, mesh, report) = planned();
+        // Setup 2 left out: its planes are still covered, which a run that
+        // plans from zero would ask to machine.
+        let mut smaller = unchanged(&doc, &report);
+        smaller.setups.truncate(1);
+        let script = Script::new(vec![json(&smaller), json(&unchanged(&doc, &report))]);
+        let outcome = change(&script, &doc, &mesh, asking("Skip the underside."))
+            .await
+            .unwrap();
+        assert_eq!((outcome.requests, outcome.chosen), (1, 1));
+        assert_eq!(outcome.job.setups.len(), 1);
+        assert_eq!(script.seen.lock().unwrap().len(), 1);
+        // Without a request the run plans from zero: the same reply gets its round.
+        let mut plain = good(&report);
+        plain.setups.truncate(1);
+        let script = Script::new(vec![json(&plain), json(&good(&report))]);
+        let outcome = change(&script, &doc, &mesh, Chat::default()).await.unwrap();
+        assert_eq!(outcome.requests, 2);
+        assert_eq!(*script.edits.lock().unwrap(), [false, false]);
+    }
+    #[tokio::test]
+    async fn a_change_that_never_passes_says_it_could_not_change_the_plan() {
+        let (doc, mesh, report) = planned();
+        let mut wrong = unchanged(&doc, &report);
+        wrong.setups[0].operations[0].tool = 9;
+        let replies = vec![json(&wrong); MAX_REQUESTS];
+        let script = Script::new(replies);
+        let failure = change(&script, &doc, &mesh, asking("Use a bigger cutter."))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "The planner could not change the plan so that it passes every check in 4 attempts."
+        );
+        assert_eq!(
+            (failure.requests, failure.api.clone()),
+            (MAX_REQUESTS, None)
+        );
+        assert!(
+            failure
+                .problems
+                .iter()
+                .any(|p| p.message.contains("T9 is not in the tool library")),
+            "{:?}",
+            failure.problems
+        );
+        // Each correction asks again for the whole changed plan.
+        assert_eq!(*script.edits.lock().unwrap(), [true; MAX_REQUESTS]);
+        // Planning from zero keeps its own wording.
+        let mut wrong = good(&report);
+        wrong.setups[0].operations[0].tool = 9;
+        let script = Script::new(vec![json(&wrong); MAX_REQUESTS]);
+        let failure = change(&script, &doc, &mesh, Chat::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "The planner could not produce a plan that passes every check in 4 attempts."
+        );
+    }
+    #[tokio::test]
+    async fn a_request_on_a_job_without_operations_plans_from_zero_with_the_request() {
+        let (doc, mesh, report) = block();
+        let doc = without_operations(doc);
+        assert!(!editing(&doc, &asking("Hold it in the vise.")));
+        let script = Script::new(vec![json(&good(&report)), json(&good(&report))]);
+        let outcome = change(&script, &doc, &mesh, asking("Hold it in the vise."))
+            .await
+            .unwrap();
+        assert_eq!(outcome.requests, 2, "a plan from zero still gets its round");
+        let seen = script.seen.lock().unwrap();
+        let roles: Vec<Role> = seen[0].iter().map(|(role, _)| *role).collect();
+        assert_eq!(roles, [Role::System, Role::User, Role::User]);
+        assert!(!seen[0][0].1.contains("CHANGING THE CURRENT PLAN"));
+        assert_eq!(
+            seen[0][2].1,
+            "Plan the job, and follow this request of the user where the rules allow it: Hold it in the vise."
+        );
+        let all: String = seen.iter().flatten().map(|(_, t)| t.as_str()).collect();
+        assert!(!all.contains("current_plan") && !all.contains("kept_operations"));
+        assert_eq!(*script.edits.lock().unwrap(), [false, false]);
+        let schemas = script.check_schemas.lock().unwrap();
+        assert!(
+            schemas
+                .iter()
+                .all(|s| s.as_ref().is_none_or(|s| *s == proposal::schema()))
+        );
+    }
+    #[tokio::test]
+    async fn a_plan_that_cannot_be_described_fails_before_anything_is_sent() {
+        let (mut doc, mesh, _) = planned();
+        doc.setups[1].p.insert("rx".into(), "45".into());
+        let script = Script::new(vec![]);
+        let failure = change(&script, &doc, &mesh, asking("Change it."))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "Setup 2 is not turned square to the part, so the planner cannot change this plan."
+        );
+        assert_eq!((failure.requests, failure.api), (0, None));
+        assert!(script.seen.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn check_plan_in_a_change_takes_drafts_with_from() {
+        for pictures in [false, true] {
+            let schema = |edit: bool| {
+                planner_tools::offered_with(pictures, edit)
+                    .into_iter()
+                    .find(|t| t.name == "check_plan")
+                    .unwrap()
+                    .parameters["properties"]["proposal"]
+                    .clone()
+            };
+            assert_eq!(schema(true), proposal::schema_for(true));
+            assert_eq!(schema(false), proposal::schema());
+            let names = |edit: bool| -> Vec<&'static str> {
+                planner_tools::offered_with(pictures, edit)
+                    .iter()
+                    .map(|t| t.name)
+                    .collect()
+            };
+            assert_eq!(names(true), names(false));
+            assert_eq!(
+                planner_tools::offered(pictures)
+                    .iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>(),
+                names(false)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn the_openai_backend_asks_for_the_schema_with_from_when_the_plan_is_changed() {
+        use crate::fake_openai::{Fake, Resp};
+        use crate::session::SessionStore;
+        let fake = Fake::start(|_| Resp::answer("{}")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::session::FileStore(dir.path().join("s.json")));
+        let session = crate::session::sample();
+        store.save(&session).unwrap();
+        let client = crate::openai::Client::new(
+            crate::oauth::Endpoints::local(&fake.base),
+            "oaiapp_1".into(),
+            store,
+            session,
+        );
+        let stream = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let backend = OpenAiBackend::new(
+            std::sync::Arc::new(client),
+            "gpt-6.1-sol".into(),
+            stream,
+            false,
+        );
+        let messages = vec![
+            Item::text(Role::System, "Plan."),
+            Item::text(Role::User, "Part."),
+        ];
+        for edit in [false, true] {
+            backend
+                .reply(&messages, &[], ToolChoice::Auto, edit)
+                .await
+                .unwrap();
+        }
+        let sent = fake.seen("/v1/responses");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[0].json()["text"]["format"]["schema"],
+            proposal::schema()
+        );
+        assert_eq!(
+            sent[1].json()["text"]["format"]["schema"],
+            proposal::schema_for(true)
+        );
+    }
+    #[test]
+    fn applied_joins_setup_1s_planner_note_to_its_notes_and_replaces_the_last_one() {
+        let (mut job, mesh, report) = planned();
+        job.setups[0].p.insert("notes".into(), "Mine".into());
+        let mut proposal = good(&report);
+        proposal.setups[0].workholding = "Vise on the long sides.".into();
+        let (check, built) = plan_check::check(&job, &mesh, &report, &proposal);
+        let outcome = |proposal: Proposal, job: Document| Outcome {
+            proposal,
+            check: check.clone(),
+            job,
+            report: report.clone(),
+            requests: 1,
+            chosen: 1,
+            more_warnings: 0,
+            more_unmachined: 0,
+            note: None,
+        };
+        let first = outcome(proposal.clone(), built.unwrap());
+        let applied_once = applied(&first);
+        let p = &applied_once.setups[0].p;
+        assert_eq!(get(p, "notes"), "Mine · Planner: Vise on the long sides.");
+        assert_eq!(get(p, PLANNER_NOTE_KEY), "Vise on the long sides.");
+        // The outcome's own job is not touched; later setups are as planned.
+        assert_eq!(get(&first.job.setups[0].p, "notes"), "Mine");
+        assert!(!first.job.setups[0].p.contains_key(PLANNER_NOTE_KEY));
+        assert_eq!(applied_once.setups[1].p, first.job.setups[1].p);
+        // A change planned from the applied job: its note replaces the last.
+        let mut next = proposal.clone();
+        next.setups[0].workholding = "Clamp it instead.".into();
+        let second = outcome(next.clone(), applied_once.clone());
+        let p = &applied(&second).setups[0].p.clone();
+        assert_eq!(get(p, "notes"), "Mine · Planner: Clamp it instead.");
+        assert_eq!(get(p, PLANNER_NOTE_KEY), "Clamp it instead.");
+        // Without a note the last one goes and the user's notes stay.
+        next.setups[0].workholding = String::new();
+        let third = outcome(next, applied_once);
+        let p = &applied(&third).setups[0].p.clone();
+        assert_eq!(get(p, "notes"), "Mine");
+        assert!(!p.contains_key(PLANNER_NOTE_KEY));
     }
 }
