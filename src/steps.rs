@@ -2950,8 +2950,15 @@ pub(crate) mod tests {
         // The Outside: the touch on the bar, then a pass with two dials.
         send(&mut a, GuideAction::Go(face + 1));
         shows(&a, &["Touch", "touch Ø50.20", "zero the cross dial"]);
+        let first = nth(&a, 0, |l| matches!(l, L::Pass { .. }));
+        send(&mut a, GuideAction::Go(first));
+        shows(
+            &a,
+            &["Pass 1 of 6", "set the carriage stop at the shoulder"],
+        );
         let third = nth(&a, 2, |l| matches!(l, L::Pass { .. }));
         send(&mut a, GuideAction::Go(third));
+        assert!(!has(&a, "set the carriage stop at the shoulder"));
         shows(
             &a,
             &[
@@ -3094,6 +3101,11 @@ pub(crate) mod tests {
             ],
         );
         assert!(!has(&a, "out to 9.80 (Ø19.80)"));
+        assert!(!has(&a, "set the carriage stop at the bottom"));
+        // The first pass: the carriage stop before the power feed.
+        let first = nth(&a, 0, |l| matches!(l, L::Pass { .. }));
+        send(&mut a, GuideAction::Go(first));
+        shows(&a, &["set the carriage stop at the bottom"]);
         let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
         send(&mut a, GuideAction::Go(measure));
         shows(
@@ -3372,6 +3384,7 @@ pub(crate) mod tests {
         let mut a = bore_app(|_| {});
         let fifth = nth(&a, 4, |l| matches!(l, L::Pass { .. }));
         shot(&mut a, "20-bore-pass", fifth, 1);
+        shot(&mut a, "20a-bore-pass-1", fifth - 4, 0);
         let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
         shot(&mut a, "22-bore-measure", measure, 0);
         // Only inside tools: the Zero touches the end and measures the bar.

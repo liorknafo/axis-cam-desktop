@@ -1582,11 +1582,13 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             cross,
             carriage,
             feed_off,
+            to_jaws,
         } => {
             let bar = bar_of(*op);
             let end = end_of(bar);
             let rings = rings_of(*op);
             let i = index - 1;
+            let first = *index == 1;
             let mut marks = vec![];
             for (j, pieces) in rings.iter().enumerate() {
                 for g in pieces {
@@ -1623,9 +1625,21 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 INK,
                 Align::Center,
             ));
+            if first {
+                // Under power feed: how far the stop leaves the tool from
+                // the jaws, below the bar.
+                let y = -(big_r + 3.);
+                marks.push(Mark::Span([z_end - to_jaws, y], [z_end, y], String::new()));
+                marks.push(Mark::Word(
+                    [z_end + 1., y - 4.],
+                    format!("{} to the jaws", mm(*to_jaws)),
+                    NEVER,
+                    Align::Left,
+                ));
+            }
             let from = touched(g, *op, p.at).unwrap_or(2. * big_r);
             let depth = along.first().map_or(0., |a| (2. * a.0 - from).abs());
-            let left = column![
+            let mut left = column![
                 view(bar, marks, 380.),
                 note(format!(
                     "{} → {} · {} long · {} off the Ø a pass · the last after you measure",
@@ -1635,8 +1649,17 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     fixed(depth, 2)
                 ))
             ]
-            .spacing(4)
-            .into();
+            .spacing(4);
+            if first {
+                // Before the first power feed, under the picture of how
+                // far the jaws are.
+                left = left.push(chips(vec![warn_chip(if *bore {
+                    "set the carriage stop at the bottom"
+                } else {
+                    "set the carriage stop at the shoulder"
+                })]));
+            }
+            let left = left.into();
             // The measurement the last pass reads from.
             let measured = (g.steps.iter()).find_map(|s| match s {
                 Step::Lathe(LatheStep::Measure {
@@ -1668,6 +1691,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             if *feed > 0. {
                 c_chips.push(chip(format!("power feed {}", fixed(*feed, 2))));
             }
+
             let right = column![
                 chips(c_chips),
                 dials(vec![

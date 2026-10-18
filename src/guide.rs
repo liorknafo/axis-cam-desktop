@@ -335,7 +335,8 @@ pub enum LatheStep {
     /// Pass `index` of `of` of an Outside (or Bore, `bore`) to `diameter`:
     /// the cross dial in (out, boring) to `cross`, power feed at `feed`
     /// mm/rev toward the chuck, off at `feed_off` (1 mm before), the last
-    /// mm by hand to `carriage`.
+    /// mm by hand to `carriage`; `to_jaws` from where it stops to the jaws,
+    /// what the carriage stop guards under power feed.
     Pass {
         op: usize,
         index: usize,
@@ -347,6 +348,7 @@ pub enum LatheStep {
         cross: Dial,
         carriage: Dial,
         feed_off: Option<Dial>,
+        to_jaws: f32,
     },
     /// Before the last pass: measure the diameter (`expect` as planned, the
     /// last pass to `target`); typed under `key`, it sets the last pass's
@@ -1207,6 +1209,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                         carriage: zeroes.dial(Slide::Carriage, stop),
                         feed_off: (stop > 1. + 1e-3)
                             .then(|| zeroes.dial(Slide::Carriage, stop - 1.)),
+                        to_jaws: mm(turn::work_z(stock, m.to[2]) + stickout),
                     }));
                     last = Some((d, cross));
                 }
@@ -2335,6 +2338,14 @@ pub(crate) mod tests {
         // Faced 1 mm, the carriage was zeroed on the new end: the shoulder
         // at −65 is 64 from it, 3 turns + 4.0 on a 20-a-turn dial; the power
         // feed goes off 1 mm before, at 3 turns + 3.0.
+        // The shoulder at −65 is 5 from the jaws, 70 out of them.
+        let setup = &doc.setups[0];
+        assert_eq!(num(&setup.p, "stickout"), Some(70.));
+        for l in lathe_steps(&guide) {
+            if let LatheStep::Pass { op: 1, to_jaws, .. } = l {
+                close(*to_jaws, 5.);
+            }
+        }
         for (_, _, carriage, feed_off) in &passes {
             close(carriage.distance, 64.);
             reads(carriage, 3, 4.);
