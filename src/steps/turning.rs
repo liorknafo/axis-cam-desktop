@@ -510,8 +510,11 @@ struct DialFace {
     /// The dial's numbers in one turn, and its divisions.
     turn: f32,
     div: u32,
-    /// The reading, or why there is none.
+    /// What the collar reads at the index, or why there is no number.
     reading: Result<f32, String>,
+    /// Wound out: the collar counted down from 0, so the arc runs
+    /// counter-clockwise from 0 to the reading.
+    out: bool,
 }
 /// The decimals a dial of `turn` numbers a turn over `div` divisions shows.
 fn places(turn: f32, div: f32) -> usize {
@@ -583,13 +586,23 @@ impl canvas::Program<Message> for DialFace {
             Ok(v) => {
                 let turn = self.turn.max(1e-6);
                 if *v > 1e-6 {
+                    // The arc from 0 to the reading, the way the collar
+                    // turned: clockwise winding in, counter-clockwise out.
                     let end = -FRAC_PI_2 + TAU * (v / turn).min(0.999);
+                    let (a0, a1) = if self.out {
+                        (
+                            -FRAC_PI_2 - TAU * (1. - v / turn).clamp(0.001, 0.999),
+                            -FRAC_PI_2,
+                        )
+                    } else {
+                        (-FRAC_PI_2, end)
+                    };
                     let arc = canvas::Path::new(|b| {
                         b.arc(canvas::path::Arc {
                             center: c,
                             radius: r - 3.,
-                            start_angle: iced::Radians(-FRAC_PI_2),
-                            end_angle: iced::Radians(end),
+                            start_angle: iced::Radians(a0),
+                            end_angle: iced::Radians(a1),
                         })
                     });
                     f.stroke(
@@ -669,22 +682,52 @@ fn collar(machine: &crate::model::Machine, slide: Slide) -> (f32, f32) {
         num(&machine.p, d).unwrap_or(100.),
     )
 }
+/// What to do with a dial wound out: "2 turns out", "reads 2.20" (its
+/// collar counts down).
+fn out_tags(d: &Dial) -> Vec<String> {
+    let (t, _) = d.reading.clone().unwrap_or((0, 0.));
+    let r = d.reads.unwrap_or(0.);
+    vec![
+        match t {
+            1 => "1 turn out".into(),
+            t => format!("{t} turns out"),
+        },
+        format!("reads {r:.2}"),
+    ]
+}
+/// The decimals the `slide`'s collar shows.
+fn places_of(p: &Page<'_>, slide: Slide) -> usize {
+    let (turn, div) = collar(&p.setup.machine, slide);
+    places(turn, div)
+}
 /// What the page says of a dial's number.
 struct Reading {
     /// The whole turns and the reading, when there is a number.
     at: Option<(u32, f32)>,
     /// The number the dial goes to from its zero, in its own numbers
-    /// (turns × a turn + the reading): "6.00".
+    /// (turns × a turn + the reading): "6.00"; wound out, the turns and
+    /// what the collar reads, "2 t out, 2.20", as it counts down.
     total: String,
-    /// "1 t + 2.00".
+    /// "1 t + 2.00", "2 t out, 2.20".
     short: String,
-    /// "1 turn + 2.00".
+    /// "1 turn + 2.00", "2 turns out, reads 2.20".
     long: String,
 }
 fn reading(p: &Page<'_>, d: &Dial) -> Reading {
     let (turn, div) = collar(&p.setup.machine, d.slide);
     let k = places(turn, div);
     match &d.reading {
+        Ok((t, r)) if d.out => {
+            let reads = fixed(d.reads.unwrap_or(0.), k);
+            let turns = if *t == 1 { "turn" } else { "turns" };
+            let short = format!("{t} t out, {reads}");
+            Reading {
+                at: Some((*t, *r)),
+                total: short.clone(),
+                short,
+                long: format!("{t} {turns} out, reads {reads}"),
+            }
+        }
         Ok((t, r)) => {
             let reading = fixed(*r, k);
             let turns = match t {
@@ -721,6 +764,7 @@ fn dial_box<'a>(p: &Page<'a>, d: &Dial, sub: String, size: f32) -> Element<'a, M
     let r = reading(p, d);
     let name = slide_name(d.slide);
     let title = match r.at {
+        Some(_) if d.out => r.long.clone(),
         Some((0, _)) | None => name.to_string(),
         Some((1, _)) => format!("{name} · 1 turn +"),
         Some((t, _)) => format!("{name} · {t} turns +"),
@@ -728,7 +772,19 @@ fn dial_box<'a>(p: &Page<'a>, d: &Dial, sub: String, size: f32) -> Element<'a, M
     let face = DialFace {
         turn,
         div: div.max(1.) as u32,
-        reading: d.reading.as_ref().map(|(_, v)| *v).map_err(|e| e.clone()),
+        reading: match (&d.reading, d.out) {
+            (Ok(_), true) => Ok(d.reads.unwrap_or(0.)),
+            (Ok((_, v)), false) => Ok(*v),
+            (Err(e), _) => Err(e.clone()),
+        },
+        out: d.out,
+    };
+    // Wound out, the title is the turns and the reading; the slide is named
+    // under the dial.
+    let sub = if d.out {
+        format!("{name} · {sub}")
+    } else {
+        sub
     };
     column![
         bold(title, 13),
@@ -737,7 +793,7 @@ fn dial_box<'a>(p: &Page<'a>, d: &Dial, sub: String, size: f32) -> Element<'a, M
     ]
     .spacing(2)
     .align_x(Alignment::Center)
-    .width(size + 60.)
+    .width(if d.out { size + 100. } else { size + 60. })
     .into()
 }
 /// The dials side by side, centred.
@@ -1005,6 +1061,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     turn,
                     div: div.max(1.) as u32,
                     reading: Ok(*dialed),
+                    out: false,
                 };
                 column![
                     bold(format!("Ø went down by {}", fixed(dialed * times, 2)), 13),
@@ -1381,6 +1438,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             let c = reading(p, cross);
             let at = reading(p, carriage);
             let mut cross_tags = match c.at {
+                Some(_) if cross.out => out_tags(cross),
                 Some(_) => vec![format!("{} on the dial", c.long)],
                 None => vec![c.long.clone()],
             };
@@ -1404,7 +1462,11 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     dial_box(
                         p,
                         cross,
-                        format!("{way} to {} ({})", c.total, dia(*diameter)),
+                        if cross.out {
+                            format!("out to {}", dia(*diameter))
+                        } else {
+                            format!("{way} to {} ({})", c.total, dia(*diameter))
+                        },
                         112.
                     ),
                     dial_box(p, carriage, format!("stop at {}", at.short), 112.),
@@ -1514,7 +1576,11 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     .push(dials(vec![dial_box(
                         p,
                         cross,
-                        format!("{way} to {} → {}", c.total, dia(*target)),
+                        if cross.out {
+                            format!("out → {}", dia(*target))
+                        } else {
+                            format!("{way} to {} → {}", c.total, dia(*target))
+                        },
                         140.,
                     )]));
             }
@@ -1831,7 +1897,14 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 dials(vec![dial_box(
                     p,
                     top,
-                    format!("pass {index}: in to {}", t.total),
+                    if top.out {
+                        format!(
+                            "pass {index}: out, reads {}",
+                            fixed(top.reads.unwrap_or(0.), places_of(p, Slide::Top))
+                        )
+                    } else {
+                        format!("pass {index}: in to {}", t.total)
+                    },
                     118.
                 )]),
                 line(
@@ -1847,8 +1920,20 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     "top slide",
                     big(t.total.clone(), lit(1, item)),
                     vec![
-                        "in from the touch".into(),
-                        format!("{} toward the axis", fixed(*infeed, 3))
+                        if top.out {
+                            "out from the touch".into()
+                        } else {
+                            "in from the touch".into()
+                        },
+                        format!(
+                            "{} {}",
+                            fixed(*infeed, 3),
+                            if top.out {
+                                "away from the axis"
+                            } else {
+                                "toward the axis"
+                            }
+                        )
                     ],
                     lit(1, item),
                     reached(1),

@@ -157,17 +157,33 @@ pub struct Dial {
     /// the carriage the travel toward the chuck from its zero on the end;
     /// for the top slide and the quill the travel along them.
     pub distance: f32,
-    /// Whole turns and the reading, or why there is no number:
-    /// `lathe::CHECK_THE_DIAL` while the cross-slide dial is not known, never
-    /// a guessed reading.
+    /// Whole turns and how far past them the handle is wound (in the dial's
+    /// numbers), or why there is no number: `lathe::CHECK_THE_DIAL` while
+    /// the cross-slide dial is not known, never a guessed reading.
     pub reading: Result<(u32, f32), String>,
+    /// Wound out, away from the work (a bore's cross slide, an inside
+    /// thread's top slide): the collar counts down from its zero.
+    pub out: bool,
+    /// What the collar reads at its index once set (`lathe::reads`): the
+    /// reading winding in, `turn − reading` winding out.
+    pub reads: Option<f32>,
 }
 impl Dial {
+    /// Wound in from its zero.
     pub fn new(machine: &Machine, slide: Slide, distance: f32) -> Self {
+        Self::wound(machine, slide, distance, false)
+    }
+    /// Wound `out` (or in) from its zero.
+    pub fn wound(machine: &Machine, slide: Slide, distance: f32, out: bool) -> Self {
+        let reading = lathe::dial(machine, slide, distance);
+        let reads =
+            (reading.as_ref().ok()).and_then(|(_, r)| lathe::reads(machine, slide, *r, out));
         Self {
             slide,
             distance,
-            reading: lathe::dial(machine, slide, distance),
+            reading,
+            out,
+            reads,
         }
     }
     /// No number until the dial check is answered.
@@ -192,13 +208,18 @@ impl Dial {
             _ => amount,
         })
     }
-    /// "1 turn + 2.00", or why there is no number.
+    /// "1 turn + 2.00", "2 turns out, reads 2.20", or why there is no
+    /// number.
     pub fn text(&self) -> String {
-        match &self.reading {
-            Ok((0, r)) => format!("{r:.2}"),
-            Ok((1, r)) => format!("1 turn + {r:.2}"),
-            Ok((t, r)) => format!("{t} turns + {r:.2}"),
-            Err(e) => e.clone(),
+        match (&self.reading, self.out) {
+            (Ok((t, _)), true) => {
+                let turns = if *t == 1 { "turn" } else { "turns" };
+                format!("{t} {turns} out, reads {:.2}", self.reads.unwrap_or(0.))
+            }
+            (Ok((0, r)), false) => format!("{r:.2}"),
+            (Ok((1, r)), false) => format!("1 turn + {r:.2}"),
+            (Ok((t, r)), false) => format!("{t} turns + {r:.2}"),
+            (Err(e), _) => e.clone(),
         }
     }
 }
@@ -930,6 +951,10 @@ impl Zeroes<'_> {
     fn dial(&self, slide: Slide, distance: f32) -> Dial {
         Dial::new(self.machine, slide, mm(distance))
     }
+    /// A dial wound `out` (or in) by `distance`.
+    fn wound(&self, slide: Slide, distance: f32, out: bool) -> Dial {
+        Dial::wound(self.machine, slide, mm(distance), out)
+    }
 }
 /// The guide of setup `si`, a setup on the manual lathe: Set up (the dial
 /// check while the cross-slide dial is not known, Hold, Zero), one section
@@ -1100,7 +1125,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                 for (i, m) in along.iter().enumerate() {
                     let d = mm(2. * m.to[0]);
                     let off = |to: f32| if bore { to - from } else { from - to };
-                    let mut cross = zeroes.dial(Slide::Cross, off(d));
+                    let mut cross = zeroes.wound(Slide::Cross, off(d), bore);
                     if i + 1 == n {
                         let expect = last.as_ref().map_or(from, |l| l.0);
                         steps.push(Step::Lathe(LatheStep::Measure {
@@ -1121,6 +1146,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                             cross = if left < -1e-3 {
                                 Dial {
                                     reading: Err(format!("Ø{was:.2} is past Ø{d:.2} already.")),
+                                    reads: None,
                                     ..cross
                                 }
                             } else if past {
@@ -1128,10 +1154,11 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                                     reading: Err(format!(
                                         "Ø{was:.2} is not what was cut from Ø{from:.2}: measure again."
                                     )),
+                                    reads: None,
                                     ..cross
                                 }
                             } else {
-                                zeroes.dial(Slide::Cross, at + left.max(0.))
+                                zeroes.wound(Slide::Cross, at + left.max(0.), bore)
                             };
                         }
                     }
@@ -1253,7 +1280,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                         pitch,
                         angle,
                         infeed,
-                        top: zeroes.dial(Slide::Top, top_travel(infeed, angle)),
+                        top: zeroes.wound(Slide::Top, top_travel(infeed, angle), inside),
                         carriage: zeroes.dial(Slide::Carriage, zc - z0),
                     }));
                 }
@@ -2407,6 +2434,10 @@ pub(crate) mod tests {
                     "{d:?}"
                 );
                 assert!(d.reading.is_ok(), "{d:?}");
+                // Nothing on the outside part winds out: each reads what
+                // it is wound.
+                assert!(!d.out, "{d:?}");
+                assert_eq!(d.reads, d.reading.as_ref().ok().map(|r| r.1), "{d:?}");
             }
         }
     }
@@ -2600,9 +2631,20 @@ pub(crate) mod tests {
         assert_eq!(shown, [11.96, 13.92, 15.88, 17.84, 19.8, 20.]);
         for (d, cross, carriage, _) in &bore {
             close(cross.distance, d - 10.);
+            assert!(cross.out && !carriage.out, "{cross:?}");
             reads(carriage, 1, 0.);
         }
+        // Wound out from the zero on the Ø10 hole the collar counts down:
+        // pass 5 is 9.80 out on a 4-a-turn diameter dial, 2 turns and 1.80
+        // more, so the collar reads 4 − 1.80 = 2.20.
+        close(bore[4].1.distance, 9.8);
+        reads(bore[4].1, 2, 1.8);
+        close(bore[4].1.reads.unwrap(), 2.2);
+        assert_eq!(bore[4].1.text(), "2 turns out, reads 2.20");
+        // Pass 1: 1.96 out reads 2.04; the last, 10.00 out, reads 2.00.
+        assert_eq!(bore[0].1.text(), "0 turns out, reads 2.04");
         reads(bore[5].1, 2, 2.);
+        close(bore[5].1.reads.unwrap(), 2.);
         // Measured Ø19.88 after 9.80: the 0.12 left on the last pass.
         let id = doc.setups[0].operations[1].id.clone();
         set_measured(&mut doc, &id, 19.88);
@@ -2610,11 +2652,46 @@ pub(crate) mod tests {
         let last = passes(&guide, 1)[5].1;
         close(last.distance, 9.92);
         reads(last, 2, 1.92);
+        assert_eq!(last.text(), "2 turns out, reads 2.08");
         assert!(
             lathe_steps(&guide)
                 .iter()
                 .any(|l| matches!(l, LatheStep::Pass { bore: true, .. }))
         );
+        // An inside thread feeds the top slide out, away from the axis: its
+        // collar counts down too.
+        doc.measured.clear();
+        doc.setups[0].operations[1]
+            .p
+            .insert("diameter".into(), "20.4".into());
+        add(
+            &mut doc,
+            "Thread",
+            &[
+                ("thread_side", "Inside"),
+                ("diameter", "22"),
+                ("pitch", "1.5"),
+                ("z_end", "-15"),
+            ],
+        );
+        let guide = build(&doc, &mesh, 0).unwrap();
+        let tops: Vec<&Dial> = (lathe_steps(&guide).into_iter())
+            .filter_map(|l| match l {
+                LatheStep::ThreadPass { top, carriage, .. } => {
+                    assert!(!carriage.out);
+                    Some(top)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!tops.is_empty());
+        let machine = &doc.setups[0].machine;
+        for top in tops {
+            assert!(top.out, "{top:?}");
+            let (_, r) = top.reading.clone().unwrap();
+            assert_eq!(top.reads, lathe::reads(machine, Slide::Top, r, true));
+            close(top.reads.unwrap(), (2. - r) % 2.);
+        }
     }
     #[test]
     fn the_tailstock_drill_reads_its_depth_and_point_on_the_quill() {

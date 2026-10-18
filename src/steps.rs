@@ -2835,10 +2835,39 @@ pub(crate) mod tests {
     /// parted off) with its cross dial reading `reads` ("" = not known),
     /// `edit` made to it, on MACHINE with its guide built.
     pub(crate) fn lathe_app(reads: &str, edit: impl FnOnce(&mut Document)) -> App {
+        let (doc, mesh) = crate::guide::tests::sample(reads);
+        lathe_app_of(doc, mesh, edit)
+    }
+    /// A sleeve with a Ø21 bore: a Ø10 drill, then a bore to Ø20, on a
+    /// lathe whose cross dial reads the diameter.
+    pub(crate) fn bore_app(edit: impl FnOnce(&mut Document)) -> App {
+        use crate::turn::tests::{add, job, tube};
+        let (mut doc, mesh) = job(50.2, 100., tube(10.5, 17.5, 0., 61.), -62.);
+        let m = &mut doc.setups[0].machine;
+        m.p.insert("cross_reads".into(), "Diameter".into());
+        for t in &mut doc.tools {
+            if get(&t.p, "type") == "Boring bar" {
+                t.p.insert("min_bore".into(), "8".into());
+            }
+        }
+        add(&mut doc, "Drill", &[("depth", "30")]);
+        add(
+            &mut doc,
+            "Bore",
+            &[
+                ("diameter", "20"),
+                ("z_end", "-20"),
+                ("depth", "2"),
+                ("finish", "0.2"),
+                ("allowance", "0"),
+            ],
+        );
+        lathe_app_of(doc, mesh, edit)
+    }
+    fn lathe_app_of(mut doc: Document, mesh: Mesh, edit: impl FnOnce(&mut Document)) -> App {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
         a.test_dir = Some(dir);
-        let (mut doc, mesh) = crate::guide::tests::sample(reads);
         doc.file = Some(crate::model::ModelFile {
             name: "sleeve.stl".into(),
             path: std::path::PathBuf::from("sleeve.stl"),
@@ -3038,6 +3067,30 @@ pub(crate) mod tests {
         assert!(!has(&a, "Check the cross-slide dial"));
     }
     #[test]
+    fn a_bore_pass_shows_what_the_collar_reads_wound_out() {
+        let mut a = bore_app(|_| {});
+        let fifth = nth(&a, 4, |l| matches!(l, L::Pass { .. }));
+        send(&mut a, GuideAction::Go(fifth));
+        shows(
+            &a,
+            &[
+                "Pass 5 of 6",
+                "2 turns out, reads 2.20",
+                "cross slide · out to Ø19.80",
+                "2 t out, 2.20",
+                "2 turns out",
+                "reads 2.20",
+            ],
+        );
+        assert!(!has(&a, "out to 9.80 (Ø19.80)"));
+        let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
+        send(&mut a, GuideAction::Go(measure));
+        shows(
+            &a,
+            &["2 turns out, reads 2.00", "cross slide · out → Ø20.00"],
+        );
+    }
+    #[test]
     fn until_the_dial_check_is_answered_the_cross_slide_shows_no_number() {
         let mut a = lathe_app("", |_| {});
         shows(
@@ -3226,5 +3279,11 @@ pub(crate) mod tests {
         let chamfer = nth(&a, 0, |l| matches!(l, L::Chamfer { .. }));
         shot(&mut a, "18-chamfer-shoulder", chamfer, 0);
         shot(&mut a, "19-chamfer-end", chamfer + 1, 0);
+        // A bore: the cross slide winds out, its collar counting down.
+        let mut a = bore_app(|_| {});
+        let fifth = nth(&a, 4, |l| matches!(l, L::Pass { .. }));
+        shot(&mut a, "20-bore-pass", fifth, 1);
+        let measure = nth(&a, 0, |l| matches!(l, L::Measure { .. }));
+        shot(&mut a, "22-bore-measure", measure, 0);
     }
 }

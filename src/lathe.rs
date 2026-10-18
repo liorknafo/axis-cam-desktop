@@ -263,6 +263,22 @@ pub fn dial(m: &Machine, slide: Slide, distance: f32) -> Result<(u32, f32), Stri
     Ok((turns as u32, (rest as f64 * division) as f32))
 }
 
+/// What the `slide`'s collar reads at its index once the handle is wound
+/// `reading` past its whole turns (the reading `dial` gives, in the dial's
+/// numbers): the same number winding in; winding `out`, the collar counts
+/// down from its zero, so it reads `(turn − reading) mod turn`. None when
+/// the machine has no usable dial for it.
+pub fn reads(m: &Machine, slide: Slide, reading: f32, out: bool) -> Option<f32> {
+    if !out {
+        return Some(reading);
+    }
+    let (turn_key, div_key) = slide.keys();
+    let turn = num(&m.p, turn_key).filter(|v| *v > 0.)? as f64;
+    let div = num(&m.p, div_key).filter(|v| *v >= 1. && v.fract() == 0.)? as u64;
+    let division = turn / div as f64;
+    let k = (reading as f64 / division).round() as u64 % div;
+    Some((((div - k) % div) as f64 * division) as f32)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +445,28 @@ mod tests {
         assert!(near(r, 1.4), "{r}");
     }
 
+    #[test]
+    fn winding_out_the_collar_counts_down_from_its_zero() {
+        let mut m = defaults();
+        with(&mut m, "cross_reads", "Diameter");
+        // 9.80 out on a 4-a-turn dial: 2 turns and 1.80 more, so the collar
+        // reads 4 − 1.80 = 2.20; in, it reads 1.80.
+        let (turns, reading) = dial(&m, Slide::Cross, 9.8).unwrap();
+        assert_eq!(turns, 2);
+        assert!(near(reading, 1.8), "{reading}");
+        assert!(near(reads(&m, Slide::Cross, reading, true).unwrap(), 2.2));
+        assert!(near(reads(&m, Slide::Cross, reading, false).unwrap(), 1.8));
+        // Whole turns out read 0, not 4.
+        let (turns, reading) = dial(&m, Slide::Cross, 8.).unwrap();
+        assert_eq!(
+            (turns, reads(&m, Slide::Cross, reading, true)),
+            (2, Some(0.))
+        );
+        // The top slide: 0.64 out of 2 a turn reads 1.36.
+        assert!(near(reads(&m, Slide::Top, 0.64, true).unwrap(), 1.36));
+        with(&mut m, "top_div", "0");
+        assert_eq!(reads(&m, Slide::Top, 0.64, true), None);
+    }
     #[test]
     fn a_negative_or_unusable_distance_or_dial_is_refused() {
         let mut m = defaults();
