@@ -131,6 +131,36 @@ fn outlined_btn<'a>(label: String, msg: Message, deletes: bool) -> HelpButton<'a
         .style(move |_, status| outlined(deletes, status));
     HelpButton::new(b, &action, label)
 }
+/// The line icons of `icon_btn`, drawn black and tinted to the button's ink.
+pub(crate) const IC_DUPLICATE: &[u8] = include_bytes!("../assets/ic-duplicate.svg");
+pub(crate) const IC_SUPPRESS: &[u8] = include_bytes!("../assets/ic-suppress.svg");
+pub(crate) const IC_ENABLE: &[u8] = include_bytes!("../assets/ic-enable.svg");
+pub(crate) const IC_UP: &[u8] = include_bytes!("../assets/ic-up.svg");
+pub(crate) const IC_DOWN: &[u8] = include_bytes!("../assets/ic-down.svg");
+pub(crate) const IC_DELETE: &[u8] = include_bytes!("../assets/ic-delete.svg");
+/// `secondary` or `danger` with an icon for its text, for a row of commands
+/// too many to name: `label` is still the hover help's title.
+pub(crate) fn icon_btn<'a>(
+    icon: &'static [u8],
+    label: impl Into<String>,
+    msg: Message,
+    deletes: bool,
+) -> HelpButton<'a> {
+    let action = msg.clone();
+    let ink = if deletes { ERROR[1] } else { INK };
+    // 17 px: the line height of `outlined_btn`'s 13 px text, so a text
+    // button beside it stands as tall.
+    let b = button(
+        svg(svg::Handle::from_memory(icon))
+            .width(17)
+            .height(17)
+            .style(move |_, _| svg::Style { color: Some(ink) }),
+    )
+    .on_press(msg)
+    .padding([BUTTON_PAD, 10])
+    .style(move |_, status| outlined(deletes, status));
+    HelpButton::new(b, &action, label.into())
+}
 fn outlined(deletes: bool, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     let (ink, edge, hover) = if deletes {
@@ -2866,23 +2896,20 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             .spacing(6),
         )
     } else {
+        let (toggle, toggle_icon) = if o.enabled {
+            ("Suppress", IC_SUPPRESS)
+        } else {
+            ("Enable", IC_ENABLE)
+        };
         foot.push(
             row![
-                secondary("Duplicate", Message::DuplicateOp),
-                secondary(
-                    if o.enabled { "Suppress" } else { "Enable" },
-                    Message::ToggleOp,
-                ),
+                icon_btn(IC_DUPLICATE, "Duplicate", Message::DuplicateOp, false),
+                icon_btn(toggle_icon, toggle, Message::ToggleOp, false),
+                icon_btn(IC_UP, "Move up", Message::MoveOp(-1), false),
+                icon_btn(IC_DOWN, "Move down", Message::MoveOp(1), false),
                 space().width(Fill),
                 // Apart from the safe commands, at the end of the row.
-                danger("Delete…", Message::AskRemoveOp)
-            ]
-            .spacing(6),
-        )
-        .push(
-            row![
-                secondary("Move up", Message::MoveOp(-1)),
-                secondary("Move down", Message::MoveOp(1))
+                icon_btn(IC_DELETE, "Delete…", Message::AskRemoveOp, true)
             ]
             .spacing(6),
         )
@@ -3267,20 +3294,26 @@ fn setup_editor(app: &App) -> Panel<'_> {
         _ => setup_machine(app, c),
     };
     // Pinned under the body: the checks and the setup's actions.
-    let mut foot = column![
-        warnings(s.issues()),
-        secondary("Duplicate setup", Message::DuplicateSetup).width(Fill),
-        row![
-            secondary("Move up", Message::MoveSetup(-1)),
-            secondary("Move down", Message::MoveSetup(1))
-        ]
-        .spacing(5)
-    ]
-    .spacing(12);
+    let mut foot = column![warnings(s.issues())].spacing(12);
     if app.confirm_delete_setup {
         foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![secondary("Cancel",Message::ConfirmDeleteSetup(false)),danger("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
     } else {
-        foot = foot.push(danger("Delete setup…", Message::RemoveSetup).width(Fill));
+        // The operation editor's row of icons (`operation_editor`).
+        foot = foot.push(
+            row![
+                icon_btn(
+                    IC_DUPLICATE,
+                    "Duplicate setup",
+                    Message::DuplicateSetup,
+                    false
+                ),
+                icon_btn(IC_UP, "Move up", Message::MoveSetup(-1), false),
+                icon_btn(IC_DOWN, "Move down", Message::MoveSetup(1), false),
+                space().width(Fill),
+                icon_btn(IC_DELETE, "Delete setup…", Message::RemoveSetup, true)
+            ]
+            .spacing(6),
+        );
     }
     Panel {
         head: head.into(),
