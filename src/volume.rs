@@ -122,6 +122,19 @@ impl Volume {
         let size = bounds.dimensions();
         let step = size.into_iter().fold(0., f32::max) / 96.;
         let n = size.map(|v| (v / step).ceil().clamp(1., 96.) as usize);
+        Self::of(bounds, frame, n)
+    }
+    /// The stock `bounds` in cells at most `most` mm on a side, and no
+    /// larger than `new`'s: a finer grid for a check that must tell a few
+    /// millimetres apart (`rotary_check`'s part-off), cut with `carve`.
+    pub fn finer(bounds: Bounds, frame: Frame, most: f32) -> Self {
+        let size = bounds.dimensions();
+        let coarse = Self::new(bounds, frame);
+        let n = std::array::from_fn(|k| coarse.n[k].max((size[k] / most).ceil().max(1.) as usize));
+        Self::of(bounds, frame, n)
+    }
+    fn of(bounds: Bounds, frame: Frame, n: [usize; 3]) -> Self {
+        let size = bounds.dimensions();
         let cell = std::array::from_fn(|k| size[k] / n[k] as f32);
         let count = n.iter().product();
         Self {
@@ -288,6 +301,27 @@ impl Volume {
             cuts.push(cut);
         }
         self.version = self.version.wrapping_add(1);
+        self.clear(ranges, a, b, radius, flute, shape, current);
+    }
+    /// Takes away what `cut`, made on another grid of the same stock (its
+    /// `cuts`), sweeps, without keeping it among this grid's cuts.
+    pub fn carve(&mut self, cut: &crate::stock_surface::Cut) {
+        let (a, b, r, flute) = (cut.a, cut.b, cut.radius, cut.flute);
+        if let Some(ranges) = self.ranges(a, b, r, flute, cut.frame) {
+            self.clear(ranges, a, b, r, flute, cut.shape, cut.frame);
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn clear(
+        &mut self,
+        ranges: [(usize, usize); 3],
+        a: [f32; 3],
+        b: [f32; 3],
+        radius: f32,
+        flute: f32,
+        shape: CutterShape,
+        current: Frame,
+    ) {
         for z in ranges[2].0..ranges[2].1 {
             for y in ranges[1].0..ranges[1].1 {
                 for x in ranges[0].0..ranges[0].1 {

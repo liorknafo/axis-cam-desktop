@@ -5021,10 +5021,15 @@ pub(crate) mod tests {
             ),
             "{shown:?}"
         );
-        // ... which the model is sent, and the second plan passes.
-        assert_eq!((outcome.requests, outcome.chosen), (2, 2));
+        // ... which the model is sent, and the second plan passes. Its
+        // contour stops 7 mm over the axis, leaving the web that holds the
+        // part (LIO-211), so the middle of the square's sides is still
+        // covered: the planner asks once to machine it, and the same plan,
+        // answered again, stands.
+        assert_eq!((outcome.requests, outcome.chosen), (3, 3), "{events:?}");
+        assert!(events.contains(&Event::Stage(Progress::Extending(3))));
         let sent = fake.seen("/v1/responses");
-        assert_eq!(sent.len(), 2);
+        assert_eq!(sent.len(), 3);
         let first = sent[0].json();
         assert!(first.to_string().contains("ROTARY A AXIS"));
         let schema = first["text"]["format"]["schema"].to_string();

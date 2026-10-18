@@ -5480,10 +5480,10 @@ spindle_max_rpm = 24000
 
     /// LIO-209's job on the library CNC4030 + rotary (55 mm of Z, the A
     /// centreline at machine Y 140 Z -40, a Ø100 chuck, its face at machine
-    /// X 20): a contour round a part `x0` mm along a Ø`bar` bar `stickout`
-    /// mm out of the jaws, down to 2 mm over the axis (the web keeps the
-    /// part on the bar, LIO-208), at A 0, 90, 180 and -90, on
-    /// `controller`, its UC100 profile in `dir`.
+    /// X 20): the four sides of a square part `x0` mm along a Ø`bar` bar
+    /// `stickout` mm out of the jaws faced, so that it comes out square,
+    /// joined to the bar at a shoulder (LIO-211), at A 0, 90, 180 and -90,
+    /// on `controller`, its UC100 profile in `dir`.
     fn library_bar_job(
         dir: &Path,
         mesh: &crate::mesh::Mesh,
@@ -5492,8 +5492,8 @@ spindle_max_rpm = 24000
         bar: f32,
         controller: &str,
     ) -> crate::model::Document {
-        use crate::indexed::tests::{bar_job, cutter, on_the_bar};
-        let mut op = on_the_bar(&cutter("12"));
+        use crate::indexed::tests::{bar_job, cutter, faced_square};
+        let mut op = faced_square(&cutter("12"), mesh);
         for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
             op.p.insert(k.into(), v.into());
         }
@@ -5643,13 +5643,9 @@ spindle_max_rpm = 24000
             "15 mm above the top of the machine's 55 mm Z travel (Z 0)",
         ];
         let says = |e: &[String]| words.iter().all(|w| e.iter().any(|e| e.contains(w)));
-        // The contour from the bar's top to 15 mm over the part's bottom,
-        // within the cutter's reach.
-        let thick = |controller| {
-            let mut doc = job(&mesh, 20., "100", 80., controller);
-            (doc.setups[1].operations[0].p).insert("bottom".into(), "15".into());
-            doc
-        };
+        // Facing from the bar's top to the square's sides, 30 mm, within the
+        // cutter's reach.
+        let thick = |controller| job(&mesh, 20., "100", 80., controller);
         let exported = crate::post::post_job(&thick("LinuxCNC"), &mesh);
         let refused = exported.setups[1].result.as_ref().unwrap_err();
         assert!(says(refused), "{refused:?}");
@@ -5904,11 +5900,12 @@ spindle_max_rpm = 24000
     /// commanded to, back at A0.
     #[test]
     fn an_indexed_bar_runs_at_four_angles_turning_a_alone() {
-        use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
+        use crate::indexed::tests::{bar_job, cutter, faced_square, prism};
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mesh = prism(30.);
-        let mut op = on_the_bar(&cutter("12"));
+        // Its four sides faced, each at the angle that brings it on top.
+        let mut op = faced_square(&cutter("12"), &mesh);
         // A few seconds a pass: fast feeds, deep steps.
         for (k, v) in [("feed", "20000"), ("stepdown", "10"), ("coolant", "Off")] {
             op.p.insert(k.into(), v.into());
@@ -6170,8 +6167,7 @@ spindle_max_rpm = 24000
         );
         // The live carve followed A (LIO-190): the volume it cut at each
         // angle leaves the square on the bar's axis, the bar round it gone
-        // but within 2 mm of the planes through the axis, where the cuts stop
-        // to leave the web that keeps the part on the bar (LIO-208).
+        // (LIO-211).
         let (carved, _) = run.carved_volume().expect("a live carve of the volume");
         assert!(run.stock().is_none(), "the top view is not carved");
         let base = crate::volume::Frame::new(&doc.setups[0], &mesh);

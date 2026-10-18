@@ -40,6 +40,69 @@ pub const ORIGINS: [&str; 2] = ["A axis at stock end", "A axis at chuck face"];
 /// else (placement, work zero and offset, workholding) is its base's.
 const OWN: [&str; 5] = ["name", "notes", "reposition", ANGLES, "stock_source"];
 
+/// `op` as it runs on the part `posed` at one of its setup's angles: a
+/// Facing operation whose selected faces are not all on top there faces
+/// those that are, so that one operation faces a square's four sides at A
+/// 0, 90, 180 and 270° (LIO-211). Unchanged otherwise, and when none of its
+/// faces is on top, which the facing then refuses.
+pub fn on_top<'a>(
+    op: &'a crate::model::Operation,
+    posed: &Setup,
+    mesh: &Mesh,
+) -> std::borrow::Cow<'a, crate::model::Operation> {
+    use std::borrow::Cow;
+    let Some(selection) = op.surfaces.as_ref() else {
+        return Cow::Borrowed(op);
+    };
+    if op.strategy != crate::model::Strategy::Face || selection.ids.len() < 2 {
+        return Cow::Borrowed(op);
+    }
+    let angles = crate::stock::Placement::new(mesh, Some(posed)).rotation();
+    let up = (selection.ids.iter().copied())
+        .filter(|&id| {
+            mesh.surfaces
+                .get(id)
+                .is_some_and(|f| rotation(f.normal, angles)[2] >= 0.5f32.to_radians().cos())
+        })
+        .collect::<Vec<_>>();
+    if up.is_empty() || up.len() == selection.ids.len() {
+        return Cow::Borrowed(op);
+    }
+    let mut op = op.clone();
+    if let Some(s) = op.surfaces.as_mut() {
+        s.ids = up;
+    }
+    Cow::Owned(op)
+}
+/// The selected surfaces' problems (`surface::issues`) of operation `op` of
+/// setup `si`: an indexed setup's at each of its angles, with the part
+/// posed there and its faces on top there (`on_top`), each said once.
+pub fn surface_issues(
+    doc: &Document,
+    si: usize,
+    op: &crate::model::Operation,
+    mesh: Option<&Mesh>,
+) -> Vec<String> {
+    let setup = &doc.setups[si];
+    let (Some(mesh), Ok(list)) = (mesh, angles(setup)) else {
+        return crate::surface::issues(op, setup, mesh);
+    };
+    if !is_indexed(setup) {
+        return crate::surface::issues(op, setup, Some(mesh));
+    }
+    let mut out: Vec<String> = vec![];
+    for a in list {
+        let Ok(posed) = doc.setup_at(setup, si, a, mesh) else {
+            return crate::surface::issues(op, setup, Some(mesh));
+        };
+        for issue in crate::surface::issues(&on_top(op, &posed, mesh), &posed, Some(mesh)) {
+            if !out.contains(&issue) {
+                out.push(issue);
+            }
+        }
+    }
+    out
+}
 /// Whether `setup` is indexed: its Reposition action is `ACTION` and it
 /// lists A angles.
 pub fn is_indexed(setup: &Setup) -> bool {
@@ -815,7 +878,7 @@ pub fn generate(
             .as_ref()
             .filter(|v| !v.cuts.is_empty())
             .map(|v| std::sync::Arc::new(crate::rest::RestStock::new(v, at.frame)));
-        let mut plan = crate::simulation::generate(&posed, op, tool, mesh)
+        let mut plan = crate::simulation::generate(&posed, &on_top(op, &posed, mesh), tool, mesh)
             .map_err(|e| format!("At A {}°: {e}", degrees(a)))?;
         for m in &mut plan.moves {
             m.a = Some(a);
@@ -1384,13 +1447,33 @@ pub(crate) mod tests {
         op.p.insert("allowance".into(), "0".into());
         op
     }
-    /// `contour` down to 2 mm over the A axis instead, the part's bottom
+    /// `contour` down to 7 mm over the A axis instead, the part's bottom
     /// being 10 mm under it: at angles 180° apart its passes across the
-    /// bar's ends leave a 4 mm web on the axis, which keeps the part on the
-    /// bar in the chuck (LIO-208).
+    /// bar's ends leave a 14 mm web on the axis, which holds the part on the
+    /// bar in the chuck against the cut (LIO-208, LIO-211: a 4 mm one does
+    /// not).
     pub(crate) fn on_the_bar(tool: &crate::model::Tool) -> crate::model::Operation {
         let mut op = contour(tool);
-        op.p.insert("bottom".into(), "12".into());
+        op.p.insert("bottom".into(), "17".into());
+        op
+    }
+    /// Facing the four sides of `prism`'s square, its ±Y and ±Z faces, each
+    /// at the angle that brings it to the top (`on_top`), the tool's centre
+    /// out to the face's edges: at A 90, 180, 270 and 0° the bar comes out
+    /// square over the part, joined to the bar at a shoulder towards the
+    /// jaws (LIO-211). The demo 4-angle job.
+    pub(crate) fn faced_square(tool: &crate::model::Tool, mesh: &Mesh) -> crate::model::Operation {
+        use crate::model::{Operation, Strategy};
+        let mut op = Operation::new(Strategy::Face, tool.id.clone());
+        let ids = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, f)| f.normal[0].abs() < 0.01)
+            .map(|(i, _)| i)
+            .collect();
+        op.surfaces = Some(crate::surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids,
+        });
+        op.p.insert("containment".into(), "Tool center on boundary".into());
         op
     }
     /// The angles the moves of `plan` are made at, each once, in order.
@@ -2222,9 +2305,10 @@ pub(crate) mod tests {
     }
     #[test]
     fn each_angles_cuts_are_checked_against_the_jaws_at_that_angle() {
-        // The part 20 mm from the jaws: round it the holder comes within
-        // their gap at the angles it is cut at.
-        let (doc, mesh) = posting_bar_job(0., "80", "90, 180");
+        // The part 20 mm from the jaws, cut to 2 mm over the axis: round it
+        // the holder comes within their gap at the angles it is cut at.
+        let (mut doc, mesh) = posting_bar_job(0., "80", "90, 180");
+        (doc.setups[1].operations[0].p).insert("bottom".into(), "12".into());
         let posted = crate::post::post_job(&doc, &mesh);
         let refused = posted.setups[1].result.as_ref().unwrap_err();
         assert!(

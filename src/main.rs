@@ -1977,9 +1977,10 @@ impl App {
                         &self.doc.setup().operations[..i],
                     );
                     if self.doc.file.is_some() {
-                        issues.extend(surface::issues(
+                        issues.extend(indexed::surface_issues(
+                            &self.doc,
+                            self.doc.index(),
                             o,
-                            self.doc.setup(),
                             self.imported_mesh.as_ref(),
                         ));
                     }
@@ -1991,11 +1992,12 @@ impl App {
     pub fn job_issues(&self) -> Vec<String> {
         let mut issues = self.doc.issues();
         if self.doc.file.is_some() {
-            for setup in &self.doc.setups {
+            for (si, setup) in self.doc.setups.iter().enumerate() {
                 for operation in setup.operations.iter().filter(|o| o.enabled) {
-                    issues.extend(surface::issues(
+                    issues.extend(indexed::surface_issues(
+                        &self.doc,
+                        si,
                         operation,
-                        setup,
                         self.imported_mesh.as_ref(),
                     ));
                 }

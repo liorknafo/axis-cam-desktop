@@ -531,11 +531,12 @@ pub fn margins<'a>(
         })
         .collect()
 }
-/// A margin as said: ×1.4, ×2, ×12. Rounded down, so that one under
+/// A margin as said: ×0.05, ×1.4, ×2, ×12. Rounded down, so that one under
 /// `SAFETY` never reads as it.
-fn times(factor: f32) -> String {
+pub(crate) fn times(factor: f32) -> String {
     let tenths = match factor {
         f if f >= 10. => f.floor(),
+        f if f < 0.1 => (f * 100.).floor() / 100.,
         f => (f * 10.).floor() / 10.,
     };
     format!("×{tenths}")
@@ -618,6 +619,31 @@ pub const STIFFNESS: [(&str, f32); 7] = [
     ("Wood and composite", 8_000.),
     ("Other", 69_000.),
 ];
+/// Yield strength by material group, N/mm², on the low side of the grades
+/// these machines cut (6060 aluminium, S235 steel, annealed 304 stainless,
+/// copper, nylon, softwood across the grain): what a web left between the
+/// chuck and the part takes before it bends for good (`rotary_check`'s
+/// part-off check). "Other", and a job without a material, take copper's,
+/// the least of the metals.
+pub const STRENGTH: [(&str, f32); 7] = [
+    ("Aluminium", 110.),
+    ("Steel", 235.),
+    ("Stainless steel", 205.),
+    ("Brass and copper", 70.),
+    ("Plastic", 40.),
+    ("Wood and composite", 20.),
+    ("Other", 70.),
+];
+/// The material group of `material` (None when the project has none) and
+/// its `STRENGTH`.
+pub fn strength(material: Option<&Material>) -> (&str, f32) {
+    let group = material.map_or("Other", |m| get(&m.p, "group"));
+    let row = STRENGTH
+        .iter()
+        .find(|row| row.0 == group)
+        .unwrap_or(&STRENGTH[STRENGTH.len() - 1]);
+    (row.0, row.1)
+}
 /// How a chuck could give way.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Give {
@@ -719,25 +745,36 @@ pub fn chuck_margins<'a>(
     let Some(setup) = doc.setups.get(si) else {
         return vec![];
     };
-    let positive = |p, key| num(p, key).filter(|v| *v > 0.);
     bites
         .into_iter()
         .map(|(oi, bites)| {
             let margin = setup.operations.get(oi).and_then(|op| {
-                let tool = doc.tools.iter().find(|t| t.id == op.tool)?;
-                let pushes = pushes(
-                    bites,
-                    positive(&tool.p, "diameter")?,
-                    positive(&tool.p, "flutes")?,
-                    positive(&op.p, "rpm")?,
-                    doc.selected_material(),
-                    &setup.machine,
-                );
+                let pushes = op_pushes(doc, setup, op, bites)?;
                 chuck_check(rig, doc.selected_material(), &pushes)
             });
             (oi, margin)
         })
         .collect()
+}
+/// The `pushes` of operation `op` of `setup` over its `bites`, with its
+/// tool's diameter and flutes, its rpm and the project's material: None when
+/// one of those is not given.
+pub fn op_pushes(
+    doc: &Document,
+    setup: &crate::model::Setup,
+    op: &crate::model::Operation,
+    bites: &[Bite],
+) -> Option<Vec<Push>> {
+    let positive = |p, key| num(p, key).filter(|v| *v > 0.);
+    let tool = doc.tools.iter().find(|t| t.id == op.tool)?;
+    Some(pushes(
+        bites,
+        positive(&tool.p, "diameter")?,
+        positive(&tool.p, "flutes")?,
+        positive(&op.p, "rpm")?,
+        doc.selected_material(),
+        &setup.machine,
+    ))
 }
 /// What the setup's holding section says of operation `name`'s chuck
 /// `margin`.
