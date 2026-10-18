@@ -1039,9 +1039,25 @@ The Machine library could save 4 axes but not where the rotary sits; the owner's
 - `indexed_operations_of_an_older_project_move_into_indexed_setups`, `storage::tests::a_project_with_an_indexed_operation_loads_it_into_an_indexed_setup`: an Indexed operation at A 90° loads as a Facing operation (same id, no `angle_a`) in a new indexed setup after its own, in its clamping, the operations after it in one at A 0°; one at A 0° stays in place; on a 5-axis machine it stays Indexed and its first issue says why.
 - `the_plan_check_checks_each_angles_moves_against_the_part_posed_there`: a block 30 wide and 10 high, contoured at A 0 and 90, has no gouge when each angle's moves are checked against the part at that angle, though the A90 moves pass through the part as it sits at A0.
 - `the_swing_takes_the_centreline_the_control_page_measured`: a centreline measured at Z −150 in the machine library clears the refusal that the setup's copy (Z −40) gives; once marked stale the copy is used again.
-- `an_indexed_setups_cuts_are_not_said_held_by_the_chuck_at_its_first_angle`: the workholding check says "Holding not checked" for an indexed setup instead of checking every angle's cuts against the jaws at the first.
+- `an_indexed_setups_cuts_are_checked_against_the_chuck_at_each_angle` (changed by LIO-191): a contour 90 mm out of the jaws with 40 mm of clearance, at A 0 and 90, is clear of the chuck: the workholding check says nothing, not "Holding not checked".
 - `a_disabled_indexed_operation_at_an_angle_stays_where_it_is`: a disabled Indexed operation at A 90° does not split its setup.
 - Not validated: the removal drawn at other angles (LIO-190), anything on the machine.
+
+## Checks with the part on the rotary axis: travel, Z reach and the chuck at each angle (LIO-191, 18 October 2026)
+
+`plan_check` and `post_check` checked an indexed setup's moves in its frame only: XYZ travel as a span, no A, and its cuts not against the chuck at each angle ("Holding not checked").
+
+- `rotary_check::tests::every_move_is_checked_on_both_sides_of_the_machines_travel_and_a_range`: one move 0.01 mm outside each end of the X (0 to 600), Y (0 to 400) and Z (−300 to 0) travel and of the A range (−360° to 360°) is refused with its number, the setup, the A angle and the operation; 0.01 mm inside, nothing is said. Below the Z travel it says how many mm short and how far below the Ø40 bar's centreline; above it, the bar's top and centreline.
+- `a_uc100s_profile_soft_limits_are_kept_too`: on a UC100 the profile's X (0 to 390), Z (−55 to 0) and A (−180° to 180°) soft limits refuse 0.01 mm outside and pass 0.01 mm inside, though the machine's own travel is wider; a profile that cannot be read refuses the check.
+- `the_holder_coming_down_onto_the_bar_is_refused_with_how_much`: with 50 mm of stick-out and the 2 mm gap, a cut 50.01 mm under the Ø40 bar's top puts the holder 0.01 mm into the bar and one 48.01 mm under it leaves the holder 1.99 mm over it, inside the gap: both refused with those numbers; 47.99 mm is not; beside the bar past the holder's radius and the gap nothing is said.
+- `a_cut_too_low_whose_retract_is_too_high_is_refused_at_both_ends`: one move from machine Z 0.01 to Z −300.01 is refused at both ends of the Z travel.
+- `an_index_move_inside_what_a_swings_is_refused`: an index move from A0 (where setup 1 left the machine) 0.01 mm under the 55.9 mm the bar, the part and the jaws reach is refused, 0.01 mm over it is not.
+- `too_little_room_over_what_a_swings_is_refused_with_the_numbers`: 4.99 mm between what A swings and the top of the Z travel is refused with the centreline, the reach and the room; 5.01 mm is not.
+- `the_assumed_geometry_leaves_no_room_over_the_largest_part` (LIO-184's comment): the CNC4030 + rotary as assumed (centreline Z −40, Ø80 at most, 55 mm of Z) with a Ø80 bar in the chuck: at A0 alone the setup is refused, the jaws reaching machine Z 35.66, and the contour's retract is out of reach above the bar's top at Z 0; turning to A90 is refused when generated, at machine Z 50.66.
+- `a_cut_at_a_90_into_a_jaw_is_refused_at_that_angle`: a cut down into the place jaw 3 is at A90 (up and to +Y) is refused at A 90° naming jaw 3; the same cut at A0, where jaw 1 is straight up, is clear.
+- `an_index_move_through_the_jaws_is_refused_over_its_turn`: A turning 0 to 90 with the tool 30 mm over the axis is refused over its sweep.
+- `a_setup_that_is_not_indexed_is_not_checked_here`: setup 1, the chuck at A0, gets none of these problems; every 3-axis test passes with its messages unchanged.
+- Not validated: anything on the machine; the program a post makes with A (LIO-193) must make its links between operations as checked here (straight up, across and down, or by machine Z home).
 
 ## Rotary calibration: the A centreline, A zero and the line to the tailstock (LIO-186, 18 October 2026)
 
