@@ -3190,6 +3190,32 @@ pub(crate) mod tests {
         assert!(!has(&a, "on centre height"));
     }
     #[test]
+    fn a_stop_on_the_pictures_is_the_number_on_the_carriage_dial() {
+        // Faced 1 mm: the shoulder at Z −65 is 64 from the new end, where
+        // the carriage dial was zeroed, and the dial stops at 3 t + 4.0 = 64.
+        let a = lathe_app("Diameter", |_| {});
+        let g = guide(&a);
+        let (carriage, thread) = (g.steps.iter())
+            .filter_map(|s| match s {
+                Step::Lathe(L::Pass { carriage, .. }) => Some((Some(carriage), None)),
+                Step::Lathe(L::ThreadPass { carriage, .. }) => Some((None, Some(carriage))),
+                _ => None,
+            })
+            .fold((None, None), |acc, x| (acc.0.or(x.0), acc.1.or(x.1)));
+        let carriage = carriage.unwrap();
+        assert_eq!(carriage.reading, Ok((3, 4.)));
+        assert_eq!(
+            turning::from_end("shoulder", carriage),
+            "shoulder 64 from the end"
+        );
+        // The thread to Z −40 stops 39 from the new end: 1 t + 19.0.
+        let thread = thread.unwrap();
+        assert_eq!(
+            turning::from_end("thread stops", thread),
+            "thread stops 39 from the end"
+        );
+    }
+    #[test]
     fn until_the_dial_check_is_answered_the_cross_slide_shows_no_number() {
         let mut a = lathe_app("", |_| {});
         shows(

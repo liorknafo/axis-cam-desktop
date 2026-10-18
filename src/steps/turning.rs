@@ -795,6 +795,12 @@ fn top_angle<'a>(from_cross: f32, out: bool) -> Element<'a, Message> {
     .width(170)
     .into()
 }
+/// A stop on a picture as the carriage dial measures it: from the end the
+/// dial was zeroed on, "shoulder 64 from the end", the same number as the
+/// dial's turns and reading, never the Z from the end the setup began with.
+pub(super) fn from_end(what: &str, carriage: &Dial) -> String {
+    format!("{what} {} from the end", mm(carriage.distance))
+}
 /// What a part off or a face to the centre asks of the tool's height.
 const ON_CENTRE: &str = "on centre height";
 /// What the set up asks of every tool once.
@@ -1611,7 +1617,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     ([z_end, r - 1.5], [z_end, big_r + 2.])
                 };
                 let what = if *bore { "bottom" } else { "shoulder" };
-                marks.push(Mark::Never(a, b, format!("{what} {}", mm(z_end))));
+                marks.push(Mark::Never(a, b, from_end(what, carriage)));
             }
             let finish = along.last().map_or(*diameter, |a| 2. * a.0);
             marks.push(Mark::Path([end + 2., r], [z_end + 1., r]));
@@ -2135,10 +2141,11 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
             }
             marks.push(Mark::Path([end + 2., r], [z0 + 1., r]));
             marks.push(Mark::Tool(Cutter::Thread, [end + 2., r]));
+            // Its label above the bar, clear of its outline.
             marks.push(Mark::Never(
                 [z0, last.min(r0) - 1.5],
-                [z0, last.max(r0) + 2.],
-                format!("end {}", mm(z0)),
+                [z0, (last.max(r0) + 2.).max(outer_of(bar) + 1.5)],
+                from_end("thread stops", carriage),
             ));
             marks.push(Mark::Word(
                 [(z0 + end) / 2. + 4., r0 + 7.],
