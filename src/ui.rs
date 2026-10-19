@@ -2181,7 +2181,15 @@ fn workspace(app: &App) -> Element<'_, Message> {
                 ))
                 .size(12),
             );
-            let surface_status = stock_surface_details(app).unwrap_or_default();
+            // A slow update is said in place of the details, on their one
+            // line: the strip keeps its height while Play meshes each frame.
+            let surface_status = match stock_surface_notice(app) {
+                Some(notice) => bold(notice, 12).color(WARN),
+                None => muted(stock_surface_details(app).unwrap_or_default()).size(12),
+            };
+            let surface_status = container(surface_status.wrapping(Wrapping::None))
+                .width(Fill)
+                .clip(true);
             let mut detail = row![muted("Detail").size(12)]
                 .spacing(5)
                 .align_y(Alignment::Center);
@@ -2192,10 +2200,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
                     choice == app.stock_detail,
                 ));
             }
-            if let Some(notice) = stock_surface_notice(app) {
-                playback = playback.push(bold(notice, 12).color(WARN));
-            }
-            playback = playback.push(detail.push(muted(surface_status).size(12)));
+            playback = playback.push(detail.push(surface_status));
         }
     } else if app.generating.is_none() {
         let mut empty = row![muted(app.playback_reason()).size(12).width(Fill)]
@@ -2241,14 +2246,24 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .into()
 }
-/// The simulation strip's line while the stock mesher runs: what is drawn
-/// meanwhile, and for how long it has been working.
+/// How long the stock mesher works before the strip says so: Play meshes
+/// the stock again for each frame, mostly in well under this.
+pub(crate) const STOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+/// What the simulation strip's Detail line says once the stock mesher has
+/// run a while (`STOCK_NOTICE_AFTER`), or at once after a job that did, so
+/// that slow updates one after another keep it: for how long it has been
+/// working, and what is drawn meanwhile. The time comes first, so that a
+/// narrow strip cuts off the words rather than it.
 pub(crate) fn stock_surface_notice(app: &App) -> Option<String> {
-    let seconds = app.stock_mesh_elapsed()?.as_secs();
+    let elapsed = app.stock_mesh_elapsed()?;
+    if elapsed < STOCK_NOTICE_AFTER && !app.stock_mesh_slow() {
+        return None;
+    }
+    let seconds = elapsed.as_secs();
     let sim = app.active_simulation()?;
     app.stock_mesh_key()?;
     Some(if sim.stock_surface.is_some() {
-        format!("Updating the stock surface, showing the last finished one · {seconds} s")
+        format!("Updating the stock surface · {seconds} s, showing the last finished one")
     } else {
         format!("Building the stock surface · {seconds} s")
     })
@@ -2257,15 +2272,14 @@ pub(crate) fn stock_surface_notice(app: &App) -> Option<String> {
 /// line under the timeline; "Building stock surface…" before there is one.
 pub(crate) fn stock_surface_details(app: &App) -> Option<String> {
     let sim = app.active_simulation()?;
-    match &sim.stock_surface {
-        Some(surface) => Some(format!(
+    Some(match &sim.stock_surface {
+        Some(surface) => format!(
             "{:.2} mm finest cell · {} triangles",
             surface.cell_mm,
             surface.triangles.len()
-        )),
-        None if stock_surface_notice(app).is_some() => None,
-        None => Some("Building stock surface…".into()),
-    }
+        ),
+        None => "Building stock surface…".into(),
+    })
 }
 /// What the inspector shows: `head` and `foot` stay put, `body` scrolls.
 struct Panel<'a> {
