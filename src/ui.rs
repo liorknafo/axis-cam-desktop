@@ -2248,20 +2248,22 @@ fn workspace(app: &App) -> Element<'_, Message> {
 }
 /// How long the stock mesher works before the strip says so: Play meshes
 /// the stock again for each frame, mostly in well under this.
-const STOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const STOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// What the simulation strip's Detail line says once the stock mesher has
-/// run a while (`STOCK_NOTICE_AFTER`): what is drawn meanwhile, and for how
-/// long it has been working.
+/// run a while (`STOCK_NOTICE_AFTER`), or at once after a job that did, so
+/// that slow updates one after another keep it: for how long it has been
+/// working, and what is drawn meanwhile. The time comes first, so that a
+/// narrow strip cuts off the words rather than it.
 pub(crate) fn stock_surface_notice(app: &App) -> Option<String> {
     let elapsed = app.stock_mesh_elapsed()?;
-    if elapsed < STOCK_NOTICE_AFTER {
+    if elapsed < STOCK_NOTICE_AFTER && !app.stock_mesh_slow() {
         return None;
     }
     let seconds = elapsed.as_secs();
     let sim = app.active_simulation()?;
     app.stock_mesh_key()?;
     Some(if sim.stock_surface.is_some() {
-        format!("Updating the stock surface, showing the last finished one · {seconds} s")
+        format!("Updating the stock surface · {seconds} s, showing the last finished one")
     } else {
         format!("Building the stock surface · {seconds} s")
     })

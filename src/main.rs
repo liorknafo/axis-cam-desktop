@@ -957,6 +957,9 @@ pub struct App {
     stock_mesh_job: Option<StockMeshKey>,
     /// When the running mesher job started, for the elapsed time the strip names.
     stock_mesh_started: Option<Instant>,
+    /// The last mesher job took long enough to be named
+    /// (`ui::STOCK_NOTICE_AFTER`): the next one is named at once.
+    stock_mesh_slow: bool,
     stock_mesh_failed: Option<StockMeshKey>,
     pub progress: f32,
     pub speed: f32,
@@ -1521,6 +1524,7 @@ impl App {
             stock_detail: Default::default(),
             stock_mesh_job: None,
             stock_mesh_started: None,
+            stock_mesh_slow: false,
             stock_mesh_failed: None,
             progress: 0.,
             speed: 1.,
@@ -2363,6 +2367,10 @@ impl App {
     pub fn stock_mesh_elapsed(&self) -> Option<Duration> {
         self.stock_mesh_job.as_ref()?;
         self.stock_mesh_started.map(|t| t.elapsed())
+    }
+    /// Whether the last mesher job took long enough to be named.
+    pub fn stock_mesh_slow(&self) -> bool {
+        self.stock_mesh_slow
     }
     fn stock_mesh_key(&self) -> Option<StockMeshKey> {
         let sim = self.active_simulation()?;
@@ -5708,7 +5716,8 @@ impl App {
             } => {
                 if self.stock_mesh_job.as_ref() == Some(&key) {
                     self.stock_mesh_job = None;
-                    self.stock_mesh_started = None;
+                    self.stock_mesh_slow = (self.stock_mesh_started.take())
+                        .is_some_and(|t| t.elapsed() >= ui::STOCK_NOTICE_AFTER);
                 }
                 if let Some(sim) = &mut self.simulation
                     && sim.id == key.0

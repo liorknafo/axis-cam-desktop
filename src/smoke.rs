@@ -12769,7 +12769,7 @@ flood = { pin = 8 }
         a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
         assert_eq!(
             crate::ui::stock_surface_notice(&a).as_deref(),
-            Some("Updating the stock surface, showing the last finished one · 12 s")
+            Some("Updating the stock surface · 12 s, showing the last finished one")
         );
         // The cell size and triangle count are in the details line, not the notice.
         assert_eq!(
@@ -12899,7 +12899,7 @@ flood = { pin = 8 }
             assert_eq!((slow.0, slow.1), (still.0, still.1), "{size:?}");
             assert_eq!(
                 slow.2,
-                "Updating the stock surface, showing the last finished one · 12 s"
+                "Updating the stock surface · 12 s, showing the last finished one"
             );
             // Done: the details are back where the notice was.
             let key = a.stock_mesh_key().unwrap();
@@ -12912,12 +12912,30 @@ flood = { pin = 8 }
             let done = play_frame(&a, size);
             assert_eq!((done.0, done.1), (still.0, still.1), "{size:?}");
             assert_eq!(done.2, still.2);
+            // The next update after a slow one is named at once, so that
+            // slow updates one after another keep the line ...
+            frame(&mut a, from + 0.3, Some(20));
+            let next = play_frame(&a, size);
+            assert_eq!((next.0, next.1), (still.0, still.1), "{size:?}");
+            assert_eq!(
+                next.2,
+                "Updating the stock surface · 0 s, showing the last finished one"
+            );
+            // ... until one is quick again.
+            let key = a.stock_mesh_key().unwrap();
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds: 0.,
+                result: Ok(mesh.clone()),
+            });
+            assert!(!a.stock_mesh_slow());
         }
     }
     /// Renders playback frames to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/play-renders): the stock meshed, being meshed quickly, being
-    /// meshed for 12 s, and meshed again, for a look at the strip's bottom
-    /// edge (LIO-222). Not a check: run it with --ignored.
+    /// meshed for 12 s, meshed again, and meshed for 12 s in the smallest
+    /// window, for a look at the strip's bottom edge (LIO-222). Not a check:
+    /// run it with --ignored.
     #[test]
     #[ignore]
     fn render_play_while_the_stock_surface_updates() {
@@ -12974,6 +12992,15 @@ flood = { pin = 8 }
         render_png(&a, size, &out.join("3-meshing-slow.png"));
         mesh(&mut a);
         render_png(&a, size, &out.join("4-meshed-again.png"));
+        // The smallest window: the time stays in sight.
+        at(&mut a, 0.4);
+        a.stock_mesh_job = a.stock_mesh_key();
+        a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        render_png(
+            &a,
+            iced::Size::new(1120., 720.),
+            &out.join("5-meshing-slow-small.png"),
+        );
     }
     /// The footer's 02 and 03 steps only navigate: 02 keeps the operation
     /// selected, and 03 shows the preview strip without generating (#86).
