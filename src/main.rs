@@ -5718,8 +5718,10 @@ impl App {
             } => {
                 if self.stock_mesh_job.as_ref() == Some(&key) {
                     self.stock_mesh_job = None;
+                    // Only a job at the detail shown now says how slow the next is.
                     self.stock_mesh_slow = (self.stock_mesh_started.take())
-                        .is_some_and(|t| t.elapsed() >= ui::STOCK_NOTICE_AFTER);
+                        .is_some_and(|t| t.elapsed() >= ui::STOCK_NOTICE_AFTER)
+                        && key.3 == self.stock_detail;
                 }
                 if let Some(sim) = &mut self.simulation
                     && sim.id == key.0

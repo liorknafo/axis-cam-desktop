@@ -12930,9 +12930,17 @@ flood = { pin = 8 }
             });
             assert!(!a.stock_mesh_slow());
         }
-        // Nor does a slow update carry over to another detail.
-        a.stock_mesh_slow = true;
+        // Nor does a slow update carry over to another detail, even one
+        // still running when the detail changes.
+        frame(&mut a, 0.92, Some(12_000));
+        let slow = a.stock_mesh_job.clone().unwrap();
         let _ = a.update(Message::StockDetail(crate::stock_surface::Detail::Draft));
+        let _ = a.update(Message::StockMeshed {
+            key: slow,
+            seconds: 0.,
+            result: Ok(mesh.clone()),
+        });
+        assert!(!a.stock_mesh_slow());
         frame(&mut a, 0.95, Some(20));
         assert_eq!(crate::ui::stock_surface_notice(&a), None);
     }
