@@ -2599,7 +2599,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                     )));
                                     for h in holes.iter().take(64) {
                                         let said = format!(
-                                            "Ø{:.2} (opening Ø{:.2}) · X{:.2} Y{:.2} · depth {:.2} mm · {}",
+                                            "Ø{:.2} (opening Ø{:.2}) · X{:.2} Y{:.2} · depth {:.2} mm · {}{}",
                                             h.diameter,
                                             h.opening,
                                             // No "-0.00" for a centre on an axis.
@@ -2614,7 +2614,11 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                                 h.center[1]
                                             },
                                             h.top - h.bottom,
-                                            if h.through { "through" } else { "blind" }
+                                            if h.through { "through" } else { "blind" },
+                                            h.countersink.map_or(String::new(), |c| format!(
+                                                " · {:.1}° countersink {:.2} mm deep",
+                                                c.angle, c.depth
+                                            ))
                                         );
                                         c = c.push(match by_walls(h) {
                                             Some(i) => Element::from(
@@ -2797,7 +2801,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             } else if o.drills_pin_holes() {
                 "Each pin hole goes down from the face the pins stand on, as earlier cuts leave it, 1 mm deeper than the pins stand at its full width: a drill goes on by its point under that. Top offset raises the approach. Clearance/retract retain their original reference."
             } else if !app.is_sample() && o.strategy == Strategy::Drill {
-                "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. With a chamfer mill each opening is countersunk instead: the point goes down until its cone is as wide as the opening at the rim. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal follows the drill's 118° point or the chamfer mill's cone."
+                "Hole bottoms are detected from the model. Bottom offset raises that target; breakthrough extends below it. With a chamfer mill each opening is countersunk instead: the point goes down until its cone is as wide as the opening at the rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Peck levels start from remaining stock at each hole, accounting for previous facing. Clearance/retract retain their original reference. Removal follows the drill's 118° point or the chamfer mill's cone."
             } else { "All heights are in the current setup coordinate system. Clearance/retract are measured above stock top; offsets are relative to selected geometry." }));
             if let Some(z) = app.active_simulation().and_then(|s| s.plan.rest_top) {
                 c = c.push(note(format!("Automatic cutting start: Z {z:.2} mm. Earlier cuts cover the material above this height.")));
