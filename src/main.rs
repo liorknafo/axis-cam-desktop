@@ -1622,10 +1622,14 @@ impl App {
             }
         }
     }
-    /// The project's file, remembered for the next start.
+    /// The project's file, remembered for the next start. The workspace is
+    /// written first: a start after a crash must not pair the file with the
+    /// job that was in the workspace before, and save that job over it.
     fn set_project_file(&mut self, path: Option<PathBuf>) {
         self.project_path = path;
         if self.settings.project_file != self.project_path {
+            self.dirty = true;
+            self.persist();
             self.settings.project_file = self.project_path.clone();
             self.save_settings();
         }
@@ -2243,7 +2247,7 @@ impl App {
         self.persist();
         match self.close_decision(id, Instant::now()) {
             CloseAction::Stay => {
-                self.status = "Could not save before closing. Save Project to another location, then close again.".into();
+                self.status = "Could not save before closing. Use Save as… to save the project to another location, then close again.".into();
                 Task::none()
             }
             CloseAction::Wait => {

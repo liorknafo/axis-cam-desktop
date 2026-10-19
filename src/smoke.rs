@@ -13761,7 +13761,7 @@ flood = { pin = 8 }
         // After that Save writes the same file without a dialog.
         a.doc.title = "Changed after the first save".into();
         a.project_dirty = true;
-        assert_eq!(crate::ui::project_note(&a), "job.axis.json • unsaved");
+        assert_eq!(crate::ui::project_note(&a), "Unsaved · job.axis.json");
         let _ = a.update(Message::SaveProject);
         assert!(!a.save_busy && !a.project_dirty);
         assert_eq!(a.project_path.as_deref(), Some(file.as_path()));
@@ -13797,8 +13797,8 @@ flood = { pin = 8 }
         let file = dir.path().join("job.axis.json");
         let _ = a.update(Message::SaveProjectAs);
         let _ = a.update(Message::Saved(Some(file.clone())));
-        a.dirty = true;
-        a.persist();
+        // The workspace was written with the file's change, before settings.
+        assert!(!a.dirty);
         // Saved and the workspace the same: no unsaved changes.
         let b = fresh_app(&dir);
         assert_eq!(b.project_path.as_deref(), Some(file.as_path()));

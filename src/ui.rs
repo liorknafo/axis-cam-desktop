@@ -810,8 +810,9 @@ pub fn project_note(app: &App) -> String {
                 let tail: String = name[name.len() - SHOWN / 2 + 1..].iter().collect();
                 shown = format!("{head}…{tail}");
             }
+            // Unsaved first: a narrow header wraps the name, not the mark.
             if app.project_dirty {
-                format!("{shown} • unsaved")
+                format!("Unsaved · {shown}")
             } else {
                 shown
             }
