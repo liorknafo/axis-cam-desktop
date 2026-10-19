@@ -83,7 +83,7 @@ impl Geometry {
             })
             .collect()
     }
-    fn silhouette(&self, selected: bool, op: &Operation) -> Result<Region, String> {
+    pub(crate) fn silhouette(&self, selected: bool, op: &Operation) -> Result<Region, String> {
         region(
             self.triangles
                 .iter()

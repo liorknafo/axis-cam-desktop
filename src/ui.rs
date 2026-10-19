@@ -578,7 +578,7 @@ pub(crate) fn issue_tab(issue: &str) -> Option<&'static str> {
             };
         }
         Some("rpm" | "feed") => "Tool",
-        Some("hole_diameter") => "Geometry",
+        Some("hole_diameter" | "silhouette_extend") => "Geometry",
         Some("x_min" | "x_max" | "y_min" | "y_max" | "z_top" | "z_bottom") => "Box",
         Some(
             "turn_kind" | "face_off" | "to_diameter" | "diameter" | "z_end" | "z" | "edge" | "size"
@@ -2625,8 +2625,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             } else {
                 c = c.push(note("Import a part before selecting geometry."));
             }
-            if !app.is_sample() && o.strategy == Strategy::Face {
-                c = c.push(note("Facing preview covers the XY bounding rectangle of the selected surfaces, model or stock. It includes holes and gaps within that rectangle. Containment and radial allowance adjust the cutter-center limits."));
+            if !app.is_sample() && o.faces_outline() {
+                c = c.push(note("Model silhouette faces the part's outline seen from above, holes through it included, grown by Clear past outline: how far the cutter's edge reaches beyond it. The stock outside stays at its height for a later operation. On the part's outer corners a round cutter needs some room past the outline, about a third of its radius for a square corner and more for a sharper one; Generate refuses less and says the least that clears them."));
+            } else if !app.is_sample() && o.strategy == Strategy::Face {
+                c = c.push(note("Facing preview covers the XY bounding rectangle of the selected surfaces or the stock. It includes holes and gaps within that rectangle. Containment and radial allowance adjust the cutter-center limits."));
             }
             if app.is_sample()
                 || matches!(
@@ -2634,21 +2636,29 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     Strategy::Face | Strategy::Adaptive | Strategy::Pocket
                 )
             {
-                c = c
-                    .push(choice(
+                c = c.push(choice(
+                    p,
+                    "boundary",
+                    "Machining boundary",
+                    if matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket)
+                        && !app.is_sample()
+                    {
+                        &["Selected geometry"]
+                    } else {
+                        &["Selected geometry", "Stock silhouette", "Model silhouette"]
+                    },
+                    t,
+                ));
+                // A Facing of the outline reaches a distance past it instead.
+                if o.faces_outline() && !app.is_sample() {
+                    c = c.push(checks.hinted(
                         p,
-                        "boundary",
-                        "Machining boundary",
-                        if matches!(o.strategy, Strategy::Adaptive | Strategy::Pocket)
-                            && !app.is_sample()
-                        {
-                            &["Selected geometry"]
-                        } else {
-                            &["Selected geometry", "Stock silhouette", "Model silhouette"]
-                        },
-                        t,
-                    ))
-                    .push(choice(
+                        "silhouette_extend",
+                        "Clear past outline · mm",
+                        crate::model::OUTLINE_EXTEND,
+                    ));
+                } else {
+                    c = c.push(choice(
                         p,
                         "containment",
                         "Tool containment",
@@ -2665,6 +2675,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         },
                         t,
                     ));
+                }
             } else if o.strategy.imported_preview() && o.strategy != Strategy::Drill {
                 c = c.push(choice(
                     p,
@@ -2941,6 +2952,21 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
             c = c.push(note("Profile ramp descends around the contour it enters at 25% feed, then completes the loop at depth. Plunge feeds straight down at 25% feed and requires a plunge-capable cutter. Between contours the tool stays down: it follows the contour just cut, then steps across at most 1.5 stepovers along a line clear of every wall and island; otherwise it retracts to clearance and enters again."));
             c = c.push(note(fixture_note(app, Note::Pocket)));
         }
+        "Linking" if !app.is_sample() && o.faces_outline() => {
+            c = c.push(checks.field(p, "ramp_angle", "Entry ramp angle · degrees"));
+            if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
+                c = c.push(choice_value(
+                    p,
+                    facing_setting(p, "facing_link"),
+                    "facing_link",
+                    "Between facing passes",
+                    &FACING_LINKS,
+                    t,
+                ));
+            }
+            c = c.push(note("Each level enters on the pass round the outline's edge: from beside the stock where that edge runs off it, otherwise ramping down round the edge at the entry ramp angle (a loop too short for that plunges). The rows then start and end where that pass cut. With Keep tool down the cutter feeds to the next row at depth when it is near and the way stays inside the outline; otherwise it lifts just over the level before, or to clearance where the way leaves the outline, and feeds down where the edge pass cut. Entries and depth changes feed at 25% of cutting feed."));
+            c = c.push(note(fixtures(Note::Pocket, modelled(app))));
+        }
         "Linking" if !app.is_sample() && o.strategy == Strategy::Face => {
             if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
                 c = c.push(choice_value(
@@ -3216,7 +3242,23 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             &FACING_PATTERNS,
             t,
         ));
-        if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
+        if o.faces_outline() {
+            // Each level starts with the pass round its edge, which climbs
+            // or not either way.
+            c = c.push(choice_value(
+                p,
+                facing_setting(p, "facing_milling"),
+                "facing_milling",
+                "Milling direction",
+                &FACING_MILLING,
+                t,
+            ));
+            c = c.push(note(if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
+                "Each level goes once round the edge of the outline grown by Clear past outline (Geometry), in this milling direction, then clears inside it in rows both ways, mixing climb and conventional. Every row starts and ends in what that edge pass cut."
+            } else {
+                "Each level goes once round the edge of the outline grown by Clear past outline (Geometry), then clears inside it in rows all cut one way, in this milling direction, lifting between them. Every row starts and ends in what that edge pass cut."
+            }));
+        } else if facing_setting(p, "facing_pattern") == FACING_PATTERNS[0] {
             c = c.push(note("Mixed climb / conventional. The cutter travels both ways while the spindle keeps the same rotation. Choose One way to control the milling direction."));
             c = c.push(choice_value(
                 p,
@@ -3309,7 +3351,10 @@ fn pass_fields<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks) -> Eleme
             t,
         ));
     }
-    c = c.push(checks.field(p, "allowance", "Radial stock to leave · mm"));
+    // A Facing of the outline clears past it by Clear past outline.
+    if !(o.faces_outline() && !app.is_sample()) {
+        c = c.push(checks.field(p, "allowance", "Radial stock to leave · mm"));
+    }
     if matches!(s, Strategy::Adaptive | Strategy::Pocket) {
         c = c.push(checks.field(p, "axial_allowance", "Axial stock to leave · mm"));
     }
@@ -7978,7 +8023,14 @@ pub(crate) fn operation_lines(
     };
     match op.strategy {
         Strategy::Face => {
-            push(format!("facing area {}", get(p, "boundary").to_lowercase()));
+            if op.faces_outline() {
+                push(format!(
+                    "facing area model silhouette + {} mm",
+                    n(op.outline_extend().parse().unwrap_or(f32::NAN))
+                ));
+            } else {
+                push(format!("facing area {}", get(p, "boundary").to_lowercase()));
+            }
             push(stepdown);
             push(stepover);
             bottom.into_iter().for_each(&mut push);
@@ -8349,9 +8401,7 @@ pub(crate) enum Note {
 pub(crate) fn fixture_note(app: &App, note: Note) -> String {
     let before = match note {
         Note::Preview | Note::Panel => "",
-        Note::Facing => {
-            "Selections use connected planar regions of the imported mesh. Facing simulation uses a rectangular raster preview. "
-        }
+        Note::Facing => "Selections use connected planar regions of the imported mesh. ",
         Note::Pocket => {
             "Offset contours run from the interior toward the walls at each depth. Entry/full-width cuts can contain both milling modes. "
         }
