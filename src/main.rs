@@ -300,7 +300,10 @@ pub enum Message {
     SuggestLayout,
     SetOpTool(String),
     RestSource(String),
+    /// Saves the project to its file, asking for one the first time.
     SaveProject,
+    /// Saves the project to a file the user chooses, which becomes its file.
+    SaveProjectAs,
     OpenProject,
     OpenHistory,
     Import,
@@ -1197,6 +1200,7 @@ fn while_locked(m: &Message) -> bool {
             | LeftStock(_)
             | PartHoles(..)
             | SaveProject
+            | SaveProjectAs
             | Saved(_)
             | FileImported(_)
             | ProjectOpened(_)
@@ -1372,6 +1376,19 @@ impl App {
                 false,
             )
         };
+        // The project's file from the last run, while the workspace resumed is
+        // still there to be saved to it; the job has unsaved changes when the
+        // two files differ.
+        let workspace = std::fs::read(&state_path)
+            .ok()
+            .filter(|_| smoke_dir.is_none());
+        let project_path = settings
+            .project_file
+            .clone()
+            .filter(|p| workspace.is_some() && p.is_file());
+        let project_dirty = project_path
+            .as_ref()
+            .is_some_and(|p| std::fs::read(p).ok() != workspace);
         if shared && !isolated {
             status += " No home directory was found, so the workspace is in the shared temp directory and signing in is unavailable.";
         }
@@ -1533,8 +1550,8 @@ impl App {
             save_error: None,
             last_edit: Instant::now(),
             state_path,
-            project_path: None,
-            project_dirty: false,
+            project_path,
+            project_dirty,
             wizard_step: 0,
             planner: Planner::Idle,
             plan_run: None,
@@ -1605,6 +1622,14 @@ impl App {
             }
         }
     }
+    /// The project's file, remembered for the next start.
+    fn set_project_file(&mut self, path: Option<PathBuf>) {
+        self.project_path = path;
+        if self.settings.project_file != self.project_path {
+            self.settings.project_file = self.project_path.clone();
+            self.save_settings();
+        }
+    }
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
         // What is being generated is the old project's.
         self.cancel_generation();
@@ -1627,8 +1652,8 @@ impl App {
         }
         self.imported_mesh = None;
         self.import_error = None;
-        self.project_path = path;
-        self.project_dirty = self.project_path.is_none();
+        self.project_dirty = path.is_none();
+        self.set_project_file(path);
         self.page = Page::Work;
         self.audit_report.clear();
         self.invalidate_post();
@@ -5286,20 +5311,37 @@ impl App {
                 }
                 self.touch()
             }
-            Message::SaveProject => {
+            Message::SaveProject if self.project_path.is_some() => {
+                if self.save_busy {
+                    return Task::none();
+                }
+                let path = self.project_path.clone();
+                return self.update(Message::Saved(path));
+            }
+            Message::SaveProject | Message::SaveProjectAs => {
                 if self.save_busy || self.import_busy {
                     return Task::none();
                 }
                 self.save_busy = true;
-                let filename = format!("{}.axis.json", sanitize_name(&self.doc.title));
+                // Save as starts beside the project's file, under its name.
+                let mut dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Save AXIS CAM project")
+                    .add_filter("AXIS project", &["json"]);
+                dialog = match &self.project_path {
+                    Some(p) => {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy();
+                        let dialog = dialog.set_file_name(name);
+                        match p.parent() {
+                            Some(folder) => dialog.set_directory(folder),
+                            None => dialog,
+                        }
+                    }
+                    None => dialog
+                        .set_file_name(format!("{}.axis.json", sanitize_name(&self.doc.title))),
+                };
                 return Task::perform(
                     async move {
-                        let file = rfd::AsyncFileDialog::new()
-                            .set_title("Save AXIS CAM project")
-                            .set_file_name(filename)
-                            .add_filter("AXIS project", &["json"])
-                            .save_file()
-                            .await?;
+                        let file = dialog.save_file().await?;
                         Some(file.path().to_path_buf())
                     },
                     Message::Saved,
@@ -5453,7 +5495,10 @@ impl App {
                 if !self.archive_current() {
                     return Task::none();
                 }
-                self.replace_document(d, Some(p));
+                // A copy from History is a recovery, not the project's file:
+                // Save asks where to keep it.
+                let history = self.state_path.with_file_name("history");
+                self.replace_document(d, (!p.starts_with(&history)).then_some(p));
                 self.status = with_notes(
                     "Project opened. Your previous workspace is in History.",
                     &notes,
@@ -5474,8 +5519,8 @@ impl App {
                 match storage::save(&p, &self.doc) {
                     Ok(()) => {
                         self.status = format!("Saved {}", p.display());
-                        self.project_path = Some(p);
                         self.project_dirty = false;
+                        self.set_project_file(Some(p));
                     }
                     Err(e) => self.status = format!("Save failed: {e}"),
                 }
@@ -6529,6 +6574,13 @@ fn on_event(
         iced::Event::Window(
             iced::window::Event::Resized(size) | iced::window::Event::Opened { size, .. },
         ) => Some(Message::Resized(size.width)),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) if modifiers.command() && modifiers.shift() && c.to_lowercase() == "s" => {
+            Some(Message::SaveProjectAs)
+        }
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Character(c),
             modifiers,
