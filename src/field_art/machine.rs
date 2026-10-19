@@ -272,11 +272,11 @@ fn block_row(
         let x = x0 + k as f32 * (w + gap);
         rect(f, x, y, x + w, y + h, alpha(CYAN, 0.08));
         if k < newest {
-            rect(f, x, y, x + w, y + h, NORMAL);
-            say_mid(f, label, x + w / 2., y + h / 2. - 5., TEXT, 10.);
+            rect(f, x, y, x + w, y + h, GOLD);
+            say_mid(f, label, x + w / 2., y + h / 2. - 5., BACKGROUND, 10.);
         } else if k == newest {
             rect(f, x, y, x + w * grow, y + h, GOLD);
-            if grow >= 1. {
+            if grow >= 0.7 {
                 say_mid(f, label, x + w / 2., y + h / 2. - 5., BACKGROUND, 10.);
             }
         }
@@ -491,7 +491,7 @@ fn hand_mill(f: &mut Frame, time: f32, x0: f32, slot: f32, angle: f32) {
     rect(f, x0 + 25., 110., x0 + 43., 124., METAL.side);
     rect(f, x0 - 6., 100., x0 + LEN + 6., 110., METAL.top);
     stock(f, x0, 64., x0 + LEN, 100.);
-    rect(f, x0, 64., (x0 + slot).min(x0 + LEN), 76., BACKGROUND);
+    rect(f, x0 - 1., 62., (x0 + slot).min(x0 + LEN), 76., BACKGROUND);
     side_cutter(f, CX, 76., time, 20., false);
     handwheel(f, at(44., 118.), 20., angle);
 }
@@ -557,12 +557,14 @@ fn hand_rapid(f: &mut Frame, time: f32, phase: f32) {
         }
     }
     panel(f, 164., 17., 270., 47.);
-    say(f, "HAND RAPID", 170., 20., GOLD, 9.);
     if out || back {
+        say(f, "HAND RAPID", 170., 20., GOLD, 9.);
         say(f, "1500 MM/MIN", 170., 31., CYAN, 14.);
-    } else if phase < 0.25 {
-        say(f, "CUTTING", 170., 32., alpha(TEXT, 0.7), 12.);
+    } else if phase < 0.25 || phase >= 0.85 {
+        say(f, "CUTTING FEED", 170., 20., TEXT, 9.);
+        say(f, "120 MM/MIN", 170., 31., alpha(TEXT, 0.8), 14.);
     } else {
+        say(f, "HAND RAPID", 170., 20., GOLD, 9.);
         say(f, "CLEAR OF THE CUT", 170., 33., TEXT, 10.);
     }
     heading(f, "HAND RAPID · MOVING OFF THE CUT");
@@ -586,11 +588,13 @@ fn turn_one(f: &mut Frame, phase: f32) {
         dashed(f, at(x_l, 74.), at(x_l, 64.), GOLD, 1.);
         dimension(f, at(100., 68.), at(x_l, 68.), GOLD);
     }
+    // The readouts are the same tenth of a turn and five times it in mm.
+    let q = (u * 10.).round() / 10.;
     say(f, "1 TURN = 5 MM", 108., 42., GOLD, 12.);
-    say(f, &format!("{:.1} TURN", u), 18., 128., TEXT, 9.);
-    say(f, &format!("{:.1} MM", 5. * u), 112., 113., TEXT, 9.);
+    say(f, &format!("{q:.1} TURN"), 18., 128., TEXT, 9.);
+    say(f, &format!("{:.1} MM", 5. * q), 112., 113., TEXT, 9.);
     heading(f, "TURN · TABLE TRAVEL PER HANDWHEEL TURN");
-    caption(f, "ONE FULL TURN OF THE HANDWHEEL MOVES THE AXIS");
+    caption(f, "ONE TURN OF THE HANDWHEEL MOVES THE AXIS 5 MM");
 }
 
 /// Swing: the circle a part can turn over the bed.
@@ -734,11 +738,13 @@ fn cross_turn(f: &mut Frame, phase: f32) {
     let u = progress(phase, 0.2);
     let c = at(84., 80.);
     let r = 46.;
-    let rot = TAU * u;
+    // The dial turns anticlockwise while its numbers rise clockwise, as on a
+    // clock face: each next number arrives at the index in turn.
+    let rot = -TAU * u;
     disc_at(f, c, r, Color::from_rgb(0.20, 0.28, 0.35));
     ring(f, c, r, TEXT, 1.8);
     for i in 0..50 {
-        let a = rot - i as f32 * TAU / 50.;
+        let a = rot + i as f32 * TAU / 50.;
         let major = i % 10 == 0;
         let (len, col, w) = if major {
             (10., GOLD, 2.)
@@ -748,9 +754,13 @@ fn cross_turn(f: &mut Frame, phase: f32) {
         line(f, pt(c, r - 1., a), pt(c, r - len, a), col, w);
     }
     for k in 0..5 {
-        let a = rot - k as f32 * TAU / 5.;
+        let a = rot + k as f32 * TAU / 5.;
         let t = pt(c, 28., a);
-        say(f, &k.to_string(), t.x - 3.5, t.y - 6., TEXT, 12.);
+        if k == 0 && u >= 0.97 {
+            say(f, "5/0", t.x - 10., t.y - 6., GOLD, 12.);
+        } else {
+            say(f, &k.to_string(), t.x - 3.5, t.y - 6., TEXT, 12.);
+        }
     }
     disc_at(f, c, 4., TEXT);
     polygon(
@@ -764,8 +774,13 @@ fn cross_turn(f: &mut Frame, phase: f32) {
     );
     arc(f, c, r + 5., 0., rot, GOLD, 2.5);
     say(f, "AT THE INDEX", 152., 34., TEXT, 9.);
-    say(f, &format!("{:.1}", 5. * u), 152., 48., GOLD, 30.);
-    let done = if u >= 1. { GOLD } else { CYAN };
+    let reading = if u >= 0.97 {
+        "5 / 0".to_string()
+    } else {
+        format!("{:.1}", 5. * u)
+    };
+    say(f, &reading, 152., 48., GOLD, 30.);
+    let done = if u >= 0.97 { GOLD } else { CYAN };
     say(f, "FULL TURN = 5.0", 152., 102., done, 10.);
     heading(f, "DIAL TURN · NUMBERS IN ONE FULL TURN");
     caption(f, "THE READING AT THE INDEX AFTER ONE FULL TURN");
@@ -818,37 +833,27 @@ fn feeds(f: &mut Frame, phase: f32) {
     let sub = (phase * 2.) % 1.;
     let u = progress(sub, 0.2);
     let travel = 4. * p * u;
-    let (xs, xt) = (226., 226. - 4. * p * u);
+    let (xs, xe) = (214., 220.);
+    let xt = xs - 4. * p * u;
     let revs = travel / p;
     let spin = TAU * revs;
     rect(f, 14., 52., 52., 106., STEEL.side);
-    rect(f, 52., 64., 232., 92., STOCK.front);
-    rect(f, xt, 64., 232., 69., BACKGROUND);
-    rect(f, xt, 87., 232., 92., BACKGROUND);
-    rect(f, xt, 69., 232., 87., FRESH.front);
+    // A half section of the bar: the tool side, down to the axis.
+    rect(f, 52., 64., xe, 92., STOCK.front);
+    rect(f, xt, 63., xe, 69., BACKGROUND);
+    rect(f, xt, 69., xe, 92., FRESH.front);
+    dashed(f, at(52., 92.), at(xe, 92.), alpha(TEXT, 0.5), 1.);
     let mark = Color::from_rgba(0.1, 0.15, 0.2, 0.45);
     for k in 0..3 {
         let a = spin + k as f32 * TAU / 3.;
         if a.cos() > 0. {
-            line(
-                f,
-                at(52., 78. + 14. * a.sin()),
-                at(xt, 78. + 14. * a.sin()),
-                mark,
-                1.2,
-            );
-            line(
-                f,
-                at(xt, 78. + 9. * a.sin()),
-                at(232., 78. + 9. * a.sin()),
-                mark,
-                1.2,
-            );
+            let y = 78. + 12. * a.sin();
+            line(f, at(52., y), at(xt, y.min(91.)), mark, 1.2);
         }
     }
     for k in 1..=(revs as usize) {
         let x = xs - k as f32 * p;
-        line(f, at(x, 69.), at(x, 87.), alpha(HOLE, 0.8), 1.);
+        line(f, at(x, 69.), at(x, 92.), alpha(HOLE, 0.8), 1.);
     }
     rect(
         f,
@@ -873,23 +878,25 @@ fn feeds(f: &mut Frame, phase: f32) {
     ring(f, c, 11., TEXT, 1.4);
     line(f, c, pt(c, 10., spin), GOLD, 2.);
     say(f, &format!("REV {:.1}", revs), 46., 26., TEXT, 9.);
-    dashed(f, at(xt, 88.), at(xt, 108.), GOLD, 1.);
-    dashed(f, at(xt + p, 88.), at(xt + p, 108.), GOLD, 1.);
-    dimension(f, at(xt, 104.), at(xt + p, 104.), GOLD);
-    say(f, &format!("{name} MM PER REV"), 120., 111., GOLD, 11.);
+    say(f, "SECTION", 56., 95., alpha(TEXT, 0.6), 8.);
+    dashed(f, at(xt, 92.), at(xt, 110.), GOLD, 1.);
+    dashed(f, at(xt + p, 92.), at(xt + p, 110.), GOLD, 1.);
+    dimension(f, at(xt, 106.), at(xt + p, 106.), GOLD);
+    say(f, &format!("{name} MM PER REV"), 110., 112., GOLD, 11.);
     heading(f, "POWER FEED · CARRIAGE ADVANCE PER REV");
     caption(f, "THE CARRIAGE ADVANCES A SET AMOUNT PER TURN");
 }
 
 /// Pitches: a thread being cut, the pitch changing through the list.
 fn pitches(f: &mut Frame, phase: f32) {
-    let list = [("0.5", 8.), ("1.0", 16.), ("1.5", 24.)];
+    // Drawn 28 px to the mm, a half section of the bar down to its axis.
+    let list = [("0.5", 14.), ("1.0", 28.), ("1.5", 42.)];
     let i = ((phase * 3.) as usize).min(2);
     let sub = phase * 3. - i as f32;
     let (name, p) = list[i];
     let u = smooth(progress(sub, 0.3));
-    let (xa, xb, cy, rr) = (24., 254., 78., 24.);
-    let depth = 0.55 * p;
+    let (xa, xb, cy, rr) = (30., 244., 90., 32.);
+    let depth = 0.4 * p;
     let xt = xb - (xb - xa) * u;
     let groove = |x: f32| -> f32 {
         let s = ((xb - x) / p).rem_euclid(1.);
@@ -910,13 +917,14 @@ fn pitches(f: &mut Frame, phase: f32) {
     top.push((xt - 0.01, cy - rr));
     top.push((xa, cy - rr));
     let mut pts: Vec<Point> = top.iter().map(|(x, y)| at(*x, *y)).collect();
-    pts.extend(top.iter().rev().map(|(x, y)| at(*x, 2. * cy - *y)));
+    pts.push(at(xa, cy));
+    pts.push(at(xb, cy));
     polygon(f, &pts, METAL.front);
-    rect(f, xa, cy - rr, xt, cy + rr, STOCK.front);
+    rect(f, xa, cy - rr, xt, cy, STOCK.front);
     let upper: Vec<Point> = top.iter().map(|(x, y)| at(*x, *y)).collect();
-    let lower: Vec<Point> = top.iter().map(|(x, y)| at(*x, 2. * cy - *y)).collect();
     poly_line(f, &upper, TEXT, 1.2);
-    poly_line(f, &lower, TEXT, 1.2);
+    dashed(f, at(xa - 8., cy), at(xb + 8., cy), alpha(TEXT, 0.5), 1.);
+    say(f, "HALF SECTION", xa, cy + 3., alpha(TEXT, 0.6), 8.);
     polygon(
         f,
         &[
@@ -935,11 +943,11 @@ fn pitches(f: &mut Frame, phase: f32) {
         Color::from_rgb(0.62, 0.68, 0.73),
     );
     if xt < xb - p - 4. {
-        dashed(f, at(xb - p, cy + rr), at(xb - p, 120.), GOLD, 1.);
-        dashed(f, at(xb, cy + rr), at(xb, 120.), GOLD, 1.);
-        dimension(f, at(xb - p, 116.), at(xb, 116.), GOLD);
+        dashed(f, at(xb - p, cy), at(xb - p, 118.), GOLD, 1.);
+        dashed(f, at(xb, cy), at(xb, 118.), GOLD, 1.);
+        dimension(f, at(xb - p, 114.), at(xb, 114.), GOLD);
     }
-    say(f, &format!("PITCH {name} MM"), 110., 111., GOLD, 11.);
+    say(f, &format!("PITCH {name} MM"), 90., 112., GOLD, 11.);
     say(f, "PITCHES (MM):", 8., 143., TEXT, 9.);
     for (k, (n, _)) in list.iter().enumerate() {
         let col = if k == i { GOLD } else { alpha(TEXT, 0.5) };
@@ -967,11 +975,11 @@ fn dro_comp(f: &mut Frame, time: f32, phase: f32) {
     }
     dashed(f, at(px, 92.), at(px, 132.), CYAN, 1.);
     dimension(f, at(zero, 128.), at(px, 128.), CYAN);
-    dashed(f, at(edge, 76.), at(edge, 102.), GOLD, 1.);
-    dashed(f, at(c.x, 92.), at(c.x, 102.), GOLD, 1.);
-    dimension(f, at(edge, 98.), at(c.x, 98.), GOLD);
-    say(f, "R = TOOL RADIUS", 134., 106., GOLD, 9.);
-    panel(f, 168., 20., 274., 94.);
+    dashed(f, at(edge, 76.), at(edge, 108.), GOLD, 1.);
+    dashed(f, at(c.x, 92.), at(c.x, 108.), GOLD, 1.);
+    dimension(f, at(edge, 104.), at(c.x, 104.), GOLD);
+    say(f, "R = TOOL RADIUS", c.x + 7., 99., GOLD, 9.);
+    panel(f, 168., 20., 274., 90.);
     say(f, "DRO", 174., 24., TEXT, 9.);
     say(
         f,
@@ -996,48 +1004,59 @@ fn dro_comp(f: &mut Frame, time: f32, phase: f32) {
         9.,
     );
     heading(f, "DRO COMPENSATION · EDGE OR CENTRE");
-    caption(f, "COMP ON: THE DRO READS THE EDGE, NOT THE CENTRE");
+    caption(
+        f,
+        if on {
+            "COMP ON: THE DRO READS THE TOOL'S EDGE"
+        } else {
+            "COMP OFF: THE DRO READS THE TOOL CENTRE"
+        },
+    );
 }
 
 /// Edge finder: touch the face, the tip kicks off, the zero is one radius
 /// from the spindle centre.
 fn edge_finder(f: &mut Frame, time: f32, phase: f32) {
     let (face, r, cy) = (96., 24., 76.);
-    stock(f, 24., 26., face, 126.);
+    stock(f, 24., 26., face, 120.);
     let approach = smooth(progress(phase, 0.5));
     let cx = 214. - (214. - (face + r)) * approach;
     let touched = phase >= 0.5;
-    let kick = smooth(((phase - 0.5) / 0.08).clamp(0., 1.));
+    let kick = smooth(((phase - 0.5) / 0.06).clamp(0., 1.));
     let a = time * SPIN * 2.;
-    let wobble = (5. * a.cos(), 5. * a.sin());
-    let off = (wobble.0 * (1. - kick), -12. * kick + wobble.1 * (1. - kick));
+    let wobble = (3. * a.cos(), 3. * a.sin());
+    let off = (wobble.0 * (1. - kick), -20. * kick + wobble.1 * (1. - kick));
     let c = at(cx, cy);
     disc_at(f, c, r, Color::from_rgb(0.45, 0.52, 0.58));
     ring(f, c, r, TEXT, 1.8);
+    if touched {
+        dashed_circle(f, c, 9., DIM);
+    }
     let tip = at(cx + off.0, cy + off.1);
-    disc_at(f, tip, 14., FRESH.top);
-    ring(f, tip, 14., GOLD, 1.8);
+    disc_at(f, tip, 9., FRESH.top);
+    ring(f, tip, 9., GOLD, 1.8);
     line(f, at(cx - 6., cy), at(cx + 6., cy), CYAN, 2.);
     line(f, at(cx, cy - 6.), at(cx, cy + 6.), CYAN, 2.);
     if !touched {
         arrow(f, at(cx + r + 34., cy), at(cx + r + 10., cy), CYAN);
-        say_mid(f, "EDGE FINDER", cx.max(146.), cy - r - 14., TEXT, 9.);
+        say_mid(f, "EDGE FINDER", cx.max(170.), cy - r - 14., TEXT, 9.);
     } else {
-        dashed(f, at(cx, 46.), at(cx, cy - 6.), GOLD, 1.);
-        dimension(f, at(face, 46.), at(cx, 46.), GOLD);
-        say(f, "R = Ø ÷ 2", cx + 8., 36., GOLD, 10.);
-        say(f, "TIP KICKS OFF", 156., 58., CYAN, 9.);
+        // The radius runs along the lower half of the body, clear of the tip.
+        dashed(f, at(cx, cy), at(cx, cy + 18.), GOLD, 1.);
+        dimension(f, at(face, cy + 14.), at(cx, cy + 14.), GOLD);
+        say(f, "R = Ø ÷ 2", cx + r + 6., cy + 8., GOLD, 10.);
+        say(f, "TIP KICKS OFF", cx + r + 6., cy - 28., CYAN, 10.);
         dashed(
             f,
-            at(face + 2. * r, 100.),
-            at(face + 2. * r, 116.),
+            at(face + 2. * r, cy + 24.),
+            at(face + 2. * r, 112.),
             CYAN,
             1.,
         );
-        dimension(f, at(face, 112.), at(face + 2. * r, 112.), CYAN);
-        say(f, "Ø = EDGE FINDER", 152., 108., CYAN, 9.);
+        dimension(f, at(face, 108.), at(face + 2. * r, 108.), CYAN);
+        say(f, "Ø = EDGE FINDER", face + 2. * r + 8., 104., CYAN, 9.);
     }
-    say_mid(f, "FACE = WORK ZERO", 60., 130., GOLD, 9.);
+    say_mid(f, "FACE = WORK ZERO", 60., 127., GOLD, 9.);
     heading(f, "EDGE FINDER Ø · PICKS UP THE WORK ZERO");
     caption(f, "SPINDLE CENTRE SITS ONE RADIUS FROM THE FACE");
 }
@@ -1080,24 +1099,32 @@ fn pass_time(f: &mut Frame, phase: f32) {
 
 /// Tool time: each tool change adds minutes to the setup.
 fn tool_time(f: &mut Frame, phase: f32) {
-    let step = 0.22;
-    let k = ((phase / step) as usize + 1).min(4);
-    let frac = ((phase - (k - 1) as f32 * step) / step).clamp(0., 1.);
-    let grow = (frac / 0.5).clamp(0., 1.);
-    let total = 4 * (k - 1) + (4. * grow).round() as usize;
+    let t0 = 0.08;
+    let step = (0.96 - t0) / 4.;
+    let (idx, frac) = if phase < t0 {
+        (0, -1.)
+    } else {
+        let i = (((phase - t0) / step) as usize).min(3);
+        (i, ((phase - t0 - i as f32 * step) / step).clamp(0., 1.))
+    };
+    let slide = smooth((frac / 0.3).clamp(0., 1.));
+    let grow = ((frac - 0.45) / 0.35).clamp(0., 1.);
+    let total = 4 * idx + (4. * grow).round() as usize;
     let colors = [GOLD, CYAN, TEXT, OK];
-    let drop = 20. * (1. - smooth((frac * 3.).clamp(0., 1.)));
     rect(f, 34., 26., 58., 38., STEEL.front);
-    tool_glyph(f, 46., 38. - drop, 38., 12., colors[k - 1]);
-    let tip = 76. - drop;
-    let _ = tip;
-    line(f, at(36., 80.), at(56., 80.), CYAN, 1.6);
-    line(f, at(46., 72.), at(46., 88.), CYAN, 1.6);
-    ring(f, at(46., 80.), 7., CYAN, 1.2);
+    if frac >= 0. {
+        tool_glyph(f, 46. - 28. * (1. - slide), 38., 38., 12., colors[idx]);
+    }
+    if frac >= 0.3 {
+        // The zero picked up again with the new tool.
+        line(f, at(36., 80.), at(56., 80.), CYAN, 1.6);
+        line(f, at(46., 72.), at(46., 88.), CYAN, 1.6);
+        ring(f, at(46., 80.), 7., CYAN, 1.2);
+    }
     say(f, "+4 MIN PER TOOL CHANGE", 86., 28., GOLD, 11.);
     say(f, "SETUP TOTAL", 86., 52., TEXT, 9.);
     say(f, &format!("{total} MIN"), 86., 64., TEXT, 22.);
-    block_row(f, 24., 104., 56., 22., 3., 4, k - 1, grow, "+4 MIN");
+    block_row(f, 24., 104., 56., 22., 3., 4, idx, grow, "+4 MIN");
     for i in 0..4 {
         say_mid(
             f,
@@ -1132,7 +1159,7 @@ fn move_time(f: &mut Frame, phase: f32) {
     say_mid(f, "TOTAL", 139., 24., TEXT, 9.);
     say_mid(f, &format!("{} MIN", 15 * moves), 139., 36., GOLD, 16.);
     if (0.3..0.5).contains(&phase) || phase >= 0.8 {
-        say_mid(f, "+15 MIN", x.clamp(110., 168.), 66., GOLD, 11.);
+        say_mid(f, "+15 MIN", 139., 62., GOLD, 11.);
     }
     let newest = moves.saturating_sub(1);
     let grow = if moves == 0 {
@@ -1145,11 +1172,11 @@ fn move_time(f: &mut Frame, phase: f32) {
         let bx = 24. + k as f32 * 110.;
         rect(f, bx, 108., bx + 106., 128., alpha(CYAN, 0.08));
         if moves > 0 && k < newest {
-            rect(f, bx, 108., bx + 106., 128., NORMAL);
-            say_mid(f, "+15 MIN", bx + 53., 113., TEXT, 10.);
+            rect(f, bx, 108., bx + 106., 128., GOLD);
+            say_mid(f, "+15 MIN", bx + 53., 113., BACKGROUND, 10.);
         } else if moves > 0 && k == newest {
             rect(f, bx, 108., bx + 106. * grow, 128., GOLD);
-            if grow >= 1. {
+            if grow >= 0.5 {
                 say_mid(f, "+15 MIN", bx + 53., 113., BACKGROUND, 10.);
             }
         }
@@ -1225,7 +1252,7 @@ fn rpm_limit(f: &mut Frame, time: f32, phase: f32) {
 fn power(f: &mut Frame, time: f32, phase: f32) {
     let c = at(66., 88.);
     let limit = 0.667;
-    let frac = track(phase, &[(0., 0.05), (0.55, limit), (1., limit)]);
+    let frac = track(phase, &[(0., 0.05), (0.5, limit), (0.6, limit), (1., 0.05)]);
     gauge(
         f,
         c,
@@ -1244,16 +1271,16 @@ fn power(f: &mut Frame, time: f32, phase: f32) {
     );
     let m = pt(c, 52., ang(limit));
     say(f, "RATED", m.x - 2., m.y - 10., GOLD, 9.);
-    // The cutter and the force it meets.
-    let cx = 232.;
+    // The cutter works along the stock and the force it meets.
+    let cx = 250. - 50. * phase;
     stock(f, 130., 100., 270., 128.);
-    rect(f, 130., 100., cx + 10., 110., BACKGROUND);
+    rect(f, cx - 10., 99., 270., 110., BACKGROUND);
     side_cutter(f, cx, 110., time, 20., false);
     let len = 8. + 52. * (frac / limit);
     arrow(f, at(cx - 12., 84.), at(cx - 12. - len, 84.), GOLD);
-    say(f, "CUTTING FORCE", 130., 60., GOLD, 10.);
+    say(f, "CUTTING FORCE", 130., 52., GOLD, 10.);
     if frac >= limit - 0.01 {
-        say(f, "MAX", 130., 72., RED, 10.);
+        say(f, "MAX = RATED", 130., 64., RED, 10.);
     }
     heading(f, "SPINDLE POWER · LIMITS THE CUTTING FORCE");
     caption(f, "THE HOLDING CHECK USES THIS CUTTING FORCE");
@@ -1270,27 +1297,36 @@ fn feed_limit(f: &mut Frame, _time: f32, phase: f32) {
         (0.9, 0.93),
         (1., 0.1),
     ];
-    let frac = track(phase, &keys);
-    let over = frac > limit;
+    // The bar and the words share one rounded value.
+    let value = ((track(phase, &keys) * 3000.) / 50.).round() as i32 * 50;
+    let frac = value as f32 / 3000.;
+    let over = value > 2000;
     let mut pos = 0.;
     let steps = 60;
     for i in 0..steps {
         pos += track(phase * (i as f32 + 0.5) / steps as f32, &keys) * phase * 6.;
     }
-    bar_gauge(f, 20., 28., 258., 38., frac, limit);
-    say(f, "MAX", 20. + 238. * limit - 8., 14., GOLD, 10.);
+    bar_gauge(f, 20., 36., 258., 46., frac, limit);
     say(
         f,
-        &format!("{} MM/MIN", ((frac * 3000.) / 50.).round() as i32 * 50),
+        "MAX 2000 MM/MIN",
+        20. + 238. * limit - 94.,
         20.,
-        44.,
+        GOLD,
+        10.,
+    );
+    say(
+        f,
+        &format!("{value} MM/MIN"),
+        20.,
+        52.,
         if over { RED } else { TEXT },
         12.,
     );
     if over {
-        say(f, "ABOVE MAX: FLAGGED", 168., 60., RED, 10.);
+        say(f, "ABOVE MAX: FLAGGED", 162., 66., RED, 10.);
     } else {
-        say(f, "WITHIN THE MAX", 168., 60., OK, 10.);
+        say(f, "WITHIN THE MAX", 162., 66., OK, 10.);
     }
     // The table with parts on it, sliding left.
     rect(f, 14., 100., 264., 112., IRON_LIGHT);
@@ -1357,32 +1393,32 @@ fn travel(f: &mut Frame, time: f32, phase: f32, axis: u8) {
     let a = time * SPIN * 2.;
     match axis {
         0 => {
-            // Front view: the table slides under the spindle.
+            // Front view: the table slides under the spindle, never into the
+            // column.
             rect(f, 20., 112., 258., 124., IRON);
-            rect(f, 212., 22., 240., 112., IRON_LIGHT);
-            rect(f, 112., 24., 212., 44., IRON_LIGHT);
+            rect(f, 214., 22., 242., 112., IRON_LIGHT);
+            rect(f, 112., 24., 214., 44., IRON_LIGHT);
             rect(f, 129., 44., 149., 52., STEEL.front);
             rect(f, 136., 52., 142., 74., METAL.top);
             rect(f, 136., 74., 142., 90., GOLD);
-            let (lo, hi) = (24., 180.);
-            dashed_rect(f, lo, 102., lo + 78., 112., DIM);
-            dashed_rect(f, hi, 102., hi + 78., 112., DIM);
+            let (lo, hi, w) = (24., 134., 70.);
+            dashed_rect(f, lo, 102., lo + w, 112., DIM);
+            dashed_rect(f, hi, 102., hi + w, 112., DIM);
             let tx = lo + (hi - lo) * s;
-            rect(f, tx, 102., tx + 78., 112., METAL.top);
-            rect(f, tx + 20., 90., tx + 58., 102., STOCK.front);
-            let m = (tx + 20.).max(136.);
-            let _ = m;
+            rect(f, tx, 102., tx + w, 112., METAL.top);
+            rect(f, tx + 16., 90., tx + 54., 102., STOCK.front);
             dashed(f, at(lo, 112.), at(lo, 134.), GOLD, 1.);
             dashed(f, at(hi, 112.), at(hi, 134.), GOLD, 1.);
             dimension(f, at(lo, 130.), at(hi, 130.), GOLD);
-            say(f, "X TRAVEL", 188., 124., GOLD, 10.);
-            arrow(f, at(20., 40.), at(56., 40.), CYAN);
+            say(f, "X TRAVEL", 158., 124., GOLD, 10.);
+            dimension(f, at(20., 40.), at(56., 40.), CYAN);
             say(f, "X", 62., 34., CYAN, 12.);
-            heading(f, "X TRAVEL · TABLE STROKE, LEFT TO RIGHT");
+            heading(f, "X TRAVEL · TABLE STROKE, END TO END");
             caption(f, "THE TABLE SLIDES FROM ONE END TO THE OTHER");
         }
         1 => {
-            // Plan view: the table slides toward and away from the column.
+            // Plan view: the table slides toward and away from the column,
+            // and the spindle stays clear of the workpiece.
             rect(f, 40., 30., 200., 138., IRON);
             rect(f, 40., 30., 200., 48., IRON_LIGHT);
             say_mid(f, "COLUMN", 120., 34., TEXT, 8.);
@@ -1391,38 +1427,44 @@ fn travel(f: &mut Frame, time: f32, phase: f32, axis: u8) {
             dashed_rect(f, 60., hi, 180., hi + 30., DIM);
             let ty = lo + (hi - lo) * s;
             rect(f, 60., ty, 180., ty + 30., METAL.top);
-            rect(f, 90., ty + 6., 150., ty + 24., STOCK.top);
-            top_cutter(f, at(120., 78.), 10., a, 4);
+            rect(f, 68., ty + 6., 116., ty + 24., STOCK.top);
+            top_cutter(f, at(152., 78.), 10., a, 4);
             dashed(f, at(180., lo), at(226., lo), GOLD, 1.);
             dashed(f, at(180., hi), at(226., hi), GOLD, 1.);
             dimension(f, at(222., lo), at(222., hi), GOLD);
             say(f, "Y", 232., 70., GOLD, 12.);
             say(f, "TRAVEL", 232., 84., GOLD, 9.);
-            arrow(f, at(24., 110.), at(24., 70.), CYAN);
-            say(f, "Y", 20., 56., CYAN, 12.);
+            // The arrow follows the table: toward the operator, then back.
+            if phase < 0.5 {
+                arrow(f, at(50., 66.), at(50., 96.), CYAN);
+            } else {
+                arrow(f, at(50., 96.), at(50., 66.), CYAN);
+            }
+            dimension(f, at(18., 110.), at(18., 70.), CYAN);
+            say(f, "Y", 14., 56., CYAN, 12.);
             heading(f, "Y TRAVEL · TABLE STROKE, TOWARD AND AWAY");
             caption(f, "THE TABLE SLIDES TOWARD AND AWAY FROM THE COLUMN");
         }
         _ => {
             // Front view: the spindle head rides up and down the column.
             rect(f, 20., 120., 258., 130., IRON);
-            rect(f, 60., 112., 200., 120., METAL.top);
-            rect(f, 100., 104., 160., 112., STOCK.front);
-            rect(f, 210., 18., 238., 120., IRON_LIGHT);
-            let (hi, lo) = (20., 63.);
+            rect(f, 56., 112., 156., 120., METAL.top);
+            rect(f, 74., 104., 128., 112., STOCK.front);
+            let (hi, lo) = (20., 56.);
             let hy = hi + (lo - hi) * s;
-            dashed(f, at(129., hi + 21.), at(256., hi + 21.), DIM, 1.);
-            dashed(f, at(129., lo + 21.), at(256., lo + 21.), DIM, 1.);
-            rect(f, 130., hy, 210., hy + 16., IRON_LIGHT);
-            rect(f, 131., hy + 16., 147., hy + 21., STEEL.front);
-            rect(f, 136., hy + 21., 142., hy + 29., METAL.top);
-            rect(f, 136., hy + 29., 142., hy + 41., GOLD);
-            dashed(f, at(238., hi + 21.), at(256., hi + 21.), GOLD, 1.);
-            dashed(f, at(238., lo + 21.), at(256., lo + 21.), GOLD, 1.);
-            dimension(f, at(254., hi + 21.), at(254., lo + 21.), GOLD);
-            say(f, "Z TRAVEL", 160., 92., GOLD, 10.);
-            arrow(f, at(24., 90.), at(24., 50.), CYAN);
-            say(f, "Z", 30., 44., CYAN, 12.);
+            dashed(f, at(60., hi + 21.), at(228., hi + 21.), DIM, 1.);
+            dashed(f, at(60., lo + 21.), at(228., lo + 21.), DIM, 1.);
+            rect(f, 172., 18., 200., 120., IRON_LIGHT);
+            rect(f, 92., hy, 172., hy + 16., IRON_LIGHT);
+            rect(f, 93., hy + 16., 109., hy + 21., STEEL.front);
+            rect(f, 98., hy + 21., 104., hy + 29., METAL.top);
+            rect(f, 98., hy + 29., 104., hy + 41., GOLD);
+            dashed(f, at(200., hi + 21.), at(224., hi + 21.), GOLD, 1.);
+            dashed(f, at(200., lo + 21.), at(224., lo + 21.), GOLD, 1.);
+            dimension(f, at(222., hi + 21.), at(222., lo + 21.), GOLD);
+            say(f, "Z TRAVEL", 230., 62., GOLD, 9.);
+            dimension(f, at(24., 90.), at(24., 50.), CYAN);
+            say(f, "Z", 30., 62., CYAN, 12.);
             heading(f, "Z TRAVEL · SPINDLE STROKE, UP AND DOWN");
             caption(f, "THE SPINDLE HEAD RIDES THE COLUMN END TO END");
         }
@@ -1451,52 +1493,66 @@ fn tool_change(f: &mut Frame, phase: f32) {
     let b_col = CYAN;
     if !auto {
         rect(f, 150., 121., 262., 126., IRON);
-        let gx = track(
-            s,
-            &[
-                (0., 180.),
-                (0.12, 78.),
-                (0.3, 78.),
-                (0.45, 190.),
-                (0.55, 244.),
-                (0.7, 78.),
-                (0.88, 78.),
-                (1., 78.),
-            ],
-        );
-        let gy = track(
-            s,
-            &[
-                (0., 110.),
-                (0.12, 73.),
-                (0.3, 103.),
-                (0.45, 103.),
-                (0.55, 103.),
-                (0.7, 103.),
-                (0.88, 73.),
-                (1., 73.),
-            ],
-        );
-        // Tool A: in the spindle, in the hand, then resting.
-        if s < 0.12 {
+        // The hand: reach the spindle tool, set it on the bench, fetch the
+        // other one, carry it high over the bench and fit it.
+        let keys_x = [
+            (0., 150.),
+            (0.1, 78.),
+            (0.16, 78.),
+            (0.26, 130.),
+            (0.34, 190.),
+            (0.40, 190.),
+            (0.46, 190.),
+            (0.52, 190.),
+            (0.60, 244.),
+            (0.64, 244.),
+            (0.70, 244.),
+            (0.78, 244.),
+            (0.90, 78.),
+            (0.96, 78.),
+            (1., 78.),
+        ];
+        let keys_y = [
+            (0., 58.),
+            (0.1, 73.),
+            (0.16, 73.),
+            (0.26, 70.),
+            (0.34, 70.),
+            (0.40, 103.),
+            (0.46, 103.),
+            (0.52, 70.),
+            (0.60, 70.),
+            (0.64, 103.),
+            (0.70, 103.),
+            (0.78, 66.),
+            (0.90, 66.),
+            (0.96, 73.),
+            (1., 73.),
+        ];
+        let gx = track(s, &keys_x);
+        let gy = track(s, &keys_y);
+        // Tool A: in the spindle, carried to its place on the bench.
+        if s < 0.16 {
             tool_glyph(f, 70., 61., 30., 8., GOLD);
-        } else if s < 0.45 {
+        } else if s < 0.40 {
             tool_glyph(f, gx - 8., gy - 12., 30., 8., GOLD);
         } else {
             tool_glyph(f, 182., 91., 30., 8., GOLD);
         }
-        // Tool B: resting, then in the hand and the spindle.
-        if s < 0.55 {
+        // Tool B: on the bench, then carried to the spindle.
+        if s < 0.70 {
             tool_glyph(f, 236., 91., 30., 8., b_col);
-        } else {
+        } else if s < 0.96 {
             tool_glyph(f, gx - 8., gy - 12., 30., 8., b_col);
+        } else {
+            tool_glyph(f, 70., 61., 30., 8., b_col);
         }
         line(f, at(gx + 6., gy + 2.), at(gx + 26., gy + 30.), SKIN, 11.);
         disc_at(f, at(gx + 6., gy), 7., SKIN);
         line(f, at(gx + 2., gy - 5.), at(gx - 4., gy - 5.), SKIN, 3.);
         line(f, at(gx + 2., gy + 5.), at(gx - 4., gy + 5.), SKIN, 3.);
-        say(f, "A HAND SWAPS", 150., 50., GOLD, 10.);
-        say(f, "THE TOOL", 150., 62., GOLD, 10.);
+        say(f, "A HAND SWAPS", 8., 100., GOLD, 10.);
+        say(f, "THE TOOL", 8., 112., GOLD, 10.);
         caption(f, "MANUAL: THE OPERATOR SWAPS THE TOOL BY HAND");
     } else {
         let cc = at(200., 92.);
@@ -1554,12 +1610,21 @@ fn surface_speed(f: &mut Frame, time: f32, phase: f32) {
     disc_at(f, dot, 3.5, CYAN);
     let tail = at(dot.x + 18. * a.cos(), dot.y + 18. * a.sin());
     arrow(f, dot, tail, CYAN);
-    say(f, "V", tail.x + 3., tail.y - 3., CYAN, 10.);
-    dashed(f, at(c.x - r, c.y), at(c.x - r, 124.), GOLD, 1.);
-    dashed(f, at(c.x + r, c.y), at(c.x + r, 124.), GOLD, 1.);
+    let (tx, ty) = (a.cos(), a.sin());
+    // The label sits past the arrowhead, and above the dimension lines.
+    say(
+        f,
+        "V",
+        tail.x + 11. * tx - 3.,
+        (tail.y + 11. * ty - 5.).min(104.),
+        CYAN,
+        10.,
+    );
+    dashed(f, at(c.x - r, 112.), at(c.x - r, 124.), GOLD, 1.);
+    dashed(f, at(c.x + r, 112.), at(c.x + r, 124.), GOLD, 1.);
     dimension(f, at(c.x - r, 120.), at(c.x + r, 120.), GOLD);
     say_mid(f, "D", c.x, 123., GOLD, 10.);
-    let g = at(204., 88.);
+    let g = at(204., 82.);
     let (lo, hi) = (0.35, 0.7);
     let frac = track(
         phase,
@@ -1596,45 +1661,56 @@ fn surface_speed(f: &mut Frame, time: f32, phase: f32) {
     let m1 = pt(g, 56., ang(hi));
     say(f, "MIN", m0.x - 14., m0.y - 6., GOLD, 10.);
     say(f, "MAX", m1.x - 2., m1.y - 6., GOLD, 10.);
-    say_mid(f, "M/MIN", g.x, g.y + 30., TEXT, 9.);
+    say_mid(f, "M/MIN", g.x, g.y + 26., TEXT, 9.);
     say_mid(
         f,
         &format!("{}", (frac * 300.).round() as i32),
         g.x,
-        g.y + 12.,
+        g.y + 8.,
         state.1,
         14.,
     );
-    say_mid(f, state.0, g.x, 130., state.1, 9.);
+    say_mid(f, state.0, g.x, 128., state.1, 9.);
     heading(f, "SURFACE SPEED · π × D × RPM ÷ 1000 (M/MIN)");
     caption(f, "BAND = RECOMMENDED MIN TO MAX · OUTSIDE FLAGGED");
 }
 
 /// Chip load: the chip each tooth takes, and the recommended band.
 fn chip_load(f: &mut Frame, time: f32, phase: f32) {
-    let (c, r) = (at(100., 78.), 28.);
+    let (c, r) = (at(100., 72.), 28.);
     let (lo, hi) = (6., 11.);
     let v = track(
         phase,
         &[
-            (0., 3.),
-            (0.2, 3.),
+            (0., 3.5),
+            (0.2, 3.5),
             (0.35, 8.5),
             (0.6, 8.5),
             (0.75, 15.5),
             (0.92, 15.5),
-            (1., 3.),
+            (1., 3.5),
         ],
     );
-    rect(f, 14., 34., 206., 122., STOCK.top);
+    // The chip drawn exaggerated so even the thinnest shows.
+    let d = 6. + 1.6 * v;
+    rect(f, 14., 30., 206., 108., STOCK.top);
     rect(f, 14., c.y - r, c.x, c.y + r, BACKGROUND);
     // The cutter a tooth later: what shows beyond the cutter is the chip.
-    disc_at(f, at(c.x + v, c.y), r, GOLD);
+    disc_at(f, at(c.x + d, c.y), r, GOLD);
     top_cutter(f, c, r, time * SPIN * 2., 4);
-    dimension(f, at(c.x + r, c.y), at(c.x + r + v, c.y), HOLE);
-    say(f, "FZ", c.x + r + v + 5., c.y - 5., GOLD, 10.);
+    // The chip thickness, measured below the stock on the card's own colour.
+    dashed(f, at(c.x, c.y + r), at(c.x, 120.), HOLE, 1.);
+    dashed(f, at(c.x + d, c.y + r), at(c.x + d, 120.), HOLE, 1.);
+    dashed(f, at(c.x, 108.), at(c.x, 124.), GOLD, 1.);
+    dashed(f, at(c.x + d, 108.), at(c.x + d, 124.), GOLD, 1.);
+    arrow(f, at(c.x - 14., 120.), at(c.x, 120.), GOLD);
+    arrow(f, at(c.x + d + 14., 120.), at(c.x + d, 120.), GOLD);
+    say(f, "FZ", c.x + d + 18., 115., GOLD, 10.);
+    // The feed: the cutter advances through the slot it has cut.
+    arrow(f, at(26., c.y), at(60., c.y), CYAN);
+    say(f, "FEED", 26., c.y - 16., CYAN, 9.);
     // The scale: the recommended band and where this chip sits in it.
-    let (y0, y1) = (34., 112.);
+    let (y0, y1) = (34., 108.);
     let ys = |val: f32| y1 - (y1 - y0) * val / 18.;
     rect(f, 226., y0, 238., y1, alpha(RED, 0.25));
     rect(f, 226., ys(hi), 238., ys(lo), OK);
@@ -1655,7 +1731,7 @@ fn chip_load(f: &mut Frame, time: f32, phase: f32) {
     } else {
         ("IN BAND", OK)
     };
-    say(f, label, 214., 118., col, 9.);
+    say(f, label, 214., 113., col, 9.);
     heading(f, "CHIP LOAD = FEED ÷ (RPM × FLUTES)");
     caption(f, "GOLD: THE CHIP ONE TOOTH TAKES · BAND: MIN-MAX");
 }
