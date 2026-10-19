@@ -785,7 +785,7 @@ fn contour(f: &mut Frame, time: f32, phase: f32) {
         f,
         &format!("CONTOUR · AROUND THE WALL, PASS {} OF 2", pass + 1),
     );
-    caption(f, "AMBER: MATERIAL OUTSIDE THE FINISHED WALL");
+    caption(f, "CYAN: TOOLPATH   AMBER: OUTSIDE THE WALL");
 }
 
 /// Waterline: loops round a steep boss at constant heights, one level
