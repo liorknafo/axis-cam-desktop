@@ -730,6 +730,10 @@ fn operation(
             );
             set("containment", "Tool outside boundary".into());
             set("allowance", "0".into());
+            // Past the outline far enough for the cutter's corners.
+            if let Some(d) = num(&tool.p, "diameter").filter(|d| *d > 0.) {
+                set("silhouette_extend", crate::model::outline_extend_for(d));
+            }
         }
         Strategy::Pocket => {
             set("boundary", "Selected geometry".into());
@@ -957,7 +961,11 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
         (p.bottom_offset != d.bottom_offset, &["bottom"]),
         (p.clearance != d.clearance, &["clearance"]),
         (p.finish_passes != d.finish_passes, &["finish_passes"]),
-        (p.facing_area != d.facing_area, &["boundary"]),
+        // How far past the outline a Facing clears is sized to its cutter.
+        (
+            p.facing_area != d.facing_area,
+            &["boundary", "silhouette_extend"],
+        ),
         (p.pocket_entry != d.pocket_entry, &["pocket_entry"]),
         (p.ramp_angle != d.ramp_angle, &["ramp_angle"]),
         (
@@ -977,6 +985,9 @@ fn merged(base: &Operation, fresh: &Operation, p: &ProposedOp, d: &ProposedOp) -
     }
     if p.tool != d.tool {
         op.tool.clone_from(&fresh.tool);
+        if base.strategy == Strategy::Face {
+            copy(&["silhouette_extend"]);
+        }
     }
     if surfaces != d.surfaces {
         op.surfaces.clone_from(&fresh.surfaces);
@@ -2068,6 +2079,48 @@ pub(crate) mod tests {
         assert_eq!(parsed, good(&report));
         // A key that is not in the schema is still refused.
         assert!(parse(&text.replace("\"clearance\":null", "\"clearence\":null")).is_err());
+    }
+    #[test]
+    fn a_facing_of_the_models_outline_clears_past_it_far_enough_for_its_cutter() {
+        // A Ø25 face mill reaches the block's square corners 2.9 mm past
+        // them: the plan sets 4 mm, and the Face generates.
+        let (mut doc, mesh, report) = block();
+        doc.tools[0].p.insert("diameter".into(), "25".into());
+        let mut proposal = good(&report);
+        proposal.setups.truncate(1);
+        proposal.setups[0].operations.truncate(1);
+        proposal.setups[0].operations[0].facing_area = Some("model".into());
+        let built = build(&doc, &mesh, &report, &proposal).unwrap();
+        let setup = &built.setups[0];
+        let face = &setup.operations[0];
+        assert!(face.faces_outline());
+        assert_eq!(get(&face.p, "silhouette_extend"), "4.0");
+        let tool = built.tools.iter().find(|t| t.id == face.tool).unwrap();
+        crate::simulation::generate(setup, face, tool, &mesh).unwrap();
+    }
+    #[test]
+    fn a_change_of_cutter_resizes_how_far_past_the_outline_a_facing_clears() {
+        // Applied on the Ø10 T1, then changed to a Ø25 T4.
+        let (mut doc, mesh, report) = block();
+        let mut big = Tool::new("Face mill", "Flat end mill", "25");
+        big.p.insert("number".into(), "4".into());
+        doc.tools.push(big);
+        let mut plan = good(&report);
+        plan.setups[0].operations[0].facing_area = Some("model".into());
+        let doc = build(&doc, &mesh, &report, &plan).unwrap();
+        assert_eq!(
+            get(&doc.setups[0].operations[0].p, "silhouette_extend"),
+            "2.0"
+        );
+        let mut change = shown(&doc, &report);
+        change.setups[0].operations[0].tool = 4;
+        let rebuilt = build(&doc, &mesh, &report, &change).unwrap();
+        let (setup, face) = (&rebuilt.setups[0], &rebuilt.setups[0].operations[0]);
+        assert_eq!(face.id, doc.setups[0].operations[0].id);
+        assert_eq!(get(&face.p, "silhouette_extend"), "4.0");
+        let tool = rebuilt.tools.iter().find(|t| t.id == face.tool).unwrap();
+        assert_eq!(get(&tool.p, "diameter"), "25");
+        crate::simulation::generate(setup, face, tool, &mesh).unwrap();
     }
     #[test]
     fn operations_get_defaults_overrides_and_fixed_combinations() {

@@ -237,6 +237,61 @@ pub fn generate(
     if allowance < 0. {
         return Err("Radial stock to leave cannot be negative.".into());
     }
+    let top = stock.stock.max[2].max(plane + number(operation, "top")?);
+    let clearance = top + number(operation, "clearance")?;
+    let retract = top + number(operation, "retract")?;
+    if retract <= top || clearance < retract {
+        return Err(
+            "Set a positive retract height and clearance at or above retract before simulation."
+                .into(),
+        );
+    }
+    if top - target >= tool_length {
+        return Err("Facing depth from the cutting start to the target must be less than tool stickout. Choose a tool with adequate reach or reduce the stock above the target.".into());
+    }
+    if operation.faces_outline() {
+        let extend: f32 = operation
+            .outline_extend()
+            .parse()
+            .ok()
+            .filter(|e: &f32| e.is_finite() && *e >= 0.)
+            .ok_or("Clear past outline cannot be negative or blank.")?;
+        // The outline's outer loops: the stock over a hole through the part
+        // is above its top too.
+        let loops: Vec<crate::pocket::Polygon> = crate::cam::Geometry::new(setup, mesh)
+            .silhouette(false, operation)?
+            .into();
+        let silhouette = crate::cam::region(
+            loops
+                .into_iter()
+                .filter(|p| crate::cam::area(p) > 0.)
+                .collect(),
+        )?;
+        return crate::facing::outline(crate::facing::Outline {
+            setup,
+            op: operation,
+            silhouette,
+            extend: extend as f64,
+            stock: stock.stock,
+            scale,
+            radius,
+            flute_length,
+            tool_length,
+            holder_radius,
+            feed,
+            stepdown,
+            stepover,
+            top,
+            clearance,
+            retract,
+            target,
+            direction: number(operation, "direction")?,
+            both_ways,
+            keep_down,
+            climb,
+            spindle_clockwise,
+        });
+    }
     let mut area = match get(&operation.p, "boundary") {
         "Stock silhouette" => stock.stock,
         "Model silhouette" => placement.bounds.scaled(1. / scale),
@@ -283,18 +338,6 @@ pub fn generate(
         area.max[k] + radius < stock.stock.min[k] || area.min[k] - radius > stock.stock.max[k]
     }) {
         return Err("The selected boundary does not intersect the stock.".into());
-    }
-    let top = stock.stock.max[2].max(plane + number(operation, "top")?);
-    let clearance = top + number(operation, "clearance")?;
-    let retract = top + number(operation, "retract")?;
-    if retract <= top || clearance < retract {
-        return Err(
-            "Set a positive retract height and clearance at or above retract before simulation."
-                .into(),
-        );
-    }
-    if top - target >= tool_length {
-        return Err("Facing depth from the cutting start to the target must be less than tool stickout. Choose a tool with adequate reach or reduce the stock above the target.".into());
     }
     let mut envelope = area;
     for k in 0..2 {

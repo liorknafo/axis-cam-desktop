@@ -4,6 +4,7 @@ mod cam;
 mod choice_diagram;
 mod choice_help;
 mod control;
+mod facing;
 #[cfg(test)]
 mod fake_openai;
 mod forces;
@@ -3994,19 +3995,27 @@ impl App {
                 }
                 // Adaptive clearing starts sized to its cutter: a load of
                 // 15 % of its diameter and a stepdown of two diameters,
-                // within its flutes.
-                if strategy == Strategy::Adaptive
+                // within its flutes. A Facing clears far enough past the
+                // part's outline, when it faces that, for the cutter to
+                // reach its corners (`outline_extend_for`).
+                if matches!(strategy, Strategy::Adaptive | Strategy::Face)
                     && !self.is_sample()
                     && let Some(d) = num(&tool.p, "diameter").filter(|d| *d > 0.)
                 {
-                    let load = ((d * 0.15 / 0.05).round() * 0.05).max(0.05);
-                    let flutes = num(&tool.p, "length").unwrap_or(2. * d);
-                    operation
-                        .p
-                        .insert("optimal_load".into(), format!("{load:.2}"));
-                    operation
-                        .p
-                        .insert("stepdown".into(), format!("{:.1}", (2. * d).min(flutes)));
+                    if strategy == Strategy::Adaptive {
+                        let load = ((d * 0.15 / 0.05).round() * 0.05).max(0.05);
+                        let flutes = num(&tool.p, "length").unwrap_or(2. * d);
+                        operation
+                            .p
+                            .insert("optimal_load".into(), format!("{load:.2}"));
+                        operation
+                            .p
+                            .insert("stepdown".into(), format!("{:.1}", (2. * d).min(flutes)));
+                    } else {
+                        operation
+                            .p
+                            .insert("silhouette_extend".into(), model::outline_extend_for(d));
+                    }
                 }
                 self.doc.setup_mut().operations.push(operation);
                 self.selected = Some(self.doc.setup().operations.len() - 1);

@@ -194,7 +194,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("boundary", "Model silhouette") => (
-            "Use the current placed model's projected XY extent. Facing uses a bounding rectangle; Outside Contour follows the projected outline. Parallel and Waterline use the whole imported model with their respective vertical-access rules.",
+            "Use the current placed model's outline seen from above. Facing clears over that outline, holes through it included, grown by Clear past outline, and leaves the stock beyond it; Outside Contour follows the outline. Parallel and Waterline use the whole imported model with their respective vertical-access rules.",
             "",
         ),
         ("containment", "Tool inside boundary") => {

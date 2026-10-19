@@ -615,6 +615,15 @@ pub struct Operation {
     pub preview: bool,
 }
 pub const FACING_PATTERNS: [&str; 2] = ["Both ways (zigzag)", "One way"];
+/// How far past the part's outline a Facing on it clears when it was saved
+/// before it said (`Operation::faces_outline`), mm.
+pub const OUTLINE_EXTEND: &str = "2";
+/// How far past the part's outline a new Facing with a cutter of `diameter`
+/// clears, mm: far enough to reach its square corners (0.29 of its radius),
+/// in half millimetres up, 2 mm at least.
+pub fn outline_extend_for(diameter: f32) -> String {
+    format!("{:.1}", ((0.3 * diameter - 0.001).ceil() / 2.).max(2.))
+}
 pub const FACING_DEPTH_ORDER: [&str; 2] = ["Continue from previous end", "Return to first start"];
 pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
@@ -697,6 +706,11 @@ pub fn pocket_setting_issues(p: &Fields) -> Vec<String> {
 }
 /// Missing settings retain the behavior of projects saved before these controls.
 pub fn facing_setting<'a>(p: &'a Fields, key: &str) -> &'a str {
+    // A pattern that cleared the part's outline adaptively, saved while it
+    // was tried, rows both ways now that the boundary sets the outline.
+    if key == "facing_pattern" && p.get(key).is_some_and(|v| v.starts_with("Adaptive")) {
+        return FACING_PATTERNS[0];
+    }
     p.get(key).map(String::as_str).unwrap_or(match key {
         "facing_pattern" => FACING_PATTERNS[0],
         "facing_depth_order" => FACING_DEPTH_ORDER[1],
@@ -808,6 +822,7 @@ impl Operation {
             ("tolerance", "0.01"),
             ("optimal_load", "1"),
             ("minimum_radius", "0.5"),
+            ("silhouette_extend", OUTLINE_EXTEND),
             ("direction", "0"),
             ("facing_pattern", "Both ways (zigzag)"),
             ("facing_depth_order", "Continue from previous end"),
@@ -973,6 +988,19 @@ impl Operation {
         self.strategy == Strategy::Drill
             && get(&self.p, "cycle") == HELICAL_MILLING
             && !self.drills_pin_holes()
+    }
+    /// A Facing of the part's outline seen from above rather than a
+    /// rectangle: its Model silhouette boundary, grown by `silhouette_extend`.
+    pub fn faces_outline(&self) -> bool {
+        self.strategy == Strategy::Face && get(&self.p, "boundary") == "Model silhouette"
+    }
+    /// How far past the part's outline a Facing on it clears, mm, as
+    /// written; `OUTLINE_EXTEND` for one saved before it said.
+    pub fn outline_extend(&self) -> &str {
+        match get(&self.p, "silhouette_extend") {
+            "" => OUTLINE_EXTEND,
+            v => v,
+        }
     }
     /// Whether this is a Drill of the pin holes in the stock's leftover
     /// (`DRILL_HOLES`), which selects no surfaces.
@@ -1474,6 +1502,21 @@ impl Operation {
                 }
                 positive(&self.p, "tab_width", &mut e);
                 positive(&self.p, "tab_height", &mut e)
+            }
+            if self.faces_outline()
+                && !sample
+                && !self
+                    .outline_extend()
+                    .parse::<f32>()
+                    .is_ok_and(|n| n.is_finite() && n >= 0.)
+            {
+                e.push("Clear past outline cannot be negative or blank.".into())
+            }
+            if self.faces_outline()
+                && !sample
+                && !num(&self.p, "ramp_angle").is_some_and(|a| (0.1..=15.).contains(&a))
+            {
+                e.push("Facing's entry ramp angle must be between 0.1° and 15°.".into())
             }
             if s == Strategy::Adaptive && !sample {
                 self.adaptive_issues(tool, &mut e)
@@ -2825,6 +2868,12 @@ pub fn issue_field(issue: &str) -> Option<&'static str> {
     if m.starts_with("minimum cutting radius ") {
         return Some("minimum_radius");
     }
+    if m.starts_with("clear past outline ") {
+        return Some("silhouette_extend");
+    }
+    if m.starts_with("facing's entry ramp angle ") {
+        return Some("ramp_angle");
+    }
     if m.starts_with("adaptive clearing helix ramp angle ") {
         return Some("ramp_angle");
     }
@@ -2912,6 +2961,13 @@ fn a_model_path_that_is_not_utf8_survives_a_save_and_load() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_facing_saved_with_the_tried_adaptive_pattern_runs_rows_both_ways() {
+        let mut p = Fields::new();
+        p.insert("facing_pattern".into(), "Adaptive (part silhouette)".into());
+        assert_eq!(facing_setting(&p, "facing_pattern"), FACING_PATTERNS[0]);
+        assert!(facing_setting_issues(&p).is_empty());
+    }
     #[test]
     fn defaults_are_valid() {
         let d = Document::sample();

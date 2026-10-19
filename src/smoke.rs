@@ -3897,6 +3897,298 @@ flood = { pin = 8 }
         tick_until(&mut a, 2.0, "E-stop", |s| s.state == Some(State::EStop));
     }
 
+    #[test]
+    fn a_facing_saved_before_clear_past_outline_faces_its_outline_2_mm_past_it() {
+        let mut a = imported_app();
+        let _ = a.update(Message::SelectOp(0));
+        let mesh = a.imported_mesh.clone().unwrap();
+        let top = (0..mesh.surfaces.len())
+            .filter(|&i| mesh.surfaces[i].normal[2].abs() > 0.99999)
+            .max_by(|&i, &j| mesh.surfaces[i].center[2].total_cmp(&mesh.surfaces[j].center[2]))
+            .unwrap();
+        let _ = a.update(Message::Surface(top));
+        a.doc.setup_mut().operations[0]
+            .p
+            .remove("silhouette_extend");
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "boundary",
+            "Model silhouette".into(),
+        ));
+        let op = &a.doc.setup().operations[0];
+        assert!(op.faces_outline());
+        assert_eq!(op.outline_extend(), crate::model::OUTLINE_EXTEND);
+        assert!(a.op_issues().is_empty(), "{:?}", a.op_issues());
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        // Negative, it is named as its field is, on Geometry.
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "silhouette_extend",
+            "-1".into(),
+        ));
+        let issues = a.op_issues();
+        assert_eq!(issues, ["Clear past outline cannot be negative or blank."]);
+        assert_eq!(
+            crate::model::issue_field(&issues[0]),
+            Some("silhouette_extend")
+        );
+    }
+    #[test]
+    fn a_new_facing_clears_past_the_outline_far_enough_for_its_cutter() {
+        // 2 mm, or 0.3 of the radius rounded up to 0.5 mm for a big cutter.
+        for (diameter, extend) in [("6", "2.0"), ("20", "3.0"), ("50", "7.5")] {
+            let mut a = imported_app();
+            for t in &mut a.doc.tools {
+                t.p.insert("diameter".into(), diameter.into());
+            }
+            let _ = a.update(Message::AddOp(Strategy::Face));
+            let op = a.doc.setup().operations.last().unwrap();
+            assert_eq!(op.strategy, Strategy::Face);
+            assert_eq!(get(&op.p, "silhouette_extend"), extend, "Ø{diameter}");
+        }
+    }
+
+    /// Renders a Facing of the four-setup block's outline (its Model
+    /// silhouette boundary) to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/outline-facing): the window halfway
+    /// and at the end, its Linking and Geometry, and the stock and path seen
+    /// from above; and prints how much of the outline is cut to the top and
+    /// of the stock beyond it is left. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_outline_facing() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/outline-facing".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = imported_app();
+        let mesh = a.imported_mesh.clone().unwrap();
+        let top = mesh
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.normal[2].abs() > 0.99999)
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        assert_eq!(a.doc.setup().operations[0].strategy, Strategy::Face);
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Surface(top));
+        for (k, v) in [
+            ("stock_top", "6"),
+            ("stock_left", "8"),
+            ("stock_right", "8"),
+            ("stock_front", "8"),
+            ("stock_back", "8"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Setup, k, v.into()));
+        }
+        for (k, v) in [("boundary", "Model silhouette"), ("stepdown", "3")] {
+            let _ = a.update(Message::Edit(Target::Operation, k, v.into()));
+        }
+        picture_the_outline_facing(&mut a, &mesh, &out);
+    }
+
+    /// Renders a saved project's first Facing as it is saved (with the pass
+    /// pattern `$AXIS_PATTERN` if set), as `render_the_outline_facing` does,
+    /// to PNGs in `$AXIS_RENDER_DIR` (default /tmp/outline-facing-project),
+    /// then generates the operations after it. The project is
+    /// `$AXIS_PROJECT` (default the app's workspace), read and not saved; its
+    /// model is loaded from where it says. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_outline_facing_on_a_saved_project() {
+        let project = std::path::PathBuf::from(std::env::var("AXIS_PROJECT").unwrap_or(format!(
+            "{}/Library/Application Support/AXIS CAM Studio/workspace.json",
+            std::env::var("HOME").unwrap()
+        )));
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/outline-facing-project".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = app();
+        let (doc, _) = crate::storage::load_reporting(&project).unwrap();
+        a.doc = doc;
+        let mesh = crate::mesh::load(&a.doc.file.as_ref().unwrap().path).unwrap();
+        let _ = a.update(Message::ModelRestored(Ok(mesh.clone())));
+        let face = a
+            .doc
+            .setup()
+            .operations
+            .iter()
+            .position(|o| o.strategy == Strategy::Face)
+            .unwrap();
+        let _ = a.update(Message::SelectOp(face));
+        if let Ok(pattern) = std::env::var("AXIS_PATTERN") {
+            let _ = a.update(Message::Edit(Target::Operation, "facing_pattern", pattern));
+        }
+        picture_the_outline_facing(&mut a, &mesh, &out);
+        // The operations after it start from the stock it leaves.
+        for i in face + 1..a.doc.setup().operations.len() {
+            let _ = a.update(Message::SelectOp(i));
+            let _ = a.update(Message::Generate);
+            eprintln!("{}: {}", a.doc.setup().operations[i].name(), a.status);
+            if a.simulation.is_some() {
+                let _ = a.update(Message::Scrub(1.));
+                let _ = a.update(Message::ScrubDone);
+                mesh_the_stock(&mut a);
+                render_png(
+                    &a,
+                    iced::Size::new(1440., 1700.),
+                    &out.join(format!("6-after-operation-{}.png", i + 1)),
+                );
+            }
+        }
+    }
+
+    /// Meshes the stock as `a`'s simulation has it cut, here rather than in
+    /// the background, so the window draws it.
+    fn mesh_the_stock(a: &mut App) {
+        let key = a.stock_mesh_key().unwrap();
+        let sim = a.active_simulation().unwrap();
+        let surface =
+            crate::stock_surface::Snapshot::of(sim.volume.as_ref().unwrap(), a.stock_detail)
+                .build()
+                .unwrap();
+        let seconds = sim.seconds;
+        let _ = a.update(Message::StockMeshed {
+            key,
+            seconds,
+            result: Ok(std::sync::Arc::new(surface)),
+        });
+        let _ = a.view();
+    }
+
+    /// Generates the selected Facing in `a` and writes its pictures to `out`.
+    fn picture_the_outline_facing(a: &mut App, mesh: &crate::mesh::Mesh, out: &std::path::Path) {
+        let size = iced::Size::new(1440., 1700.);
+        let op = a.selected.unwrap();
+        let extend: f64 = a.doc.setup().operations[op]
+            .outline_extend()
+            .parse()
+            .unwrap();
+        let _ = a.update(Message::Tab("Passes".into()));
+        let started = std::time::Instant::now();
+        let _ = a.update(Message::Generate);
+        assert!(a.simulation.is_some(), "{}", a.status);
+        eprintln!(
+            "generated in {:.1} s: {}",
+            started.elapsed().as_secs_f32(),
+            a.status
+        );
+        for (name, at) in [("1-halfway", 0.5), ("2-done", 1.)] {
+            let _ = a.update(Message::Scrub(at));
+            let _ = a.update(Message::ScrubDone);
+            mesh_the_stock(a);
+            render_png(a, size, &out.join(format!("{name}.png")));
+        }
+        // From above: the stock left (darker lower), the part's outline in
+        // red and the cutter centre's path at the last level in blue.
+        let sim = a.simulation.as_ref().unwrap();
+        let (plan, stock) = (&sim.plan, &sim.stock);
+        let silhouette: Vec<crate::pocket::Polygon> =
+            crate::cam::Geometry::new(a.doc.setup(), mesh)
+                .silhouette(false, &a.doc.setup().operations[op])
+                .unwrap()
+                .into();
+        let scale = 6.;
+        let b = stock.bounds;
+        // Of the stock grid's cells: over the outline and at the part's
+        // top, and more than the reach past it and uncut.
+        let (mut over, mut cut, mut beyond, mut kept) = (0, 0, 0, 0);
+        let filled: Vec<crate::pocket::Polygon> = silhouette
+            .iter()
+            .filter(|p| crate::cam::area(p) > 0.)
+            .cloned()
+            .collect();
+        let grown: Vec<crate::pocket::Polygon> = crate::cam::region(filled.clone())
+            .unwrap()
+            .inflate(
+                extend + 1.5,
+                clipper2::JoinType::Round,
+                clipper2::EndType::Polygon,
+                2.,
+            )
+            .into();
+        for j in 0..stock.ny {
+            for i in 0..stock.nx {
+                let p = (
+                    (b.min[0] + (i as f32 + 0.5) * stock.dx) as f64,
+                    (b.min[1] + (j as f32 + 0.5) * stock.dy) as f64,
+                );
+                let height = stock.heights[j * stock.nx + i];
+                if crate::pocket::inside(&filled, p) {
+                    over += 1;
+                    cut += usize::from((height - plan.target).abs() < 0.01);
+                } else if !crate::pocket::inside(&grown, p) {
+                    beyond += 1;
+                    kept += usize::from(height == b.max[2]);
+                }
+            }
+        }
+        eprintln!(
+            "over the outline {cut} of {over} cut to the top; beyond its reach {kept} of {beyond} uncut"
+        );
+        let (w, h) = (
+            ((b.max[0] - b.min[0]) * scale) as usize,
+            ((b.max[1] - b.min[1]) * scale) as usize,
+        );
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let px = b.min[0] + (x as f32 + 0.5) / scale;
+                let py = b.max[1] - (y as f32 + 0.5) / scale;
+                let i = (((px - b.min[0]) / stock.dx) as usize).min(stock.nx - 1);
+                let j = (((py - b.min[1]) / stock.dy) as usize).min(stock.ny - 1);
+                let t = (stock.heights[j * stock.nx + i] - plan.target) / (b.max[2] - plan.target);
+                let v = (120. + 120. * t.clamp(0., 1.)) as u8;
+                let inside = crate::pocket::inside(&silhouette, (px as f64, py as f64));
+                let edge = [(-1., 0.), (1., 0.), (0., -1.), (0., 1.)]
+                    .iter()
+                    .any(|(dx, dy)| {
+                        crate::pocket::inside(
+                            &silhouette,
+                            ((px + dx / scale) as f64, (py + dy / scale) as f64),
+                        ) != inside
+                    });
+                let c = if edge { [220, 0, 0] } else { [v, v, v] };
+                rgb[(y * w + x) * 3..][..3].copy_from_slice(&c);
+            }
+        }
+        for m in plan
+            .moves
+            .iter()
+            .filter(|m| m.cutting_pass && (m.to[2] - plan.target).abs() < 0.001)
+        {
+            let n = ((m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]) * scale) as usize + 1;
+            for k in 0..=n {
+                let t = k as f32 / n as f32;
+                let x = ((m.from[0] + t * (m.to[0] - m.from[0]) - b.min[0]) * scale) as usize;
+                let y = ((b.max[1] - m.from[1] - t * (m.to[1] - m.from[1])) * scale) as usize;
+                if x < w && y < h {
+                    rgb[(y * w + x) * 3..][..3].copy_from_slice(&[30, 90, 230]);
+                }
+            }
+        }
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(std::fs::File::create(out.join("5-from-above.png")).unwrap()),
+            w as u32,
+            h as u32,
+        );
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&rgb)
+            .unwrap();
+        let _ = a.update(Message::Tab("Linking".into()));
+        render_png(a, size, &out.join("3-linking.png"));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        render_png(a, size, &out.join("4-geometry.png"));
+    }
+
     /// Draws `a`'s whole window, `size` px, headless (tiny-skia) to `path`.
     fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
         render_png_at(a, size, path, iced::mouse::Cursor::Unavailable);
@@ -10329,7 +10621,7 @@ flood = { pin = 8 }
         let old_notes = [
             (
                 Note::Facing,
-                "Selections use connected planar regions of the imported mesh. Facing simulation uses a rectangular raster preview. Exact CAD faces and fixture or machine collision checks are not implemented; the moves can be exported as LinuxCNC G-code.",
+                "Selections use connected planar regions of the imported mesh. Exact CAD faces and fixture or machine collision checks are not implemented; the moves can be exported as LinuxCNC G-code.",
             ),
             (
                 Note::Pocket,
@@ -16268,7 +16560,7 @@ flood = { pin = 8 }
         face.p.insert("coolant".into(), "Off".into());
         assert!(
             crate::ui::operation_lines(&face, "T1", 1., "")[1].starts_with(
-                "8000 rpm · 1000 mm/min · coolant Off · facing area model silhouette · "
+                "8000 rpm · 1000 mm/min · coolant Off · facing area model silhouette + 2 mm · "
             )
         );
         // An inside contour, and a drill that stops in the hole.
