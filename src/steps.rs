@@ -1198,7 +1198,10 @@ impl<'a> Page<'a> {
     fn named(&self, id: &str, diameter: f32) -> String {
         match self.app.doc.tools.iter().find(|t| t.id == id) {
             Some(t) => match t.number() {
-                Some(n) => format!("Ø{} {} · T{n}", mm(diameter), t.name()),
+                Some(n) if !crate::model::names_number(n, t.name()) => {
+                    format!("Ø{} {} · T{n}", mm(diameter), t.name())
+                }
+                Some(_) => format!("Ø{} {}", mm(diameter), t.name()),
                 None => format!("Ø{} {}", mm(diameter), t.name()),
             },
             None => format!("Ø{}", mm(diameter)),

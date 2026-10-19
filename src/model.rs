@@ -243,12 +243,17 @@ const HANDED_OVER: [&str; 17] = [
 /// named "Flat end mill 3mm", and the name alone when it already begins
 /// with its number ("T4 Flat end mill 3mm" is not "T4 T4 …").
 pub fn tool_label(number: impl std::fmt::Display, name: &str) -> String {
-    let t = format!("T{number}");
-    if name == t || name.starts_with(&format!("{t} ")) {
+    if names_number(&number, name) {
         name.to_string()
     } else {
-        format!("{t} {name}")
+        format!("T{number} {name}")
     }
+}
+/// Whether the tool name `name` already begins with tool number `number`
+/// ("T4 Flat end mill 3mm" for 4): then it is not numbered again.
+pub fn names_number(number: impl std::fmt::Display, name: &str) -> bool {
+    let t = format!("T{number}");
+    name == t || name.starts_with(&format!("{t} "))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

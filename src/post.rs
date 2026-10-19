@@ -781,8 +781,14 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     for op in ops {
         if !listed.contains(&op.tool) {
             listed.push(op.tool);
+            // A name that begins with its number is not numbered again.
+            let numbered = crate::model::names_number(op.tool, &op.tool_name);
             w.wrapped(
-                &format!("T{}: ", op.tool),
+                &if numbered {
+                    String::new()
+                } else {
+                    format!("T{}: ", op.tool)
+                },
                 &format!(
                     "{} - diameter {} mm - stickout {} mm",
                     op.tool_name,
@@ -854,12 +860,12 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
     if !settings.tool_table {
         // AXIS cannot touch off while a program is paused; G49 below would cancel a Tool Touch Off.
         // Earlier programs cut away the Z0 surface, so later tools use a fixed reference.
-        let (t, name) = (ops[0].tool, &ops[0].tool_name);
+        let tool = crate::model::tool_label(ops[0].tool, &ops[0].tool_name);
         if h.part.is_none_or(|(i, _)| i == 1) {
             w.wrapped(
                 "Before starting: ",
                 &format!(
-                    "load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, {}",
+                    "load {tool}, then use AXIS Touch Off, not Tool Touch Off, {}",
                 match touch_off_spots(origin, h.stock) {
                     Some(spots) => format!("to touch off {spots}."),
                     None if model && top.is_some() => {
@@ -877,7 +883,7 @@ pub fn emit(h: &Header, ops: &[OpState], blocks: &[Block], settings: &PostSettin
             w.wrapped(
                 "Before starting: ",
                 &format!(
-                    "load T{t} {name}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
+                    "load {tool}, then use AXIS Touch Off, not Tool Touch Off, on the fixed reference surface noted after program 1 and enter its noted Z."
                 ),
             );
             w.note("Do not touch off on the stock: earlier programs have cut it.");
@@ -5391,6 +5397,44 @@ M2
             !errors(&job).iter().any(|e| e.contains("not square")),
             "{:?}",
             errors(&job)
+        );
+    }
+    #[test]
+    fn a_tool_named_with_its_number_is_numbered_once_in_the_programs() {
+        let (mut doc, mesh) = fixture::job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("post_tool_length".into(), POST_TOOL_LENGTH[1].into());
+        // Each tool named as the owner names theirs: "T1 Flat end mill …".
+        for t in &mut doc.tools {
+            let n = get(&t.p, "number").to_string();
+            let named = format!("T{n} {}", t.name());
+            t.p.insert("name".into(), named);
+        }
+        let job = post_job(&doc, &mesh);
+        assert!(job.ready(), "{:?}", errors(&job));
+        let programs = job.setups[0].result.as_ref().unwrap();
+        for p in programs {
+            for n in 1..=4 {
+                assert!(!p.text.contains(&format!("T{n} T{n}")), "{}", p.text);
+                assert!(!p.text.contains(&format!("T{n}: T{n}")), "{}", p.text);
+            }
+        }
+        assert!(
+            programs[1]
+                .text
+                .contains("(Before starting: load T3 Drill 4, then use AXIS Touch Off")
+        );
+        assert!(
+            programs[0]
+                .text
+                .contains("(T1 Flat 10 - diameter 10.000 mm")
+                && programs[0]
+                    .text
+                    .contains("(Before starting: load T1 Flat 10, then"),
+            "{}",
+            programs[0].text
         );
     }
     #[test]

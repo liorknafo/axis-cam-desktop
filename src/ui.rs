@@ -7477,9 +7477,13 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
         list = list.push(
             btn(
                 format!(
-                    "T{} · {}\n{}",
-                    get(&t.p, "number"),
-                    t.name(),
+                    "{}\n{}",
+                    // "T4 · name", or the name when it begins with its number.
+                    if crate::model::names_number(get(&t.p, "number"), t.name()) {
+                        t.name().to_string()
+                    } else {
+                        format!("T{} · {}", get(&t.p, "number"), t.name())
+                    },
                     tool_details(t)
                 ),
                 Message::EditTool(t.id.clone()),
