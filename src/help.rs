@@ -33,6 +33,19 @@ pub enum Diagram {
     Entry(bool),
     DrillCycle(u8),
     Containment(i8),
+    // A field's own picture, numbered within its group (`field_art`).
+    Vise(u8),
+    Clamp(u8),
+    Stock(u8),
+    Chuck(u8),
+    LatheTool(u8),
+    TurnOp(u8),
+    Probe(u8),
+    Post(u8),
+    Linking(u8),
+    Manual(u8),
+    Machine(u8),
+    Cutting(u8),
 }
 #[derive(Clone, Debug)]
 pub struct Help {
@@ -1716,17 +1729,17 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (Target::Machine, "rpm") => (
             "Maximum spindle speed allowed by this machine, in revolutions per minute. Operations above this limit are flagged.",
             "",
-            None,
+            Some(Machine(0)),
         ),
         (Target::Machine, "power") => (
             "The spindle's rated power, in watts. The check of whether a setup's vise or clamps hold the stock against each operation's cut takes no more force than this power drives at the spindle's top speed (the spindle keeps its torque below that speed). Empty: 800 W, a Jingyan CNC4030's spindle.",
             "",
-            None,
+            Some(Machine(1)),
         ),
         (Target::Machine, "feed") => (
             "Maximum feed rate in the machine profile's units per minute. Use the manufacturer's specification; operation feeds are in mm/min.",
             "",
-            None,
+            Some(Machine(2)),
         ),
         (Target::Machine, "uc100_profile") => (
             "Path of the UC100 driver profile (TOML) this machine runs with. Browse… picks it; MACHINE → Controller configuration on the Control page edits it in place.",
@@ -1791,22 +1804,22 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (Target::Material, "vc_min") => (
             "Lowest recommended surface speed for carbide tools, in m/min. Surface speed = π × tool diameter × spindle rpm ÷ 1000. A slower operation is flagged, unless the machine's top spindle speed is the limit.",
             "",
-            None,
+            Some(Cutting(0)),
         ),
         (Target::Material, "vc_max") => (
             "Highest recommended surface speed for carbide tools, in m/min. Surface speed = π × tool diameter × spindle rpm ÷ 1000. A faster operation is flagged.",
             "",
-            None,
+            Some(Cutting(0)),
         ),
         (Target::Material, k) if k.starts_with("fz") && k.ends_with("_min") => (
             "Lowest recommended chip load per tooth, in mm, for tools in this diameter range. Chip load = feed ÷ (rpm × flutes). A lower value is flagged, unless the machine's top feed is the limit.",
             "",
-            None,
+            Some(Cutting(1)),
         ),
         (Target::Material, k) if k.starts_with("fz") && k.ends_with("_max") => (
             "Highest recommended chip load per tooth, in mm, for tools in this diameter range. Chip load = feed ÷ (rpm × flutes). A higher value is flagged.",
             "",
-            None,
+            Some(Cutting(1)),
         ),
         (Target::Holder, "name") => (
             "The entry's name in the workholding library and in the setup's list. Each entry needs its own name of up to 60 characters; capitals do not make a name different.",
@@ -1821,202 +1834,202 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (Target::Holder, "jaw_width") => (
             "Length of each jaw along the jaws, in mm. The jaws are centred on the stock, or shifted by the setup's jaw offset.",
             "",
-            None,
+            Some(Vise(0)),
         ),
         (Target::Holder, "jaw_height") => (
             "Height of the jaws above the parallels' top, in mm. Kept for reference: the modelled jaws reach from far below the stock up to the setup's grip height.",
             "",
-            None,
+            Some(Vise(1)),
         ),
         (Target::Holder, "jaw_thickness") => (
             "How thick each jaw is, measured outward from the stock, in mm.",
             "",
-            None,
+            Some(Vise(2)),
         ),
         (Target::Holder, "max_opening") => (
             "The widest stock the jaws open to, in mm. A setup whose stock is wider across the jaws shows an issue.",
             "",
-            None,
+            Some(Vise(3)),
         ),
         (Target::Holder, "grip") => (
             "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. A setup starts from it and can change its own grip.",
             "",
-            None,
+            Some(Vise(4)),
         ),
         (Target::Holder, "length") => (
             "Length of the clamp from its tip outward, in mm; the bite is part of it. The rest of it reaches beyond the stock's edge.",
             "",
-            None,
+            Some(Clamp(0)),
         ),
         (Target::Holder, "width") => (
             "Width of the clamp, in mm, along the side of the stock it sits on.",
             "",
-            None,
+            Some(Clamp(1)),
         ),
         (Target::Holder, "height") => (
             "Height of the clamp above the stock's top, in mm.",
             "",
-            None,
+            Some(Clamp(2)),
         ),
         (Target::Holder, "force") => (
             "How hard the vise clamps the stock, or one clamp holds it down, in newtons. The check of each operation's cutting forces takes it as what the jaws' friction and the clamps' hold work with: measure or estimate yours, and raise it if yours is tightened harder. Empty: 5000 N for a vise, 2000 N for a clamp, typical when tightened by hand.",
             "",
-            None,
+            Some(Vise(5)),
         ),
         (Target::Holder, "bite") => (
             "How far the clamp reaches onto the stock from its edge, in mm. It must be shorter than the clamp's length.",
             "",
-            None,
+            Some(Clamp(3)),
         ),
         (Target::Holder, "jaws") => (
             "How many jaws the chuck has: 3 (self-centring, for round bar) or 4 (independent, for square or off-centre work).",
             "",
-            None,
+            Some(Chuck(0)),
         ),
         (Target::Holder, "min_grip") => (
             "The smallest diameter the jaws close on, in mm, with the jaws in their normal position.",
             "",
-            None,
+            Some(Chuck(1)),
         ),
         (Target::Holder, "max_grip") => (
             "The largest diameter the jaws close on, in mm. It must be above the smallest grip and below the chuck body.",
             "",
-            None,
+            Some(Chuck(2)),
         ),
         (Target::Holder, "jaw_length") => (
             "How deep the jaws reach along the bar, in mm: the most length a setup can hold in them. A setup starts from it.",
             "",
-            None,
+            Some(Chuck(3)),
         ),
         (Target::Holder, "body") => (
             "The chuck's outside diameter, in mm. The 160 mm starters are typical: measure yours.",
             "",
-            None,
+            Some(Chuck(4)),
         ),
         (Target::Setup, "grip") => (
             "How much of the bar is held in the jaws, in mm. It starts at the chuck's jaw length. Hold at least a third of the diameter.",
             "",
-            None,
+            Some(Chuck(5)),
         ),
         (Target::Setup, "stickout") => (
             "How far the bar sticks out of the jaws to its free end, in mm. It must reach the furthest cut from the end.",
             "",
-            None,
+            Some(Chuck(6)),
         ),
         (Target::Tool, "hand") => (
             "Which way the turning tool cuts: Right cuts toward the chuck, Left away from it, Neutral either way.",
             "",
-            None,
+            Some(LatheTool(0)),
         ),
         (Target::Tool, "nose_radius") => (
             "The radius of the insert's tip in mm; 0 is a sharp point. It rounds inside corners and sets the finish.",
             "",
-            None,
+            Some(LatheTool(1)),
         ),
         (Target::Tool, "lead_angle") => (
             "The angle between the cutting edge and the bar's axis, in degrees; 93 is typical for a turning tool that can also face.",
             "",
-            None,
+            Some(LatheTool(2)),
         ),
         (Target::Tool, "min_bore") => (
             "The smallest hole the boring bar goes into, in mm.",
             "",
-            None,
+            Some(LatheTool(3)),
         ),
         (Target::Tool, "reach") => (
             "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge.",
             "",
-            None,
+            Some(LatheTool(4)),
         ),
         (Target::Tool, "width") => (
             "The width of the grooving tool's or parting blade's cutting edge, in mm. A groove is at least this wide.",
             "",
-            None,
+            Some(LatheTool(5)),
         ),
         (Target::Tool, "thread_angle") => (
             "The included angle of the thread form, in degrees: 60 for metric and unified threads, 55 for Whitworth.",
             "",
-            None,
+            Some(LatheTool(6)),
         ),
         (Target::Tool, "pitches") => (
             "The finest and coarsest pitch the threading tool cuts, in mm, written like 0.5-3.",
             "",
-            None,
+            Some(LatheTool(7)),
         ),
         (Target::Operation, "turn_kind") => (
             "What this Turn does: face the end, turn an outside diameter, bore, chamfer an edge, cut a groove, part off or cut a thread. Changing the kind brings that kind's sizes and a fitting tool.",
             "Each kind uses a tool of its own type: a turning tool for Face, Outside and Chamfer, a boring bar, a grooving tool, a parting blade, a threading tool.",
-            None,
+            Some(TurnOp(0)),
         ),
         (Target::Operation, "face_off") => (
             "How much comes off the end of the bar, in mm: the face ends up this far in from the free end.",
             "",
-            None,
+            Some(TurnOp(1)),
         ),
         (Target::Operation, "to_diameter") => (
             "The diameter the facing cut reaches, in mm; 0 faces right to the centre.",
             "",
-            None,
+            Some(TurnOp(2)),
         ),
         (Target::Operation, "diameter") => (
             "The finished diameter in mm: what the turned or bored section measures, a groove's bottom, or a thread's major diameter. Diameters are diameters, not radii.",
             "",
-            None,
+            Some(TurnOp(3)),
         ),
         (Target::Operation, "z_end") => (
             "Where the cut stops along the bar, in mm. Z 0 is the free end and negative is toward the chuck, so -30 turns 30 mm of the bar.",
             "",
-            None,
+            Some(TurnOp(4)),
         ),
         (Target::Operation, "z") => (
             "Where the cut is along the bar, in mm: the groove's side toward the chuck, or the side of a parting cut that stays with the part. Z 0 is the free end and negative is toward the chuck.",
             "",
-            None,
+            Some(TurnOp(5)),
         ),
         (Target::Operation, "depth") => (
             "How much one pass takes off the diameter, in mm; a lathe drill's depth in from the free end. Passes are equal and no larger than this.",
             "",
-            None,
+            Some(TurnOp(6)),
         ),
         (Target::Operation, "finish") => (
             "What the last pass takes off the diameter, in mm, to leave a clean surface at the finished size.",
             "",
-            None,
+            Some(TurnOp(7)),
         ),
         (Target::Operation, "edge") => (
             "Which edge to break: the outside corner of the end, the inside corner of a bore, or a shoulder.",
             "",
-            None,
+            Some(TurnOp(8)),
         ),
         (Target::Operation, "size") => (
             "The length of the 45 degree chamfer's leg, in mm.",
             "",
-            None,
+            Some(TurnOp(9)),
         ),
         (Target::Operation, "width") => (
             "How wide the groove is, in mm. It is at least as wide as the grooving tool.",
             "",
-            None,
+            Some(TurnOp(10)),
         ),
         (Target::Operation, "thread_side") => (
             "Cut the thread on the outside of the bar or inside a bore.",
             "",
-            None,
+            Some(TurnOp(11)),
         ),
         (Target::Operation, "pitch") => (
             "The distance between thread crests, in mm. It must be one the gearbox cuts and one the threading tool's range covers.",
             "",
-            None,
+            Some(TurnOp(12)),
         ),
         (Target::Operation, "passes") => (
             "How many passes cut the thread. Empty takes the usual number for the pitch; the first pass is the deepest and they get lighter.",
             "",
-            None,
+            Some(TurnOp(13)),
         ),
         (Target::Setup, "holding") => (
             "The workholding to model for this setup: a Vise from the library, with its jaws on two opposite sides of the stock, or Clamps placed around it. Each is kept as boxes with a clearance gap that every move is checked against, and its hold is checked against each operation's cutting force. None models nothing.",
             "Each is kept as boxes with a clearance gap, and every move is checked against them: the cutter from its tip up to its stickout at its cutting diameter, the tool holder above that at the holder diameter (a wider shank or a reduced neck is not modelled). A move that comes within the gap is warned of in the operation preview, which covers that operation's own toolpath, and refused at export, which checks every program move, the links between operations, approaches and retracts included. Parallels, bolts, the table and the machine body are not modelled. Each operation's cutting force is also set against what the vise's or clamps' clamping force holds (sliding, lifting and tipping), over the contact the earlier setups left the jaws; an operation held with a margin under ×2 is refused at export. In a later setup the jaws or clamps sit at the stock box carried over from setup 1, not at the walls earlier operations cut, and a setup turned from setup 1 by other than a multiple of 90° cannot model them. None models nothing; the Fixture note below is only a description. A lathe setup has a Chuck instead of a Vise or Clamps, and its checks are the chuck's: the bar's diameter in the jaws must be one the chuck closes on (a 3-jaw holds round work only), the grip at least a third of that diameter and no longer than the jaws, the stickout at least the furthest cut from the free end plus 5 mm, no cut inside the grip, the bar within the lathe's swing and the grip plus the stickout within the bar's length. A stickout over 4 diameters is warned of, not refused. The chuck's body is a box 40 mm deep behind the jaws' end, and a move within the clearance gap of it is warned of in the operation preview. Nothing is exported: a lathe has no G-code.",
-            None,
+            Some(Vise(8)),
         ),
         (Target::Setup, "holder") => (
             "The library entry used: a vise for Vise, a clamp for Clamps. Entries are made on the Workholding page; changing one changes every setup that uses it.",
@@ -2026,27 +2039,27 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (Target::Setup, "vise_axis") => (
             "Which sides of the stock the jaws face: X sides put one jaw on the −X side and one on the +X side, Y sides on −Y and +Y. A stock wider across the jaws than the vise's maximum opening shows an issue.",
             "",
-            None,
+            Some(Vise(6)),
         ),
         (Target::Setup, "vise_offset") => (
             "Shifts the jaws along their length from the middle of the stock, in mm: toward +Y for jaws on the X sides, toward +X for jaws on the Y sides. 0 centres them. The jaws must still overlap the stock along their length: an offset of half the stock's length plus half the jaw width or more shows an issue.",
             "",
-            None,
+            Some(Vise(7)),
         ),
         (Target::Setup, "vise_grip") => (
             "How much of the stock the jaws hold, as a height above the stock's bottom, in mm. The jaws are modelled from far below the stock up to it; the stock above it is not covered by the modelled jaws. It starts at the vise's own grip.",
             "",
-            None,
+            Some(Vise(4)),
         ),
         (Target::Setup, "holding_gap") => (
             "The clearance gap the checks keep round the modelled jaws or clamps, in mm: 0 or more; left empty it is 2 mm. The operation preview, the export and the Run checks all use it, with the machine profile's path blending tolerance (G64 P) added, since the controller may leave the programmed path by that much at a corner.",
             "A move whose cutter or holder comes within the two is warned of in the operation preview (that operation's own toolpath) and refused at export and by the Run checks (every program move, the links between operations, approaches and retracts included). It is not the Requested fixture clearance under Setup notes, which nothing checks.",
-            None,
+            Some(Vise(9)),
         ),
         (Target::Setup, "clamps") => (
             "Where the clamps sit, a row each: the side of the stock, -X, +X, -Y or +Y, and the offset, in mm, that moves the clamp along that side from its middle (toward +Y on the X sides, toward +X on the Y sides), no more than half that side's length. Place 1 to 8 clamps with + Add clamp and Remove.",
             "The positions are saved only when every offset is a number; what is wrong is shown under the rows. The setup keeps them as side:offset separated by semicolons, for example -X:0;+X:20.",
-            None,
+            Some(Clamp(4)),
         ),
         (_, "name") => (
             "A descriptive name shown in the browser, library and setup sheet. Use names that identify the part position, operation or hardware.",
@@ -2086,7 +2099,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "coolant") => (
             "Coolant for this operation. LinuxCNC export writes M8 for Flood, M7 for Mist, the machine's Air output for Air (refused when it has none) and nothing for Off, then M9 when the coolant changes, at a tool change and at the end of the program. The preview does not simulate coolant.",
             "",
-            None,
+            Some(Linking(0)),
         ),
         (_, "hole_diameter") => (
             "Filter detected circular openings by nominal diameter in mm (±0.1 mm). Zero includes all detected holes on the selected rim. The drill must fit every included opening. Select the horizontal rim face first.",
@@ -2196,7 +2209,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "collision") => (
             "Preferred response to an obstruction: retract and relink, or tilt within limits. This is a saved preference; no collision solver is active yet.",
             "",
-            None,
+            Some(Linking(1)),
         ),
         (_, "cycle") => (
             "Drilling feeds once to depth. Chip breaking retracts slightly between pecks; deep drilling retracts clear of the hole. Counterboring adds a bottom dwell. Helical milling cuts each hole with a flat end mill, down a helix to a flat bottom.",
@@ -2216,7 +2229,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "hole_order") => (
             "Optimize travel drills the nearest remaining hole next, a greedy route that is not a global optimum. By X then Y drills the holes in setup X then Y order.",
             "",
-            None,
+            Some(Linking(2)),
         ),
         (_, "ramp") => (
             "How the cutter enters material. Adaptive clearing on an imported part enters with a Helix or a Plunge where it cannot reach the material from the side; the sample also records a back-and-forth or profile ramp. Match the entry to the cutter's cutting capabilities.",
@@ -2236,7 +2249,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "keep_down") => (
             "Request links close to cutting depth where possible to reduce retracts. This does not authorize crossing uncut stock or fixtures.",
             "",
-            None,
+            Some(Linking(3)),
         ),
         (_, "facing_pattern") => (
             "Both ways alternates travel on neighboring rows, mixing climb and conventional cutting without reversing the spindle. One way enables the Climb / Conventional choice and retracts for return moves. The pass-angle field rotates either pattern in setup XY.",
@@ -2246,12 +2259,12 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "facing_depth_order") => (
             "Continue from previous end starts the next depth at the last pass's X/Y, with the row order and travel directions reversed. Return to first start repeats each depth from the original X/Y. Applies to Both ways; One way always returns.",
             "",
-            None,
+            Some(Linking(4)),
         ),
         (_, "facing_link") => (
             "Keep tool down feeds sideways between adjacent rows, then cuts back across the stock. Continue from previous end also feeds vertically down at the last X/Y for the next depth. Retract each pass lifts to clearance between rows.",
             "Applies to Both ways and the rectangular Facing preview; fixtures are not avoided, and a move within the clearance gap of a modelled vise jaw or clamp is refused at export.",
-            None,
+            Some(Linking(5)),
         ),
         (_, "direction") => (
             "Angle of the parallel cutting passes in the setup XY plane, in degrees. Rotates the pass pattern across the face.",
@@ -2306,7 +2319,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "compensation") => (
             "Choose whether tool-radius offset is calculated in CAM or adjusted at the control. Wear modes need a matching, validated controller/postprocessor convention.",
             "",
-            None,
+            Some(Linking(6)),
         ),
         (_, "finish_passes") => (
             "Number of finishing passes along the boundary after roughing. Extra passes may improve consistency; cutting strategy still needs validation.",
@@ -2336,7 +2349,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "tolerance") => (
             "Requested maximum toolpath approximation deviation, in mm: in Adaptive clearing, how far the path's straight segments may stray from the computed path. A smaller value can require more path segments. It is not a guarantee of finished-part accuracy.",
             "",
-            None,
+            Some(Linking(7)),
         ),
         (_, "rest") => (
             "Target material remaining from an earlier operation, often with a smaller tool. Select the previous operation as the source; remaining-stock calculation is not connected. Adaptive clearing on an imported part needs no setting: like Pocket, it cuts only where earlier operations and setups left material.",
@@ -2356,152 +2369,152 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "post_tool_length") => (
             "How programs apply tool length: from LinuxCNC's tool table with T# M6 and G43 H#, or one program per tool that you touch off before running it.",
             "",
-            None,
+            Some(Post(0)),
         ),
         (_, "post_retract") => (
             "Where the tool goes before a tool change and at the end: machine Z0 with G53, or the setup's highest clearance height.",
             "",
-            None,
+            Some(Post(1)),
         ),
         (_, "post_blend") => (
             "Path blending tolerance for LinuxCNC's trajectory planner. A positive value writes G64 P with this tolerance in mm, so corners may round by up to that much at speed. 0 writes G61 exact path.",
             "The checks allow for it: it is added to the setup's clearance gap around the jaws and clamps and to the cutter's radius when a rapid descent is proven clear of the stock, also for a UC100 run. At a corner the blend can leave the vertical by 2.41 times the tolerance below the height a rapid crosses at, so the clearance plane and every sideways rapid keep 2.5 times the tolerance over the stock top (export and the Run checks refuse a rapid closer than that) and the link between two operations of one tool is raised to that height.",
-            None,
+            Some(Post(2)),
         ),
         (_, "post_dwell") => (
             "Seconds to wait after starting or changing the spindle before the first move, and, between two operations of one tool that turn it opposite ways, after the M5 that stops it before it is started the other way. Use it when the spindle has no at-speed feedback. 0 writes no dwell. At a reversal nothing then waits for the spindle to stop.",
             "",
-            None,
+            Some(Post(3)),
         ),
         (_, "post_air") => (
             "LinuxCNC output used for operations set to Air: M7 (mist) or M8 (flood), whichever is wired to the air blast.",
             "",
-            None,
+            Some(Post(4)),
         ),
         (_, "probe_plate") => (
             "Thickness of the touch plate, in mm: measure it. Probe Z makes work Z at the plate's top this value, so the surface under the plate is Z 0. Used when the project's material is not a metal; on a metal the plate's lead goes on the stock and the tool touches it. Leave it empty without a plate.",
             "",
-            None,
+            Some(Probe(0)),
         ),
         (_, "pins") => (
             "The fixture plate's dowel pins, as drilled, in the plate's own X Y (mm), pin 1 first: \"0 0; 120 0\" for two pins 120 mm apart along X. Pin 1 is the reference pin, pin 2 gives the turn. Leave it empty without pins.",
             "The plate is taken as square to the machine's X and Y: Record the pins' place on the Control page measures how far off it is. A setup that sits on the pins gets its X and Y work offset from pin 1's recorded place.",
-            None,
+            Some(Probe(1)),
         ),
         (_, "pin_diameter") => (
             "The pins' diameter, in mm: measure it. The holes a part drops over them by must be this to 0.2 mm over: a wider hole leaves the part free to move. The checks keep tools clear of a pin-sized box per pin.",
             "",
-            None,
+            Some(Probe(2)),
         ),
         (_, "pin_height") => (
             "How far the pins stand above the plate, in mm: measure it. The part's holes for them must be at least this deep, and Pin centre probes the pins' sides min(3 mm, half of it) below their top.",
             "",
-            None,
+            Some(Probe(3)),
         ),
         (_, "probe_tip") => (
             "Diameter of the probe's ball or pin, in mm: measure it, or the tool's diameter for a tool with the plate's lead on conductive stock. Probe corner and Probe centre move each side they touch by half of it. Leave it empty without a probe.",
             "",
-            None,
+            Some(Probe(4)),
         ),
         (_, "probe_feed") => (
             "How fast Z feeds down to the plate, in mm/min. Slow is accurate: the machine stops a little past the contact, and AXIS CAM uses where the contact was.",
             "",
-            None,
+            Some(Probe(5)),
         ),
         (_, "probe_distance") => (
             "How far down a probe goes at most, in mm, and never below the bottom of Z. Without contact by then it stops and nothing is set.",
             "",
-            None,
+            Some(Probe(6)),
         ),
         (_, "probe_retract") => (
             "How far the tool lifts after the contact, in mm, so the plate can come away. 0 leaves it on the plate.",
             "",
-            None,
+            Some(Probe(7)),
         ),
         (Target::Machine, "kind") => (
             "CNC runs G-code. Manual is a hand-operated mill with a DRO, Lathe a hand-operated lathe with dials: no G-code, no Run, and their setups are shown as steps on the MACHINE page.",
             "",
-            None,
+            Some(Machine(3)),
         ),
         (_, "speeds") => (
             "The spindle speeds the gearbox has, in rpm, comma-separated. A range such as 100-2000 means a variable drive. The rpm of a manual operation must be one of them.",
             "",
-            None,
+            Some(Manual(0)),
         ),
         (_, "hand_feed") => (
             "The fastest feed you can turn steadily by hand, in mm/min. No manual operation feeds faster.",
             "",
-            None,
+            Some(Manual(1)),
         ),
         (_, "hand_rapid") => (
             "How fast you move an axis off the cut by hand, in mm/min. It sets the time of the moves between cuts.",
             "",
-            None,
+            Some(Manual(2)),
         ),
         (_, "turn_x" | "turn_y" | "turn_z") => (
             "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
             "",
-            None,
+            Some(Manual(3)),
         ),
         (_, "swing") => (
             "The largest diameter the lathe turns over its bed, in mm. A bar or part wider than this is refused.",
             "",
-            None,
+            Some(Manual(4)),
         ),
         (_, "centres") => (
             "The distance between the centres, in mm: the longest work the lathe takes between chuck and tailstock.",
             "",
-            None,
+            Some(Manual(5)),
         ),
         (_, "cross_reads") => (
             "Whether a reading on the cross-slide dial takes that much off the diameter or off the radius. Not known yet: the first lathe setup asks you to cut a test and measure, and saves the answer.",
             "",
-            None,
+            Some(Manual(6)),
         ),
         (_, "cross_turn" | "top_turn" | "carriage_turn" | "quill_turn") => (
             "The numbers the dial goes through in one full turn of the handwheel: what it reads at the index after one turn. The steps use it to say how many turns and what reading.",
             "",
-            None,
+            Some(Manual(7)),
         ),
         (_, "cross_div" | "top_div" | "carriage_div" | "quill_div") => (
             "How many divisions the dial has round its collar, a whole number. A reading is rounded to one division.",
             "",
-            None,
+            Some(Manual(8)),
         ),
         (_, "feeds") => (
             "The carriage power feeds the gearbox has, in mm per revolution, comma-separated. Turning passes use the one nearest 0.1.",
             "",
-            None,
+            Some(Manual(9)),
         ),
         (_, "pitches") => (
             "The thread pitches the gearbox cuts, in mm, comma-separated. A thread operation must use one of them.",
             "",
-            None,
+            Some(Manual(10)),
         ),
         (_, "dro_comp") => (
             "Yes when the DRO has tool-radius compensation, so it reads the tool's edge instead of its centre.",
             "",
-            None,
+            Some(Manual(11)),
         ),
         (_, "edge_finder") => (
             "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off each face it touches.",
             "",
-            None,
+            Some(Manual(12)),
         ),
         (_, "pass_time") => (
             "Seconds to reset, set and lock the axes for one pass. It adds to the setup's minutes.",
             "",
-            None,
+            Some(Manual(13)),
         ),
         (_, "tool_time") => (
             "Minutes to change a tool and pick up the zero again. It adds to the setup's minutes.",
             "",
-            None,
+            Some(Manual(14)),
         ),
         (_, "move_time") => (
             "Minutes to move the stock between this machine and another. The plan adds it each time the stock changes machine.",
             "",
-            None,
+            Some(Manual(15)),
         ),
         (_, "machines") => (
             "The machines that hold this entry. None checked means every CNC machine and no manual machine.",
@@ -2516,27 +2529,32 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "stock_type") => (
             "Relative size box adds offsets to the six sides of the part's box after setup rotation. Fixed size box uses X, Y and Z sizes. A round bar lies along setup Z on X 0 Y 0, for the lathe. Values are kept when switching.",
             "",
-            None,
+            Some(Stock(0)),
         ),
         (_, "stock_diameter") => (
             "Round bar diameter, mm. The bar lies along the setup Z axis, centred on X 0 Y 0.",
             "",
-            None,
+            Some(Stock(1)),
         ),
         (_, "stock_length") => (
             "Round bar length along the setup Z axis, mm, from Z 0 up.",
             "",
-            None,
+            Some(Stock(2)),
         ),
         (_, "stock_radial") => (
             "Extra material round the part, mm: the bar's radius is the part's largest distance from the setup Z axis plus this. 0 touches the part.",
             "",
-            None,
+            Some(Stock(3)),
         ),
         (_, "stock_x" | "stock_y" | "stock_z") => (
             "Overall stock box extent along this setup axis, in mm. Fixed stock is centered on X and Y with its bottom on Z=0 in the preview. Use relative stock for extra material measured from each part side.",
             "",
-            None,
+            Some(Stock(
+                4 + ["stock_x", "stock_y", "stock_z"]
+                    .iter()
+                    .position(|k| *k == key)
+                    .unwrap_or(0) as u8,
+            )),
         ),
         (_, "stock_top") => (
             "Extra material above the part's highest point along setup +Z, in mm. 10 adds 10 mm only at the top. Z size = part height + top + bottom. 0 is flush with the part.",
@@ -2606,7 +2624,9 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "x" | "y" | "z") => (
             "Available linear travel along this machine axis, in the selected machine units. Enter the usable stroke from the machine specification.",
             "",
-            None,
+            Some(Machine(
+                4 + ["x", "y", "z"].iter().position(|k| *k == key).unwrap_or(0) as u8,
+            )),
         ),
         (_, "mode") => (
             "Indexed motion positions the rotary axes before cutting; simultaneous motion changes rotary and linear positions together. This prototype saves the capability but does not solve it.",
@@ -2636,7 +2656,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         (_, "tool_change") => (
             "Whether the operator changes tools manually or the machine has an automatic tool changer. Used for planning the setup sequence.",
             "",
-            None,
+            Some(Machine(7)),
         ),
         (_, "tcp") => (
             "Tool center point control lets the controller compensate linear axes while rotating, to maintain the tool tip's position. Requires supported kinematics and a matching postprocessor.",
@@ -2868,6 +2888,7 @@ impl canvas::Program<Message> for Illustration {
             return vec![f.into_geometry()];
         }
         if crate::illustration::draw(self.diagram, &mut f, time)
+            || crate::field_art::draw(self.diagram, &mut f, time)
             || crate::choice_diagram::draw(self.diagram, &mut f, time)
         {
             return vec![f.into_geometry()];
@@ -3289,11 +3310,139 @@ mod tests {
             ("containment-inside", Containment(-1)),
             ("containment-on", Containment(0)),
             ("containment-outside", Containment(1)),
+            ("chuck-0-jaws", Chuck(0)),
+            ("chuck-1-min_grip", Chuck(1)),
+            ("chuck-2-max_grip", Chuck(2)),
+            ("chuck-3-jaw_length", Chuck(3)),
+            ("chuck-4-body", Chuck(4)),
+            ("chuck-5-grip", Chuck(5)),
+            ("chuck-6-stickout", Chuck(6)),
+            ("clamp-0-length", Clamp(0)),
+            ("clamp-1-width", Clamp(1)),
+            ("clamp-2-height", Clamp(2)),
+            ("clamp-3-bite", Clamp(3)),
+            ("clamp-4-clamps", Clamp(4)),
+            ("cutting-0-vc_min", Cutting(0)),
+            ("cutting-1-fz", Cutting(1)),
+            ("lathetool-0-hand", LatheTool(0)),
+            ("lathetool-1-nose_radius", LatheTool(1)),
+            ("lathetool-2-lead_angle", LatheTool(2)),
+            ("lathetool-3-min_bore", LatheTool(3)),
+            ("lathetool-4-reach", LatheTool(4)),
+            ("lathetool-5-width", LatheTool(5)),
+            ("lathetool-6-thread_angle", LatheTool(6)),
+            ("lathetool-7-pitches", LatheTool(7)),
+            ("linking-0-coolant", Linking(0)),
+            ("linking-1-collision", Linking(1)),
+            ("linking-2-hole_order", Linking(2)),
+            ("linking-3-keep_down", Linking(3)),
+            ("linking-4-facing_depth_order", Linking(4)),
+            ("linking-5-facing_link", Linking(5)),
+            ("linking-6-compensation", Linking(6)),
+            ("linking-7-tolerance", Linking(7)),
+            ("machine-0-rpm", Machine(0)),
+            ("machine-1-power", Machine(1)),
+            ("machine-2-feed", Machine(2)),
+            ("machine-3-kind", Machine(3)),
+            ("machine-7-tool_change", Machine(7)),
+            ("manual-0-speeds", Manual(0)),
+            ("manual-1-hand_feed", Manual(1)),
+            ("manual-10-pitches", Manual(10)),
+            ("manual-11-dro_comp", Manual(11)),
+            ("manual-12-edge_finder", Manual(12)),
+            ("manual-13-pass_time", Manual(13)),
+            ("manual-14-tool_time", Manual(14)),
+            ("manual-15-move_time", Manual(15)),
+            ("manual-2-hand_rapid", Manual(2)),
+            ("manual-3-turn_x", Manual(3)),
+            ("manual-4-swing", Manual(4)),
+            ("manual-5-centres", Manual(5)),
+            ("manual-6-cross_reads", Manual(6)),
+            ("manual-7-cross_turn", Manual(7)),
+            ("manual-8-cross_div", Manual(8)),
+            ("manual-9-feeds", Manual(9)),
+            ("post-0-post_tool_length", Post(0)),
+            ("post-1-post_retract", Post(1)),
+            ("post-2-post_blend", Post(2)),
+            ("post-3-post_dwell", Post(3)),
+            ("post-4-post_air", Post(4)),
+            ("probe-0-probe_plate", Probe(0)),
+            ("probe-1-pins", Probe(1)),
+            ("probe-2-pin_diameter", Probe(2)),
+            ("probe-3-pin_height", Probe(3)),
+            ("probe-4-probe_tip", Probe(4)),
+            ("probe-5-probe_feed", Probe(5)),
+            ("probe-6-probe_distance", Probe(6)),
+            ("probe-7-probe_retract", Probe(7)),
+            ("stock-4-stock_x", Stock(4)),
+            ("stock-5-stock_y", Stock(5)),
+            ("stock-6-stock_z", Stock(6)),
+            ("stock-0-stock_type", Stock(0)),
+            ("stock-1-stock_diameter", Stock(1)),
+            ("stock-2-stock_length", Stock(2)),
+            ("stock-3-stock_radial", Stock(3)),
+            ("turnop-0-turn_kind", TurnOp(0)),
+            ("turnop-1-face_off", TurnOp(1)),
+            ("turnop-10-width", TurnOp(10)),
+            ("turnop-11-thread_side", TurnOp(11)),
+            ("turnop-12-pitch", TurnOp(12)),
+            ("turnop-13-passes", TurnOp(13)),
+            ("turnop-2-to_diameter", TurnOp(2)),
+            ("turnop-3-diameter", TurnOp(3)),
+            ("turnop-4-z_end", TurnOp(4)),
+            ("turnop-5-z", TurnOp(5)),
+            ("turnop-6-depth", TurnOp(6)),
+            ("turnop-7-finish", TurnOp(7)),
+            ("turnop-8-edge", TurnOp(8)),
+            ("turnop-9-size", TurnOp(9)),
+            ("vise-0-jaw_width", Vise(0)),
+            ("vise-1-jaw_height", Vise(1)),
+            ("vise-2-jaw_thickness", Vise(2)),
+            ("vise-3-max_opening", Vise(3)),
+            ("vise-4-grip", Vise(4)),
+            ("vise-5-force", Vise(5)),
+            ("vise-6-vise_axis", Vise(6)),
+            ("vise-7-vise_offset", Vise(7)),
+            ("vise-8-holding", Vise(8)),
+            ("vise-9-holding_gap", Vise(9)),
+            ("machine-4-travel_x", Machine(4)),
+            ("machine-5-travel_y", Machine(5)),
+            ("machine-6-travel_z", Machine(6)),
         ] {
             all.push((name.into(), d));
         }
-        let size = iced::Size::new(4. * 288. + 10., 2. * 182. + 10.);
+        // With `ANIM_SEQ=n`, n single frames through the phase instead, as
+        // `<name>/000.png`… for an animated preview.
+        let sequence: Option<usize> = std::env::var("ANIM_SEQ").ok().and_then(|n| n.parse().ok());
+        let mut jobs: Vec<(Element<Message>, iced::Size, std::path::PathBuf)> = vec![];
         for (name, d) in all.into_iter().filter(|(n, _)| n.contains(&only)) {
+            if let Some(n) = sequence {
+                std::fs::create_dir_all(dir.join(&name)).unwrap();
+                for i in 0..n {
+                    let t = 5. * i as f32 / n as f32;
+                    // `ANIM_MARGIN=m` leaves m px round the canvas, where
+                    // anything drawn past its edge shows.
+                    let m: f32 = std::env::var("ANIM_MARGIN")
+                        .ok()
+                        .and_then(|m| m.parse().ok())
+                        .unwrap_or(0.);
+                    jobs.push((
+                        container(
+                            canvas(Illustration {
+                                diagram: d,
+                                still: Some(t),
+                            })
+                            .width(CARD_WIDTH)
+                            .height(155),
+                        )
+                        .padding(m)
+                        .into(),
+                        iced::Size::new(CARD_WIDTH + 2. * m, 155. + 2. * m),
+                        dir.join(&name).join(format!("{i:03}.png")),
+                    ));
+                }
+                continue;
+            }
             let mut grid = widget::Column::new().spacing(6).padding(5);
             for r in 0..2 {
                 let mut row = widget::Row::new().spacing(10);
@@ -3317,7 +3466,14 @@ mod tests {
                 }
                 grid = grid.push(row);
             }
-            let element: Element<Message> = container(grid)
+            jobs.push((
+                grid.into(),
+                iced::Size::new(4. * 288. + 10., 2. * 182. + 10.),
+                dir.join(format!("{name}.png")),
+            ));
+        }
+        for (content, size, path) in jobs {
+            let element: Element<Message> = container(content)
                 .style(|_| container::Style {
                     background: Some(Color::from_rgb8(27, 44, 61).into()),
                     ..Default::default()
@@ -3351,7 +3507,6 @@ mod tests {
             let physical =
                 iced::Size::new((size.width * scale) as u32, (size.height * scale) as u32);
             let rgba = renderer.screenshot(physical, scale, Color::from_rgb8(27, 44, 61));
-            let path = dir.join(format!("{name}.png"));
             let mut encoder = png::Encoder::new(
                 std::io::BufWriter::new(std::fs::File::create(&path).unwrap()),
                 physical.width,
@@ -3893,7 +4048,8 @@ mod tests {
         ] {
             assert!(gap.more.contains(part), "{part}: {}", gap.more);
         }
-        assert!(gap.diagram.is_none());
+        // Its picture: the clearance envelope round a jaw.
+        assert_eq!(gap.diagram, Some(Diagram::Vise(9)));
         // The requested clearance says in its label that it is not checked,
         // sits under a heading that says the same, and its card says where
         // it is printed and which field the checks use instead.

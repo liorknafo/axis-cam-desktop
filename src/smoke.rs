@@ -6842,13 +6842,13 @@ flood = { pin = 8 }
         let mut a = app();
         assert!(!a.ticks_fast(), "idle, the app ticks every 500 ms");
         // A text-only card: no animation to drive.
-        let rpm = crate::help::FieldTag {
-            target: Target::Machine,
-            key: "rpm".into(),
-            label: "Maximum spindle speed · rpm".into(),
+        let name = crate::help::FieldTag {
+            target: Target::Material,
+            key: "name".into(),
+            label: "Name".into(),
         };
-        assert!(rpm.help().diagram.is_none());
-        let _ = a.update(Message::HelpFor(Some(rpm)));
+        assert!(name.help().diagram.is_none());
+        let _ = a.update(Message::HelpFor(Some(name)));
         assert!(!a.ticks_fast());
         // The requested fixture clearance's animated card (issue #186):
         // fast while it plays, slow while it is paused, fast again on Play.

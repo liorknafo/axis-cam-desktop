@@ -9,60 +9,60 @@ use iced::{
 };
 use std::f32::consts::{PI, TAU};
 
-type V = [f32; 3];
-const CYAN: Color = Color::from_rgb(0.26, 0.83, 0.92);
-const GOLD: Color = Color::from_rgb(1., 0.75, 0.33);
-const TEXT: Color = Color::from_rgb(0.725, 0.81, 0.875);
-const DIM: Color = Color::from_rgba(0.26, 0.83, 0.92, 0.28);
-const BACKGROUND: Color = Color::from_rgb(0.106, 0.173, 0.239);
-const EDGE: Color = Color::from_rgba(0.85, 0.9, 0.94, 0.35);
-const HOLE: Color = Color::from_rgb(0.12, 0.18, 0.24);
+pub(crate) type V = [f32; 3];
+pub(crate) const CYAN: Color = Color::from_rgb(0.26, 0.83, 0.92);
+pub(crate) const GOLD: Color = Color::from_rgb(1., 0.75, 0.33);
+pub(crate) const TEXT: Color = Color::from_rgb(0.725, 0.81, 0.875);
+pub(crate) const DIM: Color = Color::from_rgba(0.26, 0.83, 0.92, 0.28);
+pub(crate) const BACKGROUND: Color = Color::from_rgb(0.106, 0.173, 0.239);
+pub(crate) const EDGE: Color = Color::from_rgba(0.85, 0.9, 0.94, 0.35);
+pub(crate) const HOLE: Color = Color::from_rgb(0.12, 0.18, 0.24);
 /// The three faces this view sees of a box: its top, its +Y face (front
 /// left on screen) and its +X face (front right).
 #[derive(Clone, Copy)]
-struct Tone {
-    top: Color,
-    front: Color,
-    side: Color,
+pub(crate) struct Tone {
+    pub top: Color,
+    pub front: Color,
+    pub side: Color,
 }
 /// Finished metal.
-const METAL: Tone = Tone {
+pub(crate) const METAL: Tone = Tone {
     top: Color::from_rgb(0.57, 0.67, 0.73),
     front: Color::from_rgb(0.45, 0.56, 0.64),
     side: Color::from_rgb(0.40, 0.52, 0.60),
 };
 /// Metal the cutter has just cut: brighter than the rest.
-const FRESH: Tone = Tone {
+pub(crate) const FRESH: Tone = Tone {
     top: Color::from_rgb(0.72, 0.84, 0.90),
     front: Color::from_rgb(0.60, 0.72, 0.80),
     side: Color::from_rgb(0.54, 0.67, 0.76),
 };
 /// Material still to be removed.
-const STOCK: Tone = Tone {
+pub(crate) const STOCK: Tone = Tone {
     top: Color::from_rgb(0.80, 0.63, 0.36),
     front: Color::from_rgb(0.66, 0.50, 0.27),
     side: Color::from_rgb(0.58, 0.44, 0.24),
 };
 /// The direction the view looks from: +X, +Y and up.
-const VIEW: V = [1., 1., 0.77];
+pub(crate) const VIEW: V = [1., 1., 0.77];
 
-fn p(a: V) -> Point {
+pub(crate) fn p(a: V) -> Point {
     Point::new(
         139. + (a[0] - a[1]) * 1.40,
         111. + (a[0] + a[1]) * 0.52 - a[2] * 1.35,
     )
 }
-fn add(a: V, b: V) -> V {
+pub(crate) fn add(a: V, b: V) -> V {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-fn lerp(a: V, b: V, t: f32) -> V {
+pub(crate) fn lerp(a: V, b: V, t: f32) -> V {
     [
         a[0] + (b[0] - a[0]) * t,
         a[1] + (b[1] - a[1]) * t,
         a[2] + (b[2] - a[2]) * t,
     ]
 }
-fn mix(a: Color, b: Color, t: f32) -> Color {
+pub(crate) fn mix(a: Color, b: Color, t: f32) -> Color {
     Color::from_rgb(
         a.r + (b.r - a.r) * t,
         a.g + (b.g - a.g) * t,
@@ -71,23 +71,23 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 }
 /// The phase as progress: 0 to 1 over all but the last `hold` of the
 /// phase, which shows the finished result before it starts again.
-fn progress(phase: f32, hold: f32) -> f32 {
+pub(crate) fn progress(phase: f32, hold: f32) -> f32 {
     (phase / (1. - hold)).min(1.)
 }
-fn smooth(t: f32) -> f32 {
+pub(crate) fn smooth(t: f32) -> f32 {
     let t = t.clamp(0., 1.);
     t * t * (3. - 2. * t)
 }
-fn line(f: &mut Frame, a: Point, b: Point, color: Color, width: f32) {
+pub(crate) fn line(f: &mut Frame, a: Point, b: Point, color: Color, width: f32) {
     f.stroke(
         &Path::line(a, b),
         Stroke::default().with_color(color).with_width(width),
     );
 }
-fn line3(f: &mut Frame, a: V, b: V, color: Color, width: f32) {
+pub(crate) fn line3(f: &mut Frame, a: V, b: V, color: Color, width: f32) {
     line(f, p(a), p(b), color, width);
 }
-fn polyline3(f: &mut Frame, points: &[V], color: Color, width: f32) {
+pub(crate) fn polyline3(f: &mut Frame, points: &[V], color: Color, width: f32) {
     if points.len() < 2 {
         return;
     }
@@ -99,7 +99,7 @@ fn polyline3(f: &mut Frame, points: &[V], color: Color, width: f32) {
     });
     f.stroke(&path, Stroke::default().with_color(color).with_width(width));
 }
-fn dashed(f: &mut Frame, a: Point, b: Point, color: Color, width: f32) {
+pub(crate) fn dashed(f: &mut Frame, a: Point, b: Point, color: Color, width: f32) {
     let n = ((b.x - a.x).hypot(b.y - a.y) / 6.).max(1.) as usize;
     for i in (0..n).step_by(2) {
         let t0 = i as f32 / n as f32;
@@ -113,7 +113,7 @@ fn dashed(f: &mut Frame, a: Point, b: Point, color: Color, width: f32) {
         );
     }
 }
-fn polygon(f: &mut Frame, points: &[Point], fill: Color) {
+pub(crate) fn polygon(f: &mut Frame, points: &[Point], fill: Color) {
     let path = Path::new(|b| {
         b.move_to(points[0]);
         for a in &points[1..] {
@@ -123,7 +123,7 @@ fn polygon(f: &mut Frame, points: &[Point], fill: Color) {
     });
     f.fill(&path, fill);
 }
-fn quad(f: &mut Frame, points: &[V], fill: Color) {
+pub(crate) fn quad(f: &mut Frame, points: &[V], fill: Color) {
     let screen: Vec<Point> = points.iter().map(|a| p(*a)).collect();
     polygon(f, &screen, fill);
     let path = Path::new(|b| {
@@ -136,7 +136,7 @@ fn quad(f: &mut Frame, points: &[V], fill: Color) {
     f.stroke(&path, Stroke::default().with_color(EDGE).with_width(0.6));
 }
 /// A box from `min` to `max` as this view sees it.
-fn cuboid(f: &mut Frame, min: V, max: V, t: Tone) {
+pub(crate) fn cuboid(f: &mut Frame, min: V, max: V, t: Tone) {
     let [x, y, z] = min;
     let [xx, yy, zz] = max;
     if xx - x < 0.01 || yy - y < 0.01 || zz - z < 0.01 {
@@ -159,7 +159,7 @@ fn cuboid(f: &mut Frame, min: V, max: V, t: Tone) {
     );
 }
 /// A face shaded by its normal, or nothing when it faces away.
-fn lit(f: &mut Frame, points: &[V], base: Tone) {
+pub(crate) fn lit(f: &mut Frame, points: &[V], base: Tone) {
     let u = [
         points[1][0] - points[0][0],
         points[1][1] - points[0][1],
@@ -189,7 +189,7 @@ fn lit(f: &mut Frame, points: &[V], base: Tone) {
     };
     quad(f, points, color);
 }
-fn text(f: &mut Frame, s: &str, x: f32, y: f32, color: Color, size: f32) {
+pub(crate) fn text(f: &mut Frame, s: &str, x: f32, y: f32, color: Color, size: f32) {
     f.fill_text(Text {
         content: s.into(),
         position: Point::new(x, y),
@@ -199,15 +199,15 @@ fn text(f: &mut Frame, s: &str, x: f32, y: f32, color: Color, size: f32) {
     });
 }
 /// The line at the top of the canvas.
-fn heading(f: &mut Frame, s: &str) {
+pub(crate) fn heading(f: &mut Frame, s: &str) {
     text(f, s, 8., 3., GOLD, 10.);
 }
 /// The legend under the drawing.
-fn caption(f: &mut Frame, s: &str) {
+pub(crate) fn caption(f: &mut Frame, s: &str) {
     text(f, s, 8., 143., TEXT, 9.);
 }
 /// A dimension between `a` and `b` with an arrowhead at each end.
-fn dimension(f: &mut Frame, a: Point, b: Point, color: Color) {
+pub(crate) fn dimension(f: &mut Frame, a: Point, b: Point, color: Color) {
     line(f, a, b, color, 1.4);
     let len = (b.x - a.x).hypot(b.y - a.y).max(1e-3);
     let (ux, uy) = ((b.x - a.x) / len, (b.y - a.y) / len);
@@ -230,7 +230,7 @@ fn dimension(f: &mut Frame, a: Point, b: Point, color: Color) {
 /// spindle along the unit `up`, `d` px wide. Gold flutes whose marks move
 /// as it turns, a light shank and a grey holder; a drill ends in a point.
 /// Nothing is drawn of the first `hidden` px from the tip (inside a hole).
-fn cutter_at(
+pub(crate) fn cutter_at(
     f: &mut Frame,
     tip: Point,
     up: (f32, f32),
@@ -291,12 +291,12 @@ fn cutter_at(
 }
 /// A vertical cutter in the 3D view with its tip at `tip`, hidden below
 /// the height `hide_below` (as when it is down a hole).
-fn cutter(f: &mut Frame, tip: V, time: f32, d: f32, drill: bool, hide_below: f32) {
+pub(crate) fn cutter(f: &mut Frame, tip: V, time: f32, d: f32, drill: bool, hide_below: f32) {
     let hidden = (hide_below - tip[2]).max(0.) * 1.35;
     cutter_at(f, p(tip), (0., -1.), time, d, drill, hidden);
 }
 /// A cutter whose axis leans by `tilt` radians toward +X.
-fn tilted_cutter(f: &mut Frame, tip: V, tilt: f32, time: f32, d: f32) {
+pub(crate) fn tilted_cutter(f: &mut Frame, tip: V, tilt: f32, time: f32, d: f32) {
     let a = p(tip);
     let b = p(add(tip, [tilt.sin() * 10., 0., tilt.cos() * 10.]));
     let len = (b.x - a.x).hypot(b.y - a.y);
@@ -312,7 +312,7 @@ fn tilted_cutter(f: &mut Frame, tip: V, tilt: f32, time: f32, d: f32) {
 }
 /// A recess cut into a flat top at `top`, from `x0..x1 × y0..y1` down to
 /// `floor`: its two far walls and as much of its floor as shows.
-fn pocket(f: &mut Frame, x0: f32, x1: f32, y0: f32, y1: f32, top: f32, floor: f32) {
+pub(crate) fn pocket(f: &mut Frame, x0: f32, x1: f32, y0: f32, y1: f32, top: f32, floor: f32) {
     if x1 - x0 < 0.01 || y1 - y0 < 0.01 {
         return;
     }
@@ -352,7 +352,7 @@ fn pocket(f: &mut Frame, x0: f32, x1: f32, y0: f32, y1: f32, top: f32, floor: f3
     );
 }
 /// A disc of radius r around `c` in the plane at height c[2].
-fn disc(c: V, r: f32) -> Vec<V> {
+pub(crate) fn disc(c: V, r: f32) -> Vec<V> {
     (0..24)
         .map(|i| {
             let a = i as f32 * TAU / 24.;
@@ -362,7 +362,7 @@ fn disc(c: V, r: f32) -> Vec<V> {
 }
 /// The point a fraction `u` along a polyline, by length, and how many of
 /// its points lie behind it.
-fn along(path: &[V], u: f32) -> (V, usize) {
+pub(crate) fn along(path: &[V], u: f32) -> (V, usize) {
     let lengths: Vec<f32> = path
         .windows(2)
         .map(|w| {
@@ -442,6 +442,22 @@ fn facing(f: &mut Frame, time: f32, phase: f32) {
         };
         cuboid(f, [a, y, 22.], [b, y + 12., 26.], STOCK);
     };
+    // The zigzag toolpath: rows ±48 across, one row (12) apart.
+    let ends = |i: usize, z: f32| {
+        let y = -18. + 12. * i as f32;
+        if i % 2 == 0 {
+            ([-48., y, z], [48., y, z])
+        } else {
+            ([48., y, z], [-48., y, z])
+        }
+    };
+    let mut done = vec![];
+    for i in 0..row {
+        let (a, b) = ends(i, 22.);
+        done.extend([a, b]);
+    }
+    done.extend([ends(row, 22.).0, [x, -18. + 12. * row as f32, 22.]]);
+    polyline3(f, &done, CYAN, 1.7);
     for i in 0..=row {
         piece(f, i);
     }
@@ -449,8 +465,15 @@ fn facing(f: &mut Frame, time: f32, phase: f32) {
     for i in row + 1..4 {
         piece(f, i);
     }
+    // What is still to cut, faint over the amber.
+    let mut ahead = vec![[x, -18. + 12. * row as f32, 26.], ends(row, 26.).1];
+    for i in row + 1..4 {
+        let (a, b) = ends(i, 26.);
+        ahead.extend([a, b]);
+    }
+    polyline3(f, &ahead, DIM, 1.);
     heading(f, "FACING · ROW BY ROW ACROSS THE TOP");
-    caption(f, "AMBER: TOP LAYER TO REMOVE   BRIGHT: FACED");
+    caption(f, "CYAN: TOOLPATH   AMBER: LAYER TO REMOVE");
 }
 
 /// Box on a manual mill: a step cut by straight passes along X, a step
@@ -486,6 +509,16 @@ fn manual_box(f: &mut Frame, time: f32, phase: f32) {
         }
     }
     let tip = [x, -18. + 12. * row as f32, 18. - 6. * layer as f32];
+    // The toolpath so far: straight passes along X, steps in Y and Z.
+    let mut done = vec![];
+    for q in 0..=pass {
+        let (l, i) = (q / 4, q % 4);
+        let (y, z) = (-18. + 12. * i as f32, 18. - 6. * l as f32);
+        let (a, b) = if i % 2 == 0 { (-1., 48.) } else { (48., -1.) };
+        done.push([a, y, z]);
+        done.push(if q == pass { [x, y, z] } else { [b, y, z] });
+    }
+    polyline3(f, &done, CYAN, 1.7);
     // Behind-first: lower layers, then rows toward the front.
     pieces.sort_by(|a, b| (a.0[2], a.0[1]).partial_cmp(&(b.0[2], b.0[1])).unwrap());
     let mut drawn = false;
@@ -511,7 +544,7 @@ fn manual_box(f: &mut Frame, time: f32, phase: f32) {
         }),
     );
     heading(f, "ONE AXIS AT A TIME: X, THEN Y, THEN Z");
-    caption(f, "AMBER: THE BLOCK OF MATERIAL TO REMOVE");
+    caption(f, "CYAN: TOOLPATH   AMBER: MATERIAL TO REMOVE");
 }
 
 /// Drilling: the drill goes down each hole in turn and comes back up,
@@ -681,6 +714,29 @@ fn contour(f: &mut Frame, time: f32, phase: f32) {
     ];
     let tip = [c[0], c[1], 18. - 8. * pass as f32];
     cuboid(f, [-40., -24., 0.], [40., 24., 10.], METAL);
+    // The toolpath so far, side by side: those behind the boss (2, 3) are
+    // drawn before it, the front two after.
+    let mut done: Vec<(usize, V, V)> = vec![];
+    for p in 0..=pass {
+        let z = 18. - 8. * p as f32;
+        for j in 0..4 {
+            if p == pass && j > side {
+                break;
+            }
+            let a = [corners[j][0], corners[j][1], z];
+            let b = if p == pass && j == side {
+                [c[0], c[1], z]
+            } else {
+                [corners[j + 1][0], corners[j + 1][1], z]
+            };
+            done.push((j, a, b));
+        }
+    }
+    for (j, a, b) in &done {
+        if *j >= 2 {
+            line3(f, *a, *b, CYAN, 1.7);
+        }
+    }
     let mut items: Vec<(f32, V, V, Tone)> = vec![(18., [-22., -12., 10.], [22., 12., 26.], FRESH)];
     for p in 0..2 {
         let (z0, z1) = (18. - 8. * p as f32, 26. - 8. * p as f32);
@@ -717,6 +773,11 @@ fn contour(f: &mut Frame, time: f32, phase: f32) {
         }
         cuboid(f, min, max, tone);
     }
+    for (j, a, b) in &done {
+        if *j < 2 {
+            line3(f, *a, *b, CYAN, 1.7);
+        }
+    }
     if !drawn {
         cutter(f, tip, time, 13., false, 0.);
     }
@@ -724,7 +785,7 @@ fn contour(f: &mut Frame, time: f32, phase: f32) {
         f,
         &format!("CONTOUR · AROUND THE WALL, PASS {} OF 2", pass + 1),
     );
-    caption(f, "AMBER: MATERIAL OUTSIDE THE FINISHED WALL");
+    caption(f, "CYAN: TOOLPATH   AMBER: OUTSIDE THE WALL");
 }
 
 /// Waterline: loops round a steep boss at constant heights, one level
@@ -993,7 +1054,7 @@ fn indexed(f: &mut Frame, time: f32, phase: f32, setup: bool) {
 
 /// A cylinder along X from x0 to x1 of radius r round (y 0, z zc), turned
 /// by `spin`: its sides this view sees and its +X end.
-fn cylinder(f: &mut Frame, x0: f32, x1: f32, r: f32, zc: f32, spin: f32, tone: Tone) {
+pub(crate) fn cylinder(f: &mut Frame, x0: f32, x1: f32, r: f32, zc: f32, spin: f32, tone: Tone) {
     let n = 28;
     let at = |x: f32, a: f32| [x, r * a.cos(), zc + r * a.sin()];
     for i in 0..n {
@@ -1131,14 +1192,14 @@ fn five_axis(f: &mut Frame, time: f32, phase: f32) {
 // Sections and plans: a straight-on view where a depth or a spacing can be
 // read off, with the stock in blue and what is cut away in the background.
 
-const SECTION: Color = Color::from_rgb(0.45, 0.56, 0.64);
-fn rect(f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
+pub(crate) const SECTION: Color = Color::from_rgb(0.45, 0.56, 0.64);
+pub(crate) fn rect(f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32, c: Color) {
     if x1 > x0 && y1 > y0 {
         f.fill_rectangle(Point::new(x0, y0), Size::new(x1 - x0, y1 - y0), c);
     }
 }
 /// A block of stock in section from x0..x1, its top at y0.
-fn stock(f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32) {
+pub(crate) fn stock(f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32) {
     rect(f, x0, y0, x1, y1, SECTION);
     // Hatching, as a section is drawn.
     let mut x = x0 - (y1 - y0);
@@ -1158,7 +1219,7 @@ fn stock(f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32) {
     );
 }
 /// A cutter side on, its bottom centre at (x, y).
-fn side_cutter(f: &mut Frame, x: f32, y: f32, time: f32, w: f32, drill: bool) {
+pub(crate) fn side_cutter(f: &mut Frame, x: f32, y: f32, time: f32, w: f32, drill: bool) {
     cutter_at(f, Point::new(x, y), (0., -1.), time, w, drill, 0.);
 }
 
@@ -1426,7 +1487,7 @@ fn offsets(f: &mut Frame, time: f32, phase: f32) {
 }
 
 /// The setup's X, Y and Z at the bottom left, `bright` in gold.
-fn axes(f: &mut Frame, bright: Option<usize>) {
+pub(crate) fn axes(f: &mut Frame, bright: Option<usize>) {
     let o = [-36., 31., 0.];
     for (i, name) in ["X", "Y", "Z"].iter().enumerate() {
         let mut e = o;
