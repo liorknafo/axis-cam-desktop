@@ -232,6 +232,11 @@ impl Vise {
     }
 }
 
+/// A thin pointer from a label to what it names.
+fn leader(f: &mut Frame, a: Point, b: Point) {
+    line(f, a, b, alpha(TEXT, 0.7), 1.);
+}
+
 pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
     let mut v = Vise::new();
     match n {
@@ -251,9 +256,11 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             let a = p(v.at(x, v.len, z));
             let b = p(v.at(x, -v.len, z));
             dimension(f, a, b, GOLD);
-            text(f, "JAW WIDTH", b.x + 5., b.y - 12., GOLD, 9.);
+            let t = Point::new(b.x + 12., b.y - 22.);
+            text(f, "JAW WIDTH", t.x, t.y, GOLD, 9.);
+            leader(f, Point::new(t.x + 3., t.y + 11.), b);
             heading(f, "JAW WIDTH · LENGTH OF EACH JAW");
-            caption(f, "GOLD: A JAW'S LENGTH ALONG THE JAWS");
+            caption(f, "JAW WIDTH: EACH JAW'S LENGTH ALONG THE JAWS");
         }
         1 => {
             let jh = 6. + 9. * wave(phase);
@@ -266,14 +273,9 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             let lo = p(v.at(a, b, BASE));
             let hi = p(v.at(a, b, v.top));
             dimension(f, lo, hi, GOLD);
-            text(
-                f,
-                "JAW HEIGHT",
-                lo.x - 72.,
-                (lo.y + hi.y) / 2. - 5.,
-                GOLD,
-                9.,
-            );
+            let mid = (lo.y + hi.y) / 2.;
+            text(f, "JAW HEIGHT", lo.x - 76., mid - 5., GOLD, 9.);
+            leader(f, Point::new(lo.x - 15., mid), Point::new(lo.x - 3., mid));
             heading(f, "JAW HEIGHT · ABOVE THE PARALLELS' TOP");
             text(f, "FOR REFERENCE", 8., 16., TEXT, 9.);
             caption(f, "MODELLED JAWS REACH THE GRIP HEIGHT INSTEAD");
@@ -283,27 +285,31 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             v.draw(f);
             let b = v.len - 5.;
             let z = v.top;
-            for (a0, a1) in [(v.moving, v.moving + v.thick), (v.fixed - v.thick, v.fixed)] {
-                dim3(f, v.at(a0, b, z), v.at(a1, b, z), GOLD);
-            }
-            let m = p(v.at(v.moving + v.thick, b, z));
-            text(f, "THICKNESS", m.x + 8., m.y + 1., GOLD, 9.);
-            let q = p(v.at(v.fixed - v.thick, b, z));
-            text(f, "THICKNESS", q.x - 58., q.y - 9., GOLD, 9.);
+            // The near jaw carries the dimension.
+            dim3(
+                f,
+                v.at(v.moving, b, z),
+                v.at(v.moving + v.thick, b, z),
+                GOLD,
+            );
+            let mid = p(v.at(v.moving + v.thick / 2., b, z));
+            let t = Point::new(mid.x + 62., mid.y - 12.);
+            text(f, "JAW THICKNESS", t.x, t.y, GOLD, 9.);
+            leader(f, Point::new(t.x - 2., t.y + 5.), mid);
             heading(f, "JAW THICKNESS · OUTWARD FROM THE STOCK");
-            caption(f, "GOLD: HOW THICK EACH JAW IS");
+            caption(f, "JAW THICKNESS: HOW THICK EACH JAW IS");
         }
         3 => {
             v.fixed = -20.;
             v.stock = (-20., 8.);
             let wide = phase >= 0.5;
-            let reached;
             if wide {
                 v.moving = 20.;
-                reached = true;
                 let k = smooth(((phase - 0.5) / 0.25).min(1.));
-                v.lift = 10. + 16. * (1. - k);
+                // It stops on top of the jaws, at their top.
+                v.lift = (v.top - BASE) + 16. * (1. - k);
                 v.stock = (-24., 24.);
+                v.sb = 10.;
                 v.stock_tone = Tone {
                     top: mix(STOCK.top, RED, 0.45),
                     front: mix(STOCK.front, RED, 0.45),
@@ -311,9 +317,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
                 };
                 v.stock_last = true;
             } else {
-                let k = smooth((phase / 0.3).min(1.));
-                v.moving = 8. + 12. * k;
-                reached = k >= 0.999;
+                v.moving = 8. + 12. * smooth((phase / 0.3).min(1.));
             }
             v.draw(f);
             let b = v.len + 8.;
@@ -322,14 +326,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             }
             let l = p(v.at(v.fixed, b, BASE));
             dimension(f, l, p(v.at(v.moving, b, BASE)), GOLD);
-            text(
-                f,
-                if reached { "MAX OPENING" } else { "OPENING" },
-                l.x - 10.,
-                l.y + 20.,
-                GOLD,
-                9.,
-            );
+            text(f, "MAX OPENING", l.x - 66., l.y + 6., GOLD, 9.);
             if wide {
                 let zb = BASE + v.lift;
                 let sb = v.sb + 8.;
@@ -341,7 +338,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
                 text(f, "TOO WIDE", r.x - 68., r.y - 8., RED, 10.);
                 caption(f, "WIDER THAN THE OPENING: A SETUP ISSUE");
             } else {
-                caption(f, "GOLD: THE WIDEST STOCK THE JAWS TAKE");
+                caption(f, "MAX OPENING: THE WIDEST STOCK THE JAWS TAKE");
             }
             heading(f, "MAX OPENING · WIDEST STOCK THE JAWS TAKE");
         }
@@ -351,7 +348,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             v.top = BASE + g;
             v.draw(f);
             let zt = v.stock_top();
-            // The stock above the grip is free: its front edge in gold.
+            // The stock above the grip is free: the grip height marked on it.
             line3(
                 f,
                 v.at(-14., v.sb, v.top),
@@ -365,45 +362,49 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             let lo = p(v.at(-14., b, BASE));
             let hi = p(v.at(-14., b, v.top));
             dimension(f, lo, hi, GOLD);
-            text(f, "GRIP", lo.x - 32., (lo.y + hi.y) / 2. - 5., GOLD, 9.);
+            let mid = (lo.y + hi.y) / 2.;
+            text(f, "GRIP", lo.x - 38., mid - 5., GOLD, 9.);
+            leader(f, Point::new(lo.x - 11., mid), Point::new(lo.x - 3., mid));
             let free = p(v.at(14., -v.sb, zt));
             text(f, "STOCK ABOVE", free.x + 10., free.y - 6., TEXT, 9.);
             text(f, "THE GRIP: FREE", free.x + 10., free.y + 5., TEXT, 9.);
             heading(f, "GRIP · HEIGHT OF STOCK THE JAWS HOLD");
-            caption(f, "GOLD: FROM THE STOCK'S BOTTOM UP TO THE GRIP");
+            caption(f, "GRIP: STOCK BOTTOM UP TO THE JAWS' TOP");
         }
         5 => {
             let pulse = wave(phase);
             v.draw(f);
             let z = v.top + 6.;
-            let l = 8. + 8. * pulse;
-            // Both jaws squeeze toward the stock from outside.
+            let l = 12. + 6. * pulse;
+            // Both jaws squeeze toward the stock from outside, at the front.
             let lt = v.fixed - v.thick - 2.;
-            arrow(f, p(v.at(lt - l, 12., z)), p(v.at(lt, 12., z)), GOLD);
-            let n = p(v.at(lt - l, 12., z));
+            arrow(f, p(v.at(lt - l, 14., z)), p(v.at(lt, 14., z)), GOLD);
+            let n = p(v.at(lt - l, 14., z));
             text(f, "N", n.x - 10., n.y - 6., GOLD, 10.);
             let rt = v.moving + v.thick + 2.;
-            arrow(f, p(v.at(rt + l, 12., z)), p(v.at(rt, 12., z)), GOLD);
-            let n = p(v.at(rt + l, 12., z));
-            text(f, "N", n.x + 4., n.y - 4., GOLD, 10.);
+            arrow(f, p(v.at(rt + l, 14., z)), p(v.at(rt, 14., z)), GOLD);
+            let n = p(v.at(rt + l, 14., z));
+            text(f, "N", n.x + 5., n.y - 6., GOLD, 10.);
             // The cutter pushes the part sideways, along the jaws.
             let push = 6. + 12. * progress(phase, 0.1);
             let zs = v.stock_top();
             cutter(f, [0., 12., zs], time, 10., false, 0.);
             arrow(f, p([0., 6., zs]), p([0., 6. - push, zs]), RED);
             let c = p([0., 6. - push, zs]);
-            text(f, "CUT PUSH", c.x + 6., c.y - 17., RED, 9.);
-            // The jaws' friction holds it.
+            let t = Point::new(c.x + 26., c.y - 28.);
+            text(f, "CUT PUSH", t.x, t.y, RED, 9.);
+            leader(f, Point::new(t.x + 3., t.y + 11.), c);
+            // The jaws' friction holds it: on the jaw's back half.
             arrow(
                 f,
-                p(v.at(v.moving + 4., -push, v.top)),
-                p(v.at(v.moving + 4., 0., v.top)),
+                p(v.at(v.moving + 4., -4. - push, v.top)),
+                p(v.at(v.moving + 4., -4., v.top)),
                 CYAN,
             );
             let lbl = p(v.at(v.moving + v.thick, -v.len, v.top));
-            text(f, "FRICTION", lbl.x + 6., lbl.y - 4., CYAN, 9.);
+            text(f, "FRICTION", lbl.x + 8., lbl.y - 4., CYAN, 9.);
             heading(f, "FORCE · HOW HARD THE VISE CLAMPS, IN N");
-            caption(f, "GOLD: CLAMPING   RED: CUT PUSH   CYAN: FRICTION");
+            caption(f, "N: JAW FORCE   RED: CUT PUSH   CYAN: FRICTION");
         }
         6 => {
             let half = phase < 0.5;
@@ -429,7 +430,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             );
         }
         7 => {
-            let o = 10. * (phase * TAU).sin();
+            let o = 11. * (phase * TAU).sin();
             v.len = 14.;
             v.off = o;
             v.draw(f);
@@ -437,22 +438,24 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             let zj = v.top;
             let edge = v.moving + v.thick;
             let x = edge + 8.;
-            dashed(f, p(v.at(-14., 0., zs)), p(v.at(14., 0., zs)), CYAN, 2.);
-            line3(f, v.at(v.moving, o, zj), v.at(edge, o, zj), GOLD, 2.6);
+            // Centre marks: the stock's across its top, the jaws' on both jaw tops.
+            dashed(f, p(v.at(-14., 0., zs)), p(v.at(14., 0., zs)), CYAN, 3.);
+            line3(f, v.at(v.moving, o, zj), v.at(edge, o, zj), GOLD, 4.);
             line3(
                 f,
                 v.at(v.fixed - v.thick, o, zj),
                 v.at(v.fixed, o, zj),
                 GOLD,
-                2.6,
+                4.,
             );
             ext(f, v.at(edge, 0., zj), v.at(x, 0., zj), CYAN);
             ext(f, v.at(edge, o, zj), v.at(x, o, zj), GOLD);
             dim3(f, v.at(x, 0., zj), v.at(x, o, zj), GOLD);
             let q = p(v.at(x, 0., zj));
-            text(f, "OFFSET", q.x + 10., q.y + 1., GOLD, 9.);
+            text(f, "OFFSET", 200., 74., GOLD, 9.);
+            leader(f, Point::new(204., 86.), Point::new(q.x + 2., q.y - 2.));
             heading(f, "VISE OFFSET · JAWS SLIDE ALONG THEIR LENGTH");
-            caption(f, "CYAN: STOCK'S CENTRE   GOLD: THE JAWS' CENTRE");
+            caption(f, "OFFSET: STOCK CENTRE TO THE JAWS' CENTRE");
         }
         8 => {
             let third = ((phase * 3.) as usize).min(2);
@@ -470,7 +473,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
                 }
                 1 => {
                     let c = Clamps::new();
-                    let list = [(0, -4., 0.), (1, 4., 0.), (3, 0., 0.)];
+                    let list = [(1, 5., 0.), (3, -5., 0.)];
                     draw_clamps(f, &c, &list);
                     for &(s, o, l) in &list {
                         let (lo, hi) = c.envelope(s, o, l);
@@ -489,9 +492,12 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
             heading(f, "HOLDING · WHAT THE SETUP MODELS");
         }
         _ => {
-            let g = 9.;
+            let g = 8.;
+            v.len = 14.;
             let (lo, hi) = v.jaw_box(true);
-            let (elo, ehi) = grown(lo, hi, g);
+            let (mut elo, ehi) = grown(lo, hi, g);
+            // The envelope hugs the jaw, from the vise body up.
+            elo[2] = FLOOR;
             let outer = v.moving + v.thick + g;
             let rc = 4.;
             let t = if phase < 0.5 {
@@ -514,15 +520,23 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
                 );
             }
             dbox(f, elo, ehi, color);
-            let a = v.moving + v.thick - 2.;
+            // The gap, between the jaw's end face and the envelope's.
+            let a = v.moving + v.thick / 2.;
             let d0 = p(v.at(a, v.len, v.top));
-            dimension(f, d0, p(v.at(a, v.len + g, v.top)), GOLD);
-            text(f, "GAP", d0.x - 24., d0.y + 4., GOLD, 9.);
+            let d1 = p(v.at(a, v.len + g, v.top));
+            dimension(f, d0, d1, GOLD);
+            let t = Point::new(d0.x - 44., d0.y + 12.);
+            text(f, "GAP", t.x, t.y, GOLD, 9.);
+            leader(
+                f,
+                Point::new(t.x + 20., t.y + 4.),
+                Point::new((d0.x + d1.x) / 2., (d0.y + d1.y) / 2.),
+            );
             if warn {
                 text(f, "WARNING", 8., 16., RED, 10.);
             }
             heading(f, "HOLDING GAP · CLEARANCE AROUND THE JAWS");
-            caption(f, "CYAN: THE GAP KEPT   RED: A MOVE WITHIN IT");
+            caption(f, "CYAN BOXES: JAW + GAP   RED: A MOVE WITHIN IT");
         }
     }
 }
@@ -613,7 +627,7 @@ impl Clamps {
 
 /// The table, the stock and the clamps `(side, offset, lift)` on it.
 fn draw_clamps(f: &mut Frame, c: &Clamps, list: &[(usize, f32, f32)]) {
-    cuboid(f, [-34., -22., 0.], [34., 22., TABLE], BODY);
+    cuboid(f, [-44., -22., 0.], [44., 22., TABLE], BODY);
     for &(s, o, l) in list {
         if s % 2 == 0 {
             let [_, stud, _] = c.parts(s, o, l);
@@ -645,36 +659,38 @@ fn draw_clamps(f: &mut Frame, c: &Clamps, list: &[(usize, f32, f32)]) {
 pub fn clamp(f: &mut Frame, _time: f32, phase: f32, n: u8) {
     let mut c = Clamps::new();
     let side = 1;
-    // Dimensions sit on the back side of the bar (toward −Y), in the open.
+    // Dimensions on the back side of the bar (toward −Y), in the open.
     let back = |c: &Clamps| -(c.w / 2. + 6.);
     match n {
         0 => {
-            c.len = 14. + 8. * wave(phase);
+            c.len = 16. + 14. * wave(phase);
             draw_clamps(f, &c, &[(side, 0., 0.)]);
             let (u0, u1) = (HX - c.bite, HX + c.len - c.bite);
             let z = c.top() + c.ch;
             let lat = back(&c);
-            ext(
-                f,
-                Clamps::pt(side, u0, -c.w / 2., z),
-                Clamps::pt(side, u0, lat, z),
-                GOLD,
-            );
-            ext(
-                f,
-                Clamps::pt(side, u1, -c.w / 2., z),
-                Clamps::pt(side, u1, lat, z),
-                GOLD,
-            );
+            for u in [u0, u1] {
+                ext(
+                    f,
+                    Clamps::pt(side, u, -c.w / 2., z),
+                    Clamps::pt(side, u, lat, z),
+                    GOLD,
+                );
+            }
             let a = p(Clamps::pt(side, u0, lat, z));
             let b = p(Clamps::pt(side, u1, lat, z));
             dimension(f, a, b, GOLD);
-            text(f, "LENGTH", b.x + 6., b.y - 10., GOLD, 9.);
+            let t = Point::new(a.x + 6., a.y - 26.);
+            text(f, "CLAMP LENGTH", t.x, t.y, GOLD, 9.);
+            leader(
+                f,
+                Point::new(t.x + 30., t.y + 11.),
+                Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.),
+            );
             heading(f, "CLAMP LENGTH · FROM ITS TIP OUTWARD");
-            caption(f, "GOLD: THE WHOLE CLAMP, BITE INCLUDED");
+            caption(f, "CLAMP LENGTH: TIP TO END, BITE INCLUDED");
         }
         1 => {
-            c.w = 6. + 12. * wave(phase);
+            c.w = 9. + 9. * wave(phase);
             draw_clamps(f, &c, &[(side, 0., 0.)]);
             let u1 = HX + c.len - c.bite;
             let z = c.top() + c.ch;
@@ -690,31 +706,39 @@ pub fn clamp(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             let a = p(Clamps::pt(side, u, c.w / 2., z));
             let b = p(Clamps::pt(side, u, -c.w / 2., z));
             dimension(f, a, b, GOLD);
-            text(f, "WIDTH", b.x + 6., b.y - 8., GOLD, 9.);
+            let t = Point::new(b.x + 10., b.y - 24.);
+            text(f, "CLAMP WIDTH", t.x, t.y, GOLD, 9.);
+            leader(f, Point::new(t.x + 3., t.y + 11.), b);
             heading(f, "CLAMP WIDTH · ALONG THE STOCK'S SIDE");
-            caption(f, "GOLD: ACROSS THE BAR, ALONG THE SIDE IT SITS ON");
+            caption(f, "CLAMP WIDTH: ACROSS THE BAR, ALONG THE SIDE");
         }
         2 => {
-            c.ch = 3. + 10. * wave(phase);
+            c.ch = 9. + 5. * wave(phase);
             draw_clamps(f, &c, &[(side, 0., 0.)]);
             let u1 = HX + c.len - c.bite;
-            let u = u1 - 3.;
-            let lat = back(&c);
+            let u = u1 + 7.;
             let zt = c.top();
-            for z in [zt, zt + c.ch] {
-                ext(
-                    f,
-                    Clamps::pt(side, u, -c.w / 2., z),
-                    Clamps::pt(side, u, lat, z),
-                    GOLD,
-                );
-            }
-            let a = p(Clamps::pt(side, u, lat, zt));
-            let b = p(Clamps::pt(side, u, lat, zt + c.ch));
-            dimension(f, a, b, GOLD);
-            text(f, "HEIGHT", a.x + 8., (a.y + b.y) / 2. - 5., GOLD, 9.);
+            // A reference line at the stock's top, carried out past the bar's end.
+            dashed(
+                f,
+                p(Clamps::pt(side, u1, 0., zt)),
+                p(Clamps::pt(side, u + 4., 0., zt)),
+                TEXT,
+                1.6,
+            );
+            ext(
+                f,
+                Clamps::pt(side, u1, 0., zt + c.ch),
+                Clamps::pt(side, u, 0., zt + c.ch),
+                CYAN,
+            );
+            let a = p(Clamps::pt(side, u, 0., zt));
+            let b = p(Clamps::pt(side, u, 0., zt + c.ch));
+            dimension(f, a, b, CYAN);
+            text(f, "CLAMP HEIGHT", b.x + 8., b.y - 6., CYAN, 9.);
+            text(f, "STOCK TOP", a.x + 8., a.y + 1., TEXT, 9.);
             heading(f, "CLAMP HEIGHT · ABOVE THE STOCK'S TOP");
-            caption(f, "GOLD: FROM THE STOCK'S TOP TO THE CLAMP'S TOP");
+            caption(f, "CLAMP HEIGHT: STOCK TOP TO TOP OF THE CLAMP");
         }
         3 => {
             c.len = 20.;
@@ -722,7 +746,7 @@ pub fn clamp(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             draw_clamps(f, &c, &[(side, 0., 0.)]);
             let (u0, u1) = (HX - c.bite, HX + c.len - c.bite);
             let zt = c.top();
-            // The bite, on the stock's top in front of the bar, up to the edge.
+            // The bite, on the stock's top in front of the bar: tip to edge.
             let fl = c.w / 2. + 4.;
             ext(
                 f,
@@ -739,23 +763,30 @@ pub fn clamp(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             let a = p(Clamps::pt(side, u0, fl, zt));
             let b = p(Clamps::pt(side, HX, fl, zt));
             dimension(f, a, b, CYAN);
-            text(f, "BITE", b.x - 12., b.y + 14., CYAN, 9.);
-            // The whole length, above the bar.
-            let z = zt + c.ch + 14.;
+            text(f, "BITE", b.x - 30., b.y + 8., CYAN, 9.);
+            // The clamp's whole length, along the bar's back side.
+            let z = zt + c.ch;
+            let lat = back(&c);
             for u in [u0, u1] {
                 ext(
                     f,
-                    Clamps::pt(side, u, 0., zt + c.ch),
-                    Clamps::pt(side, u, 0., z),
+                    Clamps::pt(side, u, -c.w / 2., z),
+                    Clamps::pt(side, u, lat, z),
                     GOLD,
                 );
             }
-            let l = p(Clamps::pt(side, u0, 0., z));
-            let r = p(Clamps::pt(side, u1, 0., z));
+            let l = p(Clamps::pt(side, u0, lat, z));
+            let r = p(Clamps::pt(side, u1, lat, z));
             dimension(f, l, r, GOLD);
-            text(f, "LENGTH", r.x + 6., r.y - 8., GOLD, 9.);
+            let t = Point::new(l.x + 6., l.y - 26.);
+            text(f, "CLAMP LENGTH", t.x, t.y, GOLD, 9.);
+            leader(
+                f,
+                Point::new(t.x + 30., t.y + 11.),
+                Point::new((l.x + r.x) / 2., (l.y + r.y) / 2.),
+            );
             heading(f, "CLAMP BITE · REACH ONTO THE STOCK");
-            caption(f, "CYAN: BITE   GOLD: LENGTH   BITE MUST BE SHORTER");
+            caption(f, "BITE < CLAMP LENGTH");
         }
         _ => {
             c.len = 16.;
@@ -868,13 +899,17 @@ fn vbar(f: &mut Frame, c: V, r: f32, h: f32, a: f32) {
 }
 
 /// The fixed-size stock box centred on X and Y, its bottom on Z 0, round
-/// a part; `dims` are the axes (0 X, 1 Y, 2 Z) whose size is marked.
+/// a part standing on Z0; `dims` are the axes (0 X, 1 Y, 2 Z) whose size is
+/// marked, in `letters` named by a letter.
 fn fixed_box(f: &mut Frame, sx: f32, sy: f32, sz: f32, dims: &[usize], letters: bool) {
     let (hx, hy) = (sx / 2., sy / 2.);
-    dashed(f, p([-hx - 6., 0., 0.]), p([hx + 6., 0., 0.]), CYAN, 1.);
-    dashed(f, p([0., -hy - 6., 0.]), p([0., hy + 6., 0.]), CYAN, 1.);
-    cuboid(f, [-12., -8., 2.], [12., 8., 18.], PART);
+    cuboid(f, [-12., -8., 0.], [12., 8., 16.], PART);
     cuboid(f, [-hx, -hy, 0.], [hx, hy, sz], tone_a(STOCK, 0.3));
+    // The Z0 mark touches the box's bottom edge.
+    let corner = p([-hx, hy, 0.]);
+    line(f, Point::new(corner.x - 16., corner.y), corner, CYAN, 1.6);
+    f.fill(&Path::circle(corner, 2.2), CYAN);
+    text(f, "Z0", corner.x - 36., corner.y - 5., CYAN, 9.);
     for &d in dims {
         let (a, b, name) = match d {
             0 => ([-hx, -hy - 6., sz], [hx, -hy - 6., sz], "X"),
@@ -903,7 +938,7 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             let w = wave(phase * 3. - third as f32);
             match third {
                 0 => {
-                    let o = 3. + 6. * w;
+                    let o = 8. + 6. * w;
                     cuboid(f, [-14., -9., 6.], [14., 9., 22.], PART);
                     cuboid(
                         f,
@@ -911,8 +946,18 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
                         [14. + o, 9. + o, 22. + o],
                         tone_a(STOCK, 0.3),
                     );
+                    // Short offset arrows: on the top, to the right, upward.
+                    let zt = 22. + o;
+                    dim3(f, [14., 0., zt], [14. + o, 0., zt], GOLD);
+                    dim3(f, [0., 9., zt], [0., 9. + o, zt], GOLD);
+                    dim3(
+                        f,
+                        [14. + o + 2., 9. + o + 2., 22.],
+                        [14. + o + 2., 9. + o + 2., 22. + o],
+                        GOLD,
+                    );
                     text(f, "PART + AN OFFSET ON EACH OF 6 SIDES", 8., 30., TEXT, 9.);
-                    caption(f, "BLUE: PART   AMBER: STOCK GROWN ON ALL SIDES");
+                    caption(f, "BLUE: PART   AMBER BOX: PART + OFFSETS");
                 }
                 1 => {
                     fixed_box(
@@ -924,10 +969,10 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
                         true,
                     );
                     text(f, "X, Y AND Z SIZES, BOTTOM ON Z0", 8., 30., TEXT, 9.);
-                    caption(f, "BLUE: PART   AMBER: A BOX OF THE SIZES GIVEN");
+                    caption(f, "BLUE: PART   AMBER BOX: THE SIZES GIVEN");
                 }
                 _ => {
-                    cuboid(f, [-12., -8., 2.], [12., 8., 18.], PART);
+                    cuboid(f, [-12., -8., 0.], [12., 8., 16.], PART);
                     vbar(f, [0., 0., 0.], 18. + 3. * w, 28., 0.3);
                     text(
                         f,
@@ -937,7 +982,7 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
                         TEXT,
                         9.,
                     );
-                    caption(f, "BLUE: PART   AMBER: ROUND BAR AROUND IT");
+                    caption(f, "BLUE: PART   AMBER BAR: ROUND BAR AROUND IT");
                 }
             }
             heading(f, "STOCK TYPE · THE SHAPE OF THE MATERIAL");
@@ -963,7 +1008,7 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             );
             text(f, "X0 Y0", 122., 132., TEXT, 9.);
             heading(f, "STOCK DIAMETER · ROUND BAR");
-            caption(f, "GOLD: ACROSS THE BAR, WHICH STANDS ALONG Z");
+            caption(f, "DIAMETER: ACROSS THE BAR, WHICH STANDS ON Z");
         }
         2 => {
             let h = 22. + 26. * wave(phase);
@@ -978,16 +1023,17 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             dimension(f, Point::new(x, 111.), Point::new(x, top), GOLD);
             text(f, "LENGTH", x + 7., (111. + top) / 2. - 5., GOLD, 10.);
             // Z0: the bar starts here and grows up.
-            dashed(
+            line(
                 f,
-                Point::new(139. - rx - 16., 111.),
+                Point::new(139. - rx - 18., 111.),
                 Point::new(139. - rx, 111.),
                 CYAN,
-                1.5,
+                1.6,
             );
-            text(f, "Z0", 139. - rx - 36., 106., CYAN, 10.);
+            f.fill(&Path::circle(Point::new(139. - rx, 111.), 2.2), CYAN);
+            text(f, "Z0", 139. - rx - 38., 106., CYAN, 10.);
             heading(f, "STOCK LENGTH · BAR LENGTH ALONG Z");
-            caption(f, "GOLD: FROM Z0 UP");
+            caption(f, "LENGTH: FROM Z0 UP");
         }
         3 => {
             let (cx, cy) = (139., 80.);
@@ -1009,9 +1055,15 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             f.fill(&Path::circle(Point::new(cx, cy), 2.5), TEXT);
             text(f, "Z", cx - 12., cy + 2., TEXT, 9.);
             text(f, "PART", cx - hw + 4., cy + hh - 13., BACKGROUND, 9.);
-            text(f, "EXTRA", cx + ux * r + 6., cy + uy * r - 12., GOLD, 10.);
+            let mid = Point::new(
+                cx + ux * (corner + extra / 2.),
+                cy + uy * (corner + extra / 2.),
+            );
+            let t = Point::new(cx + ux * r + 12., cy + uy * r - 22.);
+            text(f, "EXTRA", t.x, t.y, GOLD, 10.);
+            leader(f, Point::new(t.x + 4., t.y + 12.), mid);
             heading(f, "STOCK RADIAL · EXTRA ROUND THE PART");
-            caption(f, "CYAN: FURTHEST POINT FROM Z   GOLD: EXTRA");
+            caption(f, "RADIUS = CYAN FURTHEST POINT + EXTRA");
             text(f, "SEEN FROM ABOVE", 8., 16., GHOST, 9.);
         }
         _ => {
@@ -1021,7 +1073,10 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
             let name = ["STOCK X SIZE", "STOCK Y SIZE", "STOCK Z SIZE"][axis];
             match axis {
                 0 => sx = 44. + 32. * w,
-                1 => sy = 28. + 16. * w,
+                1 => {
+                    sx = 40.;
+                    sy = 28. + 16. * w;
+                }
                 _ => sz = 24. + 20. * w,
             }
             fixed_box(f, sx, sy, sz, &[axis], false);
@@ -1031,15 +1086,23 @@ pub fn stock(f: &mut Frame, _time: f32, phase: f32, n: u8) {
                 1 => (p([hx + 6., hy, sz]), p([hx + 6., -hy, sz])),
                 _ => (p([hx + 6., -hy, 0.]), p([hx + 6., -hy, sz])),
             };
-            let (tx, ty) = match axis {
-                0 => (a.x - 14., a.y - 16.),
-                1 => (b.x - 62., b.y - 18.),
-                _ => (a.x + 8., (a.y + b.y) / 2. - 5.),
-            };
-            text(f, name, tx, ty, GOLD, 10.);
-            let corner = p([-hx, hy, 0.]);
-            dashed(f, Point::new(corner.x - 18., corner.y), corner, CYAN, 1.5);
-            text(f, "Z0", corner.x - 38., corner.y - 5., CYAN, 9.);
+            let mid = Point::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+            // The label sits in clear space, with a short leader.
+            match axis {
+                0 => {
+                    text(f, name, mid.x - 38., mid.y - 32., GOLD, 10.);
+                    leader(
+                        f,
+                        Point::new(mid.x, mid.y - 20.),
+                        Point::new(mid.x, mid.y - 3.),
+                    );
+                }
+                1 => {
+                    text(f, "STOCK", b.x + 8., b.y - 16., GOLD, 10.);
+                    text(f, "Y SIZE", b.x + 8., b.y - 5., GOLD, 10.);
+                }
+                _ => text(f, name, a.x + 8., mid.y - 5., GOLD, 10.),
+            }
             heading(
                 f,
                 &format!(
