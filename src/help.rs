@@ -2671,7 +2671,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Tool),
         ),
         (_, "tip_angle") => (
-            "A chamfer mill's included point angle in degrees, 90 when left empty. Match a countersink's angle: an 82° countersink needs an 82° cutter.",
+            "A chamfer mill's included point angle in degrees, 90 when left empty. Match a countersink's angle: an 82° countersink needs an 82° cutter. A Drill finds each countersink the model has with its angle and refuses a chamfer mill of another angle, which would cut into its wall (sharper) or leave its cone (blunter).",
             "Drilling with a chamfer mill plunges its point into each detected opening until the cone is as wide as the opening at its rim, so a countersink comes out at the CAD's size. Bottom offset raises the plunge (a narrower chamfer); a negative one lowers it (a wider one).",
             Some(Tool),
         ),

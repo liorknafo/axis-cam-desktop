@@ -435,7 +435,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("type", "Chamfer mill") => (
-            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. Chamfers along edges are not generated.",
+            "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Chamfers along edges are not generated.",
             "",
         ),
         ("type", "Turning tool") => (
