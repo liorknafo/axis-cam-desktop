@@ -333,6 +333,9 @@ pub enum Message {
     /// The simulation replayed to where the slider was let go: the epoch
     /// of that catch-up and the simulation.
     Replayed(u64, Replayed),
+    /// The part's holes worked out off the window's thread for picking by
+    /// their outline (`App::refresh_part_holes`), with their key.
+    PartHoles(u64, PartHoles),
     /// The replay of that catch-up failed: its epoch.
     ReplayFailed(u64),
     Speed(f32),
@@ -843,6 +846,12 @@ pub struct App {
     /// The holes a Pocket's or Contour's selected walls pick, kept as
     /// `drill_holes` is (`App::pocket_holes`).
     pocket_holes: std::cell::RefCell<Option<(u64, std::sync::Arc<PocketHoles>)>>,
+    /// Every hole of the part a Pocket or a Contour can pick in the current
+    /// setup (`pocket::part_holes`), with what it was worked out from
+    /// (`App::part_holes_key`): their outlines are what the 3D view picks a
+    /// hole by. Worked out off the window's thread (`part_holes_job`).
+    part_holes: Option<(u64, std::sync::Arc<FoundHoles>)>,
+    part_holes_job: Option<u64>,
     /// Which levels of those holes the operation's cutter fits (`Hole::fits`),
     /// kept as they are (`App::pocket_fits`).
     pocket_fits: std::cell::RefCell<Option<(u64, std::sync::Arc<PocketFits>)>>,
@@ -1055,6 +1064,34 @@ impl std::fmt::Debug for Replayed {
         f.write_str("Replayed")
     }
 }
+/// The part's holes worked out off the window's thread (`App::part_holes`).
+#[derive(Clone)]
+pub struct PartHoles(std::sync::Arc<FoundHoles>);
+impl std::fmt::Debug for PartHoles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PartHoles({})", self.0.holes.len())
+    }
+}
+/// Every hole of the part a wall click picks (`pocket::part_holes`), and
+/// each read as a drill reads it (`cam::drill_holes_of`): None where it is
+/// not round.
+#[derive(Default)]
+pub struct FoundHoles {
+    pub holes: Vec<pocket::Hole>,
+    pub round: Vec<Option<cam::Hole>>,
+}
+/// Whether a click on a wall of the part picks its whole hole in `op`: a
+/// Pocket, a Contour, and a Drill of the part's holes (not of the pins').
+pub(crate) fn picks_holes(op: &Operation) -> bool {
+    matches!(op.strategy, Strategy::Pocket | Strategy::Contour)
+        || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
+}
+/// The part's holes as `setup` places it, for picking by their outline.
+pub(crate) fn find_holes(setup: &model::Setup, mesh: &mesh::Mesh) -> FoundHoles {
+    let holes = pocket::part_holes(setup, mesh);
+    let round = cam::drill_holes_of(setup, mesh, &holes);
+    FoundHoles { holes, round }
+}
 /// What a generation off the window's thread makes (`App::generate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Generation {
@@ -1153,6 +1190,7 @@ fn while_locked(m: &Message) -> bool {
             | PlanExpand(_)
             | PostChecked(..)
             | LeftStock(_)
+            | PartHoles(..)
             | SaveProject
             | Saved(_)
             | FileImported(_)
@@ -1429,6 +1467,8 @@ impl App {
             drill_holes: std::cell::RefCell::new(None),
             bottom_holes: std::cell::RefCell::new(None),
             pocket_holes: std::cell::RefCell::new(None),
+            part_holes: None,
+            part_holes_job: None,
             pocket_fits: std::cell::RefCell::new(None),
             scrub_pending: false,
             scrub_live: SCRUB_LIVE,
@@ -2580,6 +2620,117 @@ impl App {
         *kept = Some((key, found.clone()));
         found
     }
+    /// What the part's holes the 3D view outlines are worked out from (the
+    /// part and the setup's placement), while a Pocket, a Contour or a
+    /// Drill of the part's holes is being picked on the part; None otherwise.
+    pub(crate) fn part_holes_key(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let op = self.operation()?;
+        if !self.picking || self.is_sample() || !picks_holes(op) {
+            return None;
+        }
+        let mesh = self.part_mesh()?;
+        let setup = self.doc.setup();
+        let mut hasher = std::hash::DefaultHasher::new();
+        mesh.fingerprint.hash(&mut hasher);
+        for key in ["rx", "ry", "rz", "tx", "ty", "tz"] {
+            get(&setup.p, key).hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+    /// Works out the part's holes for picking by their outline when they
+    /// are wanted and not known: off the window's thread (a second or more
+    /// on a part of thousands of walls), or here in a smoke run and tests.
+    /// None when it starts no work off the window's thread.
+    fn refresh_part_holes(&mut self) -> Option<Task<Message>> {
+        let key = self.part_holes_key()?;
+        if self.part_holes.as_ref().is_some_and(|(k, _)| *k == key)
+            || self.part_holes_job == Some(key)
+        {
+            return None;
+        }
+        let (setup, mesh) = (self.doc.setup().clone(), self.part_mesh().unwrap().clone());
+        if self.generate_inline {
+            let found = find_holes(&setup, &mesh);
+            self.part_holes = Some((key, std::sync::Arc::new(found)));
+            return None;
+        }
+        self.part_holes_job = Some(key);
+        Some(Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || find_holes(&setup, &mesh))
+                    .await
+                    .unwrap_or_default()
+            },
+            move |found| Message::PartHoles(key, PartHoles(std::sync::Arc::new(found))),
+        ))
+    }
+    /// Whether the part's holes for the outlines are being worked out.
+    pub(crate) fn finding_holes(&self) -> bool {
+        self.part_holes_job.is_some() && self.part_holes_job == self.part_holes_key()
+    }
+    /// The part's holes as the 3D view outlines them while a Pocket, a
+    /// Contour or a Drill is being picked, each marked when the operation
+    /// has it. A Drill's are its round holes only, each once, all shown
+    /// with the diameter it drills.
+    pub(crate) fn hole_outlines(&self) -> Vec<viewport::HoleOutline> {
+        let (Some(key), Some((known, found)), Some(op)) =
+            (self.part_holes_key(), &self.part_holes, self.operation())
+        else {
+            return vec![];
+        };
+        if key != *known {
+            return vec![];
+        }
+        let ids: std::collections::HashSet<usize> = (op.surfaces.iter())
+            .flat_map(|s| s.ids.iter().copied())
+            .collect();
+        let outline = |h: &pocket::Hole| {
+            let loops: Vec<Vec<(f64, f64)>> = h.levels[0].open.clone().into();
+            viewport::HoleOutline {
+                loops: (loops.iter())
+                    .map(|l| l.iter().map(|q| [q.0 as f32, q.1 as f32]).collect())
+                    .collect(),
+                z: h.top,
+                walls: h.walls.clone(),
+                picked: h.walls.iter().any(|w| ids.contains(w)),
+                label: None,
+            }
+        };
+        if op.strategy != Strategy::Drill {
+            return found.holes.iter().map(outline).collect();
+        }
+        // What the Drill drills: by its walls or in a selected rim face.
+        let drilled: Vec<[f32; 2]> = self
+            .part_mesh()
+            .and_then(|mesh| self.drill_holes(op, mesh).as_ref().as_ref().ok().cloned())
+            .map_or(vec![], |holes| holes.iter().map(|h| h.center).collect());
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= 0.05;
+        // A counterbore and its bore are one hole to a drill, read alike:
+        // the widest outline stands for it.
+        let mut order: Vec<usize> = (0..found.holes.len()).collect();
+        let area = |i: usize| found.holes[i].levels[0].open.signed_area().abs();
+        order.sort_by(|&a, &b| area(b).total_cmp(&area(a)));
+        let mut seen: Vec<[f32; 2]> = vec![];
+        let mut out = vec![];
+        for i in order {
+            let (h, Some(round)) = (&found.holes[i], &found.round[i]) else {
+                continue;
+            };
+            if seen.iter().any(|&c| near(c, round.center)) {
+                continue;
+            }
+            seen.push(round.center);
+            let mut o = outline(h);
+            o.picked = drilled.iter().any(|&c| near(c, round.center));
+            // The largest drill in 0.1 mm steps it takes, as drills come:
+            // never a size the drill check then refuses.
+            let d = cam::largest_drill(round);
+            o.label = Some(format!("Ø{}", crate::post::exact_mm(d)));
+            out.push(o);
+        }
+        out
+    }
     /// What the holes a Pocket's or Contour's walls pick are worked out from:
     /// the part, the setup's placement and the selected surfaces.
     fn holes_key(&self, op: &Operation, mesh: &mesh::Mesh) -> u64 {
@@ -3417,6 +3568,11 @@ impl App {
         let before = self.status.clone();
         let (selected, page) = (self.selected, self.page);
         let task = self.handle(message);
+        // Batched only when it starts one: a batch is never an empty task.
+        let task = match self.refresh_part_holes() {
+            Some(holes) => Task::batch([task, holes]),
+            None => task,
+        };
         // The probes follow the project's material: the touch plate on stock
         // that does not conduct, the plate's lead on stock that does.
         if let Some(c) = &mut self.control {
@@ -3943,13 +4099,14 @@ impl App {
                     return Task::none();
                 }
                 let fingerprint = mesh.fingerprint.clone();
-                // A Pocket or an inside Contour takes a wall as its hole: every
-                // wall of it, added or removed together. A face that is
-                // neither a floor nor a wall (a cone, a chamfer, a fillet)
-                // takes the hole it borders, or nothing.
-                let picks_holes = self
+                // A Pocket, an inside Contour or a Drill takes a wall as its
+                // hole: every wall of it, added or removed together. A face
+                // that is neither a floor nor a wall (a cone, a chamfer, a
+                // fillet) takes the hole it borders, or nothing.
+                let picks_holes = self.operation().is_some_and(picks_holes);
+                let drill = self
                     .operation()
-                    .is_some_and(|o| matches!(o.strategy, Strategy::Pocket | Strategy::Contour));
+                    .is_some_and(|o| o.strategy == Strategy::Drill);
                 let angles = ["rx", "ry", "rz"].map(|k| num(&self.doc.setup().p, k).unwrap_or(0.));
                 let up = mesh::rotation(mesh.surfaces[n].normal, angles)[2].abs();
                 let wall = pocket::is_wall(self.doc.setup(), mesh, n);
@@ -3988,9 +4145,33 @@ impl App {
                         .and_then(|c| pocket::holes(self.doc.setup(), c, mesh).ok())
                         .unwrap_or_default();
                     let drop = pocket::dropped(now, &picked, n, clicked.as_ref(), &this);
+                    // A Drill drills round holes: it reads the hole as it
+                    // drills it, and names it by the diameter it drills.
+                    let round = if drill {
+                        cam::drill_holes_of(self.doc.setup(), mesh, &this)
+                    } else {
+                        vec![]
+                    };
+                    if drill
+                        && drop.is_none()
+                        && let Some(h) = this.first()
+                        && round.first().is_none_or(|r| r.is_none())
+                    {
+                        let ((x, y), (w, d)) = (h.centre(), h.size());
+                        self.status = format!(
+                            "The hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm) is not round: a Drill drills round holes. Pick it in a Pocket."
+                        );
+                        return Task::none();
+                    }
                     let named = |h: &pocket::Hole| {
                         let ((x, y), (w, d)) = (h.centre(), h.size());
-                        format!("the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm)")
+                        match round.first().and_then(|r| r.as_ref()) {
+                            Some(r) if drill => format!(
+                                "the Ø{} hole at X{x:.2} Y{y:.2}",
+                                crate::post::exact_mm(cam::largest_drill(r))
+                            ),
+                            _ => format!("the hole at X{x:.2} Y{y:.2} ({w:.2} × {d:.2} mm)"),
+                        }
                     };
                     let said = match (&drop, this.first()) {
                         (Some(_), _) => (0..now.len())
@@ -4004,6 +4185,7 @@ impl App {
                         }
                         (None, None) => String::new(),
                     };
+                    let dropping = drop.is_some();
                     let walls = match (drop.is_some(), found) {
                         (true, _) => vec![],
                         (false, Ok(walls)) => walls,
@@ -4035,6 +4217,26 @@ impl App {
                     self.touch();
                     if !said.is_empty() {
                         self.status = said;
+                    }
+                    // A hole a Drill still drills after its walls were dropped:
+                    // a selected rim face, or another of its walls, holds it.
+                    if drill
+                        && dropping
+                        && let Some(r) = round.first().and_then(|r| r.as_ref())
+                        && let Some(mesh) = self.imported_mesh.take()
+                    {
+                        let held = (self.operation())
+                            .and_then(|op| self.drill_holes(op, &mesh).as_ref().clone().ok())
+                            .is_some_and(|holes| {
+                                holes.iter().any(|h| {
+                                    (h.center[0] - r.center[0]).hypot(h.center[1] - r.center[1])
+                                        <= 0.05
+                                })
+                            });
+                        self.imported_mesh = Some(mesh);
+                        if held {
+                            self.status += " It is still drilled: a selected rim face (or another wall of it) holds it. Remove that face to drop it.";
+                        }
                     }
                     return Task::none();
                 }
@@ -5462,6 +5664,12 @@ impl App {
                         "Replaying the toolpath to the slider failed: move the slider again."
                             .into();
                 }
+            }
+            Message::PartHoles(key, found) => {
+                if self.part_holes_job == Some(key) {
+                    self.part_holes_job = None;
+                }
+                self.part_holes = Some((key, found.0));
             }
             Message::Replayed(epoch, replayed) => {
                 let Some((_, at, play)) = self.catching_up.take_if(|c| c.0 == epoch) else {

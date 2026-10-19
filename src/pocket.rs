@@ -665,21 +665,30 @@ impl Hole {
     /// Whether `other` is this hole: their outlines differ by no more than
     /// a hairline (one crossed at another height, through other facets).
     pub fn same_place(&self, other: &Hole) -> bool {
-        let thin = |a: &Region, b: &Region| {
-            difference::<Milli>(a.clone(), b.clone(), FillRule::NonZero).is_ok_and(|d| {
-                d.inflate(
-                    -(LEAN + SHALLOW_OVERHANG / 2.),
-                    JoinType::Round,
-                    EndType::Polygon,
-                    2.,
-                )
-                .signed_area()
-                .abs()
-                    <= 0.05
-            })
-        };
-        thin(&self.outline, &other.outline) && thin(&other.outline, &self.outline)
+        same_region(&self.outline, &other.outline)
     }
+    /// Whether it opens from above where `other` does: a recess under a
+    /// plate's opening opens through that opening, as the plate's hole.
+    pub fn same_opening(&self, other: &Hole) -> bool {
+        same_region(&self.levels[0].open, &other.levels[0].open)
+    }
+}
+/// Whether regions `a` and `b` differ by no more than a hairline.
+fn same_region(a: &Region, b: &Region) -> bool {
+    let thin = |a: &Region, b: &Region| {
+        difference::<Milli>(a.clone(), b.clone(), FillRule::NonZero).is_ok_and(|d| {
+            d.inflate(
+                -(LEAN + SHALLOW_OVERHANG / 2.),
+                JoinType::Round,
+                EndType::Polygon,
+                2.,
+            )
+            .signed_area()
+            .abs()
+                <= 0.05
+        })
+    };
+    thin(a, b) && thin(b, a)
 }
 /// Whether mesh surface `id` is a wall, as `setup` turns the part: what a
 /// click on it picks in a Pocket or a Contour is the hole it is a wall of.
@@ -876,6 +885,33 @@ pub fn hole_walls(setup: &Setup, mesh: &Mesh, id: usize) -> Result<Vec<usize>, S
     let spans = spans(&g);
     let (path, walls) = walls_of(&g, &spans, id)?;
     hole(&g, &spans, path, walls).map(|h| h.walls)
+}
+/// Every hole of the part a click on one of its walls picks in this setup
+/// (`hole_walls`), once each: what the 3D view outlines for a Pocket or a
+/// Contour, so that a hole is picked by its outline as well as by a wall.
+pub fn part_holes(setup: &Setup, mesh: &Mesh) -> Vec<Hole> {
+    let g = crate::cam::Geometry::new(setup, mesh);
+    let spans = spans(&g);
+    let mut seen = std::collections::HashSet::new();
+    let mut found: Vec<Hole> = vec![];
+    for id in 0..mesh.surfaces.len() {
+        if seen.contains(&id) || !is_wall(setup, mesh, id) {
+            continue;
+        }
+        seen.insert(id);
+        let Ok((path, walls)) = walls_of(&g, &spans, id) else {
+            continue;
+        };
+        if let Ok(h) = hole(&g, &spans, path, walls) {
+            seen.extend(h.walls.iter().copied());
+            // One outline for each opening from above: a recess under a
+            // plate's opening is reached, and picked, through it.
+            if !found.iter().any(|f| f.same_place(&h) || f.same_opening(&h)) {
+                found.push(h);
+            }
+        }
+    }
+    found
 }
 /// Why a wall picks no hole when its outline crosses a sloping face: a
 /// chamfer's, a fillet's, a cone's (`hole_near` looks past it).

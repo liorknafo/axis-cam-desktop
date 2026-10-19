@@ -168,10 +168,7 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
         return vec!["The model geometry changed. Clear the saved surface selection and select surfaces on the current part.".into()];
     }
     let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.));
-    let picks_holes = matches!(
-        operation.strategy,
-        crate::model::Strategy::Pocket | crate::model::Strategy::Contour
-    );
+    let picks_holes = crate::picks_holes(operation);
     let mut result = Vec::new();
     let mut heights = Vec::new();
     for &id in &selection.ids {
@@ -182,7 +179,7 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
             break;
         };
         let up = rotation(surface.normal, angles)[2].abs();
-        // A Pocket or an inside Contour picks a hole by its walls.
+        // A Pocket, an inside Contour or a Drill picks a hole by its walls.
         if picks_holes && up < crate::pocket::WALL {
             continue;
         }
