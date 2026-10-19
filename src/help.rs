@@ -2091,8 +2091,8 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::Drill)),
         ),
         (_, "boundary") => (
-            "Defines the region that should contain machining: selected geometry, stock outline or model outline. Facing uses rectangular extents. Pocket and Adaptive clearing follow the selected floor, and a Pocket the outline of each hole picked by a click on its wall. Contour and finishing use the imported model silhouette.",
-            "",
+            "Defines the region that should contain machining: selected geometry, stock outline or model outline. Facing uses rectangles, or the part outline with Model silhouette. Pocket and Adaptive clearing follow the selected floor, and a Pocket the outline of each hole picked by a click on its wall. Contour and finishing use the imported model silhouette.",
+            "A Facing with Model silhouette clears over the part's outline seen from above, grown by Clear past outline, and leaves the stock beyond it at its height.",
             Some(Operation(Strategy::Contour)),
         ),
         (_, "containment") => (
@@ -2279,6 +2279,11 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "Target radial engagement for adaptive clearing, in mm: how much of the cutter's side is cutting at once, from 2% to 50% of the tool diameter. The path sweeps in open areas and loops into corners and along walls to hold it, so the stepdown can be deeper than for Pocket; a new operation starts at 15% of the diameter and a stepdown of two diameters.",
             "",
             Some(Operation(Strategy::Adaptive)),
+        ),
+        (_, "silhouette_extend") => (
+            "How far past the part's outline seen from above the cutter's edge reaches, in mm, for a Facing with the Model silhouette boundary. A round cutter needs about a third of its radius past a square outer corner to clear it, more for a sharper one; Generate refuses less and says the least that works. Stock beyond it stays at its height.",
+            "",
+            Some(Operation(Strategy::Face)),
         ),
         (_, "minimum_radius") => (
             "Smallest radius the path may turn in open material, in mm, from 0 to the tool radius. Larger radii soften direction changes. At a wall, or to avoid overloading the cutter, the path turns as sharply as it must.",
