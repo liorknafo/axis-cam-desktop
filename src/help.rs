@@ -3420,15 +3420,24 @@ mod tests {
                 std::fs::create_dir_all(dir.join(&name)).unwrap();
                 for i in 0..n {
                     let t = 5. * i as f32 / n as f32;
+                    // `ANIM_MARGIN=m` leaves m px round the canvas, where
+                    // anything drawn past its edge shows.
+                    let m: f32 = std::env::var("ANIM_MARGIN")
+                        .ok()
+                        .and_then(|m| m.parse().ok())
+                        .unwrap_or(0.);
                     jobs.push((
-                        canvas(Illustration {
-                            diagram: d,
-                            still: Some(t),
-                        })
-                        .width(CARD_WIDTH)
-                        .height(155)
+                        container(
+                            canvas(Illustration {
+                                diagram: d,
+                                still: Some(t),
+                            })
+                            .width(CARD_WIDTH)
+                            .height(155),
+                        )
+                        .padding(m)
                         .into(),
-                        iced::Size::new(CARD_WIDTH, 155.),
+                        iced::Size::new(CARD_WIDTH + 2. * m, 155. + 2. * m),
                         dir.join(&name).join(format!("{i:03}.png")),
                     ));
                 }
