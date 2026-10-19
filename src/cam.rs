@@ -973,6 +973,18 @@ pub struct Hole {
     pub bottom: f32,
     /// The bottom is the model's bottom: nothing of the part is under it.
     pub through: bool,
+    /// The cone its opening narrows down in, when it is countersunk.
+    pub countersink: Option<Countersink>,
+}
+/// A countersink: a cone from a hole's opening, `Hole::opening` wide at the
+/// face, straight down to the wall or floor under it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Countersink {
+    /// Its included angle, degrees: 82° for an inch flat head screw's, 90°
+    /// for a metric one's.
+    pub angle: f32,
+    /// From the face down to where the cone ends.
+    pub depth: f32,
 }
 /// Circular holes bounded by the selected horizontal rim, verified against mesh rays.
 /// Noncircular openings and boss outlines are rejected, never converted to drills.
@@ -1091,6 +1103,7 @@ fn round_holes(g: &Geometry, selected: &[&Triangle]) -> Result<Vec<Hole>, String
             top,
             bottom,
             through,
+            countersink: countersink(g, center, top, radius, path.len()),
         });
     }
     holes.sort_by(|a, b| {
@@ -1099,6 +1112,71 @@ fn round_holes(g: &Geometry, selected: &[&Triangle]) -> Result<Vec<Hole>, String
             .then(a.center[1].total_cmp(&b.center[1]))
     });
     Ok(holes)
+}
+/// The countersink of the opening of radius `radius` round `center` in the
+/// face at `top`, its rim a loop of `sides` chords: a cone from each chord
+/// of the rim down to a wall or a floor, read at its tessellation's
+/// vertices, which all lie on it. A rim that drops straight down (a plain
+/// hole or a counterbore), rounds over (a fillet, a cone of changing slope)
+/// or bevels in two slopes is none.
+fn countersink(
+    g: &Geometry,
+    center: [f32; 2],
+    top: f32,
+    radius: f32,
+    sides: usize,
+) -> Option<Countersink> {
+    let tolerance = 0.01f32.max(radius * 0.005);
+    let out = |p: &[f32; 3]| (p[0] - center[0]).hypot(p[1] - center[1]);
+    let rim = |p: &[f32; 3]| (out(p) - radius).abs() < tolerance && (p[2] - top).abs() < tolerance;
+    // Sloping faces inside the rim and under it.
+    let sloped = |t: &Triangle| {
+        plane_slope(&t.p).is_some_and(|s| s > 0.01)
+            && t.p
+                .iter()
+                .all(|p| out(p) < radius + tolerance && p[2] < top + tolerance)
+    };
+    // Each chord of the rim has a sloping face under it; its other corners
+    // give the cone's slope, how far in it comes per mm down.
+    let (mut chords, mut slopes) = (0, vec![]);
+    for t in g.triangles.iter().filter(|t| sloped(t)) {
+        if t.p.iter().filter(|p| rim(p)).count() >= 2 {
+            chords += 1;
+            slopes.extend(
+                (t.p.iter())
+                    .filter(|p| !rim(p) && top - p[2] > tolerance)
+                    .map(|p| (radius - out(p)) / (top - p[2])),
+            );
+        }
+    }
+    if chords < sides || slopes.is_empty() {
+        return None;
+    }
+    let (low, high) = (slopes.iter()).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &s| {
+        (a.min(s), b.max(s))
+    });
+    let angle = 2. * ((low + high) / 2.).atan().to_degrees();
+    if 2. * (high.atan() - low.atan()).to_degrees() > 0.5 || !(20. ..=160.).contains(&angle) {
+        return None;
+    }
+    let slope = (low + high) / 2.;
+    let on_cone = |p: &[f32; 3]| {
+        p[2] < top + tolerance && (out(p) - (radius - (top - p[2]) * slope)).abs() < tolerance
+    };
+    let cone = |t: &Triangle| sloped(t) && t.p.iter().all(on_cone);
+    let end = (g.triangles.iter().filter(|t| cone(t)))
+        .flat_map(|t| t.p.iter().map(|p| p[2]))
+        .fold(top, f32::min);
+    // It ends on a wall or a floor, not on more slope: the corners of its
+    // lowest ring are only the cone's, upright faces' and flat ones'.
+    let ring = |p: &[f32; 3]| (p[2] - end).abs() < tolerance && on_cone(p);
+    let ends_square = (g.triangles.iter())
+        .filter(|t| t.p.iter().any(ring) && !cone(t))
+        .all(|t| plane_slope(&t.p).is_none_or(|s| s < 0.01));
+    (top - end > tolerance && ends_square).then_some(Countersink {
+        angle,
+        depth: top - end,
+    })
 }
 /// The narrowest vertical corridor round `center` above the height `z`,
 /// starting from `radius`: how close to the centre the part comes anywhere
@@ -1644,6 +1722,20 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         // The drill may be as wide as the bore at its tessellation's vertices,
         // which its chords lie a sagitta inside, and 0.01 over that: the part
         // report rounds the bore to 0.01 and the planner's drill is that size.
+        // A countersink is cut by a cone of its own angle: a sharper one
+        // would cut into its wall and the bore under it, a blunter one would
+        // leave the cone but for its rim.
+        if let (CutterShape::Chamfer(tenths), Some(c)) = (b.plan.shape, h.countersink)
+            && (f32::from(tenths) / 10. - c.angle).abs() > 0.5
+        {
+            let angle = (c.angle * 10.).round() / 10.;
+            return Err(format!(
+                "The hole at X{:.2} Y{:.2} has a countersink of {angle}°, and this chamfer mill's tip is {}°. Choose a chamfer mill of {angle}°.",
+                h.center[0],
+                h.center[1],
+                f32::from(tenths) / 10.,
+            ));
+        }
         if chamfer && b.plan.radius * 2. < h.opening - 2. * h.sagitta - 0.01 {
             return Err(format!(
                 "The Ø{:.2} chamfer mill is narrower than an opening Ø{:.2} it would countersink. Choose a wider one or a diameter filter.",
@@ -4303,6 +4395,146 @@ pub(crate) mod tests {
                     plan.levels
                 );
                 assert_plan(plan);
+            }
+        }
+    }
+
+    /// A Ø24 × 10 disc with a Ø4 hole through it, 64 sides, whose opening
+    /// in the top is the section `rim` from the top face's inner edge down
+    /// to the bore's wall: (radius, height) points.
+    fn rimmed(rim: &[(f32, f32)]) -> Mesh {
+        let mut section = vec![(2., 0.), (12., 0.), (12., 10.)];
+        section.extend_from_slice(rim);
+        section.push((2., 0.));
+        mesh::normalize(revolved(&section)).unwrap()
+    }
+    /// The one hole of the top of `mesh`, with the Drill fixture.
+    fn top_hole(mesh: &Mesh) -> Hole {
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        select_top(&mut op, mesh);
+        let found = holes(&setup, &op, mesh).unwrap();
+        assert_eq!(found.len(), 1);
+        found[0].clone()
+    }
+    #[test]
+    fn a_countersink_is_found_with_its_angle_and_depth() {
+        // Ø8 at the face down to the Ø4 bore: 82° and 90° cones.
+        for angle in [82f32, 90.] {
+            let depth = 2. / (angle / 2.).to_radians().tan();
+            let h = top_hole(&rimmed(&[(4., 10.), (2., 10. - depth)]));
+            let c = h.countersink.unwrap_or_else(|| panic!("{angle}: {h:?}"));
+            assert!((c.angle - angle).abs() < 0.05, "{c:?}");
+            assert!((c.depth - depth).abs() < 0.01, "{c:?}");
+            assert!((h.opening - 8.).abs() < 0.01 && (h.diameter - 4.).abs() < 0.01);
+        }
+        // Down to a flat floor, then the bore: still a countersink.
+        let c = top_hole(&rimmed(&[(4., 10.), (3., 9.), (2., 9.)]))
+            .countersink
+            .unwrap();
+        assert!(
+            (c.angle - 90.).abs() < 0.05 && (c.depth - 1.).abs() < 0.01,
+            "{c:?}"
+        );
+        // A plain hole, a counterbore, a rounded edge and a bevel of two
+        // slopes have none.
+        let round: Vec<(f32, f32)> = (0..=8)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::FRAC_PI_2 / 8.;
+                (2. + 2. * (1. - a.sin()), 8. + 2. * a.cos())
+            })
+            .collect();
+        for (name, rim) in [
+            ("plain", vec![(2., 10.)]),
+            ("counterbore", vec![(4., 10.), (4., 7.), (2., 7.)]),
+            ("rounded", round),
+            ("two slopes", vec![(4., 10.), (3., 9.5), (2., 7.5)]),
+        ] {
+            let h = top_hole(&rimmed(&rim));
+            assert_eq!(h.countersink, None, "{name}: {h:?}");
+        }
+    }
+    #[test]
+    fn a_chamfer_mill_countersinks_only_at_its_countersinks_angle() {
+        let depth = 2. / 41f32.to_radians().tan();
+        let mesh = rimmed(&[(4., 10.), (2., 10. - depth)]);
+        let h = top_hole(&mesh);
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        tool.p.insert("type".into(), "Chamfer mill".into());
+        tool.p.insert("diameter".into(), "12".into());
+        // Of its angle, its cone is the countersink's: its point goes down
+        // to the countersink's apex.
+        tool.p.insert("tip_angle".into(), "82".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!((h.top - plan.target - 4. / 41f32.to_radians().tan()).abs() < 0.005);
+        assert_plan(plan);
+        // A sharper one would cut into the cone's wall and the bore, a
+        // blunter one leave the cone.
+        for angle in ["60", "90", "83"] {
+            tool.p.insert("tip_angle".into(), angle.into());
+            let error = generate(&setup, &op, &tool, &mesh).unwrap_err();
+            assert!(
+                error.contains("countersink of 82°") && error.contains("chamfer mill of 82°."),
+                "{angle}: {error}"
+            );
+        }
+        // A drill drills it as it did.
+        let (_, _, drill) = fixture(Strategy::Drill);
+        assert!(generate(&setup, &op, &drill, &mesh).is_ok());
+    }
+    #[test]
+    fn the_totem_cases_screw_holes_are_82_degree_countersinks_cut_by_an_82_degree_chamfer_mill() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let mesh = mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/totem-case-top-right.step"),
+        )
+        .unwrap();
+        // Its four screw holes in the top: Ø4.3 at the face, 82° down to
+        // the Ø2 bore 1.32 mm under it (the STEP's cones).
+        let (setup, mut op, mut tool) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        assert_eq!(found.len(), 4);
+        for h in &found {
+            let c = h.countersink.unwrap_or_else(|| panic!("{h:?}"));
+            assert!((c.angle - 82.).abs() < 0.05, "{c:?}");
+            assert!((c.depth - 1.323).abs() < 0.01, "{c:?}");
+            assert!((h.opening - 4.3).abs() < 0.01 && (h.diameter - 2.).abs() < 0.01);
+        }
+        tool.p.insert("type".into(), "Chamfer mill".into());
+        tool.p.insert("diameter".into(), "6".into());
+        tool.p.insert("tip_angle".into(), "90".into());
+        assert!(
+            generate(&setup, &op, &tool, &mesh)
+                .unwrap_err()
+                .contains("Choose a chamfer mill of 82°.")
+        );
+        tool.p.insert("tip_angle".into(), "82".into());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        // Each countersink is cut to its size, and the cone stays off the
+        // part: every corner of the part within its reach is on or outside
+        // it, less the chords' sagitta.
+        let g = Geometry::new(&setup, &mesh);
+        let tan = 41f32.to_radians().tan();
+        for h in &found {
+            let tip = (plan.moves.iter())
+                .filter(|m| {
+                    m.cutting_pass && (m.to[0] - h.center[0]).hypot(m.to[1] - h.center[1]) < 0.001
+                })
+                .map(|m| m.to[2])
+                .fold(f32::INFINITY, f32::min);
+            assert!((h.top - tip - 2.15 / tan).abs() < 0.005, "{h:?}: {tip}");
+            for p in g.triangles.iter().flat_map(|t| t.p.iter()) {
+                let out = (p[0] - h.center[0]).hypot(p[1] - h.center[1]);
+                if p[2] > tip && p[2] < h.top + 0.001 && out < 4. {
+                    assert!(
+                        out >= (p[2] - tip) * tan - h.sagitta - 0.005,
+                        "{p:?} of {h:?}"
+                    );
+                }
             }
         }
     }

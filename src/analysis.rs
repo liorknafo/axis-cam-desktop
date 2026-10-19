@@ -217,6 +217,15 @@ pub struct HoleReport {
     pub opening_diameter: f32,
     pub depth: f32,
     pub through: bool,
+    /// The cone the opening narrows down in, when it is countersunk.
+    pub countersink: Option<CountersinkReport>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CountersinkReport {
+    /// Its included angle, degrees.
+    pub angle: f32,
+    /// From the plane down to where the cone ends.
+    pub depth: f32,
 }
 fn r2(v: f32) -> f32 {
     // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
@@ -1032,6 +1041,10 @@ fn orientation(
                     opening_diameter: r2(h.opening),
                     depth: r2(h.top - h.bottom),
                     through: h.through,
+                    countersink: h.countersink.map(|c| CountersinkReport {
+                        angle: (c.angle * 10.).round() / 10. + 0.,
+                        depth: r2(c.depth),
+                    }),
                 })
                 .collect();
             holes_left = holes_left.saturating_sub(plane.holes.len());
@@ -1544,6 +1557,8 @@ pub(crate) mod tests {
                 .iter()
                 .all(|h| h.diameter == 6.6 && h.opening_diameter == 11. && h.depth == 40.)
         );
+        // Counterbores, not countersinks.
+        assert!(face.holes.iter().all(|h| h.countersink.is_none()));
         let blind = face.holes.iter().find(|h| !h.through).unwrap();
         assert_eq!((blind.diameter, blind.depth), (6., 8.));
         assert_eq!(blind.center, [42., 40.]);
