@@ -19,6 +19,8 @@ const CY: f32 = 80.;
 const R: f32 = 26.;
 /// Screen px per mm along Z.
 const PX: f32 = 4.;
+/// Where the thread ends, short of the bar's end.
+const TEND: f32 = ZX - 12.;
 
 const AMBER: Color = STOCK.front;
 const GREY: Color = Color::from_rgb(0.62, 0.68, 0.73);
@@ -86,8 +88,13 @@ fn label_r(f: &mut Frame, s: &str, rx: f32, y: f32, color: Color, size: f32) {
     text(f, s, rx - tw(s, size), y, color, size);
 }
 /// A row of names under the drawing with the active one in gold.
-fn tags(f: &mut Frame, names: &[&str], active: usize) {
-    let (size, gap) = (8., 9.);
+fn tag_w(s: &str, size: f32) -> f32 {
+    s.chars()
+        .map(|c| if c == ' ' { 0.3 } else { 0.64 })
+        .sum::<f32>()
+        * size
+}
+fn tags(f: &mut Frame, names: &[&str], active: usize, size: f32, gap: f32) {
     let mut x = 8.;
     for (i, s) in names.iter().enumerate() {
         let color = if i == active {
@@ -96,7 +103,7 @@ fn tags(f: &mut Frame, names: &[&str], active: usize) {
             Color { a: 0.5, ..TEXT }
         };
         text(f, s, x, 143., color, size);
-        x += tw(s, size) + gap;
+        x += tag_w(s, size) + gap;
     }
 }
 
@@ -119,12 +126,6 @@ fn shape_rect(f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32, fill: Color) {
 }
 fn dot(f: &mut Frame, c: Point, r: f32, color: Color) {
     f.fill(&Path::circle(c, r), color);
-}
-fn ring(f: &mut Frame, c: Point, r: f32, color: Color) {
-    f.stroke(
-        &Path::circle(c, r),
-        Stroke::default().with_color(color).with_width(1.4),
-    );
 }
 
 /// Bands of the bar from radius `r0` out to `r1`, above and below the axis.
@@ -160,8 +161,13 @@ fn span(f: &mut Frame, a: Point, b: Point, color: Color) {
     let len = (b.x - a.x).hypot(b.y - a.y);
     if len >= 13. {
         dimension(f, a, b, color);
-        return;
+    } else {
+        span_out(f, a, b, color);
     }
+}
+/// A dimension whose arrows point in at `a` and `b` from outside.
+fn span_out(f: &mut Frame, a: Point, b: Point, color: Color) {
+    let len = (b.x - a.x).hypot(b.y - a.y);
     let (ux, uy) = ((b.x - a.x) / len.max(1e-3), (b.y - a.y) / len.max(1e-3));
     arrow(f, pt(a.x - ux * 9., a.y - uy * 9.), a, color);
     arrow(f, pt(b.x + ux * 9., b.y + uy * 9.), b, color);
@@ -176,7 +182,7 @@ fn chuck(f: &mut Frame) {
 }
 /// The axis as a dash-dot line.
 fn axis(f: &mut Frame) {
-    let end = ZX + 10.;
+    let end = ZX + 6.;
     let mut x = CX0;
     while x < end {
         line(f, pt(x, CY), pt((x + 12.).min(end), CY), AXIS, 1.);
@@ -228,7 +234,7 @@ fn blade(f: &mut Frame, xc: f32, y: f32, w: f32, len: f32) {
 /// each side over `h`, on a grey shank below.
 fn vtool(f: &mut Frame, tip: Point, half: f32, h: f32) {
     let base = tip.y + h;
-    let end = (base + 16.).min(137.);
+    let end = (base + 16.).min(128.);
     shape(
         f,
         &[
@@ -250,11 +256,12 @@ fn vtool(f: &mut Frame, tip: Point, half: f32, h: f32) {
 
 /// The end being faced: the bar ends `amt` in from Z 0, the slice still to
 /// come off is amber out to the tool's radius `rt`.
-fn faced(f: &mut Frame, amt: f32, rt: f32) {
+fn faced(f: &mut Frame, amt: f32, rt: f32, stub: f32) {
     let x = ZX - amt;
     chuck(f);
     rect(f, CX0, CY - R, x, CY + R, METAL.front);
-    rect(f, x, CY - rt, ZX, CY + rt, AMBER);
+    band(f, x, ZX, stub, rt, AMBER);
+    rect(f, x, CY - stub, ZX, CY + stub, METAL.front);
     line(f, pt(x, CY - R), pt(x, CY - rt), FRESH.top, 2.);
     line(f, pt(x, CY + R), pt(x, CY + rt), FRESH.top, 2.);
     axis(f);
@@ -269,9 +276,6 @@ fn turned(f: &mut Frame, radii: &[f32], colors: &[Color], xe: f32, pass: usize, 
     chuck(f);
     rect(f, CX0, CY - R, xe, CY + R, METAL.front);
     rect(f, xe, CY - last, ZX, CY + last, METAL.front);
-    if pass + 1 == n {
-        rect(f, xt, CY - last, ZX, CY + last, FRESH.front);
-    }
     for k in pass..n {
         let x1 = if k == pass { xt.max(xe) } else { ZX };
         band(f, xe, x1, radii[k + 1], radii[k], colors[k]);
@@ -283,7 +287,7 @@ fn turned(f: &mut Frame, radii: &[f32], colors: &[Color], xe: f32, pass: usize, 
             pt(xt, CY + sgn * r),
             pt(ZX, CY + sgn * r),
             FRESH.top,
-            1.8,
+            1.4,
         );
     }
     axis(f);
@@ -440,7 +444,7 @@ fn shoulder_chamfer(f: &mut Frame, xs: f32, rs: f32, c: f32, t: f32) -> Point {
 /// How deep a sharp V thread is at `x`: 0 on a crest, `h` at a root.
 /// Roots lie at ZX, ZX - pitch, ...
 fn vdepth(x: f32, pitch: f32, h: f32) -> f32 {
-    let t = ((ZX - x) / pitch).rem_euclid(1.);
+    let t = ((TEND - x) / pitch).rem_euclid(1.);
     h * if t < 0.5 { 1. - 2. * t } else { 2. * t - 1. }
 }
 fn thread_h(pitch: f32) -> f32 {
@@ -448,15 +452,15 @@ fn thread_h(pitch: f32) -> f32 {
 }
 /// Where the thread begins (toward the chuck): a whole number of pitches.
 fn thread_start(pitch: f32) -> f32 {
-    ZX - (60. / pitch).round() * pitch
+    TEND - (60. / pitch).round() * pitch
 }
 /// `x0`, every crest and root between, and `x1`.
 fn breaks(x0: f32, x1: f32, pitch: f32) -> Vec<f32> {
     let half = pitch / 2.;
-    let mut k = (((ZX - x1) / half).ceil() as i32).max(0);
+    let mut k = (((TEND - x1) / half).ceil() as i32).max(0);
     let mut mids = vec![];
-    while ZX - k as f32 * half > x0 + 0.01 {
-        let x = ZX - k as f32 * half;
+    while TEND - k as f32 * half > x0 + 0.01 {
+        let x = TEND - k as f32 * half;
         if x < x1 - 0.01 {
             mids.push(x);
         }
@@ -516,11 +520,12 @@ fn thread_out(f: &mut Frame, pitch: f32, xt: f32) -> Point {
     let xe = thread_start(pitch);
     chuck(f);
     rect(f, CX0, CY - R, xe, CY + R, METAL.front);
-    rect(f, xe, CY - (R - h), ZX, CY + (R - h), METAL.front);
+    rect(f, TEND, CY - R, ZX, CY + R, METAL.front);
+    rect(f, xe, CY - (R - h), TEND, CY + (R - h), METAL.front);
     let rz = |x: f32| R - vdepth(x, pitch, h);
-    region(f, xe, ZX, pitch, R - h, &rz, METAL.front);
+    region(f, xe, TEND, pitch, R - h, &rz, METAL.front);
     region(f, xe, xt, pitch, R, &rz, AMBER);
-    zigzag(f, xt.max(xe), ZX, pitch, &rz, FRESH.top);
+    zigzag(f, xt.max(xe), TEND, pitch, &rz, FRESH.top);
     axis(f);
     pt(xt, CY + rz(xt))
 }
@@ -535,8 +540,8 @@ fn thread_in(f: &mut Frame, pitch: f32, xt: f32) -> Point {
     rect(f, xb, CY - rb, ZX, CY + rb, HOLE);
     let rz = |x: f32| rb + vdepth(x, pitch, h);
     region(f, xe, xt, pitch, rb, &rz, AMBER);
-    region(f, xt, ZX, pitch, rb, &rz, HOLE);
-    zigzag(f, xt.max(xe), ZX, pitch, &rz, FRESH.top);
+    region(f, xt, TEND, pitch, rb, &rz, HOLE);
+    zigzag(f, xt.max(xe), TEND, pitch, &rz, FRESH.top);
     axis(f);
     pt(xt, CY - rz(xt))
 }
@@ -554,7 +559,7 @@ fn turn_kind(f: &mut Frame, phase: f32) {
     match k {
         0 => {
             let rt = R * (1. - s);
-            faced(f, 12., rt);
+            faced(f, 12., rt, 0.);
             z_zero(f);
             tool(f, pt(ZX - 12., CY + rt), (0.8, 0.6), 9.);
         }
@@ -573,7 +578,7 @@ fn turn_kind(f: &mut Frame, phase: f32) {
             tool(f, pt(xt, CY - 16.), (0.8, 0.6), 9.);
         }
         3 => {
-            let tip = end_chamfer(f, 9., s);
+            let tip = end_chamfer(f, 14., s);
             z_zero(f);
             tool(f, tip, (0.7, 0.7), 9.);
         }
@@ -583,7 +588,7 @@ fn turn_kind(f: &mut Frame, phase: f32) {
             let level = mid(R, rg, pl);
             grooved(f, x0, x0 + gw, rg, &[(x0, x0 + gw, level)]);
             z_zero(f);
-            blade(f, x0 + gw / 2., CY + level + 16. * re, gw, 16.);
+            blade(f, x0 + gw / 2., CY + level + 1.5 + 16. * re, gw, 16.);
         }
         5 => {
             let (xp, bw) = (zx(-16.), 6.);
@@ -596,7 +601,7 @@ fn turn_kind(f: &mut Frame, phase: f32) {
         }
         _ => {
             let pitch = 8.;
-            let xt = ZX - 64. * s;
+            let xt = TEND - (TEND - thread_start(pitch)) * s;
             let tip = thread_out(f, pitch, xt);
             z_zero(f);
             vtool(f, tip, pitch / 2., thread_h(pitch));
@@ -612,7 +617,7 @@ fn turn_kind(f: &mut Frame, phase: f32) {
         "THREAD",
     ];
     heading(f, &format!("TURN KIND · {}", names[k]));
-    tags(f, &KINDS, k);
+    tags(f, &KINDS, k, 7.5, 9.);
 }
 
 /// face_off: how much comes off the end.
@@ -620,7 +625,7 @@ fn face_off(f: &mut Frame, phase: f32) {
     let (i, u) = part(phase, 2, 0.3);
     let amt = [10., 20.][i];
     let rt = R * (1. - smooth(u));
-    faced(f, amt, rt);
+    faced(f, amt, rt, 0.);
     z_zero(f);
     let y = 46.;
     ext(f, pt(ZX - amt, y), pt(ZX - amt, CY - R), GOLD);
@@ -645,14 +650,14 @@ fn to_diameter(f: &mut Frame, phase: f32) {
     let stub = [12., 0.][i];
     let amt = 12.;
     let rt = stub + (R - stub) * (1. - smooth(u));
-    faced(f, amt, rt);
+    faced(f, amt, rt, stub);
     z_zero(f);
     let x = ZX + 14.;
     if stub > 0. {
         for sgn in [-1., 1.] {
             ext(
                 f,
-                pt(ZX, CY + sgn * stub),
+                pt(ZX + 4., CY + sgn * stub),
                 pt(x + 4., CY + sgn * stub),
                 GOLD,
             );
@@ -662,15 +667,21 @@ fn to_diameter(f: &mut Frame, phase: f32) {
             f,
             &format!("Ø {}", stub * 2. / PX),
             x + 8.,
-            CY - 13.,
+            CY - 6.,
             GOLD,
             11.,
         );
-        text(f, "STUB LEFT", x + 8., CY + 2., TEXT, 8.);
+        text(f, "STUB", ZX + 8., 50., TEXT, 8.);
+        line(
+            f,
+            pt(ZX + 10., 60.),
+            pt(ZX - 2., CY - stub + 1.),
+            Color { a: 0.8, ..TEXT },
+            1.,
+        );
     } else {
         arrow(f, pt(x, CY - 12.), pt(x, CY - 1.), GOLD);
         arrow(f, pt(x, CY + 12.), pt(x, CY + 1.), GOLD);
-        ring(f, pt(ZX - amt, CY), 5., GOLD);
         text(f, "Ø 0", x + 8., CY - 13., GOLD, 11.);
         text(f, "TO CENTRE", x + 8., CY + 2., TEXT, 8.);
     }
@@ -681,26 +692,34 @@ fn to_diameter(f: &mut Frame, phase: f32) {
 
 /// diameter: the finished diameter across the whole bar.
 fn diameter(f: &mut Frame, phase: f32) {
-    let (i, u) = part(phase, 2, 0.35);
-    let rd = [16., 10.][i];
+    let (i, u) = part(phase, 2, 0.45);
+    let (r0, rd) = [(R, 16.), (16., 10.)][i];
     let xe = zx(-24.);
     let xt = ZX - (ZX - xe) * smooth(u);
-    turned(f, &[R, rd], &[AMBER], xe, 0, xt);
+    turned(f, &[r0, rd], &[AMBER], xe, 0, xt);
     z_zero(f);
-    let x = ZX + 14.;
-    for sgn in [-1., 1.] {
-        ext(f, pt(ZX, CY + sgn * rd), pt(x + 4., CY + sgn * rd), GOLD);
+    // Only once the end is turned to this diameter is it dimensioned.
+    if u >= 1. {
+        let x = ZX + 14.;
+        for sgn in [-1., 1.] {
+            ext(
+                f,
+                pt(ZX + 4., CY + sgn * rd),
+                pt(x + 4., CY + sgn * rd),
+                GOLD,
+            );
+        }
+        span(f, pt(x, CY - rd), pt(x, CY + rd), GOLD);
+        text(
+            f,
+            &format!("Ø {} MM", rd * 2. / PX),
+            x + 8.,
+            CY - 13.,
+            GOLD,
+            10.,
+        );
+        text(f, "NOT RADIUS", x + 8., CY + 2., TEXT, 8.);
     }
-    span(f, pt(x, CY - rd), pt(x, CY + rd), GOLD);
-    text(
-        f,
-        &format!("Ø {} MM", rd * 2. / PX),
-        x + 8.,
-        CY - 13.,
-        GOLD,
-        10.,
-    );
-    text(f, "NOT RADIUS", x + 8., CY + 2., TEXT, 8.);
     tool(f, pt(xt, CY + rd), TOOL_DIR, 9.);
     heading(f, "DIAMETER · THE FINISHED Ø, NOT RADIUS");
     caption(f, "FULL HEIGHT ACROSS THE AXIS · AMBER: TAKEN OFF");
@@ -745,7 +764,8 @@ fn groove_z(f: &mut Frame, phase: f32) {
     ext(f, pt(ZX, y), pt(ZX, CY - R), GOLD);
     span(f, pt(x0, y), pt(ZX, y), GOLD);
     label_r(f, &format!("Z {z}"), x0 - 8., y - 4.5, GOLD, 9.);
-    blade(f, x0 + gw / 2., CY + level + 16. * re, gw, 16.);
+    blade(f, x0 + gw / 2., CY + level + 1.5 + 16. * re, gw, 16.);
+    text(f, "SECTION · SAME GROOVE ALL ROUND", 8., 17., TEXT, 7.5);
     heading(f, "Z · WHERE THE GROOVE SITS ALONG THE BAR");
     caption(f, "GOLD WALL: THE GROOVE SIDE TOWARD THE CHUCK");
 }
@@ -771,9 +791,6 @@ fn stepped(
     let lift = smooth(((l - 0.85) / 0.15).clamp(0., 1.)) * 8.;
     turned(f, radii, colors, xe, k, xt);
     z_zero(f);
-    for r in radii {
-        line(f, pt(ZX + 2., CY - r), pt(ZX + 10., CY - r), DIM, 1.);
-    }
     for (j, m) in marks.iter().enumerate() {
         let ym = CY - (radii[j] + radii[j + 1]) / 2.;
         let color = if j == k {
@@ -781,17 +798,25 @@ fn stepped(
         } else if j < k {
             TEXT
         } else {
-            Color { a: 0.5, ..TEXT }
+            Color { a: 0.55, ..TEXT }
         };
-        text(f, m, ZX + 13., ym - 4.5, color, 8.);
+        let ly = CY - 34. + 11. * j as f32;
+        line(
+            f,
+            pt(ZX + 2., ym),
+            pt(ZX + 9., ly),
+            Color { a: 0.6, ..color },
+            1.,
+        );
+        text(f, m, ZX + 11., ly - 5.5, color, 10.);
     }
     let (b, name) = dim;
-    let dx = ZX + 28.;
+    let dx = ZX + 30.;
     for sgn in [-1., 1.] {
         for r in [radii[b], radii[b + 1]] {
             ext(
                 f,
-                pt(ZX + 22., CY + sgn * r),
+                pt(ZX + 18., CY + sgn * r),
                 pt(dx + 4., CY + sgn * r),
                 GOLD,
             );
@@ -803,8 +828,8 @@ fn stepped(
             GOLD,
         );
     }
-    text(f, name, dx + 8., CY - 10., GOLD, 9.);
-    text(f, "ON Ø", dx + 8., CY + 1., TEXT, 8.);
+    text(f, name, dx + 8., CY - 11., GOLD, 9.);
+    text(f, "ON Ø", dx + 8., CY + 1., TEXT, 9.);
     tool(f, pt(xt, CY + radii[k + 1] + lift), TOOL_DIR, 9.);
     k
 }
@@ -844,58 +869,81 @@ fn finish(f: &mut Frame, phase: f32) {
 fn edge(f: &mut Frame, phase: f32) {
     let (i, u) = part(phase, 3, 0.3);
     let t = smooth(u);
-    let c = 9.;
-    let (tip, dir, corner) = match i {
-        0 => (end_chamfer(f, c, t), (0.7, 0.7), pt(ZX, CY - R)),
-        1 => (bore_chamfer(f, 14., c, t), (0.85, -0.5), pt(ZX, CY - 14.)),
-        _ => {
-            let xs = ZX - 70.;
-            (
-                shoulder_chamfer(f, xs, 16., c, t),
-                (0.7, 0.7),
-                pt(xs, CY - R),
-            )
-        }
+    let c = 12.;
+    let xs = ZX - 70.;
+    let (tip, dir) = match i {
+        0 => (end_chamfer(f, c, t), (0.7, 0.7)),
+        1 => (bore_chamfer(f, 14., c, t), (0.7, -0.7)),
+        _ => (shoulder_chamfer(f, xs, 16., c, t), (0.7, 0.7)),
     };
     z_zero(f);
-    ring(f, corner, 11., GOLD);
-    text(f, "45°", corner.x + 15., corner.y - 4.5, GOLD, 9.);
+    // A leader from the upper chamfer to its angle.
+    let (a, b, out) = match i {
+        0 => (pt(ZX - c, CY - R), pt(ZX, CY - R + c), (1., -1.)),
+        1 => (pt(ZX - c, CY - 14.), pt(ZX, CY - 14. - c), (1., 1.)),
+        _ => (pt(xs - c, CY - R), pt(xs, CY - R + c), (1., -1.)),
+    };
+    let m = pt((a.x + b.x) / 2., (a.y + b.y) / 2.);
+    let e = pt(m.x + out.0 * 10., m.y + out.1 * 10.);
+    line(f, m, e, GOLD, 1.2);
+    let ty = if out.1 < 0. { e.y - 10. } else { e.y - 4. };
+    text(f, "45°", e.x + 3., ty, GOLD, 9.);
     tool(f, tip, dir, 9.);
     heading(f, "EDGE · WHICH EDGE GETS THE 45° CHAMFER");
     tags(
         f,
         &["END CORNER (OUTSIDE)", "BORE CORNER (INSIDE)", "SHOULDER"],
         i,
+        7.5,
+        9.,
     );
 }
 
 /// size: the leg of the chamfer, growing.
 fn size(f: &mut Frame, phase: f32) {
-    let c = 8. + 12. * smooth(progress(phase, 0.2));
-    chuck(f);
-    rect(f, CX0, CY - R, ZX, CY + R, METAL.front);
-    let mut tip = pt(ZX, CY);
-    for sgn in [-1., 1.] {
-        let corner = pt(ZX, CY + sgn * R);
-        let a = pt(ZX - c, CY + sgn * R);
-        let b = pt(ZX, CY + sgn * (R - c));
-        polygon(f, &[a, b, corner], AMBER);
-        line(f, a, b, FRESH.top, 2.);
-        tip = pt(mid(a.x, b.x, 0.5), mid(a.y, b.y, 0.5));
+    // A magnified view of the end's upper corner, 8 px per mm.
+    let c = (2. + 3. * smooth(progress(phase, 0.2))) * 8.;
+    let (fx, top) = (190., 54.);
+    rect(f, 20., top, fx, 106., METAL.front);
+    for k in 0..22 {
+        let x = 20. + 8. * k as f32;
+        let (y0, y1) = if k % 2 == 0 {
+            (106., 109.)
+        } else {
+            (109., 106.)
+        };
+        line(f, pt(x, y0), pt(x + 8., y1), EDGE, 1.2);
     }
-    axis(f);
-    z_zero(f);
-    let y = 46.;
-    ext(f, pt(ZX - c, y), pt(ZX - c, CY - R), GOLD);
-    span(f, pt(ZX - c, y), pt(ZX, y), GOLD);
-    let lx = ZX - c - if c < 18. { 14. } else { 8. };
-    label_r(f, &format!("SIZE {:.1} MM", c / PX), lx, y - 4.5, GOLD, 9.);
-    let x = ZX + 14.;
-    ext(f, pt(ZX, CY - R), pt(x + 4., CY - R), GOLD);
-    ext(f, pt(ZX, CY - R + c), pt(x + 4., CY - R + c), GOLD);
-    span(f, pt(x, CY - R), pt(x, CY - R + c), GOLD);
-    text(f, "= SIZE", x + 8., CY - R + c / 2. - 4.5, GOLD, 8.);
-    tool(f, tip, (0.7, 0.7), 9.);
+    let corner = pt(fx, top);
+    let a = pt(fx - c, top);
+    let b = pt(fx, top + c);
+    polygon(f, &[a, b, corner], AMBER);
+    line(f, a, b, FRESH.top, 2.4);
+    // The leg along the bar and the leg across the end, both at this corner.
+    let y = 38.;
+    ext(f, pt(a.x, y), pt(a.x, top), GOLD);
+    ext(f, pt(fx, y), pt(fx, top), GOLD);
+    span(f, pt(a.x, y), pt(fx, y), GOLD);
+    label_r(
+        f,
+        &format!("SIZE {:.1} MM", c / 8.),
+        a.x - 8.,
+        y - 4.5,
+        GOLD,
+        9.,
+    );
+    let x = fx + 14.;
+    ext(f, pt(fx, top), pt(x + 4., top), GOLD);
+    ext(f, pt(fx, b.y), pt(x + 4., b.y), GOLD);
+    span(f, pt(x, top), pt(x, b.y), GOLD);
+    text(f, "= SIZE", x + 8., top + c / 2. - 4.5, GOLD, 9.);
+    tool(
+        f,
+        pt(mid(a.x, b.x, 0.5), mid(a.y, b.y, 0.5)),
+        (0.7, -0.7),
+        9.,
+    );
+    text(f, "MAGNIFIED: END CORNER OF THE BAR", 20., 118., TEXT, 8.);
     heading(f, "SIZE · LENGTH OF THE 45° CHAMFER'S LEG");
     caption(f, "AMBER: CORNER REMOVED · BRIGHT: THE CHAMFER");
 }
@@ -949,7 +997,8 @@ fn width(f: &mut Frame, phase: f32) {
     ext(f, pt(xw, y2), pt(xw, y), CYAN);
     span(f, pt(xw, y2), pt(xw + bw, y2), CYAN);
     label_r(f, "TOOL", xw - 14., y2 - 4.5, CYAN, 9.);
-    blade(f, xc, CY + r, bw, 16.);
+    blade(f, xc, CY + r + 1.5, bw, 16.);
+    text(f, "SECTION · SAME GROOVE ALL ROUND", 8., 17., TEXT, 7.5);
     heading(f, "WIDTH · AT LEAST AS WIDE AS THE TOOL");
     caption(f, "A SECOND PLUNGE WIDENS THE GROOVE PAST THE TOOL");
 }
@@ -958,7 +1007,7 @@ fn width(f: &mut Frame, phase: f32) {
 fn thread_side(f: &mut Frame, phase: f32) {
     let (i, u) = part(phase, 2, 0.25);
     let pitch = 8.;
-    let xt = ZX - 64. * smooth(u);
+    let xt = TEND - (TEND - thread_start(pitch)) * smooth(u);
     let tip = if i == 0 {
         thread_out(f, pitch, xt)
     } else {
@@ -970,27 +1019,26 @@ fn thread_side(f: &mut Frame, phase: f32) {
     text(f, big, 8., 19., GOLD, 12.);
     text(f, note, 12. + tw(big, 12.), 22., TEXT, 8.);
     heading(f, "THREAD SIDE · ON THE BAR OR IN A BORE");
-    tags(f, &["OUTSIDE", "INSIDE"], i);
+    tags(f, &["OUTSIDE", "INSIDE"], i, 8., 9.);
 }
 
 /// pitch: the distance between crests, fine then coarse.
 fn pitch_pic(f: &mut Frame, phase: f32) {
     let (i, u) = part(phase, 2, 0.25);
     let pitch = [8., 16.][i];
-    let xt = ZX - (ZX - thread_start(pitch)) * smooth(u);
+    let xt = TEND - (TEND - thread_start(pitch)) * smooth(u);
     let tip = thread_out(f, pitch, xt);
-    let (xa, xb) = (ZX - 1.5 * pitch, ZX - 0.5 * pitch);
-    let y = 46.;
+    let (xa, xb) = (TEND - 1.5 * pitch, TEND - 0.5 * pitch);
+    let y = 38.;
     ext(f, pt(xa, y), pt(xa, CY - R), GOLD);
     ext(f, pt(xb, y), pt(xb, CY - R), GOLD);
-    span(f, pt(xa, y), pt(xb, y), GOLD);
+    span_out(f, pt(xa, y), pt(xb, y), GOLD);
     dot(f, pt(xa, CY - R), 2.2, GOLD);
     dot(f, pt(xb, CY - R), 2.2, GOLD);
-    let lx = xa - if pitch < 12. { 14. } else { 8. };
     label_r(
         f,
         &format!("PITCH {} MM", pitch / PX),
-        lx,
+        xa - 14.,
         y - 4.5,
         GOLD,
         9.,
@@ -1003,7 +1051,7 @@ fn pitch_pic(f: &mut Frame, phase: f32) {
 /// passes: a magnified thread groove cut in several passes, each lighter.
 fn passes(f: &mut Frame, phase: f32) {
     const N: usize = 4;
-    let (cx, ys, dmax, t30) = (139., 118., 76., 0.577);
+    let (cx, ys, dmax, t30) = (139., 106., 64., 0.577);
     let d = |k: usize| dmax * (k as f32 / N as f32).sqrt();
     let x = progress(phase, 0.1) * N as f32;
     let k = (x as usize).min(N - 1);
@@ -1011,7 +1059,7 @@ fn passes(f: &mut Frame, phase: f32) {
     let cp = smooth((l / 0.8).min(1.));
     let dn = mid(d(k), d(k + 1), cp);
     let lift = if k == N - 1 {
-        smooth(((l - 0.85) / 0.15).clamp(0., 1.)) * 48.
+        smooth(((l - 0.85) / 0.15).clamp(0., 1.)) * 40.
     } else {
         0.
     };
@@ -1022,7 +1070,7 @@ fn passes(f: &mut Frame, phase: f32) {
             pt(cx, ys - depth),
         ]
     };
-    rect(f, 8., 30., 270., ys, METAL.front);
+    rect(f, 8., 32., 270., ys, METAL.front);
     // Every pass's band, the deepest drawn first.
     for j in (1..=N).rev() {
         let c = if j % 2 == 0 { AMBER } else { STOCK.top };
@@ -1048,37 +1096,36 @@ fn passes(f: &mut Frame, phase: f32) {
         flanks(f, dn, FRESH.top, 2.);
     }
     line(f, pt(8., ys), pt(270., ys), EDGE, 1.);
-    // The pass numbers where each band meets the surface.
+    // Each band's number, led in from the left to where the band lies.
     for j in 1..=N {
+        let h = (d(j - 1) + d(j)) / 2.;
+        let hw = (d(j) - h) * t30;
+        let ly = [ys - 14., ys - 33., ys - 50., ys - 66.][j - 1];
         let color = if j == k + 1 {
             GOLD
         } else if j <= k {
             TEXT
         } else {
-            Color { a: 0.5, ..TEXT }
+            Color { a: 0.6, ..TEXT }
         };
-        label_c(f, &j.to_string(), cx - d(j) * t30, ys + 3., color, 9.);
+        line(
+            f,
+            pt(cx - 62., ly),
+            pt(cx - hw, ys - h),
+            Color { a: 0.55, ..color },
+            1.,
+        );
+        text(f, &j.to_string(), cx - 72., ly - 5.5, color, 11.);
     }
-    // The current pass's infeed down the middle.
+    // The current pass's infeed beside the apex.
     let (y1, y2) = (ys - d(k), ys - d(k + 1));
-    let dx = cx + 24.;
+    let dx = cx + 26.;
     ext(f, pt(cx, y1), pt(dx + 4., y1), GOLD);
     ext(f, pt(cx, y2), pt(dx + 4., y2), GOLD);
     span(f, pt(dx, y1), pt(dx, y2), GOLD);
     text(f, "INFEED", dx + 8., (y1 + y2) / 2. - 4.5, GOLD, 9.);
     vtool(f, pt(cx, ys - dn + lift), 18. * t30, 18.);
-    text(f, &format!("{N} PASSES"), 8., 17., GOLD, 11.);
-    label_r(
-        f,
-        "MAGNIFIED: ONE GROOVE, A BAND PER PASS",
-        270.,
-        20.,
-        TEXT,
-        8.,
-    );
+    text(f, &format!("PASS {} OF {N}", k + 1), 8., 17., GOLD, 12.);
     heading(f, "PASSES · EACH PASS CUTS LESS THAN THE LAST");
-    caption(
-        f,
-        &format!("PASS {} OF {N} · EACH TAKES LESS THAN THE LAST", k + 1),
-    );
+    caption(f, "MAGNIFIED · A BAND PER PASS, EACH THINNER");
 }
