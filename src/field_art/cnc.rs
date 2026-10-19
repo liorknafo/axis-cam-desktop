@@ -277,7 +277,7 @@ fn probe_pin_diameter(f: &mut Frame, phase: f32) {
         mode(f, "WIDER HOLE · PART IS FREE", 24., 28., GOLD);
         arrow(f, pt(104., 46.), pt(84., 46.), GOLD);
         arrow(f, pt(104., 46.), pt(124., 46.), GOLD);
-        label(f, "MORE THAN +0.2", 196., 50., GOLD);
+        label(f, "MORE THAN +0.2", 130., 41., GOLD);
         caption(f, "WIDER: THE PART IS FREE TO MOVE");
     }
     heading(f, "PIN Ø · THE HOLE FITS TO 0.2 MM OVER");
