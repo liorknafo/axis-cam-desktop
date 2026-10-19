@@ -5708,6 +5708,8 @@ impl App {
             }
             Message::StockDetail(detail) => {
                 self.stock_detail = detail;
+                // How long the last detail took says nothing of this one.
+                self.stock_mesh_slow = false;
             }
             Message::StockMeshed {
                 key,

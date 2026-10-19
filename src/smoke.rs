@@ -12930,6 +12930,11 @@ flood = { pin = 8 }
             });
             assert!(!a.stock_mesh_slow());
         }
+        // Nor does a slow update carry over to another detail.
+        a.stock_mesh_slow = true;
+        let _ = a.update(Message::StockDetail(crate::stock_surface::Detail::Draft));
+        frame(&mut a, 0.95, Some(20));
+        assert_eq!(crate::ui::stock_surface_notice(&a), None);
     }
     /// Renders playback frames to PNGs in `$AXIS_RENDER_DIR` (default
     /// /tmp/play-renders): the stock meshed, being meshed quickly, being
