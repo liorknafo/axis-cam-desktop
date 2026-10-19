@@ -1,5 +1,6 @@
 //! Conservative start-height planning from earlier continuous cutter sweeps.
-//! A cap is skipped only when its whole volume is covered by known cuts.
+//! A cap is skipped only when its whole volume is covered by known cuts,
+//! or, over the area a cutter reaches (`Reach`), all of it there is.
 //! Coarse display voxels and samples never establish that material is absent.
 use crate::{
     mesh::Bounds,
@@ -9,6 +10,7 @@ use crate::{
     stock_surface::Cut,
     volume::{Frame, Volume},
 };
+use clipper2::{FillRule, Milli, difference, intersect};
 
 /// The units of `covered` work `left` and `band` spend on each side.
 const BUDGET: usize = 200_000;
@@ -590,7 +592,16 @@ impl RestStock {
     /// Upper bound on remaining material within an operation's XY envelope.
     /// Uncertain coverage, thin remnants, or exhausted work budgets keep the
     /// higher starting height. Clearance/retract planes are independent.
-    pub fn top(&self, mut region: Bounds, target: f32, original: f32) -> f32 {
+    pub fn top(&self, region: Bounds, target: f32, original: f32) -> f32 {
+        self.cap(region, None, target, original)
+    }
+    /// `top` over only the area the cutter reaches: material beside it, as
+    /// in the corners of its box, does not hold the start up.
+    pub fn top_over(&self, reach: &Reach, target: f32, original: f32) -> f32 {
+        self.cap(reach.bounds, Some(reach), target, original)
+    }
+    /// `top` within `region`, and within `reach` where there is one.
+    fn cap(&self, mut region: Bounds, reach: Option<&Reach>, target: f32, original: f32) -> f32 {
         if self.cuts.is_empty()
             || original <= target
             || !original.is_finite()
@@ -633,14 +644,52 @@ impl RestStock {
         while lo < hi && budget > 0 {
             let mid = lo + (hi - lo) / 2;
             region.min[2] = candidates[mid];
-            if self.covered(region, &ids, 0, &mut budget) {
+            if self.covered(region, &ids, reach, 0, &mut budget) {
                 hi = mid;
             } else {
                 lo = mid + 1;
             }
         }
+        // Below that, with a reach, the same in the plane: the reach less
+        // the outlines of the sweeps through every height of the cap. It
+        // sees a reach that passes a hair from material beside it, as a
+        // contour does round the part, which boxes cannot follow.
+        if let Some(reach) = reach {
+            let (mut lo, mut budget) = (0, BUDGET);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                match self.swept(reach, candidates[mid], region.max[2], &mut budget) {
+                    Some(true) => hi = mid,
+                    Some(false) => lo = mid + 1,
+                    // Out of work: the start stays as proven so far.
+                    None => break,
+                }
+            }
+        }
         // hi always identifies a proven cap (or the original height).
         candidates[hi]
+    }
+    /// Whether the outlines of the earlier sweeps through every height from
+    /// `low` to `high` (`cleared`) cover all of `reach` within the stock's
+    /// box. Their chords lie inside the sweeps, so a reach whose edge
+    /// follows a sweep's exactly is not covered. Each outline costs a unit
+    /// of `budget`; None when there are more than it has left.
+    fn swept(&self, reach: &Reach, low: f32, high: f32, budget: &mut usize) -> Option<bool> {
+        let gone = self.cleared(reach.bounds, low, high);
+        *budget = budget.checked_sub(gone.len())?;
+        if gone.is_empty() {
+            return Some(false);
+        }
+        let e = self.extent;
+        let inside = vec![vec![
+            (e.min[0] as f64, e.min[1] as f64),
+            (e.max[0] as f64, e.min[1] as f64),
+            (e.max[0] as f64, e.max[1] as f64),
+            (e.min[0] as f64, e.max[1] as f64),
+        ]];
+        let area = intersect::<Milli>(reach.loops.clone(), inside, FillRule::NonZero);
+        let left = area.and_then(|a| difference::<Milli>(a, gone, FillRule::NonZero));
+        Some(left.is_ok_and(|l| !l.contains_points()))
     }
     /// The stock box a later setup starts from, in the current frame (mm):
     /// the original block's box, narrowed to what lathe cuts left (`turned`),
@@ -934,7 +983,7 @@ impl RestStock {
                 // Slabs nest: when the thinnest is not covered, no deeper one is.
                 if hi == 0
                     || budget == 0
-                    || !self.covered(slab(candidates[hi - 1]), ids, 0, &mut budget)
+                    || !self.covered(slab(candidates[hi - 1]), ids, None, 0, &mut budget)
                 {
                     continue;
                 }
@@ -942,7 +991,7 @@ impl RestStock {
                 let mut lo = 0;
                 while lo < hi && budget > 0 {
                     let mid = lo + (hi - lo) / 2;
-                    if self.covered(slab(candidates[mid]), ids, 0, &mut budget) {
+                    if self.covered(slab(candidates[mid]), ids, None, 0, &mut budget) {
                         hi = mid;
                     } else {
                         lo = mid + 1;
@@ -960,7 +1009,17 @@ impl RestStock {
         }
         b
     }
-    fn covered(&self, b: Bounds, ids: &[usize], depth: u8, budget: &mut usize) -> bool {
+    /// Whether earlier cuts provably removed all the material in `b`, or,
+    /// with a `reach`, all of it within the reach: a box wholly beside the
+    /// reach holds nothing that counts.
+    fn covered(
+        &self,
+        b: Bounds,
+        ids: &[usize],
+        reach: Option<&Reach>,
+        depth: u8,
+        budget: &mut usize,
+    ) -> bool {
         if b.min[2] > b.max[2] {
             return true;
         }
@@ -968,6 +1027,9 @@ impl RestStock {
             return false;
         }
         *budget -= 1;
+        if reach.is_some_and(|r| r.misses(b)) {
+            return true;
+        }
         let points = corners(b);
         let reference = points.map(|p| transfer(p, self.current, self.reference));
         let guard = if self.current == self.reference {
@@ -1013,9 +1075,9 @@ impl RestStock {
         if overlap.is_empty() || depth >= 24 {
             return false;
         }
-        // A box whose centre lies inside the stock but in no capsule cannot be
-        // proven: the part of it round its centre would have to lie inside
-        // one. Said before splitting it, so that a slab reaching into
+        // A box whose centre lies inside the stock (and the reach) but in no
+        // capsule cannot be proven: the part of it round its centre would
+        // have to lie inside one. Said before splitting it, so that a slab reaching into
         // material is given up at the first such box, not after proving all
         // the rest of it.
         let centre: [f32; 3] = std::array::from_fn(|k| (b.min[k] + b.max[k]) / 2.);
@@ -1023,6 +1085,7 @@ impl RestStock {
         let in_stock = (0..3)
             .all(|k| at[k] > self.bounds.min[k] + guard && at[k] < self.bounds.max[k] - guard);
         if in_stock
+            && reach.is_none_or(|r| r.holds(centre))
             && !overlap
                 .iter()
                 .any(|&id| self.contains(&self.cuts[id], centre))
@@ -1054,8 +1117,8 @@ impl RestStock {
         let (mut left, mut right) = (b, b);
         left.max[k] = mid;
         right.min[k] = mid;
-        self.covered(left, &overlap, depth + 1, budget)
-            && self.covered(right, &overlap, depth + 1, budget)
+        self.covered(left, &overlap, reach, depth + 1, budget)
+            && self.covered(right, &overlap, reach, depth + 1, budget)
     }
     fn contains(&self, capsule: &Capsule, p: [f32; 3]) -> bool {
         let c = &capsule.cut;
@@ -1091,6 +1154,139 @@ pub fn start(setup: &Setup, region: Bounds, target: f32, original: f32, offset: 
             .min(original)
             .max(target)
     })
+}
+/// `start` with clearance proven over only the area the cutter reaches
+/// (`Reach`), not over its box: stock left beside that area, as in the
+/// corners of an irregular pocket's box, does not keep the start up.
+pub fn start_over(setup: &Setup, reach: &Reach, target: f32, original: f32, offset: f32) -> f32 {
+    setup.preview_remaining.as_ref().map_or(original, |rest| {
+        (rest.top_over(reach, target, original) + offset.max(0.))
+            .min(original)
+            .max(target)
+    })
+}
+
+/// The area in XY (current frame, mm) a cutter reaches over all its moves:
+/// closed loops, filled by the nonzero rule as Clipper's are. A cutting
+/// start found over it (`start_over`) sees only the material the cutter
+/// can meet.
+#[derive(Debug, Clone)]
+pub struct Reach {
+    loops: Vec<Vec<(f64, f64)>>,
+    edges: Vec<[(f64, f64); 2]>,
+    /// The loops' box; its heights unbounded.
+    bounds: Bounds,
+    /// The edges by band of Y, `band` mm each from `bounds.min[1]`, each
+    /// edge in every band its Y range meets.
+    bands: Vec<Vec<usize>>,
+    band: f64,
+}
+impl Reach {
+    pub fn new(loops: &[Vec<(f64, f64)>]) -> Self {
+        let edges: Vec<[(f64, f64); 2]> = loops
+            .iter()
+            .filter(|l| l.len() > 2)
+            .flat_map(|l| {
+                l.iter()
+                    .zip(l.iter().cycle().skip(1))
+                    .map(|(a, b)| [*a, *b])
+            })
+            .collect();
+        let mut bounds = Bounds {
+            min: [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY],
+            max: [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY],
+        };
+        // A micrometre out, past any rounding to single precision.
+        for p in edges.iter().map(|e| e[0]) {
+            for (k, v) in [p.0, p.1].into_iter().enumerate() {
+                bounds.min[k] = bounds.min[k].min(v as f32 - 0.001);
+                bounds.max[k] = bounds.max[k].max(v as f32 + 0.001);
+            }
+        }
+        // About eight edges a band.
+        let count = (edges.len() / 8).clamp(1, 1024);
+        let band = ((bounds.max[1] - bounds.min[1]) as f64 / count as f64).max(1e-6);
+        let mut reach = Self {
+            loops: loops.iter().filter(|l| l.len() > 2).cloned().collect(),
+            edges,
+            bounds,
+            bands: vec![vec![]; count],
+            band,
+        };
+        for (i, e) in reach.edges.iter().enumerate() {
+            let (lo, hi) = (e[0].1.min(e[1].1), e[0].1.max(e[1].1));
+            for b in reach.at(lo)..=reach.at(hi) {
+                reach.bands[b].push(i);
+            }
+        }
+        reach
+    }
+    /// A disc of `radius` about `centre`, within a polygon round it.
+    pub fn disc(centre: [f32; 2], radius: f32) -> Self {
+        const SIDES: usize = 32;
+        // Out to the polygon's corners, so its sides are on the circle or
+        // beyond it.
+        let r = radius as f64 / (std::f64::consts::PI / SIDES as f64).cos();
+        Self::new(&[(0..SIDES)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / SIDES as f64;
+                (
+                    centre[0] as f64 + r * a.cos(),
+                    centre[1] as f64 + r * a.sin(),
+                )
+            })
+            .collect()])
+    }
+    /// The band holding height `y`.
+    fn at(&self, y: f64) -> usize {
+        (((y - self.bounds.min[1] as f64) / self.band)
+            .floor()
+            .max(0.) as usize)
+            .min(self.bands.len() - 1)
+    }
+    /// Whether `p` lies in the area.
+    fn holds(&self, p: [f32; 3]) -> bool {
+        let (x, y) = (p[0] as f64, p[1] as f64);
+        if self.edges.is_empty() {
+            return false;
+        }
+        let mut winding = 0;
+        for e in self.bands[self.at(y)].iter().map(|&i| self.edges[i]) {
+            let [a, b] = e;
+            let left = (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0);
+            if a.1 <= y && y < b.1 && left > 0. {
+                winding += 1;
+            } else if b.1 <= y && y < a.1 && left < 0. {
+                winding -= 1;
+            }
+        }
+        winding != 0
+    }
+    /// Whether `b`'s XY lies wholly outside the area: no edge meets it and
+    /// its centre is outside.
+    fn misses(&self, b: Bounds) -> bool {
+        if (0..2).any(|k| b.max[k] < self.bounds.min[k] || b.min[k] > self.bounds.max[k]) {
+            return true;
+        }
+        let (x0, x1) = (b.min[0] as f64, b.max[0] as f64);
+        let (y0, y1) = (b.min[1] as f64, b.max[1] as f64);
+        for band in self.at(y0)..=self.at(y1) {
+            for &[a, e] in self.bands[band].iter().map(|&i| &self.edges[i]) {
+                if a.0.max(e.0) < x0 || a.0.min(e.0) > x1 || a.1.max(e.1) < y0 || a.1.min(e.1) > y1
+                {
+                    continue;
+                }
+                // Within the box's span, an edge whose line has corners on
+                // both sides of it, or on it, meets the box.
+                let side = |x: f64, y: f64| (e.0 - a.0) * (y - a.1) - (e.1 - a.1) * (x - a.0);
+                let sides = [side(x0, y0), side(x1, y0), side(x1, y1), side(x0, y1)];
+                if !(sides.iter().all(|s| *s > 0.) || sides.iter().all(|s| *s < 0.)) {
+                    return false;
+                }
+            }
+        }
+        !self.holds(std::array::from_fn(|k| (b.min[k] + b.max[k]) / 2.))
+    }
 }
 
 #[cfg(test)]
@@ -1431,6 +1627,58 @@ mod tests {
         );
     }
     #[test]
+    fn a_reach_holds_its_area_less_its_holes_and_misses_only_boxes_wholly_beside_it() {
+        // A 20 mm square with a 6 mm square hole, as Clipper gives it: the
+        // outline anticlockwise, the hole clockwise.
+        let reach = Reach::new(&[
+            vec![(-10., -10.), (10., -10.), (10., 10.), (-10., 10.)],
+            vec![(-3., -3.), (-3., 3.), (3., 3.), (3., -3.)],
+        ]);
+        let square = |x: f32, y: f32, half: f32| Bounds {
+            min: [x - half, y - half, 0.],
+            max: [x + half, y + half, 1.],
+        };
+        assert!(reach.holds([5., 5., 0.]) && reach.holds([-9.9, 0., 0.]));
+        assert!(!reach.holds([0., 0., 0.]) && !reach.holds([11., 0., 0.]));
+        // In the hole, beyond the outline: missed.
+        assert!(reach.misses(square(0., 0., 2.9)));
+        assert!(reach.misses(square(12., 12., 1.9)));
+        assert!(reach.misses(square(0., -15., 4.)));
+        // Inside it, over an edge, round the hole: met.
+        assert!(!reach.misses(square(6., 6., 1.)));
+        assert!(!reach.misses(square(0., 0., 3.)));
+        assert!(!reach.misses(square(10.5, 0., 1.)));
+        assert!(!reach.misses(square(0., 0., 30.)));
+        // A disc reaches out to its radius, not to its box's corners.
+        let disc = Reach::disc([1., 2.], 3.);
+        assert!(disc.holds([1., 4.99, 0.]) && disc.holds([3.1, 4.1, 0.]));
+        assert!(disc.misses(square(1. + 2.7, 2. + 2.7, 0.3)));
+    }
+    #[test]
+    fn a_reach_within_a_diagonal_cut_starts_under_it_though_its_box_corners_are_full_height() {
+        let (mut v, f, _, _, _) = fixture();
+        v.cut(
+            [-15., -15., 8.],
+            [15., 15., 8.],
+            2.5,
+            10.,
+            CutterShape::Flat,
+            f,
+            (0, 0),
+        );
+        let rest = RestStock::new(&v, f);
+        // A band along the cut, 0.7 mm either side of its centre line.
+        let band = Reach::new(&[vec![(-8., -9.), (9., 8.), (8., 9.), (-9., -8.)]]);
+        assert_eq!(rest.top(band.bounds, 2., 12.), 12.);
+        assert_eq!(rest.top_over(&band, 2., 12.), 8.);
+        // The plane's proof sees it too, and gives up without the work.
+        assert_eq!(rest.swept(&band, 8., 12., &mut 10), Some(true));
+        assert_eq!(rest.swept(&band, 8., 12., &mut 0), None);
+        // One that reaches past the cut's side meets the stock beside it.
+        let wide = Reach::new(&[vec![(-8., -9.), (9., 8.), (8., 9.), (-9., -4.)]]);
+        assert_eq!(rest.top_over(&wide, 2., 12.), 12.);
+    }
+    #[test]
     fn finite_flutes_and_thin_uncut_strips_are_not_ignored() {
         let (mut v, f, b, _, _) = fixture();
         face(&mut v, f, 8., &[-10., -6., -2., 2., 6., 10.], 1.);
@@ -1476,7 +1724,13 @@ mod tests {
         assert_eq!(RestStock::new(&v, f).top(b, 2., 12.), 12.);
         face(&mut v, f, 8., &[-10., -6., -2., 2., 6., 10.], 10.);
         let rest = RestStock::new(&v, f);
-        assert!(!rest.covered(b, &(0..rest.cuts.len()).collect::<Vec<_>>(), 0, &mut 0));
+        assert!(!rest.covered(
+            b,
+            &(0..rest.cuts.len()).collect::<Vec<_>>(),
+            None,
+            0,
+            &mut 0
+        ));
     }
     #[test]
     fn a_region_is_beside_the_stock_only_when_it_shares_no_area_with_the_box() {

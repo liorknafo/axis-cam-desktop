@@ -1451,9 +1451,26 @@ pub(crate) struct Job {
     /// The small conservative margin each zone's centres keep from its walls.
     pub(crate) margin: f32,
 }
+/// The area the tool of `radius` sweeps with its centre in `centres`, and
+/// a margin past it (a Pocket's centres' `margin`): links between loops
+/// cut up to half of that outside the centres, Facing's 0.01 mm.
+pub(crate) fn reach(centres: &Region, radius: f32) -> crate::rest::Reach {
+    let margin = (radius * 0.01).max(0.02);
+    let swept: Vec<Polygon> = centres
+        .inflate(
+            (radius + margin) as f64,
+            JoinType::Round,
+            EndType::Polygon,
+            2.,
+        )
+        .into();
+    crate::rest::Reach::new(&swept)
+}
 /// The height `zone` starts cutting at, its tool of `radius` over
-/// `centres`: below what earlier cuts cleared, plus a positive Top offset
-/// where the zone starts at the stock top (`top`).
+/// `centres`: below what earlier cuts cleared where the tool reaches (not
+/// over its box: an irregular zone's box takes in stock it never meets),
+/// plus a positive Top offset where the zone starts at the stock top
+/// (`top`).
 pub(crate) fn zone_start(
     setup: &Setup,
     op: &Operation,
@@ -1463,9 +1480,9 @@ pub(crate) fn zone_start(
     centres: &Region,
 ) -> f32 {
     let offset = num(&op.p, "top").unwrap_or(0.);
-    crate::rest::start(
+    crate::rest::start_over(
         setup,
-        envelope(centres, radius),
+        &reach(centres, radius),
         zone.target,
         zone.top,
         if zone.top == top { offset } else { 0. },
@@ -3759,6 +3776,252 @@ mod tests {
                 sim.stock.heights[y * sim.stock.nx + x],
                 sim.stock.bounds.max[2]
             );
+        }
+    }
+
+    /// A plus-shaped plate, its arms 12 mm wide and 36 mm long, its top at
+    /// Z 8 round a plus-shaped pocket to Z 2 (arms 6 mm wide, 28 mm long),
+    /// on a bottom at Z 0; `flipped`, turned over about X, as a part is that
+    /// a setup turned 180° machines.
+    fn plus_plate(flipped: bool) -> Vec<[[f32; 3]; 3]> {
+        const AT: [f32; 8] = [-18., -14., -6., -3., 3., 6., 14., 18.];
+        let mut tris = vec![];
+        for (x, xx) in AT.iter().zip(&AT[1..]) {
+            for (y, yy) in AT.iter().zip(&AT[1..]) {
+                let (cx, cy) = ((x + xx) / 2., (y + yy) / 2.);
+                if cx.abs() > 6. && cy.abs() > 6. {
+                    continue;
+                }
+                let pocket = (cx.abs() < 3. && cy.abs() < 14.) || (cy.abs() < 3. && cx.abs() < 14.);
+                quad(&mut tris, *x, *y, *xx, *yy, if pocket { 2. } else { 8. });
+                quad(&mut tris, *x, *y, *xx, *yy, 0.);
+            }
+        }
+        if flipped {
+            for p in tris.iter_mut().flatten() {
+                *p = [p[0], -p[1], -p[2]];
+            }
+        }
+        tris
+    }
+    /// The plus plate (`plus_plate`) in stock 2 mm over its sides and 4 mm
+    /// over its top and bottom: a Ø6 Facing of its outline, 2 mm past it,
+    /// down to its top, then a Ø3 Pocket of its plus, 2 mm a level. Flipped,
+    /// a first setup without operations sees the part upside down and the
+    /// second, turned 180° about X, machines it, as the user's job does.
+    fn faced_plus(flipped: bool) -> (crate::model::Document, Mesh) {
+        let mesh = mesh::normalize(plus_plate(flipped)).unwrap();
+        let mut doc = crate::model::Document::default();
+        let face_tool = Tool::new("Facing Ø6", "Flat end mill", "6");
+        let mut pocket_tool = Tool::new("Pocket Ø3", "Flat end mill", "3");
+        pocket_tool.p.insert("diameter".into(), "3".into());
+        let stock = |setup: &mut Setup| {
+            setup
+                .p
+                .insert("stock_type".into(), "Relative size box".into());
+            for (k, _) in stock::OFFSETS {
+                let margin = if k == "stock_top" || k == "stock_bottom" {
+                    "4"
+                } else {
+                    "2"
+                };
+                setup.p.insert(k.into(), margin.into());
+            }
+        };
+        let mut first = Setup::new(Machine::new(3), "G54");
+        stock(&mut first);
+        let mut setup = if flipped {
+            let mut s = Setup::new(Machine::new(3), "G55");
+            s.p.insert("rx".into(), "180".into());
+            stock(&mut s);
+            s
+        } else {
+            first.clone()
+        };
+        let placement = Placement::new(&mesh, Some(&setup));
+        let scale = mesh.display_scale();
+        // The faces at `depth` mm under the part's top, as the setup has it.
+        let at = |depth: f32| surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: (mesh.surfaces.iter().enumerate())
+                .filter(|(_, s)| {
+                    let z = placement.transform(s.center)[2];
+                    (placement.bounds.max[2] - depth * scale - z).abs() < 0.001 * scale
+                })
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        let mut face = Operation::new(Strategy::Face, face_tool.id.clone());
+        face.geometry.clear();
+        face.surfaces = Some(at(0.));
+        for (k, v) in [
+            ("boundary", "Model silhouette"),
+            ("silhouette_extend", "2"),
+            ("stepdown", "2"),
+            ("stepover", "40"),
+        ] {
+            face.p.insert(k.into(), v.into());
+        }
+        let mut pocket = Operation::new(Strategy::Pocket, pocket_tool.id.clone());
+        pocket.geometry.clear();
+        pocket.surfaces = Some(at(6.));
+        assert_eq!(pocket.surfaces.as_ref().unwrap().ids.len(), 1);
+        for (k, v) in [
+            ("allowance", "0"),
+            ("axial_allowance", "0"),
+            ("stepover", "40"),
+            ("stepdown", "2"),
+            ("pocket_entry", "Plunge"),
+            ("finish_passes", "0"),
+        ] {
+            pocket.p.insert(k.into(), v.into());
+        }
+        setup.operations = vec![face, pocket];
+        doc.tools = vec![face_tool, pocket_tool];
+        doc.active = setup.id.clone();
+        doc.setups = if flipped {
+            vec![first, setup]
+        } else {
+            vec![setup]
+        };
+        doc.sync_stock_sources();
+        (doc, mesh)
+    }
+    /// The Pocket of `faced_plus` as the job plans it, and the stock the
+    /// Facing before it left.
+    fn pocket_after_facing(
+        doc: &crate::model::Document,
+        mesh: &Mesh,
+    ) -> (Plan, crate::volume::Volume) {
+        let last = doc.setups.len() - 1;
+        let (mut plan, mut faced) = (None, None);
+        crate::simulation::sequence_with(
+            doc,
+            mesh,
+            Some((last, 1)),
+            |si, oi, result| {
+                let sim = result.unwrap();
+                if (si, oi) == (last, 1) {
+                    plan = Some(sim.plan);
+                }
+            },
+            |si, oi, volume| {
+                if (si, oi) == (last, 0) {
+                    faced = Some(volume.clone());
+                }
+            },
+        );
+        (plan.unwrap(), faced.unwrap())
+    }
+    /// The XY distance from `p` to the segment `a`–`b`.
+    fn off_segment(a: [f32; 3], b: [f32; 3], p: [f32; 2]) -> f32 {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let length = d[0] * d[0] + d[1] * d[1];
+        let t = if length == 0. {
+            0.
+        } else {
+            (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / length).clamp(0., 1.)
+        };
+        (p[0] - a[0] - t * d[0]).hypot(p[1] - a[1] - t * d[1])
+    }
+    #[test]
+    fn a_pocket_in_a_faced_plus_starts_at_the_faced_top_though_its_box_corners_are_full_height() {
+        for flipped in [false, true] {
+            let (doc, mesh) = faced_plus(flipped);
+            let (plan, faced) = pocket_after_facing(&doc, &mesh);
+            let setup = doc.setups.last().unwrap();
+            let frame = crate::volume::Frame::new(setup, &mesh);
+            let top = plan.stock.max[2];
+            let (cx, cy) = (
+                (plan.stock.min[0] + plan.stock.max[0]) / 2.,
+                (plan.stock.min[1] + plan.stock.max[1]) / 2.,
+            );
+            // The Facing took the plus 4 mm down, to the part's top; the
+            // corners of the pocket's box, outside the plus and 2 mm past
+            // it, it left at the stock's top.
+            let rest = crate::rest::RestStock::new(&faced, frame);
+            let faced_top = top - 4.;
+            let square = |x: f32, y: f32, half: f32| crate::mesh::Bounds {
+                min: [cx + x - half, cy + y - half, f32::NEG_INFINITY],
+                max: [cx + x + half, cy + y + half, f32::INFINITY],
+            };
+            assert!(
+                (rest.top(square(0., 0., 1.), plan.target, top) - faced_top).abs() < 0.001,
+                "flipped {flipped}"
+            );
+            assert_eq!(rest.top(square(13., 13., 0.5), plan.target, top), top);
+            assert_eq!(rest.top(square(0., 0., 14.), plan.target, top), top);
+            // So the pocket starts at the faced top, not in the air over
+            // it: its first level 2 mm under it, three levels down to its
+            // floor 6 mm under it.
+            assert!(
+                (plan.target - (faced_top - 6.)).abs() < 0.001,
+                "flipped {flipped}: {}",
+                plan.target
+            );
+            assert!(
+                plan.rest_top.is_some_and(|z| (z - faced_top).abs() < 0.001),
+                "flipped {flipped}: {:?}",
+                plan.rest_top
+            );
+            assert_eq!(plan.levels, 3, "flipped {flipped}");
+            let points = cutting(&plan);
+            assert!(!points.is_empty());
+            assert!(
+                points.iter().all(|p| p[2] <= faced_top - 2. + 0.001),
+                "flipped {flipped}"
+            );
+        }
+    }
+    #[test]
+    fn a_pocket_keeps_the_levels_over_a_tall_piece_the_facing_left_in_its_reach() {
+        for flipped in [false, true] {
+            let (doc, mesh) = faced_plus(flipped);
+            let (whole, faced) = pocket_after_facing(&doc, &mesh);
+            let mut setup = doc.setups.last().unwrap().clone();
+            let frame = crate::volume::Frame::new(&setup, &mesh);
+            let top = whole.stock.max[2];
+            // The Facing without its strokes over a spot in the pocket's
+            // right arm: a strip across the plate is left at the stock's
+            // top, through the pocket.
+            let spot = [
+                (whole.stock.min[0] + whole.stock.max[0]) / 2. + 10.,
+                (whole.stock.min[1] + whole.stock.max[1]) / 2.,
+            ];
+            let mut left = faced.clone();
+            left.cuts = std::sync::Arc::new(
+                (faced.cuts.iter())
+                    .filter(|c| off_segment(c.a, c.b, spot) > c.radius + 1.)
+                    .cloned()
+                    .collect(),
+            );
+            assert!(left.cuts.len() < faced.cuts.len() && !left.cuts.is_empty());
+            setup.p.insert("stock_source".into(), "fresh".into());
+            if flipped {
+                let mut uncut = faced.clone();
+                uncut.cuts = Default::default();
+                setup.preview_stock = Some(crate::simulation::leftover_box(&uncut, &setup, &mesh));
+            }
+            setup.preview_remaining = Some(std::sync::Arc::new(crate::rest::RestStock::new(
+                &left, frame,
+            )));
+            let op = &setup.operations[1];
+            let tool = doc.tools.iter().find(|t| t.id == op.tool).unwrap();
+            let plan = generate(&setup, op, tool, &mesh).unwrap();
+            assert!((plan.stock.max[2] - top).abs() < 0.001);
+            // Down from the stock's top, as without the Facing: five levels,
+            // the first two over the piece.
+            assert_eq!(plan.rest_top, None, "flipped {flipped}");
+            assert_eq!(plan.levels, 5, "flipped {flipped}");
+            for level in [top - 2., top - 4.] {
+                assert!(
+                    plan.moves.iter().any(|m| m.cutting_pass
+                        && (m.from[2] - level).abs() < 0.001
+                        && (m.to[2] - level).abs() < 0.001
+                        && off_segment(m.from, m.to, spot) < plan.radius),
+                    "flipped {flipped}: no cut over the piece at Z {level}"
+                );
+            }
         }
     }
 }
