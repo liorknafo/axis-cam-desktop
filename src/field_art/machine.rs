@@ -1242,7 +1242,8 @@ fn rpm_limit(f: &mut Frame, time: f32, phase: f32) {
         say(f, "ABOVE THE MAX:", 196., 94., RED, 10.);
         say(f, "FLAGGED", 196., 106., RED, 10.);
     } else {
-        say(f, "WITHIN THE LIMIT", 196., 94., OK, 10.);
+        say(f, "WITHIN", 196., 94., OK, 10.);
+        say(f, "THE LIMIT", 196., 106., OK, 10.);
     }
     heading(f, "MAX RPM · THE SPINDLE'S SPEED LIMIT");
     caption(f, "AN OPERATION ASKING FOR MORE IS FLAGGED");

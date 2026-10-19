@@ -101,11 +101,11 @@ fn grown(lo: V, hi: V, g: f32) -> (V, V) {
 }
 /// A row of names at the top, the active one in gold.
 fn tabs(f: &mut Frame, names: &[&str], active: usize) {
-    let mut x = 8.;
+    let mut x = 6.;
     for (i, n) in names.iter().enumerate() {
         let color = if i == active { GOLD } else { GHOST };
         text(f, n, x, 16., color, 9.);
-        x += n.chars().count() as f32 * 6.2 + 14.;
+        x += n.chars().count() as f32 * 6.2 + 9.;
     }
 }
 /// A small X and Y marker at the left: X runs right-down, Y left-down, the
@@ -293,7 +293,7 @@ pub fn vise(f: &mut Frame, time: f32, phase: f32, n: u8) {
                 GOLD,
             );
             let mid = p(v.at(v.moving + v.thick / 2., b, z));
-            let t = Point::new(mid.x + 62., mid.y - 12.);
+            let t = Point::new(mid.x + 50., mid.y - 12.);
             text(f, "JAW THICKNESS", t.x, t.y, GOLD, 9.);
             leader(f, Point::new(t.x - 2., t.y + 5.), mid);
             heading(f, "JAW THICKNESS · OUTWARD FROM THE STOCK");
