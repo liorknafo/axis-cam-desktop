@@ -6912,9 +6912,15 @@ flood = { pin = 8 }
         assert!(matches!(new, Some(Message::NewProject)), "{new:?}");
         let open = press("o", command);
         assert!(matches!(open, Some(Message::OpenProject)), "{open:?}");
-        // Caps Lock or Shift gives an upper-case letter; it is the same shortcut.
+        // Caps Lock gives an upper-case letter; it is the same shortcut.
+        let caps = press("S", command);
+        assert!(matches!(caps, Some(Message::SaveProject)), "{caps:?}");
+        // With Shift it is Save as.
         let shifted = press("S", command | Modifiers::SHIFT);
-        assert!(matches!(shifted, Some(Message::SaveProject)), "{shifted:?}");
+        assert!(
+            matches!(shifted, Some(Message::SaveProjectAs)),
+            "{shifted:?}"
+        );
         // Without the command key, or with the wrong one, a letter does nothing.
         for (letter, modifiers) in [
             ("s", Modifiers::empty()),
@@ -13739,6 +13745,91 @@ flood = { pin = 8 }
         let _ = a.update(Message::SaveProject);
         let _ = a.update(Message::Saved(None));
         assert!(!a.save_busy && a.project_dirty);
+    }
+    #[test]
+    fn save_writes_the_projects_file_and_save_as_asks_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.replace_document(Document::sample(), None);
+        assert_eq!(crate::ui::project_note(&a), "No project file yet");
+        // The first Save asks where: the dialog is open.
+        let _ = a.update(Message::SaveProject);
+        assert!(a.save_busy);
+        let file = dir.path().join("mine").join("job.axis.json");
+        let _ = a.update(Message::Saved(Some(file.clone())));
+        assert_eq!(crate::ui::project_note(&a), "job.axis.json");
+        // After that Save writes the same file without a dialog.
+        a.doc.title = "Changed after the first save".into();
+        a.project_dirty = true;
+        assert_eq!(crate::ui::project_note(&a), "Unsaved · job.axis.json");
+        let _ = a.update(Message::SaveProject);
+        assert!(!a.save_busy && !a.project_dirty);
+        assert_eq!(a.project_path.as_deref(), Some(file.as_path()));
+        let saved = crate::storage::load(&file).unwrap();
+        assert_eq!(saved.title, "Changed after the first save");
+        // Save as always asks, and the new file becomes the project's.
+        let _ = a.update(Message::SaveProjectAs);
+        assert!(a.save_busy);
+        let other = dir.path().join("other.axis.json");
+        let _ = a.update(Message::Saved(Some(other.clone())));
+        assert_eq!(a.project_path.as_deref(), Some(other.as_path()));
+        // A long name is cut in the middle, to fit the header.
+        a.project_path = Some(
+            dir.path()
+                .join("a-very-long-project-name-for-the-housing.axis.json"),
+        );
+        assert_eq!(
+            crate::ui::project_note(&a),
+            "a-very-long-proj…using.axis.json"
+        );
+        // A new project has no file until it is saved.
+        let _ = a.update(Message::NewProject);
+        assert!(a.project_path.is_none());
+        let _ = a.update(Message::SaveProject);
+        assert!(a.save_busy);
+        let _ = a.update(Message::Saved(None));
+    }
+    #[test]
+    fn the_projects_file_is_remembered_across_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.replace_document(Document::sample(), None);
+        let file = dir.path().join("job.axis.json");
+        let _ = a.update(Message::SaveProjectAs);
+        let _ = a.update(Message::Saved(Some(file.clone())));
+        // The workspace was written with the file's change, before settings.
+        assert!(!a.dirty);
+        // Saved and the workspace the same: no unsaved changes.
+        let b = fresh_app(&dir);
+        assert_eq!(b.project_path.as_deref(), Some(file.as_path()));
+        assert!(!b.project_dirty);
+        // An edit the workspace kept and the file did not.
+        a.doc.title = "Edited after saving".into();
+        a.dirty = true;
+        a.persist();
+        let b = fresh_app(&dir);
+        assert_eq!(b.project_path.as_deref(), Some(file.as_path()));
+        assert!(b.project_dirty);
+        // A file that is gone is not written back behind the user's back.
+        std::fs::remove_file(&file).unwrap();
+        let b = fresh_app(&dir);
+        assert!(b.project_path.is_none());
+    }
+    #[test]
+    fn a_project_recovered_from_history_has_no_file_until_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh_app(&dir);
+        a.replace_document(Document::sample(), None);
+        let copy = crate::storage::archive(&a.state_path, &a.doc).unwrap();
+        let opened = crate::storage::load_reporting(&copy).map(|(d, n)| (d, copy.clone(), n));
+        let _ = a.update(Message::ProjectOpened(Some(opened)));
+        assert!(a.project_path.is_none());
+        // A project opened from anywhere else keeps its file.
+        let file = dir.path().join("job.axis.json");
+        crate::storage::save(&file, &a.doc).unwrap();
+        let opened = crate::storage::load_reporting(&file).map(|(d, n)| (d, file.clone(), n));
+        let _ = a.update(Message::ProjectOpened(Some(opened)));
+        assert_eq!(a.project_path.as_deref(), Some(file.as_path()));
     }
     #[test]
     fn a_failing_workspace_save_is_said_once_and_shown_in_the_header_until_it_works() {

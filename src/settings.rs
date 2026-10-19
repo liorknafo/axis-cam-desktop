@@ -15,6 +15,9 @@ pub struct Settings {
     pub plan_pictures_off: bool,
     /// The Work page's layout as the user left it.
     pub layout: Layout,
+    /// The file the project in the workspace was last saved to or opened
+    /// from: Save writes there without asking.
+    pub project_file: Option<PathBuf>,
 }
 /// The browser or the inspector: the sidebars beside the Work page's 3D view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1031,7 +1031,11 @@ pub fn command(m: &Message, label: String) -> Help {
             "",
         ),
         SaveProject => (
-            "Save a portable JSON project containing your settings. Keep the original model file available: the project stores its path, not embedded geometry. Shortcut: ⌘S.",
+            "Save the project to its file. The first time, choose where to keep it; after that Save writes the same file without asking. The file is portable JSON with your settings. Keep the original model file available: the project stores its path, not embedded geometry. Shortcut: ⌘S.",
+            "",
+        ),
+        SaveProjectAs => (
+            "Save the project to a new file you choose, in any folder. From then on Save writes to that file. Shortcut: ⇧⌘S.",
             "",
         ),
         Page(crate::Page::Machines) => (
@@ -4259,6 +4263,7 @@ mod tests {
             OpenHistory,
             OpenProject,
             SaveProject,
+            SaveProjectAs,
             RunOnMachine(0),
             NewMachine,
             AddSetup,

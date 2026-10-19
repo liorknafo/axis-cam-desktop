@@ -792,6 +792,34 @@ pub fn workspace_note(app: &App) -> String {
         (None, false) => "Workspace saved locally".into(),
     }
 }
+/// Which file the project is saved in, and whether it has changes since.
+/// A long name keeps its start and its end; the tooltip has the whole path.
+pub fn project_note(app: &App) -> String {
+    const SHOWN: usize = 32;
+    match &app.project_path {
+        Some(p) => {
+            let name: Vec<char> = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .chars()
+                .collect();
+            let mut shown: String = name.iter().collect();
+            if name.len() > SHOWN {
+                let head: String = name[..SHOWN / 2].iter().collect();
+                let tail: String = name[name.len() - SHOWN / 2 + 1..].iter().collect();
+                shown = format!("{head}…{tail}");
+            }
+            // Unsaved first: a narrow header wraps the name, not the mark.
+            if app.project_dirty {
+                format!("Unsaved · {shown}")
+            } else {
+                shown
+            }
+        }
+        None => "No project file yet".into(),
+    }
+}
 pub fn view(app: &App) -> Element<'_, Message> {
     if app.smoke_dir.is_some() && (13..=14).contains(&app.smoke_step) {
         return help::gallery(u8::from(app.smoke_step == 14));
@@ -841,7 +869,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 ),
                 bar_btn("Import model", Message::Import, false),
                 bar_btn("Open", Message::OpenProject, false),
-                bar_btn("Save project", Message::SaveProject, false),
+                bar_btn("Save", Message::SaveProject, false),
+                bar_btn("Save as…", Message::SaveProjectAs, false),
             ]
             .spacing(4)
             .align_y(Alignment::Center),
@@ -853,8 +882,20 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .color(Color::from_rgb8(214, 228, 240)),
         )
     };
+    let where_saved = match &app.project_path {
+        Some(p) => p.display().to_string(),
+        None => "Use Save or Save as… to choose the file this project is kept in. Until then it lives only in the workspace.".into(),
+    };
     let brand = brand
         .push(space().width(Fill))
+        .push(help::wrap(
+            text(project_note(app))
+                .size(12)
+                .color(Color::from_rgb8(214, 228, 240)),
+            Help::text("Project file", where_saved),
+            widget::tooltip::Position::Bottom,
+        ))
+        .push(space().width(10))
         .push(
             text(workspace_note(app))
                 .size(12)
