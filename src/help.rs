@@ -4048,7 +4048,8 @@ mod tests {
         ] {
             assert!(gap.more.contains(part), "{part}: {}", gap.more);
         }
-        assert!(gap.diagram.is_none());
+        // Its picture: the clearance envelope round a jaw.
+        assert_eq!(gap.diagram, Some(Diagram::Vise(9)));
         // The requested clearance says in its label that it is not checked,
         // sits under a heading that says the same, and its card says where
         // it is printed and which field the checks use instead.
