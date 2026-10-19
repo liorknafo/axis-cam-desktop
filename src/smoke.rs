@@ -2536,6 +2536,65 @@ flood = { pin = 8 }
         );
     }
 
+    /// Pictures of a hole's outline under the pointer seen from above, on
+    /// the outline and in the opening, and of the hole picked by a click.
+    #[test]
+    #[ignore]
+    fn render_a_holes_outline_under_the_pointer() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/hole-outlines".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let _ = a.update(Message::Camera("TOP"));
+        let size = iced::Size::new(1600., 1100.);
+        let _ = a.view();
+        let plain = out.join("1-picking.png");
+        render_png(&a, size, &plain);
+        // The 3D view's bounds: where its background colour is.
+        let decoder = png::Decoder::new(std::io::BufReader::new(
+            std::fs::File::open(&plain).unwrap(),
+        ));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 250..820 {
+            for x in 0..info.width {
+                let k = ((y * info.width + x) * 4) as usize;
+                if buf[k..k + 3] == [239, 243, 247] {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                }
+            }
+        }
+        let bounds = iced::Rectangle {
+            x: x0 as f32,
+            y: y0 as f32,
+            width: (x1 - x0 + 1) as f32,
+            height: (y1 - y0 + 1) as f32,
+        };
+        let outlines = a.hole_outlines();
+        let o = (outlines.iter())
+            .find(|o| o.loops[0].iter().all(|q| q[0] > 0.))
+            .unwrap();
+        let scale = a.part_mesh().unwrap().display_scale();
+        let view = crate::ui::scene_viewport(&a).unwrap();
+        let screen = |q: [f32; 2]| {
+            let p = view.screen_point(bounds, [q[0] * scale, q[1] * scale, o.z * scale]);
+            iced::mouse::Cursor::Available(iced::Point::new(bounds.x + p.x, bounds.y + p.y))
+        };
+        render_png_at(&a, size, &out.join("2-on-outline.png"), screen([13., 0.]));
+        render_png_at(&a, size, &out.join("3-in-opening.png"), screen([10., 0.]));
+        let _ = a.update(Message::Surface(o.walls[0]));
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-picked.png"));
+    }
     /// Not a check: draws a Pocket that picked the plate's two holes by a
     /// click on a wall of each (`pocket::hole_plate`), its Geometry tab
     /// listing them and its preview, as `pocket-holes-*.png` in
@@ -3840,6 +3899,15 @@ flood = { pin = 8 }
 
     /// Draws `a`'s whole window, `size` px, headless (tiny-skia) to `path`.
     fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
+        render_png_at(a, size, path, iced::mouse::Cursor::Unavailable);
+    }
+    /// `render_png` with the pointer at `cursor` (hover marks drawn).
+    fn render_png_at(
+        a: &App,
+        size: iced::Size,
+        path: &std::path::Path,
+        cursor: iced::mouse::Cursor,
+    ) {
         use futures_util::FutureExt;
         use iced::advanced::renderer::{self, Headless};
         let mut renderer = <iced::Renderer as Headless>::new(
@@ -3862,7 +3930,7 @@ flood = { pin = 8 }
             &renderer::Style {
                 text_color: iced::Color::BLACK,
             },
-            iced::mouse::Cursor::Unavailable,
+            cursor,
         );
         let physical = iced::Size::new(size.width as u32, size.height as u32);
         let rgba = renderer.screenshot(physical, 1., iced::Color::WHITE);
@@ -11575,6 +11643,205 @@ flood = { pin = 8 }
         assert!(a.status.contains("not a hole"), "{}", a.status);
         let _ = a.update(Message::Surface(at(-2., 0.)));
         assert!(ids(&a).is_empty());
+    }
+    #[test]
+    fn a_pocket_being_picked_outlines_the_parts_holes_and_a_click_on_one_picks_it() {
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        // The square hole through the plate and the round one into it.
+        let outlines = a.hole_outlines();
+        assert_eq!(outlines.len(), 2);
+        let extent = |o: &crate::viewport::HoleOutline| {
+            o.loops
+                .concat()
+                .iter()
+                .fold([f32::MAX, f32::MIN, f32::MAX, f32::MIN], |e, q| {
+                    [
+                        e[0].min(q[0]),
+                        e[1].max(q[0]),
+                        e[2].min(q[1]),
+                        e[3].max(q[1]),
+                    ]
+                })
+        };
+        let square = (outlines.iter()).position(|o| extent(o)[0] > 0.).unwrap();
+        let e = extent(&outlines[square]);
+        for (got, want) in e.iter().zip([7., 13., -3., 3.]) {
+            assert!((got - want).abs() < 0.01, "{e:?}");
+        }
+        assert!(outlines.iter().all(|o| !o.picked));
+        // A click on it (its first wall, as the 3D view sends) picks the hole
+        // and its outline turns blue; another drops it.
+        let wall = outlines[square].walls[0];
+        let _ = a.update(Message::Surface(wall));
+        assert!(
+            a.status.starts_with("Picked the hole at X10.00 Y0.00"),
+            "{}",
+            a.status
+        );
+        let picked: Vec<bool> = a.hole_outlines().iter().map(|o| o.picked).collect();
+        assert_eq!(picked.iter().filter(|&&p| p).count(), 1);
+        assert!(picked[square]);
+        let _ = a.update(Message::Surface(wall));
+        assert!(a.status.starts_with("Dropped the hole"), "{}", a.status);
+        assert!(a.hole_outlines().iter().all(|o| !o.picked));
+        // Nothing is outlined once picking is finished, nor for a Face.
+        let _ = a.update(Message::PickMode);
+        assert!(!a.picking && a.hole_outlines().is_empty());
+        // Off the window's thread, the holes come back with what they were
+        // worked out from, and holes for another placement are not shown.
+        let mut b = pocket_app(crate::pocket::hole_plate(false));
+        b.generate_inline = false;
+        b.page = Page::Work;
+        let _ = b.update(Message::SelectOp(0));
+        let _ = b.update(Message::Tab("Geometry".into()));
+        if !b.picking {
+            let _ = b.update(Message::PickMode);
+        }
+        let key = b.part_holes_key().unwrap();
+        assert_eq!(b.part_holes_job, Some(key));
+        assert!(b.hole_outlines().is_empty());
+        let finding = "Finding the part's holes: their outlines show when the pointer is over them once found.";
+        shows(&b, &[finding]);
+        let found = crate::find_holes(b.doc.setup(), b.part_mesh().unwrap());
+        let found = std::sync::Arc::new(found);
+        let _ = b.update(Message::PartHoles(key ^ 1, crate::PartHoles(found.clone())));
+        assert!(b.hole_outlines().is_empty());
+        let _ = b.update(Message::PartHoles(key, crate::PartHoles(found)));
+        assert_eq!((b.part_holes_job, b.hole_outlines().len()), (None, 2));
+        lacks(&b, &[finding]);
+        // Turned on the machine, the part's holes are worked out again.
+        let _ = b.update(Message::Edit(Target::Setup, "rz", "90".into()));
+        assert!(b.hole_outlines().is_empty());
+        assert_eq!(b.part_holes_job, b.part_holes_key());
+    }
+    #[test]
+    fn a_tool_that_cannot_be_saved_says_why_beside_its_save_button() {
+        let mut a = app();
+        a.page = Page::Tools;
+        let _ = a.update(Message::NewTool);
+        // A Ø2 drill with 40 mm of flute, its stickout left at 35.
+        for (k, v) in [
+            ("name", "Drill 2mm"),
+            ("type", "Drill"),
+            ("number", "12"),
+            ("diameter", "2"),
+            ("flutes", "2"),
+            ("length", "40"),
+        ] {
+            let _ = a.update(Message::Edit(Target::Tool, k, v.into()));
+        }
+        let why = "Stickout (35 mm) must be at least the flute length (40 mm): how far the tool reaches out of its holder.";
+        shows(&a, &[&format!("Save is blocked: {why}")]);
+        let before = a.doc.tools.len();
+        let _ = a.update(Message::SaveTool);
+        assert_eq!((a.doc.tools.len(), a.status.as_str()), (before, why));
+        // A longer stickout lets it save, and the line goes.
+        let _ = a.update(Message::Edit(Target::Tool, "stickout", "45".into()));
+        lacks(&a, &[&format!("Save is blocked: {why}")]);
+        let _ = a.update(Message::SaveTool);
+        assert_eq!(a.doc.tools.len(), before + 1);
+    }
+    #[test]
+    fn a_drill_outlines_the_parts_round_holes_with_their_diameters_and_picks_one_by_a_click() {
+        let mut a = pocket_app(crate::pocket::hole_plate(false));
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Drill, tool);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        // Of the plate's two holes only the round one is outlined, labelled
+        // with the diameter it drills; the square one is no drill's.
+        let outlines = a.hole_outlines();
+        assert_eq!(outlines.len(), 1);
+        let round = &outlines[0];
+        assert_eq!(round.label.as_deref(), Some("Ø6"));
+        assert!(!round.picked);
+        assert!(
+            round.loops[0]
+                .iter()
+                .all(|q| ((q[0] + 10.).hypot(q[1]) - 3.).abs() < 0.01)
+        );
+        // A click on it (its first wall, as the 3D view sends) drills it.
+        let wall = round.walls[0];
+        let _ = a.update(Message::Surface(wall));
+        assert_eq!(
+            a.status,
+            "Picked the Ø6 hole at X-10.00 Y0.00: its walls are blue."
+        );
+        assert!(a.hole_outlines()[0].picked);
+        let mesh = a.part_mesh().unwrap().clone();
+        let holes = a.drill_holes(a.operation().unwrap(), &mesh);
+        let holes = holes.as_ref().as_ref().unwrap();
+        assert_eq!(holes.len(), 1);
+        let h = &holes[0];
+        assert!((h.center[0] + 10.).abs() < 0.01 && h.center[1].abs() < 0.01);
+        assert!((h.diameter - 6.).abs() < 0.01 && !h.through);
+        assert!((h.top - h.bottom - 5.).abs() < 0.01, "{h:?}");
+        let bottom = h.bottom;
+        let row = "✓ Ø6.00 (opening Ø6.00) · X-10.00 Y0.00 · depth 5.00 mm · blind · remove";
+        shows(&a, &["1 hole to drill", row]);
+        // With a Ø6 drill it raises nothing and drills it.
+        let mut drill = crate::model::Tool::new("T9 Drill 6", "Drill", "6");
+        drill.p.insert("number".into(), "9".into());
+        let drill_id = drill.id.clone();
+        a.doc.tools.push(drill);
+        a.operation_mut().unwrap().tool = drill_id;
+        assert_eq!(a.op_issues(), Vec::<String>::new());
+        let _ = a.update(Message::Generate);
+        let plan = &a.simulation.as_ref().expect(&a.status).plan;
+        // Down to the hole's floor, at its centre.
+        let lowest = (plan.moves.iter())
+            .filter(|m| (m.to[0] + 10.).abs() < 0.01 && m.to[1].abs() < 0.01)
+            .map(|m| m.to[2])
+            .fold(f32::INFINITY, f32::min);
+        assert!((lowest - bottom).abs() < 0.01, "{lowest} {bottom}");
+        // Generating ends picking; picking again shows the holes again.
+        let _ = a.update(Message::Tab("Geometry".into()));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        // The square hole's wall is refused, and nothing else changes.
+        let picked = a.operation().unwrap().surfaces.clone();
+        let square = surface_at(&a, |id, c| {
+            crate::pocket::is_wall(a.doc.setup(), a.part_mesh().unwrap(), id)
+                && (c[0] - 13.).abs() < 0.01
+        });
+        let _ = a.update(Message::Surface(square));
+        assert_eq!(
+            a.status,
+            "The hole at X10.00 Y0.00 (6.00 × 6.00 mm) is not round: a Drill drills round holes. Pick it in a Pocket."
+        );
+        assert_eq!(
+            a.operation().unwrap().surfaces.as_ref().map(|s| &s.ids),
+            picked.as_ref().map(|s| &s.ids)
+        );
+        // Its remove button drops it; a second click on its outline does too.
+        let _ = a.update(Message::DropHole(0));
+        assert!(!a.hole_outlines()[0].picked);
+        lacks(&a, &[row]);
+        let _ = a.update(Message::Surface(wall));
+        let _ = a.update(Message::Surface(wall));
+        assert!(
+            a.status.starts_with("Dropped the Ø6 hole at X-10.00 Y0.00"),
+            "{}",
+            a.status
+        );
+        assert!(!a.hole_outlines()[0].picked);
+        // The pin holes' Drill outlines nothing.
+        a.operation_mut()
+            .unwrap()
+            .p
+            .insert("holes".into(), crate::model::DRILL_HOLES[1].into());
+        assert!(a.hole_outlines().is_empty());
     }
     /// An app with `tris` imported and its first operation a Pocket.
     fn pocket_app(tris: Vec<[[f32; 3]; 3]>) -> App {

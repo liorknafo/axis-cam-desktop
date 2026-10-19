@@ -145,6 +145,23 @@ pub struct PinHolePick {
     pub pick: bool,
     pub holes: Vec<(usize, [f32; 3], f32)>,
 }
+/// A hole of the part a Pocket or a Contour picks by its outline
+/// (`pocket::part_holes`): what of it is open from above, as loops in the
+/// setup's frame (mm) at the height of its rim, the walls a click on it
+/// clicks, and whether the operation has it. The outline is drawn while
+/// the pointer is over it or over the hole, blue once picked.
+#[derive(Clone, Debug, Default)]
+pub struct HoleOutline {
+    pub loops: Vec<Vec<[f32; 2]>>,
+    pub z: f32,
+    pub walls: Vec<usize>,
+    pub picked: bool,
+    /// What it is labelled with (a Drill's: the diameter it drills). A
+    /// labelled outline is drawn whether or not the pointer is over it, so
+    /// every hole the operation can take shows, and inside it the pointer
+    /// takes the hole before the faces under it.
+    pub label: Option<String>,
+}
 /// The fixture pins being placed in the stock's leftover ("Place the pins
 /// on the leftover", the Work zero step): the plate's pins follow the
 /// pointer on the stock's bottom, and a click, or a drag of the placed
@@ -180,6 +197,9 @@ pub struct Viewport<'a> {
     pub pin_holes: PinHolePick,
     /// The pins being placed in the stock's leftover (the Work zero step).
     pub pin_aim: PinAim,
+    /// The part's holes a Pocket or a Contour being picked can pick by their
+    /// outline; empty otherwise.
+    pub hole_outlines: Vec<HoleOutline>,
     pub show_stock: bool,
     pub show_paths: bool,
     pub progress: Option<f32>,
@@ -467,6 +487,17 @@ impl Viewport<'_> {
         {
             return None;
         }
+        // A hole's outline under the pointer clicks one of its walls, and so
+        // does the inside of a labelled one (a Drill's), whatever face of
+        // the hole (its floor, its bore) is under the pointer there.
+        if let Some(i) = self.outline_near(b, point) {
+            return self.hole_outlines[i].walls.first().copied();
+        }
+        if let Some(i) = self.outline_around(b, point)
+            && self.hole_outlines[i].label.is_some()
+        {
+            return self.hole_outlines[i].walls.first().copied();
+        }
         let p = self.projector(b);
         let mut nearest = f32::NEG_INFINITY;
         let mut feature = None;
@@ -481,6 +512,13 @@ impl Viewport<'_> {
                 }
             }
         }
+        // Nothing of the part under the pointer: the opening of a hole
+        // through it, seen from above.
+        if feature.is_none()
+            && let Some(i) = self.outline_around(b, point)
+        {
+            return self.hole_outlines[i].walls.first().copied();
+        }
         feature.filter(|f| {
             if self.sample {
                 self.operation
@@ -489,6 +527,172 @@ impl Viewport<'_> {
                 *f < self.mesh.surfaces.len()
             }
         })
+    }
+    /// Where this view of `bounds` puts the point `q` (display units),
+    /// relative to it: for pictures with the pointer over it.
+    #[cfg(test)]
+    pub(crate) fn screen_point(&self, bounds: Rectangle, q: [f32; 3]) -> Point {
+        self.projector(bounds).p(q)
+    }
+    /// The holes' outlines: the one under the pointer (by its outline, a
+    /// wall, or its opening) in amber, those picked in blue, and the other
+    /// labelled ones in teal, each with its label.
+    fn hole_marks(&self, frame: &mut Frame, bounds: Rectangle, cursor: mouse::Cursor) {
+        if self.hole_outlines.is_empty() {
+            return;
+        }
+        let hovered = cursor
+            .position_in(bounds)
+            .and_then(|at| self.picked(bounds, at))
+            .and_then(|id| {
+                self.hole_outlines
+                    .iter()
+                    .position(|o| o.walls.contains(&id))
+            });
+        let halo = Color::from_rgba8(255, 255, 255, 0.9);
+        let blue = Color::from_rgb8(37, 99, 235);
+        let amber = Color::from_rgb8(217, 119, 6);
+        let teal = Color::from_rgb8(13, 128, 120);
+        let screen = self.outlines_on_screen(bounds);
+        let color = |i: usize| {
+            let o = &self.hole_outlines[i];
+            if hovered == Some(i) {
+                Some(amber)
+            } else if o.picked {
+                Some(blue)
+            } else if o.label.is_some() {
+                Some(teal)
+            } else {
+                None
+            }
+        };
+        for (i, loops) in screen.iter().enumerate() {
+            let Some(color) = color(i) else { continue };
+            for l in loops {
+                line(frame, l, halo, 4.5);
+                line(frame, l, color, 2.);
+            }
+        }
+        let boxes: Vec<Rectangle> = (screen.iter())
+            .map(|loops| {
+                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for q in loops.iter().flatten() {
+                    (x0, y0, x1, y1) = (x0.min(q.x), y0.min(q.y), x1.max(q.x), y1.max(q.y));
+                }
+                Rectangle::new(
+                    Point::new(x0 - 2., y0 - 2.),
+                    iced::Size::new(x1 - x0 + 4., y1 - y0 + 4.),
+                )
+            })
+            .collect();
+        let widths: Vec<Option<usize>> = (self.hole_outlines.iter())
+            .map(|o| o.label.as_ref().map(|l| l.chars().count()))
+            .collect();
+        let picked: Vec<bool> = self.hole_outlines.iter().map(|o| o.picked).collect();
+        let (placed, hidden) = place_labels(&boxes, &widths, &picked, hovered);
+        // Text is not clipped to the view: a label off it is left out.
+        let inside = |r: &Rectangle| {
+            r.x >= 0.
+                && r.y >= 0.
+                && r.x + r.width <= bounds.width
+                && r.y + r.height <= bounds.height
+        };
+        // The hovered hole's is moved into the view rather than left out.
+        let placed = placed.into_iter().map(|(i, spot, away)| {
+            if hovered == Some(i) && !inside(&spot) {
+                let at = Point::new(
+                    spot.x.clamp(0., (bounds.width - spot.width).max(0.)),
+                    spot.y.clamp(0., (bounds.height - spot.height).max(0.)),
+                );
+                (i, Rectangle::new(at, spot.size()), true)
+            } else {
+                (i, spot, away)
+            }
+        });
+        let labels: Vec<(usize, Rectangle, bool, Color)> = placed
+            .filter(|(_, spot, _)| inside(spot))
+            .filter_map(|(i, spot, away)| color(i).map(|c| (i, spot, away, c)))
+            .collect();
+        // In order: the hovered hole's comes last (`place_labels`), over the
+        // others, which cover none of each other.
+        for &(i, spot, away, color) in &labels {
+            if away {
+                let hole = boxes[i];
+                let from = Point::new(hole.x + hole.width / 2., hole.y + hole.height / 2.);
+                let to = leader_end(from, spot);
+                line(frame, &[from, to], halo, 3.);
+                line(frame, &[from, to], color, 1.);
+            }
+            frame.fill_rectangle(spot.position(), spot.size(), halo);
+            frame.fill_text(Text {
+                content: self.hole_outlines[i].label.clone().unwrap_or_default(),
+                position: Point::new(spot.x + 3., spot.y + 1.),
+                color,
+                size: 11.into(),
+                ..Text::default()
+            });
+        }
+        if hidden > 0 {
+            let said = hidden_note(hidden);
+            let size = iced::Size::new(said.chars().count() as f32 * 6.4 + 12., 20.);
+            // Under the stock's label, top left.
+            let corner = Point::new(((bounds.width - size.width) / 2.).max(6.), 44.);
+            frame.fill_rectangle(corner, size, halo);
+            frame.fill_text(Text {
+                content: said,
+                position: Point::new(corner.x + 6., corner.y + 3.),
+                color: teal,
+                size: 12.into(),
+                ..Text::default()
+            });
+        }
+    }
+    /// Each hole outline's loops on the screen.
+    fn outlines_on_screen(&self, b: Rectangle) -> Vec<Vec<Vec<Point>>> {
+        let p = self.projector(b);
+        let scale = self.mesh.display_scale();
+        (self.hole_outlines.iter())
+            .map(|o| {
+                (o.loops.iter())
+                    .map(|l| {
+                        (l.iter().chain(l.first()))
+                            .map(|q| p.p([q[0] * scale, q[1] * scale, o.z * scale]))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+    /// The hole outline nearest `point` within `OUTLINE_REACH` on the screen.
+    fn outline_near(&self, b: Rectangle, point: Point) -> Option<usize> {
+        if self.hole_outlines.is_empty() {
+            return None;
+        }
+        let mut best = None;
+        for (i, loops) in self.outlines_on_screen(b).iter().enumerate() {
+            for l in loops {
+                for w in l.windows(2) {
+                    let d = segment_distance(point, w[0], w[1]);
+                    if d <= OUTLINE_REACH && best.is_none_or(|(_, e)| d < e) {
+                        best = Some((i, d));
+                    }
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+    /// The smallest hole outline around `point` on the screen.
+    fn outline_around(&self, b: Rectangle, point: Point) -> Option<usize> {
+        let mut best = None;
+        for (i, loops) in self.outlines_on_screen(b).iter().enumerate() {
+            for l in loops {
+                let area = screen_area(l);
+                if area > 0. && inside(point, l) && best.is_none_or(|(_, a)| area < a) {
+                    best = Some((i, area));
+                }
+            }
+        }
+        best.map(|(i, _)| i)
     }
     fn raster(&self, p: &Projector, bounds: Rectangle, hovered: Option<usize>) -> RasterFrame {
         let (w, h, rgba) = self.pixels(p, bounds, hovered);
@@ -1048,9 +1252,9 @@ impl canvas::Program<Event> for Marks<'_> {
         renderer: &Renderer,
         _: &Theme,
         bounds: Rectangle,
-        _: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        vec![self.0.marks(renderer, bounds)]
+        vec![self.0.marks(renderer, bounds, cursor)]
     }
 }
 impl<'a> Viewport<'a> {
@@ -1065,9 +1269,15 @@ impl<'a> Viewport<'a> {
         .height(height)
         .into()
     }
-    fn marks(&self, renderer: &Renderer, bounds: Rectangle) -> canvas::Geometry {
+    fn marks(
+        &self,
+        renderer: &Renderer,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> canvas::Geometry {
         let p = self.projector(bounds);
         let mut frame = Frame::new(renderer, bounds.size());
+        self.hole_marks(&mut frame, bounds, cursor);
         if self.show_stock
             && let Some(setup) = self.setup
             && let Some(stock) = self.resolved_stock()
@@ -1259,15 +1469,23 @@ impl<'a> Viewport<'a> {
             let size = iced::Size::new(56., 16.);
             let centre = Point::new(o.x - ax * 40., o.y - ay * 22.);
             let corner = Point::new(centre.x - size.width / 2., centre.y - size.height / 2.);
-            frame.fill_rectangle(corner, size, halo);
-            let label = Point::new(corner.x + 3., corner.y + 1.);
-            frame.fill_text(Text {
-                content: "X0 Y0 Z0".into(),
-                position: label,
-                color: Color::from_rgb8(30, 30, 30),
-                size: 11.into(),
-                ..Text::default()
-            });
+            // Text is not clipped to the view: off it, over the panels round
+            // it, the label is left out.
+            if corner.x >= 0.
+                && corner.y >= 0.
+                && corner.x + size.width <= bounds.width
+                && corner.y + size.height <= bounds.height
+            {
+                frame.fill_rectangle(corner, size, halo);
+                let label = Point::new(corner.x + 3., corner.y + 1.);
+                frame.fill_text(Text {
+                    content: "X0 Y0 Z0".into(),
+                    position: label,
+                    color: Color::from_rgb8(30, 30, 30),
+                    size: 11.into(),
+                    ..Text::default()
+                });
+            }
         }
         let origin = Point::new(45., bounds.height - 45.);
         let o = p.p([0., 0., 0.]);
@@ -1572,6 +1790,181 @@ fn pin_outline(
         ..Text::default()
     });
     p.p([c[0], c[1], z[1]])
+}
+/// Where each hole's label goes in the 3D view (`boxes`: each hole's
+/// outline's box on the screen; `widths`: its label's length, None for an
+/// unlabelled hole). The picked holes' first, then the rest, each where
+/// `label_spot` finds room: beside its outline, or a little way out with a
+/// leader line, clear of the other holes and labels. Else it is left out
+/// (counted in the second value): the view then says how many are, and the
+/// pointer over the hole shows it, for the hovered hole's label always goes,
+/// laid out after the others so that pointing moves none of them, and last
+/// in the list, so that it is drawn over them. So no label covers another
+/// or another hole, or seems to be another hole's. Each placed label: its
+/// hole, its place, and whether it is away from its hole.
+pub(crate) fn place_labels(
+    boxes: &[Rectangle],
+    widths: &[Option<usize>],
+    picked: &[bool],
+    hovered: Option<usize>,
+) -> (Vec<(usize, Rectangle, bool)>, usize) {
+    // The labels without the pointer, so that pointing at a hole moves no
+    // other label; then the hovered hole's, when it was left out.
+    let mut order: Vec<usize> = (0..boxes.len()).filter(|&i| widths[i].is_some()).collect();
+    order.sort_by_key(|&i| !picked[i]);
+    let mut labels: Vec<(usize, Rectangle, bool)> = vec![];
+    let mut hidden = 0;
+    for &i in &order {
+        let taken: Vec<Rectangle> = labels.iter().map(|l| l.1).collect();
+        match label_spot(boxes, widths, i, &taken, false) {
+            Some((spot, away)) => labels.push((i, spot, away)),
+            None => hidden += 1,
+        }
+    }
+    if let Some(at) = hovered.and_then(|h| labels.iter().position(|l| l.0 == h)) {
+        // Shown already: last, drawn over the others.
+        let l = labels.remove(at);
+        labels.push(l);
+    } else if let Some(h) = hovered
+        && widths.get(h).is_some_and(|w| w.is_some())
+    {
+        let taken: Vec<Rectangle> = labels.iter().map(|l| l.1).collect();
+        if let Some((spot, away)) = label_spot(boxes, widths, h, &taken, true) {
+            labels.push((h, spot, away));
+            hidden -= 1;
+        }
+    }
+    (labels, hidden)
+}
+/// How far a label keeps from another hole's outline on the screen: so near
+/// it, it would seem to be that hole's.
+const LABEL_GAP: f32 = 4.;
+/// Where hole `i`'s label goes, given the labels `taken` (`place_labels`),
+/// and whether that is away from its hole, with a leader line. Beside it,
+/// right or left, clear of its own outline, `LABEL_GAP` from every other
+/// labelled hole's and off every label taken; else 20 or 32 points out in one
+/// of eight directions, its leader line crossing no other labelled hole and
+/// no label. None if no place is; but `anyway` (the hovered hole) takes any
+/// free place whatever its line crosses, and else the place beside it, over
+/// whatever is there.
+fn label_spot(
+    boxes: &[Rectangle],
+    widths: &[Option<usize>],
+    i: usize,
+    taken: &[Rectangle],
+    anyway: bool,
+) -> Option<(Rectangle, bool)> {
+    let width = widths[i]?;
+    let hole = boxes[i];
+    let size = iced::Size::new(width as f32 * 6.6 + 6., 15.);
+    let (cx, cy) = (hole.x + hole.width / 2., hole.y + hole.height / 2.);
+    let beside = [
+        Point::new(hole.x + hole.width + 2., cy - size.height / 2.),
+        Point::new(hole.x - 2. - size.width, cy - size.height / 2.),
+    ];
+    let mut spots: Vec<(Point, bool)> = beside.iter().map(|&p| (p, false)).collect();
+    for reach in [20., 32.] {
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let (x, y) = (cx + reach * a.cos(), cy - reach * a.sin());
+            spots.push((Point::new(x - size.width / 2., y - size.height / 2.), true));
+        }
+    }
+    let apart = |a: &Rectangle, b: &Rectangle| {
+        a.x + a.width <= b.x
+            || b.x + b.width <= a.x
+            || a.y + a.height <= b.y
+            || b.y + b.height <= a.y
+    };
+    let others = (boxes.iter().enumerate())
+        .filter(|&(j, _)| j != i && widths[j].is_some())
+        .map(|(_, b)| *b);
+    let near: Vec<Rectangle> = others
+        .clone()
+        .map(|b| {
+            Rectangle::new(
+                Point::new(b.x - LABEL_GAP, b.y - LABEL_GAP),
+                iced::Size::new(b.width + 2. * LABEL_GAP, b.height + 2. * LABEL_GAP),
+            )
+        })
+        .collect();
+    let free = |at: Point| {
+        let r = Rectangle::new(at, size);
+        apart(&r, &hole) && near.iter().chain(taken).all(|b| apart(&r, b))
+    };
+    // A leader line crosses no other hole (it would seem to point at that
+    // one) and no other label.
+    let others: Vec<Rectangle> = others.collect();
+    let clear = |at: Point| {
+        let from = Point::new(cx, cy);
+        let to = leader_end(from, Rectangle::new(at, size));
+        (0..=20).all(|k| {
+            let t = k as f32 / 20.;
+            let q = Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+            others.iter().chain(taken).all(|b| !b.contains(q))
+        })
+    };
+    let found = (spots.iter())
+        .find(|&&(at, away)| free(at) && (!away || clear(at)))
+        .or_else(|| {
+            anyway
+                .then(|| spots.iter().find(|&&(at, _)| free(at)))
+                .flatten()
+        })
+        .copied()
+        .or(anyway.then_some((beside[0], false)));
+    found.map(|(at, away)| (Rectangle::new(at, size), away))
+}
+/// What the view says when `n` holes' labels are left out where holes are
+/// close together.
+pub(crate) fn hidden_note(n: usize) -> String {
+    format!(
+        "{} hidden where holes are close: zoom in, or point at a hole",
+        if n == 1 {
+            "1 hole's size".to_string()
+        } else {
+            format!("{n} holes' sizes")
+        }
+    )
+}
+/// Where a leader line from `from` meets the label `spot`: its nearest point.
+fn leader_end(from: Point, spot: Rectangle) -> Point {
+    Point::new(
+        from.x.clamp(spot.x, spot.x + spot.width),
+        from.y.clamp(spot.y, spot.y + spot.height),
+    )
+}
+/// How near a hole's outline the pointer picks it, in screen points.
+const OUTLINE_REACH: f32 = 4.;
+/// How far `p` is from the segment `a`–`b`, on the screen.
+fn segment_distance(p: Point, a: Point, b: Point) -> f32 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length = dx * dx + dy * dy;
+    let t = if length > 0. {
+        (((p.x - a.x) * dx + (p.y - a.y) * dy) / length).clamp(0., 1.)
+    } else {
+        0.
+    };
+    p.distance(Point::new(a.x + t * dx, a.y + t * dy))
+}
+/// Whether `p` is inside the closed loop `l`, on the screen (even-odd).
+fn inside(p: Point, l: &[Point]) -> bool {
+    let mut odd = false;
+    for w in l.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            odd = !odd;
+        }
+    }
+    odd
+}
+/// The area the closed loop `l` covers on the screen.
+fn screen_area(l: &[Point]) -> f32 {
+    (l.windows(2)
+        .map(|w| w[0].x * w[1].y - w[1].x * w[0].y)
+        .sum::<f32>()
+        / 2.)
+        .abs()
 }
 fn line(frame: &mut Frame, points: &[Point], c: Color, w: f32) {
     let path = Path::new(|b| {
@@ -2214,6 +2607,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2284,6 +2678,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2335,6 +2730,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
@@ -2397,6 +2793,7 @@ mod tests {
                 camera: Camera::default(),
                 picking: false,
                 pin_holes: Default::default(),
+                hole_outlines: vec![],
                 pin_aim: Default::default(),
                 show_stock: true,
                 show_paths: false,
@@ -2441,6 +2838,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock,
             show_paths: false,
@@ -2518,6 +2916,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
@@ -2653,6 +3052,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2748,6 +3148,7 @@ mod tests {
             },
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2808,6 +3209,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2855,6 +3257,7 @@ mod tests {
             camera: Camera::default(),
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2903,6 +3306,7 @@ mod tests {
             camera,
             picking: true,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,
@@ -2949,6 +3353,7 @@ mod tests {
             },
             picking: true,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -2970,6 +3375,160 @@ mod tests {
         assert_eq!(v.picked(bounds, v.projector(bounds).p(point)), None);
     }
 
+    #[test]
+    fn a_holes_outline_under_the_pointer_or_its_opening_clicks_one_of_its_walls() {
+        let mesh = crate::mesh::normalize(vec![
+            [[0., 0., 0.], [10., 0., 0.], [0., 10., 0.]],
+            [[0., 0., 2.], [10., 0., 2.], [0., 10., 2.]],
+        ])
+        .unwrap();
+        let d = crate::model::Document::sample();
+        let scale = mesh.display_scale();
+        let at = Placement::new(&mesh, Some(d.setup()))
+            .transform(mesh.surfaces[1].center)
+            .map(|v| v / scale);
+        // A 2 mm square outline round the upper face's centre, and one 50 mm
+        // off the part, where nothing of it is under the pointer.
+        let square = |x: f32, walls: Vec<usize>| HoleOutline {
+            loops: vec![vec![
+                [x - 1., at[1] - 1.],
+                [x + 1., at[1] - 1.],
+                [x + 1., at[1] + 1.],
+                [x - 1., at[1] + 1.],
+            ]],
+            z: at[2],
+            walls,
+            picked: false,
+            label: None,
+        };
+        let v = Viewport {
+            setup: Some(d.setup()),
+            operation: Some(&d.setup().operations[0]),
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera {
+                yaw: 0.,
+                pitch: std::f32::consts::FRAC_PI_2,
+                ..Default::default()
+            },
+            picking: true,
+            pin_holes: Default::default(),
+            hole_outlines: vec![square(at[0], vec![7, 9]), square(at[0] + 50., vec![8])],
+            pin_aim: Default::default(),
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+            live: None,
+            live_stock: None,
+            uncut: &[],
+            show_uncut: true,
+        };
+        let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
+        let screen = |x: f32, y: f32| v.projector(b).p([x * scale, y * scale, at[2] * scale]);
+        // On the outline, over the part: the outline's hole, by its first wall.
+        assert_eq!(v.picked(b, screen(at[0] + 1., at[1])), Some(7));
+        // Within its reach on the screen, and not beyond it.
+        let edge = screen(at[0] + 1., at[1]);
+        assert_eq!(v.picked(b, Point::new(edge.x + 3.5, edge.y)), Some(7));
+        assert!(v.picked(b, Point::new(edge.x + 30., edge.y)) != Some(7));
+        // Inside it with the part's face under the pointer: the face.
+        assert_eq!(v.picked(b, screen(at[0], at[1])), Some(1));
+        // Inside the outline off the part: the opening picks its hole.
+        assert_eq!(v.picked(b, screen(at[0] + 50., at[1])), Some(8));
+        assert_eq!(v.picked(b, screen(at[0] + 80., at[1])), None);
+        // Not while picking is off.
+        let off = Viewport {
+            picking: false,
+            ..v.clone()
+        };
+        assert_eq!(off.picked(b, screen(at[0] + 50., at[1])), None);
+    }
+
+    #[test]
+    fn hole_labels_never_cover_each_other_or_another_hole_and_crowded_ones_are_counted() {
+        let hole = |x: f32, y: f32| Rectangle::new(Point::new(x, y), iced::Size::new(8., 8.));
+        let overlap = |a: &Rectangle, b: &Rectangle| {
+            a.x < b.x + b.width
+                && b.x < a.x + a.width
+                && a.y < b.y + b.height
+                && b.y < a.y + a.height
+        };
+        // Three holes far apart: each labelled beside it.
+        let apart = [hole(0., 0.), hole(200., 0.), hole(0., 200.)];
+        let (placed, hidden) = place_labels(&apart, &[Some(2); 3], &[false; 3], None);
+        assert_eq!((placed.len(), hidden), (3, 0));
+        assert!(placed.iter().all(|(_, _, away)| !away));
+        // A 6 × 6 grid of holes 11 points apart, labels as wide as "Ø1.8".
+        let grid: Vec<Rectangle> = (0..36)
+            .map(|k| hole((k % 6) as f32 * 11., (k / 6) as f32 * 11.))
+            .collect();
+        for hovered in std::iter::once(None).chain((0..36).map(Some)) {
+            let (placed, hidden) = place_labels(&grid, &[Some(4); 36], &[false; 36], hovered);
+            assert_eq!(placed.len() + hidden, 36);
+            assert!(hidden > 0, "{placed:?}");
+            for (n, (i, spot, away)) in placed.iter().enumerate() {
+                // The hovered hole's goes over the others if it must.
+                if hovered == Some(*i) {
+                    continue;
+                }
+                // No label covers another, nor a hole but its own.
+                for (j, other, _) in &placed[n + 1..] {
+                    assert!(
+                        hovered == Some(*j) || !overlap(spot, other),
+                        "{spot:?} {other:?}"
+                    );
+                }
+                for (j, b) in grid.iter().enumerate() {
+                    assert!(j == *i || !overlap(spot, b), "label of {i} on hole {j}");
+                }
+                // A leader line passes no other hole.
+                if *away {
+                    let from = Point::new(grid[*i].x + 4., grid[*i].y + 4.);
+                    let to = leader_end(from, *spot);
+                    for k in 0..=50 {
+                        let t = k as f32 / 50.;
+                        let q =
+                            Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+                        for (j, b) in grid.iter().enumerate() {
+                            assert!(j == *i || !b.contains(q), "leader of {i} through hole {j}");
+                        }
+                    }
+                }
+            }
+            // The hovered hole's label always shows, last, so that it is
+            // drawn over the others, and pointing at it moves no other label.
+            if let Some(h) = hovered {
+                assert_eq!(placed.last().map(|l| l.0), Some(h));
+                let (still, _) = place_labels(&grid, &[Some(4); 36], &[false; 36], None);
+                for l in &still {
+                    assert!(placed.contains(l), "{l:?} moved");
+                }
+            }
+            // Each keeps its gap from every other hole.
+            for (i, spot, _) in placed.iter().filter(|l| hovered != Some(l.0)) {
+                for (j, b) in grid.iter().enumerate().filter(|(j, _)| j != i) {
+                    let wide = Rectangle::new(
+                        Point::new(b.x - LABEL_GAP + 0.01, b.y - LABEL_GAP + 0.01),
+                        iced::Size::new(
+                            b.width + 2. * LABEL_GAP - 0.02,
+                            b.height + 2. * LABEL_GAP - 0.02,
+                        ),
+                    );
+                    assert!(
+                        !overlap(spot, &wide),
+                        "label of {i} within the gap of hole {j}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            hidden_note(7),
+            "7 holes' sizes hidden where holes are close: zoom in, or point at a hole"
+        );
+    }
     /// The frame is right-handed: in each of the camera buttons' views
     /// (TOP, FRONT, RIGHT and ISO, the default) the axes go where a part
     /// seen from there has them.
@@ -3044,6 +3603,7 @@ mod tests {
             },
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: false,
             show_paths: false,

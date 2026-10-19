@@ -3346,7 +3346,7 @@ pub(crate) fn post_simulated(
                         })?;
                         let mut tools: Vec<String> = vec![];
                         for op in &p.ops {
-                            let tool = format!("T{} {}", op.tool, op.tool_name);
+                            let tool = crate::model::tool_label(op.tool, &op.tool_name);
                             if !tools.contains(&tool) {
                                 tools.push(tool);
                             }

@@ -1945,8 +1945,13 @@ pub(crate) fn pin_aim(app: &App) -> viewport::PinAim {
 /// stock, workholding, the preview and the machine's tool while a tool run of
 /// the setup cuts. None without a part to show.
 fn scene(app: &App) -> Option<Element<'_, Message>> {
+    let canvas: Element<viewport::Event> = scene_viewport(app)?.view(Fill);
+    Some(canvas.map(Message::Viewport))
+}
+/// The 3D view `scene` shows. None without a part to show.
+pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
     let s = app.doc.active_setup();
-    let canvas: Element<viewport::Event> = Viewport {
+    Some(Viewport {
         setup: s,
         mesh: app.part_mesh()?,
         operation: app.operation(),
@@ -1955,6 +1960,7 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
         camera: app.camera,
         picking: app.picking || app.picking_pin_holes(),
         pin_holes: pin_hole_marks(app),
+        hole_outlines: app.hole_outlines(),
         pin_aim: pin_aim(app),
         show_stock: app.stock && s.is_some(),
         show_paths: app.paths && app.playback_ready(),
@@ -1972,9 +1978,7 @@ fn scene(app: &App) -> Option<Element<'_, Message>> {
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
         show_uncut: app.show_uncut,
-    }
-    .view(Fill);
-    Some(canvas.map(Message::Viewport))
+    })
 }
 fn workspace(app: &App) -> Element<'_, Message> {
     let s = app.doc.active_setup();
@@ -2453,7 +2457,7 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 } else if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Drill { "Select a horizontal rim face containing circular hole openings. Geometry detects the holes in that face; the diameter filter can restrict the group." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or click any wall of a hole: that picks the whole hole, and its outline is cut down to its floor, or through the part if nothing is under it. Click a picked wall again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -2468,10 +2472,15 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                             .width(Fill),
                         );
                     }
+                    if app.finding_holes() {
+                        c = c.push(muted("Finding the part's holes: their outlines show when the pointer is over them once found."));
+                    }
                     let selection = o.surfaces.as_ref();
                     // A Pocket or an inside Contour lists the holes its
-                    // selected walls pick, and its floors as surfaces.
-                    let picks_holes = matches!(o.strategy, Strategy::Pocket | Strategy::Contour);
+                    // selected walls pick, and its floors as surfaces; a
+                    // Drill lists the holes it drills (below).
+                    let picks_holes = crate::picks_holes(o);
+                    let drill = o.strategy == Strategy::Drill;
                     let wall = |id: usize| {
                         picks_holes
                             && app
@@ -2485,14 +2494,18 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     // Floors are surfaces; holes are listed by their walls.
                     if !picks_holes {
                         c = c.push(muted(format!("{} selected", plural(count, "surface"))));
+                    } else if drill {
+                        if count > 0 {
+                            c = c.push(muted(format!("{} selected", plural(count, "rim face"))));
+                        }
                     } else if count > 0 || !walls {
                         c = c.push(muted(format!(
                             "{} selected",
                             plural(count, "floor surface")
                         )));
                     }
-                    if let (true, Some(selected), Some(mesh)) =
-                        (walls, selection, &app.imported_mesh)
+                    if let (true, false, Some(selected), Some(mesh)) =
+                        (walls, drill, selection, &app.imported_mesh)
                         && selected.matches(mesh)
                     {
                         match &*app.pocket_holes(o, mesh) {
@@ -2567,15 +2580,53 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         if let Some(mesh) = &app.imported_mesh {
                             match &*app.drill_holes(o, mesh) {
                                 Ok(holes) => {
-                                    for h in holes.iter().take(24) {
-                                        c = c.push(muted(format!(
-                                            "Bore Ø{:.2} / opening Ø{:.2} · X{:.2} Y{:.2} · depth {:.2} mm · {}",
-                                            h.diameter, h.opening,
-                                            h.center[0],
-                                            h.center[1],
+                                    // A hole picked by its walls has a remove
+                                    // button; a rim face's go with the face.
+                                    let picked = app.pocket_holes(o, mesh);
+                                    let by_walls = |h: &crate::cam::Hole| {
+                                        picked.as_ref().as_ref().ok().and_then(|p| {
+                                            p.iter().position(|w| {
+                                                let (x, y) = w.centre();
+                                                (x as f32 - h.center[0])
+                                                    .hypot(y as f32 - h.center[1])
+                                                    <= 0.1
+                                            })
+                                        })
+                                    };
+                                    c = c.push(muted(format!(
+                                        "{} to drill",
+                                        plural(holes.len(), "hole")
+                                    )));
+                                    for h in holes.iter().take(64) {
+                                        let said = format!(
+                                            "Ø{:.2} (opening Ø{:.2}) · X{:.2} Y{:.2} · depth {:.2} mm · {}",
+                                            h.diameter,
+                                            h.opening,
+                                            // No "-0.00" for a centre on an axis.
+                                            if h.center[0].abs() < 0.005 {
+                                                0.
+                                            } else {
+                                                h.center[0]
+                                            },
+                                            if h.center[1].abs() < 0.005 {
+                                                0.
+                                            } else {
+                                                h.center[1]
+                                            },
                                             h.top - h.bottom,
                                             if h.through { "through" } else { "blind" }
-                                        )));
+                                        );
+                                        c = c.push(match by_walls(h) {
+                                            Some(i) => Element::from(
+                                                btn(
+                                                    format!("✓ {said} · remove"),
+                                                    Message::DropHole(i),
+                                                    true,
+                                                )
+                                                .width(Fill),
+                                            ),
+                                            None => muted(said).into(),
+                                        });
                                     }
                                 }
                                 Err(error) => c = c.push(note(error.clone())),
@@ -6498,10 +6549,9 @@ pub(crate) fn run_strip<'a>(
             None => String::new(),
         };
         body = body.push(muted(format!(
-            "Next tool run: {} of {count}, T{} {}{from}",
+            "Next tool run: {} of {count}, {}{from}",
             run.next + 1,
-            p.ops[0].tool,
-            p.ops[0].tool_name
+            crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
         )));
     }
     let mut problems = run.problems(c, &app.doc);
@@ -6606,10 +6656,9 @@ pub(crate) fn run_panel<'a>(
                 text(mark).size(12).width(52),
                 act(
                     format!(
-                        "Tool run {} of {count}: T{} {}",
+                        "Tool run {} of {count}: {}",
                         i + 1,
-                        p.ops[0].tool,
-                        p.ops[0].tool_name
+                        crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
                     ),
                     msg(!running, R::Next(i)),
                     i == run.next,
@@ -6649,10 +6698,9 @@ pub(crate) fn run_panel<'a>(
     if let Some(p) = run.tool_change() {
         let o = &p.ops[0];
         body = body.push(note(format!(
-            "Tool change for tool run {}: T{} {} (stickout {:.1} mm). The last tool run ended with the spindle and coolant off at the clearance plane. 1. If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and press Record reference. 2. Jog up and change to T{}. 3. Touch the new tool on the same surface and press Set Z from reference, or Zero Z on the stock top if no tool run has cut it. With a touch plate on that surface, Probe reference and Probe Z from reference do steps 1 and 3. 4. Jog clear and press Cycle Start. X/Y zero stays as it is.",
+            "Tool change for tool run {}: {} (stickout {:.1} mm). The last tool run ended with the spindle and coolant off at the clearance plane. 1. If no reference is recorded, touch the old tool on a surface that stays put (a vise jaw, the table, a block) and press Record reference. 2. Jog up and change to T{}. 3. Touch the new tool on the same surface and press Set Z from reference, or Zero Z on the stock top if no tool run has cut it. With a touch plate on that surface, Probe reference and Probe Z from reference do steps 1 and 3. 4. Jog clear and press Cycle Start. X/Y zero stays as it is.",
             run.next + 1,
-            o.tool,
-            o.tool_name,
+            crate::model::tool_label(o.tool, &o.tool_name),
             o.stickout,
             o.tool
         )));
@@ -6804,7 +6852,7 @@ fn op_card<'a>(
         ]
         .spacing(4),
         muted(if o.name == o.strategy {
-            format!("T{} {}", o.tool, o.tool_name)
+            crate::model::tool_label(o.tool, &o.tool_name)
         } else {
             format!("{} · T{}", o.strategy, o.tool)
         })
@@ -7004,13 +7052,12 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
         .map(|o| o.name.as_str())
         .collect();
     let mut steps = vec![format!(
-        "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load T{} {} and set the work zero on the stock they left.",
+        "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load {} and set the work zero on the stock they left.",
         o.name,
         run.next + 1,
         skipped.join(", "),
         if skipped.len() == 1 { "it" } else { "them" },
-        o.tool,
-        o.tool_name
+        crate::model::tool_label(o.tool, &o.tool_name)
     )];
     let datum = p.datum[2];
     // Where the check cannot tell the surface, step 3 says so.
@@ -7318,13 +7365,24 @@ pub(crate) fn holder_labels(h: &crate::holding::Holder) -> (String, String) {
 /// fields scroll, and under them, outside the scroll, the notes (an unsaved
 /// draft, an entry that cannot be deleted) and the Save and Delete buttons
 /// stay in sight at any window height.
+/// A library entry's editor: its fields, scrolled, and under them, always
+/// in view, what keeps Save from saving it (`blocking`, its own checks; the
+/// form lists them too, at its end), the notes, and the buttons.
 fn library_editor<'a>(
     form: Column<'a, Message>,
+    blocking: &[String],
     notes: impl IntoIterator<Item = String>,
     save: HelpButton<'a>,
     delete: HelpButton<'a>,
 ) -> Element<'a, Message> {
     let mut actions = column![].spacing(8);
+    if !blocking.is_empty() {
+        actions = actions.push(
+            text(format!("Save is blocked: {}", blocking.join(" ")))
+                .size(12)
+                .color(Color::from_rgb8(180, 35, 24)),
+        );
+    }
     for note in notes {
         actions = actions.push(text(note).size(12).color(Color::from_rgb8(166, 101, 32)));
     }
@@ -7462,9 +7520,10 @@ pub(crate) fn tools(app: &App) -> Element<'_, Message> {
     form = form.push(machine_boxes(app, p, lathe, Message::ToolMachine));
     let mut tool_issues = app.tool_draft.issues();
     tool_issues.extend(app.doc.tool_number_issues(&app.tool_draft));
-    form = form.push(warnings(tool_issues));
+    form = form.push(warnings(tool_issues.clone()));
     let editor = library_editor(
         form,
+        &tool_issues,
         tool_unsaved(app)
             .into_iter()
             .chain(app.doc.tool_in_use_note(&app.tool_draft.id)),
@@ -7535,9 +7594,10 @@ pub(crate) fn materials(app: &App) -> Element<'_, Message> {
     }
     let mut issues = app.material_draft.issues();
     issues.extend(app.doc.material_name_issues(&app.material_draft));
-    form = form.push(warnings(issues));
+    form = form.push(warnings(issues.clone()));
     let editor = library_editor(
         form,
+        &issues,
         material_unsaved(app),
         primary("Save material", Message::SaveMaterial),
         danger(
@@ -7662,10 +7722,11 @@ pub(crate) fn workholding(app: &App) -> Element<'_, Message> {
             Message::HolderMachine,
         ))
         .push(field(p, "notes", "Notes", t))
-        .push(warnings(issues));
+        .push(warnings(issues.clone()));
     let (save, delete) = holder_labels(draft);
     let editor = library_editor(
         form,
+        &issues,
         holder_unsaved(app),
         primary(save, Message::SaveHolder),
         danger(delete, Message::DeleteHolder(draft.id.clone())),
@@ -8569,7 +8630,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
                 .tools
                 .iter()
                 .find(|t| t.id == o.tool)
-                .map(|t| format!("T{} {}", get(&t.p, "number"), t.name()))
+                .map(|t| crate::model::tool_label(get(&t.p, "number"), t.name()))
                 .unwrap_or_default();
             let minutes = check
                 .operations
@@ -8656,6 +8717,7 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             camera: app.plan_camera,
             picking: false,
             pin_holes: Default::default(),
+            hole_outlines: vec![],
             pin_aim: Default::default(),
             show_stock: true,
             show_paths: false,
@@ -9571,6 +9633,8 @@ fn post(app: &App) -> Element<'_, Message> {
         code = code.push(
             text(if app.post_busy {
                 "Writing the programs…"
+            } else if page.machine == NcMachine::Uc100 {
+                "A UC100 machine takes no G-code file: each setup's program goes to the machine from MACHINE, through Run on the machine."
             } else {
                 "Each setup's G-code appears here once its checks pass."
             })

@@ -605,10 +605,9 @@ impl Run {
             && (s.work_offset[2] - z).abs() < 1e-6
         {
             e.push(format!(
-                "Tool run {} uses T{} {}: touch off its Z first (Set Z from reference, or Zero Z).",
+                "Tool run {} uses {}: touch off its Z first (Set Z from reference, or Zero Z).",
                 self.next + 1,
-                p.ops[0].tool,
-                p.ops[0].tool_name
+                crate::model::tool_label(p.ops[0].tool, &p.ops[0].tool_name)
             ));
         }
         e

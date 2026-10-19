@@ -64,7 +64,9 @@ impl Strategy {
             Self::Contour => {
                 "Available · outside silhouette or selected-floor inside contours; computer compensation"
             }
-            Self::Drill => "Available · detected circular openings in a selected horizontal rim",
+            Self::Drill => {
+                "Available · round holes clicked on the part, or the openings in a selected horizontal rim"
+            }
             Self::Parallel => "Available · sampled vertical flat/ball cutter surface finishing",
             Self::Waterline => "Available · constant-Z contours with a vertical flat cutter",
             Self::Adaptive => {
@@ -236,6 +238,18 @@ const HANDED_OVER: [&str; 17] = [
     "fixture",
     "clearance",
 ];
+
+/// A tool as the app names it: "T4 Flat end mill 3mm" for tool number 4
+/// named "Flat end mill 3mm", and the name alone when it already begins
+/// with its number ("T4 Flat end mill 3mm" is not "T4 T4 …").
+pub fn tool_label(number: impl std::fmt::Display, name: &str) -> String {
+    let t = format!("T{number}");
+    if name == t || name.starts_with(&format!("{t} ")) {
+        name.to_string()
+    } else {
+        format!("{t} {name}")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Machine {
@@ -498,7 +512,11 @@ impl Tool {
             e.push("Flutes must be a whole number.".into())
         }
         if num(&self.p, "stickout") < num(&self.p, "length") {
-            e.push("Stickout must be at least the flute length.".into())
+            e.push(format!(
+                "Stickout ({} mm) must be at least the flute length ({} mm): how far the tool reaches out of its holder.",
+                get(&self.p, "stickout"),
+                get(&self.p, "length")
+            ))
         }
         if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
@@ -2985,6 +3003,21 @@ mod tests {
             !o.issues(&m, &tools, &[])
                 .contains(&HELICAL_PIN_DRILL.to_string())
         );
+    }
+    #[test]
+    fn a_tool_named_with_its_number_is_not_numbered_twice() {
+        assert_eq!(tool_label(4, "Flat end mill 3mm"), "T4 Flat end mill 3mm");
+        assert_eq!(
+            tool_label(4, "T4 Flat end mill 3mm"),
+            "T4 Flat end mill 3mm"
+        );
+        assert_eq!(tool_label("4", "T4"), "T4");
+        // Another number, or a name that only starts like one, keeps it.
+        assert_eq!(
+            tool_label(1, "T4 Flat end mill 3mm"),
+            "T1 T4 Flat end mill 3mm"
+        );
+        assert_eq!(tool_label(4, "T45 drill"), "T4 T45 drill");
     }
     #[test]
     fn incompatible_pick_ignored() {
