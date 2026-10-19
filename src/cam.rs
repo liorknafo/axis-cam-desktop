@@ -474,12 +474,20 @@ fn contour(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
             "Use a positive stepdown within flute length and 0–20 whole finishing passes.".into(),
         );
     }
-    let mut envelope = g.bounds;
-    for k in 0..2 {
-        envelope.min[k] -= 2. * b.plan.radius + radial + (b.plan.radius * 0.01).max(0.02);
-        envelope.max[k] += 2. * b.plan.radius + radial + (b.plan.radius * 0.01).max(0.02);
-    }
-    let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
+    // From the highest material in the ring the cutter sweeps round each
+    // outline, not in the outlines' box: the part inside the ring stands
+    // above where earlier cuts may have cleared round it.
+    let outer: Vec<Polygon> = paths.iter().filter(|p| area(p) > 0.).cloned().collect();
+    let ring: Vec<Polygon> = Region::from(outer)
+        .inflate(b.plan.radius as f64, JoinType::Round, EndType::Joined, 2.)
+        .into();
+    let cutting_top = crate::rest::start_over(
+        setup,
+        &crate::rest::Reach::new(&ring),
+        target,
+        top,
+        number(op, "top")?,
+    );
     b.plan.rest_top = (cutting_top < top - 0.0001).then_some(cutting_top);
     let levels = ((cutting_top - target - 0.0001) / down).ceil().max(1.) as usize;
     if levels > CEILING {
@@ -1936,19 +1944,13 @@ fn drill(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan
         {
             return Err("Drilling depth must fit the flute length, and the bottom offset cannot take the drill below the hole bottom: only Through does, below a hole that goes through the part.".into());
         }
-        let envelope = Bounds {
-            min: [
-                h.center[0] - b.plan.radius,
-                h.center[1] - b.plan.radius,
-                target,
-            ],
-            max: [
-                h.center[0] + b.plan.radius,
-                h.center[1] + b.plan.radius,
-                top,
-            ],
-        };
-        let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
+        let cutting_top = crate::rest::start_over(
+            setup,
+            &crate::rest::Reach::disc([h.center[0], h.center[1]], b.plan.radius),
+            target,
+            top,
+            number(op, "top")?,
+        );
         let lower = (cutting_top < top - 0.0001).then_some(cutting_top);
         b.plan.rest_top = if b.plan.levels == 0 {
             lower
@@ -2101,11 +2103,13 @@ fn helical(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Pl
         // The cutter's centre travels up to `outer` from the hole's.
         let outer = (diameter / 2. - r).max(0.);
         let reach = outer + r;
-        let envelope = Bounds {
-            min: [h.center[0] - reach, h.center[1] - reach, target],
-            max: [h.center[0] + reach, h.center[1] + reach, top],
-        };
-        let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
+        let cutting_top = crate::rest::start_over(
+            setup,
+            &crate::rest::Reach::disc([h.center[0], h.center[1]], reach),
+            target,
+            top,
+            number(op, "top")?,
+        );
         // The flutes cut the hole's wall from where the material starts
         // down; the tool's reach from the stock's top is its stickout's.
         if cutting_top - target >= b.plan.flute_length {
@@ -2514,12 +2518,26 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     {
         return Err("Use nonnegative allowances, a target above model bottom, positive stepdown within flute length, and adequate tool reach.".into());
     }
-    let mut envelope = g.bounds;
-    for k in 0..2 {
-        envelope.min[k] -= 2. * b.plan.radius + allowance + (b.plan.radius * 0.01).max(0.02);
-        envelope.max[k] += 2. * b.plan.radius + allowance + (b.plan.radius * 0.01).max(0.02);
-    }
-    let cutting_top = crate::rest::start(setup, envelope, target, top, number(op, "top")?);
+    // Every level's loops go round what of the model stands above it, so
+    // the cutter stays within its diameter and the allowance of the model's
+    // outline: material beyond that, as in the corners of the outline's box,
+    // does not keep the start up.
+    let near: Vec<Polygon> = g
+        .silhouette(false, op)?
+        .inflate(
+            (2. * b.plan.radius + allowance + (b.plan.radius * 0.01).max(0.02)) as f64,
+            JoinType::Round,
+            EndType::Polygon,
+            2.,
+        )
+        .into();
+    let cutting_top = crate::rest::start_over(
+        setup,
+        &crate::rest::Reach::new(&near),
+        target,
+        top,
+        number(op, "top")?,
+    );
     b.plan.rest_top = (cutting_top < top - 0.0001).then_some(cutting_top);
     let levels = ((cutting_top - target) / down).ceil().max(1.) as usize;
     if levels > CEILING {
@@ -2761,6 +2779,71 @@ pub(crate) mod tests {
         op.p.insert("spindle_rotation".into(), "Counterclockwise (CCW)".into());
         assert!(winding(&generate(&setup, &op, &tool, &mesh).unwrap()) < 0.);
         assert_plan(plan);
+    }
+    #[test]
+    fn an_outside_contour_starts_under_what_was_cleared_round_the_part_not_its_box() {
+        let mesh = block();
+        let (mut setup, op, tool) = fixture(Strategy::Contour);
+        for k in ["stock_left", "stock_right", "stock_front", "stock_back"] {
+            setup.p.insert(k.into(), "8".into());
+        }
+        let g = Geometry::new(&setup, &mesh);
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let top = plan.stock.max[2];
+        let frame = crate::volume::Frame::new(&setup, &mesh);
+        // A Ø`2 × radius` cutter once round the part, its edge on the
+        // part's sides, down to the part's top: the stock over the part
+        // stays.
+        let cleared = |radius: f32| {
+            let mut v = crate::volume::Volume::new(plan.stock, frame);
+            let (lo, hi) = (g.bounds.min, g.bounds.max);
+            let corners = [
+                [lo[0] - radius, lo[1] - radius],
+                [hi[0] + radius, lo[1] - radius],
+                [hi[0] + radius, hi[1] + radius],
+                [lo[0] - radius, hi[1] + radius],
+            ];
+            for i in 0..4 {
+                let (a, b) = (corners[i], corners[(i + 1) % 4]);
+                v.cut(
+                    [a[0], a[1], hi[2]],
+                    [b[0], b[1], hi[2]],
+                    radius,
+                    20.,
+                    CutterShape::Flat,
+                    frame,
+                    (0, 0),
+                );
+            }
+            let mut setup = setup.clone();
+            setup.preview_remaining =
+                Some(std::sync::Arc::new(crate::rest::RestStock::new(&v, frame)));
+            setup
+        };
+        // A Ø8 cutter cleared all the Ø4 contour sweeps round the part: it
+        // starts at the part's top, though the box round it holds the
+        // stock over the part.
+        let wide = cleared(4.);
+        let rest = wide.preview_remaining.as_ref().unwrap();
+        assert_eq!(rest.top(g.bounds, plan.target, top), top);
+        let lower = generate(&wide, &op, &tool, &mesh).unwrap();
+        assert!(
+            lower
+                .rest_top
+                .is_some_and(|z| (z - g.bounds.max[2]).abs() < 0.001),
+            "{:?}",
+            lower.rest_top
+        );
+        assert!(lower.levels < plan.levels);
+        assert!(
+            (lower.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .all(|m| m.to[2] < g.bounds.max[2])
+        );
+        // A Ø2 one left stock in the outer half of the sweeps: from the top.
+        let narrow = generate(&cleared(1.), &op, &tool, &mesh).unwrap();
+        assert_eq!(narrow.rest_top, None);
+        assert_eq!(narrow.levels, plan.levels);
     }
     #[test]
     fn contour_tabs_keep_the_part_joined_to_the_stock_around_it() {

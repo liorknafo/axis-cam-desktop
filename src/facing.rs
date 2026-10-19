@@ -269,12 +269,11 @@ pub(crate) fn outline(f: Outline) -> Result<Plan, String> {
         order.push(stroke);
     }
     let edge_points: usize = edges.iter().map(|e| e.0.len()).sum();
-    let mut envelope = crate::pocket::envelope(&region, f.radius);
-    envelope.min[2] = f.target;
-    envelope.max[2] = f.top;
-    let cutting_top = crate::rest::start(
+    // Down from the highest material the cutter can meet over its centres'
+    // region, not over that region's box.
+    let cutting_top = crate::rest::start_over(
         f.setup,
-        envelope,
+        &crate::pocket::reach(&region, f.radius),
         f.target,
         f.top,
         num(&f.op.p, "top").unwrap_or(0.),
