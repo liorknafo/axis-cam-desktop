@@ -11,6 +11,7 @@ mod forces;
 mod guide;
 mod help;
 mod holding;
+mod illustration;
 mod lathe;
 mod look;
 mod machine_view;

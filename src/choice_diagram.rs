@@ -23,6 +23,10 @@ fn label(f: &mut canvas::Frame, s: &str, x: f32, y: f32) {
         ..Default::default()
     });
 }
+/// What the path's two colours mean.
+fn legend(f: &mut canvas::Frame) {
+    label(f, "CYAN: CUTTING   AMBER: LIFTED, NOT CUTTING", 12., 140.);
+}
 fn point(p: [f32; 3]) -> Point {
     Point::new(
         139. + (p[0] - p[1]) * 1.45,
@@ -43,10 +47,10 @@ fn block(f: &mut canvas::Frame) {
     poly(
         f,
         &[
-            [-40., -22., 4.],
-            [40., -22., 4.],
-            [40., -22., 24.],
-            [-40., -22., 24.],
+            [-40., 22., 4.],
+            [40., 22., 4.],
+            [40., 22., 24.],
+            [-40., 22., 24.],
         ],
         Color::from_rgb(0.37, 0.45, 0.5),
     );
@@ -82,23 +86,55 @@ fn cutter(f: &mut canvas::Frame, p: [f32; 3]) {
         17.,
     );
 }
-fn trace(f: &mut canvas::Frame, path: &[([f32; 3], bool)], phase: f32) {
+/// An arrowhead halfway along each cutting row, pointing the way it cuts.
+fn arrows(f: &mut canvas::Frame, path: &[([f32; 3], bool)]) {
     for pair in path.windows(2) {
+        let (a, b) = (pair[0].0, pair[1].0);
+        if !pair[1].1 || a[2] != b[2] || (b[0] - a[0]).abs() < 1. {
+            continue;
+        }
+        let (pa, pb) = (point(a), point(b));
+        let len = (pb.x - pa.x).hypot(pb.y - pa.y);
+        let (ux, uy) = ((pb.x - pa.x) / len, (pb.y - pa.y) / len);
+        let m = Point::new((pa.x + pb.x) / 2. + 4. * ux, (pa.y + pb.y) / 2. + 4. * uy);
+        for side in [-1., 1.] {
+            line(
+                f,
+                m,
+                Point::new(
+                    m.x - 7. * ux + side * 4. * uy,
+                    m.y - 7. * uy - side * 4. * ux,
+                ),
+                CYAN,
+                2.,
+            );
+        }
+    }
+}
+/// The path faint ahead of the cutter and bright behind it, cyan where it
+/// cuts and amber where it is lifted.
+fn trace(f: &mut canvas::Frame, path: &[([f32; 3], bool)], phase: f32) {
+    let t = phase * (path.len() - 1) as f32;
+    let i = (t as usize).min(path.len() - 2);
+    let u = t - i as f32;
+    let at: [f32; 3] =
+        std::array::from_fn(|k| path[i].0[k] + (path[i + 1].0[k] - path[i].0[k]) * u);
+    for (j, pair) in path.windows(2).enumerate() {
+        let color = if pair[1].1 { CYAN } else { GOLD };
         line(
             f,
             point(pair[0].0),
             point(pair[1].0),
-            if pair[1].1 { CYAN } else { GOLD },
-            1.7,
+            Color { a: 0.3, ..color },
+            1.,
         );
+        if j < i {
+            line(f, point(pair[0].0), point(pair[1].0), color, 1.9);
+        } else if j == i {
+            line(f, point(pair[0].0), point(at), color, 1.9);
+        }
     }
-    let t = phase * (path.len() - 1) as f32;
-    let i = (t as usize).min(path.len() - 2);
-    let u = t - i as f32;
-    cutter(
-        f,
-        std::array::from_fn(|k| path[i].0[k] + (path[i + 1].0[k] - path[i].0[k]) * u),
-    );
+    cutter(f, at);
 }
 pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
     let phase = (time / 5.).fract();
@@ -110,7 +146,7 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
             // fixed. It is the setup's note, which nothing checks, and the
             // heading and the dimension say so.
             label(f, "REQUESTED GAP · NOT CHECKED", 6., 2.);
-            let pulse = 0.12 + 0.06 * (time * SPIN).sin();
+            let pulse = 0.2 + 0.15 * (time * SPIN).sin();
             f.fill_rectangle(
                 Point::new(137., 59.),
                 Size::new(54., 79.),
@@ -150,6 +186,7 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
                     1.5,
                 );
             }
+            label(f, "Gap", 152., 92.);
             label(f, "Holder", 35., 75.);
             line(f, Point::new(73., 82.), Point::new(102., 82.), CYAN, 1.);
             label(f, "Cutter", 66., 107.);
@@ -245,6 +282,7 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
                 path.push((end, true));
             }
             trace(f, &path, phase);
+            arrows(f, &path);
             label(
                 f,
                 if both {
@@ -255,6 +293,9 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
                 8.,
                 4.,
             );
+            if !both {
+                legend(f);
+            }
         }
         Diagram::FacingLink(down) => {
             block(f);
@@ -280,104 +321,8 @@ pub fn draw(d: Diagram, f: &mut canvas::Frame, time: f32) -> bool {
                 16.,
                 4.,
             );
-        }
-        Diagram::Entry(ramp) => {
-            block(f);
-            let mut path = vec![];
-            if ramp {
-                for i in 0..=48 {
-                    let t = i as f32 / 48.;
-                    let side = (t * 4.).min(3.9999);
-                    let n = side as usize;
-                    let u = side - n as f32;
-                    let corners = [
-                        [-26., -13.],
-                        [26., -13.],
-                        [26., 13.],
-                        [-26., 13.],
-                        [-26., -13.],
-                    ];
-                    path.push((
-                        [
-                            corners[n][0] + (corners[n + 1][0] - corners[n][0]) * u,
-                            corners[n][1] + (corners[n + 1][1] - corners[n][1]) * u,
-                            30. - t * 17.,
-                        ],
-                        true,
-                    ));
-                }
-            } else {
-                path = vec![
-                    ([-26., -13., 35.], true),
-                    ([-26., -13., 13.], true),
-                    ([26., -13., 13.], true),
-                ];
-            }
-            trace(f, &path, phase);
-            label(
-                f,
-                if ramp {
-                    "DESCEND ALONG THE CLOSED PROFILE"
-                } else {
-                    "VERTICAL PLUNGE · THEN CUT"
-                },
-                10.,
-                4.,
-            );
-        }
-        Diagram::DrillCycle(4) => {
-            // Helical milling: down a helix, once round at the bottom, to
-            // the centre and out.
-            block(f);
-            let mut path = vec![([0., 0., 40.], false), ([7., 0., 40.], false)];
-            let at = |step: usize, z: f32| {
-                let a = step as f32 * std::f32::consts::TAU / 16.;
-                [7. * a.cos(), 7. * a.sin(), z]
-            };
-            path.push((at(0, 26.), false));
-            for step in 1..=48 {
-                path.push((at(step, 26. - 18. * step as f32 / 48.), true));
-            }
-            for step in 1..=16 {
-                path.push((at(step, 8.), true));
-            }
-            path.extend([([0., 0., 8.], false), ([0., 0., 40.], false)]);
-            trace(f, &path, phase);
-            label(f, "HELIX DOWN · ROUND AT THE BOTTOM", 14., 4.);
-        }
-        Diagram::DrillCycle(cycle) => {
-            block(f);
-            let mut path = vec![([0., 0., 40.], false), ([0., 0., 26.], true)];
-            if cycle == 1 || cycle == 2 {
-                for z in [19., 12., 5.] {
-                    path.push(([0., 0., z], true));
-                    path.push(([0., 0., if cycle == 1 { z + 2. } else { 38. }], false));
-                    if cycle == 2 && z > 5. {
-                        path.push(([0., 0., z + 1.], false));
-                    }
-                }
-            } else {
-                path.push(([0., 0., 5.], true));
-                if cycle == 3 {
-                    path.push(([0., 0., 5.], true));
-                    path.push(([0., 0., 5.], true));
-                }
-            }
-            path.push(([0., 0., 40.], false));
-            trace(f, &path, phase);
-            label(
-                f,
-                match cycle {
-                    1 => "PECK · SHORT RETRACT",
-                    2 => "PECK · FULL CLEARANCE RETRACT",
-                    3 => "FEED · BOTTOM DWELL · RETRACT",
-                    _ => "ONE FEED TO DEPTH · RETRACT",
-                },
-                14.,
-                4.,
-            );
-            if cycle == 3 {
-                label(f, "DWELL AT THE BOTTOM", 55., 139.);
+            if !down {
+                legend(f);
             }
         }
         Diagram::Containment(side) => {
