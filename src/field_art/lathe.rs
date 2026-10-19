@@ -122,13 +122,40 @@ fn closing(t: f32) -> f32 {
 
 // ---- The chuck from the front ----
 
-/// The chuck from the front: its body, the slots and the jaws on them
-/// (`d` is each jaw's inner face from the centre), the bar between.
+const RED: Color = Color::from_rgb(0.95, 0.38, 0.38);
+const GREEN: Color = Color::from_rgb(0.40, 0.85, 0.50);
+const FAINT: Color = Color::from_rgba(0.26, 0.83, 0.92, 0.6);
+
+/// One jaw as the front sees it: its screen angle, how far its inner face
+/// is from the centre, and whether it is the one moving.
+type FrontJaw = (f32, f32, bool);
+
+/// A jaw's outline. A round one has an inner face that is an arc of the
+/// bar's own circle, so it touches the bar along its surface; a flat one a
+/// flat face. Neither reaches into another jaw.
+fn jaw_points(a: f32, d: f32, h: f32, w: f32, round: bool) -> Vec<Point> {
+    if round {
+        let half = 0.38;
+        let mut pts = arc_pts(C, d, a - half, a + half);
+        pts.extend(arc_pts(C, d + h, a + half, a - half));
+        pts
+    } else {
+        vec![
+            rot(C, a, d, -w / 2.),
+            rot(C, a, d + h, -w / 2.),
+            rot(C, a, d + h, w / 2.),
+            rot(C, a, d, w / 2.),
+        ]
+    }
+}
+
+/// The chuck from the front: its body, the slots and the jaws on them,
+/// the bar between.
 fn front_chuck(
     f: &mut Frame,
     r: f32,
-    angles: &[f32],
-    d: &[f32],
+    jaws: &[FrontJaw],
+    round: bool,
     w: f32,
     h: f32,
     bar: impl Fn(&mut Frame),
@@ -137,39 +164,36 @@ fn front_chuck(
     ring(f, C, r, BODY_LIGHT, 1.8);
     ring(f, C, r - 5., Color::from_rgb(0.36, 0.41, 0.46), 1.);
     disc2(f, C, r * 0.5, HOLE);
-    for a in angles {
-        line(f, C, rot(C, *a, r - 4., 0.), HOLE, w * 0.55);
+    for (a, _, _) in jaws {
+        line(f, C, rot(C, *a, r - 4., 0.), HOLE, 6.);
     }
     bar(f);
-    for (a, di) in angles.iter().zip(d) {
-        let pts = [
-            rot(C, *a, *di, -w / 2.),
-            rot(C, *a, di + h, -w / 2.),
-            rot(C, *a, di + h, w / 2.),
-            rot(C, *a, *di, w / 2.),
-        ];
-        poly_fill(f, &pts, JAW, BODY_LIGHT, 1.);
-        line(f, pts[0], pts[3], Color::from_rgb(0.80, 0.85, 0.88), 1.6);
+    for (a, d, moving) in jaws {
+        let pts = jaw_points(*a, *d, h, w, round);
+        if *moving {
+            poly_fill(f, &pts, JAW, GOLD, 2.2);
+        } else {
+            poly_fill(f, &pts, JAW, BODY_LIGHT, 1.);
+        }
     }
 }
 fn bar_disc(f: &mut Frame, r: f32) {
     disc2(f, C, r, STOCK.top);
     ring(f, C, r, BAR_EDGE, 1.2);
 }
-/// The diameter of a bar below the chuck: dashed lines down from its
-/// edges and a dimension between them, with its label.
-fn dia_below(f: &mut Frame, r: f32, label: &str, outside: bool) {
-    let y = C.y + 48. + 9.;
-    for s in [-1., 1.] {
-        dashed(f, pt(C.x + s * r, C.y), pt(C.x + s * r, y + 4.), GOLD, 1.);
-    }
-    if outside {
-        arrow(f, pt(C.x - r - 16., y), pt(C.x - r, y), GOLD);
-        arrow(f, pt(C.x + r + 16., y), pt(C.x + r, y), GOLD);
+/// The bar's diameter across the bar itself, through its centre, with a
+/// gold label outside the chuck.
+fn dia_across(f: &mut Frame, r: f32, label: &str) {
+    if r < 10. {
+        // Too small for arrowheads inside: they point in from outside.
+        arrow(f, pt(C.x - r - 14., C.y), pt(C.x - r, C.y), GOLD);
+        arrow(f, pt(C.x + r + 14., C.y), pt(C.x + r, C.y), GOLD);
+        line(f, pt(C.x - r, C.y), pt(C.x + r, C.y), INK, 1.2);
     } else {
-        dimension(f, pt(C.x - r, y), pt(C.x + r, y), GOLD);
+        dimension(f, pt(C.x - r, C.y), pt(C.x + r, C.y), INK);
     }
-    text(f, label, C.x + r + 22., y - 5., GOLD, 9.);
+    dashed(f, pt(C.x + r + 14., C.y), pt(C.x + 54., C.y), GOLD, 1.);
+    text(f, label, C.x + 58., C.y - 5., GOLD, 9.);
 }
 
 pub fn chuck(f: &mut Frame, _time: f32, phase: f32, n: u8) {
@@ -186,19 +210,28 @@ pub fn chuck(f: &mut Frame, _time: f32, phase: f32, n: u8) {
 
 fn chuck_jaws(f: &mut Frame, phase: f32) {
     heading(f, "CHUCK JAWS · SELF-CENTRING OR INDEPENDENT");
-    let t = (phase * 2.) % 1.;
     if phase < 0.5 {
+        let t = phase * 2.;
         let d = 28. - 14. * closing(t);
-        front_chuck(f, 48., &JAWS3, &[d; 3], 15., 14., |f| bar_disc(f, 14.));
+        let jaws: Vec<FrontJaw> = JAWS3.iter().map(|a| (*a, d, false)).collect();
+        front_chuck(f, 48., &jaws, true, 15., 14., |f| bar_disc(f, 14.));
         text(f, "3", 44., 50., GOLD, 40.);
         text(f, "SELF-CENTRING", 196., 62., TEXT, 9.);
         text(f, "JAWS TOGETHER", 196., 74., TEXT, 9.);
         caption(f, "3 JAWS · ROUND BAR");
     } else {
-        let d: Vec<f32> = (0..4)
-            .map(|i| 28. - 15. * closing(t - 0.045 * i as f32))
+        // One jaw at a time, the moving one outlined in gold.
+        let t = (phase - 0.5) * 2.;
+        let jaws: Vec<FrontJaw> = JAWS4
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let x = (t - 0.2 * i as f32) / 0.2;
+                let open = smooth((t - 0.88) / 0.12);
+                (*a, 28. - 15. * smooth(x) * (1. - open), x > 0. && x < 1.)
+            })
             .collect();
-        front_chuck(f, 48., &JAWS4, &d, 15., 14., |f| {
+        front_chuck(f, 48., &jaws, false, 15., 14., |f| {
             poly_fill(
                 f,
                 &[
@@ -222,18 +255,31 @@ fn chuck_jaws(f: &mut Frame, phase: f32) {
 fn chuck_min_grip(f: &mut Frame, phase: f32) {
     heading(f, "MIN GRIP · SMALLEST BAR THE JAWS CLOSE ON");
     let d = 26. - 19. * smooth(progress(phase, 0.35));
-    front_chuck(f, 48., &JAWS3, &[d; 3], 9., 12., |f| bar_disc(f, 7.));
-    dia_below(f, 7., "MIN Ø", true);
+    let jaws: Vec<FrontJaw> = JAWS3.iter().map(|a| (*a, d, false)).collect();
+    front_chuck(f, 48., &jaws, true, 9., 12., |f| bar_disc(f, 7.));
+    dia_across(f, 7., "MIN Ø");
     caption(f, "JAWS CLOSED AS FAR AS THEY GO");
 }
 
 fn chuck_max_grip(f: &mut Frame, phase: f32) {
     heading(f, "MAX GRIP · LARGEST BAR THE JAWS CLOSE ON");
     let r = 12. + 18. * smooth(progress(phase, 0.35));
-    front_chuck(f, 48., &JAWS3, &[r; 3], 15., 13., |f| bar_disc(f, r));
-    dia_below(f, r, "MAX Ø", false);
-    text(f, "BODY", 62., 26., TEXT, 9.);
-    line(f, pt(88., 31.), pt(105., 40.), TEXT, 1.);
+    let jaws: Vec<FrontJaw> = JAWS3.iter().map(|a| (*a, r, false)).collect();
+    front_chuck(f, 48., &jaws, true, 15., 13., |f| bar_disc(f, r));
+    dia_across(f, r, "MAX Ø");
+    // The chuck body's own diameter, faint: the bar stays inside it.
+    let y = C.y + 48. + 9.;
+    for s in [-1., 1.] {
+        dashed(
+            f,
+            pt(C.x + s * 48., C.y),
+            pt(C.x + s * 48., y + 4.),
+            FAINT,
+            1.,
+        );
+    }
+    dimension(f, pt(C.x - 48., y), pt(C.x + 48., y), FAINT);
+    text(f, "BODY Ø", C.x + 56., y - 5., FAINT, 9.);
     caption(f, "MAX GRIP STAYS BELOW THE CHUCK BODY Ø");
 }
 
@@ -241,7 +287,8 @@ fn chuck_body(f: &mut Frame, phase: f32) {
     heading(f, "CHUCK BODY · OUTSIDE DIAMETER OF THE CHUCK");
     let r = 42. + 8. * (TAU * phase).sin();
     let k = r / 48.;
-    front_chuck(f, r, &JAWS3, &[14. * k * 2.; 3], 15. * k, 14. * k, |f| {
+    let jaws: Vec<FrontJaw> = JAWS3.iter().map(|a| (*a, 14. * k, false)).collect();
+    front_chuck(f, r, &jaws, true, 15. * k, 14. * k, |f| {
         bar_disc(f, 14. * k)
     });
     let y = C.y + 50. + 7.;
@@ -258,7 +305,7 @@ fn chuck_body(f: &mut Frame, phase: f32) {
 fn side_body(f: &mut Frame, face: f32, cy: f32, h: f32) {
     box_o(
         f,
-        face - 44.,
+        face - 38.,
         cy - h / 2.,
         face,
         cy + h / 2.,
@@ -278,8 +325,10 @@ fn side_bar(f: &mut Frame, x0: f32, x1: f32, cy: f32, r: f32) {
     line(f, pt(x0, cy + r), pt(x1, cy + r), BAR_EDGE, 1.);
     line(f, pt(x1, cy - r), pt(x1, cy + r), BAR_EDGE, 1.);
 }
-fn side_jaw(f: &mut Frame, x0: f32, x1: f32, y0: f32, y1: f32) {
-    box_o(f, x0, y0, x1, y1, JAW, BODY_LIGHT);
+/// The two jaws seen from the side, pressing on the bar's surface.
+fn side_jaws(f: &mut Frame, x0: f32, x1: f32, cy: f32, rb: f32, th: f32) {
+    box_o(f, x0, cy - rb - th, x1, cy - rb + 1., JAW, BODY_LIGHT);
+    box_o(f, x0, cy + rb - 1., x1, cy + rb + th, JAW, BODY_LIGHT);
 }
 /// A turning tool seen from the front, its tip at `t`.
 fn side_tool(f: &mut Frame, t: Point) {
@@ -310,8 +359,7 @@ fn chuck_jaw_length(f: &mut Frame, phase: f32) {
     let l = 22. + 48. * smooth(progress(phase, 0.3));
     side_body(f, face, cy, 76.);
     side_bar(f, face, 262., cy, rb);
-    side_jaw(f, face, face + l, cy - rb - th, cy - rb);
-    side_jaw(f, face, face + l, cy + rb, cy + rb + th);
+    side_jaws(f, face, face + l, cy, rb, th);
     let y = 108.;
     for x in [face, face + l] {
         dashed(f, pt(x, cy + rb + th), pt(x, y + 3.), GOLD, 1.);
@@ -323,49 +371,71 @@ fn chuck_jaw_length(f: &mut Frame, phase: f32) {
 
 fn chuck_grip(f: &mut Frame, phase: f32) {
     heading(f, "GRIP · HOW MUCH OF THE BAR THE JAWS HOLD");
-    let (face, cy, rb, th, l) = (52., 62., 13., 13., 70.);
-    let tip = face + l;
-    let xe = 132. - 72. * smooth(progress(phase, 0.3));
+    let (face, cy, rb, th) = (48., 60., 22., 11.);
+    let jt = face + 70.;
+    let u = progress(phase, 0.1);
+    let xe = jt + 10. - 62. * u;
+    let third = 2. * rb / 3.;
+    let grip = (jt - xe).max(0.);
+    let status = if grip >= third { GREEN } else { RED };
     side_body(f, face, cy, 76.);
-    side_bar(f, xe, xe + 140., cy, rb);
-    side_jaw(f, face, tip, cy - rb - th, cy - rb);
-    side_jaw(f, face, tip, cy + rb, cy + rb + th);
+    side_bar(f, xe, xe + 130., cy, rb);
+    side_jaws(f, face, jt, cy, rb, th);
     // The bar's diameter, drawn across the bar.
-    dimension(f, pt(168., cy - rb), pt(168., cy + rb), INK);
-    text(f, "Ø", 174., cy - 5., INK, 9.);
-    let y = 106.;
-    if xe < tip - 4. {
-        for x in [xe, tip] {
-            dashed(f, pt(x, cy + rb + th), pt(x, y + 3.), GOLD, 1.);
+    let dx = xe + 110.;
+    dimension(f, pt(dx, cy - rb), pt(dx, cy + rb), INK);
+    text(f, "Ø", dx + 6., cy - 5., INK, 9.);
+    // A third of it: the least that should be held.
+    let ym = cy + rb + th + 8.;
+    dashed(
+        f,
+        pt(jt - third, cy - rb),
+        pt(jt - third, ym + 3.),
+        GOLD,
+        1.2,
+    );
+    dashed(f, pt(jt, cy + rb + th), pt(jt, ym + 3.), GOLD, 1.);
+    dimension(f, pt(jt - third, ym), pt(jt, ym), GOLD);
+    text(f, "Ø/3", jt + 6., ym - 5., GOLD, 9.);
+    // How much is held, red until it passes the third.
+    let y = 120.;
+    if grip > 2. {
+        for x in [xe, jt] {
+            dashed(f, pt(x, cy + rb), pt(x, y + 3.), status, 1.);
         }
-        dimension(f, pt(xe, y), pt(tip, y), GOLD);
-        text(f, "GRIPPED", (xe + tip) / 2. - 20., y + 5., GOLD, 9.);
+        dimension(f, pt(xe, y), pt(jt, y), status);
     }
+    let s = if grip >= third {
+        "GRIPPED · OK"
+    } else {
+        "GRIPPED · TOO SHORT"
+    };
+    text(f, s, jt + 8., y - 5., status, 9.);
     caption(f, "HOLD ≥ 1/3 OF Ø");
 }
 
 fn chuck_stickout(f: &mut Frame, phase: f32) {
     heading(f, "STICKOUT · BAR LENGTH PAST THE JAWS");
-    let (face, cy, rb, th) = (44., 70., 13., 13.);
-    let xf = face + 110. + 60. * smooth(progress(phase, 0.3));
-    let xc = xf - 70.;
+    let (face, cy, rb, th) = (48., 62., 13., 13.);
+    let jt = face + 30.;
+    let xf = jt + 100. + 65. * smooth(progress(phase, 0.3));
+    let xc = jt + 0.7 * (xf - jt);
     side_body(f, face, cy, 72.);
     side_bar(f, face, xf, cy, rb);
-    side_jaw(f, face, face + 30., cy - rb - th, cy - rb);
-    side_jaw(f, face, face + 30., cy + rb, cy + rb + th);
+    side_jaws(f, face, jt, cy, rb, th);
     side_tool(f, pt(xc, cy - rb));
-    // How far the furthest cut is from the free end.
-    let yc = cy - rb - 12.;
-    dashed(f, pt(xf, cy - rb), pt(xf, yc - 4.), CYAN, 1.);
-    dimension(f, pt(xc + 2., yc), pt(xf, yc), CYAN);
-    text(f, "FURTHEST CUT", xc + 8., 27., CYAN, 9.);
+    // The furthest cut the stickout has to reach.
+    let yc = 102.;
+    dashed(f, pt(xc, cy - rb), pt(xc, yc + 3.), CYAN, 1.);
+    dimension(f, pt(jt, yc), pt(xc, yc), CYAN);
+    text(f, "MUST REACH", jt + 8., yc - 12., CYAN, 9.);
     // The stickout from the jaw face to the free end.
-    let y = 110.;
-    for x in [face, xf] {
+    let y = 124.;
+    for x in [jt, xf] {
         dashed(f, pt(x, cy + rb), pt(x, y + 3.), GOLD, 1.);
     }
-    dimension(f, pt(face, y), pt(xf, y), GOLD);
-    text(f, "STICKOUT", (face + xf) / 2. - 22., y + 5., GOLD, 9.);
+    dimension(f, pt(jt, y), pt(xf, y), GOLD);
+    text(f, "STICKOUT", jt + 8., y - 12., GOLD, 9.);
     caption(f, "STICKOUT MUST REACH THE FURTHEST CUT");
 }
 
@@ -477,18 +547,27 @@ fn tool_nose(f: &mut Frame, phase: f32) {
     fillet.push(pt(xw, ys));
     poly_fill(f, &fillet, SECTION, SECTION, 0.5);
     line(f, pt(xw, 56.), pt(xw, ys - r), CUT_EDGE, 1.);
-    // The insert, its corner rounded to the radius.
+    // The insert itself: its corner is rounded to the radius.
     let mut insert = vec![pt(xw, ys - l)];
     insert.extend(arc.iter().copied());
     insert.push(pt(xw - l, ys));
     insert.push(pt(xw - l, ys - l));
     poly_fill(f, &insert, DARK_STEEL, CUT_EDGE, 1.2);
-    ring(f, pt(xw - l / 2., ys - l / 2.), 6., BACKGROUND, 1.);
-    // The radius in gold.
-    poly_line(f, &arc, GOLD, 2.8);
-    let tip = pt(corner.x + r * 0.707, corner.y + r * 0.707);
-    arrow(f, corner, tip, GOLD);
-    text(f, "R", corner.x - 15., corner.y - 15., GOLD, 11.);
+    ring(f, pt(xw - 48., ys - 50.), 5., BACKGROUND, 1.);
+    // The square corner it would have without the radius, faint.
+    dashed(f, pt(xw, ys - r), pt(xw, ys), FAINT, 1.);
+    dashed(f, pt(xw - r, ys), pt(xw, ys), FAINT, 1.);
+    // The radius in gold: the rounded edge, and a line from its centre.
+    poly_line(f, &arc, GOLD, 2.2);
+    line(
+        f,
+        corner,
+        pt(corner.x + r * 0.707, corner.y + r * 0.707),
+        GOLD,
+        1.4,
+    );
+    disc2(f, corner, 1.8, GOLD);
+    text(f, "R", corner.x - 15., corner.y - 8., GOLD, 11.);
     text(f, "R = NOSE RADIUS", 12., 46., GOLD, 9.);
     caption(f, "BIGGER R = ROUNDER CORNER, SMOOTHER FINISH");
 }
@@ -497,12 +576,12 @@ fn tool_lead(f: &mut Frame, phase: f32) {
     heading(f, "LEAD ANGLE · CUTTING EDGE VS THE BAR AXIS");
     let theta = (60. + 33. * smooth(progress(phase, 0.3))).to_radians();
     let n = pt(170., 72.);
-    // The bar in section with its axis, a chuck on the left.
+    // The bar in section, a chuck on the left; the labelled axis line
+    // runs along the bar and is the line the angle is measured from.
     rect(f, 40., 34., 268., 72., SECTION);
-    line(f, pt(40., 72.), pt(268., 72.), CUT_EDGE, 1.);
     box_o(f, 8., 26., 40., 82., BODY, BODY_LIGHT);
-    dashed(f, pt(44., 53.), pt(266., 53.), CYAN, 1.2);
-    text(f, "BAR AXIS", 52., 38., INK, 8.);
+    dashed(f, pt(44., 72.), pt(266., 72.), CYAN, 1.6);
+    text(f, "BAR AXIS", 52., 58., INK, 9.);
     // The tool, turned about its nose so the edge leans by the angle.
     let e = (-theta.cos(), theta.sin());
     let s = (theta.sin(), theta.cos());
@@ -515,20 +594,19 @@ fn tool_lead(f: &mut Frame, phase: f32) {
         1.,
     );
     line(f, n, at(40., 0.), GOLD, 3.);
-    // The angle from the axis (toward the chuck) to the edge.
-    dashed(f, n, pt(n.x - 92., n.y), CYAN, 1.4);
-    let a1 = PI - theta;
-    poly_line(f, &arc_pts(n, 26., a1, PI), CYAN, 1.8);
+    // The angle from the axis line (toward the chuck) to the edge.
+    poly_line(f, &arc_pts(n, 26., PI - theta, PI), CYAN, 1.8);
     let mid = PI - theta / 2.;
+    let label = format!("LEAD ANGLE {:.0}°", theta.to_degrees());
+    let width = label.chars().count() as f32 * 5.4;
     text(
         f,
-        &format!("{:.0}°", theta.to_degrees()),
-        n.x + 42. * mid.cos() - 14.,
-        n.y + 42. * mid.sin() - 5.,
+        &label,
+        n.x + 30. * mid.cos() - width,
+        n.y + 30. * mid.sin() - 2.,
         GOLD,
-        11.,
+        9.,
     );
-    text(f, "LEAD ANGLE", 58., 112., TEXT, 9.);
     caption(f, "GOLD: CUTTING EDGE   93° IS TYPICAL");
 }
 
@@ -539,12 +617,12 @@ fn work_walls(f: &mut Frame, x0: f32, x1: f32, top: f32, bot: f32, y0: f32, y1: 
     line(f, pt(x0, y0), pt(x1, y0), CUT_EDGE, 1.);
 }
 fn boring_bar(f: &mut Frame, x_tip: f32, yc: f32) {
-    box_o(f, x_tip, yc - 12., 276., yc + 12., STEEL, CUT_EDGE);
+    box_o(f, x_tip, yc - 12., 268., yc + 12., STEEL, CUT_EDGE);
     rect(
         f,
         x_tip + 1.,
         yc - 11.,
-        275.,
+        267.,
         yc - 4.,
         Color::from_rgb(0.74, 0.8, 0.85),
     );
@@ -642,7 +720,7 @@ fn tool_thread_angle(f: &mut Frame, phase: f32) {
     let m = smooth((phase - 0.42) / 0.1) - smooth((phase - 0.92) / 0.08);
     let alpha = (60. - 5. * m).to_radians();
     let half = alpha / 2.;
-    let (cx, ys, hd, p) = (118., 76., 26., 40.);
+    let (cx, ys, hd, p) = (118., 74., 30., 40.);
     // The thread cut in the bar: grooves a pitch apart.
     let hw = hd * half.tan();
     let mut profile = vec![pt(8., ys)];
@@ -654,10 +732,9 @@ fn tool_thread_angle(f: &mut Frame, phase: f32) {
     let mut body = profile.clone();
     body.extend([pt(268., 124.), pt(8., 124.)]);
     poly_fill(f, &body, SECTION, SECTION, 0.5);
-    poly_line(f, &profile, CUT_EDGE, 1.4);
     // The threading insert sitting in the middle groove.
     let apex = pt(cx, ys + hd);
-    let top = 40.;
+    let top = 50.;
     let wt = (apex.y - top) * half.tan();
     poly_fill(
         f,
@@ -672,7 +749,8 @@ fn tool_thread_angle(f: &mut Frame, phase: f32) {
         CUT_EDGE,
         1.2,
     );
-    dashed(f, pt(cx, apex.y - 4.), pt(cx, 26.), DIM, 1.);
+    // The groove walls show along the insert.
+    poly_line(f, &profile, CUT_EDGE, 1.6);
     poly_line(
         f,
         &arc_pts(apex, 22., -FRAC_PI_2 - half, -FRAC_PI_2 + half),
@@ -684,10 +762,10 @@ fn tool_thread_angle(f: &mut Frame, phase: f32) {
     } else {
         ("55°", ["WHITWORTH", ""])
     };
-    text_c(f, deg, cx, apex.y - 50., GOLD, 11.);
+    text(f, deg, cx + 6., apex.y - 50., GOLD, 10.);
     text(f, deg, 206., 24., GOLD, 20.);
-    text(f, name[0], 206., 50., TEXT, 9.);
-    text(f, name[1], 206., 61., TEXT, 9.);
+    text(f, name[0], 206., 44., TEXT, 9.);
+    text(f, name[1], 206., 55., TEXT, 9.);
     caption(f, "60° METRIC AND UNIFIED · 55° WHITWORTH");
 }
 
