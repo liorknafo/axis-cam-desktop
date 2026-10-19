@@ -7,6 +7,7 @@ mod control;
 mod facing;
 #[cfg(test)]
 mod fake_openai;
+mod field_art;
 mod forces;
 mod guide;
 mod help;
