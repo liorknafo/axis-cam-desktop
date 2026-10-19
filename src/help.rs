@@ -185,9 +185,12 @@ pub fn card<'a>(h: Help, expanded: bool, paused: bool) -> Element<'a, Message> {
         c = c
             .push(
                 container(
-                    canvas(Illustration { diagram: d, paused })
-                        .width(CARD_WIDTH)
-                        .height(155),
+                    canvas(Illustration {
+                        diagram: d,
+                        still: paused.then_some(STILL_TIME),
+                    })
+                    .width(CARD_WIDTH)
+                    .height(155),
                 )
                 .center_x(Length::Fill),
             )
@@ -2707,7 +2710,8 @@ fn wrapped(seconds: f64) -> f32 {
 }
 struct Illustration {
     diagram: Diagram,
-    paused: bool,
+    /// The moment to hold, or None to follow the clock.
+    still: Option<f32>,
 }
 /// The moment a paused animation shows: 3 s into the 5 s phase, with the
 /// cutter partway along its path and an indexed part already turned.
@@ -2723,11 +2727,7 @@ impl canvas::Program<Message> for Illustration {
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut f = canvas::Frame::new(renderer, bounds.size());
-        let time = if self.paused {
-            STILL_TIME
-        } else {
-            animation_time()
-        };
+        let time = self.still.unwrap_or_else(animation_time);
         let phase = (time / 5.).fract();
         let p = |a: [f32; 3]| {
             Point::new(
@@ -2800,6 +2800,13 @@ impl canvas::Program<Message> for Illustration {
                     ..Default::default()
                 });
                 let center = Point::new(left + 63. + sign * (phase - 0.5) * 42., 72.);
+                // The strip the cutter has already taken off behind it.
+                let start = left + 63. - sign * 21.;
+                f.fill_rectangle(
+                    Point::new(start.min(center.x), 52.),
+                    iced::Size::new((center.x - start).abs(), 20.),
+                    Color::from_rgb8(27, 44, 61),
+                );
                 f.fill(
                     &canvas::Path::circle(center, 20.),
                     Color::from_rgb8(52, 76, 95),
@@ -2860,78 +2867,9 @@ impl canvas::Program<Message> for Illustration {
             });
             return vec![f.into_geometry()];
         }
-        if crate::choice_diagram::draw(self.diagram, &mut f, time) {
-            return vec![f.into_geometry()];
-        }
-        if let Diagram::StockOffset(axis, positive) = self.diagram {
-            let vertices = |min: [f32; 3], max: [f32; 3]| {
-                let [x, y, z] = min;
-                let [xx, yy, zz] = max;
-                [
-                    [x, y, z],
-                    [xx, y, z],
-                    [xx, yy, z],
-                    [x, yy, z],
-                    [x, y, zz],
-                    [xx, y, zz],
-                    [xx, yy, zz],
-                    [x, yy, zz],
-                ]
-            };
-            let part_min = [-34., -22., 0.];
-            let part_max = [34., 22., 24.];
-            let part = vertices(part_min, part_max);
-            for (indices, color) in [
-                ([0, 1, 5, 4], Color::from_rgb8(88, 115, 135)),
-                ([1, 2, 6, 5], Color::from_rgb8(116, 144, 163)),
-                ([4, 5, 6, 7], Color::from_rgb8(146, 172, 189)),
-            ] {
-                polygon(&mut f, &indices.map(|i| part[i]), color);
-            }
-            let offset = 4. + 9. * (0.5 - 0.5 * (phase * std::f32::consts::TAU).cos());
-            let mut min = part_min;
-            let mut max = part_max;
-            if positive {
-                max[axis] += offset;
-            } else {
-                min[axis] -= offset;
-            }
-            let stock = vertices(min, max);
-            for (a, b) in [
-                (0, 1),
-                (1, 2),
-                (2, 3),
-                (3, 0),
-                (4, 5),
-                (5, 6),
-                (6, 7),
-                (7, 4),
-                (0, 4),
-                (1, 5),
-                (2, 6),
-                (3, 7),
-            ] {
-                line(&mut f, stock[a], stock[b], gold, 1.2);
-            }
-            let mut from = [0., 0., 12.];
-            from[axis] = if positive {
-                part_max[axis]
-            } else {
-                part_min[axis]
-            };
-            let mut to = from;
-            to[axis] += if positive { offset } else { -offset };
-            line(&mut f, from, to, cyan, 3.);
-            for v in [from, to] {
-                f.fill(&canvas::Path::circle(p(v), 2.4), cyan);
-            }
-            f.fill_text(canvas::Text {
-                content: "EXTRA MATERIAL ON ONE SIDE".into(),
-                position: Point::new(8., 7.),
-                color: gold,
-                size: 10.into(),
-                ..Default::default()
-            });
+        if crate::illustration::draw(self.diagram, &mut f, time)
+            || crate::choice_diagram::draw(self.diagram, &mut f, time)
+        {
             return vec![f.into_geometry()];
         }
         if matches!(self.diagram, Diagram::Tool) {
@@ -2983,56 +2921,42 @@ impl canvas::Program<Message> for Illustration {
                 size: 10.into(),
                 ..Default::default()
             });
+            // The diameter as a dimension across the flutes' width, with
+            // extension lines down from their edges.
+            for dx in [-7., 7.] {
+                f.stroke(
+                    &canvas::Path::line(Point::new(x + dx, 127.), Point::new(x + dx, 138.)),
+                    canvas::Stroke::default().with_color(gold).with_width(1.),
+                );
+                for dy in [-3., 3.] {
+                    f.stroke(
+                        &canvas::Path::line(
+                            Point::new(x + dx, 134.),
+                            Point::new(x + dx * 0.55, 134. + dy),
+                        ),
+                        canvas::Stroke::default().with_color(gold).with_width(1.5),
+                    );
+                }
+            }
             f.stroke(
                 &canvas::Path::line(Point::new(x - 7., 134.), Point::new(x + 7., 134.)),
-                canvas::Stroke::default().with_color(gold).with_width(2.),
+                canvas::Stroke::default().with_color(gold).with_width(1.5),
             );
             f.fill_text(canvas::Text {
                 content: "CUTTING DIAMETER".into(),
-                position: Point::new(139., 130.),
+                position: Point::new(131., 129.),
                 color: gold,
                 size: 9.into(),
                 ..Default::default()
             });
             return vec![f.into_geometry()];
         }
+        // What is left for this generic scene: Parallel, Scallop and
+        // Rotary finishing, and the heights over a row of holes. The rest
+        // is drawn by `illustration` and `choice_diagram` above.
         let s = match self.diagram {
             Diagram::Operation(s) => s,
-            Diagram::Stepover => Strategy::Face,
-            Diagram::Stepdown | Diagram::Allowance | Diagram::Ramp => Strategy::Pocket,
-            Diagram::Orientation => Strategy::Indexed,
-            Diagram::Heights | Diagram::Offsets => Strategy::Drill,
-            Diagram::Tool
-            | Diagram::StockOffset(_, _)
-            | Diagram::MillingDirection
-            | Diagram::MillingChoice(..)
-            | Diagram::Spindle(_)
-            | Diagram::FacingPattern(_)
-            | Diagram::FacingLink(_)
-            | Diagram::Entry(_)
-            | Diagram::DrillCycle(_)
-            | Diagram::FixtureClearance
-            | Diagram::Containment(_) => Strategy::Face,
-        };
-        let orientation = matches!(
-            self.diagram,
-            Diagram::Orientation | Diagram::Operation(Strategy::Indexed)
-        );
-        let angle = if orientation {
-            (phase * 2.5).min(1.) * std::f32::consts::FRAC_PI_2
-        } else {
-            0.
-        };
-        let pose = |a: [f32; 3]| {
-            if orientation {
-                [
-                    a[0],
-                    a[1] * angle.cos() - (a[2] - 12.) * angle.sin(),
-                    12. + a[1] * angle.sin() + (a[2] - 12.) * angle.cos(),
-                ]
-            } else {
-                a
-            }
+            _ => Strategy::Drill,
         };
         if s != Strategy::Rotary {
             for (face, c) in [
@@ -3073,7 +2997,7 @@ impl canvas::Program<Message> for Illustration {
                     Color::from_rgb8(146, 170, 186),
                 ),
             ] {
-                polygon(&mut f, &face.map(pose), c);
+                polygon(&mut f, &face, c);
             }
         }
         if s == Strategy::Rotary {
@@ -3095,17 +3019,14 @@ impl canvas::Program<Message> for Illustration {
             polygon(&mut f, &cap, Color::from_rgb8(124, 155, 177));
             line(&mut f, [40., 0., 20.], cyl(40., spin), gold, 2.);
         }
-        if matches!(
-            s,
-            Strategy::Parallel | Strategy::FiveAxis | Strategy::Scallop | Strategy::Waterline
-        ) {
-            // A curved surface makes surface-following and changing tilt visible.
+        let surface = |x: f32, y: f32| 26. + 8. * (x / 26.).cos() * (y / 28.).cos();
+        if matches!(s, Strategy::Parallel | Strategy::Scallop) {
+            // A curved surface makes surface-following visible.
             for yi in 0..8 {
                 for xi in 0..12 {
                     let x = -36. + xi as f32 * 6.;
                     let y = -20. + yi as f32 * 5.;
-                    let surf =
-                        |x: f32, y: f32| [x, y, 25. + 8. * (x / 26.).cos() * (y / 28.).cos()];
+                    let surf = |x: f32, y: f32| [x, y, surface(x, y) - 1.];
                     polygon(
                         &mut f,
                         &[
@@ -3123,122 +3044,38 @@ impl canvas::Program<Message> for Illustration {
                 }
             }
         }
-        if matches!(s, Strategy::Pocket | Strategy::Adaptive) {
-            polygon(
-                &mut f,
-                &[
-                    [-28., -16., 24.],
-                    [28., -16., 24.],
-                    [24., -12., 13.],
-                    [-24., -12., 13.],
-                ],
-                Color::from_rgb8(71, 96, 117),
-            );
-            polygon(
-                &mut f,
-                &[
-                    [-24., -12., 13.],
-                    [24., -12., 13.],
-                    [24., 12., 13.],
-                    [-24., 12., 13.],
-                ],
-                Color::from_rgb8(102, 128, 146),
-            );
-        }
         let n = 180usize;
         let mut path = vec![];
         for i in 0..=n {
             let t = i as f32 / n as f32;
             let a = t * std::f32::consts::TAU;
-            let q = match s {
-                Strategy::Face | Strategy::Parallel | Strategy::Indexed => {
+            path.push(match s {
+                Strategy::Parallel => {
                     let row = (t * 6.).floor().min(5.);
                     let x = if row as i32 % 2 == 0 {
                         -37. + 74. * (t * 6. - row)
                     } else {
                         37. - 74. * (t * 6. - row)
                     };
-                    [
-                        x,
-                        -20. + row * 8.,
-                        if s == Strategy::Parallel {
-                            26. + 8. * (x / 26.).cos() * ((-20. + row * 8.) / 28.).cos()
-                        } else {
-                            25.
-                        },
-                    ]
+                    let y = -20. + row * 8.;
+                    [x, y, surface(x, y)]
                 }
-                Strategy::Adaptive => {
-                    let r = 5. + 14. * t;
-                    [
-                        r * (a * 4.).cos() + 5. * (a * 15.).cos(),
-                        r * 0.65 * (a * 4.).sin() + 3. * (a * 15.).sin(),
-                        15.,
-                    ]
-                }
-                Strategy::Pocket | Strategy::Scallop => {
+                Strategy::Scallop => {
                     let r = 5. + 21. * t;
-                    [
-                        r * (a * 4.).cos(),
-                        r * 0.55 * (a * 4.).sin(),
-                        if matches!(self.diagram, Diagram::Stepdown) {
-                            24. - 3. * (t * 4.).floor().min(3.)
-                        } else if matches!(self.diagram, Diagram::Ramp) {
-                            24. - 12. * t
-                        } else if s == Strategy::Scallop {
-                            let x = r * (a * 4.).cos();
-                            let y = r * 0.55 * (a * 4.).sin();
-                            26. + 8. * (x / 26.).cos() * (y / 28.).cos()
-                        } else {
-                            15.
-                        },
-                    ]
-                }
-                Strategy::Box => {
-                    // Passes along X, stepping across by Y: one axis at a time.
-                    let row = (t * 4.).floor().min(3.);
-                    let k = (t * 4.).fract();
-                    let x = if row as i32 % 2 == 0 {
-                        2. * k
-                    } else {
-                        2. - 2. * k
-                    };
-                    [-30. + 30. * x, -18. + row * 10., 25.]
-                }
-                Strategy::Turn => {
-                    // A pass along the bar, back, and one nearer the axis.
-                    let pass = (t * 2.).floor().min(1.);
-                    let k = (t * 2.).fract();
-                    let x = if k < 0.5 { 2. * k } else { 2. - 2. * k };
-                    [-34. + 68. * x, 10. - 6. * pass, 25.]
-                }
-                Strategy::Contour => [44. * a.cos(), 27. * a.sin(), 21.],
-                Strategy::Drill => {
-                    let hole = (t * 4.).floor().min(3.) as usize;
-                    let xy = [[-23., -12.], [23., -12.], [23., 12.], [-23., 12.]][hole];
-                    let k = (t * 4.).fract();
-                    [xy[0], xy[1], 40. - 28. * (k * std::f32::consts::PI).sin()]
-                }
-                Strategy::Waterline => {
-                    let level = (t * 4.).floor().min(3.);
-                    [42. * (a * 4.).cos(), 26. * (a * 4.).sin(), 23. - level * 5.]
+                    let (x, y) = (r * (a * 4.).cos(), r * 0.55 * (a * 4.).sin());
+                    [x, y, surface(x, y)]
                 }
                 Strategy::Rotary => {
                     let angle =
                         a * 4. + std::f32::consts::FRAC_PI_2 - phase * std::f32::consts::TAU * 4.;
                     [-32. + 64. * t, 19. * angle.cos(), 20. + 19. * angle.sin()]
                 }
-                Strategy::FiveAxis => {
-                    let x = -34. + 68. * t;
-                    let y = 12. * a.sin();
-                    [x, y, 26. + 8. * (x / 26.).cos() * (y / 28.).cos()]
+                _ => {
+                    let hole = (t * 4.).floor().min(3.) as usize;
+                    let xy = [[-23., -12.], [23., -12.], [23., 12.], [-23., 12.]][hole];
+                    let k = (t * 4.).fract();
+                    [xy[0], xy[1], 40. - 28. * (k * std::f32::consts::PI).sin()]
                 }
-            };
-            // Indexed cutting only starts after the workpiece is held in its new position.
-            path.push(if orientation {
-                [q[0], q[1] * 0.5, 38.]
-            } else {
-                q
             });
         }
         if matches!(self.diagram, Diagram::Heights) {
@@ -3251,33 +3088,20 @@ impl canvas::Program<Message> for Illustration {
                     line(&mut f, a, b, c, 1.);
                 }
             }
-        }
-        if matches!(self.diagram, Diagram::Offsets) {
-            for (z, c) in [
-                (24., cyan),
-                (7., cyan),
-                (7. + 5. * (phase * std::f32::consts::TAU).sin(), gold),
-            ] {
-                line(&mut f, [-40., 24., z], [40., 24., z], c, 2.);
+            // Each plane named at its right-hand corner.
+            for (z, c, name) in [(47., gold, "CLEARANCE"), (37., cyan, "RETRACT")] {
+                let q = p([40., -24., z]);
+                f.fill_text(canvas::Text {
+                    content: name.into(),
+                    position: Point::new(q.x - 6., q.y - 13.),
+                    color: c,
+                    size: 9.into(),
+                    ..Default::default()
+                });
             }
-            f.fill_text(canvas::Text {
-                content: "REFERENCE / OFFSET PLANE".into(),
-                position: Point::new(8., 8.),
-                color: gold,
-                size: 10.into(),
-                ..Default::default()
-            });
         }
-        let cutting_phase = if orientation {
-            ((phase - 0.4) / 0.6).max(0.)
-        } else {
-            phase
-        };
-        let end = ((cutting_phase * n as f32) as usize).min(n);
+        let end = ((phase * n as f32) as usize).min(n);
         for (i, pair) in path.windows(2).enumerate() {
-            if orientation && phase < 0.4 {
-                continue;
-            }
             line(
                 &mut f,
                 pair[0],
@@ -3290,46 +3114,14 @@ impl canvas::Program<Message> for Illustration {
                 if i <= end { 1.6 } else { 0.8 },
             );
         }
-        if matches!(
-            self.diagram,
-            Diagram::Stepover | Diagram::Stepdown | Diagram::Allowance
-        ) {
-            let (a, b, label) = match self.diagram {
-                Diagram::Stepover => ([28., -20., 26.], [28., -12., 26.], "SIDEWAYS SPACING"),
-                Diagram::Stepdown => ([29., 10., 24.], [29., 10., 21.], "DEPTH PER LAYER"),
-                _ => ([27., -16., 25.], [33., -16., 25.], "STOCK TO LEAVE"),
-            };
-            line(&mut f, a, b, gold, 3.);
-            for a in [a, b] {
-                f.fill(&canvas::Path::circle(p(a), 2.5), gold)
-            }
-            f.fill_text(canvas::Text {
-                content: label.into(),
-                position: Point::new(8., 8.),
-                color: gold,
-                size: 10.into(),
-                ..Default::default()
-            });
-        }
-        let tip = if orientation && phase < 0.4 {
-            [-30., -20., 47.]
-        } else {
-            path[end]
-        };
-        let tilt = if s == Strategy::FiveAxis {
-            0.5 * (phase * std::f32::consts::TAU).sin()
-        } else {
-            0.
-        };
-        let endtool = [tip[0] + tilt * 23., tip[1], tip[2] + 23.];
-        let mid = [tip[0] + tilt * 11., tip[1], tip[2] + 11.];
+        let tip = path[end];
+        let endtool = [tip[0], tip[1], tip[2] + 23.];
+        let mid = [tip[0], tip[1], tip[2] + 11.];
         line(&mut f, mid, endtool, Color::from_rgb8(221, 231, 236), 9.);
         line(&mut f, tip, mid, gold, 7.);
         f.fill(&canvas::Path::circle(p(tip), 3.2), gold);
         for z in 0..4 {
-            let z = z as f32 * 2.6;
-            let a = [tip[0] + tilt * z, tip[1], tip[2] + z];
-            let q = p(a);
+            let q = p([tip[0], tip[1], tip[2] + z as f32 * 2.6]);
             f.stroke(
                 &canvas::Path::line(
                     Point::new(q.x - 3., q.y + 1.),
@@ -3340,14 +3132,8 @@ impl canvas::Program<Message> for Illustration {
                     .with_width(1.),
             );
         }
-        let caption = if orientation {
-            "REPOSITION → HOLD → CUT"
-        } else if matches!(self.diagram, Diagram::Heights) {
+        let caption = if matches!(self.diagram, Diagram::Heights) {
             "AMBER: CLEARANCE   CYAN: RETRACT"
-        } else if matches!(self.diagram, Diagram::Offsets) {
-            "CYAN: GEOMETRY   AMBER: OFFSET"
-        } else if s == Strategy::FiveAxis {
-            "TOOL AXIS CHANGES ALONG THE SURFACE"
         } else if s == Strategy::Rotary {
             "ROTARY SWEEP AROUND THE AXIS"
         } else {
@@ -3439,6 +3225,148 @@ pub fn gallery<'a>(kind: u8) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every illustration as a strip of eight moments through its 5 s phase,
+    /// written to `$ANIM_DIR` (default /tmp/anim) as `<name>.png`; `ANIM`
+    /// limits it to names containing that text.
+    #[test]
+    #[ignore]
+    fn render_animation_frames() {
+        use futures_util::FutureExt;
+        use iced::advanced::renderer::{self, Headless};
+        let dir = std::path::PathBuf::from(
+            std::env::var("ANIM_DIR").unwrap_or_else(|_| "/tmp/anim".into()),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let only = std::env::var("ANIM").unwrap_or_default();
+        let mut all: Vec<(String, Diagram)> = [
+            Strategy::Face,
+            Strategy::Adaptive,
+            Strategy::Pocket,
+            Strategy::Contour,
+            Strategy::Drill,
+            Strategy::Parallel,
+            Strategy::Waterline,
+            Strategy::Scallop,
+            Strategy::Indexed,
+            Strategy::Rotary,
+            Strategy::FiveAxis,
+            Strategy::Box,
+            Strategy::Turn,
+        ]
+        .into_iter()
+        .map(|s| (format!("op-{s:?}"), Diagram::Operation(s)))
+        .collect();
+        use Diagram::*;
+        for (name, d) in [
+            ("heights", Heights),
+            ("fixture-clearance", FixtureClearance),
+            ("offsets", Offsets),
+            ("stepover", Stepover),
+            ("stepdown", Stepdown),
+            ("orientation", Orientation),
+            ("ramp", Ramp),
+            ("tool", Tool),
+            ("allowance", Allowance),
+            ("stock-offset-top", StockOffset(2, true)),
+            ("stock-offset-left", StockOffset(0, false)),
+            ("milling-direction", MillingDirection),
+            ("milling-climb-cw", MillingChoice(true, true)),
+            ("milling-conventional-cw", MillingChoice(false, true)),
+            ("spindle-cw", Spindle(true)),
+            ("spindle-ccw", Spindle(false)),
+            ("facing-zigzag", FacingPattern(true)),
+            ("facing-one-way", FacingPattern(false)),
+            ("facing-link-down", FacingLink(true)),
+            ("facing-link-up", FacingLink(false)),
+            ("entry-ramp", Entry(true)),
+            ("entry-plunge", Entry(false)),
+            ("drill-simple", DrillCycle(0)),
+            ("drill-peck-short", DrillCycle(1)),
+            ("drill-peck-full", DrillCycle(2)),
+            ("drill-dwell", DrillCycle(3)),
+            ("drill-helix", DrillCycle(4)),
+            ("containment-inside", Containment(-1)),
+            ("containment-on", Containment(0)),
+            ("containment-outside", Containment(1)),
+        ] {
+            all.push((name.into(), d));
+        }
+        let size = iced::Size::new(4. * 288. + 10., 2. * 182. + 10.);
+        for (name, d) in all.into_iter().filter(|(n, _)| n.contains(&only)) {
+            let mut grid = widget::Column::new().spacing(6).padding(5);
+            for r in 0..2 {
+                let mut row = widget::Row::new().spacing(10);
+                for c in 0..4 {
+                    let k = r * 4 + c;
+                    let t = 5. * (k as f32 + 0.5) / 8.;
+                    row = row.push(
+                        widget::column![
+                            canvas(Illustration {
+                                diagram: d,
+                                still: Some(t)
+                            })
+                            .width(CARD_WIDTH)
+                            .height(155),
+                            text(format!("frame {} · t = {t:.2} s", k + 1))
+                                .size(11)
+                                .color(Color::from_rgb8(236, 242, 249)),
+                        ]
+                        .spacing(4),
+                    );
+                }
+                grid = grid.push(row);
+            }
+            let element: Element<Message> = container(grid)
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgb8(27, 44, 61).into()),
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+            let mut renderer = <iced::Renderer as Headless>::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(16.),
+                Some("tiny-skia"),
+            )
+            .now_or_never()
+            .flatten()
+            .expect("tiny-skia renderer");
+            let mut ui = iced_runtime::UserInterface::build(
+                element,
+                size,
+                iced_runtime::user_interface::Cache::new(),
+                &mut renderer,
+            );
+            ui.draw(
+                &mut renderer,
+                &iced::Theme::Dark,
+                &renderer::Style {
+                    text_color: Color::WHITE,
+                },
+                mouse::Cursor::Unavailable,
+            );
+            let scale = 2.;
+            let physical =
+                iced::Size::new((size.width * scale) as u32, (size.height * scale) as u32);
+            let rgba = renderer.screenshot(physical, scale, Color::from_rgb8(27, 44, 61));
+            let path = dir.join(format!("{name}.png"));
+            let mut encoder = png::Encoder::new(
+                std::io::BufWriter::new(std::fs::File::create(&path).unwrap()),
+                physical.width,
+                physical.height,
+            );
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&rgba)
+                .unwrap();
+            eprintln!("Rendered {}", path.display());
+        }
+    }
 
     /// The most characters a card's hover text may have (issue #89).
     const SHORT_LIMIT: usize = 350;
