@@ -655,13 +655,14 @@ impl RestStock {
         // sees a reach that passes a hair from material beside it, as a
         // contour does round the part, which boxes cannot follow.
         if let Some(reach) = reach {
-            let mut lo = 0;
+            let (mut lo, mut budget) = (0, BUDGET);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if self.swept(reach, candidates[mid], region.max[2]) {
-                    hi = mid;
-                } else {
-                    lo = mid + 1;
+                match self.swept(reach, candidates[mid], region.max[2], &mut budget) {
+                    Some(true) => hi = mid,
+                    Some(false) => lo = mid + 1,
+                    // Out of work: the start stays as proven so far.
+                    None => break,
                 }
             }
         }
@@ -671,11 +672,13 @@ impl RestStock {
     /// Whether the outlines of the earlier sweeps through every height from
     /// `low` to `high` (`cleared`) cover all of `reach` within the stock's
     /// box. Their chords lie inside the sweeps, so a reach whose edge
-    /// follows a sweep's exactly is not covered.
-    fn swept(&self, reach: &Reach, low: f32, high: f32) -> bool {
+    /// follows a sweep's exactly is not covered. Each outline costs a unit
+    /// of `budget`; None when there are more than it has left.
+    fn swept(&self, reach: &Reach, low: f32, high: f32, budget: &mut usize) -> Option<bool> {
         let gone = self.cleared(reach.bounds, low, high);
+        *budget = budget.checked_sub(gone.len())?;
         if gone.is_empty() {
-            return false;
+            return Some(false);
         }
         let e = self.extent;
         let inside = vec![vec![
@@ -686,7 +689,7 @@ impl RestStock {
         ]];
         let area = intersect::<Milli>(reach.loops.clone(), inside, FillRule::NonZero);
         let left = area.and_then(|a| difference::<Milli>(a, gone, FillRule::NonZero));
-        left.is_ok_and(|l| !l.contains_points())
+        Some(left.is_ok_and(|l| !l.contains_points()))
     }
     /// The stock box a later setup starts from, in the current frame (mm):
     /// the original block's box, narrowed to what lathe cuts left (`turned`),
@@ -1668,6 +1671,9 @@ mod tests {
         let band = Reach::new(&[vec![(-8., -9.), (9., 8.), (8., 9.), (-9., -8.)]]);
         assert_eq!(rest.top(band.bounds, 2., 12.), 12.);
         assert_eq!(rest.top_over(&band, 2., 12.), 8.);
+        // The plane's proof sees it too, and gives up without the work.
+        assert_eq!(rest.swept(&band, 8., 12., &mut 10), Some(true));
+        assert_eq!(rest.swept(&band, 8., 12., &mut 0), None);
         // One that reaches past the cut's side meets the stock beside it.
         let wide = Reach::new(&[vec![(-8., -9.), (9., 8.), (8., 9.), (-9., -4.)]]);
         assert_eq!(rest.top_over(&wide, 2., 12.), 12.);
