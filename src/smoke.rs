@@ -12721,8 +12721,8 @@ flood = { pin = 8 }
         assert!(a.simulation.is_none());
     }
     /// The strip names the wait at normal size, with the time it has taken,
-    /// while the mesher runs, and keeps the cell size and triangle count in
-    /// a details line (#83).
+    /// while the mesher runs, in place of the cell size and triangle count
+    /// on the Detail line (#83, LIO-222).
     #[test]
     fn the_simulation_strip_says_the_stock_surface_is_updating_while_the_mesher_runs() {
         let mut a = imported_app();
@@ -12786,6 +12786,194 @@ flood = { pin = 8 }
         assert_eq!(crate::ui::stock_surface_notice(&a), None);
         assert!(a.stock_mesh_elapsed().is_none());
         let _ = a.view();
+    }
+    /// The bounds of each text `a`'s window lays out at `size`, by its words.
+    fn laid_out_texts(a: &App, size: iced::Size) -> Vec<(String, iced::Rectangle)> {
+        use futures_util::FutureExt;
+        use iced::advanced::renderer::Headless;
+        use iced::advanced::widget::{Id, Operation};
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn text(&mut self, _id: Option<&Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_string(), bounds));
+            }
+        }
+        let mut renderer = <iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(16.),
+            Some("tiny-skia"),
+        )
+        .now_or_never()
+        .flatten()
+        .expect("tiny-skia renderer");
+        let mut ui = iced_runtime::UserInterface::build(
+            a.view(),
+            size,
+            iced_runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let mut texts = Texts(vec![]);
+        ui.operate(&renderer, &mut texts);
+        texts.0
+    }
+    /// The top of the simulation strip and of the 3D view's hint line under
+    /// the scene, in `a`'s window at `size`, with the stock line it shows.
+    fn play_frame(a: &App, size: iced::Size) -> (f32, f32, String) {
+        let texts = laid_out_texts(a, size);
+        let top = |words: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t.starts_with(words))
+                .unwrap_or_else(|| panic!("no {words:?} in {texts:?}"))
+                .1
+                .y
+        };
+        let stock = texts
+            .iter()
+            .find(|(t, _)| t.contains("stock surface") || t.contains("finest cell"))
+            .map_or(String::new(), |(t, _)| t.clone());
+        (top("OPERATION SIMULATION"), top("Drag to orbit"), stock)
+    }
+    /// While Play runs, every frame meshes the stock again in the background:
+    /// the strip and the 3D view stand still through it, a quick update says
+    /// nothing, and a slow one says so in place, on the Detail line (LIO-222).
+    #[test]
+    fn the_view_stands_still_while_play_updates_the_stock_surface() {
+        let mut a = imported_app();
+        let top = a
+            .imported_mesh
+            .as_ref()
+            .unwrap()
+            .surfaces
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        let mesh = std::sync::Arc::new(crate::stock_surface::SurfaceMesh {
+            vertices: vec![],
+            triangles: vec![],
+            cell_mm: 0.5,
+            milliseconds: 0,
+        });
+        let key = a.stock_mesh_key().unwrap();
+        let _ = a.update(Message::StockMeshed {
+            key,
+            seconds: 0.,
+            result: Ok(mesh.clone()),
+        });
+        let _ = a.update(Message::Play);
+        assert!(a.playing);
+        // A frame of playback: the stock has moved on and is being meshed.
+        let frame = |a: &mut App, progress: f32, running: Option<u64>| {
+            a.progress = progress;
+            a.simulation.as_mut().unwrap().seek(progress);
+            a.stock_mesh_job = None;
+            a.stock_mesh_started = None;
+            if let Some(ms) = running {
+                a.stock_mesh_job = a.stock_mesh_key();
+                a.stock_mesh_started =
+                    Some(std::time::Instant::now() - std::time::Duration::from_millis(ms));
+            }
+        };
+        // Forward only: a step back would drop the finished surface.
+        let sizes = [iced::Size::new(1600., 1100.), iced::Size::new(1180., 760.)];
+        for (size, from) in sizes.into_iter().zip([0.2, 0.6]) {
+            frame(&mut a, from, None);
+            let still = play_frame(&a, size);
+            assert_eq!(still.2, "0.50 mm finest cell · 0 triangles");
+            // A quick update, as Play's frames are: nothing moves, nothing is said.
+            frame(&mut a, from + 0.1, Some(150));
+            let quick = play_frame(&a, size);
+            assert_eq!((quick.0, quick.1), (still.0, still.1), "{size:?}");
+            assert_eq!(quick.2, still.2);
+            // A slow one (a fine detail, a long toolpath): said in place.
+            frame(&mut a, from + 0.2, Some(12_000));
+            let slow = play_frame(&a, size);
+            assert_eq!((slow.0, slow.1), (still.0, still.1), "{size:?}");
+            assert_eq!(
+                slow.2,
+                "Updating the stock surface, showing the last finished one · 12 s"
+            );
+            // Done: the details are back where the notice was.
+            let key = a.stock_mesh_key().unwrap();
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds: 0.,
+                result: Ok(mesh.clone()),
+            });
+            let done = play_frame(&a, size);
+            assert_eq!((done.0, done.1), (still.0, still.1), "{size:?}");
+            assert_eq!(done.2, still.2);
+        }
+    }
+    /// Renders playback frames to PNGs in `$AXIS_RENDER_DIR` (default
+    /// /tmp/play-renders): the stock meshed, being meshed quickly, being
+    /// meshed for 12 s, and meshed again, for a look at the strip's bottom
+    /// edge (LIO-222). Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_play_while_the_stock_surface_updates() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/play-renders".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = imported_app();
+        let top = a
+            .imported_mesh
+            .as_ref()
+            .unwrap()
+            .surfaces
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.center[2].total_cmp(&b.center[2]))
+            .unwrap()
+            .0;
+        let _ = a.update(Message::Surface(top));
+        let _ = a.update(Message::Generate);
+        assert!(a.active_simulation().is_some(), "{}", a.status);
+        let mesh = |a: &mut App| {
+            a.stock_mesh_job = None;
+            a.stock_mesh_started = None;
+            let key = a.stock_mesh_key().expect("a simulation with stock");
+            let sim = a.active_simulation().unwrap();
+            let volume = sim.volume.as_ref().unwrap();
+            let snapshot = crate::stock_surface::Snapshot::of(volume, a.stock_detail);
+            let seconds = sim.seconds;
+            let result = snapshot.build().map(std::sync::Arc::new);
+            a.stock_mesh_job = Some(key.clone());
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result,
+            });
+        };
+        mesh(&mut a);
+        let _ = a.update(Message::Play);
+        let size = iced::Size::new(1280., 800.);
+        let at = |a: &mut App, progress: f32| {
+            a.progress = progress;
+            a.simulation.as_mut().unwrap().seek(progress);
+        };
+        at(&mut a, 0.3);
+        mesh(&mut a);
+        render_png(&a, size, &out.join("1-meshed.png"));
+        at(&mut a, 0.35);
+        a.stock_mesh_job = a.stock_mesh_key();
+        a.stock_mesh_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(150));
+        render_png(&a, size, &out.join("2-meshing-quick.png"));
+        a.stock_mesh_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        render_png(&a, size, &out.join("3-meshing-slow.png"));
+        mesh(&mut a);
+        render_png(&a, size, &out.join("4-meshed-again.png"));
     }
     /// The footer's 02 and 03 steps only navigate: 02 keeps the operation
     /// selected, and 03 shows the preview strip without generating (#86).
