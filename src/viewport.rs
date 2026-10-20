@@ -39,7 +39,9 @@ impl Default for Camera {
 pub enum Event {
     Orbit(f32, f32),
     Pan(f32, f32),
-    Zoom(f32),
+    /// A wheel step, and where the pointer is from the view's centre
+    /// (`Projector::center`, pixels): the zoom keeps the point under it.
+    Zoom(f32, [f32; 2]),
     Pick(usize),
     PickSurface(usize),
     /// Where pin 1 would stand under the pointer while placing the pins
@@ -1626,7 +1628,14 @@ impl canvas::Program<Event> for Viewport<'_> {
                     mouse::ScrollDelta::Lines { y, .. } => *y * 0.12,
                     mouse::ScrollDelta::Pixels { y, .. } => *y * 0.004,
                 };
-                return Some(Action::publish(Event::Zoom(dy)).and_capture());
+                // From the view's centre as `Projector::new` puts it.
+                let at = cursor.position_in(bounds).map_or([0., 0.], |p| {
+                    [
+                        p.x - (bounds.width * 0.5 + self.camera.pan[0]),
+                        p.y - (bounds.height * 0.53 + self.camera.pan[1]),
+                    ]
+                });
+                return Some(Action::publish(Event::Zoom(dy, at)).and_capture());
             }
             _ => {}
         }

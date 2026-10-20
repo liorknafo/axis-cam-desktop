@@ -17440,7 +17440,7 @@ flood = { pin = 8 }
         for event in [
             Event::Orbit(0.5, -0.2),
             Event::Pan(4., 2.),
-            Event::Zoom(0.2),
+            Event::Zoom(0.2, [0., 0.]),
         ] {
             let _ = a.update(Message::PlanViewport(event));
         }
@@ -19113,6 +19113,52 @@ flood = { pin = 8 }
         // A new app on the same workspace starts with the saved layout.
         assert_eq!(fresh_app(&dir).settings.layout, l);
     }
+    /// The wheel zooms toward the pointer, keeping the point under it where
+    /// it is, and goes far enough in for the part's smallest details.
+    #[test]
+    fn the_wheel_zooms_toward_the_pointer_far_in() {
+        use crate::viewport::{Event, Projector};
+        let mut a = app();
+        let bounds = crate::mesh::Bounds {
+            min: [-70., -50., 0.],
+            max: [70., 50., 12.],
+        };
+        let size = (900., 600.);
+        let corner = [-60., -40., 12.];
+        let at = |a: &App| Projector::fit(a.camera, size, bounds).p(corner);
+        let before = at(&a);
+        let centre = (900. * 0.5 + a.camera.pan[0], 600. * 0.53 + a.camera.pan[1]);
+        let _ = a.update(Message::Viewport(Event::Zoom(
+            0.5,
+            [before.x - centre.0, before.y - centre.1],
+        )));
+        let after = at(&a);
+        assert!(a.camera.zoom > 1.4);
+        assert!(
+            (after.x - before.x).abs() < 0.01 && (after.y - before.y).abs() < 0.01,
+            "{before:?} {after:?}"
+        );
+        // Far past the old 4×, up to 100×, and the point still stays.
+        for _ in 0..40 {
+            let p = at(&a);
+            let centre = (900. * 0.5 + a.camera.pan[0], 600. * 0.53 + a.camera.pan[1]);
+            let _ = a.update(Message::Viewport(Event::Zoom(
+                0.5,
+                [p.x - centre.0, p.y - centre.1],
+            )));
+        }
+        assert_eq!(a.camera.zoom, 100.);
+        let last = at(&a);
+        assert!(
+            (last.x - before.x).abs() < 0.5 && (last.y - before.y).abs() < 0.5,
+            "{last:?}"
+        );
+        // And out no further than 0.3×.
+        for _ in 0..80 {
+            let _ = a.update(Message::Viewport(Event::Zoom(-0.5, [0., 0.])));
+        }
+        assert!((a.camera.zoom - 0.3).abs() < 1e-6);
+    }
     /// Fit beside the camera views puts the scene back in the 3D view from
     /// where it looks: the zoom and the pan go back, the direction stays
     /// (#76).
@@ -19123,7 +19169,7 @@ flood = { pin = 8 }
         let start = a.camera;
         for e in [
             Event::Orbit(0.3, 0.2),
-            Event::Zoom(0.5),
+            Event::Zoom(0.5, [0., 0.]),
             Event::Pan(30., -20.),
         ] {
             let _ = a.update(Message::Viewport(e));

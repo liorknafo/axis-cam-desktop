@@ -1359,6 +1359,9 @@ pub(crate) async fn run_plan_with(
     };
     let _ = sender.send(Message::PlanFinished(epoch, result)).await;
 }
+/// How far the 3D views zoom out and in from the fitted scene.
+const ZOOM_OUT: f32 = 0.3;
+const ZOOM_IN: f32 = 100.;
 /// Orbit, pan or zoom `camera` as a viewport asks; picks do not move it.
 fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
     match *event {
@@ -1371,8 +1374,15 @@ fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
             camera.pan[0] += x;
             camera.pan[1] += y
         }
-        viewport::Event::Zoom(v) => {
-            camera.zoom = (camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(0.3, 4.)
+        viewport::Event::Zoom(v, at) => {
+            let zoom = (camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(ZOOM_OUT, ZOOM_IN);
+            // The point under the pointer stays there: the centre moves
+            // toward the pointer as the view grows and away as it shrinks.
+            let k = zoom / camera.zoom;
+            for (pan, at) in camera.pan.iter_mut().zip(at) {
+                *pan += at * (1. - k);
+            }
+            camera.zoom = zoom
         }
         viewport::Event::Pick(_)
         | viewport::Event::PickSurface(_)
@@ -5794,7 +5804,7 @@ impl App {
             Message::PlanViewport(e) => steer(&mut self.plan_camera, &e),
             Message::Viewport(e) => match e {
                 viewport::Event::Orbit(..)
-                | viewport::Event::Zoom(_)
+                | viewport::Event::Zoom(..)
                 | viewport::Event::Pan(..) => steer(&mut self.camera, &e),
                 viewport::Event::Pick(n) => {
                     if self.picking {
