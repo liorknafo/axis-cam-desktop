@@ -2543,6 +2543,23 @@ impl Document {
             .p
             .insert("reposition".into(), "Reclamp and probe origin".into());
     }
+    /// Why later setup `i` cannot use its work zero: its rotation leaves
+    /// the stock setup 1 defined skewed (not `volume::turn_between`), and
+    /// the zero is on the stock. None for setup 1, a square setup, or a
+    /// zero not on the stock.
+    pub fn skew_issue(&self, i: usize) -> Option<String> {
+        let (first, s) = (self.setups.first()?, self.setups.get(i)?);
+        let origin = get(&s.p, "origin");
+        (i > 0
+            && crate::post::stock_zero(origin).is_some()
+            && crate::volume::turn_between(first, s).is_none())
+        .then(|| {
+            format!(
+                "The stock {} defined is skewed in this setup, so its {origin} work zero is not on a stock face. Press Square to the stock under Part position.",
+                first.name()
+            )
+        })
+    }
     /// Sets setup 1's rotation `k` to `v`, turning with it each later setup
     /// that was square to it, so it stays square to the stock. The names of
     /// the setups turned.
@@ -4743,6 +4760,20 @@ mod tests {
         assert_eq!(get(&doc.setups[2].p, "rz"), "7");
         // The same value again turns nothing.
         assert!(doc.rotate_first("rz", "2".into()).is_empty());
+        // A stock-based zero is refused in the skewed setup alone.
+        for s in &mut doc.setups {
+            s.p.insert("origin".into(), "Stock top left".into());
+        }
+        assert_eq!(doc.skew_issue(0), None);
+        assert_eq!(doc.skew_issue(1), None);
+        assert!(
+            doc.skew_issue(2)
+                .is_some_and(|e| e.contains("Square to the stock"))
+        );
+        doc.setups[2]
+            .p
+            .insert("origin".into(), "Model origin".into());
+        assert_eq!(doc.skew_issue(2), None);
     }
     #[test]
     fn a_later_setup_not_square_to_setup_1_cannot_model_its_workholding() {

@@ -3589,7 +3589,9 @@ fn setup_editor(app: &App) -> Panel<'_> {
         _ => setup_machine(app, c),
     };
     // Pinned under the body: the checks and the setup's actions.
-    let mut foot = column![warnings(s.issues())].spacing(12);
+    let mut issues = s.issues();
+    issues.extend(app.doc.skew_issue(app.doc.index()));
+    let mut foot = column![warnings(issues)].spacing(12);
     if app.confirm_delete_setup {
         foot=foot.push(note("Delete this setup and its operations? Later stock will be rebuilt from the revised setup order.")).push(row![secondary("Cancel",Message::ConfirmDeleteSetup(false)),danger("Delete setup",Message::ConfirmDeleteSetup(true))].spacing(5));
     } else {
@@ -4310,7 +4312,7 @@ fn stock_turn<'a>(app: &'a App, i: usize, mut c: Column<'a, Message>) -> Column<
     ));
     if now.is_none() {
         c = c.push(note(format!(
-            "This setup's rotation is not a whole number of quarter turns from {}'s, where the stock was defined, so the stock sits skewed: no stock-based work zero, jaws or clamps can be used. Square it to the stock, or choose the face up above.",
+            "Not quarter turns from {}, where the stock was defined: the stock sits skewed.",
             first.name()
         )));
         c = c.push(row![secondary(
