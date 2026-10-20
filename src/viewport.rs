@@ -1087,6 +1087,23 @@ impl Viewport<'_> {
             let q = p.p(v);
             (Point::new(q.x * ratio, q.y * ratio), p.depth(v))
         };
+        if self.show_stock
+            && let (Some(volume), Some(current)) = (&sim.volume, sim.frame)
+            && let Some(surface) = &sim.stock_surface
+        {
+            // Each vertex moved to the setup's frame and projected once, each
+            // triangle coloured once, then drawn.
+            let corners = on_every_core(&surface.vertices, |&v| {
+                let q = volume.frame.transfer(v, current);
+                (q, project(q))
+            });
+            let colors = on_every_core(&surface.triangles, |t| {
+                stock_color(volume, surface, t, t.map(|i| corners[i].0))
+            });
+            raster_triangles(rgba, depths, w, h, surface.triangles.len(), |i| {
+                (surface.triangles[i].map(|v| corners[v].1), colors[i])
+            });
+        }
         let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
             let vertices: Vec<_> = points.iter().copied().map(project).collect();
             for i in 1..vertices.len() - 1 {
@@ -1100,14 +1117,6 @@ impl Viewport<'_> {
                 );
             }
         };
-        if self.show_stock
-            && let (Some(volume), Some(current)) = (&sim.volume, sim.frame)
-            && let Some(surface) = &sim.stock_surface
-        {
-            for (points, color) in stock_triangles(volume, surface, current) {
-                face(&points, color);
-            }
-        }
         if self.show_stock && sim.volume.is_none() {
             grid_faces(&sim.stock, &mut face);
         }
@@ -2002,17 +2011,44 @@ pub(crate) fn stock_triangles<'a>(
     current: crate::volume::Frame,
 ) -> impl Iterator<Item = ([[f32; 3]; 3], [u8; 4])> + 'a {
     surface.triangles.iter().map(move |triangle| {
-        let source = triangle.map(|i| surface.vertices[i]);
-        let points = source.map(|p| volume.frame.transfer(p, current));
-        let outer = (0..3).any(|k| {
-            source
+        let points = triangle.map(|i| volume.frame.transfer(surface.vertices[i], current));
+        (points, stock_color(volume, surface, triangle, points))
+    })
+}
+/// The colour the view gives `triangle` of `surface`, whose corners are
+/// `points` in the frame it is seen in: the block's where it lies on the
+/// stock's own faces, else the cut's, shaded.
+fn stock_color(
+    volume: &crate::volume::Volume,
+    surface: &crate::stock_surface::SurfaceMesh,
+    triangle: &[usize; 3],
+    points: [[f32; 3]; 3],
+) -> [u8; 4] {
+    let source = triangle.map(|i| surface.vertices[i]);
+    let outer = (0..3).any(|k| {
+        source
+            .iter()
+            .all(|p| (p[k] - volume.bounds.min[k]).abs() < 0.01)
+            || source
                 .iter()
-                .all(|p| (p[k] - volume.bounds.min[k]).abs() < 0.01)
-                || source
-                    .iter()
-                    .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
-        }) || volume.round && on_bar(volume.bounds, &source, surface.cell_mm);
-        (points, shade(&points, if outer { BLOCK } else { CUT }))
+                .all(|p| (p[k] - volume.bounds.max[k]).abs() < 0.01)
+    }) || volume.round && on_bar(volume.bounds, &source, surface.cell_mm);
+    shade(&points, if outer { BLOCK } else { CUT })
+}
+/// `f` of each of `items`, in order, worked out on every core.
+fn on_every_core<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads == 1 || items.len() < 4096 {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (items.chunks(items.len().div_ceil(threads)))
+            .map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<_>>()))
+            .collect();
+        (parts.into_iter())
+            .flat_map(|part| part.join().unwrap())
+            .collect()
     })
 }
 /// Whether every vertex of `triangle` lies on the cylinder of the round bar
@@ -2074,10 +2110,12 @@ pub(crate) fn stock_picture(
     let p = Projector::filling(Camera::default(), (w as f32, h as f32), &[all], 0.9);
     let mut rgba = vec![0; (w * h * 4) as usize];
     let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
-    for (t, color) in triangles {
-        let vertices = t.map(|v| (p.p(v), p.depth(v)));
-        raster_triangle(&mut rgba, &mut depths, w, h, vertices, *color);
-    }
+    let projected = on_every_core(triangles, |(t, color)| {
+        (t.map(|v| (p.p(v), p.depth(v))), *color)
+    });
+    raster_triangles(&mut rgba, &mut depths, w, h, projected.len(), |i| {
+        projected[i]
+    });
     Some(iced::widget::image::Handle::from_rgba(w, h, rgba))
 }
 fn box_vertices(bounds: crate::mesh::Bounds) -> [[f32; 3]; 8] {
@@ -2325,6 +2363,87 @@ fn raster_triangle(
     vertices: [(Point, f32); 3],
     color: [u8; 4],
 ) {
+    raster_rows(pixels, depths, w, 0..h, vertices, color);
+}
+/// A triangle projected to the frame (its corners' pixels and depths), and
+/// its colour.
+type Projected = ([(Point, f32); 3], [u8; 4]);
+/// `triangles` drawn as `raster_triangle` draws each in turn, on every core:
+/// each draws a band of rows, taking the triangles in the same order, so the
+/// pixels are the same.
+fn raster_triangles(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    w: u32,
+    h: u32,
+    count: usize,
+    triangle: impl Fn(usize) -> Projected + Sync,
+) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+    if threads == 1 || count < 4096 || w == 0 {
+        for i in 0..count {
+            let (vertices, color) = triangle(i);
+            raster_triangle(pixels, depths, w, h, vertices, color);
+        }
+        return;
+    }
+    let band = h.div_ceil(threads).max(1);
+    let bands = h.div_ceil(band) as usize;
+    let length = count.div_ceil(threads as usize);
+    let triangle = &triangle;
+    // The triangles reaching each band, sorted out a part of the list a core.
+    let parts: Vec<Vec<Vec<u32>>> = std::thread::scope(|scope| {
+        let sorting: Vec<_> = (0..count)
+            .step_by(length)
+            .map(|first| {
+                scope.spawn(move || {
+                    let mut reaching = vec![vec![]; bands];
+                    for i in first..(first + length).min(count) {
+                        let (low, high) = (triangle(i).0.iter())
+                            .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), v| {
+                                (l.min(v.0.y), h.max(v.0.y))
+                            });
+                        // The rows `raster_rows` draws.
+                        let top = low.floor().clamp(0., h as f32) as u32;
+                        let bottom = high.ceil().clamp(0., h as f32) as u32;
+                        if top < bottom {
+                            for b in (top / band)..=((bottom - 1) / band) {
+                                reaching[b as usize].push(i as u32);
+                            }
+                        }
+                    }
+                    reaching
+                })
+            })
+            .collect();
+        (sorting.into_iter()).map(|s| s.join().unwrap()).collect()
+    });
+    std::thread::scope(|scope| {
+        let rows = (pixels.chunks_mut((band * w * 4) as usize))
+            .zip(depths.chunks_mut((band * w) as usize));
+        for (b, (pixels, depths)) in rows.enumerate() {
+            let top = b as u32 * band;
+            let rows = top..top + depths.len() as u32 / w;
+            let parts = &parts;
+            scope.spawn(move || {
+                for i in parts.iter().flat_map(|reaching| &reaching[b]) {
+                    let (vertices, color) = triangle(*i as usize);
+                    raster_rows(pixels, depths, w, rows.clone(), vertices, color);
+                }
+            });
+        }
+    });
+}
+/// `raster_triangle` over the frame's rows `rows` alone, whose pixels and
+/// depths `pixels` and `depths` hold.
+fn raster_rows(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    w: u32,
+    rows: std::ops::Range<u32>,
+    vertices: [(Point, f32); 3],
+    color: [u8; 4],
+) {
     let minx = vertices
         .iter()
         .map(|v| v.0.x)
@@ -2342,16 +2461,16 @@ fn raster_triangle(
         .map(|v| v.0.y)
         .fold(f32::INFINITY, f32::min)
         .floor()
-        .clamp(0., h as f32) as u32;
+        .clamp(rows.start as f32, rows.end as f32) as u32;
     let maxy = vertices
         .iter()
         .map(|v| v.0.y)
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil()
-        .clamp(0., h as f32) as u32;
+        .clamp(rows.start as f32, rows.end as f32) as u32;
     for y in miny..maxy {
         for x in minx..maxx {
-            let index = (y * w + x) as usize;
+            let index = ((y - rows.start) * w + x) as usize;
             if let Some(z) = triangle_depth(vertices, Point::new(x as f32 + 0.5, y as f32 + 0.5))
                 && z >= depths[index]
             {
@@ -2557,6 +2676,62 @@ mod tests {
         })
     }
     #[test]
+    fn stock_drawn_on_every_core_is_the_same_as_one_triangle_at_a_time() {
+        let mesh =
+            crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
+        let frame = crate::volume::Frame::new(
+            &crate::model::Setup::new(crate::model::Machine::new(3), "G54"),
+            &mesh,
+        );
+        let bounds = crate::mesh::Bounds {
+            min: [-30., -20., 0.],
+            max: [30., 20., 15.],
+        };
+        let mut v = crate::volume::Volume::new(bounds, frame);
+        for i in 0..12 {
+            let y = -15. + i as f32 * 2.5;
+            let z = 13. - i as f32 * 0.6;
+            use crate::simulation::CutterShape;
+            let shape = [CutterShape::Flat, CutterShape::Ball][i % 2];
+            v.cut(
+                [-25., y, z],
+                [25., y + 1., z - 1.],
+                3.,
+                12.,
+                shape,
+                frame,
+                (0, 0),
+            );
+        }
+        let surface =
+            crate::stock_surface::Snapshot::of(&v, crate::stock_surface::Detail::Standard)
+                .build()
+                .unwrap();
+        let (w, h) = (900, 700);
+        let p = Projector::filling(Camera::default(), (w as f32, h as f32), &[bounds], 0.9);
+        let triangles: Vec<_> = stock_triangles(&v, &surface, frame)
+            .map(|(t, color)| (t.map(|q| (p.p(q), p.depth(q))), color))
+            .collect();
+        assert!(triangles.len() > 4096, "{} triangles", triangles.len());
+        let blank = || {
+            (
+                vec![0u8; (w * h * 4) as usize],
+                vec![f32::NEG_INFINITY; (w * h) as usize],
+            )
+        };
+        let (mut one, mut one_depths) = blank();
+        for (t, color) in &triangles {
+            raster_triangle(&mut one, &mut one_depths, w, h, *t, *color);
+        }
+        let (mut all, mut all_depths) = blank();
+        raster_triangles(&mut all, &mut all_depths, w, h, triangles.len(), |i| {
+            triangles[i]
+        });
+        assert!(one.chunks(4).filter(|px| px[3] != 0).count() > (w * h / 4) as usize);
+        assert!(one == all);
+        assert!((one_depths.iter().zip(&all_depths)).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+    #[test]
     fn a_round_bars_cylinder_and_ends_are_block_and_its_turned_faces_cut() {
         let mesh =
             crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
@@ -2584,8 +2759,14 @@ mod tests {
             } else if z.iter().all(|z| z.abs() < 0.001) {
                 // The end in the chuck.
                 assert_eq!(color, shade(&points, BLOCK), "{points:?}");
-            } else if radii.iter().all(|r| (r - 20.).abs() < 0.01) && z.iter().all(|z| *z > 51.)
+            } else if radii.iter().all(|r| (r - 20.).abs() < 0.01)
+                && z.iter().all(|z| *z > 51.)
+                // A sliver along the turned diameter's end lies on the bar's
+                // end too, and one along the shoulder's rim on its cylinder:
+                // those are the block's.
+                && !z.iter().all(|z| (z - 100.).abs() < 0.001)
                 || z.iter().all(|z| (z - 50.).abs() < 0.001)
+                    && !radii.iter().all(|r| (r - 25.).abs() < 0.05)
             {
                 // The turned diameter and its shoulder.
                 assert_eq!(color, shade(&points, CUT), "{points:?}");

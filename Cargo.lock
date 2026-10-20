@@ -500,6 +500,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
+ "bytemuck",
  "clipper2",
  "dirs",
  "fidget",
@@ -511,6 +512,7 @@ dependencies = [
  "iced_tiny_skia",
  "jsonwebtoken",
  "png 0.17.16",
+ "pollster",
  "reqwest",
  "rfd",
  "roxmltree 0.21.1",
@@ -523,6 +525,7 @@ dependencies = [
  "toml_edit",
  "uc100",
  "uuid",
+ "wgpu",
  "zip",
 ]
 

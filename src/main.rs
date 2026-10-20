@@ -9,6 +9,7 @@ mod facing;
 mod fake_openai;
 mod field_art;
 mod forces;
+mod gpu_mesh;
 mod guide;
 mod help;
 mod holding;
@@ -7060,6 +7061,9 @@ fn main() -> iced::Result {
         );
         std::process::exit(2)
     }
+    // The stock mesher's GPU takes a moment to open: open it now, not on the
+    // first simulation's stock.
+    std::thread::spawn(gpu_mesh::shared);
     iced::application(App::boot, App::update, App::view)
         .title(|app: &App| format!("{} — AXIS CAM Studio", app.doc.title))
         .theme(Theme::custom(

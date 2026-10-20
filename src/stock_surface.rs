@@ -1,7 +1,9 @@
-//! Continuous swept-tool CSG, meshed with an adaptive octree and manifold dual
-//! contouring. Coordinates remain attached to the first setup, across flips.
-//! The small occupancy grid in Volume is only a removal-volume estimate; it is
-//! never used to construct this surface. No dense fine-resolution grid exists.
+//! Continuous swept-tool CSG, meshed by dual contouring: on the GPU over a
+//! grid of the detail's cell, kept to the bricks the surface can cross
+//! (`gpu_mesh`), or else on the CPU with fidget's adaptive octree. Coordinates
+//! remain attached to the first setup, across flips. The small occupancy grid
+//! in Volume is only a removal-volume estimate; it is never used to construct
+//! this surface.
 use crate::{mesh::Bounds, simulation::CutterShape, volume::Frame};
 use fidget::{
     context::Tree,
@@ -240,7 +242,7 @@ impl Snapshot {
             round: volume.round,
         }
     }
-    fn field(&self) -> Tree {
+    pub(crate) fn field(&self) -> Tree {
         let p = [Tree::x(), Tree::y(), Tree::z()];
         let box_field = if self.round {
             // The bar's cylinder between the box's ends.
@@ -262,7 +264,19 @@ impl Snapshot {
         let mut cuts: Vec<_> = self.cuts.iter().map(|cut| cut.field(self.frame)).collect();
         box_field.max(-balanced_union(&mut cuts))
     }
+    /// The surface, meshed on the GPU when there is one (`gpu_mesh`), else
+    /// by fidget's octree on the CPU (`build_cpu`).
     pub fn build(&self) -> Result<SurfaceMesh, String> {
+        if let Some(gpu) = crate::gpu_mesh::shared() {
+            match gpu.mesh(self) {
+                Ok(mesh) => return Ok(mesh),
+                Err(e) => eprintln!("GPU stock mesher: {e}; meshing on the CPU."),
+            }
+        }
+        self.build_cpu()
+    }
+    /// The surface meshed by fidget's adaptive octree on the CPU.
+    pub fn build_cpu(&self) -> Result<SurfaceMesh, String> {
         let start = std::time::Instant::now();
         let size = self.bounds.dimensions();
         let span = size.into_iter().fold(0., f32::max) * 1.04;
@@ -396,8 +410,10 @@ mod tests {
     #[test]
     fn octree_mesh_retains_round_tool_radius_and_exact_flat_faces() {
         let c = cut([0., 0., 12.], [0., 0., 3.], CutterShape::Flat);
-        let coarse = snapshot(vec![c.clone()], Detail::Draft).build().unwrap();
-        let fine = snapshot(vec![c], Detail::Standard).build().unwrap();
+        let coarse = snapshot(vec![c.clone()], Detail::Draft)
+            .build_cpu()
+            .unwrap();
+        let fine = snapshot(vec![c], Detail::Standard).build_cpu().unwrap();
         watertight(&coarse);
         watertight(&fine);
         let error = |mesh: &SurfaceMesh| {
@@ -428,7 +444,7 @@ mod tests {
             vec![cut([-12., 0., 2.], [12., 0., 7.], CutterShape::Flat)],
             Detail::Standard,
         )
-        .build()
+        .build_cpu()
         .unwrap();
         watertight(&mesh);
         let mut checked = 0;
@@ -552,7 +568,7 @@ mod tests {
             max: [25., 25., 100.],
         };
         let mut v = crate::volume::Volume::bar(bar, frame());
-        let whole = Snapshot::of(&v, Detail::Draft).build().unwrap();
+        let whole = Snapshot::of(&v, Detail::Draft).build_cpu().unwrap();
         watertight(&whole);
         let cell = whole.cell_mm;
         let on = |p: &[f32; 3], radius: f32, low: f32| {
@@ -579,7 +595,7 @@ mod tests {
         // Turned to Ø40 over its top half: the step and the new face, the
         // cylinder below.
         v.revolve(50., 101., 20., 26., frame(), (0, 0));
-        let turned = Snapshot::of(&v, Detail::Draft).build().unwrap();
+        let turned = Snapshot::of(&v, Detail::Draft).build_cpu().unwrap();
         watertight(&turned);
         for p in &turned.vertices {
             let r = p[0].hypot(p[1]);
@@ -592,7 +608,7 @@ mod tests {
         }
         // The box field is unchanged for a box stock.
         let block = Snapshot::of(&crate::volume::Volume::new(bar, frame()), Detail::Draft)
-            .build()
+            .build_cpu()
             .unwrap();
         assert!(
             block
@@ -607,7 +623,7 @@ mod tests {
             vec![cut([0., 0., 12.], [0., 0., 3.], CutterShape::Ball)],
             Detail::Draft,
         )
-        .build()
+        .build_cpu()
         .unwrap();
         watertight(&mesh);
         let mut count = 0;
@@ -629,7 +645,7 @@ mod tests {
             vec![cut([0., 0., 12.], [0., 0., 3.], CutterShape::Drill)],
             Detail::Standard,
         )
-        .build()
+        .build_cpu()
         .unwrap();
         watertight(&mesh);
         // Under the wall the floor is the 118° cone from the tip at Z3 to
