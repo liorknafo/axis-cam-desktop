@@ -1211,6 +1211,14 @@ pub fn command(m: &Message, label: String) -> Help {
             "Set the part rotation to 90° about Y to expose a side. Review the origin and fixture for this position; the stock is what the setups before it leave.",
             "",
         ),
+        TurnStock(..) => (
+            "Turn this setup so the stock lies with the chosen face up and turn on the table, as setup 1 has the stock: square to it whatever setup 1's rotation is.",
+            "",
+        ),
+        SquareToStock => (
+            "Set this setup's rotation to the quarter turn of the stock nearest it, so the stock is no longer skewed and its stock-based work zero, jaws and clamps can be used.",
+            "",
+        ),
         AssignMachine(_) => (
             "Use this machine to create the first setup, or copy its saved version into the current setup. Later library edits will not silently change that setup's machine settings.",
             "",
@@ -1501,7 +1509,9 @@ pub fn command(m: &Message, label: String) -> Help {
     };
     let h = Help::text(label, description).more(more);
     match m {
-        Flip(_) | AddSetup | DuplicateSetup => h.animated(Diagram::Orientation),
+        Flip(_) | TurnStock(..) | SquareToStock | AddSetup | DuplicateSetup => {
+            h.animated(Diagram::Orientation)
+        }
         _ => h,
     }
 }
@@ -4304,6 +4314,8 @@ mod tests {
             MoveSetup(1),
             Flip("rx"),
             Flip("ry"),
+            TurnStock(1, 2),
+            SquareToStock,
             AssignMachine("m".into()),
             EditMachine("m".into()),
             SaveMachine,

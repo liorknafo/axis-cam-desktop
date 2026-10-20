@@ -4236,13 +4236,19 @@ fn setup_stock<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> 
 fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Message> {
     let p = &app.doc.setup().p;
     let t = Target::Setup;
-    let mut c = c.push(section("Part position")).push(
-        row![
-            secondary("Flip X 180°", Message::Flip("rx")),
-            secondary("Side Y 90°", Message::Flip("ry"))
-        ]
-        .spacing(4),
-    );
+    let mut c = c.push(section("Part position"));
+    let i = app.doc.index();
+    c = if i == 0 {
+        c.push(
+            row![
+                secondary("Flip X 180°", Message::Flip("rx")),
+                secondary("Side Y 90°", Message::Flip("ry"))
+            ]
+            .spacing(4),
+        )
+    } else {
+        stock_turn(app, i, c)
+    };
     for (k, l) in [
         ("rx", "Rotation X · degrees"),
         ("ry", "Rotation Y · degrees"),
@@ -4252,6 +4258,65 @@ fn setup_position<'a>(app: &'a App, c: Column<'a, Message>) -> Column<'a, Messag
         ("tz", "Translation Z · mm"),
     ] {
         c = c.push(field(p, k, l, t));
+    }
+    c
+}
+/// How a later setup has the stock that setup 1 defined: which of its faces
+/// is up and how it is turned on the table, chosen from setup 1's frame so
+/// the setup is always square to the stock; or, when its angles leave it a
+/// few degrees off, the way to square it.
+fn stock_turn<'a>(app: &'a App, i: usize, mut c: Column<'a, Message>) -> Column<'a, Message> {
+    use crate::volume::{FACES, TABLE_TURNS, face_and_table, turn_between};
+    let first = &app.doc.setups[0];
+    let now = turn_between(first, &app.doc.setups[i]).map(face_and_table);
+    let faces: Vec<String> = FACES.iter().map(|(name, _)| name.to_string()).collect();
+    let tables: Vec<String> = TABLE_TURNS.iter().map(|t| t.to_string()).collect();
+    let (face, table) = now.unwrap_or((0, 0));
+    let face_list = pick_list(
+        faces.clone(),
+        now.map(|(f, _)| faces[f].clone()),
+        move |v: String| {
+            Message::TurnStock(FACES.iter().position(|(n, _)| *n == v).unwrap_or(0), table)
+        },
+    )
+    .placeholder("Not square to the stock")
+    .width(Fill)
+    .padding([7, 9])
+    .text_size(13)
+    .style(choice_style);
+    let table_list = pick_list(
+        tables.clone(),
+        now.map(|(_, q)| tables[q].clone()),
+        move |v: String| {
+            Message::TurnStock(face, TABLE_TURNS.iter().position(|t| *t == v).unwrap_or(0))
+        },
+    )
+    .placeholder("—")
+    .width(Fill)
+    .padding([7, 9])
+    .text_size(13)
+    .style(choice_style);
+    c = c.push(help::wrap(
+        row![
+            column![muted("Stock face up"), face_list].spacing(5).width(Length::FillPortion(3)),
+            column![muted("Turned on the table"), table_list].spacing(5).width(Length::FillPortion(2)),
+        ]
+        .spacing(8),
+        Help::text(
+            "Stock face up",
+            "Which face of the stock this setup has on top, and how far it is turned about Z on the table, as setup 1 has the stock. The rotations below are set from these and setup 1's rotation, so this setup stays square to the stock and its jaws, clamps and stock-based work zero can be used.",
+        ),
+        widget::tooltip::Position::Left,
+    ));
+    if now.is_none() {
+        c = c.push(note(format!(
+            "This setup's rotation is not a whole number of quarter turns from {}'s, where the stock was defined, so the stock sits skewed: no stock-based work zero, jaws or clamps can be used. Square it to the stock, or choose the face up above.",
+            first.name()
+        )));
+        c = c.push(row![secondary(
+            "Square to the stock",
+            Message::SquareToStock
+        )]);
     }
     c
 }

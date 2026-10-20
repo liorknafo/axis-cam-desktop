@@ -2527,6 +2527,49 @@ impl Document {
         }
         Ok(())
     }
+    /// Turns later setup `i` so the stock lies as `turn` from setup 1's
+    /// frame (`volume::turned`): square to the stock whatever setup 1's
+    /// rotation is. Setup 1 itself is not turned this way.
+    pub fn turn_setup(&mut self, i: usize, turn: crate::volume::Turn) {
+        let (Some(first), true) = (self.setups.first(), i > 0) else {
+            return;
+        };
+        let angles = crate::volume::turned(first, turn);
+        let setup = &mut self.setups[i];
+        for (k, v) in ["rx", "ry", "rz"].iter().zip(angles) {
+            setup.p.insert((*k).into(), v.to_string());
+        }
+        setup
+            .p
+            .insert("reposition".into(), "Reclamp and probe origin".into());
+    }
+    /// Sets setup 1's rotation `k` to `v`, turning with it each later setup
+    /// that was square to it, so it stays square to the stock. The names of
+    /// the setups turned.
+    pub fn rotate_first(&mut self, k: &str, v: String) -> Vec<String> {
+        let Some(first) = self.setups.first() else {
+            return vec![];
+        };
+        let kept: Vec<_> = self.setups[1..]
+            .iter()
+            .map(|later| crate::volume::turn_between(first, later))
+            .collect();
+        self.setups[0].p.insert(k.into(), v);
+        let mut turned = vec![];
+        for (i, turn) in kept.into_iter().enumerate() {
+            let Some(turn) = turn else { continue };
+            if crate::volume::turn_between(&self.setups[0], &self.setups[i + 1]) == Some(turn) {
+                continue;
+            }
+            let angles = crate::volume::turned(&self.setups[0], turn);
+            let later = &mut self.setups[i + 1];
+            for (k, v) in ["rx", "ry", "rz"].iter().zip(angles) {
+                later.p.insert((*k).into(), v.to_string());
+            }
+            turned.push(later.name().to_string());
+        }
+        turned
+    }
     pub fn move_setup(&mut self, from: usize, delta: isize) -> Result<(), String> {
         let to = from as isize + delta;
         if to < 0 || to as usize >= self.setups.len() {
@@ -4674,12 +4717,40 @@ mod tests {
         doc
     }
     #[test]
+    fn turning_setup_1_turns_the_later_setups_square_to_it_with_it() {
+        let mut doc = Document::default();
+        for name in ["Setup 1", "Flipped", "Skewed"] {
+            let mut s = Setup::new(Machine::new(3), "G54");
+            s.p.insert("name".into(), name.into());
+            doc.setups.push(s);
+        }
+        let bottom = crate::volume::turns()
+            .find(|&(f, q, _)| (f, q) == (1, 0))
+            .unwrap()
+            .2;
+        doc.turn_setup(1, bottom);
+        doc.setups[2].p.insert("rz".into(), "7".into());
+        // Setup 1 is never turned from itself.
+        let before = doc.setups[0].p.clone();
+        doc.turn_setup(0, bottom);
+        assert_eq!(doc.setups[0].p, before);
+        assert_eq!(doc.rotate_first("rz", "2".into()), ["Flipped"]);
+        assert_eq!(
+            crate::volume::turn_between(&doc.setups[0], &doc.setups[1]),
+            Some(bottom)
+        );
+        // One not square before is left as typed.
+        assert_eq!(get(&doc.setups[2].p, "rz"), "7");
+        // The same value again turns nothing.
+        assert!(doc.rotate_first("rz", "2".into()).is_empty());
+    }
+    #[test]
     fn a_later_setup_not_square_to_setup_1_cannot_model_its_workholding() {
         use crate::holding::NOT_SQUARE;
         let mesh = crate::mesh::sample();
         assert_eq!(
             NOT_SQUARE,
-            "This setup is not square to setup 1, so its vise or clamps cannot be modelled. Choose None, or square the setup."
+            "This setup is not square to setup 1, so its vise or clamps cannot be modelled. Choose None, or press Square to the stock under Part position."
         );
         // A quarter turn about Z, in either direction, a half turn and none
         // keep the axes parallel: the jaws turn with the stock.

@@ -11951,6 +11951,39 @@ flood = { pin = 8 }
         let _view = a.view();
     }
     #[test]
+    fn a_later_setup_is_turned_from_the_stock_and_stays_square_to_it() {
+        let mut a = app();
+        let _ = a.update(Message::DuplicateSetup);
+        // Stock face up: bottom, turned 180° on the table.
+        let _ = a.update(Message::TurnStock(1, 2));
+        let later = |a: &App| crate::volume::turn_between(&a.doc.setups[0], &a.doc.setups[1]);
+        assert_eq!(later(&a).map(crate::volume::face_and_table), Some((1, 2)));
+        drop(a.view());
+        // Setup 1 turned 2° on the table: the flipped setup turns with it.
+        let _ = a.update(Message::SelectSetup(0));
+        edit_setup(&mut a, &[("rz", "2")]);
+        assert_eq!(later(&a).map(crate::volume::face_and_table), Some((1, 2)));
+        assert!(
+            a.status.contains("to stay square to the stock"),
+            "{}",
+            a.status
+        );
+        // Its own angles typed a few degrees off are squared again in one press.
+        let _ = a.update(Message::SelectSetup(1));
+        edit_setup(&mut a, &[("rx", "0"), ("ry", "180"), ("rz", "0")]);
+        assert_eq!(later(&a), None);
+        drop(a.view());
+        let _ = a.update(Message::SquareToStock);
+        assert_eq!(later(&a).map(crate::volume::face_and_table), Some((1, 2)));
+        assert!(
+            a.status.contains("Bottom (−Z) up, turned 180°"),
+            "{}",
+            a.status
+        );
+        let angles = ["rx", "ry", "rz"].map(|k| get(&a.doc.setups[1].p, k).to_string());
+        assert_eq!(angles, ["0", "180", "-2"]);
+    }
+    #[test]
     fn setup_actions_on_empty_document_are_safe() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = App::from_workspace(dir.path().join("workspace.json"), None);

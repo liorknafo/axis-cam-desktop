@@ -89,6 +89,123 @@ impl Frame {
         std::array::from_fn(|k| (0..3).map(|i| to.basis[i][k] * part[i]).sum())
     }
 }
+/// A turn of the stock by whole quarter turns, from setup 1's frame to a
+/// later setup's: `turn[k][i]` is how far the stock's axis `i` lies along
+/// the machine's axis `k`, each -1, 0 or 1.
+pub type Turn = [[f32; 3]; 3];
+/// The faces of the stock a later setup can have up, each with the turn
+/// from setup 1 that puts it there (rotations about X, Y, Z, degrees).
+pub const FACES: [(&str, [f32; 3]); 6] = [
+    ("Top (+Z)", [0., 0., 0.]),
+    ("Bottom (−Z)", [180., 0., 0.]),
+    ("Front (−Y)", [-90., 0., 0.]),
+    ("Back (+Y)", [90., 0., 0.]),
+    ("+X side", [0., -90., 0.]),
+    ("−X side", [0., 90., 0.]),
+];
+/// The quarter turns on the table, about Z, after the face is up.
+pub const TABLE_TURNS: [&str; 4] = ["0°", "90°", "180°", "270°"];
+/// The matrix of a setup's rotation: column `i` is where the part's axis
+/// `i` goes.
+fn matrix(angles: [f32; 3]) -> Turn {
+    let columns = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|p| rotation(p, angles));
+    std::array::from_fn(|k| std::array::from_fn(|i| columns[i][k]))
+}
+fn product(a: Turn, b: Turn) -> Turn {
+    std::array::from_fn(|k| std::array::from_fn(|i| (0..3).map(|j| a[k][j] * b[j][i]).sum()))
+}
+fn transposed(a: Turn) -> Turn {
+    std::array::from_fn(|k| std::array::from_fn(|i| a[i][k]))
+}
+fn angles_of(setup: &Setup) -> [f32; 3] {
+    ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(0.))
+}
+/// The rotations about X, Y and Z (degrees, as a setup holds them) whose
+/// matrix is `m`: of the two that are, the one with the smaller angles, so
+/// a flip reads 0, 180, -2 rather than 180, 0, 178. Rounded to 0.0001°.
+fn angles(m: Turn) -> [f32; 3] {
+    let tidy = |v: f32| {
+        let v = (v.to_degrees() * 10_000.).round() / 10_000.;
+        // Into (-180, 180], and a -0 printed as 0.
+        let v = if v <= -180. {
+            v + 360.
+        } else if v > 180. {
+            v - 360.
+        } else {
+            v
+        };
+        v + 0.
+    };
+    let cb = m[0][0].hypot(m[1][0]);
+    let b = (-m[2][0]).atan2(cb);
+    if cb < 1e-6 {
+        // Y at ±90°: X and Z turn about the same axis, so X takes none of it.
+        let c = (-m[0][1]).atan2(m[1][1]);
+        return [0., tidy(b), tidy(c)];
+    }
+    let a = m[2][1].atan2(m[2][2]);
+    let c = m[1][0].atan2(m[0][0]);
+    let pi = std::f32::consts::PI;
+    let first = [a, b, c].map(tidy);
+    let second = [a + pi, pi - b, c + pi].map(tidy);
+    let size = |r: [f32; 3]| r.iter().map(|v| v.abs()).sum::<f32>();
+    if size(second) + 1e-3 < size(first) {
+        second
+    } else {
+        first
+    }
+}
+/// The turn from setup `first`'s frame to setup `later`'s, when it is by
+/// whole quarter turns (`Frame::square_to`).
+pub fn turn_between(first: &Setup, later: &Setup) -> Option<Turn> {
+    let turn = product(
+        matrix(angles_of(later)),
+        transposed(matrix(angles_of(first))),
+    );
+    turn.iter()
+        .flatten()
+        .all(|v| v.abs() < 1e-4 || (v.abs() - 1.).abs() < 1e-4)
+        .then(|| turn.map(|row| row.map(|v| v.round() + 0.)))
+}
+/// Every quarter-turn of the stock: each face up (`FACES`), turned on the
+/// table (`TABLE_TURNS`), as (face, table turn, turn).
+pub fn turns() -> impl Iterator<Item = (usize, usize, Turn)> {
+    (0..FACES.len()).flat_map(|f| {
+        (0..TABLE_TURNS.len()).map(move |q| {
+            let turn = product(matrix([0., 0., 90. * q as f32]), matrix(FACES[f].1));
+            (f, q, turn.map(|row| row.map(|v| v.round() + 0.)))
+        })
+    })
+}
+/// The face up and the table turn (`turns`) of a quarter turn.
+pub fn face_and_table(turn: Turn) -> (usize, usize) {
+    turns()
+        .find(|(_, _, t)| *t == turn)
+        .map_or((0, 0), |(f, q, _)| (f, q))
+}
+/// The quarter turn nearest the turn from `first`'s frame to `later`'s: the
+/// one a later setup a few degrees off was meant to be.
+pub fn nearest_turn(first: &Setup, later: &Setup) -> Turn {
+    let turn = product(
+        matrix(angles_of(later)),
+        transposed(matrix(angles_of(first))),
+    );
+    let along = |t: &Turn| {
+        (0..3)
+            .flat_map(|k| (0..3).map(move |i| (k, i)))
+            .map(|(k, i)| t[k][i] * turn[k][i])
+            .sum::<f32>()
+    };
+    turns()
+        .map(|(_, _, t)| t)
+        .max_by(|a, b| along(a).total_cmp(&along(b)))
+        .expect("there are 24 turns")
+}
+/// The rotations (X, Y, Z, degrees) that turn the part as setup `first`
+/// has it, and then the stock by `turn`: a later setup square to setup 1.
+pub fn turned(first: &Setup, turn: Turn) -> [f32; 3] {
+    angles(product(turn, matrix(angles_of(first))))
+}
 #[derive(Debug, Clone)]
 pub struct Volume {
     pub bounds: Bounds,
@@ -456,6 +573,72 @@ mod tests {
             assert!(!f.square_to(unrotated), "{angles:?}");
             assert!(!unrotated.square_to(f), "{angles:?}");
         }
+    }
+    fn setup_at(angles: [f32; 3]) -> Setup {
+        let mut s = Setup::new(crate::model::Machine::new(3), "G54");
+        for (k, v) in ["rx", "ry", "rz"].iter().zip(angles) {
+            s.p.insert((*k).into(), v.to_string());
+        }
+        s
+    }
+    #[test]
+    fn the_angles_of_a_rotation_give_it_back() {
+        for a in [
+            [0., 0., 0.],
+            [180., 0., 0.],
+            [0., 180., -2.],
+            [12., -33., 71.],
+            [-170., 89.99, 5.],
+            [0., 90., 30.],
+            [45., -90., 0.],
+            [90., 0., 90.],
+        ] {
+            let back = angles(matrix(a));
+            let (m, n) = (matrix(a), matrix(back));
+            assert!(
+                (0..3).all(|k| (0..3).all(|i| (m[k][i] - n[k][i]).abs() < 1e-4)),
+                "{a:?} came back as {back:?}"
+            );
+        }
+        // Of the two angle sets of a turn, the smaller.
+        assert_eq!(angles(matrix([180., 0., 178.])), [0., 180., -2.]);
+    }
+    #[test]
+    fn every_turn_of_the_stock_is_square_to_a_tilted_setup_1() {
+        let all: Vec<_> = turns().collect();
+        assert_eq!(all.len(), 24);
+        for (n, (_, _, t)) in all.iter().enumerate() {
+            assert!(all[..n].iter().all(|(_, _, u)| u != t), "turn {n} repeats");
+        }
+        for first in [
+            [0., 0., 0.],
+            [0., 0., 2.],
+            [10., -20., 33.],
+            [180., 0., 90.],
+        ] {
+            let first = setup_at(first);
+            for &(f, q, t) in &all {
+                let later = setup_at(turned(&first, t));
+                assert_eq!(turn_between(&first, &later), Some(t), "{f} {q}");
+                assert_eq!(face_and_table(t), (f, q));
+                assert!(Frame::axes(&later).square_to(Frame::axes(&first)));
+            }
+        }
+    }
+    #[test]
+    fn a_setup_a_few_degrees_off_is_nearest_the_turn_it_was_meant_to_be() {
+        let first = setup_at([0., 0., 2.]);
+        let flipped = setup_at([0., 180., 0.]);
+        assert_eq!(turn_between(&first, &flipped), None);
+        let t = nearest_turn(&first, &flipped);
+        assert_eq!(face_and_table(t), (1, 2));
+        assert_eq!(turned(&first, t), [0., 180., -2.]);
+        // Already square: its own turn.
+        let square = setup_at([180., 0., 88.]);
+        assert_eq!(
+            Some(nearest_turn(&first, &square)),
+            turn_between(&first, &square)
+        );
     }
     #[test]
     fn stock_frame_roundtrips_after_flip_and_translation() {
