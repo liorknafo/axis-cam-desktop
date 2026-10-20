@@ -6714,6 +6714,11 @@ pub(crate) fn run_strip<'a>(
             ));
         }
     }
+    if !crate::run::busy(state)
+        && let Some(line) = crate::run::limits_unchecked(c)
+    {
+        body = body.push(caution("Soft limits are off for Cycle Start", vec![line]));
+    }
     if let Some((ok, message)) = &run.outcome {
         body = body.push(text(message.clone()).size(12).color(if *ok {
             Color::from_rgb8(39, 130, 93)
@@ -7096,17 +7101,16 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     steps.push(if (0..3).all(|a| s.referenced[a]) {
         "1. X, Y and Z have a machine position.".into()
     } else if c.home_switches() {
-        "1. Home under Position.".into()
+        "1. Optional: Home under Position, so that the soft limits are on. Without it Cycle Start runs with them off.".into()
     } else {
-        "1. Set machine zero under Position: jog X to its left end, Y to its front end and Z to the top first.".into()
+        "1. Optional: Set machine zero under Position, so that the soft limits are on: jog X to its left end, Y to its front end and Z to the top first. Without it Cycle Start runs with them off.".into()
     });
     steps.push(if p.offset == format!("G{}", 54 + s.active_wcs) {
         format!("2. {} is the active work system.", p.offset)
     } else {
         format!("2. Select {} under Work zero.", p.offset)
     });
-    let checks =
-        "The checks above then say whether every tool run fits the soft limits from there.";
+    let checks = fits_check(c);
     let blocked = c.partway_blocked();
     if let Some(on) = &p.pins {
         steps.truncate(1);
@@ -7329,13 +7333,23 @@ fn pin_steps(
                 }
             });
             format!(
-                "4. Jog the tool tip over {spot}, down until it just pinches a sheet of paper, and press Set Z{}, or put the touch plate there and press Probe Z under Work zero. The checks above then say whether every tool run fits the soft limits from there.",
-                crate::post::exact_mm(work[2] as f32)
+                "4. Jog the tool tip over {spot}, down until it just pinches a sheet of paper, and press Set Z{}, or put the touch plate there and press Probe Z under Work zero. {}",
+                crate::post::exact_mm(work[2] as f32),
+                fits_check(c)
             )
         }
         None => "4. Touch Z off on the part with Set under Work zero: the program header says where Z0 is.".into(),
     });
     steps
+}
+/// What the checks say once the work zero is on the stock: whether every
+/// tool run fits the soft limits, which needs a machine position.
+fn fits_check(c: &crate::control::Connection) -> &'static str {
+    if c.snapshot.referenced[..3].iter().all(|r| *r) {
+        "The checks above then say whether every tool run fits the soft limits from there."
+    } else {
+        "Without a machine position the checks cannot say whether every tool run fits the machine's travel."
+    }
 }
 /// A work position (mm) as it is said: "X0 Y0 Z12.5".
 fn work_words(work: [f64; 3]) -> String {

@@ -3386,6 +3386,40 @@ flood = { pin = 8 }
         assert_eq!(counts(&a), (strip, runs + 20));
     }
 
+    /// The machine has no home or limit switches, and every E-stop clears its
+    /// machine position: with only a work zero, Cycle Start runs a tool run
+    /// with the soft limits off, and the Run panel says so.
+    #[test]
+    fn cycle_start_runs_without_a_machine_position() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        idle(&mut a);
+        mdi(&mut a, "G0 X195 Y140 Z-20");
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(None)));
+        tick_until(&mut a, 2.0, "work zero", |s| {
+            s.work_pos[..3].iter().all(|v| v.abs() < 1e-6)
+        });
+        assert!(!conn(&a).snapshot.referenced[..3].iter().any(|r| *r));
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let line = crate::run::limits_unchecked(conn(&a)).expect("the warning");
+        assert!(line.contains("runs with the soft limits off"), "{line}");
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).outcome.as_ref().unwrap().0);
+        // It ended at the clearance plane of the work zero.
+        let p = &run_of(&a).checked().unwrap()[0];
+        let plane = crate::post::clearance_plane(&p.blocks) - p.datum[2];
+        let z = conn(&a).snapshot.work_pos[2];
+        assert!((z - plane as f64).abs() < 1e-3, "{z}");
+    }
+
     #[test]
     fn cycle_start_waits_for_what_the_run_panel_lists() {
         use crate::run::Action as R;
@@ -3394,14 +3428,10 @@ flood = { pin = 8 }
         idle(&mut a);
         check_run(&mut a, 0);
         let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
-        // Machine zero is not set yet.
-        assert!(
-            has(&a, "no machine position (every E-stop clears it)"),
-            "{:?}",
-            problems(&a)
-        );
-        let _ = a.update(Message::Run(R::CycleStart));
-        assert!(run_of(&a).running.is_none());
+        // Machine zero is not set yet: it does not stop Cycle Start, which
+        // says it runs with the soft limits off.
+        assert!(!has(&a, "machine position"), "{:?}", problems(&a));
+        assert!(crate::run::limits_unchecked(conn(&a)).is_some());
         let _ = a.view();
         let _ = a.update(Message::Run(R::Next(9)));
         assert_eq!(run_of(&a).next, 0);
@@ -3474,11 +3504,19 @@ flood = { pin = 8 }
         let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
         assert!(!has(&a, "no mist output"), "{:?}", problems(&a));
-        // An E-stop clears the machine position: Cycle Start waits for it.
+        // An E-stop clears the machine position: Cycle Start does not wait
+        // for it, it says the soft limits are off.
+        assert!(crate::run::limits_unchecked(conn(&a)).is_none());
         let _ = a.update(Message::MachineEStop);
         tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[0]);
         let _ = a.view();
-        assert!(has(&a, "Set machine zero again"), "{:?}", problems(&a));
+        assert!(!has(&a, "machine position"), "{:?}", problems(&a));
+        let line = crate::run::limits_unchecked(conn(&a)).unwrap();
+        assert!(
+            line.starts_with("X, Y, Z have no machine position")
+                && line.ends_with("Set machine zero under Position to turn them on."),
+            "{line}"
+        );
     }
 
     /// A run names its setup by id: moving a setup in MANUFACTURE moves the
@@ -3653,7 +3691,7 @@ flood = { pin = 8 }
         check_run(&mut a, 0);
         let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
         assert!(
-            steps(&a).contains("1. Set machine zero under Position"),
+            steps(&a).contains("1. Optional: Set machine zero under Position"),
             "{}",
             steps(&a)
         );
