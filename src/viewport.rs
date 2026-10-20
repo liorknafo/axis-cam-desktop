@@ -63,8 +63,10 @@ pub struct State {
     /// Whether the pins follow the pointer, so that leaving the view says so.
     aiming: bool,
     /// While the view is turned by a drag: the point it turns about
-    /// (`Viewport::pivot`), found once the drag starts turning.
-    pivot: Option<[f32; 3]>,
+    /// (`Viewport::pivot`), found once the drag starts turning, and the
+    /// camera the turns sent so far leave, which the next turn starts from
+    /// even when the app has not drawn them yet.
+    pivot: Option<([f32; 3], Camera)>,
     raster: RefCell<Option<(String, RasterFrame)>>,
 }
 
@@ -1631,18 +1633,25 @@ impl canvas::Program<Event> for Viewport<'_> {
                                     let (yaw, pitch) = (dx * 0.008, dy * 0.008);
                                     // The pan moves so the pivot stays where
                                     // it is on the screen as the view turns.
-                                    let pivot =
-                                        *state.pivot.get_or_insert_with(|| self.pivot(bounds));
+                                    // A wheel step during the drag: start again
+                                    // from the camera the view has now.
+                                    if state.pivot.is_some_and(|(_, c)| c.zoom != self.camera.zoom)
+                                    {
+                                        state.pivot = None;
+                                    }
+                                    let (pivot, camera) = state
+                                        .pivot
+                                        .get_or_insert_with(|| (self.pivot(bounds), self.camera));
                                     let size = (bounds.width, bounds.height);
                                     let scene = self.scene_bounds();
-                                    let before = Projector::fit(self.camera, size, scene).p(pivot);
-                                    let turned = orbited(self.camera, yaw, pitch);
-                                    let after = Projector::fit(turned, size, scene).p(pivot);
-                                    Event::Orbit(
-                                        yaw,
-                                        pitch,
-                                        [before.x - after.x, before.y - after.y],
-                                    )
+                                    let before = Projector::fit(*camera, size, scene).p(*pivot);
+                                    let mut turned = orbited(*camera, yaw, pitch);
+                                    let after = Projector::fit(turned, size, scene).p(*pivot);
+                                    let shift = [before.x - after.x, before.y - after.y];
+                                    turned.pan =
+                                        [turned.pan[0] + shift[0], turned.pan[1] + shift[1]];
+                                    *camera = turned;
+                                    Event::Orbit(yaw, pitch, shift)
                                 } else {
                                     Event::Pan(dx, dy)
                                 })
@@ -2580,6 +2589,11 @@ fn raster_depth_line(
     color: [u8; 4],
     ratio: f32,
 ) {
+    let Some((t0, t1)) = in_frame(a.0, b.0, w, h, ratio + 2.) else {
+        return;
+    };
+    let z = |t: f32| a.1 + (b.1 - a.1) * t;
+    let (a, b) = ((along(a.0, b.0, t0), z(t0)), (along(a.0, b.0, t1), z(t1)));
     let steps = (a.0.distance(b.0).ceil() as usize).clamp(1, 10000);
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
@@ -2600,7 +2614,38 @@ fn raster_depth_line(
         }
     }
 }
+/// The part of the segment `a`–`b` within the `w` × `h` frame grown by
+/// `margin` on each side, as its ends' fractions of the way from `a`; None
+/// when none of it is. A zoomed-in view stretches a move far past the
+/// frame: only what shows is stepped along.
+fn in_frame(a: Point, b: Point, w: u32, h: u32, margin: f32) -> Option<(f32, f32)> {
+    let (mut t0, mut t1) = (0f32, 1f32);
+    let d = [b.x - a.x, b.y - a.y];
+    for (start, delta, low, high) in [
+        (a.x, d[0], -margin, w as f32 + margin),
+        (a.y, d[1], -margin, h as f32 + margin),
+    ] {
+        if delta.abs() < 1e-9 {
+            if start < low || start > high {
+                return None;
+            }
+            continue;
+        }
+        let (u, v) = ((low - start) / delta, (high - start) / delta);
+        t0 = t0.max(u.min(v));
+        t1 = t1.min(u.max(v));
+    }
+    (t0 <= t1).then_some((t0, t1))
+}
+/// The point `t` of the way from `a` to `b`.
+fn along(a: Point, b: Point, t: f32) -> Point {
+    Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
 fn raster_line(pixels: &mut [u8], w: u32, h: u32, a: Point, b: Point, color: [u8; 4], width: f32) {
+    let Some((t0, t1)) = in_frame(a, b, w, h, width + 2.) else {
+        return;
+    };
+    let (a, b) = (along(a, b, t0), along(a, b, t1));
     let steps = (a.distance(b).ceil() as usize).clamp(1, 10000);
     let radius = (width / 2.).max(0.7);
     for i in 0..=steps {
@@ -3065,6 +3110,55 @@ mod tests {
             at(turned).distance(start) < 0.5,
             "{:?} {start:?}",
             at(turned)
+        );
+        // More moves before the app draws again (the view keeps the camera
+        // it had): each turn starts from the camera the earlier ones left,
+        // so applied in turn they keep the point too.
+        for (i, (x, y)) in [(318., 300.), (325., 309.), (331., 305.)]
+            .into_iter()
+            .enumerate()
+        {
+            let moved = canvas::Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, y),
+            });
+            let action = view.update(&mut state, &moved, bounds, cursor(x, y));
+            let Some(Event::Orbit(yaw, pitch, shift)) = action.and_then(|a| a.into_inner().0)
+            else {
+                panic!("move {i} turns the view");
+            };
+            turned = orbited(turned, yaw, pitch);
+            turned.pan = [turned.pan[0] + shift[0], turned.pan[1] + shift[1]];
+            assert!(
+                at(turned).distance(start) < 0.5,
+                "move {i}: {:?}",
+                at(turned)
+            );
+        }
+    }
+    /// A move stretched far past the frame by a zoomed-in view is drawn
+    /// whole where it shows, not as dashes: only its part in the frame is
+    /// stepped along.
+    #[test]
+    fn a_long_line_through_the_frame_is_drawn_without_gaps() {
+        let (w, h) = (200u32, 100u32);
+        // Along the centres of row 50's pixels.
+        let (a, b) = (Point::new(-500_000., 50.5), Point::new(500_000., 50.5));
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        raster_line(&mut pixels, w, h, a, b, [255; 4], 1.);
+        let row = |p: &[u8]| {
+            (0..w)
+                .filter(|x| p[((50 * w + x) * 4) as usize] == 255)
+                .count()
+        };
+        assert_eq!(row(&pixels), w as usize);
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+        raster_depth_line(&mut pixels, &depths, w, h, (a, 0.), (b, 0.), [255; 4], 1.);
+        assert_eq!(row(&pixels), w as usize);
+        // One that misses the frame draws nothing.
+        assert_eq!(
+            in_frame(Point::new(-50., -50.), Point::new(-10., -60.), w, h, 2.),
+            None
         );
     }
     #[test]
