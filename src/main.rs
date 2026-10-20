@@ -205,6 +205,13 @@ pub enum Message {
     RemoveSetup,
     MoveSetup(isize),
     Flip(&'static str),
+    /// Turns a later setup so the stock lies with face `.0` of
+    /// `volume::FACES` up, turned `.1` quarter turns on the table, from
+    /// setup 1: square to the stock.
+    TurnStock(usize, usize),
+    /// Snaps a later setup a few degrees off to the quarter turn of the
+    /// stock nearest it (`volume::nearest_turn`).
+    SquareToStock,
     AssignMachine(String),
     NewMachine,
     EditMachine(String),
@@ -1676,6 +1683,17 @@ impl App {
         self.plan_chat.clear();
         self.plan_request.clear();
     }
+    /// Says which later setups turned with setup 1 to stay square to the
+    /// stock (`Document::rotate_first`).
+    fn say_turned_with_first(&mut self, turned: &[String]) {
+        if !turned.is_empty() {
+            self.status = format!(
+                "{} turned with {} to stay square to the stock.",
+                crate::post::listed(turned),
+                self.doc.setups[0].name()
+            );
+        }
+    }
     fn create_setup(&mut self, machine: Machine) {
         let mut setup = Setup::new(machine, &self.doc.next_offset());
         setup.p.insert(
@@ -1685,6 +1703,17 @@ impl App {
         if !self.doc.sample_model {
             for key in ["stock_x", "stock_y", "stock_z"] {
                 setup.p.insert(key.into(), String::new());
+            }
+        }
+        // A later setup starts with the stock as setup 1 has it, top up and
+        // square to it, whatever setup 1's rotation.
+        if let Some(first) = self.doc.setups.first() {
+            let (_, _, top) = crate::volume::turns().next().expect("the stock top up");
+            for (k, v) in ["rx", "ry", "rz"]
+                .iter()
+                .zip(crate::volume::turned(first, top))
+            {
+                setup.p.insert((*k).into(), v.to_string());
             }
         }
         self.doc.active = setup.id.clone();
@@ -3682,6 +3711,8 @@ impl App {
                     | Message::ConfirmDeleteSetup(_)
                     | Message::MoveSetup(_)
                     | Message::Flip(_)
+                    | Message::TurnStock(..)
+                    | Message::SquareToStock
                     | Message::SetClamps(_)
                     | Message::SuggestLayout
                     | Message::Plan
@@ -3926,6 +3957,12 @@ impl App {
                         (_, value) => value,
                     };
                     if matches!(k, "holding" | "holder" | "vise_axis") && shown == v {
+                        return Task::none();
+                    }
+                    if self.doc.index() == 0 && matches!(k, "rx" | "ry" | "rz") {
+                        let turned = self.doc.rotate_first(k, v);
+                        self.say_turned_with_first(&turned);
+                        self.touch();
                         return Task::none();
                     }
                     let holder = get(&self.doc.setup().p, "holder").to_string();
@@ -4706,15 +4743,50 @@ impl App {
                 }
             }
             Message::Flip(axis) => {
-                self.doc
-                    .setup_mut()
-                    .p
-                    .insert(axis.into(), if axis == "ry" { "90" } else { "180" }.into());
+                let angle = if axis == "ry" { "90" } else { "180" };
+                let i = self.doc.index();
+                if i == 0 {
+                    let turned = self.doc.rotate_first(axis, angle.into());
+                    self.say_turned_with_first(&turned);
+                } else {
+                    // A later setup turns the stock, as setup 1 has it.
+                    let face = if axis == "ry" { 5 } else { 1 };
+                    let turn = crate::volume::turns()
+                        .find(|&(f, q, _)| (f, q) == (face, 0))
+                        .map(|(_, _, t)| t)
+                        .expect("every face is a turn");
+                    self.doc.turn_setup(i, turn);
+                }
                 self.doc
                     .setup_mut()
                     .p
                     .insert("reposition".into(), "Reclamp and probe origin".into());
                 self.touch();
+            }
+            Message::TurnStock(face, table) => {
+                if let Some((_, _, turn)) =
+                    crate::volume::turns().find(|&(f, q, _)| (f, q) == (face, table))
+                {
+                    self.doc.turn_setup(self.doc.index(), turn);
+                    self.touch();
+                }
+            }
+            Message::SquareToStock => {
+                let i = self.doc.index();
+                if i > 0 {
+                    let turn =
+                        crate::volume::nearest_turn(&self.doc.setups[0], &self.doc.setups[i]);
+                    self.doc.turn_setup(i, turn);
+                    let (face, table) = crate::volume::face_and_table(turn);
+                    self.status = format!(
+                        "{} now has the stock's {} up, turned {} on the table, square to the stock {} defined.",
+                        self.doc.setups[i].name(),
+                        crate::volume::FACES[face].0,
+                        crate::volume::TABLE_TURNS[table],
+                        self.doc.setups[0].name()
+                    );
+                    self.touch();
+                }
             }
             Message::AssignMachine(id) => {
                 if let Some(m) = self.doc.machines.iter().find(|m| m.id == id).cloned() {

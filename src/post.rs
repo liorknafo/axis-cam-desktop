@@ -1439,7 +1439,7 @@ fn uncut_zeros(
         .collect()
 }
 /// `items` as a list: "a", "a and b", "a, b and c".
-fn listed(items: &[impl AsRef<str>]) -> String {
+pub(crate) fn listed(items: &[impl AsRef<str>]) -> String {
     match items {
         [] => String::new(),
         [one] => one.as_ref().to_string(),
@@ -2346,6 +2346,7 @@ fn stock_zero_check(
     // Why the zero is not on the stock, how far that is, and the
     // stock-based zeros that are.
     let mut off: Option<(String, &str, Vec<&str>)> = None;
+    let mut skewed = false;
     if let (Some(volume), Some(frame)) = (&first.initial_volume, first.frame) {
         if !volume.frame.square_to(frame) {
             off = Some((
@@ -2353,6 +2354,7 @@ fn stock_zero_check(
                 "is not on a stock face",
                 vec![],
             ));
+            skewed = true;
         } else {
             let bottom = stock_zero(origin).is_some_and(|(_, top)| !top);
             let cut = stock_zero_cut(stock, volume, frame, refs, bottom);
@@ -2385,7 +2387,9 @@ fn stock_zero_check(
                 warnings: vec![],
             };
         }
-        let choose = if usable.is_empty() {
+        let choose = if skewed {
+            "Press Square to the stock under this setup's Part position, or choose Model origin for this setup.".to_string()
+        } else if usable.is_empty() {
             "Choose Model origin for this setup.".to_string()
         } else {
             format!(
@@ -5392,6 +5396,50 @@ M2
         doc.setups[1]
             .p
             .insert("origin".into(), "Model origin".into());
+        let job = post_job(&doc, &mesh);
+        assert!(
+            !errors(&job).iter().any(|e| e.contains("not square")),
+            "{:?}",
+            errors(&job)
+        );
+    }
+    #[test]
+    fn a_quarter_turn_after_a_setup_turned_a_few_degrees_is_squared_to_the_stock() {
+        // Setup 1 turns the part 2° on the table; setup 2 was turned a
+        // quarter on the table by its own angles, so the stock sits 2°
+        // skewed in it.
+        let (mut doc, mesh) = fixture::job();
+        let ops = doc.setups[0].operations.clone();
+        doc.setups[0].operations.truncate(1);
+        doc.setups[0].p.insert("rz".into(), "2".into());
+        let mut flipped = Setup::new(Machine::new(3), "G55");
+        flipped.p.insert("name".into(), "Quarter".into());
+        flipped.p.insert("rz".into(), "90".into());
+        flipped.p.insert("origin".into(), "Stock top left".into());
+        for op in &ops[..2] {
+            let mut op = op.clone();
+            op.id = id();
+            flipped.operations.push(op);
+        }
+        doc.setups.push(flipped);
+        doc.sync_stock_sources();
+        let job = post_job(&doc, &mesh);
+        assert!(
+            errors(&job).iter().any(
+                |e| e.contains("not square to this setup") && e.contains("Square to the stock")
+            ),
+            "{:?}",
+            errors(&job)
+        );
+        let turn = crate::volume::nearest_turn(&doc.setups[0], &doc.setups[1]);
+        assert_eq!(
+            crate::volume::face_and_table(turn),
+            (0, 1),
+            "top up, turned 90°"
+        );
+        doc.turn_setup(1, turn);
+        let angles = ["rx", "ry", "rz"].map(|k| get(&doc.setups[1].p, k).to_string());
+        assert_eq!(angles, ["0", "0", "92"]);
         let job = post_job(&doc, &mesh);
         assert!(
             !errors(&job).iter().any(|e| e.contains("not square")),

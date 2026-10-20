@@ -17,7 +17,7 @@ pub const DELETED: &str = "The workholding entry was deleted; choose another.";
 /// What a later setup's issues say when its frame is turned from setup 1's by
 /// other than a multiple of 90 degrees: the stock carried into it is no box
 /// the jaws or clamps could sit on.
-pub const NOT_SQUARE: &str = "This setup is not square to setup 1, so its vise or clamps cannot be modelled. Choose None, or square the setup.";
+pub const NOT_SQUARE: &str = "This setup is not square to setup 1, so its vise or clamps cannot be modelled. Choose None, or press Square to the stock under Part position.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Holder {
