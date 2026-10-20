@@ -1723,9 +1723,13 @@ pub(crate) fn uncut_line(app: &App) -> Option<String> {
     })
 }
 /// The "Show uncut faces" checkbox, beside Stock: None unless the job leaves
-/// some of the part under stock, as there is nothing to show then.
+/// some of the part under stock, as there is nothing to show then. While an
+/// edited job is simulated again it stays as the last run had it, so the
+/// checkboxes beside it do not move.
 pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
-    job_uncut(app)?
+    app.left_key()?;
+    job_uncut(app)
+        .or(app.left_stock.uncut.as_ref())?
         .as_ref()
         .ok()
         .filter(|found| found.faces.iter().any(|f| *f))?;
@@ -2160,9 +2164,14 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .spacing(8)
     ]
     .spacing(8);
-    if let Some((heading, lines, ok)) = run_check(app) {
+    if let Some((heading, lines, ok, checking)) = run_check(app) {
         let said: Element<'_, Message> = if ok {
-            let mut c = column![bold(heading, 12).color(GOOD)].spacing(3);
+            let heading = if checking {
+                muted(heading).size(12)
+            } else {
+                bold(heading, 12).color(GOOD)
+            };
+            let mut c = column![heading].spacing(3);
             for line in lines {
                 c = c.push(muted(line).size(12));
             }
@@ -5003,9 +5012,12 @@ fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
 /// What the simulation panel says of the selected operation's setup above
 /// its controls: a heading, the lines of the checks before a run (the Run
 /// panel's, export's for a machine that is not a UC100; the selected
-/// operation's workholding problems first, then the setup's), and whether
-/// the setup will run. None for the example and a suppressed operation.
-pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
+/// operation's workholding problems first, then the setup's), whether the
+/// setup will run, and whether it is being checked. While a changed job is
+/// checked again the lines and the verdict are the last check's, under a
+/// Checking heading, so the panel keeps its height and the view above it
+/// does not move. None for the example and a suppressed operation.
+pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool, bool)> {
     let i = app.selected?;
     let setup = app.doc.active_setup()?;
     let uc100 = get(&setup.machine.p, "controller") == "UC100";
@@ -5015,28 +5027,38 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
         ("Export", "export")
     };
     let name = setup.name();
-    let Some(r) = app.current_ready() else {
-        // Nothing is checked for the example.
-        app.holding_key()?;
-        return Some((format!("Checking {name} as {verb} will…"), vec![], false));
+    let checking = format!("Checking {name} as {verb} will…");
+    let (r, checked) = match (app.current_ready(), app.stale_ready()) {
+        (Some(r), _) => (r, true),
+        (None, Some(r)) => (r, false),
+        (None, None) => {
+            // Nothing is checked for the example.
+            app.holding_key()?;
+            return Some((checking, vec![], false, true));
+        }
     };
     let mark = op_mark(app, Some(r), i);
     let lines = refusal_lines(r, i);
     let machine = "The machine's position and the work zero are checked on the Run panel.";
-    match mark {
-        OpMark::Suppressed => None,
-        OpMark::Ready => Some((
+    let (heading, lines, ok) = match mark {
+        OpMark::Suppressed => return None,
+        OpMark::Ready => (
             format!("Ready to {verb}: {by}'s checks of {name} pass."),
             if uc100 { vec![machine.into()] } else { vec![] },
             true,
-        )),
-        OpMark::Collides => Some((
+        ),
+        OpMark::Collides => (
             format!("Workholding problem: {by} will refuse {name}"),
             lines,
             false,
-        )),
-        _ => Some((format!("{by} will refuse {name}"), lines, false)),
-    }
+        ),
+        _ => (format!("{by} will refuse {name}"), lines, false),
+    };
+    Some(if checked {
+        (heading, lines, ok, false)
+    } else {
+        (checking, lines, ok, true)
+    })
 }
 /// `holding_warning` of the plan of the operation `name`, worked out.
 fn holding_note(

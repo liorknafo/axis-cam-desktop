@@ -3261,6 +3261,16 @@ impl App {
         let key = self.holding_key()?;
         (self.ready.key == key && self.ready.setup == self.doc.index()).then_some(&self.ready)
     }
+    /// The last checks of the active setup, when the job has changed since
+    /// they were worked out: what the simulation panel keeps the shape of
+    /// while they are worked out again. None before the setup was checked
+    /// (the key of `Ready::default` is 0).
+    pub(crate) fn stale_ready(&self) -> Option<&run::Ready> {
+        (self.current_ready().is_none()
+            && self.ready.key != 0
+            && self.ready.setup == self.doc.index())
+        .then_some(&self.ready)
+    }
     /// Checks the active setup as a run would (`run::ready`), when the job
     /// changed since or another setup is active, as `refresh_left_stock` works
     /// out the stock: on the blocking pool (in line in the smoke run), only in

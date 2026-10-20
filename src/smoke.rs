@@ -10244,6 +10244,15 @@ flood = { pin = 8 }
         let _ = a.refresh_left_stock();
         // The job leaves faces under stock: the checkbox is there, on or off.
         assert!(toggle(&a).is_some());
+        // While an edited job is simulated again the checkbox stays, so the
+        // Toolpath checkbox beside it does not move.
+        a.left_stock.key ^= 1;
+        assert_eq!(
+            crate::ui::uncut_line(&a).unwrap(),
+            "Completeness not checked yet."
+        );
+        assert!(toggle(&a).is_some());
+        a.left_stock.key ^= 1;
         // On by default: the line promises magenta and the legend names it.
         assert!(a.show_uncut);
         assert!(
@@ -11075,9 +11084,9 @@ flood = { pin = 8 }
         let refused = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).unwrap_err();
         assert_eq!(a.current_ready().unwrap().problems, refused);
         assert_eq!(marks(&a), [OpMark::Collides, OpMark::Collides]);
-        let (heading, lines, ok) = run_check(&a).unwrap();
+        let (heading, lines, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Workholding problem: Run will refuse Top");
-        assert!(!ok);
+        assert!(!ok && !checking);
         let hit = format!(
             "{}: the tool hits the clamp on",
             a.doc.setups[0].operations[0].name()
@@ -11092,20 +11101,31 @@ flood = { pin = 8 }
         // green, and Run agrees.
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         assert!(a.current_ready().is_none());
+        // While it is checked again the panel keeps the last check's lines
+        // under a Checking heading, so it keeps its height.
+        let (heading, kept, ok, checking) = run_check(&a).unwrap();
+        assert_eq!(heading, "Checking Top as run will…");
+        assert_eq!(kept, lines);
+        assert!(!ok && checking);
         let _ = a.refresh_ready();
         assert!(crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).is_ok());
         assert_eq!(marks(&a), [OpMark::Ready, OpMark::Ready]);
-        let (heading, _, ok) = run_check(&a).unwrap();
+        let (heading, machine, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Ready to run: Run's checks of Top pass.");
-        assert!(ok);
+        assert!(ok && !checking);
         let _ = a.view();
         // Coolant the profile has no output for: generated, not ready.
         let _ = a.update(Message::Edit(Target::Operation, "coolant", "Mist".into()));
+        // A ready setup checked again keeps its two lines, in grey.
+        assert_eq!(
+            run_check(&a).unwrap(),
+            ("Checking Top as run will…".into(), machine, true, true)
+        );
         let _ = a.refresh_ready();
         assert_eq!(marks(&a), [OpMark::Generated, OpMark::Generated]);
-        let (heading, lines, ok) = run_check(&a).unwrap();
+        let (heading, lines, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Run will refuse Top");
-        assert!(!ok);
+        assert!(!ok && !checking);
         assert!(
             lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"),
             "{lines:?}"
