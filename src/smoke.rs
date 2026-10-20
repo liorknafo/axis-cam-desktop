@@ -11982,6 +11982,15 @@ flood = { pin = 8 }
         );
         let angles = ["rx", "ry", "rz"].map(|k| get(&a.doc.setups[1].p, k).to_string());
         assert_eq!(angles, ["0", "180", "-2"]);
+        // A new setup starts square to the stock, top up, not skewed by setup 1's 2°.
+        let _ = a.update(Message::AddSetup);
+        let added = a.doc.setups.len() - 1;
+        assert_eq!(
+            crate::volume::turn_between(&a.doc.setups[0], &a.doc.setups[added])
+                .map(crate::volume::face_and_table),
+            Some((0, 0))
+        );
+        assert_eq!(a.doc.skew_issue(added), None);
     }
     #[test]
     fn setup_actions_on_empty_document_are_safe() {

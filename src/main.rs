@@ -1705,6 +1705,17 @@ impl App {
                 setup.p.insert(key.into(), String::new());
             }
         }
+        // A later setup starts with the stock as setup 1 has it, top up and
+        // square to it, whatever setup 1's rotation.
+        if let Some(first) = self.doc.setups.first() {
+            let (_, _, top) = crate::volume::turns().next().expect("the stock top up");
+            for (k, v) in ["rx", "ry", "rz"]
+                .iter()
+                .zip(crate::volume::turned(first, top))
+            {
+                setup.p.insert((*k).into(), v.to_string());
+            }
+        }
         self.doc.active = setup.id.clone();
         self.doc.setups.push(setup);
         self.stop_selection();
