@@ -19,6 +19,13 @@ const BUDGET: usize = 200_000;
 /// with far fewer, larger boxes than one a hair inside it, and the jaws
 /// close at most this much outside a cut wall.
 const BAND_SLACK: f32 = 0.01;
+/// How far inside its cylinder a sweep's outline (`cleared`) may run, mm:
+/// its chords' sagitta.
+const CHORD: f32 = 0.01;
+/// How clear a point is of the earlier sweeps and of the area's edge, mm,
+/// when it shows material left there (`RestStock::uncut`): far past
+/// Clipper's rounding to thousandths, so its clipping leaves that too.
+const CLEAR: f64 = 0.01;
 #[derive(Debug, Clone)]
 struct Capsule {
     cut: Cut,
@@ -535,13 +542,26 @@ impl RestStock {
     /// vertices on the cylinder, its chords at most `CHORD` inside it, so the
     /// outlines never claim more than was cut.
     pub fn cleared(&self, near: Bounds, low: f32, high: f32) -> Vec<Vec<(f64, f64)>> {
-        const CHORD: f32 = 0.01;
+        (self.sweeps(near, low, high, |_| true).into_iter())
+            .map(|(a, e, r)| outline(a, e, r))
+            .collect()
+    }
+    /// The sweeps `cleared` outlines, of only those whose boxes `keep`
+    /// takes: each its ends and radius in the current frame.
+    fn sweeps(
+        &self,
+        near: Bounds,
+        low: f32,
+        high: f32,
+        keep: impl Fn(Bounds) -> bool,
+    ) -> Vec<([f32; 3], [f32; 3], f32)> {
         let mut out = vec![];
         for capsule in &self.cuts {
             let b = capsule.bounds;
             if (0..2).any(|k| b.max[k] < near.min[k] || b.min[k] > near.max[k])
                 || b.min[2] > low + 0.001
                 || b.max[2] < high - 0.001
+                || !keep(b)
             {
                 continue;
             }
@@ -560,30 +580,90 @@ impl RestStock {
             {
                 continue;
             }
-            let r = cut.radius;
-            if r <= CHORD {
-                continue;
+            if cut.radius > CHORD {
+                out.push((a, e, cut.radius));
             }
-            let steps = (std::f32::consts::PI / (1. - CHORD / r).acos())
-                .ceil()
-                .max(8.) as usize;
-            let heading = (e[1] - a[1]).atan2(e[0] - a[0]);
-            let mut outline = Vec::with_capacity(2 * steps + 2);
-            for (centre, from) in [
-                (e, heading - std::f32::consts::FRAC_PI_2),
-                (a, heading + std::f32::consts::FRAC_PI_2),
-            ] {
-                for i in 0..=steps {
-                    let angle = from + std::f32::consts::PI * i as f32 / steps as f32;
-                    outline.push((
-                        (centre[0] + r * angle.cos()) as f64,
-                        (centre[1] + r * angle.sin()) as f64,
-                    ));
-                }
-            }
-            out.push(outline);
         }
         out
+    }
+    /// Whether some point of `reach`, within the stock's box, lies clear of
+    /// all of `sweeps` (as `RestStock::sweeps` gives them): material left
+    /// there, which the clipping in `swept` would find too. Tried along the
+    /// reach's edges, where a larger tool leaves the corners, then over a
+    /// grid.
+    fn uncut(&self, reach: &Reach, sweeps: &[([f32; 3], [f32; 3], f32)]) -> bool {
+        let e = self.extent;
+        let (lo, hi) = (reach.bounds.min, reach.bounds.max);
+        let size = [(hi[0] - lo[0]) as f64, (hi[1] - lo[1]) as f64];
+        // The sweeps by cell of a 32 × 32 grid over the reach's box.
+        const N: usize = 32;
+        let cell = [size[0] / N as f64, size[1] / N as f64];
+        let at =
+            |v: f64, k: usize| (((v - lo[k] as f64) / cell[k]).floor().max(0.) as usize).min(N - 1);
+        let mut cells = vec![vec![]; N * N];
+        for (i, (a, b, r)) in sweeps.iter().enumerate() {
+            let r = *r as f64 + CLEAR;
+            let span = |k: usize| {
+                (
+                    at(a[k].min(b[k]) as f64 - r, k),
+                    at(a[k].max(b[k]) as f64 + r, k),
+                )
+            };
+            let ((x0, x1), (y0, y1)) = (span(0), span(1));
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    cells[y * N + x].push(i);
+                }
+            }
+        }
+        let clear = |p: (f64, f64)| {
+            (0..2).all(|k| {
+                let v = if k == 0 { p.0 } else { p.1 };
+                v >= e.min[k] as f64 + CLEAR && v <= e.max[k] as f64 - CLEAR
+            }) && cells[at(p.1, 1) * N + at(p.0, 0)].iter().all(|&i| {
+                let (a, b, r) = sweeps[i];
+                let d = [b[0] as f64 - a[0] as f64, b[1] as f64 - a[1] as f64];
+                let v = [p.0 - a[0] as f64, p.1 - a[1] as f64];
+                let length = d[0] * d[0] + d[1] * d[1];
+                let t = if length == 0. {
+                    0.
+                } else {
+                    ((v[0] * d[0] + v[1] * d[1]) / length).clamp(0., 1.)
+                };
+                (v[0] - t * d[0]).hypot(v[1] - t * d[1]) > r as f64 + CLEAR
+            }) && reach.holds_by(p, CLEAR)
+        };
+        let along = reach.edges.iter().flat_map(|&[a, b]| {
+            let d = (b.0 - a.0, b.1 - a.1);
+            let length = d.0.hypot(d.1);
+            let (u, n) = if length > 0. {
+                ((d.0 / length, d.1 / length), (-d.1 / length, d.0 / length))
+            } else {
+                ((0., 0.), (0., 0.))
+            };
+            let end = (length / 2.).min(0.05);
+            [end, length / 2., length - end]
+                .into_iter()
+                .flat_map(move |s| {
+                    [1., -1.].map(|side| {
+                        (
+                            a.0 + u.0 * s + side * 2. * CLEAR * n.0,
+                            a.1 + u.1 * s + side * 2. * CLEAR * n.1,
+                        )
+                    })
+                })
+        });
+        let step = (size[0] * size[1] / 4096.).sqrt().max(0.25);
+        let (nx, ny) = ((size[0] / step) as usize + 1, (size[1] / step) as usize + 1);
+        let grid = (0..ny).flat_map(|y| {
+            (0..nx).map(move |x| {
+                (
+                    lo[0] as f64 + (x as f64 + 0.5) * step,
+                    lo[1] as f64 + (y as f64 + 0.5) * step,
+                )
+            })
+        });
+        along.chain(grid).any(clear)
     }
     /// Whether `region` lies wholly beside the stock box, where no stock is left.
     pub fn beside(&self, region: Bounds) -> bool {
@@ -675,11 +755,19 @@ impl RestStock {
     /// follows a sweep's exactly is not covered. Each outline costs a unit
     /// of `budget`; None when there are more than it has left.
     fn swept(&self, reach: &Reach, low: f32, high: f32, budget: &mut usize) -> Option<bool> {
-        let gone = self.cleared(reach.bounds, low, high);
-        *budget = budget.checked_sub(gone.len())?;
-        if gone.is_empty() {
+        // A sweep whose box lies wholly off the reach, as a pocket's inside
+        // a contour round the part does, takes none of it: left out, it
+        // spares Clipper the crossings of thousands of outlines.
+        let sweeps = self.sweeps(reach.bounds, low, high, |b| !reach.misses(b));
+        *budget = budget.checked_sub(sweeps.len())?;
+        // A point the sweeps missed answers without clipping them all, as
+        // round a smaller tool's zone, whose corners a larger one left.
+        if sweeps.is_empty() || self.uncut(reach, &sweeps) {
             return Some(false);
         }
+        let gone: Vec<_> = (sweeps.into_iter())
+            .map(|(a, e, r)| outline(a, e, r))
+            .collect();
         let e = self.extent;
         let inside = vec![vec![
             (e.min[0] as f64, e.min[1] as f64),
@@ -1166,6 +1254,29 @@ pub fn start_over(setup: &Setup, reach: &Reach, target: f32, original: f32, offs
     })
 }
 
+/// A sweep's outline in XY from `a` to `e` of radius `r`: a capsule with
+/// its vertices on the cylinder, its chords at most `CHORD` inside it.
+fn outline(a: [f32; 3], e: [f32; 3], r: f32) -> Vec<(f64, f64)> {
+    let steps = (std::f32::consts::PI / (1. - CHORD / r).acos())
+        .ceil()
+        .max(8.) as usize;
+    let heading = (e[1] - a[1]).atan2(e[0] - a[0]);
+    let mut outline = Vec::with_capacity(2 * steps + 2);
+    for (centre, from) in [
+        (e, heading - std::f32::consts::FRAC_PI_2),
+        (a, heading + std::f32::consts::FRAC_PI_2),
+    ] {
+        for i in 0..=steps {
+            let angle = from + std::f32::consts::PI * i as f32 / steps as f32;
+            outline.push((
+                (centre[0] + r * angle.cos()) as f64,
+                (centre[1] + r * angle.sin()) as f64,
+            ));
+        }
+    }
+    outline
+}
+
 /// The area in XY (current frame, mm) a cutter reaches over all its moves:
 /// closed loops, filled by the nonzero rule as Clipper's are. A cutting
 /// start found over it (`start_over`) sees only the material the cutter
@@ -1261,6 +1372,25 @@ impl Reach {
             }
         }
         winding != 0
+    }
+    /// Whether `p` lies in the area, more than `d` from its every edge.
+    fn holds_by(&self, p: (f64, f64), d: f64) -> bool {
+        let near = |e: &[(f64, f64); 2]| {
+            let [a, b] = *e;
+            let v = (b.0 - a.0, b.1 - a.1);
+            let w = (p.0 - a.0, p.1 - a.1);
+            let length = v.0 * v.0 + v.1 * v.1;
+            let t = if length == 0. {
+                0.
+            } else {
+                ((w.0 * v.0 + w.1 * v.1) / length).clamp(0., 1.)
+            };
+            (w.0 - t * v.0).hypot(w.1 - t * v.1) <= d
+        };
+        !self.edges.is_empty()
+            && !(self.at(p.1 - d)..=self.at(p.1 + d))
+                .any(|band| self.bands[band].iter().any(|&i| near(&self.edges[i])))
+            && self.holds([p.0 as f32, p.1 as f32, 0.])
     }
     /// Whether `b`'s XY lies wholly outside the area: no edge meets it and
     /// its centre is outside.
@@ -1677,6 +1807,122 @@ mod tests {
         // One that reaches past the cut's side meets the stock beside it.
         let wide = Reach::new(&[vec![(-8., -9.), (9., 8.), (8., 9.), (-9., -4.)]]);
         assert_eq!(rest.top_over(&wide, 2., 12.), 12.);
+    }
+    #[test]
+    fn a_point_the_sweeps_miss_shows_what_clipping_would_find_left() {
+        let square = |r: f64| Reach::new(&[vec![(-r, -r), (r, -r), (r, r), (-r, r)]]);
+        // What clipping the outlines from the reach leaves.
+        let left = |rest: &RestStock, reach: &Reach| {
+            let e = rest.extent;
+            let inside = vec![vec![
+                (e.min[0] as f64, e.min[1] as f64),
+                (e.max[0] as f64, e.min[1] as f64),
+                (e.max[0] as f64, e.max[1] as f64),
+                (e.min[0] as f64, e.max[1] as f64),
+            ]];
+            let area = intersect::<Milli>(reach.loops.clone(), inside, FillRule::NonZero);
+            let gone = rest.cleared(reach.bounds, 8., 12.);
+            area.and_then(|a| difference::<Milli>(a, gone, FillRule::NonZero))
+                .unwrap()
+                .contains_points()
+        };
+        // Rows of a larger tool over a square: they reach its corners out
+        // to 3.27 mm from the centre, no further.
+        let (mut v, f, _, _, _) = fixture();
+        for (i, y) in [-1.5, 0., 1.5].into_iter().enumerate() {
+            v.cut(
+                [-1.5, y, 8.],
+                [1.5, y, 8.],
+                2.5,
+                10.,
+                CutterShape::Flat,
+                f,
+                (0, i as u16),
+            );
+        }
+        let rest = RestStock::new(&v, f);
+        for (r, uncut) in [(2., false), (3., false), (3.5, true)] {
+            let reach = square(r);
+            let sweeps = rest.sweeps(reach.bounds, 8., 12., |_| true);
+            assert_eq!(rest.uncut(&reach, &sweeps), uncut, "{r}");
+            assert_eq!(left(&rest, &reach), uncut, "{r}");
+            assert_eq!(rest.swept(&reach, 8., 12., &mut 3), Some(!uncut), "{r}");
+        }
+        // Four sweeps round a spot 0.6 mm square in the middle that none
+        // reach: the grid finds it, with every edge of the reach cut.
+        let (mut v, f, _, _, _) = fixture();
+        for (i, (a, b)) in [
+            ([-2., -1.5], [2., -1.5]),
+            ([-2., 1.5], [2., 1.5]),
+            ([-1.5, -2.], [-1.5, 2.]),
+            ([1.5, -2.], [1.5, 2.]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            v.cut(
+                [a[0], a[1], 8.],
+                [b[0], b[1], 8.],
+                1.2,
+                10.,
+                CutterShape::Flat,
+                f,
+                (0, i as u16),
+            );
+        }
+        let rest = RestStock::new(&v, f);
+        let reach = square(1.6);
+        let sweeps = rest.sweeps(reach.bounds, 8., 12., |_| true);
+        assert!(rest.uncut(&reach, &sweeps) && left(&rest, &reach));
+        assert_eq!(rest.swept(&reach, 8., 12., &mut 4), Some(false));
+    }
+    #[test]
+    fn sweeps_off_a_reach_cost_its_plane_proof_no_work() {
+        let (mut v, f, _, _, _) = fixture();
+        // A ring 6 to 9 mm out, cleared by four sweeps along its sides…
+        for (a, b) in [
+            ([-7.5, -7.5], [7.5, -7.5]),
+            ([7.5, -7.5], [7.5, 7.5]),
+            ([7.5, 7.5], [-7.5, 7.5]),
+            ([-7.5, 7.5], [-7.5, -7.5]),
+        ] {
+            v.cut(
+                [a[0], a[1], 8.],
+                [b[0], b[1], 8.],
+                2.5,
+                10.,
+                CutterShape::Flat,
+                f,
+                (0, 0),
+            );
+        }
+        // …round a pocket of a hundred sweeps in its hole.
+        for i in 0..100 {
+            let y = -2. + 4. * i as f32 / 99.;
+            v.cut(
+                [-2., y, 8.],
+                [2., y, 8.],
+                1.,
+                10.,
+                CutterShape::Flat,
+                f,
+                (0, 1 + i),
+            );
+        }
+        let rest = RestStock::new(&v, f);
+        let square = |r: f64| vec![(-r, -r), (r, -r), (r, r), (-r, r)];
+        let mut hole = square(6.);
+        hole.reverse();
+        let ring = Reach::new(&[square(9.), hole]);
+        // Only the four along the ring are worked through.
+        assert_eq!(rest.swept(&ring, 8., 12., &mut 4), Some(true));
+        assert_eq!(rest.swept(&ring, 8., 12., &mut 3), None);
+        assert_eq!(rest.top_over(&ring, 2., 12.), 8.);
+        // Over the hole the pocket's sweeps count, and do not cover it.
+        assert_eq!(
+            rest.swept(&Reach::new(&[square(5.)]), 8., 12., &mut 200),
+            Some(false)
+        );
     }
     #[test]
     fn finite_flutes_and_thin_uncut_strips_are_not_ignored() {

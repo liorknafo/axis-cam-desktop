@@ -567,8 +567,9 @@ impl App {
                 ]
             }
             51 => vec![Message::PickMode, Message::Generate],
+            // A strategy imported parts cannot use yet is refused.
             52 => vec![
-                Message::AddOp(crate::model::Strategy::Adaptive),
+                Message::AddOp(crate::model::Strategy::Scallop),
                 Message::Tab("Geometry".into()),
             ],
             53 => {
