@@ -10249,9 +10249,10 @@ flood = { pin = 8 }
         a.left_stock.key ^= 1;
         assert_eq!(
             crate::ui::uncut_line(&a).unwrap(),
-            "Completeness not checked yet."
+            "Checking completeness again; the magenta faces are the last check's."
         );
         assert!(toggle(&a).is_some());
+        assert!(legend(&a) > Some(without));
         a.left_stock.key ^= 1;
         // On by default: the line promises magenta and the legend names it.
         assert!(a.show_uncut);
@@ -10280,6 +10281,64 @@ flood = { pin = 8 }
         let mut sample = app();
         sample.doc = Document::sample();
         assert!(crate::ui::uncut_toggle(&sample).is_none());
+    }
+    /// Picking a face of a later setup's operation simulates the whole job
+    /// again, but cannot change the stock that setup starts from: its box
+    /// and the band its vise closes on stay known, so the 3D view keeps its
+    /// stock and its framing. The uncut faces of the whole job stay as last
+    /// worked out until the job is simulated again.
+    #[test]
+    fn an_edit_of_a_later_setups_operations_keeps_the_stock_it_starts_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let _ = a.refresh_left_stock();
+        let (stock, real) = a.known_stock(1);
+        assert!(real && stock.is_some());
+        assert_eq!(crate::ui::leftover_view(&a), stock);
+        let held = a.known_held(1).unwrap();
+        let line = crate::ui::uncut_line(&a).unwrap();
+        // Setup 2's own operation changes: the job is out of date.
+        a.doc.setups[1].operations[0]
+            .p
+            .insert("notes".into(), "picked".into());
+        assert!(a.left_boxes().is_none() && a.current_checks().is_none());
+        assert_eq!(a.known_stock(1), (stock, true));
+        assert_eq!(crate::ui::leftover_view(&a), stock);
+        assert_eq!(a.known_held(1), Some(held));
+        assert!(a.start_checks(1).is_some());
+        assert_ne!(crate::ui::uncut_line(&a).unwrap(), line);
+        assert!(
+            crate::ui::uncut_line(&a)
+                .unwrap()
+                .starts_with("Checking completeness again")
+        );
+        let _ = a.view();
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.known_stock(1), (stock, true));
+        assert_eq!(crate::ui::uncut_line(&a).unwrap(), line);
+        // Setup 1's operation changes what setup 2 starts from: not known
+        // until the job is simulated again.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("notes".into(), "changed".into());
+        assert!(!a.known_stock(1).1);
+        assert_eq!(crate::ui::leftover_view(&a), None);
+        // So does how setup 2 sits: its box is in its own frame.
+        let _ = a.refresh_left_stock();
+        assert!(a.known_stock(1).1);
+        a.doc.setups[1].p.insert("tx".into(), "1".into());
+        assert!(!a.known_stock(1).1);
+        // How it is held keeps the box, but not the band its vise closes on.
+        a.doc.setups[1].p.insert("tx".into(), "0".into());
+        let _ = a.refresh_left_stock();
+        a.doc.setups[1].p.insert("vise_grip".into(), "6".into());
+        assert!(a.known_stock(1).1);
+        assert!(a.current_checks().is_none() && a.start_checks(1).is_none());
+        // Another project keeps nothing of this one's.
+        let mut b = leftover_app(&dir);
+        let _ = b.refresh_left_stock();
+        b.replace_document(crate::model::Document::default(), None);
+        assert!(b.left_stock.uncut.is_none() && b.left_stock.starts.is_empty());
     }
     #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
@@ -10493,10 +10552,11 @@ flood = { pin = 8 }
             surfaces: vec![],
             bites: vec![],
             uncut: None,
+            ..Default::default()
         };
         let checks = crate::HoldingChecks {
             key: held,
-            setups: vec![],
+            ..Default::default()
         };
         Message::LeftStock(Box::new((left, checks)))
     }
@@ -11126,6 +11186,18 @@ flood = { pin = 8 }
         let (heading, lines, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Run will refuse Top");
         assert!(!ok && !checking);
+        // A check that comes back after the project was replaced is not
+        // even the new project's last one.
+        let old = a.ready.clone();
+        let mut b = run_app_on(dir.path(), LIMITED);
+        b.ready_job = Some(old.key);
+        b.replace_document(crate::model::Document::default(), None);
+        let _ = b.update(Message::Ready(Box::new(old.clone())));
+        assert_eq!(b.ready.key, 0);
+        // The check this project started is taken.
+        b.ready_job = Some(old.key);
+        let _ = b.update(Message::Ready(Box::new(old)));
+        assert!(b.ready.key != 0 && b.ready_job.is_none());
         assert!(
             lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"),
             "{lines:?}"
