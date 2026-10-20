@@ -17428,7 +17428,7 @@ flood = { pin = 8 }
         use crate::viewport::Event;
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
-        let _ = a.update(Message::Viewport(Event::Orbit(0.3, 0.1)));
+        let _ = a.update(Message::Viewport(Event::Orbit(0.3, 0.1, [0., 0.])));
         let workspace = format!("{:?}", a.camera);
         let framed = format!("{:?}", crate::viewport::Camera::default());
         assert_ne!(workspace, framed);
@@ -17438,7 +17438,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
         assert_eq!(format!("{:?}", a.plan_camera), framed, "starts framed");
         for event in [
-            Event::Orbit(0.5, -0.2),
+            Event::Orbit(0.5, -0.2, [0., 0.]),
             Event::Pan(4., 2.),
             Event::Zoom(0.2, [0., 0.]),
         ] {
@@ -19168,7 +19168,7 @@ flood = { pin = 8 }
         let mut a = app();
         let start = a.camera;
         for e in [
-            Event::Orbit(0.3, 0.2),
+            Event::Orbit(0.3, 0.2, [0., 0.]),
             Event::Zoom(0.5, [0., 0.]),
             Event::Pan(30., -20.),
         ] {

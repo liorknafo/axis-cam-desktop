@@ -1365,10 +1365,11 @@ const ZOOM_IN: f32 = 100.;
 /// Orbit, pan or zoom `camera` as a viewport asks; picks do not move it.
 fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
     match *event {
-        viewport::Event::Orbit(x, y) => {
-            // The model follows the mouse, as in the machine view.
-            camera.yaw -= x;
-            camera.pitch = (camera.pitch + y).clamp(-1.5, 1.57)
+        viewport::Event::Orbit(x, y, shift) => {
+            *camera = viewport::orbited(*camera, x, y);
+            for (pan, shift) in camera.pan.iter_mut().zip(shift) {
+                *pan += shift;
+            }
         }
         viewport::Event::Pan(x, y) => {
             camera.pan[0] += x;

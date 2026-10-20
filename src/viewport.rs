@@ -37,7 +37,9 @@ impl Default for Camera {
 }
 #[derive(Debug, Clone)]
 pub enum Event {
-    Orbit(f32, f32),
+    /// A turn of the view (yaw, pitch, radians), and how far to move the
+    /// pan with it (pixels) so the point the view turns about stays put.
+    Orbit(f32, f32, [f32; 2]),
     Pan(f32, f32),
     /// A wheel step, and where the pointer is from the view's centre
     /// (`Projector::center`, pixels): the zoom keeps the point under it.
@@ -60,6 +62,9 @@ pub struct State {
     grab: Option<[f32; 2]>,
     /// Whether the pins follow the pointer, so that leaving the view says so.
     aiming: bool,
+    /// While the view is turned by a drag: the point it turns about
+    /// (`Viewport::pivot`), found once the drag starts turning.
+    pivot: Option<[f32; 3]>,
     raster: RefCell<Option<(String, RasterFrame)>>,
 }
 
@@ -229,6 +234,16 @@ pub struct Viewport<'a> {
     /// then just these faces are, after the stock and depth-tested against it.
     pub show_uncut: bool,
 }
+/// `camera` turned by `yaw` and `pitch` (radians), as a drag turns the
+/// view: the model follows the mouse, as in the machine view, and the pitch
+/// stops short of looking straight up or down past the vertical.
+pub(crate) fn orbited(camera: Camera, yaw: f32, pitch: f32) -> Camera {
+    Camera {
+        yaw: camera.yaw - yaw,
+        pitch: (camera.pitch + pitch).clamp(-1.5, 1.57),
+        ..camera
+    }
+}
 pub(crate) struct Projector {
     camera: Camera,
     center: Point,
@@ -335,6 +350,19 @@ impl Projector {
             z,
         ])
     }
+    /// The point the screen point `at` shows at depth `depth` (`depth`
+    /// back, as `p` with it).
+    pub(crate) fn at_depth(&self, at: Point, depth: f32) -> [f32; 3] {
+        let (s, c) = self.camera.yaw.sin_cos();
+        let (se, ce) = self.camera.pitch.sin_cos();
+        let right = [c, s, 0.];
+        let up = [-s * se, c * se, ce];
+        let toward = [s * ce, -c * ce, se];
+        let a = (at.x - self.center.x) / self.scale;
+        let b = (self.center.y - at.y) / self.scale;
+        let d = depth - self.depth(self.target);
+        std::array::from_fn(|i| self.target[i] + right[i] * a + up[i] * b + toward[i] * d)
+    }
     /// How far toward the viewer: larger is nearer.
     pub(crate) fn depth(&self, v: [f32; 3]) -> f32 {
         let (s, c) = self.camera.yaw.sin_cos();
@@ -345,6 +373,24 @@ impl Projector {
 impl Viewport<'_> {
     fn projector(&self, b: Rectangle) -> Projector {
         Projector::fit(self.camera, (b.width, b.height), self.scene_bounds())
+    }
+    /// The point the view turns about: the part's nearest surface at the
+    /// view's centre, so what is zoomed in on stays in view as it turns;
+    /// where no surface is there, the point at the scene's centre's depth.
+    fn pivot(&self, b: Rectangle) -> [f32; 3] {
+        let p = self.projector(b);
+        let centre = Point::new(b.width * 0.5, b.height * 0.53);
+        let nearest = self
+            .transformed()
+            .iter()
+            .filter_map(|face| {
+                let v: Vec<_> = face.points.iter().map(|q| (p.p(*q), p.depth(*q))).collect();
+                (1..v.len().saturating_sub(1))
+                    .filter_map(|i| triangle_depth([v[0], v[i], v[i + 1]], centre))
+                    .reduce(f32::max)
+            })
+            .reduce(f32::max);
+        p.at_depth(centre, nearest.unwrap_or_else(|| p.depth(p.target)))
     }
     /// What the camera must contain, in display units: the part, the stock,
     /// the jaws or clamps and, when simulating, the stock and every move.
@@ -1541,6 +1587,7 @@ impl canvas::Program<Event> for Viewport<'_> {
                     }
                     state.drag = Some((p, p, *b));
                     state.moved = false;
+                    state.pivot = None;
                     return Some(Action::capture());
                 }
             }
@@ -1581,7 +1628,21 @@ impl canvas::Program<Event> for Viewport<'_> {
                         if state.moved {
                             return Some(
                                 Action::publish(if b == mouse::Button::Left {
-                                    Event::Orbit(dx * 0.008, dy * 0.008)
+                                    let (yaw, pitch) = (dx * 0.008, dy * 0.008);
+                                    // The pan moves so the pivot stays where
+                                    // it is on the screen as the view turns.
+                                    let pivot =
+                                        *state.pivot.get_or_insert_with(|| self.pivot(bounds));
+                                    let size = (bounds.width, bounds.height);
+                                    let scene = self.scene_bounds();
+                                    let before = Projector::fit(self.camera, size, scene).p(pivot);
+                                    let turned = orbited(self.camera, yaw, pitch);
+                                    let after = Projector::fit(turned, size, scene).p(pivot);
+                                    Event::Orbit(
+                                        yaw,
+                                        pitch,
+                                        [before.x - after.x, before.y - after.y],
+                                    )
                                 } else {
                                     Event::Pan(dx, dy)
                                 })
@@ -2925,6 +2986,86 @@ mod tests {
             ..off
         };
         assert_eq!(magenta(&none, size), 0);
+    }
+    /// Zoomed far in, turning the view keeps what is zoomed in on in place:
+    /// it turns about the part's surface at the view's centre, not the
+    /// scene's centre, which a 100× view would swing hundreds of pixels.
+    #[test]
+    fn turning_a_zoomed_in_view_keeps_the_surface_at_its_centre() {
+        use canvas::Program;
+        let (doc, mesh) = crate::post::fixture::job();
+        let mut view = Viewport {
+            setup: doc.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+            live: None,
+            live_stock: None,
+            uncut: &[],
+            show_uncut: false,
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 900.,
+            height: 600.,
+        };
+        let centre = Point::new(450., 600. * 0.53);
+        // A point of the part off the scene's centre, brought to the view's
+        // centre at 100×.
+        let p = view.projector(bounds);
+        let corner = view.scene_bounds().min;
+        let near = Point::new(
+            p.p(corner).x * 0.6 + centre.x * 0.4,
+            p.p(corner).y * 0.6 + centre.y * 0.4,
+        );
+        let mut camera = Camera {
+            zoom: 100.,
+            ..view.camera
+        };
+        let k = 100.;
+        camera.pan = [(centre.x - near.x) * k, (centre.y - near.y) * k];
+        view.camera = camera;
+        let pivot = view.pivot(bounds);
+        let at = |c: Camera| Projector::fit(c, (900., 600.), view.scene_bounds()).p(pivot);
+        let start = at(view.camera);
+        assert!(start.distance(centre) < 1., "{start:?}");
+        // The point found is on the part: back where the view shows it.
+        let q = view.projector(bounds);
+        assert!(q.p(q.at_depth(centre, q.depth(pivot))).distance(centre) < 0.01);
+        // A drag that turns the view.
+        let mut state = State::default();
+        let cursor = |x, y| mouse::Cursor::Available(Point::new(x, y));
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let _ = view.update(&mut state, &press, bounds, cursor(300., 300.));
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(310., 304.),
+        });
+        let action = view.update(&mut state, &moved, bounds, cursor(310., 304.));
+        let Some(Event::Orbit(yaw, pitch, shift)) = action.and_then(|a| a.into_inner().0) else {
+            panic!("the drag turns the view");
+        };
+        let mut turned = orbited(view.camera, yaw, pitch);
+        let unshifted = at(turned);
+        turned.pan = [turned.pan[0] + shift[0], turned.pan[1] + shift[1]];
+        // Without the pan it would leave the view; with it, it stays.
+        assert!(unshifted.distance(start) > 100., "{unshifted:?}");
+        assert!(
+            at(turned).distance(start) < 0.5,
+            "{:?} {start:?}",
+            at(turned)
+        );
     }
     #[test]
     fn a_selected_face_under_stock_is_striped_in_blue_and_magenta() {
