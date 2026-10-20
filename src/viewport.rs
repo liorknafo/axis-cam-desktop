@@ -803,9 +803,9 @@ impl Viewport<'_> {
                 })
                 .collect()
         };
-        // A selected face still under stock keeps its magenta and gets its
-        // outline in the selection colour, drawn once the faces are.
-        let mut outlines: Vec<Vec<(Point, f32)>> = vec![];
+        // A selected face still under stock is striped in the selection's
+        // blue and the magenta (`hatch`).
+        let hatch = hatch(ratio);
         for (fi, face) in faces.iter().enumerate() {
             if behind_stock {
                 break;
@@ -815,12 +815,10 @@ impl Viewport<'_> {
             let hover = face.feature.is_some() && face.feature == hovered;
             let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
             let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
+            let striped = !hover && uncut && selected;
             let color = if hover {
                 [242, 190, 93, 255]
             } else if uncut {
-                if selected {
-                    outlines.push(project(face));
-                }
                 uncut_color(light)
             } else if selected {
                 SELECTED
@@ -867,6 +865,7 @@ impl Viewport<'_> {
                             let index = (y * w + x) as usize;
                             if z > depths[index] {
                                 depths[index] = z;
+                                let color = if striped { hatch(color, x, y) } else { color };
                                 rgba[index * 4..index * 4 + 4].copy_from_slice(&color);
                                 if let Some(plain) = plain.get_mut(index) {
                                     *plain = kept;
@@ -912,19 +911,19 @@ impl Viewport<'_> {
                     continue;
                 }
                 let v = project(face);
-                let light = face_light(face);
+                let color = uncut_color(face_light(face));
+                let striped = selected_by(face);
                 for i in 1..v.len() - 1 {
-                    raster_triangle(
+                    raster_rows_with(
                         &mut rgba,
                         &mut depths,
                         w,
-                        h,
+                        0..h,
                         [v[0], v[i], v[i + 1]],
-                        uncut_color(light),
+                        |x, y| {
+                            if striped { hatch(color, x, y) } else { color }
+                        },
                     );
-                }
-                if selected_by(face) {
-                    outlines.push(v);
                 }
             }
         } else if self.show_stock
@@ -944,12 +943,6 @@ impl Viewport<'_> {
             // so the translucent box must not dim them.
             for (index, _) in plain.iter().enumerate().filter(|(_, kept)| **kept) {
                 rgba[index * 4..index * 4 + 4].copy_from_slice(&SELECTED);
-            }
-        }
-        for outline in &outlines {
-            for (i, a) in outline.iter().enumerate() {
-                let b = outline[(i + 1) % outline.len()];
-                raster_depth_line(&mut rgba, &depths, w, h, *a, b, SELECTED, ratio);
             }
         }
         if !self.holding.is_empty() {
@@ -2149,6 +2142,21 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
 const SELECTED: [u8; 4] = [92, 168, 223, 255];
 /// The colour of the part's faces the whole job leaves under stock.
 const UNCUT: [u8; 3] = [214, 72, 166];
+/// How wide each stripe of `hatch` is, in logical pixels.
+const HATCH_STRIPE: f32 = 4.;
+/// The colour at pixel (x, y) of a selected face still under stock, whose
+/// magenta is `uncut`: diagonal stripes of it and the selection's blue, so
+/// the face reads as both, at a frame of `ratio` pixels a logical pixel.
+fn hatch(ratio: f32) -> impl Fn([u8; 4], u32, u32) -> [u8; 4] + Copy {
+    let stripe = (HATCH_STRIPE * ratio).max(2.);
+    move |uncut, x, y| {
+        if (((x + y) as f32 / stripe) as u32).is_multiple_of(2) {
+            uncut
+        } else {
+            SELECTED
+        }
+    }
+}
 /// `UNCUT` as a face of brightness `light` is drawn.
 fn uncut_color(light: f32) -> [u8; 4] {
     let shade = |c: u8| (c as f32 * (light + 0.1).min(1.)) as u8;
@@ -2444,6 +2452,17 @@ fn raster_rows(
     vertices: [(Point, f32); 3],
     color: [u8; 4],
 ) {
+    raster_rows_with(pixels, depths, w, rows, vertices, |_, _| color);
+}
+/// `raster_rows` with the colour of each pixel (x, y) its own.
+fn raster_rows_with(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    w: u32,
+    rows: std::ops::Range<u32>,
+    vertices: [(Point, f32); 3],
+    color: impl Fn(u32, u32) -> [u8; 4],
+) {
     let minx = vertices
         .iter()
         .map(|v| v.0.x)
@@ -2475,7 +2494,7 @@ fn raster_rows(
                 && z >= depths[index]
             {
                 depths[index] = z;
-                pixels[index * 4..index * 4 + 4].copy_from_slice(&color);
+                pixels[index * 4..index * 4 + 4].copy_from_slice(&color(x, y));
             }
         }
     }
@@ -2899,7 +2918,7 @@ mod tests {
         assert_eq!(magenta(&none, size), 0);
     }
     #[test]
-    fn a_selected_face_under_stock_keeps_its_magenta_and_is_outlined() {
+    fn a_selected_face_under_stock_is_striped_in_blue_and_magenta() {
         let (doc, mesh) = crate::post::fixture::job();
         let all = vec![true; mesh.faces.len()];
         let view = Viewport {
@@ -2930,23 +2949,38 @@ mod tests {
         let (plain, _) = view.render(&p, size, 1., None, &[]);
         let (marked, _) = view.render(&p, size, 1., None, &features);
         let tinted = |rgba: &[u8]| rgba.chunks(4).filter(|px| **px == SELECTED).count();
-        // Selected, the faces are still magenta, with a line round each in the
-        // selection colour; they are no longer filled with it.
+        // Selected, the faces are striped: about half of what was magenta
+        // is the selection's blue, the rest still magenta.
         assert_eq!(tinted(&plain), 0);
-        assert!(tinted(&marked) > 0);
         assert!(magenta(&view, size) > 0);
         let fill = |rgba: &[u8]| {
             rgba.chunks(4)
                 .filter(|px| px[0] > px[1].saturating_add(60) && px[2] > px[1].saturating_add(40))
                 .count()
         };
-        // The lines take some of it; most is still magenta.
+        let (blue, kept, was) = (tinted(&marked), fill(&marked), fill(&plain));
         assert!(
-            fill(&marked) * 4 > fill(&plain),
-            "{} {}",
-            fill(&marked),
-            fill(&plain)
+            blue * 10 > was * 3 && kept * 10 > was * 3,
+            "{blue} {kept} {was}"
         );
+        assert!(blue + kept <= was, "{blue} {kept} {was}");
+        // In stripes across the frame: along a row, blue and magenta take
+        // turns many times.
+        let row = (0..size.1)
+            .max_by_key(|y| {
+                let line = &marked[(y * size.0 * 4) as usize..((y + 1) * size.0 * 4) as usize];
+                fill(line) + tinted(line)
+            })
+            .unwrap();
+        let line = &marked[(row * size.0 * 4) as usize..((row + 1) * size.0 * 4) as usize];
+        let turns = line
+            .chunks(4)
+            .map(|px| *px == SELECTED)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0] != w[1])
+            .count();
+        assert!(turns >= 6, "{turns}");
         // Without the toggle the selection fills the face, as it did.
         let off = Viewport {
             show_uncut: false,
