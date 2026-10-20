@@ -59,6 +59,10 @@ pub struct Running {
     /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
     /// back when the driver refuses the job: nothing ran then (#168).
     before: Before,
+    /// The line each of its blocks moves the tool tip along (`paths`).
+    paths: Vec<Option<[[f32; 3]; 2]>>,
+    /// The block the tool tip is on and how far along it (`track`).
+    on: Option<(usize, f32)>,
 }
 
 /// The run's record of its tool runs before a Cycle Start.
@@ -128,6 +132,9 @@ pub struct Run {
     /// runs (`carve`), from the stock before the operation the first started
     /// at. None until a tool run moves, and again once the start is changed.
     pub carving: Option<Carving>,
+    /// How long its tool runs take (`Times`), worked out with the check:
+    /// None while checking, or when the setup cannot run.
+    pub times: Option<Arc<Times>>,
 }
 
 /// The stock before an operation of the setup being run, seen from above,
@@ -178,6 +185,7 @@ impl Run {
             left: None,
             before: Arc::new(vec![]),
             carving: None,
+            times: None,
         }
     }
 
@@ -343,7 +351,7 @@ impl Run {
             None => {
                 // Out of range, so that no setup the project has is shown as picked.
                 self.setup = usize::MAX;
-                self.checked_as(Arc::new(Err(vec![REMOVED.into()])), None);
+                self.checked_as(Arc::new(Err(vec![REMOVED.into()])), None, None);
                 None
             }
         }
@@ -354,11 +362,13 @@ impl Run {
         self.programs.as_deref()?.as_deref().ok()
     }
 
-    /// A check's answer, and the stock it left to picture.
+    /// A check's answer, the stock it left to picture and how long its tool
+    /// runs take.
     pub fn checked_as(
         &mut self,
         programs: Arc<Result<Vec<Checked>, Vec<String>>>,
         left: Option<Arc<Left>>,
+        times: Option<Arc<Times>>,
     ) {
         // The start stays on its operation only when its tool run still has
         // the same operations; the work zero is set for it again.
@@ -383,6 +393,7 @@ impl Run {
             .as_ref()
             .map_or_else(Default::default, |l| l.before.clone());
         self.left = left.filter(|_| self.checked().is_some());
+        self.times = times.filter(|_| self.checked().is_some());
         self.pictures.clear();
     }
 
@@ -645,6 +656,10 @@ impl Run {
         let (count, p) = (programs.len(), &programs[self.next]);
         let s = &c.snapshot;
         let actions = lower(p, self.from, s.work_offset, s.machine_pos).ok()?;
+        // Where the tool tip is, in plan coordinates: the first retract's start.
+        let tip =
+            std::array::from_fn(|k| (s.machine_pos[k] - s.work_offset[k]) as f32 + p.datum[k]);
+        let paths = paths(p.from(self.from).ok()?, tip);
         let tool = p.ops[0].tool_id.clone();
         let zero = (p.origin.clone(), p.datum);
         let mut name = format!("{} · tool run {} of {count}", self.name, self.next + 1);
@@ -662,6 +677,8 @@ impl Run {
                 last: self.last.clone(),
                 touched: self.touched,
             },
+            paths,
+            on: None,
         });
         self.xy
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
@@ -1192,6 +1209,369 @@ fn go(at: &mut [f64; 6], to: [f64; 6], feed: Option<f64>, actions: &mut Vec<Do>)
     }
 }
 
+/// How long the machine takes over a checked setup's tool runs: each
+/// program lowered as Cycle Start lowers it and played through the
+/// driver's own planner (`uc100::planner`), with the profile's axis speeds,
+/// accelerations and corner deviation, its spindle spin-up and the
+/// program's dwells, at 100 % feed. Manual tool changes between tool runs
+/// and holds are the operator's, and not counted.
+#[derive(Debug, Default)]
+pub struct Times {
+    /// By tool run, then by the operation it starts at (`Checked::from`):
+    /// the seconds of each block of that program; None when it cannot
+    /// start there.
+    programs: Vec<Vec<Option<Vec<f32>>>>,
+}
+
+/// How many moves the driver keeps planned ahead (its
+/// `MAX_PLANNED_BLOCKS`): the look-ahead the estimate plans with.
+const LOOK_AHEAD: usize = 400;
+/// The time step the estimate samples the planner at, s.
+const SAMPLE: f64 = 0.01;
+
+impl Times {
+    /// The times of a check's answer, when it passed.
+    pub fn checked(
+        programs: &Result<Vec<Checked>, Vec<String>>,
+        config: &uc100::config::MachineConfig,
+    ) -> Option<Arc<Self>> {
+        Some(Arc::new(Self::of(programs.as_ref().ok()?, config)))
+    }
+
+    pub fn of(programs: &[Checked], config: &uc100::config::MachineConfig) -> Self {
+        Times {
+            programs: (programs.iter())
+                .map(|p| {
+                    (0..p.ops.len())
+                        .map(|k| block_seconds(p, k, config))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    /// The seconds of each block of tool run `i`'s program from its
+    /// operation `k` on.
+    pub fn blocks(&self, i: usize, k: usize) -> Option<&[f32]> {
+        self.programs.get(i)?.get(k)?.as_deref()
+    }
+
+    /// The seconds of each operation of tool run `p` (index `i`), cut from
+    /// its first.
+    pub fn ops(&self, i: usize, p: &Checked) -> Option<Vec<f32>> {
+        Some(op_seconds(&p.blocks, self.blocks(i, 0)?, p.ops.len()))
+    }
+
+    /// The seconds of tool run `i`, cut from operation `k` on.
+    pub fn run(&self, i: usize, k: usize) -> Option<f32> {
+        Some(self.blocks(i, k)?.iter().sum())
+    }
+}
+
+/// The seconds of each of `ops` operations, from the seconds of each of
+/// `blocks`: a block that names no operation (stop, retract, dwell, end)
+/// counts to the next that does, the last ones to the last operation.
+pub fn op_seconds(blocks: &[Block], seconds: &[f32], ops: usize) -> Vec<f32> {
+    let mut out = vec![0.; ops];
+    for (o, s) in owners(blocks, ops).into_iter().zip(seconds) {
+        if let Some(o) = o {
+            out[o] += s;
+        }
+    }
+    out
+}
+
+/// The operation each of `blocks` counts to (`op_seconds`).
+fn owners(blocks: &[Block], ops: usize) -> Vec<Option<usize>> {
+    let mut owner = vec![None; blocks.len()];
+    let mut next = ops.checked_sub(1);
+    for (j, b) in blocks.iter().enumerate().rev() {
+        next = op_of(b).or(next);
+        owner[j] = next.filter(|&o| o < ops);
+    }
+    owner
+}
+
+/// The seconds of `blocks` at feed override `feed` (1 is 100 %): their
+/// feed moves take 1 / `feed` as long, their rapids, dwells and spin-ups
+/// as long. Feeds the axes cap stay a little faster than this.
+fn at_override(blocks: &[Block], seconds: &[f32], feed: f32) -> Vec<f32> {
+    (blocks.iter().zip(seconds))
+        .map(|(b, &s)| match b {
+            Block::Move {
+                kind: Kind::Feed, ..
+            } => s / feed,
+            _ => s,
+        })
+        .collect()
+}
+
+/// How near its move the tool tip is taken to be on it, mm: within the
+/// corners the planner rounds and a coarse axis's step.
+const ON_MOVE: f32 = 0.1;
+/// How many blocks past the driver's line the tool may be.
+const LINE_LAG: usize = 8;
+
+/// The straight line each of `blocks` moves the tool tip along, in plan
+/// coordinates, as `lower` lowers them from the tool tip at `start`: None
+/// for a block that does not move it.
+fn paths(blocks: &[Block], start: [f32; 3]) -> Vec<Option<[[f32; 3]; 2]>> {
+    let plane = clearance_plane(blocks);
+    let mut at = Some(start);
+    (blocks.iter())
+        .map(|b| {
+            let to = match b {
+                Block::Retract => at.map(|a| [a[0], a[1], plane]),
+                Block::Approach { xy, .. } => Some([xy[0], xy[1], plane]),
+                Block::Descend { xy, z, .. } => Some([xy[0], xy[1], *z]),
+                Block::Move {
+                    kind: Kind::Feed | Kind::Rapid,
+                    to,
+                    ..
+                } => Some(*to),
+                _ => None,
+            };
+            let path = to.and_then(|to| Some([at?, to]));
+            at = to.or(at);
+            path
+        })
+        .collect()
+}
+
+/// The share of `path` behind `tip`, when the tip is on it (`ON_MOVE`).
+fn along([from, to]: [[f32; 3]; 2], tip: [f32; 3]) -> Option<f32> {
+    let d: [f32; 3] = std::array::from_fn(|a| to[a] - from[a]);
+    let length = d.iter().map(|x| x * x).sum::<f32>();
+    let t = if length > 0. {
+        ((0..3).map(|a| (tip[a] - from[a]) * d[a]).sum::<f32>() / length).clamp(0., 1.)
+    } else {
+        1.
+    };
+    let gap = (0..3)
+        .map(|a| (from[a] + t * d[a] - tip[a]).powi(2))
+        .sum::<f32>();
+    (gap <= ON_MOVE * ON_MOVE).then_some(t)
+}
+
+/// How long the run has left, in seconds, at the feed override now
+/// (`Run::left`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeLeft {
+    /// The operation being cut (index in its program): left, and all of it.
+    pub op: Option<(usize, f32, f32)>,
+    /// The tool run being cut, or the one Cycle Start starts from its start.
+    pub run: f32,
+    /// That tool run and every one after it.
+    pub setup: f32,
+}
+
+impl Run {
+    /// The estimated seconds of each operation of tool run `i` at 100 %
+    /// feed: cut from its first, but for the tool run being cut or next when
+    /// it starts at a later operation, from there; that operation then has
+    /// the safe start too.
+    pub fn op_times(&self, i: usize) -> Option<Vec<f32>> {
+        let times = self.times.as_ref()?;
+        let p = self.checked()?.get(i)?;
+        let mut ops = times.ops(i, p)?;
+        let (at, k) = self
+            .running
+            .as_ref()
+            .map_or((self.next, self.from), |r| (r.index, r.from));
+        if at == i
+            && k > 0
+            && let (Ok(blocks), Some(seconds)) = (p.from(k), times.blocks(i, k))
+        {
+            let from = op_seconds(blocks, seconds, p.ops.len());
+            ops[k..].copy_from_slice(&from[k..]);
+        }
+        Some(ops)
+    }
+
+    /// The estimated seconds of all the setup's tool runs, each cut from its
+    /// first operation, at 100 % feed.
+    pub fn setup_time(&self) -> Option<f32> {
+        let times = self.times.as_ref()?;
+        (0..self.checked()?.len()).map(|i| times.run(i, 0)).sum()
+    }
+
+    /// How long the run has left at the feed override now, the machine as
+    /// `s` reports it: while a tool run cuts, the blocks after the one it is
+    /// on and what is left of that one (how far along its move the tool
+    /// is); otherwise the tool run Cycle Start starts, from the operation it
+    /// starts at. The tool runs after it count from their first operation.
+    /// None until the check is timed.
+    pub fn left(&self, s: &uc100::controller::Snapshot) -> Option<TimeLeft> {
+        let times = self.times.as_ref()?;
+        let programs = self.checked()?;
+        let feed = (s.feed_override as f32).max(0.01);
+        let (i, k) = self
+            .running
+            .as_ref()
+            .map_or((self.next, self.from), |r| (r.index, r.from));
+        let later: f32 = (i + 1..programs.len())
+            .map(|j| {
+                let seconds = times.blocks(j, 0)?;
+                Some(
+                    at_override(&programs[j].blocks, seconds, feed)
+                        .iter()
+                        .sum::<f32>(),
+                )
+            })
+            .sum::<Option<f32>>()?;
+        let Some(p) = programs.get(i) else {
+            return Some(TimeLeft {
+                op: None,
+                run: 0.,
+                setup: later,
+            });
+        };
+        let blocks = p.from(k).ok()?;
+        let seconds = at_override(blocks, times.blocks(i, k)?, feed);
+        let Some((_, op, _)) = self
+            .progress(s.current_line)
+            .filter(|_| self.running.is_some())
+        else {
+            let run = seconds.iter().sum();
+            return Some(TimeLeft {
+                op: None,
+                run,
+                setup: run + later,
+            });
+        };
+        // What is left of the block the tool tip is on (`track`): the share
+        // of its move past the tip. Until the tip is found, all of it. The
+        // operation is the one the panel shows cut (`progress`): until the
+        // tip reaches it, all of it is left.
+        let owner = owners(blocks, p.ops.len());
+        let (block, rest) = (self.running.as_ref())
+            .and_then(|r| r.on)
+            .map_or((0, 1.), |(j, t)| (j, 1. - t));
+        let ahead = |j: usize| {
+            if j > block {
+                seconds[j]
+            } else if j == block {
+                seconds[j] * rest
+            } else {
+                0.
+            }
+        };
+        let of_op = |j: &usize| owner[*j] == Some(op);
+        let op_left = (0..blocks.len()).filter(of_op).map(ahead).sum();
+        let op_all = (0..blocks.len()).filter(of_op).map(|j| seconds[j]).sum();
+        let run: f32 = (0..blocks.len()).map(ahead).sum();
+        Some(TimeLeft {
+            op: Some((op, op_left, op_all)),
+            run,
+            setup: run + later,
+        })
+    }
+}
+
+impl Run {
+    /// Follows the tool tip along the running tool run's blocks, the
+    /// machine as `s` reports it: from the block it was on, the first on
+    /// whose move the tip is, up to a few past the driver's line
+    /// (`LINE_LAG`). It stays on its block only while the tip goes on along
+    /// it: moves that go back over the same line (a retract and the plunge
+    /// after it, a pocket's passes) are told apart by their order. Where the
+    /// tip is on none, it stays.
+    pub fn track(&mut self, s: &uc100::controller::Snapshot) {
+        let (Some(live), Some((_, _, line))) = (self.live(s), self.progress(s.current_line)) else {
+            return;
+        };
+        let Some(r) = self.running.as_mut() else {
+            return;
+        };
+        let (from, t0) = r.on.unwrap_or((0, 0.));
+        let end = (line + LINE_LAG + 1).min(r.paths.len());
+        r.on = (from..end)
+            .find_map(|j| {
+                let t = along(r.paths[j]?, live.tip)?;
+                (j > from || t >= t0 - 1e-4).then_some((j, t))
+            })
+            .or(r.on);
+    }
+}
+
+/// A time as a clock shows it: "m:ss", or "h:mm:ss" from an hour on.
+pub fn clock(seconds: f32) -> String {
+    let s = seconds.max(0.).round() as u64;
+    match (s / 3600, s / 60 % 60, s % 60) {
+        (0, m, s) => format!("{m}:{s:02}"),
+        (h, m, s) => format!("{h}:{m:02}:{s:02}"),
+    }
+}
+
+/// The seconds the driver takes over each block of tool run `p`'s program
+/// from operation `k` on, or None when it cannot start there: its moves
+/// planned `LOOK_AHEAD` ahead, as the driver feeds them, waiting for the
+/// motion to stop at each dwell and spindle start. It starts at the
+/// clearance plane over the program's first point.
+fn block_seconds(p: &Checked, k: usize, config: &uc100::config::MachineConfig) -> Option<Vec<f32>> {
+    use uc100::planner::{Limits, Planner};
+    let blocks = p.from(k).ok()?;
+    let plane = clearance_plane(blocks);
+    let first = blocks.iter().find_map(|b| match b {
+        Block::Approach { xy, .. } | Block::Descend { xy, .. } => Some(*xy),
+        Block::Move { from, .. } => Some([from[0], from[1]]),
+        _ => None,
+    })?;
+    let mut start = [0.; 6];
+    for (a, v) in [first[0], first[1], plane].into_iter().enumerate() {
+        start[a] = v as f64 - p.datum[a] as f64;
+    }
+    let actions = lower(p, k, [0.; 6], start).ok()?;
+    let mut limits = Limits {
+        max_velocity: [0.; 6],
+        max_acceleration: [0.; 6],
+        junction_deviation: config.motion.junction_deviation,
+    };
+    for a in 0..6 {
+        if let Some(axis) = config.axes.get(a) {
+            limits.max_velocity[a] = axis.max_velocity / 60.;
+            limits.max_acceleration[a] = axis.acceleration;
+        }
+    }
+    let mut planner = Planner::new(limits, start);
+    let mut seconds = vec![0f64; blocks.len()];
+    let at = |line: u32| (line.max(1) as usize - 1).min(blocks.len() - 1);
+    let mut actions = actions.into_iter().peekable();
+    let mut spindle = Spindle::Off;
+    loop {
+        while planner.queued() < LOOK_AHEAD
+            && let Some(Located {
+                line,
+                action: Do::Move { target, feed },
+            }) = actions.peek()
+        {
+            planner.push_line(*target, *feed, *line);
+            actions.next();
+        }
+        if !planner.is_idle() {
+            let line = planner.current_tag();
+            planner.sample(SAMPLE);
+            seconds[at(line)] += SAMPLE;
+            continue;
+        }
+        let Some(Located { line, action }) = actions.next() else {
+            break;
+        };
+        match action {
+            Do::Dwell { seconds: s } => seconds[at(line)] += s,
+            Do::Spindle { state, .. } => {
+                if state != Spindle::Off && state != spindle {
+                    seconds[at(line)] += config.outputs.spindle_spinup_s;
+                }
+                spindle = state;
+            }
+            Do::End => break,
+            _ => {}
+        }
+    }
+    Some(seconds.into_iter().map(|s| s as f32).collect())
+}
+
 /// Whether a job is cutting, held or paused: Cycle Start and the tool
 /// change wait, Hold, Resume and Stop apply.
 pub fn busy(state: Option<&State>) -> bool {
@@ -1327,6 +1707,149 @@ mod tests {
             ],
         );
         checked(vec![fixture::facing_op()], &[&plan])
+    }
+
+    #[test]
+    fn the_estimate_moves_each_block_as_the_drivers_planner_does() {
+        // X and Z of the template: 2000 and 1000 mm/min, 300 and 200 mm/s²,
+        // with a 0.5 s spindle spin-up.
+        let mut config = uc100::config::MachineConfig::from_toml(uc100::config::TEMPLATE).unwrap();
+        config.outputs.spindle_spinup_s = 0.5;
+        let p = program();
+        let times = Times::of(std::slice::from_ref(&p), &config);
+        let seconds = times.blocks(0, 0).unwrap();
+        assert_eq!(seconds.len(), p.blocks.len());
+        let of = |want: &dyn Fn(&Block) -> bool| -> f32 {
+            (p.blocks.iter().zip(seconds))
+                .filter(|(b, _)| want(b))
+                .map(|(_, s)| s)
+                .sum()
+        };
+        // 10 mm at F600 (10 mm/s), from and to a stop: 1 s and v/a at 300 mm/s².
+        let feed = of(&|b| {
+            matches!(
+                b,
+                Block::Move {
+                    kind: Kind::Feed,
+                    ..
+                }
+            )
+        });
+        assert!((feed - (1. + 10. / 300.)).abs() < 0.02, "{feed}");
+        // The start dwell (2 s) after the spin-up, and the program's 1 s dwell.
+        let wait = of(&|b| matches!(b, Block::Wait { .. }));
+        let run = of(&|b| matches!(b, Block::Run { .. }));
+        assert!(
+            (wait - 2.).abs() < 1e-6 && (run - 0.5).abs() < 1e-6,
+            "{wait} {run}"
+        );
+        let dwell = of(&|b| {
+            matches!(
+                b,
+                Block::Move {
+                    kind: Kind::Dwell,
+                    ..
+                }
+            )
+        });
+        assert!((dwell - 1.).abs() < 1e-6, "{dwell}");
+        // Z down 10 and up 10 mm at 1000 mm/min, 200 mm/s²: 0.6 + 1/12 s each.
+        let rapids = of(&|b| {
+            matches!(
+                b,
+                Block::Move {
+                    kind: Kind::Rapid,
+                    ..
+                }
+            )
+        });
+        let one = 10. / (1000. / 60.) + (1000. / 60.) / 200.;
+        assert!((rapids - 2. * one).abs() < 0.03, "{rapids}");
+        // One operation: all of it, the stops and retracts too.
+        let ops = times.ops(0, &p).unwrap();
+        let total: f32 = seconds.iter().sum();
+        assert_eq!(ops.len(), 1);
+        assert!((ops[0] - total).abs() < 1e-4 && times.run(0, 0) == Some(total));
+    }
+
+    #[test]
+    fn a_time_reads_as_a_clock() {
+        assert_eq!(
+            [0., 9.4, 59.6, 61., 3599., 3600., 3725.].map(clock),
+            [
+                "0:00", "0:09", "1:00", "1:01", "59:59", "1:00:00", "1:02:05"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_block_of_no_operation_counts_to_the_next_operation_and_the_end_to_the_last() {
+        let mv = |op| Block::Move {
+            op,
+            kind: Kind::Feed,
+            from: [0.; 3],
+            to: [1., 0., 0.],
+            feed: 60.,
+            seconds: 0.,
+        };
+        let blocks = [
+            Block::Stop,
+            Block::Retract,
+            mv(0),
+            Block::Stop,
+            Block::Standstill { seconds: 2. },
+            mv(1),
+            Block::Stop,
+            Block::Retract,
+            Block::End,
+        ];
+        let seconds = [1., 2., 4., 8., 16., 32., 64., 128., 256.];
+        assert_eq!(
+            op_seconds(&blocks, &seconds, 2),
+            [1. + 2. + 4., 8. + 16. + 32. + 64. + 128. + 256.]
+        );
+    }
+
+    #[test]
+    fn the_fixture_jobs_tool_runs_take_at_least_their_feed_time() {
+        let (mut doc, mesh) = fixture::job();
+        let m = &mut doc.setups[0].machine;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        m.p.insert("controller".into(), "UC100".into());
+        m.p.insert("uc100_profile".into(), profile.display().to_string());
+        let programs = programs(&doc, &mesh, 0).unwrap();
+        let config = uc100::config::MachineConfig::from_toml(uc100::config::TEMPLATE).unwrap();
+        let started = std::time::Instant::now();
+        let times = Times::of(&programs, &config);
+        eprintln!("estimated in {:?}", started.elapsed());
+        for (i, p) in programs.iter().enumerate() {
+            let feed: f32 = (p.blocks.iter())
+                .map(|b| match b {
+                    Block::Move {
+                        kind: Kind::Feed,
+                        from,
+                        to,
+                        feed,
+                        ..
+                    } => {
+                        let d = (0..3).map(|a| (to[a] - from[a]).powi(2)).sum::<f32>();
+                        d.sqrt() / feed.min(2000.) * 60.
+                    }
+                    _ => 0.,
+                })
+                .sum();
+            let run = times.run(i, 0).unwrap();
+            eprintln!(
+                "tool run {i}: {} blocks, feed {feed:.1} s, estimate {run:.1} s",
+                p.blocks.len()
+            );
+            assert!(run >= feed, "{run} {feed}");
+            for k in 1..p.ops.len() {
+                assert!(times.run(i, k).unwrap() < run);
+            }
+        }
     }
 
     #[test]
@@ -1481,6 +2004,8 @@ mod tests {
                     last: None,
                     touched: false,
                 },
+                paths: vec![],
+                on: None,
             }),
             xy: None,
             zero: None,
@@ -1491,6 +2016,7 @@ mod tests {
             pictures: vec![],
             left: None,
             before: Default::default(),
+            times: None,
             carving: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();

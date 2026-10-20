@@ -6681,6 +6681,9 @@ pub(crate) fn run_strip<'a>(
     body = body.push(muted(
         "Space holds from any page while no text field is being edited, and resumes on this page.",
     ));
+    if let Some(line) = run_times(run, s) {
+        body = body.push(line);
+    }
     if let Some((p, op, block)) = run.progress(s.current_line) {
         let i = run.running.as_ref().map_or(0, |r| r.index);
         let blocks = run.running_blocks().map_or(1, <[_]>::len);
@@ -6721,6 +6724,68 @@ pub(crate) fn run_strip<'a>(
     machine_panel(&format!("Run · {}", run.name), body)
 }
 
+/// The Run strip's times: the whole setup's estimate and what is left of it,
+/// of the tool run being cut or next and, while one cuts, of its
+/// operation; and what the estimate counts. None until the check is timed.
+fn run_times<'a>(
+    run: &crate::run::Run,
+    s: &uc100::controller::Snapshot,
+) -> Option<Element<'a, Message>> {
+    use crate::run::clock;
+    let total = run.setup_time()?;
+    let left = run.left(s)?;
+    let count = run.checked()?.len();
+    let mut parts = vec![format!("Setup {} in all", clock(total))];
+    let running = run.running.as_ref();
+    let (i, k) = running.map_or((run.next, run.from), |r| (r.index, r.from));
+    let fresh = running.is_none() && (i, k) == (0, 0) && !run.done.contains(&true);
+    if i >= count {
+        parts.push("all tool runs cut".into());
+    } else if running.is_some() {
+        parts.push(format!("{} left", clock(left.setup)));
+        if i + 1 < count {
+            parts.push(format!("tool run {}: {} left", i + 1, clock(left.run)));
+        }
+        if let Some((op, op_left, op_all)) = left.op {
+            parts.push(format!(
+                "operation {}: {} left of {}",
+                op + 1,
+                clock(op_left),
+                clock(op_all)
+            ));
+        }
+    } else {
+        if !fresh {
+            let from = if k > 0 {
+                format!(", operation {}", k + 1)
+            } else {
+                String::new()
+            };
+            parts.push(format!(
+                "{} left from tool run {}{from}",
+                clock(left.setup),
+                i + 1
+            ));
+        }
+        if count > 1 && (fresh || i + 1 < count) {
+            parts.push(format!("tool run {}: {}", i + 1, clock(left.run)));
+        }
+    }
+    let feed = (s.feed_override * 100.).round();
+    let note = if (feed - 100.).abs() < 0.5 {
+        "Estimated from the machine profile's axis speeds and accelerations, with the spindle spin-up and dwells. Manual tool changes and holds are not counted.".to_string()
+    } else {
+        format!(
+            "Estimated from the machine profile's axis speeds and accelerations, with the spindle spin-up and dwells; what is left at the feed override of {feed:.0} %, the setup in all at 100 %. Manual tool changes and holds are not counted."
+        )
+    };
+    Some(
+        column![bold(parts.join(" · "), 13), muted(note).size(11)]
+            .spacing(2)
+            .into(),
+    )
+}
+
 /// The Tool runs panel, in the part of the Control page that scrolls, under
 /// the Run strip: the setup's tool runs (Cycle Start starts the one marked
 /// next), the manual tool change between tool runs, and the work zero on
@@ -6738,6 +6803,7 @@ pub(crate) fn run_panel<'a>(
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let mut body = column![].spacing(10);
     let count = programs.len();
+    let left = run.left(s);
     body = body.push(muted(
         "Each operation in the order it is cut, with the stock as it leaves it: cut faces are green. Start here makes Cycle Start begin with that operation, those before it taken as cut.",
     ));
@@ -6767,15 +6833,23 @@ pub(crate) fn run_panel<'a>(
                     msg(!running, R::Next(i)),
                     i == run.next,
                 ),
-                muted(match p.ops.len() {
-                    1 => "1 operation".to_string(),
-                    n => format!("{n} operations"),
+                muted({
+                    let ops = match p.ops.len() {
+                        1 => "1 operation".to_string(),
+                        n => format!("{n} operations"),
+                    };
+                    match run.times.as_ref().and_then(|t| t.run(i, 0)) {
+                        Some(t) => format!("{ops} · {}", crate::run::clock(t)),
+                        None => ops,
+                    }
                 }),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
         let mut cards = row![].spacing(8);
+        let times = run.op_times(i);
+        let left = left.filter(|_| run.running.as_ref().is_some_and(|r| r.index == i));
         for (k, ((o, &oi), stage)) in p
             .ops
             .iter()
@@ -6787,7 +6861,16 @@ pub(crate) fn run_panel<'a>(
             use crate::run::Stage;
             let start = (!matches!(stage, Stage::Next | Stage::Cutting) && !c.probing())
                 .then_some(msg(!running, R::From(i, k)));
-            cards = cards.push(op_card(number, o, run.picture(oi), stage, start));
+            let time = match (left.and_then(|l| l.op), &times) {
+                (Some((op, op_left, op_all)), _) if op == k => Some(format!(
+                    "{} left of {}",
+                    crate::run::clock(op_left),
+                    crate::run::clock(op_all)
+                )),
+                (_, Some(t)) => t.get(k).map(|&t| format!("Time {}", crate::run::clock(t))),
+                _ => None,
+            };
+            cards = cards.push(op_card(number, o, run.picture(oi), stage, time, start));
         }
         body = body.push(cards.wrap().vertical_spacing(8));
     }
@@ -6916,14 +6999,16 @@ const OP_CARD_PICTURE: (f32, f32) = (150., 112.5);
 /// One operation of a tool run in the Tool runs panel, the `n`th the setup
 /// cuts: the picture of the stock it leaves (a blank while that is worked
 /// out), its name, strategy and tool, and its `stage`. The one being cut is
-/// framed in blue, those done in green, those skipped greyed. With `start`,
-/// a Start here button that makes it the one Cycle Start begins with
-/// (greyed while that message is None).
+/// framed in blue, those done in green, those skipped greyed. `time` is how
+/// long it takes, or what is left of it while it is cut. With `start`, a
+/// Start here button that makes it the one Cycle Start begins with (greyed
+/// while that message is None).
 fn op_card<'a>(
     n: usize,
     o: &'a crate::post::OpState,
     picture: Option<&widget::image::Handle>,
     stage: crate::run::Stage,
+    time: Option<String>,
     start: Option<Option<Message>>,
 ) -> Element<'a, Message> {
     use crate::run::Stage;
@@ -6965,6 +7050,9 @@ fn op_card<'a>(
     ]
     .spacing(4)
     .width(w);
+    if let Some(time) = time {
+        card = card.push(muted(time).size(11));
+    }
     if let Some(start) = start {
         card = card.push(act("Start here", start, false));
     }

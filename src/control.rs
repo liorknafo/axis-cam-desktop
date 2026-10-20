@@ -1705,6 +1705,7 @@ impl Connection {
         if let Some(run) = &mut self.run {
             run.refresh(self.snapshot.program_outcome.as_ref());
             run.carve(&self.snapshot);
+            run.track(&self.snapshot);
         }
         if let Some(st) = &self.snapshot.status {
             self.inputs.observe(self.opened.elapsed(), st);
