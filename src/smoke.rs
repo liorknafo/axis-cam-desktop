@@ -3691,7 +3691,7 @@ flood = { pin = 8 }
         check_run(&mut a, 0);
         let steps = |a: &App| work_zero_steps(a, conn(a)).expect("the guide").join("\n");
         assert!(
-            steps(&a).contains("1. Set machine zero under Position"),
+            steps(&a).contains("1. Optional: Set machine zero under Position"),
             "{}",
             steps(&a)
         );
