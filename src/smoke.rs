@@ -2360,11 +2360,13 @@ flood = { pin = 8 }
         use std::sync::Arc;
         let epoch = run_of(a).epoch;
         let (programs, left) = crate::run::check(&a.doc, a.part_mesh().unwrap(), si);
+        let times = crate::run::Times::checked(&programs, &conn(a).config);
         a.smoke_dir = Some(dir.to_path_buf());
         let _ = a.update(Message::RunCheckedStock(
             epoch,
             Arc::new(programs),
             Arc::new(left),
+            times,
         ));
         a.smoke_dir = None;
     }
@@ -2447,6 +2449,94 @@ flood = { pin = 8 }
         let _ = a.update(Message::RunPictures(epoch, pictures(&a)));
         assert_eq!(run_of(&a).pictures.len(), 4);
         assert_eq!(a.planning_busy(), None);
+    }
+
+    /// The Run strip estimates the setup, and while a tool run cuts counts
+    /// down what is left of it, its operation and the setup: the estimate
+    /// is the simulated machine's own time for the tool run, as its planner
+    /// moves it.
+    #[test]
+    fn the_run_estimates_the_setup_and_counts_down_while_it_cuts() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let s = conn(&a).snapshot.clone();
+        let run = run_of(&a);
+        let times = run.times.clone().expect("the check is timed");
+        let total = run.setup_time().unwrap();
+        let first = times.run(0, 0).unwrap();
+        assert!(first > 1. && total > first, "{first} {total}");
+        let left = run.left(&s).unwrap();
+        assert_eq!((left.op, left.run, left.setup), (None, first, total));
+        let ops = run.op_times(0).unwrap();
+        assert_eq!(ops.len(), 3);
+        assert!(
+            (ops.iter().sum::<f32>() - first).abs() < 1e-3,
+            "{ops:?} {first}"
+        );
+        // Started at the Pocket, its card's time has the safe start too: the
+        // cards from there add up to what is left of the tool run.
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        let from = run_of(&a).op_times(0).unwrap();
+        let left = run_of(&a).left(&s).unwrap();
+        assert_eq!(from[0], ops[0]);
+        assert!(
+            (from[1] + from[2] - left.run).abs() < 1e-3,
+            "{from:?} {left:?}"
+        );
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        assert_eq!(run_of(&a).op_times(0).unwrap(), ops);
+        let started = std::time::Instant::now();
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let mut seen = vec![];
+        let mut deadline = Deadline::new(60.);
+        while !run_of(&a).done[0] {
+            let _ = a.update(Message::Tick);
+            let _ = a.view();
+            if let Some(l) = run_of(&a).left(&conn(&a).snapshot)
+                && l.op.is_some()
+            {
+                seen.push(l);
+            }
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let took = started.elapsed().as_secs_f32();
+        // The machine's time, and the estimate's, within a tenth and the
+        // ticks' lag.
+        assert!(
+            (took - first).abs() < 0.1 * first + 0.5,
+            "took {took} s, estimated {first} s"
+        );
+        // It counts down: what is left of the tool run and of the setup only
+        // falls, each operation's left is part of it, and its last is near 0.
+        assert!(seen.len() > 10, "{}", seen.len());
+        for w in seen.windows(2) {
+            assert!(w[1].run <= w[0].run + 0.05, "{:?}", w);
+            assert!((w[1].setup - w[1].run - (total - first)).abs() < 1e-3);
+        }
+        for l in &seen {
+            let (_, op_left, op_all) = l.op.unwrap();
+            assert!(op_left <= op_all + 1e-3 && op_left <= l.run + 1e-3, "{l:?}");
+        }
+        assert!(
+            seen[0].run > 0.8 * first && seen.last().unwrap().run < 1.,
+            "{:?}",
+            seen.last()
+        );
+        let ops: Vec<usize> = seen.iter().map(|l| l.op.unwrap().0).collect();
+        assert!(
+            ops.windows(2).all(|w| w[0] <= w[1]) && ops.contains(&1),
+            "{ops:?}"
+        );
+        // Done: the next tool run, and the setup's last, is what is left.
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let l = run_of(&a).left(&conn(&a).snapshot).unwrap();
+        assert_eq!((l.op, l.run, l.setup), (None, total - first, total - first));
     }
 
     /// Renders the Control page's Tool runs panel to PNGs in

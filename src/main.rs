@@ -270,11 +270,13 @@ pub enum Message {
     /// A setup's tool runs, checked for a UC100 run (the check's epoch).
     RunChecked(u64, std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>),
     /// `RunChecked`, with the stock the check left after each operation of
-    /// the setup, to picture (`run::check`).
+    /// the setup, to picture (`run::check`), and how long its tool runs take
+    /// on the connected machine (`run::Times`).
     RunCheckedStock(
         u64,
         std::sync::Arc<Result<Vec<post::Checked>, Vec<String>>>,
         std::sync::Arc<run::Left>,
+        Option<std::sync::Arc<run::Times>>,
     ),
     /// The pictures of the stock after each operation of the setup being
     /// run, by its index in the setup (`run::op_pictures`), for the check
@@ -2451,7 +2453,11 @@ impl App {
     /// Checks the setup being run, in the background: simulates the job up to
     /// it and checks its tool runs as export would.
     fn check_run(&mut self) -> Task<Message> {
-        let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) else {
+        let Some(c) = self.control.as_mut() else {
+            return Task::none();
+        };
+        let config = c.config.clone();
+        let Some(r) = c.run.as_mut() else {
             return Task::none();
         };
         // The setup is checked where it is now: setups may have been moved,
@@ -2462,14 +2468,18 @@ impl App {
         let epoch = r.epoch;
         let doc = self.doc.clone();
         let mesh = self.part_mesh().cloned();
-        let check = move || match mesh {
-            Some(mesh) => run::check(&doc, &mesh, si),
-            None => (
-                Err(vec![
-                    "Load the imported part before running a setup.".into(),
-                ]),
-                run::Left::default(),
-            ),
+        let check = move || {
+            let (programs, left) = match mesh {
+                Some(mesh) => run::check(&doc, &mesh, si),
+                None => (
+                    Err(vec![
+                        "Load the imported part before running a setup.".into(),
+                    ]),
+                    run::Left::default(),
+                ),
+            };
+            let times = run::Times::checked(&programs, &config);
+            (programs, left, times)
         };
         Task::perform(
             async move {
@@ -2479,14 +2489,16 @@ impl App {
                         (
                             Err(vec![format!("The check failed: {e}")]),
                             run::Left::default(),
+                            None,
                         )
                     })
             },
-            move |(programs, left)| {
+            move |(programs, left, times)| {
                 Message::RunCheckedStock(
                     epoch,
                     std::sync::Arc::new(programs),
                     std::sync::Arc::new(left),
+                    times,
                 )
             },
         )
@@ -5050,20 +5062,24 @@ impl App {
                 }
             }
             Message::RunChecked(epoch, programs) => {
+                // Timed here: the smoke run sends it, and runs no tasks.
+                let times =
+                    (self.control.as_ref()).and_then(|c| run::Times::checked(&programs, &c.config));
                 return self.update(Message::RunCheckedStock(
                     epoch,
                     programs,
                     Default::default(),
+                    times,
                 ));
             }
-            Message::RunCheckedStock(epoch, programs, left) => {
+            Message::RunCheckedStock(epoch, programs, left, times) => {
                 if let Some(c) = self.control.as_mut()
                     && let Some(r) = c.run.as_mut()
                     && r.epoch == epoch
                 {
                     // A check without stock (the smoke run's) is not pictured.
                     let left = (!left.after.is_empty() || left.last.is_some()).then_some(left);
-                    r.checked_as(programs, left);
+                    r.checked_as(programs, left, times);
                     c.fit_sim_block();
                     return self.picture_run();
                 }

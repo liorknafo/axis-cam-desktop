@@ -933,6 +933,20 @@ panel, at once when that machine is connected, or when you press
    Run strip shows the tool run, operation and block being cut, and how the
    tool run ended.
 
+   It also shows the times: the whole setup's, and what is left of it, of
+   the tool run being cut (or the next) and, while one cuts, of the
+   operation being cut ("Setup 42:10 in all · 18:02 left · tool run 2: 6:30
+   left · operation 3: 2:10 left of 5:20"). Each tool run's row in the Tool
+   runs panel gives its time, and each operation's card its own, counting
+   down on the card being cut. They are worked out with the check, by
+   playing each tool run's program through the driver's own planner with the
+   machine profile's axis speeds, accelerations and corner deviation, the
+   spindle spin-up and the dwells, so rapids, short moves and corners take
+   the time the machine takes on them (on the simulated machine within a few
+   per cent). What is left follows the tool tip along the program and counts
+   feed moves at the feed override set; the setup in all is at 100 %. Manual
+   tool changes between tool runs and holds are not counted.
+
    Each tool run in the Tool runs panel shows its operations as cards, each
    with a picture of the stock it leaves and where it stands. **Start here**
    on a card makes Cycle Start begin with that operation, in any tool run,
