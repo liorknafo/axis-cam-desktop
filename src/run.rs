@@ -488,18 +488,8 @@ impl Run {
         if !c.idle() {
             e.push("The machine is not Idle.".into());
         }
-        let unset: Vec<&str> = (0..3)
-            .filter(|&a| !s.referenced[a])
-            .map(|a| AXES[a])
-            .collect();
-        if !unset.is_empty() {
-            e.push(format!(
-                "{} {} no machine position (every E-stop clears it), so the soft limits are off. {} under Position, then Cycle Start.",
-                unset.join(", "),
-                if unset.len() == 1 { "has" } else { "have" },
-                if c.home_switches() { "Home again" } else { "Set machine zero again" }
-            ));
-        }
+        // No machine position does not stop Cycle Start (`limits_unchecked`).
+        let unset = unset_axes(c);
         if s.limits_override {
             e.push("Turn off Override limit switches first.".into());
         }
@@ -1042,6 +1032,31 @@ pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
         problems,
         zero: crate::post::zero_checked(doc, mesh, si, &sims),
     }
+}
+
+/// X, Y and Z without a machine position (every E-stop clears it).
+fn unset_axes(c: &Connection) -> Vec<&'static str> {
+    (0..3)
+        .filter(|&a| !c.snapshot.referenced[a])
+        .map(|a| AXES[a])
+        .collect()
+}
+
+/// What Cycle Start does not check while X, Y or Z has no machine position:
+/// the driver keeps the soft limits off, and the job is not checked against
+/// the machine's travel. It runs anyway, as a tool run moves only in work
+/// coordinates (its retracts go to the clearance plane, not machine Z0).
+/// None once every axis has one.
+pub fn limits_unchecked(c: &Connection) -> Option<String> {
+    let unset = unset_axes(c);
+    (!unset.is_empty()).then(|| {
+        format!(
+            "{} {} no machine position (every E-stop clears it), so Cycle Start runs with the soft limits off and does not check that the job fits the machine's travel. Make sure the work zero is on the stock (touch it off again after an E-stop, as the drives may lose steps) and watch the machine. {} under Position to turn them on.",
+            unset.join(", "),
+            if unset.len() == 1 { "has" } else { "have" },
+            if c.home_switches() { "Home" } else { "Set machine zero" }
+        )
+    })
 }
 
 /// What the UC100 profile's `out`puts refuse in a tool run's `ops`: a

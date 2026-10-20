@@ -6714,6 +6714,11 @@ pub(crate) fn run_strip<'a>(
             ));
         }
     }
+    if !crate::run::busy(state)
+        && let Some(line) = crate::run::limits_unchecked(c)
+    {
+        body = body.push(caution("Soft limits are off for Cycle Start", vec![line]));
+    }
     if let Some((ok, message)) = &run.outcome {
         body = body.push(text(message.clone()).size(12).color(if *ok {
             Color::from_rgb8(39, 130, 93)
