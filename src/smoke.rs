@@ -10244,6 +10244,16 @@ flood = { pin = 8 }
         let _ = a.refresh_left_stock();
         // The job leaves faces under stock: the checkbox is there, on or off.
         assert!(toggle(&a).is_some());
+        // While an edited job is simulated again the checkbox stays, so the
+        // Toolpath checkbox beside it does not move.
+        a.left_stock.key ^= 1;
+        assert_eq!(
+            crate::ui::uncut_line(&a).unwrap(),
+            "Checking completeness again; the magenta faces are the last check's."
+        );
+        assert!(toggle(&a).is_some());
+        assert!(legend(&a) > Some(without));
+        a.left_stock.key ^= 1;
         // On by default: the line promises magenta and the legend names it.
         assert!(a.show_uncut);
         assert!(
@@ -10271,6 +10281,64 @@ flood = { pin = 8 }
         let mut sample = app();
         sample.doc = Document::sample();
         assert!(crate::ui::uncut_toggle(&sample).is_none());
+    }
+    /// Picking a face of a later setup's operation simulates the whole job
+    /// again, but cannot change the stock that setup starts from: its box
+    /// and the band its vise closes on stay known, so the 3D view keeps its
+    /// stock and its framing. The uncut faces of the whole job stay as last
+    /// worked out until the job is simulated again.
+    #[test]
+    fn an_edit_of_a_later_setups_operations_keeps_the_stock_it_starts_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = leftover_app(&dir);
+        let _ = a.refresh_left_stock();
+        let (stock, real) = a.known_stock(1);
+        assert!(real && stock.is_some());
+        assert_eq!(crate::ui::leftover_view(&a), stock);
+        let held = a.known_held(1).unwrap();
+        let line = crate::ui::uncut_line(&a).unwrap();
+        // Setup 2's own operation changes: the job is out of date.
+        a.doc.setups[1].operations[0]
+            .p
+            .insert("notes".into(), "picked".into());
+        assert!(a.left_boxes().is_none() && a.current_checks().is_none());
+        assert_eq!(a.known_stock(1), (stock, true));
+        assert_eq!(crate::ui::leftover_view(&a), stock);
+        assert_eq!(a.known_held(1), Some(held));
+        assert!(a.start_checks(1).is_some());
+        assert_ne!(crate::ui::uncut_line(&a).unwrap(), line);
+        assert!(
+            crate::ui::uncut_line(&a)
+                .unwrap()
+                .starts_with("Checking completeness again")
+        );
+        let _ = a.view();
+        let _ = a.refresh_left_stock();
+        assert_eq!(a.known_stock(1), (stock, true));
+        assert_eq!(crate::ui::uncut_line(&a).unwrap(), line);
+        // Setup 1's operation changes what setup 2 starts from: not known
+        // until the job is simulated again.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("notes".into(), "changed".into());
+        assert!(!a.known_stock(1).1);
+        assert_eq!(crate::ui::leftover_view(&a), None);
+        // So does how setup 2 sits: its box is in its own frame.
+        let _ = a.refresh_left_stock();
+        assert!(a.known_stock(1).1);
+        a.doc.setups[1].p.insert("tx".into(), "1".into());
+        assert!(!a.known_stock(1).1);
+        // How it is held keeps the box, but not the band its vise closes on.
+        a.doc.setups[1].p.insert("tx".into(), "0".into());
+        let _ = a.refresh_left_stock();
+        a.doc.setups[1].p.insert("vise_grip".into(), "6".into());
+        assert!(a.known_stock(1).1);
+        assert!(a.current_checks().is_none() && a.start_checks(1).is_none());
+        // Another project keeps nothing of this one's.
+        let mut b = leftover_app(&dir);
+        let _ = b.refresh_left_stock();
+        b.replace_document(crate::model::Document::default(), None);
+        assert!(b.left_stock.uncut.is_none() && b.left_stock.starts.is_empty());
     }
     #[test]
     fn the_editor_draws_the_stock_a_later_setup_starts_from_only_when_it_is_known() {
@@ -10484,10 +10552,11 @@ flood = { pin = 8 }
             surfaces: vec![],
             bites: vec![],
             uncut: None,
+            ..Default::default()
         };
         let checks = crate::HoldingChecks {
             key: held,
-            setups: vec![],
+            ..Default::default()
         };
         Message::LeftStock(Box::new((left, checks)))
     }
@@ -11075,9 +11144,9 @@ flood = { pin = 8 }
         let refused = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).unwrap_err();
         assert_eq!(a.current_ready().unwrap().problems, refused);
         assert_eq!(marks(&a), [OpMark::Collides, OpMark::Collides]);
-        let (heading, lines, ok) = run_check(&a).unwrap();
+        let (heading, lines, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Workholding problem: Run will refuse Top");
-        assert!(!ok);
+        assert!(!ok && !checking);
         let hit = format!(
             "{}: the tool hits the clamp on",
             a.doc.setups[0].operations[0].name()
@@ -11092,20 +11161,43 @@ flood = { pin = 8 }
         // green, and Run agrees.
         let _ = a.update(Message::Edit(Target::Setup, "holding", "Vise".into()));
         assert!(a.current_ready().is_none());
+        // While it is checked again the panel keeps the last check's lines
+        // under a Checking heading, so it keeps its height.
+        let (heading, kept, ok, checking) = run_check(&a).unwrap();
+        assert_eq!(heading, "Checking Top as run will…");
+        assert_eq!(kept, lines);
+        assert!(!ok && checking);
         let _ = a.refresh_ready();
         assert!(crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0).is_ok());
         assert_eq!(marks(&a), [OpMark::Ready, OpMark::Ready]);
-        let (heading, _, ok) = run_check(&a).unwrap();
+        let (heading, machine, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Ready to run: Run's checks of Top pass.");
-        assert!(ok);
+        assert!(ok && !checking);
         let _ = a.view();
         // Coolant the profile has no output for: generated, not ready.
         let _ = a.update(Message::Edit(Target::Operation, "coolant", "Mist".into()));
+        // A ready setup checked again keeps its two lines, in grey.
+        assert_eq!(
+            run_check(&a).unwrap(),
+            ("Checking Top as run will…".into(), machine, true, true)
+        );
         let _ = a.refresh_ready();
         assert_eq!(marks(&a), [OpMark::Generated, OpMark::Generated]);
-        let (heading, lines, ok) = run_check(&a).unwrap();
+        let (heading, lines, ok, checking) = run_check(&a).unwrap();
         assert_eq!(heading, "Run will refuse Top");
-        assert!(!ok);
+        assert!(!ok && !checking);
+        // A check that comes back after the project was replaced is not
+        // even the new project's last one.
+        let old = a.ready.clone();
+        let mut b = run_app_on(dir.path(), LIMITED);
+        b.ready_job = Some(old.key);
+        b.replace_document(crate::model::Document::default(), None);
+        let _ = b.update(Message::Ready(Box::new(old.clone())));
+        assert_eq!(b.ready.key, 0);
+        // The check this project started is taken.
+        b.ready_job = Some(old.key);
+        let _ = b.update(Message::Ready(Box::new(old)));
+        assert!(b.ready.key != 0 && b.ready_job.is_none());
         assert!(
             lines[0].contains("uses mist coolant, but the UC100 profile has no mist output"),
             "{lines:?}"
@@ -17336,7 +17428,7 @@ flood = { pin = 8 }
         use crate::viewport::Event;
         let dir = tempfile::tempdir().unwrap();
         let mut a = signed_in_planning_app(&dir);
-        let _ = a.update(Message::Viewport(Event::Orbit(0.3, 0.1)));
+        let _ = a.update(Message::Viewport(Event::Orbit(0.3, 0.1, [0., 0.])));
         let workspace = format!("{:?}", a.camera);
         let framed = format!("{:?}", crate::viewport::Camera::default());
         assert_ne!(workspace, framed);
@@ -17346,9 +17438,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::PlanFinished(epoch, Ok(checked_preview(&a, false))));
         assert_eq!(format!("{:?}", a.plan_camera), framed, "starts framed");
         for event in [
-            Event::Orbit(0.5, -0.2),
+            Event::Orbit(0.5, -0.2, [0., 0.]),
             Event::Pan(4., 2.),
-            Event::Zoom(0.2),
+            Event::Zoom(0.2, [0., 0.]),
         ] {
             let _ = a.update(Message::PlanViewport(event));
         }
@@ -19021,6 +19113,52 @@ flood = { pin = 8 }
         // A new app on the same workspace starts with the saved layout.
         assert_eq!(fresh_app(&dir).settings.layout, l);
     }
+    /// The wheel zooms toward the pointer, keeping the point under it where
+    /// it is, and goes far enough in for the part's smallest details.
+    #[test]
+    fn the_wheel_zooms_toward_the_pointer_far_in() {
+        use crate::viewport::{Event, Projector};
+        let mut a = app();
+        let bounds = crate::mesh::Bounds {
+            min: [-70., -50., 0.],
+            max: [70., 50., 12.],
+        };
+        let size = (900., 600.);
+        let corner = [-60., -40., 12.];
+        let at = |a: &App| Projector::fit(a.camera, size, bounds).p(corner);
+        let before = at(&a);
+        let centre = (900. * 0.5 + a.camera.pan[0], 600. * 0.53 + a.camera.pan[1]);
+        let _ = a.update(Message::Viewport(Event::Zoom(
+            0.5,
+            [before.x - centre.0, before.y - centre.1],
+        )));
+        let after = at(&a);
+        assert!(a.camera.zoom > 1.4);
+        assert!(
+            (after.x - before.x).abs() < 0.01 && (after.y - before.y).abs() < 0.01,
+            "{before:?} {after:?}"
+        );
+        // Far past the old 4×, up to 100×, and the point still stays.
+        for _ in 0..40 {
+            let p = at(&a);
+            let centre = (900. * 0.5 + a.camera.pan[0], 600. * 0.53 + a.camera.pan[1]);
+            let _ = a.update(Message::Viewport(Event::Zoom(
+                0.5,
+                [p.x - centre.0, p.y - centre.1],
+            )));
+        }
+        assert_eq!(a.camera.zoom, 100.);
+        let last = at(&a);
+        assert!(
+            (last.x - before.x).abs() < 0.5 && (last.y - before.y).abs() < 0.5,
+            "{last:?}"
+        );
+        // And out no further than 0.3×.
+        for _ in 0..80 {
+            let _ = a.update(Message::Viewport(Event::Zoom(-0.5, [0., 0.])));
+        }
+        assert!((a.camera.zoom - 0.3).abs() < 1e-6);
+    }
     /// Fit beside the camera views puts the scene back in the 3D view from
     /// where it looks: the zoom and the pan go back, the direction stays
     /// (#76).
@@ -19030,8 +19168,8 @@ flood = { pin = 8 }
         let mut a = app();
         let start = a.camera;
         for e in [
-            Event::Orbit(0.3, 0.2),
-            Event::Zoom(0.5),
+            Event::Orbit(0.3, 0.2, [0., 0.]),
+            Event::Zoom(0.5, [0., 0.]),
             Event::Pan(30., -20.),
         ] {
             let _ = a.update(Message::Viewport(e));

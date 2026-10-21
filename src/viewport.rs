@@ -37,9 +37,13 @@ impl Default for Camera {
 }
 #[derive(Debug, Clone)]
 pub enum Event {
-    Orbit(f32, f32),
+    /// A turn of the view (yaw, pitch, radians), and how far to move the
+    /// pan with it (pixels) so the point the view turns about stays put.
+    Orbit(f32, f32, [f32; 2]),
     Pan(f32, f32),
-    Zoom(f32),
+    /// A wheel step, and where the pointer is from the view's centre
+    /// (`Projector::center`, pixels): the zoom keeps the point under it.
+    Zoom(f32, [f32; 2]),
     Pick(usize),
     PickSurface(usize),
     /// Where pin 1 would stand under the pointer while placing the pins
@@ -58,6 +62,11 @@ pub struct State {
     grab: Option<[f32; 2]>,
     /// Whether the pins follow the pointer, so that leaving the view says so.
     aiming: bool,
+    /// While the view is turned by a drag: the point it turns about
+    /// (`Viewport::pivot`), found once the drag starts turning, and the
+    /// camera the turns sent so far leave, which the next turn starts from
+    /// even when the app has not drawn them yet.
+    pivot: Option<([f32; 3], Camera)>,
     raster: RefCell<Option<(String, RasterFrame)>>,
 }
 
@@ -227,6 +236,16 @@ pub struct Viewport<'a> {
     /// then just these faces are, after the stock and depth-tested against it.
     pub show_uncut: bool,
 }
+/// `camera` turned by `yaw` and `pitch` (radians), as a drag turns the
+/// view: the model follows the mouse, as in the machine view, and the pitch
+/// stops short of looking straight up or down past the vertical.
+pub(crate) fn orbited(camera: Camera, yaw: f32, pitch: f32) -> Camera {
+    Camera {
+        yaw: camera.yaw - yaw,
+        pitch: (camera.pitch + pitch).clamp(-1.5, 1.57),
+        ..camera
+    }
+}
 pub(crate) struct Projector {
     camera: Camera,
     center: Point,
@@ -333,6 +352,19 @@ impl Projector {
             z,
         ])
     }
+    /// The point the screen point `at` shows at depth `depth` (`depth`
+    /// back, as `p` with it).
+    pub(crate) fn at_depth(&self, at: Point, depth: f32) -> [f32; 3] {
+        let (s, c) = self.camera.yaw.sin_cos();
+        let (se, ce) = self.camera.pitch.sin_cos();
+        let right = [c, s, 0.];
+        let up = [-s * se, c * se, ce];
+        let toward = [s * ce, -c * ce, se];
+        let a = (at.x - self.center.x) / self.scale;
+        let b = (self.center.y - at.y) / self.scale;
+        let d = depth - self.depth(self.target);
+        std::array::from_fn(|i| self.target[i] + right[i] * a + up[i] * b + toward[i] * d)
+    }
     /// How far toward the viewer: larger is nearer.
     pub(crate) fn depth(&self, v: [f32; 3]) -> f32 {
         let (s, c) = self.camera.yaw.sin_cos();
@@ -343,6 +375,24 @@ impl Projector {
 impl Viewport<'_> {
     fn projector(&self, b: Rectangle) -> Projector {
         Projector::fit(self.camera, (b.width, b.height), self.scene_bounds())
+    }
+    /// The point the view turns about: the part's nearest surface at the
+    /// view's centre, so what is zoomed in on stays in view as it turns;
+    /// where no surface is there, the point at the scene's centre's depth.
+    fn pivot(&self, b: Rectangle) -> [f32; 3] {
+        let p = self.projector(b);
+        let centre = Point::new(b.width * 0.5, b.height * 0.53);
+        let nearest = self
+            .transformed()
+            .iter()
+            .filter_map(|face| {
+                let v: Vec<_> = face.points.iter().map(|q| (p.p(*q), p.depth(*q))).collect();
+                (1..v.len().saturating_sub(1))
+                    .filter_map(|i| triangle_depth([v[0], v[i], v[i + 1]], centre))
+                    .reduce(f32::max)
+            })
+            .reduce(f32::max);
+        p.at_depth(centre, nearest.unwrap_or_else(|| p.depth(p.target)))
     }
     /// What the camera must contain, in display units: the part, the stock,
     /// the jaws or clamps and, when simulating, the stock and every move.
@@ -803,9 +853,9 @@ impl Viewport<'_> {
                 })
                 .collect()
         };
-        // A selected face still under stock keeps its magenta and gets its
-        // outline in the selection colour, drawn once the faces are.
-        let mut outlines: Vec<Vec<(Point, f32)>> = vec![];
+        // A selected face still under stock is striped in the selection's
+        // blue and the magenta (`hatch`).
+        let hatch = hatch(ratio);
         for (fi, face) in faces.iter().enumerate() {
             if behind_stock {
                 break;
@@ -815,12 +865,10 @@ impl Viewport<'_> {
             let hover = face.feature.is_some() && face.feature == hovered;
             let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
             let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
+            let striped = !hover && uncut && selected;
             let color = if hover {
                 [242, 190, 93, 255]
             } else if uncut {
-                if selected {
-                    outlines.push(project(face));
-                }
                 uncut_color(light)
             } else if selected {
                 SELECTED
@@ -867,6 +915,7 @@ impl Viewport<'_> {
                             let index = (y * w + x) as usize;
                             if z > depths[index] {
                                 depths[index] = z;
+                                let color = if striped { hatch(color, x, y) } else { color };
                                 rgba[index * 4..index * 4 + 4].copy_from_slice(&color);
                                 if let Some(plain) = plain.get_mut(index) {
                                     *plain = kept;
@@ -912,19 +961,19 @@ impl Viewport<'_> {
                     continue;
                 }
                 let v = project(face);
-                let light = face_light(face);
+                let color = uncut_color(face_light(face));
+                let striped = selected_by(face);
                 for i in 1..v.len() - 1 {
-                    raster_triangle(
+                    raster_rows_with(
                         &mut rgba,
                         &mut depths,
                         w,
-                        h,
+                        0..h,
                         [v[0], v[i], v[i + 1]],
-                        uncut_color(light),
+                        |x, y| {
+                            if striped { hatch(color, x, y) } else { color }
+                        },
                     );
-                }
-                if selected_by(face) {
-                    outlines.push(v);
                 }
             }
         } else if self.show_stock
@@ -944,12 +993,6 @@ impl Viewport<'_> {
             // so the translucent box must not dim them.
             for (index, _) in plain.iter().enumerate().filter(|(_, kept)| **kept) {
                 rgba[index * 4..index * 4 + 4].copy_from_slice(&SELECTED);
-            }
-        }
-        for outline in &outlines {
-            for (i, a) in outline.iter().enumerate() {
-                let b = outline[(i + 1) % outline.len()];
-                raster_depth_line(&mut rgba, &depths, w, h, *a, b, SELECTED, ratio);
             }
         }
         if !self.holding.is_empty() {
@@ -1546,6 +1589,7 @@ impl canvas::Program<Event> for Viewport<'_> {
                     }
                     state.drag = Some((p, p, *b));
                     state.moved = false;
+                    state.pivot = None;
                     return Some(Action::capture());
                 }
             }
@@ -1586,7 +1630,28 @@ impl canvas::Program<Event> for Viewport<'_> {
                         if state.moved {
                             return Some(
                                 Action::publish(if b == mouse::Button::Left {
-                                    Event::Orbit(dx * 0.008, dy * 0.008)
+                                    let (yaw, pitch) = (dx * 0.008, dy * 0.008);
+                                    // The pan moves so the pivot stays where
+                                    // it is on the screen as the view turns.
+                                    // A wheel step during the drag: start again
+                                    // from the camera the view has now.
+                                    if state.pivot.is_some_and(|(_, c)| c.zoom != self.camera.zoom)
+                                    {
+                                        state.pivot = None;
+                                    }
+                                    let (pivot, camera) = state
+                                        .pivot
+                                        .get_or_insert_with(|| (self.pivot(bounds), self.camera));
+                                    let size = (bounds.width, bounds.height);
+                                    let scene = self.scene_bounds();
+                                    let before = Projector::fit(*camera, size, scene).p(*pivot);
+                                    let mut turned = orbited(*camera, yaw, pitch);
+                                    let after = Projector::fit(turned, size, scene).p(*pivot);
+                                    let shift = [before.x - after.x, before.y - after.y];
+                                    turned.pan =
+                                        [turned.pan[0] + shift[0], turned.pan[1] + shift[1]];
+                                    *camera = turned;
+                                    Event::Orbit(yaw, pitch, shift)
                                 } else {
                                     Event::Pan(dx, dy)
                                 })
@@ -1633,7 +1698,14 @@ impl canvas::Program<Event> for Viewport<'_> {
                     mouse::ScrollDelta::Lines { y, .. } => *y * 0.12,
                     mouse::ScrollDelta::Pixels { y, .. } => *y * 0.004,
                 };
-                return Some(Action::publish(Event::Zoom(dy)).and_capture());
+                // From the view's centre as `Projector::new` puts it.
+                let at = cursor.position_in(bounds).map_or([0., 0.], |p| {
+                    [
+                        p.x - (bounds.width * 0.5 + self.camera.pan[0]),
+                        p.y - (bounds.height * 0.53 + self.camera.pan[1]),
+                    ]
+                });
+                return Some(Action::publish(Event::Zoom(dy, at)).and_capture());
             }
             _ => {}
         }
@@ -2149,6 +2221,21 @@ fn alpha_over(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
 const SELECTED: [u8; 4] = [92, 168, 223, 255];
 /// The colour of the part's faces the whole job leaves under stock.
 const UNCUT: [u8; 3] = [214, 72, 166];
+/// How wide each stripe of `hatch` is, in logical pixels.
+const HATCH_STRIPE: f32 = 4.;
+/// The colour at pixel (x, y) of a selected face still under stock, whose
+/// magenta is `uncut`: diagonal stripes of it and the selection's blue, so
+/// the face reads as both, at a frame of `ratio` pixels a logical pixel.
+fn hatch(ratio: f32) -> impl Fn([u8; 4], u32, u32) -> [u8; 4] + Copy {
+    let stripe = (HATCH_STRIPE * ratio).max(2.);
+    move |uncut, x, y| {
+        if (((x + y) as f32 / stripe) as u32).is_multiple_of(2) {
+            uncut
+        } else {
+            SELECTED
+        }
+    }
+}
 /// `UNCUT` as a face of brightness `light` is drawn.
 fn uncut_color(light: f32) -> [u8; 4] {
     let shade = |c: u8| (c as f32 * (light + 0.1).min(1.)) as u8;
@@ -2444,6 +2531,17 @@ fn raster_rows(
     vertices: [(Point, f32); 3],
     color: [u8; 4],
 ) {
+    raster_rows_with(pixels, depths, w, rows, vertices, |_, _| color);
+}
+/// `raster_rows` with the colour of each pixel (x, y) its own.
+fn raster_rows_with(
+    pixels: &mut [u8],
+    depths: &mut [f32],
+    w: u32,
+    rows: std::ops::Range<u32>,
+    vertices: [(Point, f32); 3],
+    color: impl Fn(u32, u32) -> [u8; 4],
+) {
     let minx = vertices
         .iter()
         .map(|v| v.0.x)
@@ -2475,7 +2573,7 @@ fn raster_rows(
                 && z >= depths[index]
             {
                 depths[index] = z;
-                pixels[index * 4..index * 4 + 4].copy_from_slice(&color);
+                pixels[index * 4..index * 4 + 4].copy_from_slice(&color(x, y));
             }
         }
     }
@@ -2491,6 +2589,11 @@ fn raster_depth_line(
     color: [u8; 4],
     ratio: f32,
 ) {
+    let Some((t0, t1)) = in_frame(a.0, b.0, w, h, ratio + 2.) else {
+        return;
+    };
+    let z = |t: f32| a.1 + (b.1 - a.1) * t;
+    let (a, b) = ((along(a.0, b.0, t0), z(t0)), (along(a.0, b.0, t1), z(t1)));
     let steps = (a.0.distance(b.0).ceil() as usize).clamp(1, 10000);
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
@@ -2511,7 +2614,38 @@ fn raster_depth_line(
         }
     }
 }
+/// The part of the segment `a`–`b` within the `w` × `h` frame grown by
+/// `margin` on each side, as its ends' fractions of the way from `a`; None
+/// when none of it is. A zoomed-in view stretches a move far past the
+/// frame: only what shows is stepped along.
+fn in_frame(a: Point, b: Point, w: u32, h: u32, margin: f32) -> Option<(f32, f32)> {
+    let (mut t0, mut t1) = (0f32, 1f32);
+    let d = [b.x - a.x, b.y - a.y];
+    for (start, delta, low, high) in [
+        (a.x, d[0], -margin, w as f32 + margin),
+        (a.y, d[1], -margin, h as f32 + margin),
+    ] {
+        if delta.abs() < 1e-9 {
+            if start < low || start > high {
+                return None;
+            }
+            continue;
+        }
+        let (u, v) = ((low - start) / delta, (high - start) / delta);
+        t0 = t0.max(u.min(v));
+        t1 = t1.min(u.max(v));
+    }
+    (t0 <= t1).then_some((t0, t1))
+}
+/// The point `t` of the way from `a` to `b`.
+fn along(a: Point, b: Point, t: f32) -> Point {
+    Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
 fn raster_line(pixels: &mut [u8], w: u32, h: u32, a: Point, b: Point, color: [u8; 4], width: f32) {
+    let Some((t0, t1)) = in_frame(a, b, w, h, width + 2.) else {
+        return;
+    };
+    let (a, b) = (along(a, b, t0), along(a, b, t1));
     let steps = (a.distance(b).ceil() as usize).clamp(1, 10000);
     let radius = (width / 2.).max(0.7);
     for i in 0..=steps {
@@ -2898,8 +3032,137 @@ mod tests {
         };
         assert_eq!(magenta(&none, size), 0);
     }
+    /// Zoomed far in, turning the view keeps what is zoomed in on in place:
+    /// it turns about the part's surface at the view's centre, not the
+    /// scene's centre, which a 100× view would swing hundreds of pixels.
     #[test]
-    fn a_selected_face_under_stock_keeps_its_magenta_and_is_outlined() {
+    fn turning_a_zoomed_in_view_keeps_the_surface_at_its_centre() {
+        use canvas::Program;
+        let (doc, mesh) = crate::post::fixture::job();
+        let mut view = Viewport {
+            setup: doc.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation: None,
+            sample: false,
+            camera: Camera::default(),
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock: false,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            leftover: None,
+            live: None,
+            live_stock: None,
+            uncut: &[],
+            show_uncut: false,
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 900.,
+            height: 600.,
+        };
+        let centre = Point::new(450., 600. * 0.53);
+        // A point of the part off the scene's centre, brought to the view's
+        // centre at 100×.
+        let p = view.projector(bounds);
+        let corner = view.scene_bounds().min;
+        let near = Point::new(
+            p.p(corner).x * 0.6 + centre.x * 0.4,
+            p.p(corner).y * 0.6 + centre.y * 0.4,
+        );
+        let mut camera = Camera {
+            zoom: 100.,
+            ..view.camera
+        };
+        let k = 100.;
+        camera.pan = [(centre.x - near.x) * k, (centre.y - near.y) * k];
+        view.camera = camera;
+        let pivot = view.pivot(bounds);
+        let at = |c: Camera| Projector::fit(c, (900., 600.), view.scene_bounds()).p(pivot);
+        let start = at(view.camera);
+        assert!(start.distance(centre) < 1., "{start:?}");
+        // The point found is on the part: back where the view shows it.
+        let q = view.projector(bounds);
+        assert!(q.p(q.at_depth(centre, q.depth(pivot))).distance(centre) < 0.01);
+        // A drag that turns the view.
+        let mut state = State::default();
+        let cursor = |x, y| mouse::Cursor::Available(Point::new(x, y));
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let _ = view.update(&mut state, &press, bounds, cursor(300., 300.));
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(310., 304.),
+        });
+        let action = view.update(&mut state, &moved, bounds, cursor(310., 304.));
+        let Some(Event::Orbit(yaw, pitch, shift)) = action.and_then(|a| a.into_inner().0) else {
+            panic!("the drag turns the view");
+        };
+        let mut turned = orbited(view.camera, yaw, pitch);
+        let unshifted = at(turned);
+        turned.pan = [turned.pan[0] + shift[0], turned.pan[1] + shift[1]];
+        // Without the pan it would leave the view; with it, it stays.
+        assert!(unshifted.distance(start) > 100., "{unshifted:?}");
+        assert!(
+            at(turned).distance(start) < 0.5,
+            "{:?} {start:?}",
+            at(turned)
+        );
+        // More moves before the app draws again (the view keeps the camera
+        // it had): each turn starts from the camera the earlier ones left,
+        // so applied in turn they keep the point too.
+        for (i, (x, y)) in [(318., 300.), (325., 309.), (331., 305.)]
+            .into_iter()
+            .enumerate()
+        {
+            let moved = canvas::Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, y),
+            });
+            let action = view.update(&mut state, &moved, bounds, cursor(x, y));
+            let Some(Event::Orbit(yaw, pitch, shift)) = action.and_then(|a| a.into_inner().0)
+            else {
+                panic!("move {i} turns the view");
+            };
+            turned = orbited(turned, yaw, pitch);
+            turned.pan = [turned.pan[0] + shift[0], turned.pan[1] + shift[1]];
+            assert!(
+                at(turned).distance(start) < 0.5,
+                "move {i}: {:?}",
+                at(turned)
+            );
+        }
+    }
+    /// A move stretched far past the frame by a zoomed-in view is drawn
+    /// whole where it shows, not as dashes: only its part in the frame is
+    /// stepped along.
+    #[test]
+    fn a_long_line_through_the_frame_is_drawn_without_gaps() {
+        let (w, h) = (200u32, 100u32);
+        // Along the centres of row 50's pixels.
+        let (a, b) = (Point::new(-500_000., 50.5), Point::new(500_000., 50.5));
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        raster_line(&mut pixels, w, h, a, b, [255; 4], 1.);
+        let row = |p: &[u8]| {
+            (0..w)
+                .filter(|x| p[((50 * w + x) * 4) as usize] == 255)
+                .count()
+        };
+        assert_eq!(row(&pixels), w as usize);
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+        raster_depth_line(&mut pixels, &depths, w, h, (a, 0.), (b, 0.), [255; 4], 1.);
+        assert_eq!(row(&pixels), w as usize);
+        // One that misses the frame draws nothing.
+        assert_eq!(
+            in_frame(Point::new(-50., -50.), Point::new(-10., -60.), w, h, 2.),
+            None
+        );
+    }
+    #[test]
+    fn a_selected_face_under_stock_is_striped_in_blue_and_magenta() {
         let (doc, mesh) = crate::post::fixture::job();
         let all = vec![true; mesh.faces.len()];
         let view = Viewport {
@@ -2930,23 +3193,38 @@ mod tests {
         let (plain, _) = view.render(&p, size, 1., None, &[]);
         let (marked, _) = view.render(&p, size, 1., None, &features);
         let tinted = |rgba: &[u8]| rgba.chunks(4).filter(|px| **px == SELECTED).count();
-        // Selected, the faces are still magenta, with a line round each in the
-        // selection colour; they are no longer filled with it.
+        // Selected, the faces are striped: about half of what was magenta
+        // is the selection's blue, the rest still magenta.
         assert_eq!(tinted(&plain), 0);
-        assert!(tinted(&marked) > 0);
         assert!(magenta(&view, size) > 0);
         let fill = |rgba: &[u8]| {
             rgba.chunks(4)
                 .filter(|px| px[0] > px[1].saturating_add(60) && px[2] > px[1].saturating_add(40))
                 .count()
         };
-        // The lines take some of it; most is still magenta.
+        let (blue, kept, was) = (tinted(&marked), fill(&marked), fill(&plain));
         assert!(
-            fill(&marked) * 4 > fill(&plain),
-            "{} {}",
-            fill(&marked),
-            fill(&plain)
+            blue * 10 > was * 3 && kept * 10 > was * 3,
+            "{blue} {kept} {was}"
         );
+        assert!(blue + kept <= was, "{blue} {kept} {was}");
+        // In stripes across the frame: along a row, blue and magenta take
+        // turns many times.
+        let row = (0..size.1)
+            .max_by_key(|y| {
+                let line = &marked[(y * size.0 * 4) as usize..((y + 1) * size.0 * 4) as usize];
+                fill(line) + tinted(line)
+            })
+            .unwrap();
+        let line = &marked[(row * size.0 * 4) as usize..((row + 1) * size.0 * 4) as usize];
+        let turns = line
+            .chunks(4)
+            .map(|px| *px == SELECTED)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0] != w[1])
+            .count();
+        assert!(turns >= 6, "{turns}");
         // Without the toggle the selection fills the face, as it did.
         let off = Viewport {
             show_uncut: false,

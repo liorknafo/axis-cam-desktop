@@ -1693,39 +1693,53 @@ pub(crate) fn browser(app: &App) -> Element<'_, Message> {
         .style(panel_style)
         .into()
 }
-/// What the whole job leaves uncut as worked out for the job as it is now
-/// (`LeftStock::uncut`): None while it is worked out, and without a setup or
-/// an imported part.
-fn job_uncut(app: &App) -> Option<&Result<std::sync::Arc<crate::uncut::Uncut>, String>> {
+/// What the whole job leaves uncut (`LeftStock::uncut`), and whether that
+/// was worked out for the job as it is now. While an edited job is worked
+/// out again, the last result on the same part, so the magenta faces, the
+/// checkbox and the browser's list stay where they are until it is done.
+/// None before it is first worked out, and without a setup or an imported
+/// part.
+fn shown_uncut(app: &App) -> Option<(&Result<std::sync::Arc<crate::uncut::Uncut>, String>, bool)> {
     let key = app.left_key()?;
-    (app.left_stock.key == key)
-        .then_some(app.left_stock.uncut.as_ref())
-        .flatten()
+    let left = &app.left_stock;
+    let found = left.uncut.as_ref()?;
+    if left.key == key {
+        Some((found, true))
+    } else {
+        (app.part_mesh()?.fingerprint == left.part).then_some((found, false))
+    }
 }
 /// One line on what the whole job leaves uncut, under the 3D views: None
 /// without a setup or an imported part.
 pub(crate) fn uncut_line(app: &App) -> Option<String> {
     app.left_key()?;
-    Some(match job_uncut(app) {
+    Some(match shown_uncut(app) {
         None => "Completeness not checked yet.".into(),
-        Some(Err(why)) => format!("Completeness not checked: {why}"),
-        Some(Ok(found)) if found.regions.is_empty() => {
+        Some((Ok(found), false)) if app.show_uncut && found.faces.iter().any(|f| *f) => {
+            "Checking completeness again; the magenta faces are the last check's.".into()
+        }
+        Some((_, false)) => "Checking completeness again…".into(),
+        Some((Err(why), true)) => format!("Completeness not checked: {why}"),
+        Some((Ok(found), true)) if found.regions.is_empty() => {
             "Every face of the part is cut by the job.".into()
         }
-        Some(Ok(found)) if app.show_uncut => format!(
+        Some((Ok(found), true)) if app.show_uncut => format!(
             "Magenta faces are still under stock after the whole job: {:.0}% of the part's surface.",
             found.share * 100.
         ),
-        Some(Ok(found)) => format!(
+        Some((Ok(found), true)) => format!(
             "{:.0}% of the part's surface is still under stock after the whole job; Show uncut faces is off.",
             found.share * 100.
         ),
     })
 }
 /// The "Show uncut faces" checkbox, beside Stock: None unless the job leaves
-/// some of the part under stock, as there is nothing to show then.
+/// some of the part under stock, as there is nothing to show then. While an
+/// edited job is simulated again it stays as the last run had it
+/// (`shown_uncut`), so the checkboxes beside it do not move.
 pub(crate) fn uncut_toggle(app: &App) -> Option<Element<'_, Message>> {
-    job_uncut(app)?
+    shown_uncut(app)?
+        .0
         .as_ref()
         .ok()
         .filter(|found| found.faces.iter().any(|f| *f))?;
@@ -1767,11 +1781,22 @@ pub(crate) fn uncut_legend(app: &App) -> Option<Element<'_, Message>> {
     Some(legend.into())
 }
 /// The browser's list of the regions of the part the whole job leaves under
-/// stock, or why that is not checked.
+/// stock, or why that is not checked. While the job is worked out again,
+/// the last list in grey under a Checking heading (`shown_uncut`).
 fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
-    let mut block = column![muted("STILL UNCUT").size(12)].spacing(4);
-    match job_uncut(app) {
-        Some(Ok(found)) if !found.regions.is_empty() => {
+    let shown = shown_uncut(app);
+    let current = shown.is_none_or(|(_, current)| current);
+    let mut block = column![
+        muted(if current {
+            "STILL UNCUT"
+        } else {
+            "STILL UNCUT · CHECKING"
+        })
+        .size(12)
+    ]
+    .spacing(4);
+    match shown {
+        Some((Ok(found), _)) if !found.regions.is_empty() => {
             block = block.push(
                 text(format!(
                     "{} region{}, {:.0}% of the part's surface, magenta in the 3D view:",
@@ -1780,7 +1805,11 @@ fn uncut_block(app: &App) -> Option<Element<'_, Message>> {
                     found.share * 100.
                 ))
                 .size(12)
-                .color(Color::from_rgb8(166, 46, 124)),
+                .color(if current {
+                    Color::from_rgb8(166, 46, 124)
+                } else {
+                    MUTED
+                }),
             );
             for region in found.regions.iter().take(5) {
                 block = block.push(muted(format!("• {}", region.line())).size(12));
@@ -2014,8 +2043,8 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
         leftover: leftover_view(app),
         live: app.live_tool(),
         live_stock: app.live_stock(),
-        uncut: job_uncut(app)
-            .and_then(|found| found.as_ref().ok())
+        uncut: shown_uncut(app)
+            .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
         show_uncut: app.show_uncut,
@@ -2160,9 +2189,14 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .spacing(8)
     ]
     .spacing(8);
-    if let Some((heading, lines, ok)) = run_check(app) {
+    if let Some((heading, lines, ok, checking)) = run_check(app) {
         let said: Element<'_, Message> = if ok {
-            let mut c = column![bold(heading, 12).color(GOOD)].spacing(3);
+            let heading = if checking {
+                muted(heading).size(12)
+            } else {
+                bold(heading, 12).color(GOOD)
+            };
+            let mut c = column![heading].spacing(3);
             for line in lines {
                 c = c.push(muted(line).size(12));
             }
@@ -5003,9 +5037,12 @@ fn refusal_lines(r: &crate::run::Ready, i: usize) -> Vec<String> {
 /// What the simulation panel says of the selected operation's setup above
 /// its controls: a heading, the lines of the checks before a run (the Run
 /// panel's, export's for a machine that is not a UC100; the selected
-/// operation's workholding problems first, then the setup's), and whether
-/// the setup will run. None for the example and a suppressed operation.
-pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
+/// operation's workholding problems first, then the setup's), whether the
+/// setup will run, and whether it is being checked. While a changed job is
+/// checked again the lines and the verdict are the last check's, under a
+/// Checking heading, so the panel keeps its height and the view above it
+/// does not move. None for the example and a suppressed operation.
+pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool, bool)> {
     let i = app.selected?;
     let setup = app.doc.active_setup()?;
     let uc100 = get(&setup.machine.p, "controller") == "UC100";
@@ -5015,28 +5052,38 @@ pub(crate) fn run_check(app: &App) -> Option<(String, Vec<String>, bool)> {
         ("Export", "export")
     };
     let name = setup.name();
-    let Some(r) = app.current_ready() else {
-        // Nothing is checked for the example.
-        app.holding_key()?;
-        return Some((format!("Checking {name} as {verb} will…"), vec![], false));
+    let checking = format!("Checking {name} as {verb} will…");
+    let (r, checked) = match (app.current_ready(), app.stale_ready()) {
+        (Some(r), _) => (r, true),
+        (None, Some(r)) => (r, false),
+        (None, None) => {
+            // Nothing is checked for the example.
+            app.holding_key()?;
+            return Some((checking, vec![], false, true));
+        }
     };
     let mark = op_mark(app, Some(r), i);
     let lines = refusal_lines(r, i);
     let machine = "The machine's position and the work zero are checked on the Run panel.";
-    match mark {
-        OpMark::Suppressed => None,
-        OpMark::Ready => Some((
+    let (heading, lines, ok) = match mark {
+        OpMark::Suppressed => return None,
+        OpMark::Ready => (
             format!("Ready to {verb}: {by}'s checks of {name} pass."),
             if uc100 { vec![machine.into()] } else { vec![] },
             true,
-        )),
-        OpMark::Collides => Some((
+        ),
+        OpMark::Collides => (
             format!("Workholding problem: {by} will refuse {name}"),
             lines,
             false,
-        )),
-        _ => Some((format!("{by} will refuse {name}"), lines, false)),
-    }
+        ),
+        _ => (format!("{by} will refuse {name}"), lines, false),
+    };
+    Some(if checked {
+        (heading, lines, ok, false)
+    } else {
+        (checking, lines, ok, true)
+    })
 }
 /// `holding_warning` of the plan of the operation `name`, worked out.
 fn holding_note(

@@ -547,6 +547,12 @@ pub struct LeftStock {
     /// (`uncut::uncut`), or why that is not checked: no operation has cut
     /// yet, or one could not be generated. None until worked out.
     pub uncut: Option<Result<std::sync::Arc<uncut::Uncut>, String>>,
+    /// The `start_fingerprint` of each setup when this was worked out: a
+    /// setup's box and `before` stay good while it is unchanged, whatever
+    /// the later setups and its own operations become.
+    pub starts: Vec<u64>,
+    /// The fingerprint of the part it was worked out on.
+    pub part: String,
 }
 /// What the holding checks found for each setup of a job, worked out with
 /// `LeftStock` (`holding_checks`) for the job and its workholding whose
@@ -557,6 +563,9 @@ pub struct LeftStock {
 pub struct HoldingChecks {
     pub key: u64,
     pub setups: Vec<Option<SetupHolding>>,
+    /// The `grip_fingerprint` of each setup when these were worked out: a
+    /// setup's `held` stays good while it is unchanged.
+    pub grips: Vec<u64>,
 }
 /// The holding checks of a setup.
 #[derive(Debug, Clone, PartialEq)]
@@ -626,6 +635,50 @@ fn left_fingerprint(doc: &Document, mesh: &mesh::Mesh) -> Option<u64> {
     }
     serde_json::to_writer(&mut out, &doc.tools).ok()?;
     mesh.fingerprint.hash(&mut hasher);
+    Some(hasher.finish())
+}
+/// A fingerprint of what the stock setup `si` of `doc` starts from depends
+/// on (`left_fingerprint` of the setups before it), with the setup's own
+/// placement but not its operations, which leave it as it is. None when it
+/// cannot be written.
+fn start_fingerprint(doc: &Document, mesh: &mesh::Mesh, si: usize) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    let mut out = HashWriter(&mut hasher);
+    let placed = |setup: &Setup| -> Vec<(String, String)> {
+        setup
+            .p
+            .iter()
+            .filter(|(k, _)| !HOLDING_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    for setup in doc.setups.get(..si)? {
+        serde_json::to_writer(
+            &mut out,
+            &(&setup.id, &setup.machine, placed(setup), &setup.operations),
+        )
+        .ok()?;
+    }
+    let setup = doc.setups.get(si)?;
+    serde_json::to_writer(&mut out, &(&setup.id, &setup.machine, placed(setup))).ok()?;
+    serde_json::to_writer(&mut out, &doc.tools).ok()?;
+    mesh.fingerprint.hash(&mut hasher);
+    Some(hasher.finish())
+}
+/// A fingerprint of what the band setup `si`'s vise closes on depends on
+/// (`holding::held_by`): the stock it starts from (`start`, its
+/// `start_fingerprint`), how it is held and the workholding library. None
+/// when it cannot be written.
+fn grip_fingerprint(doc: &Document, start: u64, si: usize) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    start.hash(&mut hasher);
+    let mut out = HashWriter(&mut hasher);
+    let setup = doc.setups.get(si)?;
+    let held: Vec<_> = HOLDING_KEYS.iter().map(|k| get(&setup.p, k)).collect();
+    serde_json::to_writer(&mut out, &held).ok()?;
+    serde_json::to_writer(&mut out, &doc.workholding).ok()?;
     Some(hasher.finish())
 }
 /// A fingerprint of what the holding checks of `doc` depend on beyond the
@@ -727,6 +780,10 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         surfaces,
         bites,
         uncut,
+        starts: (0..doc.setups.len())
+            .map(|si| start_fingerprint(doc, mesh, si).unwrap_or_default())
+            .collect(),
+        part: mesh.fingerprint.clone(),
     }
 }
 /// The holding checks of each setup of `doc` whose box `left` knows (the
@@ -787,7 +844,15 @@ fn holding_checks(doc: &Document, mesh: &mesh::Mesh, left: &LeftStock, key: u64)
             })
         })
         .collect();
-    HoldingChecks { key, setups }
+    let grips = (0..doc.setups.len())
+        .map(|si| {
+            left.starts
+                .get(si)
+                .and_then(|&start| grip_fingerprint(doc, start, si))
+                .unwrap_or_default()
+        })
+        .collect();
+    HoldingChecks { key, setups, grips }
 }
 pub struct App {
     pub smoke_dir: Option<PathBuf>,
@@ -1294,20 +1359,31 @@ pub(crate) async fn run_plan_with(
     };
     let _ = sender.send(Message::PlanFinished(epoch, result)).await;
 }
+/// How far the 3D views zoom out and in from the fitted scene.
+const ZOOM_OUT: f32 = 0.3;
+const ZOOM_IN: f32 = 100.;
 /// Orbit, pan or zoom `camera` as a viewport asks; picks do not move it.
 fn steer(camera: &mut viewport::Camera, event: &viewport::Event) {
     match *event {
-        viewport::Event::Orbit(x, y) => {
-            // The model follows the mouse, as in the machine view.
-            camera.yaw -= x;
-            camera.pitch = (camera.pitch + y).clamp(-1.5, 1.57)
+        viewport::Event::Orbit(x, y, shift) => {
+            *camera = viewport::orbited(*camera, x, y);
+            for (pan, shift) in camera.pan.iter_mut().zip(shift) {
+                *pan += shift;
+            }
         }
         viewport::Event::Pan(x, y) => {
             camera.pan[0] += x;
             camera.pan[1] += y
         }
-        viewport::Event::Zoom(v) => {
-            camera.zoom = (camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(0.3, 4.)
+        viewport::Event::Zoom(v, at) => {
+            let zoom = (camera.zoom * (1. + v).clamp(0.5, 1.5)).clamp(ZOOM_OUT, ZOOM_IN);
+            // The point under the pointer stays there: the centre moves
+            // toward the pointer as the view grows and away as it shrinks.
+            let k = zoom / camera.zoom;
+            for (pan, at) in camera.pan.iter_mut().zip(at) {
+                *pan += at * (1. - k);
+            }
+            camera.zoom = zoom
         }
         viewport::Event::Pick(_)
         | viewport::Event::PickSurface(_)
@@ -1664,6 +1740,12 @@ impl App {
         if !self.is_sample() {
             self.doc.sync_stock_sources();
         }
+        // What was worked out for the old project is not even a last result
+        // of this one (`stale_ready`, `ui::stock_picture`).
+        self.ready = run::Ready::default();
+        self.ready_job = None;
+        self.left_stock = LeftStock::default();
+        self.holding_checks = HoldingChecks::default();
         self.imported_mesh = None;
         self.import_error = None;
         self.project_dirty = path.is_none();
@@ -2911,7 +2993,30 @@ impl App {
     /// (`Document::setup_stock`), which is not current. The example part is not
     /// simulated: its original stock is all there is.
     pub fn known_stock(&self, si: usize) -> (Option<mesh::Bounds>, bool) {
-        self.known_stock_in(self.left_boxes(), si)
+        self.known_stock_in(self.start_boxes(si), si)
+    }
+    /// `left_boxes`, or, while the job is worked out again, the boxes last
+    /// worked out when setup `si` and the setups before it are as they were
+    /// then (`start_fingerprint`): an edit of a later setup or of its own
+    /// operations leaves its box as it is. Only `si`'s entry is good then.
+    fn start_boxes(&self, si: usize) -> Option<&[Option<mesh::Bounds>]> {
+        self.left_boxes().or_else(|| {
+            let key = start_fingerprint(&self.doc, self.part_mesh()?, si)?;
+            (self.left_stock.starts.get(si) == Some(&key))
+                .then_some(self.left_stock.boxes.as_slice())
+        })
+    }
+    /// `current_checks`, or, while they are worked out again, those last
+    /// worked out when setup `si`'s grip is as it was then
+    /// (`grip_fingerprint`): good for `si`'s `held` alone.
+    fn start_checks(&self, si: usize) -> Option<&[Option<SetupHolding>]> {
+        self.current_checks().or_else(|| {
+            let start = start_fingerprint(&self.doc, self.part_mesh()?, si)?;
+            let key = grip_fingerprint(&self.doc, start, si)?;
+            (self.left_stock.starts.get(si) == Some(&start)
+                && self.holding_checks.grips.get(si) == Some(&key))
+            .then_some(self.holding_checks.setups.as_slice())
+        })
     }
     /// `known_stock` for the `left` boxes of `left_boxes`, worked out once for
     /// several setups.
@@ -2966,7 +3071,7 @@ impl App {
     }
     /// `known_held_in` for the job as it is now.
     pub(crate) fn known_held(&self, si: usize) -> Option<holding::Gripped> {
-        self.known_held_in(self.left_boxes(), self.current_checks(), si)
+        self.known_held_in(self.start_boxes(si), self.start_checks(si), si)
     }
     /// What tells the bands setup `si`'s vise closes on, from the stock the
     /// earlier setups left it as worked out for the job as it is now. None
@@ -2974,7 +3079,7 @@ impl App {
     fn known_bands(&self, si: usize) -> Option<holding::Bands> {
         let mesh = self.part_mesh()?;
         let volume = self
-            .left_boxes()
+            .start_boxes(si)
             .and(self.left_stock.before.get(si))?
             .as_deref()
             .filter(|v| si > 0 && !v.cuts.is_empty())?;
@@ -3030,7 +3135,7 @@ impl App {
                     };
                     let checks = HoldingChecks {
                         key: held,
-                        setups: vec![],
+                        ..Default::default()
                     };
                     (left, checks)
                 })
@@ -3260,6 +3365,16 @@ impl App {
     pub(crate) fn current_ready(&self) -> Option<&run::Ready> {
         let key = self.holding_key()?;
         (self.ready.key == key && self.ready.setup == self.doc.index()).then_some(&self.ready)
+    }
+    /// The last checks of the active setup, when the job has changed since
+    /// they were worked out: what the simulation panel keeps the shape of
+    /// while they are worked out again. None before the setup was checked
+    /// (the key of `Ready::default` is 0).
+    pub(crate) fn stale_ready(&self) -> Option<&run::Ready> {
+        (self.current_ready().is_none()
+            && self.ready.key != 0
+            && self.ready.setup == self.doc.index())
+        .then_some(&self.ready)
     }
     /// Checks the active setup as a run would (`run::ready`), when the job
     /// changed since or another setup is active, as `refresh_left_stock` works
@@ -5690,7 +5805,7 @@ impl App {
             Message::PlanViewport(e) => steer(&mut self.plan_camera, &e),
             Message::Viewport(e) => match e {
                 viewport::Event::Orbit(..)
-                | viewport::Event::Zoom(_)
+                | viewport::Event::Zoom(..)
                 | viewport::Event::Pan(..) => steer(&mut self.camera, &e),
                 viewport::Event::Pick(n) => {
                     if self.picking {
@@ -6259,9 +6374,12 @@ impl App {
             }
             Message::Ready(ready) => {
                 // A job edited while it was checked gets a check of its own at
-                // the next pause (`current_ready`).
-                self.ready_job = None;
-                self.ready = *ready;
+                // the next pause (`current_ready`). A check of a project
+                // replaced since is dropped: it is not this one's last.
+                if self.ready_job == Some(ready.key) {
+                    self.ready_job = None;
+                    self.ready = *ready;
+                }
             }
             Message::PostChecked(epoch, job) => {
                 self.post_busy = false;
