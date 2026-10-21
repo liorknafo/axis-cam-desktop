@@ -36,7 +36,13 @@ int main(int argc, char** argv) {
         BRepMesh_IncrementalMesh mesher(shape, 0.05, false, 0.3, true);
         if (!mesher.IsDone()) throw std::runtime_error("STEP tessellation failed.");
         std::vector<std::array<gp_Pnt, 3>> triangles;
+        // The CAD face of each triangle, counted from 1, goes in its STL
+        // attribute word, so the importer can pick a curved face whole. A
+        // part of more faces than the word holds writes 0: none known.
+        std::vector<uint32_t> faces;
+        uint32_t face_number = 0;
         for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+            ++face_number;
             const TopoDS_Face face = TopoDS::Face(ex.Current());
             TopLoc_Location location;
             Handle(Poly_Triangulation) mesh = BRep_Tool::Triangulation(face, location);
@@ -53,16 +59,19 @@ int main(int argc, char** argv) {
                         throw std::runtime_error("Non-finite STEP coordinate.");
                 }
                 triangles.push_back(t);
+                faces.push_back(face_number);
             }
         }
         if (triangles.empty()) throw std::runtime_error("STEP has no surface triangles (wire-only models are unsupported).");
         std::ofstream out(argv[2], std::ios::binary);
-        char header[80] = "AXIS OCCT STEP preview; units=mm; deflection=0.05mm";
+        char header[80] = "AXIS OCCT STEP preview; units=mm; deflection=0.05mm; faces";
         out.write(header,80); u32(out,triangles.size());
-        for (const auto& t : triangles) {
+        const bool numbered = face_number <= 0xFFFF;
+        for (size_t i=0; i<triangles.size(); ++i) {
             f32(out,0); f32(out,0); f32(out,0);
-            for (auto p : t) { f32(out,p.X()); f32(out,p.Y()); f32(out,p.Z()); }
-            out.put(0); out.put(0);
+            for (auto p : triangles[i]) { f32(out,p.X()); f32(out,p.Y()); f32(out,p.Z()); }
+            const uint32_t face = numbered ? faces[i] : 0;
+            out.put(face & 255); out.put((face >> 8) & 255);
         }
         if (!out) throw std::runtime_error("Could not write the STEP preview.");
         return 0;

@@ -1014,8 +1014,10 @@ impl Operation {
     }
     pub fn needs_surfaces(&self) -> bool {
         (self.strategy.needs_surfaces() && !self.drills_pin_holes())
-            || (self.strategy == Strategy::Contour
-                && get(&self.p, "boundary") == "Selected geometry")
+            || (matches!(
+                self.strategy,
+                Strategy::Contour | Strategy::Parallel | Strategy::Waterline
+            ) && get(&self.p, "boundary") == "Selected geometry")
     }
     pub fn toggle_feature(&mut self, n: usize) {
         if !self.strategy.features().contains(&n) {

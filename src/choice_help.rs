@@ -186,7 +186,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("boundary", "Selected geometry") => (
-            "Use the regions selected on the current imported part. Facing uses their XY bounding rectangle. Pocket, Adaptive clearing and Inside Contour use selected recessed floor boundaries and preserve islands. Select geometry appropriate to this operation.",
+            "Use the regions selected on the current imported part. Facing uses their XY bounding rectangle. Pocket, Adaptive clearing and Inside Contour use selected recessed floor boundaries and preserve islands. Parallel and Waterline finish only the picked faces, flat or curved.",
             "",
         ),
         ("boundary", "Stock silhouette") => (
@@ -194,7 +194,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("boundary", "Model silhouette") => (
-            "Use the current placed model's outline seen from above. Facing clears over that outline, holes through it included, grown by Clear past outline, and leaves the stock beyond it; Outside Contour follows the outline. Parallel and Waterline use the whole imported model with their respective vertical-access rules.",
+            "Use the current placed model's outline seen from above. Facing clears over that outline, holes through it included, grown by Clear past outline, and leaves the stock beyond it; Outside Contour follows the outline. Parallel and Waterline finish the whole imported model with their respective vertical-access rules.",
             "",
         ),
         ("containment", "Tool inside boundary") => {

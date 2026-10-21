@@ -2543,10 +2543,12 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                 }
                 if o.drills_pin_holes() {
                     c = c.push(pin_hole_drilling(app, o));
+                } else if !o.needs_surfaces() && crate::picks_faces(o) {
+                    c = c.push(note("Finishes the whole imported part in this setup. To finish only some of its faces, flat or curved, set Machining boundary to Selected geometry and pick them."));
                 } else if !o.needs_surfaces() && o.strategy.imported_preview() {
                     c = c.push(note("Uses the current imported model in this setup. No demonstration geometry or saved sample features are used."));
                 } else if o.strategy.imported_preview() {
-                    c = c.push(note(if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
+                    c = c.push(note(if o.strategy == Strategy::Drill { "While picking, every round hole of the part is outlined in teal with the diameter it drills. Click a hole (its outline, its wall or inside it) to drill it: its outline turns blue. Click it again to drop it. Or click a horizontal rim face: every round opening in it is drilled. The diameter filter can restrict the holes. Amber = hover." } else if matches!(o.strategy, Strategy::Pocket | Strategy::Contour) { "Click the recessed pocket floor on your part: its outline defines the walls, and holes in the floor preserve islands. Or pick a whole hole: hold the pointer over it until its outline shows, then click the outline or the hole's wall. Its outline is cut down to its floor, or through the part if nothing is under it. Picked holes' outlines are blue; click one again to drop the hole. Amber = hover; blue = selected. Click Finish picking when done." } else if o.strategy == Strategy::Adaptive { "Click the recessed pocket floor on your part. Its outline defines the walls; holes in the floor preserve islands. Amber = hover; blue = selected. Click Finish picking when done." } else if crate::picks_faces(o) { "Click any face of your part, flat or curved: the whole face, up to its sharp edges, is picked. Click it again to drop it. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." } else { "Click a planar surface on your part. Amber = hover; blue = selected. Drag to orbit, then click Finish picking." }));
                     if app.imported_mesh.is_some() {
                         c = c.push(
                             btn(
@@ -2577,11 +2579,27 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                                 .as_ref()
                                 .is_some_and(|m| crate::pocket::is_wall(app.doc.setup(), m, id))
                     };
-                    let count =
-                        selection.map_or(0, |s| s.ids.iter().filter(|&&id| !wall(id)).count());
+                    // Parallel and Waterline finishing list whole faces: a
+                    // curved one is many surfaces of one face.
+                    let faces = crate::picks_faces(o);
+                    let face_of = |id: usize| {
+                        (app.imported_mesh.as_ref())
+                            .filter(|_| faces)
+                            .and_then(|m| m.regions.get(id).copied())
+                    };
+                    let count = if faces {
+                        (selection.iter())
+                            .flat_map(|s| s.ids.iter().map(|&id| face_of(id).unwrap_or(id)))
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                    } else {
+                        selection.map_or(0, |s| s.ids.iter().filter(|&&id| !wall(id)).count())
+                    };
                     let walls = selection.is_some_and(|s| s.ids.iter().any(|&id| wall(id)));
                     // Floors are surfaces; holes are listed by their walls.
-                    if !picks_holes {
+                    if faces {
+                        c = c.push(muted(format!("{} selected", plural(count, "face"))));
+                    } else if !picks_holes {
                         c = c.push(muted(format!("{} selected", plural(count, "surface"))));
                     } else if drill {
                         if count > 0 {
@@ -2636,7 +2654,39 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                             Err(error) => c = c.push(note(error.clone())),
                         }
                     }
-                    if let (Some(selected), Some(mesh)) = (selection, &app.imported_mesh)
+                    if let (true, Some(selected), Some(mesh)) =
+                        (faces, selection, &app.imported_mesh)
+                        && selected.matches(mesh)
+                    {
+                        // Each face once, by its first surface picked, with
+                        // the area of all of its surfaces.
+                        let mut listed: Vec<(usize, usize, f32)> = vec![];
+                        for &id in &selected.ids {
+                            let Some(surface) = mesh.surfaces.get(id) else {
+                                continue;
+                            };
+                            let face = face_of(id).unwrap_or(id);
+                            match listed.iter_mut().find(|l| l.0 == face) {
+                                Some(l) => l.2 += surface.area,
+                                None => listed.push((face, id, surface.area)),
+                            }
+                        }
+                        for (face, id, area) in listed.into_iter().take(64) {
+                            c = c.push(
+                                btn(
+                                    format!(
+                                        "✓ Face {} · {:.1} {}² · remove",
+                                        face + 1,
+                                        area / mesh.display_scale().powi(2),
+                                        mesh.units
+                                    ),
+                                    Message::Surface(id),
+                                    true,
+                                )
+                                .width(Fill),
+                            );
+                        }
+                    } else if let (Some(selected), Some(mesh)) = (selection, &app.imported_mesh)
                         && selected.matches(mesh)
                     {
                         for &id in selected.ids.iter().filter(|&&id| !wall(id)).take(64) {
@@ -2731,6 +2781,8 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                         Strategy::Pocket => "Pocket uses offset contours of the selected floor triangles, including islands, and of each picked hole's outline. Supports open, vertical-wall pockets with a flat floor; overhanging geometry is rejected. A picked hole is cut down to the highest of the part under it, or through the part with the breakthrough. Simulation inherits the stock left by all earlier enabled operations and setups.".to_string(),
                         Strategy::Contour => "Inside contour offsets only the walls and islands of this floor, or the wall of each picked hole. It does not clear the interior. The floor must be flat and accessible along setup Z; overhangs are rejected.".to_string(),
                         Strategy::Drill => "Hole detection uses tessellated circular openings and vertical rays. Noncircular openings and obstructions are excluded. Confirm the detected centers and depths before previewing.".to_string(),
+                        Strategy::Parallel => "Parallel finishing cuts only where the cutter touches a picked face. The rest of the part still holds the cutter up, so it never cuts into a face it was not given; where a picked face meets one that is not, the cutter stops at the corner between them, which keeps its radius.".to_string(),
+                        Strategy::Waterline => "Waterline finishing cuts each level's loop only where the face nearest the cutter is a picked one, and goes no lower than the lowest picked face. Where a picked face meets one that is not, the cutter finishes up to the corner between them. The rest of the part still keeps the cutter out, so it never cuts into a face it was not given.".to_string(),
                         _ => fixture_note(app, Note::Facing),
                     }));
                 } else {
@@ -2825,7 +2877,10 @@ fn operation_editor_with<'a>(app: &'a App, o: &'a Operation, checks: &mut Checks
                     p,
                     "boundary",
                     "Machining boundary",
-                    if o.strategy == Strategy::Contour {
+                    if matches!(
+                        o.strategy,
+                        Strategy::Contour | Strategy::Parallel | Strategy::Waterline
+                    ) {
                         &["Model silhouette", "Selected geometry"]
                     } else {
                         &["Model silhouette"]

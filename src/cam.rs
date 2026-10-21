@@ -10,6 +10,7 @@ use crate::{
     surface,
 };
 use clipper2::{EndType, FillRule, JoinType, Milli, Paths, union};
+use std::collections::{HashMap, HashSet};
 pub(crate) type Polygon = Vec<(f64, f64)>;
 pub(crate) type Region = Paths<Milli>;
 /// The most moves (or samples) a toolpath may have: what memory takes, not
@@ -2275,14 +2276,55 @@ fn drop_triangle(p: &[[f32; 3]; 3], xy: [f32; 2], r: f32, ball: bool) -> Option<
     }
     best.is_finite().then_some(best)
 }
+/// How close two heights of the cutter on different triangles are taken as
+/// one (`finish_grid`), mm.
+const TIE: f32 = 0.0005;
 struct SurfaceGrid {
     nx: usize,
     ny: usize,
     step: f32,
     origin: [f32; 2],
     z: Vec<Option<f32>>,
+    /// The cells cut, by cell (`nx - 1` a row), when only picked faces are;
+    /// None when every cell with all four heights is.
+    cells: Option<Vec<bool>>,
 }
-fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid, String> {
+/// The faces a finishing operation (Parallel, Waterline) is given: None for
+/// the whole part (Model silhouette), or the picked faces in groups that
+/// touch along an edge (`surface::connected`), the group picked first first.
+/// Each group is finished before the next.
+fn picked_groups(op: &Operation, mesh: &Mesh) -> Result<Option<Vec<HashSet<usize>>>, String> {
+    match get(&op.p, "boundary") {
+        "Model silhouette" => Ok(None),
+        "Selected geometry" => {
+            let ids: Vec<usize> = (op.surfaces.iter())
+                .flat_map(|s| s.ids.iter().copied())
+                .collect();
+            if ids.is_empty() {
+                return Err("Select the surfaces to finish on the part, or use Model silhouette to finish the whole part.".into());
+            }
+            Ok(Some(
+                surface::connected(mesh, &ids)
+                    .into_iter()
+                    .map(|g| g.into_iter().collect())
+                    .collect(),
+            ))
+        }
+        _ => Err(
+            "Choose Model silhouette, or Selected geometry and pick the surfaces to finish.".into(),
+        ),
+    }
+}
+/// The heights of the cutter over the part, and where it cuts: everywhere
+/// or (`picked`) where it touches one of those faces. Stages `stage` and the
+/// next of `stages` (`progress::stage`).
+fn finish_grid(
+    g: &Geometry,
+    op: &Operation,
+    b: &Builder,
+    picked: Option<&HashSet<usize>>,
+    (stage, stages): (usize, usize),
+) -> Result<SurfaceGrid, String> {
     let spacing = number(op, "surface_stepover")?;
     let tolerance = number(op, "tolerance")?;
     let offset = number(op, "allowance")? + number(op, "bottom")?;
@@ -2290,9 +2332,9 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
     {
         return Err("Use surface spacing up to cutter radius, tolerance 0–1 mm and nonnegative finishing offset.".into());
     }
-    if get(&op.p, "boundary") != "Model silhouette" {
-        return Err("Finishing preview currently uses the whole Model silhouette.".into());
-    }
+    // Picked faces only: a sample is cut where the cutter touches one of
+    // them, and the rest of the part still holds the cutter up where it is
+    // higher.
     let step = spacing.min((8. * b.plan.radius * tolerance).sqrt()).min(1.);
     if step < 0.05 {
         return Err("Requested finishing sampling is below the 0.05 mm preview limit.".into());
@@ -2318,7 +2360,7 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
     }
     // Triangle rasterization evaluates only its expanded footprint, not the entire mesh per sample.
     let r = b.plan.radius;
-    crate::progress::stage(0, 3);
+    crate::progress::stage(stage, stages);
     crate::progress::expect(g.triangles.len());
     for (i, t) in g.triangles.iter().enumerate() {
         let ranges: [(usize, usize); 2] = std::array::from_fn(|k| {
@@ -2348,6 +2390,9 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
             .clamp(0., 1.)
             .acos()
             .to_degrees();
+        let wanted = slope >= low - 0.001
+            && slope <= high + 0.001
+            && picked.is_none_or(|ids| t.feature.is_some_and(|f| ids.contains(&f)));
         for y in ranges[1].0..ranges[1].1 {
             for x in ranges[0].0..ranges[0].1 {
                 let xy = [
@@ -2356,17 +2401,27 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
                 ];
                 let i = y * nx + x;
                 if let Some(height) = drop_triangle(&t.p, xy, r, b.plan.shape == CutterShape::Ball)
-                    && z[i].is_none_or(|v| height > v)
                 {
-                    z[i] = Some(height);
-                    selected[i] = slope >= low - 0.001 && slope <= high + 0.001;
+                    // Where two faces hold the cutter at the same height (at
+                    // the edge between them) a wanted one keeps the sample.
+                    match z[i] {
+                        Some(v) if height <= v - TIE => {}
+                        Some(v) if height < v + TIE => {
+                            z[i] = Some(height.max(v));
+                            selected[i] |= wanted;
+                        }
+                        _ => {
+                            z[i] = Some(height);
+                            selected[i] = wanted;
+                        }
+                    }
                 }
             }
         }
     }
     // Only cutter centers over the model XY silhouette. This also avoids joining disconnected islands.
     let silhouette: Vec<Polygon> = g.silhouette(false, op)?.into();
-    crate::progress::stage(1, 3);
+    crate::progress::stage(stage + 1, stages);
     crate::progress::expect(ny);
     for y in 0..ny {
         crate::progress::report(y)?;
@@ -2376,19 +2431,52 @@ fn finish_grid(g: &Geometry, op: &Operation, b: &Builder) -> Result<SurfaceGrid,
                 g.bounds.min[0] as f64 + x as f64 * step as f64,
                 g.bounds.min[1] as f64 + y as f64 * step as f64,
             );
-            if !selected[i] || !contains_or_edge(&silhouette, xy) {
+            // Picked faces keep every height: the cells round them hold the
+            // cutter up where it reaches past their edge (`cells`).
+            if (!selected[i] && picked.is_none()) || !contains_or_edge(&silhouette, xy) {
                 z[i] = None;
             } else {
                 z[i] = z[i].map(|h| h + offset + tolerance);
             }
         }
     }
+    // A cell with a corner where the cutter touches a picked face is cut, and
+    // so is each cell beside one: a pass then runs on past the face's edge
+    // into the corner it makes with the next face, as it does over the whole
+    // part, rather than lifting off where a steep foot leaves no cell all of
+    // whose corners touch the face.
+    let cells = picked.map(|_| {
+        let hit: Vec<bool> = (0..(nx - 1) * (ny - 1))
+            .map(|c| {
+                let (x, y) = (c % (nx - 1), c / (nx - 1));
+                [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
+                    .iter()
+                    .any(|&(x, y)| selected[y * nx + x])
+            })
+            .collect();
+        (0..hit.len())
+            .map(|c| {
+                let (x, y) = ((c % (nx - 1)) as isize, (c / (nx - 1)) as isize);
+                (-1..=1).any(|dy| {
+                    (-1..=1).any(|dx| {
+                        let (x, y) = (x + dx, y + dy);
+                        x >= 0
+                            && y >= 0
+                            && (x as usize) < nx - 1
+                            && (y as usize) < ny - 1
+                            && hit[y as usize * (nx - 1) + x as usize]
+                    })
+                })
+            })
+            .collect()
+    });
     Ok(SurfaceGrid {
         nx,
         ny,
         step,
         origin: [g.bounds.min[0], g.bounds.min[1]],
         z,
+        cells,
     })
 }
 fn contains(paths: &[Polygon], p: (f64, f64)) -> bool {
@@ -2436,7 +2524,13 @@ impl SurfaceGrid {
         let v = v.max(0.);
         let x = u.floor() as usize;
         let y = v.floor() as usize;
-        if x + 1 >= self.nx || y + 1 >= self.ny {
+        if x + 1 >= self.nx
+            || y + 1 >= self.ny
+            || self
+                .cells
+                .as_ref()
+                .is_some_and(|cells| !cells[y * (self.nx - 1) + x])
+        {
             return None;
         }
         let values = [
@@ -2454,8 +2548,30 @@ fn parallel(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<P
         return Err("Parallel finishing requires a ball or flat end mill.".into());
     }
     let g = Geometry::new(setup, mesh);
-    // How far: the grid's triangles, its outline, then its rows (stages).
-    let grid = finish_grid(&g, op, &b)?;
+    let groups = picked_groups(op, mesh)?;
+    let groups: Vec<Option<&HashSet<usize>>> = match &groups {
+        None => vec![None],
+        Some(groups) => groups.iter().map(Some).collect(),
+    };
+    b.plan.levels = 0;
+    b.plan.target = g.bounds.min[2];
+    // Each group of touching picked faces is finished before the next.
+    // How far: each grid's triangles, its outline, then its rows (stages).
+    let stages = 3 * groups.len();
+    for (k, picked) in groups.into_iter().enumerate() {
+        let grid = finish_grid(&g, op, &b, picked, (3 * k, stages))?;
+        parallel_rows(&mut b, &g, op, &grid, (3 * k + 2, stages))?;
+    }
+    b.finish()
+}
+/// The zigzag rows of Parallel finishing over `grid`.
+fn parallel_rows(
+    b: &mut Builder,
+    g: &Geometry,
+    op: &Operation,
+    grid: &SurfaceGrid,
+    (stage, stages): (usize, usize),
+) -> Result<(), String> {
     let spacing = number(op, "surface_stepover")?;
     let (sin, cos) = number(op, "direction")?.to_radians().sin_cos();
     let corners = [
@@ -2473,9 +2589,8 @@ fn parallel(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<P
     if rows > CEILING || count > CEILING || rows.saturating_mul(count) > CEILING {
         return Err(too_many("samples"));
     }
-    b.plan.levels = rows;
-    b.plan.target = g.bounds.min[2];
-    crate::progress::stage(2, 3);
+    b.plan.levels += rows;
+    crate::progress::stage(stage, stages);
     crate::progress::expect(rows + 1);
     for row in 0..=rows {
         crate::progress::report(row)?;
@@ -2494,17 +2609,23 @@ fn parallel(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<P
         }
         b.stroke(&stroke)?;
     }
-    b.finish()
+    Ok(())
 }
 fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, String> {
     let mut b = Builder::new(setup, op, tool, mesh)?;
     if get(&tool.p, "type") != "Flat end mill" {
         return Err("Waterline preview currently requires a flat end mill.".into());
     }
-    if get(&op.p, "boundary") != "Model silhouette" {
-        return Err("Waterline preview uses Model silhouette.".into());
-    }
     let g = Geometry::new(setup, mesh);
+    // Selected geometry finishes only the picked faces: a loop is cut where
+    // the face nearest the cutter is one of them, and only down to the
+    // lowest of them. Each group of touching picked faces gets all its
+    // levels before the next.
+    let picked = picked_groups(op, mesh)?;
+    let group_of = |t: &Triangle| {
+        let f = t.feature?;
+        picked.as_ref()?.iter().position(|g| g.contains(&f))
+    };
     let allowance = number(op, "allowance")?;
     let target = g.bounds.min[2] + number(op, "bottom")?;
     let top = g.bounds.max[2] + number(op, "top")?.max(0.);
@@ -2539,6 +2660,20 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
         number(op, "top")?,
     );
     b.plan.rest_top = (cutting_top < top - 0.0001).then_some(cutting_top);
+    // No level under the lowest picked face touches one.
+    let target = match picked {
+        Some(_) => {
+            let lowest = (g.triangles.iter())
+                .filter(|t| group_of(t).is_some())
+                .flat_map(|t| t.p.iter().map(|p| p[2]))
+                .fold(f32::INFINITY, f32::min);
+            if lowest >= cutting_top {
+                return Err("The picked faces are above the remaining stock: nothing is left on them to finish.".into());
+            }
+            target.max(lowest)
+        }
+        None => target,
+    };
     let levels = ((cutting_top - target) / down).ceil().max(1.) as usize;
     if levels > CEILING {
         return Err(too_many("moves"));
@@ -2550,6 +2685,9 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
         return Err("Choose Climb or Conventional.".into());
     }
     b.plan.milling_direction = if climb { "Climb" } else { "Conventional" };
+    // The cuts of each group of picked faces, level by level, made once
+    // every level is worked out.
+    let mut later: Vec<Vec<Vec<[f32; 3]>>> = vec![vec![]; picked.as_ref().map_or(0, Vec::len)];
     crate::progress::expect(levels);
     for level in 1..=levels {
         crate::progress::report(level)?;
@@ -2577,6 +2715,16 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
             }
             polys.push(p);
         }
+        // The faces each loop point is nearest, for picked faces only.
+        let near_faces = picked.as_ref().map(|_| {
+            Nearest::new(
+                (g.triangles.iter().zip(&polys))
+                    .filter(|(_, p)| !p.is_empty())
+                    .map(|(t, p)| (group_of(t), p.clone()))
+                    .collect(),
+                b.plan.radius.max(0.5),
+            )
+        });
         let paths: Vec<Polygon> = region(polys)?
             .inflate(
                 (b.plan.radius + allowance + (b.plan.radius * 0.01).max(0.02)) as f64,
@@ -2594,11 +2742,155 @@ fn waterline(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
             if climb == b.plan.spindle_clockwise {
                 points.reverse();
             }
-            points.push(points[0]);
-            b.stroke(&points)?;
+            let Some(near) = &near_faces else {
+                points.push(points[0]);
+                b.stroke(&points)?;
+                continue;
+            };
+            // The loop in short steps, each point kept where the cutter
+            // touches a picked face there, and one point on past each end of
+            // a kept run, so the cutter finishes up to the face's edge.
+            let reach = b.plan.radius + allowance + (b.plan.radius * 0.01).max(0.02);
+            let spacing = (b.plan.radius / 4.).clamp(0.05, 0.5);
+            let dense = densify(&points, spacing);
+            let touched: Vec<Option<usize>> = dense
+                .iter()
+                .map(|p| near.group(p[0] as f64, p[1] as f64, (reach + spacing) as f64))
+                .collect();
+            let n = dense.len();
+            for (group, cuts) in later.iter_mut().enumerate() {
+                let on = |i: usize| touched[i % n] == Some(group);
+                let kept: Vec<bool> = (0..n)
+                    .map(|i| on(i + n - 1) || on(i) || on(i + 1))
+                    .collect();
+                if !kept.iter().any(|k| *k) {
+                    continue;
+                }
+                if kept.iter().all(|k| *k) {
+                    let mut closed = dense.clone();
+                    closed.push(closed[0]);
+                    cuts.push(closed);
+                    continue;
+                }
+                // Runs, from the first point not kept round the loop.
+                let start = kept.iter().position(|k| !k).unwrap();
+                let mut run = vec![];
+                for i in 1..=n {
+                    let i = (start + i) % n;
+                    if kept[i] {
+                        run.push(dense[i]);
+                    } else if !run.is_empty() {
+                        cuts.push(std::mem::take(&mut run));
+                    }
+                }
+                if !run.is_empty() {
+                    cuts.push(run);
+                }
+            }
         }
     }
+    for cut in later.iter().flatten() {
+        b.stroke(cut)?;
+    }
     b.finish()
+}
+/// `points`, a closed loop, with points between its corners at most
+/// `spacing` apart; not closed again.
+fn densify(points: &[[f32; 3]], spacing: f32) -> Vec<[f32; 3]> {
+    let mut out = vec![];
+    for (i, a) in points.iter().enumerate() {
+        let b = points[(i + 1) % points.len()];
+        let steps = ((a[0] - b[0]).hypot(a[1] - b[1]) / spacing).ceil().max(1.) as usize;
+        for k in 0..steps {
+            let t = k as f32 / steps as f32;
+            out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2]]);
+        }
+    }
+    out
+}
+/// The faces of one waterline level as seen from above (the part of each
+/// triangle over the level), bucketed for asking which is nearest a point.
+struct Nearest {
+    /// The group of picked faces each is of (`picked_groups`), and its
+    /// outline.
+    faces: Vec<(Option<usize>, Polygon)>,
+    cell: f64,
+    buckets: HashMap<(i64, i64), Vec<usize>>,
+}
+impl Nearest {
+    fn new(faces: Vec<(Option<usize>, Polygon)>, cell: f32) -> Self {
+        let cell = cell as f64;
+        let mut buckets: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (i, (_, p)) in faces.iter().enumerate() {
+            let lo = |k: fn(&(f64, f64)) -> f64| p.iter().map(k).fold(f64::INFINITY, f64::min);
+            let hi = |k: fn(&(f64, f64)) -> f64| p.iter().map(k).fold(f64::NEG_INFINITY, f64::max);
+            let (x0, x1) = (
+                (lo(|q| q.0) / cell).floor() as i64,
+                (hi(|q| q.0) / cell).floor() as i64,
+            );
+            let (y0, y1) = (
+                (lo(|q| q.1) / cell).floor() as i64,
+                (hi(|q| q.1) / cell).floor() as i64,
+            );
+            for x in x0..=x1 {
+                for y in y0..=y1 {
+                    buckets.entry((x, y)).or_default().push(i);
+                }
+            }
+        }
+        Self {
+            faces,
+            cell,
+            buckets,
+        }
+    }
+    /// The group of a picked face nearest (x, y) within `within`, or as
+    /// near to 5 µm: at a corner between two faces the cutter touches both.
+    fn group(&self, x: f64, y: f64, within: f64) -> Option<usize> {
+        let span = (within / self.cell).ceil() as i64;
+        let (cx, cy) = (
+            (x / self.cell).floor() as i64,
+            (y / self.cell).floor() as i64,
+        );
+        let mut seen = HashSet::new();
+        let mut found: Vec<(f64, Option<usize>)> = vec![];
+        for gx in cx - span..=cx + span {
+            for gy in cy - span..=cy + span {
+                for &i in self.buckets.get(&(gx, gy)).into_iter().flatten() {
+                    if seen.insert(i) {
+                        let (group, p) = &self.faces[i];
+                        found.push((distance_to(p, (x, y)), *group));
+                    }
+                }
+            }
+        }
+        let nearest = found.iter().map(|f| f.0).fold(f64::INFINITY, f64::min);
+        if nearest > within {
+            return None;
+        }
+        (found.iter())
+            .filter(|f| f.0 <= nearest + 0.005)
+            .find_map(|f| f.1)
+    }
+}
+/// How far (x, y) is from the outline `p` (a point or segment too), 0 inside it.
+fn distance_to(p: &Polygon, q: (f64, f64)) -> f64 {
+    if p.len() >= 3 && contains(std::slice::from_ref(p), q) {
+        return 0.;
+    }
+    (0..p.len())
+        .map(|i| {
+            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+            let v = (b.0 - a.0, b.1 - a.1);
+            let l2 = v.0 * v.0 + v.1 * v.1;
+            let t = if l2 < 1e-16 {
+                0.
+            } else {
+                (((q.0 - a.0) * v.0 + (q.1 - a.1) * v.1) / l2).clamp(0., 1.)
+            };
+            (q.0 - a.0 - t * v.0).hypot(q.1 - a.1 - t * v.1)
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 #[cfg(test)]
@@ -3028,6 +3320,443 @@ pub(crate) mod tests {
         assert_ne!(plan.moves[3].to, rotated.moves[3].to);
         op.p.insert("slope_max".into(), "10".into());
         assert!(generate(&setup, &op, &tool, &mesh).is_err());
+        assert_plan(plan);
+    }
+    /// A half ball R10 on a Ø40 x 4 mm round plate: 64 sides, the dome in
+    /// 16 rings from its equator to its pole.
+    pub(crate) fn half_ball_on_plate() -> Mesh {
+        let mut section = vec![(0., 0.), (20., 0.), (20., 4.)];
+        section.extend((0..=16).map(|i| {
+            let a = i as f32 * std::f32::consts::FRAC_PI_2 / 16.;
+            (if i == 16 { 0. } else { 10. * a.cos() }, 4. + 10. * a.sin())
+        }));
+        mesh::normalize(revolved(&section)).unwrap()
+    }
+    #[test]
+    fn parallel_finishes_only_the_picked_curved_face() {
+        let mesh = half_ball_on_plate();
+        let (setup, mut op, tool) = fixture(Strategy::Parallel);
+        let g = Geometry::new(&setup, &mesh);
+        let centre = [
+            (g.bounds.min[0] + g.bounds.max[0]) / 2.,
+            (g.bounds.min[1] + g.bounds.max[1]) / 2.,
+            g.bounds.min[2] + 4.,
+        ];
+        // The dome: the face of the highest triangle, picked whole.
+        let top = (mesh.faces.iter())
+            .filter(|f| f.feature.is_some())
+            .max_by(|a, b| {
+                let z = |f: &mesh::Face| f.points.iter().map(|p| p[2]).sum::<f32>();
+                z(a).total_cmp(&z(b))
+            })
+            .and_then(|f| f.feature)
+            .unwrap();
+        let dome = mesh.region_of(top);
+        assert!(dome.len() > 64, "{}", dome.len());
+        let feeds = |plan: &Plan| -> Vec<[f32; 3]> {
+            (plan.moves.iter())
+                .filter(|m| m.motion == Motion::Feed)
+                .flat_map(|m| [m.from, m.to])
+                .collect()
+        };
+        let off_axis = |p: &[f32; 3]| (p[0] - centre[0]).hypot(p[1] - centre[1]);
+        let whole = generate(&setup, &op, &tool, &mesh).unwrap();
+        // The whole part: the plate's top is finished too.
+        assert!(feeds(&whole).iter().any(|p| off_axis(p) > 15.));
+
+        op.p.insert("boundary".into(), "Selected geometry".into());
+        assert!(op.needs_surfaces());
+        assert!(generate(&setup, &op, &tool, &mesh).is_err());
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: dome,
+        });
+        let setup_with_op = {
+            let mut s = setup.clone();
+            s.operations = vec![op.clone()];
+            s
+        };
+        assert!(
+            surface::issues(&op, &setup_with_op, Some(&mesh)).is_empty(),
+            "{:?}",
+            surface::issues(&op, &setup_with_op, Some(&mesh))
+        );
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let points = feeds(&plan);
+        let r = plan.radius;
+        // Only the dome: the cutter goes no further out than into the corner
+        // at its foot, at most two sampling cells (each at most 1 mm square)
+        // past where it touches the plate there, and never below the plate.
+        let corner = ((10. + r).powi(2) - r * r).sqrt();
+        assert!(
+            points
+                .iter()
+                .all(|p| off_axis(p) <= corner + 2. * std::f32::consts::SQRT_2),
+            "{:?}",
+            points.iter().map(off_axis).fold(0., f32::max)
+        );
+        assert!(points.iter().all(|p| p[2] > centre[2] - 0.01));
+        assert!(
+            points
+                .iter()
+                .any(|p| off_axis(p) < 0.5 && p[2] > centre[2] + 9.9)
+        );
+        // All of it, down to its foot: on rings of the dome near the plate
+        // the material left is what finishing the whole part leaves. A ball
+        // reaches down to r·R/(R + r), 1.7 mm, in the corner.
+        let left = |plan: &Plan, h: f32| {
+            let centres: Vec<([f32; 3], [f32; 3])> = (plan.moves.iter())
+                .filter(|m| m.motion == Motion::Feed)
+                .map(|m| {
+                    (
+                        [m.from[0], m.from[1], m.from[2] + r],
+                        [m.to[0], m.to[1], m.to[2] + r],
+                    )
+                })
+                .collect();
+            let ring = (100. - h * h).sqrt();
+            (0..72)
+                .map(|i| {
+                    let a = i as f32 * std::f32::consts::TAU / 72.;
+                    let p = [
+                        centre[0] + ring * a.cos(),
+                        centre[1] + ring * a.sin(),
+                        centre[2] + h,
+                    ];
+                    let near = (centres.iter())
+                        .map(|(a, b)| {
+                            let v: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
+                            let l2 = v.iter().map(|x| x * x).sum::<f32>();
+                            let t = if l2 < 1e-12 {
+                                0.
+                            } else {
+                                ((0..3).map(|k| (p[k] - a[k]) * v[k]).sum::<f32>() / l2)
+                                    .clamp(0., 1.)
+                            };
+                            (0..3)
+                                .map(|k| (p[k] - a[k] - t * v[k]).powi(2))
+                                .sum::<f32>()
+                                .sqrt()
+                        })
+                        .fold(f32::INFINITY, f32::min);
+                    (near - r).max(0.)
+                })
+                .collect::<Vec<f32>>()
+        };
+        // At each of 72 points round each ring.
+        for h in [2., 3., 4., 6.] {
+            let (dome_left, whole_left) = (left(&plan, h), left(&whole, h));
+            for (d, w) in dome_left.iter().zip(&whole_left) {
+                assert!(
+                    *d <= w + 0.05,
+                    "at {h} mm up the dome leaves {d}, the whole part {w}"
+                );
+            }
+        }
+        // The ball rides on the dome, never into it (the tessellation lies
+        // up to 0.012 mm inside the true sphere).
+        for p in &points {
+            let ball = [p[0], p[1], p[2] + r];
+            let d = (0..3)
+                .map(|k| (ball[k] - centre[k]).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!(d >= 10. + r - 0.02, "gouge at {p:?}: {d}");
+        }
+        // Fewer passes than the whole part.
+        assert!(points.len() < feeds(&whole).len());
+        assert_plan(plan);
+    }
+    /// Two half balls R10, 30 mm apart along X, on a 70 x 30 x 4 plate.
+    pub(crate) fn two_half_balls() -> Mesh {
+        let dome: Vec<(f32, f32)> = (0..=16)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::FRAC_PI_2 / 16.;
+                (if i == 16 { 0. } else { 10. * a.cos() }, 4. + 10. * a.sin())
+            })
+            .collect();
+        let mut t = vec![];
+        for x in [-15., 15.] {
+            t.extend(
+                revolved(&dome)
+                    .into_iter()
+                    .map(|tri| tri.map(|p| [p[0] + x, p[1], p[2]])),
+            );
+        }
+        let (a, b) = ([-35., -15., 0.], [35., 15., 4.]);
+        quad(
+            &mut t,
+            [
+                [a[0], a[1], b[2]],
+                [b[0], a[1], b[2]],
+                [b[0], b[1], b[2]],
+                [a[0], b[1], b[2]],
+            ],
+        );
+        quad(
+            &mut t,
+            [
+                [a[0], a[1], a[2]],
+                [a[0], b[1], a[2]],
+                [b[0], b[1], a[2]],
+                [b[0], a[1], a[2]],
+            ],
+        );
+        quad(
+            &mut t,
+            [
+                [a[0], a[1], a[2]],
+                [b[0], a[1], a[2]],
+                [b[0], a[1], b[2]],
+                [a[0], a[1], b[2]],
+            ],
+        );
+        quad(
+            &mut t,
+            [
+                [b[0], b[1], a[2]],
+                [a[0], b[1], a[2]],
+                [a[0], b[1], b[2]],
+                [b[0], b[1], b[2]],
+            ],
+        );
+        quad(
+            &mut t,
+            [
+                [a[0], b[1], a[2]],
+                [a[0], a[1], a[2]],
+                [a[0], a[1], b[2]],
+                [a[0], b[1], b[2]],
+            ],
+        );
+        quad(
+            &mut t,
+            [
+                [b[0], a[1], a[2]],
+                [b[0], b[1], a[2]],
+                [b[0], b[1], b[2]],
+                [b[0], a[1], b[2]],
+            ],
+        );
+        mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn faces_apart_are_finished_one_after_the_other_in_the_order_picked() {
+        let mesh = two_half_balls();
+        // The surfaces of each dome: those above the plate, by side.
+        let dome = |right: bool| -> Vec<usize> {
+            let s = mesh.display_scale();
+            let mut ids: Vec<usize> = (mesh.faces.iter())
+                .filter(|f| f.points.iter().all(|p| p[2] > 4. * s + 4. + 0.01))
+                .filter(|f| (f.points[0][0] > 0.) == right)
+                .filter_map(|f| f.feature)
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        let (left, right) = (dome(false), dome(true));
+        // The right dome picked first.
+        let ids: Vec<usize> = right.iter().chain(&left).copied().collect();
+        let groups = surface::connected(&mesh, &ids);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), right.len());
+        for (strategy, tool_type) in [
+            (Strategy::Parallel, "Ball end mill"),
+            (Strategy::Waterline, "Flat end mill"),
+        ] {
+            let (setup, mut op, mut tool) = fixture(strategy);
+            tool.p.insert("type".into(), tool_type.into());
+            op.p.insert("stepdown".into(), "1".into());
+            op.p.insert("boundary".into(), "Selected geometry".into());
+            op.surfaces = Some(surface::Selection {
+                mesh_fingerprint: mesh.fingerprint.clone(),
+                ids: ids.clone(),
+            });
+            let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+            let g = Geometry::new(&setup, &mesh);
+            let middle = (g.bounds.min[0] + g.bounds.max[0]) / 2.;
+            // Which dome each cut is on, in order: all of the right one,
+            // then all of the left one.
+            let mut sides: Vec<bool> = (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .map(|m| m.to[0] > middle)
+                .collect();
+            assert!(sides[0], "{strategy:?} starts on the left dome");
+            sides.dedup();
+            assert_eq!(sides, vec![true, false], "{strategy:?}");
+            assert_plan(plan);
+        }
+    }
+    #[test]
+    fn waterline_finishes_only_the_picked_curved_face() {
+        let mesh = half_ball_on_plate();
+        let (setup, mut op, tool) = fixture(Strategy::Waterline);
+        op.p.insert("stepdown".into(), "0.5".into());
+        let g = Geometry::new(&setup, &mesh);
+        let centre = [
+            (g.bounds.min[0] + g.bounds.max[0]) / 2.,
+            (g.bounds.min[1] + g.bounds.max[1]) / 2.,
+            g.bounds.min[2] + 4.,
+        ];
+        let off_axis = |p: &[f32; 3]| (p[0] - centre[0]).hypot(p[1] - centre[1]);
+        let feeds = |plan: &Plan| -> Vec<[f32; 3]> {
+            (plan.moves.iter())
+                .filter(|m| m.cutting_pass)
+                .flat_map(|m| [m.from, m.to])
+                .collect()
+        };
+        // The whole part: round the plate too.
+        let whole = generate(&setup, &op, &tool, &mesh).unwrap();
+        assert!(feeds(&whole).iter().any(|p| off_axis(p) > 20.));
+        let top = (mesh.faces.iter())
+            .filter(|f| f.feature.is_some())
+            .max_by(|a, b| {
+                let z = |f: &mesh::Face| f.points.iter().map(|p| p[2]).sum::<f32>();
+                z(a).total_cmp(&z(b))
+            })
+            .and_then(|f| f.feature)
+            .unwrap();
+        op.p.insert("boundary".into(), "Selected geometry".into());
+        assert!(op.needs_surfaces());
+        assert!(generate(&setup, &op, &tool, &mesh).is_err());
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: mesh.region_of(top),
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let points = feeds(&plan);
+        let r = plan.radius;
+        // Every loop goes round the dome at its own height, the cutter's side
+        // on the dome, and none goes round the plate or below its top.
+        for p in &points {
+            let h = p[2] - centre[2];
+            assert!(h > -0.001, "{p:?}");
+            let ring = (100. - h.min(10.).powi(2)).max(0.).sqrt();
+            assert!(
+                (off_axis(p) - ring - r).abs() < 0.1,
+                "{p:?}: {} from the axis, the dome {ring} there, centre {centre:?}",
+                off_axis(p)
+            );
+        }
+        // From the foot up: a level every 0.5 mm over the dome's 10.
+        let levels: std::collections::BTreeSet<i32> = points
+            .iter()
+            .map(|p| (p[2] * 1000.).round() as i32)
+            .collect();
+        assert!(levels.len() >= 19, "{}", levels.len());
+        assert!(points.iter().any(|p| p[2] - centre[2] < 0.6));
+        assert_plan(plan);
+    }
+    #[test]
+    fn waterline_follows_only_a_picked_wall_up_to_its_corners() {
+        let mesh = block();
+        let (setup, mut op, tool) = fixture(Strategy::Waterline);
+        let g = Geometry::new(&setup, &mesh);
+        // The wall facing -Y.
+        let wall = (0..mesh.surfaces.len())
+            .find(|&i| mesh.surfaces[i].normal[1] < -0.99)
+            .unwrap();
+        op.p.insert("boundary".into(), "Selected geometry".into());
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: mesh.region_of(wall),
+        });
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let r = plan.radius;
+        let feeds: Vec<[f32; 3]> = (plan.moves.iter())
+            .filter(|m| m.cutting_pass)
+            .flat_map(|m| [m.from, m.to])
+            .collect();
+        // Along that wall, round its two corners, and at most one short step
+        // on along the next walls: never along the far wall.
+        assert!(
+            feeds.iter().all(|p| p[1] < g.bounds.min[1] + 0.6),
+            "{feeds:?}"
+        );
+        assert!(feeds.iter().any(|p| p[0] < g.bounds.min[0] - r + 0.1));
+        assert!(feeds.iter().any(|p| p[0] > g.bounds.max[0] + r - 0.1));
+        assert!(
+            feeds
+                .iter()
+                .any(|p| (p[1] - (g.bounds.min[1] - r)).abs() < 0.05)
+        );
+        assert_plan(plan);
+    }
+    #[test]
+    fn a_step_half_ball_s_dome_is_one_cad_face_and_is_finished_alone() {
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        // The reader numbers each triangle's CAD face: the dome's and the
+        // bottom's.
+        let (_, cad) = crate::step::load(&examples.join("half-ball.step")).unwrap();
+        assert_eq!(
+            cad.unwrap()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+        // On its own, a half ball is its dome and its flat bottom.
+        let ball = mesh::load(&examples.join("half-ball.step")).unwrap();
+        assert_eq!(
+            ball.regions
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+        // On a 70 x 70 x 10 plate: the dome and the plate's six faces.
+        let mesh = mesh::load(&examples.join("half-ball-on-plate.step")).unwrap();
+        assert_eq!(
+            mesh.regions
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            7
+        );
+        let s = mesh.display_scale();
+        let plate_top = 10. * s + 4.;
+        let above: Vec<usize> = (mesh.faces.iter())
+            .filter(|f| f.points.iter().any(|p| p[2] > plate_top + 0.01))
+            .filter_map(|f| f.feature)
+            .collect();
+        let dome = mesh.region_of(above[0]);
+        assert!(above.iter().all(|id| dome.contains(id)));
+        let (mut setup, mut op, tool) = fixture(Strategy::Parallel);
+        op.p.insert("boundary".into(), "Selected geometry".into());
+        op.surfaces = Some(surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: dome,
+        });
+        setup.operations = vec![op.clone()];
+        assert!(surface::issues(&op, &setup, Some(&mesh)).is_empty());
+        let plan = generate(&setup, &op, &tool, &mesh).unwrap();
+        let g = Geometry::new(&setup, &mesh);
+        let centre = [
+            (g.bounds.min[0] + g.bounds.max[0]) / 2.,
+            (g.bounds.min[1] + g.bounds.max[1]) / 2.,
+        ];
+        let feeds: Vec<[f32; 3]> = (plan.moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .map(|m| m.to)
+            .collect();
+        let reach = (feeds.iter())
+            .map(|p| (p[0] - centre[0]).hypot(p[1] - centre[1]))
+            .fold(0., f32::max);
+        // Down into the corner at the dome's foot, where the ball touches
+        // the plate, and no more than two sampling cells past it.
+        let r = plan.radius;
+        let corner = ((25. + r).powi(2) - r * r).sqrt();
+        assert!(
+            (corner..=corner + 2. * std::f32::consts::SQRT_2).contains(&reach),
+            "{reach}"
+        );
+        let plate = g.bounds.min[2] + 10.;
+        let lowest = feeds.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        assert!((plate - 0.01..plate + 0.1).contains(&lowest), "{lowest}");
         assert_plan(plan);
     }
     fn hole_part() -> Mesh {
