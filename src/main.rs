@@ -1104,6 +1104,12 @@ pub(crate) fn picks_holes(op: &Operation) -> bool {
     matches!(op.strategy, Strategy::Pocket | Strategy::Contour)
         || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
 }
+/// Whether a click on the part picks the whole smooth face it lands on in
+/// `op` (`mesh::Mesh::region_of`), a curved one included: Parallel and
+/// Waterline finishing.
+pub(crate) fn picks_faces(op: &Operation) -> bool {
+    matches!(op.strategy, Strategy::Parallel | Strategy::Waterline)
+}
 /// The part's holes as `setup` places it, for picking by their outline.
 pub(crate) fn find_holes(setup: &model::Setup, mesh: &mesh::Mesh) -> FoundHoles {
     let holes = pocket::part_holes(setup, mesh);
@@ -4329,6 +4335,14 @@ impl App {
                     }
                     return Task::none();
                 }
+                // Parallel and Waterline finishing take a whole face, curved or
+                // flat: every surface of the smooth face clicked, added or
+                // removed together.
+                let face = if self.operation().is_some_and(picks_faces) {
+                    mesh.region_of(n)
+                } else {
+                    vec![n]
+                };
                 if let Some(o) = self.operation_mut() {
                     let selected = o.surfaces.get_or_insert_with(|| surface::Selection {
                         mesh_fingerprint: fingerprint.clone(),
@@ -4340,11 +4354,13 @@ impl App {
                     }
                     let had = selected.ids.contains(&n);
                     // A Box takes one face: a click replaces the one before.
-                    if had || o.strategy == Strategy::Box {
+                    if o.strategy == Strategy::Box {
                         selected.ids.clear();
+                    } else {
+                        selected.ids.retain(|id| !face.contains(id));
                     }
                     if !had {
-                        selected.ids.push(n);
+                        selected.ids.extend(face);
                     }
                     o.geometry.clear();
                 }
@@ -5520,7 +5536,7 @@ impl App {
                     .into_owned();
                 self.import_error = None;
                 self.status = format!(
-                    "{} geometry loaded. Facing and Pocket can select planar surfaces and generate bounded previews.",
+                    "{} geometry loaded. Facing and Pocket can select planar surfaces, Parallel finishing any face, curved ones included, and generate bounded previews.",
                     f.format.to_uppercase()
                 );
                 self.doc.sample_model = false;

@@ -772,6 +772,107 @@ mod tests {
         }
         all.to_string()
     }
+    /// Writes /tmp/half-ball-{,waterline-}{whole,dome}-{paths,paths-front,stock}.png: Parallel or Waterline
+    /// finishing of the STEP half ball on its plate, of the whole part and
+    /// of the picked dome alone, its toolpaths over the part and the stock
+    /// it leaves: for looking at.
+    #[test]
+    #[ignore]
+    fn picture_the_half_ball() {
+        use crate::model::{Machine, Operation, Setup, Strategy, Tool};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/half-ball-on-plate.step");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let top = (mesh.faces.iter())
+            .filter(|f| f.feature.is_some())
+            .max_by(|a, b| {
+                let z = |f: &crate::mesh::Face| f.points.iter().map(|p| p[2]).sum::<f32>();
+                z(a).total_cmp(&z(b))
+            })
+            .and_then(|f| f.feature)
+            .unwrap();
+        let dome = mesh.region_of(top);
+        for (name, picked, waterline) in [
+            ("whole", false, false),
+            ("dome", true, false),
+            ("waterline-whole", false, true),
+            ("waterline-dome", true, true),
+        ] {
+            let mut doc = Document {
+                title: "Half ball".into(),
+                ..Default::default()
+            };
+            crate::proposal::tests::aluminium(&mut doc);
+            let mut tool = if waterline {
+                Tool::new("Flat 6", "Flat end mill", "6")
+            } else {
+                Tool::new("Ball 6", "Ball end mill", "6")
+            };
+            tool.p.insert("length".into(), "60".into());
+            tool.p.insert("stickout".into(), "65".into());
+            tool.p.insert("number".into(), "1".into());
+            let mut setup = Setup::new(Machine::new(3), "G54");
+            for k in [
+                "stock_top",
+                "stock_left",
+                "stock_right",
+                "stock_front",
+                "stock_back",
+            ] {
+                setup.p.insert(k.into(), "1".into());
+            }
+            let strategy = if waterline {
+                Strategy::Waterline
+            } else {
+                Strategy::Parallel
+            };
+            let mut op = Operation::new(strategy, tool.id.clone());
+            op.geometry.clear();
+            op.p.insert("surface_stepover".into(), "1.5".into());
+            op.p.insert("stepdown".into(), "1".into());
+            if picked {
+                op.p.insert("boundary".into(), "Selected geometry".into());
+                op.surfaces = Some(crate::surface::Selection {
+                    mesh_fingerprint: mesh.fingerprint.clone(),
+                    ids: dome.clone(),
+                });
+            }
+            setup.operations = vec![op];
+            doc.tools = vec![tool];
+            doc.setups = vec![setup];
+            doc.file = Some(crate::model::ModelFile {
+                path: path.clone(),
+                name: "half-ball-on-plate.step".into(),
+                format: "STEP".into(),
+                bytes: 0,
+            });
+            let report = crate::analysis::report(&doc, &mesh).unwrap();
+            let doc = Arc::new(doc);
+            let scene = Scene {
+                doc: doc.clone(),
+                mesh: Arc::new(mesh.clone()),
+                report: Arc::new(report),
+                job: Some(doc),
+            };
+            for (stock, angle) in [
+                (false, "iso_front_left"),
+                (false, "front"),
+                (true, "iso_front_left"),
+            ] {
+                let args = format!(
+                    r#"{{"orientation":null,"angle":"{angle}","focus_surfaces":[],"highlight_surfaces":[],"show_stock":{stock},"show_workholding":false,"labels":false,"operation":{{"setup":1,"operation":1}},"purpose":"look"}}"#
+                );
+                let picture = draw(&scene, &args).unwrap();
+                let file = format!(
+                    "/tmp/half-ball-{name}-{}{}.png",
+                    if stock { "stock" } else { "paths" },
+                    if angle == "front" { "-front" } else { "" }
+                );
+                std::fs::write(&file, picture.png.as_slice()).unwrap();
+                println!("{file}: {}", picture.description);
+            }
+        }
+    }
     fn decode(png: &[u8]) -> (u32, u32, Vec<u8>) {
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let mut reader = decoder.read_info().unwrap();

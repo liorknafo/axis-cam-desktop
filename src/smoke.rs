@@ -12328,6 +12328,247 @@ flood = { pin = 8 }
         a.selected = Some(0);
         a
     }
+    /// A Parallel finishing on a half ball on a round plate, its Geometry
+    /// tab open.
+    fn half_ball_app() -> App {
+        let mut a = app();
+        let file = ModelFile {
+            name: "half-ball.stl".into(),
+            path: "half-ball.stl".into(),
+            format: "stl".into(),
+            bytes: 1,
+        };
+        let mesh = crate::cam::tests::half_ball_on_plate();
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        let ball = a
+            .doc
+            .tools
+            .iter()
+            .find(|t| t.p.get("type").map(String::as_str) == Some("Ball end mill"));
+        let tool = ball.map_or(a.doc.setup().operations[0].tool.clone(), |t| t.id.clone());
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Parallel, tool);
+        a.page = Page::Work;
+        let _ = a.update(Message::SelectOp(0));
+        let _ = a.update(Message::Tab("Geometry".into()));
+        a
+    }
+    /// The half ball's first surface `test` takes by its centre: the
+    /// distance off the ball's axis and the height over the part's bottom.
+    fn half_ball_surface(a: &App, test: impl Fn(f32, f32) -> bool) -> usize {
+        let mesh = a.imported_mesh.as_ref().unwrap();
+        let placement = crate::stock::Placement::new(mesh, Some(a.doc.setup()));
+        let b = placement.bounds;
+        let axis = [(b.min[0] + b.max[0]) / 2., (b.min[1] + b.max[1]) / 2.];
+        let scale = mesh.display_scale();
+        (0..mesh.surfaces.len())
+            .find(|&id| {
+                let c = placement.transform(mesh.surfaces[id].center);
+                test(
+                    (c[0] - axis[0]).hypot(c[1] - axis[1]) / scale,
+                    (c[2] - b.min[2]) / scale,
+                )
+            })
+            .unwrap()
+    }
+    #[test]
+    fn a_click_on_a_curved_face_picks_it_whole_for_parallel_finishing() {
+        let mut a = half_ball_app();
+        // The whole part by default: nothing to pick, and how to pick.
+        assert!(!a.can_pick());
+        assert!(
+            page_texts(&a)
+                .iter()
+                .any(|t| t.starts_with("Finishes the whole imported part"))
+        );
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "boundary",
+            "Selected geometry".into(),
+        ));
+        assert!(a.can_pick());
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let mesh = a.imported_mesh.clone().unwrap();
+        // One triangle of the dome, near its top.
+        let dome = half_ball_surface(&a, |r, z| r < 3. && z > 12.);
+        let whole = mesh.region_of(dome);
+        assert!(whole.len() > 64);
+        let picked = |a: &App| {
+            let mut ids = a
+                .operation()
+                .unwrap()
+                .surfaces
+                .as_ref()
+                .map_or(vec![], |s| s.ids.clone());
+            ids.sort();
+            ids
+        };
+        // A click picks the whole dome: one face.
+        let _ = a.update(Message::Surface(dome));
+        assert_eq!(picked(&a), whole);
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "1 face selected"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("✓ Face ")), "{texts:?}");
+        let setup = a.doc.setup();
+        let op = &setup.operations[0];
+        assert!(
+            op.issues(&setup.machine, &a.doc.tools, &[]).is_empty(),
+            "{:?}",
+            op.issues(&setup.machine, &a.doc.tools, &[])
+        );
+        assert!(crate::surface::issues(op, setup, Some(&mesh)).is_empty());
+        // The plate's flat top ring beside it is a second face (one surface,
+        // centred on the axis).
+        let ring = half_ball_surface(&a, |r, z| r < 0.01 && (z - 4.).abs() < 0.01);
+        let _ = a.update(Message::Surface(ring));
+        assert!(page_texts(&a).iter().any(|t| t == "2 faces selected"));
+        // A click on another triangle of the dome drops it, and only it.
+        let other = *whole.iter().find(|&&id| id != dome).unwrap();
+        let _ = a.update(Message::Surface(other));
+        assert_eq!(picked(&a), mesh.region_of(ring));
+        let _ = a.update(Message::Surface(ring));
+        assert!(picked(&a).is_empty());
+    }
+    #[test]
+    fn waterline_picks_a_curved_face_whole_too() {
+        let mut a = half_ball_app();
+        let tool = a.doc.setup().operations[0].tool.clone();
+        a.doc.setup_mut().operations[0] = Operation::new(Strategy::Waterline, tool);
+        assert!(!a.can_pick());
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "boundary",
+            "Selected geometry".into(),
+        ));
+        assert!(a.can_pick());
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let dome = half_ball_surface(&a, |r, z| r < 3. && z > 12.);
+        let _ = a.update(Message::Surface(dome));
+        let mut ids = a.operation().unwrap().surfaces.clone().unwrap().ids;
+        ids.sort();
+        assert_eq!(ids, a.imported_mesh.as_ref().unwrap().region_of(dome));
+        assert!(page_texts(&a).iter().any(|t| t == "1 face selected"));
+    }
+    /// The window halfway through finishing two half balls apart, both
+    /// picked, the right one first: /tmp/half-ball-app/two-{parallel,
+    /// waterline}.png.
+    #[test]
+    #[ignore]
+    fn render_two_domes_halfway() {
+        let out = std::path::PathBuf::from("/tmp/half-ball-app");
+        std::fs::create_dir_all(&out).unwrap();
+        for strategy in [Strategy::Parallel, Strategy::Waterline] {
+            let mut a = app();
+            let file = ModelFile {
+                name: "two-half-balls.stl".into(),
+                path: "two-half-balls.stl".into(),
+                format: "stl".into(),
+                bytes: 1,
+            };
+            let mesh = crate::cam::tests::two_half_balls();
+            let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+            let kind = if strategy == Strategy::Parallel {
+                "Ball end mill"
+            } else {
+                "Flat end mill"
+            };
+            let tool = (a.doc.tools.iter())
+                .find(|t| t.p.get("type").map(String::as_str) == Some(kind))
+                .unwrap()
+                .id
+                .clone();
+            a.doc.setup_mut().operations[0] = Operation::new(strategy, tool);
+            a.page = Page::Work;
+            let _ = a.update(Message::SelectOp(0));
+            let _ = a.update(Message::Tab("Geometry".into()));
+            let _ = a.update(Message::Edit(
+                Target::Operation,
+                "boundary",
+                "Selected geometry".into(),
+            ));
+            if !a.picking {
+                let _ = a.update(Message::PickMode);
+            }
+            let mesh = a.imported_mesh.clone().unwrap();
+            let top = |right: bool| {
+                (mesh.faces.iter())
+                    .filter(|f| f.feature.is_some() && (f.points[0][0] > 0.) == right)
+                    .max_by(|a, b| {
+                        let z = |f: &crate::mesh::Face| f.points.iter().map(|p| p[2]).sum::<f32>();
+                        z(a).total_cmp(&z(b))
+                    })
+                    .unwrap()
+                    .feature
+                    .unwrap()
+            };
+            let _ = a.update(Message::Surface(top(true)));
+            let _ = a.update(Message::Surface(top(false)));
+            let _ = a.update(Message::PickMode);
+            let _ = a.update(Message::Generate);
+            println!("{}", a.status);
+            let _ = a.update(Message::Scrub(0.5));
+            let key = a.stock_mesh_key().unwrap();
+            let sim = a.active_simulation().unwrap();
+            let surface =
+                crate::stock_surface::Snapshot::of(sim.volume.as_ref().unwrap(), a.stock_detail)
+                    .build()
+                    .map(std::sync::Arc::new);
+            let seconds = sim.seconds;
+            let _ = a.update(Message::StockMeshed {
+                key,
+                seconds,
+                result: surface,
+            });
+            let _ = a.view();
+            let name = format!("two-{}.png", strategy.short().to_lowercase());
+            render_png(&a, iced::Size::new(1600., 1100.), &out.join(name));
+        }
+    }
+    /// Pictures of the half ball's dome picked for Parallel finishing, in
+    /// the window: /tmp/half-ball-app/1-picked.png and 2-generated.png.
+    #[test]
+    #[ignore]
+    fn render_a_picked_dome() {
+        let out = std::path::PathBuf::from("/tmp/half-ball-app");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = half_ball_app();
+        let _ = a.update(Message::Edit(
+            Target::Operation,
+            "boundary",
+            "Selected geometry".into(),
+        ));
+        if !a.picking {
+            let _ = a.update(Message::PickMode);
+        }
+        let dome = half_ball_surface(&a, |r, z| r < 3. && z > 12.);
+        let _ = a.update(Message::Surface(dome));
+        let size = iced::Size::new(1600., 1100.);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-picked.png"));
+        let _ = a.update(Message::PickMode);
+        let _ = a.update(Message::Generate);
+        println!("{}", a.status);
+        // The end of the cut, with its stock surface built here rather than
+        // off the window's thread.
+        let _ = a.update(Message::Scrub(1.));
+        let key = a.stock_mesh_key().unwrap();
+        let sim = a.active_simulation().unwrap();
+        let surface =
+            crate::stock_surface::Snapshot::of(sim.volume.as_ref().unwrap(), a.stock_detail)
+                .build()
+                .map(std::sync::Arc::new);
+        let seconds = sim.seconds;
+        let _ = a.update(Message::StockMeshed {
+            key,
+            seconds,
+            result: surface,
+        });
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-generated.png"));
+    }
     /// The first surface of the part `test` takes, by its id and its centre
     /// (X and Y as placed, Z over the part's bottom).
     fn surface_at(a: &App, test: impl Fn(usize, [f32; 3]) -> bool) -> usize {

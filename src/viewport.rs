@@ -803,6 +803,14 @@ impl Viewport<'_> {
                 })
                 .collect()
         };
+        // Where a click picks a whole smooth face (Parallel finishing), the
+        // pointer shows all of it.
+        let hovered_face: std::collections::HashSet<usize> = match hovered {
+            Some(h) if !self.sample && self.operation.is_some_and(crate::picks_faces) => {
+                self.mesh.region_of(h).into_iter().collect()
+            }
+            _ => Default::default(),
+        };
         // A selected face still under stock keeps its magenta and gets its
         // outline in the selection colour, drawn once the faces are.
         let mut outlines: Vec<Vec<(Point, f32)>> = vec![];
@@ -812,7 +820,8 @@ impl Viewport<'_> {
             }
             let light = face_light(face);
             let selected = selected_by(face);
-            let hover = face.feature.is_some() && face.feature == hovered;
+            let hover = face.feature.is_some()
+                && (face.feature == hovered || hovered_face.contains(&face.feature.unwrap()));
             let kept = !hover && face.feature.is_some_and(|f| marked.contains(&f));
             let uncut = self.show_uncut && self.uncut.get(fi) == Some(&true);
             let color = if hover {

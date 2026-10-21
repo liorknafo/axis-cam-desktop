@@ -64,6 +64,9 @@ impl Clone for Kept {
 pub struct Mesh {
     pub faces: Vec<Face>,
     pub surfaces: Vec<crate::surface::Surface>,
+    /// The smooth face each surface belongs to (`surface::regions`), by
+    /// surface: a curved face is many surfaces and one smooth face.
+    pub regions: Vec<usize>,
     pub fingerprint: String,
     pub dimensions: [f32; 3],
     pub triangles: usize,
@@ -75,6 +78,16 @@ pub struct Mesh {
 }
 impl Mesh {
     /// The preview normalization is uniform; use the same factor for mm stock.
+    /// Every surface of the smooth face `surface` belongs to, itself
+    /// included: the whole curved face a click on one of its triangles picks.
+    pub fn region_of(&self, surface: usize) -> Vec<usize> {
+        match self.regions.get(surface) {
+            Some(&r) => (0..self.regions.len())
+                .filter(|&i| self.regions[i] == r)
+                .collect(),
+            None => vec![surface],
+        }
+    }
     pub fn display_scale(&self) -> f32 {
         140. / self.dimensions.into_iter().fold(0., f32::max)
     }
@@ -117,23 +130,39 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
         .and_then(|x| x.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let (triangles, units) = if matches!(ext.as_str(), "step" | "stp") {
+    let ((triangles, cad), units) = if matches!(ext.as_str(), "step" | "stp") {
         (crate::step::load(path)?, "mm")
     } else {
         let b = fs::read(path).map_err(|e| e.to_string())?;
         match ext.as_str() {
-            "stl" => (stl(&b)?, "source units"),
+            "stl" => ((stl(&b)?, None), "source units"),
             "obj" => (
-                obj(std::str::from_utf8(&b).map_err(|_| "OBJ must be UTF-8 text")?)?,
+                (
+                    obj(std::str::from_utf8(&b).map_err(|_| "OBJ must be UTF-8 text")?)?,
+                    None,
+                ),
                 "source units",
             ),
-            "3mf" => (crate::three_mf::load(&b)?, "mm"),
+            "3mf" => ((crate::three_mf::load(&b)?, None), "mm"),
             _ => return Err("Choose STEP, STP, 3MF, STL or OBJ.".into()),
         }
     };
-    let mut mesh = normalize(triangles)?;
+    let mut mesh = normalize_faces(triangles, cad.as_deref())?;
     mesh.units = units;
     Ok(mesh)
+}
+/// The CAD face of each triangle of a binary STL, as the STEP reader
+/// writes it in each triangle's attribute word (counted from 1); None for an
+/// ASCII STL, or where any triangle has none.
+pub(crate) fn stl_faces(b: &[u8]) -> Option<Vec<u32>> {
+    let n = u32::from_le_bytes(b.get(80..84)?.try_into().ok()?) as usize;
+    if 84usize.checked_add(n.checked_mul(50)?) != Some(b.len()) {
+        return None;
+    }
+    let faces: Vec<u32> = (b[84..].as_chunks::<50>().0.iter())
+        .map(|chunk| u16::from_le_bytes([chunk[48], chunk[49]]) as u32)
+        .collect();
+    (!faces.is_empty() && faces.iter().all(|f| *f > 0)).then_some(faces)
 }
 pub(crate) fn stl(b: &[u8]) -> Result<Vec<[[f32; 3]; 3]>, String> {
     if b.len() >= 84 {
@@ -231,7 +260,16 @@ fn obj(text: &str) -> Result<Vec<[[f32; 3]; 3]>, String> {
     }
     Ok(out)
 }
+#[cfg(test)]
 pub(crate) fn normalize(tris: Vec<[[f32; 3]; 3]>) -> Result<Mesh, String> {
+    normalize_faces(tris, None)
+}
+/// `normalize`, with the CAD face of each triangle where the importer knew
+/// it: the smooth faces a click picks whole are then the CAD faces.
+pub(crate) fn normalize_faces(
+    tris: Vec<[[f32; 3]; 3]>,
+    cad: Option<&[u32]>,
+) -> Result<Mesh, String> {
     if tris.is_empty() {
         return Err("No mesh triangles were found.".into());
     }
@@ -285,9 +323,11 @@ pub(crate) fn normalize(tris: Vec<[[f32; 3]; 3]>) -> Result<Mesh, String> {
         })
         .collect();
     let surfaces = crate::surface::group(&mut faces);
+    let regions = crate::surface::regions(&faces, surfaces.len(), cad);
     Ok(Mesh {
         faces,
         surfaces,
+        regions,
         fingerprint: format!("{:x}", fingerprint.finalize()),
         dimensions,
         triangles: tris.len(),
@@ -322,6 +362,7 @@ pub fn sample() -> Mesh {
     Mesh {
         faces,
         surfaces: vec![],
+        regions: vec![],
         fingerprint: String::new(),
         dimensions: [140., 94., 28.],
         triangles: 0,

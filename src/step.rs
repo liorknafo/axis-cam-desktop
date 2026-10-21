@@ -101,8 +101,12 @@ fn poll(running: &Running, pid: u32) -> Poll {
     }
 }
 
-pub fn load(path: &Path) -> Result<Vec<[[f32; 3]; 3]>, String> {
-    convert(&RUNNING, &helper()?, path, TIMEOUT)
+/// The part's triangles, and the CAD face of each where the reader wrote
+/// them (`mesh::stl_faces`).
+pub type Faces = (Vec<[[f32; 3]; 3]>, Option<Vec<u32>>);
+pub fn load(path: &Path) -> Result<Faces, String> {
+    let bytes = convert(&RUNNING, &helper()?, path, TIMEOUT)?;
+    Ok((super::mesh::stl(&bytes)?, super::mesh::stl_faces(&bytes)))
 }
 
 // Split from `load` so a test can run a stand-in converter under a short timeout,
@@ -112,7 +116,7 @@ fn convert(
     helper: &Path,
     path: &Path,
     timeout: Duration,
-) -> Result<Vec<[[f32; 3]; 3]>, String> {
+) -> Result<Vec<u8>, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let bundled = executable.components().any(|p| p.as_os_str() == "Contents");
     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -165,8 +169,7 @@ fn convert(
             }
         ));
     }
-    let bytes = fs::read(result).map_err(|e| format!("STEP preview missing: {e}"))?;
-    super::mesh::stl(&bytes)
+    fs::read(result).map_err(|e| format!("STEP preview missing: {e}"))
 }
 
 #[cfg(all(test, unix))]
@@ -189,7 +192,8 @@ mod tests {
         let path = dir.path().join("converter.sh");
         fs::write(&path, script).unwrap();
         let start = Instant::now();
-        let result = convert(running, Path::new("/bin/sh"), &path, timeout);
+        let result = convert(running, Path::new("/bin/sh"), &path, timeout)
+            .and_then(|bytes| super::super::mesh::stl(&bytes));
         (result, start.elapsed())
     }
 
