@@ -1408,7 +1408,7 @@ pub fn command(m: &Message, label: String) -> Help {
             "Relative stock extends from each side of the placed part by its offset; fixed stock uses explicit dimensions. The box and part share the same display scale.",
         ),
         ToggleUncut => (
-            "Show or hide the faces of the part that the stock still covers after every setup, in magenta. With the simulated stock shown, just those faces are drawn over it, where the stock surface does not hide them. A selected one keeps its magenta and gets a blue outline. Off, the part is drawn as it is without them.",
+            "Show or hide the faces of the part that the stock still covers after every setup, in magenta. With the simulated stock shown, just those faces are drawn over it, where the stock surface does not hide them. A selected one is striped blue and magenta. Off, the part is drawn as it is without them.",
             "",
         ),
         TogglePaths => (

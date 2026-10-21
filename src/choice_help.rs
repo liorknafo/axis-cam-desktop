@@ -564,7 +564,7 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
             "",
         ),
         ("uncut_visibility", "Shown") => (
-            "The faces of the part that the stock still covers after every setup are magenta. With the simulated stock shown, they are drawn over it wherever its surface does not hide them. A selected one keeps its magenta and gets a blue outline.",
+            "The faces of the part that the stock still covers after every setup are magenta. With the simulated stock shown, they are drawn over it wherever its surface does not hide them. A selected one is striped blue and magenta.",
             "",
         ),
         ("uncut_visibility", "Hidden") => (
