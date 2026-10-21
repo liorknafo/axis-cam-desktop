@@ -15,7 +15,8 @@ use iced::{
     Point, Rectangle, Theme, mouse,
     widget::{
         self, Action, Column, Row, button, canvas, checkbox, column, container, mouse_area,
-        pick_list, row, rule, scrollable, slider, space, svg, text, text::Wrapping, text_input,
+        pick_list, responsive, row, rule, scrollable, slider, space, svg, text, text::Wrapping,
+        text_input,
     },
 };
 pub(crate) const INK: Color = Color::from_rgb(0.13, 0.20, 0.28);
@@ -2013,10 +2014,29 @@ pub(crate) fn pin_aim(app: &App) -> viewport::PinAim {
 }
 /// The 3D view of the active setup, as MANUFACTURE shows it: the part,
 /// stock, workholding, the preview and the machine's tool while a tool run of
-/// the setup cuts. None without a part to show.
-fn scene(app: &App) -> Option<Element<'_, Message>> {
-    let canvas: Element<viewport::Event> = scene_viewport(app)?.view(Fill);
+/// the setup cuts, its camera fitting the scene in `frame` (`Viewport::frame`).
+/// None without a part to show.
+fn scene(app: &App, frame: Option<f32>) -> Option<Element<'_, Message>> {
+    let view = Viewport {
+        frame,
+        ..scene_viewport(app)?
+    };
+    let canvas: Element<viewport::Event> = view.view(Fill);
     Some(canvas.map(Message::Viewport))
+}
+/// The room (logical pixels) the toolbar and the simulation strip under the
+/// 3D view take at their tallest as a rule: the strip playing a preview,
+/// with its check (some 220), and the toolbar with the uncut faces' lines
+/// (100 to 130). The camera
+/// fits the scene in the rest (`scene_frame`).
+const PANELS: f32 = 320.;
+/// How high the frame the 3D view's camera fits the scene in is, when the
+/// view, its toolbar and the simulation strip share `height`: all of it but
+/// `PANELS`, and at least half. It does not depend on how tall the panels
+/// are now, so switching operations or leaving a simulation, which changes
+/// them, does not move the view.
+pub(crate) fn scene_frame(height: f32) -> f32 {
+    (height - PANELS).max(height * 0.5)
 }
 /// The 3D view `scene` shows. None without a part to show.
 pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
@@ -2040,14 +2060,17 @@ pub(crate) fn scene_viewport(app: &App) -> Option<Viewport<'_>> {
             None
         },
         holding: holding_boxes(app),
+        framed: framed_holding(app),
         leftover: leftover_view(app),
         live: app.live_tool(),
         live_stock: app.live_stock(),
+        start_stock: app.start_stock(),
         uncut: shown_uncut(app)
             .and_then(|(found, _)| found.as_ref().ok())
             .map(|found| found.faces.as_slice())
             .unwrap_or(&[]),
         show_uncut: app.show_uncut,
+        frame: None,
     })
 }
 fn workspace(app: &App) -> Element<'_, Message> {
@@ -2089,9 +2112,50 @@ fn workspace(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     )
     .padding([12, 14]);
-    let scene = scene(app).unwrap_or_else(|| {
-        container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
+    // The view, its toolbar and the simulation strip share what is left;
+    // the camera's frame is worked out from all of it (`scene_frame`).
+    let middle = responsive(move |size| {
+        let (toolbar, simulation) = scene_panels(app);
+        let scene = scene(app, Some(scene_frame(size.height))).unwrap_or_else(|| no_scene(app));
+        column![scene, toolbar, simulation].into()
     });
+    // A UC100 machine takes no G-code file: its setups run from MACHINE.
+    let uc100 =
+        (app.doc.active_setup()).is_some_and(|s| get(&s.machine.p, "controller") == "UC100");
+    let workflow = container(
+        row![
+            btn("01  Setup", Message::SetupEditor, app.selected.is_none()),
+            btn(
+                "02  Operations",
+                Message::OperationsStep,
+                app.selected.is_some()
+            ),
+            btn("03  Preview", Message::PreviewStep, false),
+            btn(
+                if uc100 {
+                    "04  Review & run"
+                } else {
+                    "04  NC review"
+                },
+                Message::Page(Page::Post),
+                false
+            )
+        ]
+        .spacing(2),
+    )
+    .padding([5, 8])
+    .style(panel_style);
+    column![heading, middle, workflow]
+        .height(Fill)
+        .width(Fill)
+        .into()
+}
+/// What the workspace shows in place of the 3D view without a part.
+fn no_scene(app: &App) -> Element<'_, Message> {
+    container(column![bold(if app.import_busy { "Loading geometry…" } else if !app.doc.has_model() { "Import your part" } else { "Model preview unavailable" },25),muted(app.doc.file.as_ref().map(|f|f.name.clone()).unwrap_or_default()),note(app.import_error.clone().unwrap_or_else(|| "Import STEP, STP, 3MF, STL or OBJ to view your model. Geometry loads in the background; a STEP conversion may take up to two minutes.".into())),primary("Import model",Message::Import),secondary("Start screen",Message::Page(Page::Home))].spacing(20).max_width(380)).center(Fill).into()
+}
+/// The 3D view's toolbar and the simulation strip under it.
+fn scene_panels(app: &App) -> (Element<'_, Message>, Element<'_, Message>) {
     let detail = if app.is_sample() {
         "Sample housing · selectable demo geometry".to_string()
     } else if let Some(m) = &app.imported_mesh {
@@ -2290,36 +2354,7 @@ fn workspace(app: &App) -> Element<'_, Message> {
         playback = playback.push(empty);
     }
     let simulation = container(playback).padding([12, 16]).style(panel_style);
-    // A UC100 machine takes no G-code file: its setups run from MACHINE.
-    let uc100 =
-        (app.doc.active_setup()).is_some_and(|s| get(&s.machine.p, "controller") == "UC100");
-    let workflow = container(
-        row![
-            btn("01  Setup", Message::SetupEditor, app.selected.is_none()),
-            btn(
-                "02  Operations",
-                Message::OperationsStep,
-                app.selected.is_some()
-            ),
-            btn("03  Preview", Message::PreviewStep, false),
-            btn(
-                if uc100 {
-                    "04  Review & run"
-                } else {
-                    "04  NC review"
-                },
-                Message::Page(Page::Post),
-                false
-            )
-        ]
-        .spacing(2),
-    )
-    .padding([5, 8])
-    .style(panel_style);
-    column![heading, scene, toolbar, simulation, workflow]
-        .height(Fill)
-        .width(Fill)
-        .into()
+    (toolbar.into(), simulation.into())
 }
 /// How long the stock mesher works before the strip says so: Play meshes
 /// the stock again for each frame, mostly in well under this.
@@ -4844,16 +4879,42 @@ pub(crate) fn holding_boxes(app: &App) -> Vec<crate::holding::HoldBox> {
             .active_simulation()
             .map(|sim| sim.plan.stock)
             .or_else(|| app.known_stock(app.doc.index()).0)?;
-        let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
-            let jaws = app.doc.holding_boxes(setup, held_of(app, stock));
-            crate::holding::shown(&jaws.unwrap_or_default(), stock)
-        } else {
-            vec![]
-        };
-        boxes.extend(pin_boxes(app, setup, stock));
-        Some(boxes)
+        Some(holding_on(app, setup, stock, held_of(app, stock)))
     };
     boxes().unwrap_or_default()
+}
+/// The jaws or clamps the 3D view's camera fits: the active setup's round
+/// its own stock (`Document::setup_stock`), gripping all of it, whether they
+/// are drawn or not. So neither the Stock toggle, a simulation nor the box
+/// the earlier setups leave, once worked out, moves the view.
+pub(crate) fn framed_holding(app: &App) -> Vec<crate::holding::HoldBox> {
+    let si = app.doc.index();
+    match (
+        app.doc.active_setup(),
+        app.doc.setup_stock(si, app.part_mesh()),
+    ) {
+        (Some(setup), Some(stock)) => {
+            holding_on(app, setup, stock, crate::holding::Gripped::whole(stock))
+        }
+        _ => vec![],
+    }
+}
+/// `setup`'s jaws or clamps round `stock`, a vise's closed on `held`, from
+/// the stock's bottom up (`holding::shown`), and the pins it sits on.
+fn holding_on(
+    app: &App,
+    setup: &Setup,
+    stock: crate::mesh::Bounds,
+    held: crate::holding::Gripped,
+) -> Vec<crate::holding::HoldBox> {
+    let mut boxes = if matches!(get(&setup.p, "holding"), "Vise" | "Clamps") {
+        let jaws = app.doc.holding_boxes(setup, held);
+        crate::holding::shown(&jaws.unwrap_or_default(), stock)
+    } else {
+        vec![]
+    };
+    boxes.extend(pin_boxes(app, setup, stock));
+    boxes
 }
 /// The fixture pins `setup` sits on, standing under `stock`, the box it
 /// starts from (`holding::pin_boxes`): drawn with its jaws or clamps,
@@ -6126,7 +6187,7 @@ fn control(app: &App) -> Element<'_, Message> {
                 .get(r.setup)
                 .is_some_and(|x| x.id == app.doc.active)
         })
-        .and_then(|_| scene(app))
+        .and_then(|_| scene(app, None))
         .map(|view| {
             machine_panel(
                 "Job",
@@ -9107,11 +9168,14 @@ fn plan_preview<'a>(app: &'a App, preview: &'a crate::PlanPreview) -> Element<'a
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         }
         .view(380);
         c = c

@@ -360,6 +360,14 @@ pub enum Message {
         seconds: f32,
         result: Result<std::sync::Arc<stock_surface::SurfaceMesh>, String>,
     },
+    /// The stock the selected operation starts from, meshed off the window's
+    /// thread (`App::refresh_start_mesh`): its key, the job's stock it was
+    /// cut from and the surface, or why it could not be meshed.
+    StartMeshed {
+        key: StartKey,
+        volume: std::sync::Arc<volume::Volume>,
+        result: Result<std::sync::Arc<stock_surface::SurfaceMesh>, String>,
+    },
     Tick,
     Plan,
     /// The text of the planner chat's box changes.
@@ -510,6 +518,12 @@ pub struct ClampsDraft {
     pub over: String,
 }
 type StockMeshKey = (String, u64, u64, stock_surface::Detail);
+/// What the stock an operation starts from is meshed for: the fingerprint
+/// of what that stock depends on (`op_fingerprint`), the setup and the
+/// operation (by index) and the detail.
+type StartKey = (u64, usize, usize, stock_surface::Detail);
+/// How many of those the app keeps meshed (`App::start_mesh`).
+const START_MESHES: usize = 8;
 /// A heading and the lines of the box the inspector shows.
 pub type HoldingNote = Option<(String, Vec<String>)>;
 /// What the status of a generated preview ends with on a CNC machine, and on
@@ -547,6 +561,17 @@ pub struct LeftStock {
     /// (`uncut::uncut`), or why that is not checked: no operation has cut
     /// yet, or one could not be generated. None until worked out.
     pub uncut: Option<Result<std::sync::Arc<uncut::Uncut>, String>>,
+    /// The stock the job leaves, cells and cuts, as far as every operation
+    /// worked: up to the one that failed (`broken`). Each cut says which
+    /// operation made it, so the stock any operation up to that one starts
+    /// from is its cuts made before it (`App::start_source`). None where
+    /// nothing was cut.
+    pub job: Option<std::sync::Arc<volume::Volume>>,
+    /// The first operation that could not be generated, by setup and index.
+    pub broken: Option<(usize, usize)>,
+    /// The `op_fingerprint` of each operation of each setup when this was
+    /// worked out: the stock it starts from stays good while it is the same.
+    pub ops: Vec<Vec<u64>>,
     /// The `start_fingerprint` of each setup when this was worked out: a
     /// setup's box and `before` stay good while it is unchanged, whatever
     /// the later setups and its own operations become.
@@ -666,6 +691,23 @@ fn start_fingerprint(doc: &Document, mesh: &mesh::Mesh, si: usize) -> Option<u64
     mesh.fingerprint.hash(&mut hasher);
     Some(hasher.finish())
 }
+/// A fingerprint of what the stock operation `oi` of setup `si` of `doc`
+/// starts from depends on: what the setup's does (`start_fingerprint`) and
+/// the operations before it in the setup, but not it or those after it.
+/// None when it cannot be written.
+pub(crate) fn op_fingerprint(
+    doc: &Document,
+    mesh: &mesh::Mesh,
+    si: usize,
+    oi: usize,
+) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    start_fingerprint(doc, mesh, si)?.hash(&mut hasher);
+    let before = doc.setups.get(si)?.operations.get(..oi)?;
+    serde_json::to_writer(HashWriter(&mut hasher), before).ok()?;
+    Some(hasher.finish())
+}
 /// A fingerprint of what the band setup `si`'s vise closes on depends on
 /// (`holding::held_by`): the stock it starts from (`start`, its
 /// `start_fingerprint`), how it is held and the workholding library. None
@@ -750,14 +792,15 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         },
     );
     let after = after.into_inner();
-    let uncut = Some(match (broken, last.into_inner()) {
+    let job = last.into_inner();
+    let uncut = Some(match (broken, &job) {
         (Some((si, oi)), _) => Err(format!(
             "{} / {} could not be generated.",
             doc.setups[si].name(),
             doc.setups[si].operations[oi].name()
         )),
         (None, None) => Err("No operation has cut the stock yet.".into()),
-        (None, Some(stock)) => Ok(Arc::new(uncut::uncut(&stock, &doc.setups[0], mesh))),
+        (None, Some(stock)) => Ok(Arc::new(uncut::uncut(stock, &doc.setups[0], mesh))),
     });
     // A setup starts from the very stock the one before it leaves: each is
     // meshed once. ponytail: in the run the holding checks wait for; a run
@@ -780,6 +823,15 @@ fn leftover_stock(doc: &Document, mesh: &mesh::Mesh, key: u64) -> LeftStock {
         surfaces,
         bites,
         uncut,
+        job,
+        broken,
+        ops: (doc.setups.iter().enumerate())
+            .map(|(si, s)| {
+                (0..s.operations.len())
+                    .map(|oi| op_fingerprint(doc, mesh, si, oi).unwrap_or_default())
+                    .collect()
+            })
+            .collect(),
         starts: (0..doc.setups.len())
             .map(|si| start_fingerprint(doc, mesh, si).unwrap_or_default())
             .collect(),
@@ -1039,6 +1091,18 @@ pub struct App {
     /// (`ui::STOCK_NOTICE_AFTER`): the next one is named at once.
     stock_mesh_slow: bool,
     stock_mesh_failed: Option<StockMeshKey>,
+    /// The stock the operations last selected start from, meshed
+    /// (`refresh_start_mesh`): each one's key, the job's stock and the
+    /// surface, the latest last. A few are kept, so that going back to an
+    /// operation shows it at once.
+    start_mesh: Vec<(
+        StartKey,
+        std::sync::Arc<volume::Volume>,
+        std::sync::Arc<stock_surface::SurfaceMesh>,
+    )>,
+    /// The key of the one being meshed, and of the last that could not be.
+    start_mesh_job: Option<StartKey>,
+    start_mesh_failed: Option<StartKey>,
     pub progress: f32,
     pub speed: f32,
     pub last_tick: Instant,
@@ -1635,6 +1699,9 @@ impl App {
             stock_mesh_started: None,
             stock_mesh_slow: false,
             stock_mesh_failed: None,
+            start_mesh: vec![],
+            start_mesh_job: None,
+            start_mesh_failed: None,
             progress: 0.,
             speed: 1.,
             last_tick: Instant::now(),
@@ -2564,6 +2631,78 @@ impl App {
             |(key, seconds, result)| Message::StockMeshed {
                 key,
                 seconds,
+                result,
+            },
+        )
+    }
+    /// What the stock the selected operation starts from is, when the job
+    /// was worked out (`left_stock`) with the setups and operations before it
+    /// as they are now: its key, the job's stock and the setup and operation
+    /// whose cuts and later ones are not made yet. None for the example, on
+    /// another page than MANUFACTURE's, without a selected operation, while
+    /// that is not worked out, after an operation that failed and when
+    /// nothing is cut before it, where the setup's own stock is all there is.
+    pub(crate) fn start_source(
+        &self,
+    ) -> Option<(StartKey, std::sync::Arc<volume::Volume>, (u16, u16))> {
+        if self.page != Page::Work || self.is_sample() {
+            return None;
+        }
+        let (si, oi) = (self.doc.index(), self.selected?);
+        let left = &self.left_stock;
+        let key = op_fingerprint(&self.doc, self.part_mesh()?, si, oi)?;
+        if left.ops.get(si)?.get(oi) != Some(&key) || left.broken.is_some_and(|b| b < (si, oi)) {
+            return None;
+        }
+        let job = left.job.clone()?;
+        let before = (u16::try_from(si).ok()?, u16::try_from(oi).ok()?);
+        job.cuts.iter().any(|c| c.source < before).then_some(())?;
+        Some(((key, si, oi, self.stock_detail), job, before))
+    }
+    /// The stock the selected operation starts from for the 3D view, once
+    /// meshed (`refresh_start_mesh`): the job's stock and the surface.
+    pub fn start_stock(&self) -> Option<(&volume::Volume, &stock_surface::SurfaceMesh)> {
+        let (key, ..) = self.start_source()?;
+        let (_, volume, surface) = self.start_mesh.iter().find(|(k, ..)| *k == key)?;
+        Some((volume.as_ref(), surface.as_ref()))
+    }
+    /// Meshes the stock the selected operation starts from (`start_source`)
+    /// off the window's thread, at the simulation's detail, when it is not
+    /// yet (in line in the smoke run): the job's stock with only the cuts of
+    /// the operations before it.
+    pub(crate) fn refresh_start_mesh(&mut self) -> Task<Message> {
+        let Some((key, volume, before)) = self.start_source() else {
+            return Task::none();
+        };
+        if self.start_mesh.iter().any(|(k, ..)| *k == key)
+            || self.start_mesh_job.is_some()
+            || self.start_mesh_failed == Some(key)
+            || self.locked()
+        {
+            return Task::none();
+        }
+        let mut snapshot = stock_surface::Snapshot::of(&volume, key.3);
+        let cuts = volume.cuts.iter().filter(|c| c.source < before);
+        snapshot.cuts = std::sync::Arc::new(cuts.cloned().collect());
+        let build = move || snapshot.build().map(std::sync::Arc::new);
+        if self.smoke_dir.is_some() {
+            return self.update(Message::StartMeshed {
+                key,
+                volume,
+                result: build(),
+            });
+        }
+        self.start_mesh_job = Some(key);
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking(build)
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Stock mesher failed: {e}")));
+                (key, volume, result)
+            },
+            |(key, volume, result)| Message::StartMeshed {
+                key,
+                volume,
                 result,
             },
         )
@@ -6021,6 +6160,28 @@ impl App {
                     }
                 }
             }
+            Message::StartMeshed {
+                key,
+                volume,
+                result,
+            } => {
+                if self.start_mesh_job == Some(key) {
+                    self.start_mesh_job = None;
+                }
+                match result {
+                    Ok(surface) => {
+                        self.start_mesh.retain(|(k, ..)| *k != key);
+                        if self.start_mesh.len() >= START_MESHES {
+                            self.start_mesh.remove(0);
+                        }
+                        self.start_mesh.push((key, volume, surface));
+                    }
+                    Err(e) => {
+                        self.status = e;
+                        self.start_mesh_failed = Some(key);
+                    }
+                }
+            }
             Message::HelpHover(on) => self.help_animating = on,
             Message::HelpMore(expanded) => self.pinned_expanded = expanded,
             Message::HelpPause(paused) => self.pinned_paused = paused,
@@ -6133,6 +6294,7 @@ impl App {
                     settled,
                     self.picture_run(),
                     self.refresh_stock_surface(),
+                    self.refresh_start_mesh(),
                     self.refresh_post(),
                     left,
                     recheck,
