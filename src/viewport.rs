@@ -215,6 +215,10 @@ pub struct Viewport<'a> {
     /// The jaws or clamps of the setup, in its frame in mm; drawn with the
     /// stock and part of the camera's fit.
     pub holding: Vec<crate::holding::HoldBox>,
+    /// The jaws or clamps the camera fits (`scene_bounds`), in the same frame
+    /// and units: the setup's round its own stock, drawn or not, so that
+    /// hiding them or a change of the box they hold does not move the view.
+    pub framed: Vec<crate::holding::HoldBox>,
     /// The box a later setup starts from, in its frame in mm, when the setup
     /// editor knows it (`App::known_stock`): drawn as the stock, and said in
     /// the label, where the setup's own box would be the original block's.
@@ -227,6 +231,16 @@ pub struct Viewport<'a> {
     /// coordinates (`run::Run::stock`) with its version: drawn instead of the
     /// setup's stock when no simulation is shown.
     pub live_stock: Option<(&'a crate::simulation::StockGrid, u64)>,
+    /// The stock the operation shown starts from, as the operations before
+    /// it in the job leave it (`App::start_stock`): the job's stock, for its
+    /// box and frame, and the surface of what is left of it then. Drawn
+    /// instead of the setup's stock when no simulation is shown, solid as
+    /// the simulation draws it, and see-through while the part is picked.
+    /// None while nothing is cut before the operation or it is not known.
+    pub start_stock: Option<(
+        &'a crate::volume::Volume,
+        &'a crate::stock_surface::SurfaceMesh,
+    )>,
     /// Per face of the part (`Mesh::faces`): whether the whole job still
     /// leaves it under stock (`uncut::Uncut::faces`); those are drawn in
     /// `UNCUT`. Empty when that is not known.
@@ -235,6 +249,13 @@ pub struct Viewport<'a> {
     /// With a simulation and the stock shown the part itself is not drawn, so
     /// then just these faces are, after the stock and depth-tested against it.
     pub show_uncut: bool,
+    /// How high (logical pixels) the frame the camera centres and fits the
+    /// scene in is, from the view's top (`ui::scene_frame`): the area the
+    /// view shares with the panels under it, less the room they take at
+    /// their tallest. A panel that grows or shrinks then covers or uncovers
+    /// the bottom of the view and the scene stays where it is on the
+    /// screen. None: the view's own height (pictures, tests).
+    pub frame: Option<f32>,
 }
 /// `camera` turned by `yaw` and `pitch` (radians), as a drag turns the
 /// view: the model follows the mouse, as in the machine view, and the pitch
@@ -373,15 +394,22 @@ impl Projector {
     }
 }
 impl Viewport<'_> {
+    /// The frame the camera centres and fits the scene in, for the view's
+    /// bounds `b`: as wide as the view, `frame` high from its top (its own
+    /// height without one).
+    fn framed_size(&self, b: Rectangle) -> (f32, f32) {
+        (b.width, self.frame.unwrap_or(b.height))
+    }
     fn projector(&self, b: Rectangle) -> Projector {
-        Projector::fit(self.camera, (b.width, b.height), self.scene_bounds())
+        Projector::fit(self.camera, self.framed_size(b), self.scene_bounds())
     }
     /// The point the view turns about: the part's nearest surface at the
     /// view's centre, so what is zoomed in on stays in view as it turns;
     /// where no surface is there, the point at the scene's centre's depth.
     fn pivot(&self, b: Rectangle) -> [f32; 3] {
         let p = self.projector(b);
-        let centre = Point::new(b.width * 0.5, b.height * 0.53);
+        let (width, height) = self.framed_size(b);
+        let centre = Point::new(width * 0.5, height * 0.53);
         let nearest = self
             .transformed()
             .iter()
@@ -394,12 +422,19 @@ impl Viewport<'_> {
             .reduce(f32::max);
         p.at_depth(centre, nearest.unwrap_or_else(|| p.depth(p.target)))
     }
-    /// What the camera must contain, in display units: the part, the stock,
-    /// the jaws or clamps and, when simulating, the stock and every move.
+    /// What the camera fits, in display units: the part, the setup's own
+    /// stock and the jaws or clamps round it (`framed`). The same with a
+    /// simulation or without, with the stock shown or hidden and before or
+    /// after the box a later setup starts from is known (which lies inside
+    /// its own), so none of them moves the view.
     pub(crate) fn scene_bounds(&self) -> crate::mesh::Bounds {
-        let mut boxes = self.scene_boxes().into_iter();
-        let mut bounds = boxes.next().expect("the part is always framed");
-        for b in boxes {
+        let mut bounds = Placement::new(self.mesh, self.setup).bounds;
+        let stock = (self.setup)
+            .and_then(|s| stock::resolve(s, Some(self.mesh)).ok())
+            .map(|s| s.stock.scaled(s.display_scale));
+        let scale = self.mesh.display_scale();
+        let holding = self.framed.iter().map(|hold| hold.bounds.scaled(scale));
+        for b in stock.into_iter().chain(holding) {
             for i in 0..3 {
                 bounds.min[i] = bounds.min[i].min(b.min[i]);
                 bounds.max[i] = bounds.max[i].max(b.max[i]);
@@ -446,9 +481,10 @@ impl Viewport<'_> {
             || self.leftover.is_some()
             || crate::model::get(&setup.p, "stock_source") == "fresh"
     }
-    /// `scene_bounds` box by box: the part's first, then the stock's, each
-    /// jaw's or clamp's and, when simulating, the simulated stock's and the
-    /// reach of every move's cutter. Pictures fit to their projected corners.
+    /// What a still picture fits to, box by box: the part's first, then the
+    /// stock's when shown, each jaw's or clamp's and, when simulating, the
+    /// simulated stock's and the reach of every move's cutter. Pictures fit
+    /// to their projected corners; the 3D view fits `scene_bounds`.
     pub(crate) fn scene_boxes(&self) -> Vec<crate::mesh::Bounds> {
         let mut boxes = vec![Placement::new(self.mesh, self.setup).bounds];
         if self.show_stock
@@ -775,11 +811,15 @@ impl Viewport<'_> {
             self.simulation.map(|s| (s.id.as_str(), s.revision))
         );
         format!(
-            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "{key}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             self.holding,
+            self.framed,
+            self.frame,
             self.leftover,
             self.live,
             self.live_stock.map(|(g, v)| (std::ptr::from_ref(g), v)),
+            self.start_stock
+                .map(|(_, surface)| std::ptr::from_ref(surface)),
             self.uncut.first().map(std::ptr::from_ref),
             self.uncut.len(),
             self.show_uncut
@@ -824,7 +864,12 @@ impl Viewport<'_> {
         // Remaining stock is the simulated solid. Do not overlay the finished
         // reference mesh on its coincident walls; Stock off reveals that model.
         // Only the faces still under stock are drawn then, after the stock.
-        let carved = self.simulation.is_none() && self.show_stock && self.live_stock.is_some();
+        // So is the stock a run carved, or the operation starts from, unless
+        // the part is being picked: then that stock is see-through.
+        let start = self.start_stock.filter(|_| self.setup.is_some());
+        let carved = self.simulation.is_none()
+            && self.show_stock
+            && (self.live_stock.is_some() || (start.is_some() && !self.picking));
         let behind_stock = (self.simulation.is_some() && self.show_stock) || carved;
         let faces = if behind_stock && !self.show_uncut {
             vec![]
@@ -963,7 +1008,15 @@ impl Viewport<'_> {
                     };
                     grid_faces(grid, &mut face);
                 }
-                (None, None) => {}
+                (None, None) => {
+                    if let (Some((volume, surface)), Some(setup)) = (start, self.setup) {
+                        let current = crate::volume::Frame::new(setup, self.mesh);
+                        let (triangles, colors) = self.carved(volume, surface, current, p, ratio);
+                        raster_triangles(&mut rgba, &mut depths, w, h, triangles.len(), |i| {
+                            (triangles[i], colors[i])
+                        });
+                    }
+                }
             }
             for (fi, face) in faces.iter().enumerate() {
                 if !behind_stock || self.uncut.get(fi) != Some(&true) {
@@ -985,6 +1038,12 @@ impl Viewport<'_> {
                     );
                 }
             }
+        } else if self.show_stock
+            && let (Some((volume, surface)), Some(setup)) = (start, self.setup)
+        {
+            let current = crate::volume::Frame::new(setup, self.mesh);
+            let (triangles, colors) = self.carved(volume, surface, current, p, ratio);
+            raster_ghost(&mut rgba, &depths, (w, h), &triangles, &colors);
         } else if self.show_stock
             && let Some(setup) = self.setup
             && self.stock_is_known(setup)
@@ -1122,6 +1181,32 @@ impl Viewport<'_> {
         }
         (rgba, depths)
     }
+    /// The triangles of `surface`, what is left of the stock `volume`, moved
+    /// to the setup's frame `current` and projected (each vertex once), and
+    /// the colour of each (once), as the view draws them.
+    fn carved(
+        &self,
+        volume: &crate::volume::Volume,
+        surface: &crate::stock_surface::SurfaceMesh,
+        current: crate::volume::Frame,
+        p: &Projector,
+        ratio: f32,
+    ) -> (Vec<Corners>, Vec<[u8; 4]>) {
+        let scale = self.mesh.display_scale();
+        let corners = on_every_core(&surface.vertices, |&v| {
+            let q = volume.frame.transfer(v, current);
+            let v = q.map(|n| n * scale);
+            let pt = p.p(v);
+            (q, (Point::new(pt.x * ratio, pt.y * ratio), p.depth(v)))
+        });
+        let colors = on_every_core(&surface.triangles, |t| {
+            stock_color(volume, surface, t, t.map(|i| corners[i].0))
+        });
+        let triangles = (surface.triangles.iter())
+            .map(|t| t.map(|v| corners[v].1))
+            .collect();
+        (triangles, colors)
+    }
     #[allow(clippy::too_many_arguments)]
     fn raster_simulation(
         &self,
@@ -1143,17 +1228,9 @@ impl Viewport<'_> {
             && let (Some(volume), Some(current)) = (&sim.volume, sim.frame)
             && let Some(surface) = &sim.stock_surface
         {
-            // Each vertex moved to the setup's frame and projected once, each
-            // triangle coloured once, then drawn.
-            let corners = on_every_core(&surface.vertices, |&v| {
-                let q = volume.frame.transfer(v, current);
-                (q, project(q))
-            });
-            let colors = on_every_core(&surface.triangles, |t| {
-                stock_color(volume, surface, t, t.map(|i| corners[i].0))
-            });
-            raster_triangles(rgba, depths, w, h, surface.triangles.len(), |i| {
-                (surface.triangles[i].map(|v| corners[v].1), colors[i])
+            let (triangles, colors) = self.carved(volume, surface, current, p, ratio);
+            raster_triangles(rgba, depths, w, h, triangles.len(), |i| {
+                (triangles[i], colors[i])
             });
         }
         let mut face = |points: &[[f32; 3]], color: [u8; 4]| {
@@ -1651,7 +1728,7 @@ impl canvas::Program<Event> for Viewport<'_> {
                                     let (pivot, camera) = state
                                         .pivot
                                         .get_or_insert_with(|| (self.pivot(bounds), self.camera));
-                                    let size = (bounds.width, bounds.height);
+                                    let size = self.framed_size(bounds);
                                     let scene = self.scene_bounds();
                                     let before = Projector::fit(*camera, size, scene).p(*pivot);
                                     let mut turned = orbited(*camera, yaw, pitch);
@@ -1708,10 +1785,11 @@ impl canvas::Program<Event> for Viewport<'_> {
                     mouse::ScrollDelta::Pixels { y, .. } => *y * 0.004,
                 };
                 // From the view's centre as `Projector::new` puts it.
+                let (width, height) = self.framed_size(bounds);
                 let at = cursor.position_in(bounds).map_or([0., 0.], |p| {
                     [
-                        p.x - (bounds.width * 0.5 + self.camera.pan[0]),
-                        p.y - (bounds.height * 0.53 + self.camera.pan[1]),
+                        p.x - (width * 0.5 + self.camera.pan[0]),
+                        p.y - (height * 0.53 + self.camera.pan[1]),
                     ]
                 });
                 return Some(Action::publish(Event::Zoom(dy, at)).and_capture());
@@ -2451,6 +2529,34 @@ fn raster_solid(
         }
     }
 }
+/// The projected `triangles` of a stock's surface, each in its colour in
+/// `colors`, laid see-through over `pixels` as the stock's box is: only the
+/// nearest surface, where it is not behind the part (`part_depth`), lighter
+/// over the part than over empty space.
+fn raster_ghost(
+    pixels: &mut [u8],
+    part_depth: &[f32],
+    (w, h): (u32, u32),
+    triangles: &[Corners],
+    colors: &[[u8; 4]],
+) {
+    let mut near = vec![0u8; (w * h * 4) as usize];
+    let mut depths = vec![f32::NEG_INFINITY; (w * h) as usize];
+    raster_triangles(&mut near, &mut depths, w, h, triangles.len(), |i| {
+        (triangles[i], colors[i])
+    });
+    for (index, z) in depths.iter().enumerate() {
+        if z.is_finite() && *z >= part_depth[index] - 0.001 {
+            let alpha = if part_depth[index].is_finite() {
+                STOCK.behind
+            } else {
+                STOCK.open
+            };
+            let tint = [near[index * 4], near[index * 4 + 1], near[index * 4 + 2]];
+            alpha_over(&mut pixels[index * 4..index * 4 + 4], tint, alpha);
+        }
+    }
+}
 fn raster_triangle(
     pixels: &mut [u8],
     depths: &mut [f32],
@@ -2461,9 +2567,10 @@ fn raster_triangle(
 ) {
     raster_rows(pixels, depths, w, 0..h, vertices, color);
 }
-/// A triangle projected to the frame (its corners' pixels and depths), and
-/// its colour.
-type Projected = ([(Point, f32); 3], [u8; 4]);
+/// A triangle's corners projected to the frame: their pixels and depths.
+type Corners = [(Point, f32); 3];
+/// A triangle projected to the frame, and its colour.
+type Projected = (Corners, [u8; 4]);
 /// `triangles` drawn as `raster_triangle` draws each in turn, on every core:
 /// each draws a band of rows, taking the triangles in the same order, so the
 /// pixels are the same.
@@ -2937,11 +3044,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -3008,11 +3118,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &all,
             show_uncut: true,
+            frame: None,
         };
         let size = (300, 200);
         // The part is not drawn over the simulated stock, but its faces still
@@ -3041,6 +3154,171 @@ mod tests {
         };
         assert_eq!(magenta(&none, size), 0);
     }
+    /// Leaving a simulation, or showing or hiding the stock, does not move
+    /// the view: the camera fits the same scene, not the cutter's reach.
+    #[test]
+    fn the_view_stays_put_with_a_simulation_and_without() {
+        let (doc, mesh, report) = crate::proposal::tests::block();
+        let good = crate::proposal::tests::good(&report);
+        let job = crate::proposal::build(&doc, &mesh, &report, &good).unwrap();
+        let sim =
+            crate::planner::view_after(&job, &mesh, 0, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        let view = |simulation, show_stock| Viewport {
+            setup: job.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation,
+            sample: false,
+            camera: Camera {
+                zoom: 3.,
+                pan: [40., -25.],
+                ..Camera::default()
+            },
+            picking: false,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            framed: vec![],
+            leftover: None,
+            live: None,
+            live_stock: None,
+            start_stock: None,
+            uncut: &[],
+            show_uncut: true,
+            frame: None,
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 900.,
+            height: 600.,
+        };
+        let corner = Placement::new(&mesh, job.setups.first()).bounds.max;
+        let seen = |v: Viewport| {
+            let p = v.projector(bounds);
+            (p.p(corner), p.scale)
+        };
+        let regular = seen(view(None, true));
+        assert_eq!(seen(view(Some(&sim), true)), regular);
+        assert_eq!(seen(view(None, false)), regular);
+        assert_eq!(seen(view(Some(&sim), false)), regular);
+        // The panels under the view grow or shrink with the operation and
+        // the simulation, and the view's height with them; in the same
+        // frame the scene stays where it is, and so does what the wheel
+        // zooms toward and the drag turns about.
+        let framed = |height: f32| {
+            let v = Viewport {
+                frame: Some(450.),
+                ..view(Some(&sim), true)
+            };
+            let b = Rectangle { height, ..bounds };
+            let p = v.projector(b);
+            (p.p(corner), p.scale, v.pivot(b))
+        };
+        assert_eq!(framed(600.), framed(380.));
+        assert_eq!(framed(600.), framed(520.));
+        // Drawn again in another frame, or round other jaws.
+        let key = |frame, framed| {
+            Viewport {
+                frame,
+                framed,
+                ..view(None, true)
+            }
+            .raster_key(bounds, None)
+        };
+        assert_ne!(key(Some(450.), vec![]), key(Some(400.), vec![]));
+        assert_ne!(key(None, vec![]), key(Some(450.), vec![]));
+        let jaw = crate::holding::HoldBox {
+            label: "jaw".into(),
+            bounds: Placement::new(&mesh, job.setups.first()).bounds,
+        };
+        assert_ne!(key(None, vec![]), key(None, vec![jaw]));
+    }
+    /// Without a simulation the view shows the stock the operation starts
+    /// from as the operations before it leave it: solid, as the simulation
+    /// draws it, in place of the setup's box; see-through over the part
+    /// while the part is picked.
+    #[test]
+    fn the_stock_an_operation_starts_from_is_drawn_without_a_simulation() {
+        let (doc, mesh, report) = crate::proposal::tests::block();
+        let good = crate::proposal::tests::good(&report);
+        let job = crate::proposal::build(&doc, &mesh, &report, &good).unwrap();
+        let sim =
+            crate::planner::view_after(&job, &mesh, 0, 0, crate::stock_surface::Detail::Draft)
+                .unwrap();
+        let (volume, surface) = (sim.volume.as_ref().unwrap(), sim.stock_surface.as_deref());
+        let start = Some((volume, surface.unwrap()));
+        let view = |simulation, start_stock, picking| Viewport {
+            setup: job.setups.first(),
+            operation: None,
+            mesh: &mesh,
+            simulation,
+            sample: false,
+            camera: Camera::default(),
+            picking,
+            pin_holes: Default::default(),
+            hole_outlines: vec![],
+            pin_aim: Default::default(),
+            show_stock: true,
+            show_paths: false,
+            progress: None,
+            holding: vec![],
+            framed: vec![],
+            leftover: None,
+            live: None,
+            live_stock: None,
+            start_stock,
+            uncut: &[],
+            show_uncut: true,
+            frame: None,
+        };
+        let bounds = Rectangle {
+            x: 0.,
+            y: 0.,
+            width: 300.,
+            height: 200.,
+        };
+        let pixels = |v: Viewport| {
+            let p = v.projector(bounds);
+            v.pixels(&p, bounds, None).2
+        };
+        // Drawn as the simulation draws its stock when it stands there: the
+        // same pixels but for the simulation's cutter.
+        let simulated = pixels(view(Some(&sim), None, false));
+        let differ = |a: &[u8], b: &[u8]| {
+            (a.chunks(4).zip(b.chunks(4)))
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let started = pixels(view(None, start, false));
+        let boxed = pixels(view(None, None, false));
+        let (near, far) = (differ(&started, &simulated), differ(&boxed, &simulated));
+        assert!(near * 10 < far, "{near} {far}");
+        // Picking: the part is drawn, under a see-through stock.
+        let picked = pixels(view(None, start, true));
+        assert_ne!(picked, simulated);
+        assert_ne!(picked, pixels(view(None, None, true)));
+        // Hidden with the stock switched off.
+        let off = Viewport {
+            show_stock: false,
+            ..view(None, start, false)
+        };
+        let bare = Viewport {
+            show_stock: false,
+            ..view(None, None, false)
+        };
+        assert_eq!(pixels(off), pixels(bare));
+        // A new surface is drawn again.
+        assert_ne!(
+            view(None, start, false).raster_key(bounds, None),
+            view(None, None, false).raster_key(bounds, None)
+        );
+    }
     /// Zoomed far in, turning the view keeps what is zoomed in on in place:
     /// it turns about the part's surface at the view's centre, not the
     /// scene's centre, which a 100× view would swing hundreds of pixels.
@@ -3063,11 +3341,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: false,
+            frame: None,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -3189,11 +3470,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &all,
             show_uncut: true,
+            frame: None,
         };
         let size = (300, 200);
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
@@ -3267,11 +3551,14 @@ mod tests {
                 show_paths: false,
                 progress: None,
                 holding: vec![],
+                framed: vec![],
                 leftover: None,
                 live: None,
                 live_stock: None,
+                start_stock: None,
                 uncut,
                 show_uncut: true,
+                frame: None,
             }
             .raster_key(bounds, None)
         };
@@ -3312,11 +3599,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let bounds = Rectangle {
             x: 0.,
@@ -3390,11 +3680,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let p = Projector::fit(view.camera, (300., 200.), view.scene_bounds());
         let tint = [92, 168, 223, 255];
@@ -3526,11 +3819,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(860., 540.));
         let reference = v.projector(b);
@@ -3622,11 +3918,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let p = v.projector(b);
@@ -3655,7 +3954,7 @@ mod tests {
         assert_ne!(v.pixels(&p, b, None).2, listed);
     }
     #[test]
-    fn the_camera_fit_contains_the_drawn_workholding() {
+    fn the_camera_fit_contains_the_workholding_drawn_or_not() {
         use crate::holding::HoldBox;
         let d = crate::model::Document::sample();
         let mesh = crate::mesh::sample();
@@ -3683,11 +3982,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 300.));
         let bounds = clamp.bounds;
@@ -3699,16 +4001,25 @@ mod tests {
         };
         let without = v.projector(b);
         assert!(!inside(&without));
-        v.holding = vec![clamp];
+        v.framed = vec![clamp.clone()];
         let with = v.projector(b);
         assert!(inside(&with));
         assert!(with.scale < without.scale);
-        // The list alone decides: the view passes none when the stock is hidden.
+        // Framed whether drawn or not: the view draws none with the stock
+        // hidden, and the camera stays where it is.
+        v.holding = vec![clamp];
+        let drawn = v.projector(b);
         v.show_stock = false;
-        let listed = v.projector(b);
         v.holding.clear();
-        let none = v.projector(b);
-        assert!(listed.scale < none.scale);
+        let hidden = v.projector(b);
+        assert_eq!(
+            (drawn.scale, drawn.p([0.; 3])),
+            (with.scale, with.p([0.; 3]))
+        );
+        assert_eq!(
+            (hidden.scale, hidden.p([0.; 3])),
+            (with.scale, with.p([0.; 3]))
+        );
     }
     #[test]
     fn camera_fit_contains_rotated_part_and_asymmetric_stock() {
@@ -3731,11 +4042,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(500., 240.));
         let p = v.projector(b);
@@ -3780,11 +4094,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let p = v.projector(b);
@@ -3827,11 +4144,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let point = Placement::new(&mesh, v.setup).transform(mesh.surfaces[1].center);
@@ -3888,11 +4208,14 @@ mod tests {
             show_paths: false,
             progress: None,
             holding: vec![],
+            framed: vec![],
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(800., 600.));
         let screen = |x: f32, y: f32| v.projector(b).p([x * scale, y * scale, at[2] * scale]);
@@ -4058,7 +4381,7 @@ mod tests {
         use crate::holding::HoldBox;
         let d = crate::model::Document::sample();
         let mesh = crate::mesh::sample();
-        let view = |holding| Viewport {
+        let view = |holding: Vec<HoldBox>| Viewport {
             setup: Some(d.setup()),
             operation: None,
             mesh: &mesh,
@@ -4076,12 +4399,15 @@ mod tests {
             show_stock: false,
             show_paths: false,
             progress: None,
+            framed: holding.clone(),
             holding,
             leftover: None,
             live: None,
             live_stock: None,
+            start_stock: None,
             uncut: &[],
             show_uncut: true,
+            frame: None,
         };
         let b = Rectangle::new(Point::ORIGIN, iced::Size::new(400., 300.));
         let hold = |min, max| HoldBox {
