@@ -47,6 +47,8 @@ pub struct RestStock {
     removal: Vec<Bounds>,
     /// The earlier lathe cuts about `current`'s Z axis (`coaxial`).
     coaxial: Coaxial,
+    /// Every earlier cut, of any shape, in its own frame (`bored`).
+    all: std::sync::Arc<Vec<Cut>>,
 }
 fn corners(b: Bounds) -> [[f32; 3]; 8] {
     std::array::from_fn(|mask| {
@@ -523,7 +525,49 @@ impl RestStock {
             cuts,
             removal: removal_boxes(volume, current),
             coaxial: coaxial(volume, current),
+            all: volume.cuts.clone(),
         }
+    }
+    /// Whether earlier cuts have emptied the upright cylinder of `radius`
+    /// round `centre` from `bottom` up to `top` (current frame, mm): a hole
+    /// drilled or milled there, that a tool as wide can go down. Its axis
+    /// and a ring of points round it, every quarter millimetre up, must
+    /// each be inside some cut's sweep or outside the stock.
+    pub fn bored(&self, centre: [f32; 2], radius: f32, top: f32, bottom: f32) -> bool {
+        let near = Bounds {
+            min: [centre[0] - radius, centre[1] - radius, bottom],
+            max: [centre[0] + radius, centre[1] + radius, top],
+        };
+        let overlaps = |b: &Bounds| (0..3).all(|k| b.min[k] <= near.max[k] && b.max[k] >= near.min[k]);
+        let cuts: Vec<&Cut> = self
+            .all
+            .iter()
+            .filter(|c| overlaps(&removal_box(c, self.current)))
+            .collect();
+        let rings = 8;
+        let levels = ((top - bottom) / 0.25).ceil().max(1.) as usize;
+        (0..=levels).all(|l| {
+            let z = bottom + (top - bottom) * l as f32 / levels as f32;
+            (0..=rings).all(|k| {
+                let p = if k == rings {
+                    [centre[0], centre[1], z]
+                } else {
+                    let a = k as f32 * std::f32::consts::TAU / rings as f32;
+                    [centre[0] + radius * a.cos(), centre[1] + radius * a.sin(), z]
+                };
+                !(0..3).all(|i| p[i] > self.whole.min[i] && p[i] < self.whole.max[i])
+                    || cuts.iter().any(|c| {
+                        crate::volume::swept(
+                            transfer(p, self.current, c.frame),
+                            c.a,
+                            c.b,
+                            c.radius,
+                            c.flute,
+                            c.shape,
+                        )
+                    })
+            })
+        })
     }
     /// What earlier lathe cuts left about the current frame's Z axis.
     pub fn coaxial(&self) -> &Coaxial {

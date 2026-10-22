@@ -497,7 +497,7 @@ impl Tool {
     /// tool lacks (a lathe tool's sizes); keys it already has are kept.
     pub fn set_type(&mut self, kind: &str) {
         self.p.insert("type".into(), kind.into());
-        for (k, v) in crate::lathe::tool_defaults(kind) {
+        for (k, v) in crate::lathe::tool_defaults(kind).iter().chain(mill_tool_defaults(kind)) {
             self.p.entry((*k).into()).or_insert_with(|| (*v).into());
         }
     }
@@ -526,7 +526,36 @@ impl Tool {
         if get(&self.p, "type") == "Chamfer mill" && self.tip_angle().is_none() {
             e.push("Enter a chamfer mill tip angle from 20° to 160°.".into())
         }
+        match get(&self.p, "type") {
+            "Thread mill" => {
+                if !num(&self.p, "thread_angle").is_some_and(|a| a == 55. || a == 60.) {
+                    e.push("Thread angle must be 55° or 60°.".into())
+                }
+                if self.thread_pitches().is_none() {
+                    e.push("Pitches must be a range of positive pitches, like 0.5-1.25.".into())
+                }
+                positive(&self.p, "reach", &mut e);
+                if num(&self.p, "reach") > num(&self.p, "stickout") {
+                    e.push("Reach (how deep the neck goes) cannot be more than the stickout.".into())
+                }
+            }
+            "Tap" => {
+                if crate::thread::spec(get(&self.p, "thread")).is_none() {
+                    e.push("Choose the tap's thread size.".into())
+                }
+                if !TAP_KINDS.contains(&get(&self.p, "tap_kind")) {
+                    e.push("Choose the tap's kind: spiral flute, spiral point or straight flute.".into())
+                }
+            }
+            _ => {}
+        }
         e
+    }
+    /// A tap's thread size.
+    pub fn tap_spec(&self) -> Option<&'static crate::thread::Spec> {
+        (get(&self.p, "type") == "Tap")
+            .then(|| crate::thread::spec(get(&self.p, "thread")))
+            .flatten()
     }
     /// What a lathe tool's keys must be, by type: a turning tool's `hand`,
     /// `nose_radius` (0 or more) and `lead_angle` (1–179°, 93 when not
@@ -634,15 +663,45 @@ pub const FACING_LINKS: [&str; 2] = ["Keep tool down", "Retract each pass"];
 pub const SPINDLE_ROTATIONS: [&str; 2] = ["Clockwise (CW)", "Counterclockwise (CCW)"];
 pub const FACING_MILLING: [&str; 2] = ["Climb", "Conventional"];
 pub const POCKET_ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
-/// A Drill operation's cycles. The last, `HELICAL_MILLING`, mills each hole
-/// with a flat end mill instead of drilling it.
-pub const DRILL_CYCLES: [&str; 5] = [
+/// A Drill operation's cycles. The first four drill; `HELICAL_MILLING`
+/// mills each hole with a flat end mill, `THREAD_MILLING` mills its thread
+/// with a thread mill (on a CNC), and `TAPPING` taps it by hand (on the
+/// manual mill or the lathe).
+pub const DRILL_CYCLES: [&str; 7] = [
     "Drilling",
     "Chip breaking",
     "Deep drilling",
     "Counterboring",
     HELICAL_MILLING,
+    THREAD_MILLING,
+    TAPPING,
 ];
+/// The Drill cycle that mills each hole's thread with a thread mill: down
+/// the drilled hole, in to the wall on an arc, one pitch up a turn.
+pub const THREAD_MILLING: &str = "Thread milling";
+/// The Drill cycle that taps each hole by hand, the machine's spindle (or
+/// the lathe's tailstock) holding the tap square.
+pub const TAPPING: &str = "Tapping";
+/// A Drill's `thread`, `thread_hand`: what the part's modeled thread says.
+pub const FROM_MODEL: &str = "From the model";
+/// A Drill's `thread_hand` choices.
+pub const THREAD_HANDS: [&str; 3] = [FROM_MODEL, "Right hand", "Left hand"];
+/// Thread milling is for a CNC: the manual mill moves one axis at a time.
+pub const THREAD_MILL_ON_HAND: &str = "Thread milling needs a CNC: it moves round the hole and up at once. Tap the hole by hand instead (Tapping).";
+/// The CNC does not tap: its spindle and feed are not synchronised.
+pub const TAP_ON_CNC: &str = "The CNC cannot tap: its spindle and feed are not synchronised. Mill the thread with a thread mill (Thread milling), or tap it by hand on the manual mill.";
+/// The mill tools with keys of their own beyond a mill's sizes, and those
+/// keys' starting values (`Tool::set_type`).
+pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)] {
+    match kind {
+        "Thread mill" => &[("thread_angle", "60"), ("pitches", "0.5-1.25"), ("reach", "12"), ("flutes", "4")],
+        "Tap" => &[("thread", "M6×1"), ("tap_kind", TAP_KINDS[0]), ("diameter", "6"), ("flutes", "3")],
+        _ => &[],
+    }
+}
+/// A tap's kind: which way its flutes send the chips, and so the holes it
+/// suits.
+pub const TAP_KINDS: [&str; 3] = ["Spiral flute", "Spiral point", "Straight flute"];
 /// The Drill cycle that mills each round hole with a flat end mill: down a
 /// helix to a flat bottom, in rings out to the hole's size when it is over
 /// twice the cutter's.
@@ -885,6 +944,15 @@ impl Operation {
         }
         if s == Strategy::Drill {
             p.insert("through".into(), "No".into());
+            for (k, v) in [
+                ("thread", FROM_MODEL),
+                ("thread_hand", FROM_MODEL),
+                ("thread_depth", ""),
+                ("thread_passes", "2"),
+                ("spring_pass", "Yes"),
+            ] {
+                p.insert(k.into(), v.into());
+            }
         }
         if s == Strategy::Parallel {
             p.insert("surface_stepover".into(), "1".into());
@@ -993,6 +1061,22 @@ impl Operation {
         self.strategy == Strategy::Drill
             && get(&self.p, "cycle") == HELICAL_MILLING
             && !self.drills_pin_holes()
+    }
+    /// A Drill operation that mills its holes' threads (`THREAD_MILLING`).
+    pub fn thread_milling(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == THREAD_MILLING
+            && !self.drills_pin_holes()
+    }
+    /// A Drill operation that taps its holes by hand (`TAPPING`).
+    pub fn tapping(&self) -> bool {
+        self.strategy == Strategy::Drill
+            && get(&self.p, "cycle") == TAPPING
+            && !self.drills_pin_holes()
+    }
+    /// A Drill operation that threads its holes, by either cycle.
+    pub fn threads(&self) -> bool {
+        self.thread_milling() || self.tapping()
     }
     /// A Facing of the part's outline seen from above rather than a
     /// rectangle: its Model silhouette boundary, grown by `silhouette_extend`.
@@ -1356,12 +1440,17 @@ impl Operation {
                 // Its own issue below: the tool is not what is wrong.
             } else if self.helical() && get(&t.p, "type") != "Flat end mill" {
                 e.push("Choose a flat end mill for Helical milling.".into())
+            } else if self.thread_milling() && get(&t.p, "type") != "Thread mill" {
+                e.push("Choose a thread mill for Thread milling.".into())
+            } else if self.tapping() && get(&t.p, "type") != "Tap" {
+                e.push("Choose a tap for Tapping.".into())
             } else if self.strategy == Strategy::Drill
                 && !self.helical()
+                && !self.threads()
                 && !["Drill", "Chamfer mill"].contains(&get(&t.p, "type"))
             {
                 e.push(
-                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill."
+                    "Choose a drill, or a chamfer mill to countersink, for a drilling cycle. Helical milling takes a flat end mill, Thread milling a thread mill, Tapping a tap."
                         .into(),
                 )
             }
@@ -1439,6 +1528,34 @@ impl Operation {
                 positive(&self.p, "stepdown", &mut e);
                 bounded(&self.p, "stepover", 1., 100., &mut e);
                 bounded(&self.p, "tolerance", 0.001, 0.1, &mut e)
+            }
+            if self.thread_milling() && manual::is_hand(m) {
+                e.push(THREAD_MILL_ON_HAND.into())
+            }
+            if self.tapping() && !manual::is_hand(m) {
+                e.push(TAP_ON_CNC.into())
+            }
+            if self.threads() {
+                let thread = get(&self.p, "thread");
+                if thread != FROM_MODEL && crate::thread::spec(thread).is_none() {
+                    e.push("Choose the thread size, or From the model.".into())
+                }
+                if !THREAD_HANDS.contains(&get(&self.p, "thread_hand")) {
+                    e.push("Choose the thread's hand.".into())
+                }
+                if !get(&self.p, "thread_depth").trim().is_empty() {
+                    positive(&self.p, "thread_depth", &mut e)
+                }
+            }
+            if self.thread_milling() {
+                bounded(&self.p, "tolerance", 0.001, 0.1, &mut e);
+                bounded(&self.p, "thread_passes", 1., 10., &mut e);
+                if num(&self.p, "thread_passes").is_some_and(|x| x.fract() != 0.) {
+                    e.push("thread passes must be a whole number.".into())
+                }
+                if !["Yes", "No"].contains(&get(&self.p, "spring_pass")) {
+                    e.push("Choose Yes or No for the spring pass.".into())
+                }
             }
             if ["Chip breaking", "Deep drilling"].contains(&get(&self.p, "cycle")) {
                 positive(&self.p, "peck", &mut e)

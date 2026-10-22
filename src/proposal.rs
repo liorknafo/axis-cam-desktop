@@ -20,7 +20,7 @@ const STRATEGIES: [(&str, Strategy); 6] = [
     ("Waterline", Strategy::Waterline),
 ];
 const COOLANTS: [&str; 4] = ["Flood", "Mist", "Air", "Off"];
-const CYCLES: [&str; 5] = crate::model::DRILL_CYCLES;
+const CYCLES: [&str; 7] = crate::model::DRILL_CYCLES;
 const ENTRIES: [&str; 2] = ["Profile ramp", "Plunge"];
 const MAX_SETUPS: usize = 6;
 pub const MAX_SETUP_OPERATIONS: usize = 12;
