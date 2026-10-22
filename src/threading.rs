@@ -61,6 +61,12 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             });
             op.p.insert("holes".into(), DRILL_HOLES[2].into());
             op.p.insert("hole_diameter".into(), format!("{:.2}", first.diameter));
+            // A coolant the machine has: its UC100 profile may have no
+            // flood output, and a run refuses one it lacks.
+            op.p.insert(
+                "coolant".into(),
+                crate::control::default_coolant(machine).into(),
+            );
         };
         // The tap drill: a drill of its size, else (on the CNC) an end mill
         // milling the bore out.
@@ -462,6 +468,153 @@ mod tests {
         for r in results {
             r.unwrap();
         }
+    }
+    /// Writes a demo workspace to `$AXIS_DEMO_HOME` (default
+    /// /tmp/axis-demo-home)'s app folder: the threaded plate on the owner's
+    /// CNC4030 with the LUOCUT DLC thread mills and the RUKO tap drills,
+    /// Add threading applied. Launch the app with that HOME to see it. Not
+    /// a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn write_a_demo_workspace() {
+        let home = std::path::PathBuf::from(
+            std::env::var("AXIS_DEMO_HOME").unwrap_or("/tmp/axis-demo-home".into()),
+        );
+        let dir = home.join("Library/Application Support/AXIS CAM Studio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/threaded-plate.3mf");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let machine = crate::control::owners_machine(&dir).unwrap();
+        let mut tools = vec![];
+        // LUOCUT DLC set B0CZNRWQ5V: cutting Ø, pitches, reach (L1).
+        for (n, (d, pitches, reach)) in [
+            ("2.35", "0.3-0.5", "8"),
+            ("3.15", "0.5-0.8", "10"),
+            ("4", "0.5-1", "12"),
+            ("4.8", "0.5-1.25", "15"),
+            ("6", "0.5-1.25", "16"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tools.push(tool(
+                &format!("Thread mill Ø{d} DLC"),
+                "Thread mill",
+                d,
+                &[
+                    ("pitches", pitches),
+                    ("reach", reach),
+                    ("length", "1"),
+                    ("stickout", "35"),
+                    ("number", &(10 + n).to_string()),
+                ],
+            ));
+        }
+        // RUKO 245052RO's tap drills.
+        for (n, d) in ["4.2", "5", "6.8"].into_iter().enumerate() {
+            tools.push(tool(
+                &format!("Drill Ø{d}"),
+                "Drill",
+                d,
+                &[
+                    ("length", "40"),
+                    ("stickout", "50"),
+                    ("number", &(20 + n).to_string()),
+                ],
+            ));
+        }
+        let mut doc = doc(machine, tools);
+        doc.title = "Threaded plate".into();
+        doc.file = Some(crate::model::ModelFile {
+            name: "threaded-plate.3mf".into(),
+            path: path.clone(),
+            format: "3mf".into(),
+            bytes: std::fs::metadata(&path).unwrap().len(),
+        });
+        doc.adopt_materials();
+        if let Some(al) = doc
+            .materials
+            .iter()
+            .find(|m| m.name().contains("6061"))
+            .map(|m| m.id.clone())
+        {
+            doc.select_material(&al);
+        }
+        doc.setups[0].p.insert("name".into(), "Top side".into());
+        doc.active = doc.setups[0].id.clone();
+        let added = add(&doc, 0, &mesh).unwrap();
+        eprintln!("{}", added.status);
+        // On the owner's machine, whose profile has no flood output, the
+        // ops it adds pass the run's checks.
+        let mut job = doc.clone();
+        job.setups[0].operations = added.ops.clone();
+        let mut sims = vec![];
+        crate::simulation::sequence(&job, &mesh, None, |_, oi, r| sims.push((oi, r)));
+        if let Err(problems) = crate::run::plan_problems(&job, &mesh, 0, &sims) {
+            panic!("{problems:?}");
+        }
+        doc.setups[0].operations = added.ops;
+        for o in &mut doc.setups[0].operations {
+            let (rpm, feed) = if o.thread_milling() {
+                ("12000", "300")
+            } else {
+                ("3000", "150")
+            };
+            o.p.insert("rpm".into(), rpm.into());
+            o.p.insert("feed".into(), feed.into());
+        }
+        crate::storage::save(&dir.join("workspace.json"), &doc).unwrap();
+        let mut results = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| {
+            results.push((oi, r.map(|s| s.plan.duration)))
+        });
+        for (oi, r) in results {
+            eprintln!("{} {:?}", doc.setups[0].operations[oi].name(), r);
+        }
+    }
+    #[test]
+    fn on_the_owners_cnc_the_ops_added_pass_the_runs_checks() {
+        // Its UC100 profile has no flood output: the ops take its coolant.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = crate::control::owners_machine(dir.path()).unwrap();
+        let tools = vec![
+            tool(
+                "Ø5 drill",
+                "Drill",
+                "5",
+                &[("length", "40"), ("stickout", "50")],
+            ),
+            tool(
+                "Thread mill Ø4.8",
+                "Thread mill",
+                "4.8",
+                &[
+                    ("pitches", "0.5-1.25"),
+                    ("reach", "15"),
+                    ("length", "1"),
+                    ("stickout", "35"),
+                ],
+            ),
+        ];
+        let mut doc = doc(machine, tools);
+        for (n, t) in doc.tools.iter_mut().enumerate() {
+            t.p.insert("number".into(), (n + 1).to_string());
+        }
+        let mesh = plate();
+        let added = add(&doc, 0, &mesh).unwrap();
+        doc.setups[0].operations = added
+            .ops
+            .into_iter()
+            .filter(|o| o.name().starts_with("M6×1"))
+            .collect();
+        for o in &mut doc.setups[0].operations {
+            o.p.insert("rpm".into(), "12000".into());
+            o.p.insert("feed".into(), "300".into());
+        }
+        let mut sims = vec![];
+        crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| sims.push((oi, r)));
+        assert_eq!(crate::run::plan_problems(&doc, &mesh, 0, &sims), Ok(()));
     }
     #[test]
     fn the_owners_tools_are_given_once_and_are_valid() {
