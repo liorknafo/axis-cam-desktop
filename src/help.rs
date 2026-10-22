@@ -1170,6 +1170,14 @@ pub fn command(m: &Message, label: String) -> Help {
             "Place the fixture pins on the stock's leftover in the 3D view: the plate's pins follow the pointer on the stock's bottom, green where they fit and red, with why, where they do not. Click to put pin 1 there; drag the placed pins to move them; drag elsewhere to orbit. Click Finish placing when done.",
             "",
         ),
+        AddThreading => (
+            "Add, for each thread size of the setup's threaded holes that open upwards, a Drill of its tap drill and then its thread: Thread milling with a thread mill on the CNC, Tapping by hand on the manual mill. Tools come from the library; the status says which are missing.",
+            "",
+        ),
+        ThreadFromPart => (
+            "Fill this thread's side, major diameter, pitch and end from the thread modeled on the part's axis: the one nearest the bar's free end.",
+            "",
+        ),
         AddPinDrilling => (
             "Add a Drill of the pin holes to the last earlier setup that has the face this setup sits on facing up: holes where the pins are placed, 1 mm deeper than the pins stand, with a drill or flat end mill from the library that fits the pins.",
             "",
@@ -1951,8 +1959,8 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(LatheTool(3)),
         ),
         (Target::Tool, "reach") => (
-            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge.",
-            "",
+            "How far the tool can reach into the work, in mm: a boring bar's depth into the bore, a grooving tool's or parting blade's deepest plunge, a thread mill's neck.",
+            "A thread mill's neck is thinner than its cutter so it can go down a drilled hole. The thread cannot be deeper than the neck reaches.",
             Some(LatheTool(4)),
         ),
         (Target::Tool, "width") => (
@@ -1966,9 +1974,19 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(LatheTool(6)),
         ),
         (Target::Tool, "pitches") => (
-            "The finest and coarsest pitch the threading tool cuts, in mm, written like 0.5-3.",
-            "",
+            "The finest and coarsest pitch the threading tool or thread mill cuts, in mm, written like 0.5-3.",
+            "A thread mill has a single tooth, so one cuts any pitch in its range: the mill follows the pitch, not the tooth.",
             Some(LatheTool(7)),
+        ),
+        (Target::Tool, "thread") => (
+            "The thread size this tap cuts. Choosing it sets the tool's diameter to the thread's major diameter.",
+            "Drill the hole first with the tap drill for this size.",
+            Some(Tool),
+        ),
+        (Target::Tool, "tap_kind") => (
+            "Which way the flutes send the chips. Spiral flute taps lift them out: for blind holes. Spiral point taps push them ahead: for through holes. Straight flute taps are hand taps, for either.",
+            "",
+            Some(Tool),
         ),
         (Target::Operation, "turn_kind") => (
             "What this Turn does: face the end, turn an outside diameter, bore, chamfer an edge, cut a groove, part off or cut a thread. Changing the kind brings that kind's sizes and a fitting tool.",
@@ -2227,6 +2245,31 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (_, "cycle") => (
             "Drilling feeds once to depth. Chip breaking retracts slightly between pecks; deep drilling retracts clear of the hole. Counterboring adds a bottom dwell. Helical milling cuts each hole with a flat end mill, down a helix to a flat bottom.",
+            "Thread milling cuts each drilled hole's thread with a thread mill, on a CNC: the mill goes down the hole, arcs in to the wall and climbs one pitch a turn. Tapping is by hand, on the manual mill or the lathe: the spindle (off) or the tailstock holds the tap square. The CNC does not tap.",
+            Some(Operation(Strategy::Drill)),
+        ),
+        (_, "thread") => (
+            "The thread to cut or tap, from the standard sizes. From the model reads each hole's size and pitch from the part, where its thread is modeled.",
+            "A hole the part does not model as a thread needs a size picked here. The hole must already be drilled: a tap drill for a tap, a bore near the thread's minor diameter for a thread mill.",
+            Some(Operation(Strategy::Drill)),
+        ),
+        (_, "thread_hand") => (
+            "Which way the thread turns: right hand screws in clockwise, left hand counterclockwise. From the model reads it from the part.",
+            "",
+            Some(Operation(Strategy::Drill)),
+        ),
+        (_, "thread_depth") => (
+            "How deep the full thread runs from the hole's rim, in mm. Blank takes the depth the model has.",
+            "",
+            Some(Operation(Strategy::Drill)),
+        ),
+        (_, "thread_passes") => (
+            "How many times the thread mill goes round each thread, from 1 to 10. Each pass goes further out, the last to the thread's full depth, which eases the load on a small mill or a hard material.",
+            "",
+            Some(Operation(Strategy::Drill)),
+        ),
+        (_, "spring_pass") => (
+            "Yes goes round the thread once more at full depth. The mill springs back from the wall as it cuts, so the last pass takes the spring out and trues the size.",
             "",
             Some(Operation(Strategy::Drill)),
         ),
@@ -2678,7 +2721,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Operation(Strategy::FiveAxis)),
         ),
         (_, "type") => (
-            "Cutter geometry: flat end mill, ball end mill, drill or face mill, or for a lathe a turning tool, boring bar, grooving tool, parting blade or threading tool. Choose a type suited to the operation.",
+            "Cutter geometry: flat end mill, ball end mill, drill, face mill, chamfer mill, thread mill or tap, or for a lathe a turning tool, boring bar, grooving tool, parting blade or threading tool. Choose a type suited to the operation.",
             "",
             Some(Tool),
         ),
@@ -3321,6 +3364,8 @@ mod tests {
             ("drill-peck-full", DrillCycle(2)),
             ("drill-dwell", DrillCycle(3)),
             ("drill-helix", DrillCycle(4)),
+            ("drill-thread-mill", DrillCycle(5)),
+            ("drill-tap", DrillCycle(6)),
             ("containment-inside", Containment(-1)),
             ("containment-on", Containment(0)),
             ("containment-outside", Containment(1)),
@@ -4304,6 +4349,8 @@ mod tests {
             PickPinHoles,
             PlacePins,
             AddPinDrilling,
+            AddThreading,
+            ThreadFromPart,
             Generate,
             GenerateAll,
             DuplicateSetup,

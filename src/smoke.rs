@@ -2627,6 +2627,163 @@ flood = { pin = 8 }
         );
     }
 
+    /// The threaded plate (examples/threaded-plate.3mf) with drills and
+    /// thread mills in the library, before and after Add threading.
+    fn threaded_app() -> App {
+        let mut a = app();
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/threaded-plate.3mf");
+        let mesh = crate::mesh::load(&path).unwrap();
+        let file = ModelFile {
+            name: "threaded-plate.3mf".into(),
+            path: path.clone(),
+            format: "3mf".into(),
+            bytes: 1,
+        };
+        let _ = a.update(Message::FileImported(Some(Ok((file, Some(mesh))))));
+        a.doc.setup_mut().operations.clear();
+        a.selected = None;
+        for (n, (name, kind, d, extra)) in [
+            ("Drill Ø5", "Drill", "5", &[][..]),
+            ("Drill Ø6.8", "Drill", "6.8", &[][..]),
+            (
+                "Thread mill Ø4 DLC",
+                "Thread mill",
+                "4",
+                &[("pitches", "0.5-1"), ("reach", "12")][..],
+            ),
+            (
+                "Thread mill Ø4.8 DLC",
+                "Thread mill",
+                "4.8",
+                &[("pitches", "0.5-1.25"), ("reach", "16")][..],
+            ),
+            (
+                "Thread mill Ø3.15 DLC",
+                "Thread mill",
+                "3.15",
+                &[("pitches", "0.5-0.8"), ("reach", "10")][..],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut t = crate::model::Tool::new(name, kind, d);
+            t.set_type(kind);
+            for (k, v) in [("length", "30"), ("stickout", "45")].iter().chain(extra) {
+                t.p.insert((*k).into(), (*v).into());
+            }
+            t.p.insert("number".into(), (n + 10).to_string());
+            a.doc.tools.push(t);
+        }
+        a
+    }
+    /// Renders threading on the CNC to `$AXIS_RENDER_DIR` (default
+    /// /tmp/threading): the Threads list, Add threading, and an M6 thread
+    /// milled. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_threading_on_the_cnc() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = threaded_app();
+        a.page = Page::Work;
+        let size = iced::Size::new(1600., 1000.);
+        let _ = a.view();
+        render_png(&a, size, &out.join("1-threads-found.png"));
+        let _ = a.update(Message::AddThreading);
+        eprintln!("status: {}", a.status);
+        let names: Vec<String> = a
+            .doc
+            .setup()
+            .operations
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        eprintln!("ops: {names:?}");
+        let _ = a.view();
+        render_png(&a, size, &out.join("2-threading-added.png"));
+        // Generate the job, then show the M6 thread.
+        let m6 = names.iter().position(|n| n == "M6×1 · thread").unwrap();
+        let _ = a.update(Message::SelectOp(m6));
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::Generate);
+        eprintln!("after generate: {}", a.status);
+        let _ = a.view();
+        render_png(&a, size, &out.join("3-m6-thread-milling.png"));
+        let _ = a.update(Message::Tab("Tool".into()));
+        let _ = a.view();
+        render_png(&a, size, &out.join("4-thread-mill-tool.png"));
+        // From above, zoomed on the M6 hole's helix.
+        let _ = a.update(Message::Tab("Cycle".into()));
+        let _ = a.update(Message::Camera("TOP"));
+        let _ = a.view();
+        render_png(&a, size, &out.join("5-from-above.png"));
+    }
+    /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default
+    /// /tmp/threading): Add threading on a manual setup, and the guide's
+    /// Tap screen. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_tapping_on_the_manual_mill() {
+        use crate::guide::Step;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = threaded_app();
+        let machine = crate::manual::defaults();
+        for (name, kind, d, extra) in [
+            ("M6 tap", "Tap", "6", &[("thread", "M6×1")][..]),
+            ("M8 tap", "Tap", "8", &[("thread", "M8×1.25")][..]),
+            ("M5 tap", "Tap", "5", &[("thread", "M5×0.8")][..]),
+            ("Drill Ø5", "Drill", "5", &[][..]),
+            ("Drill Ø6.8", "Drill", "6.8", &[][..]),
+            ("Drill Ø4.2", "Drill", "4.2", &[][..]),
+        ] {
+            let mut t = crate::model::Tool::new(name, kind, d);
+            t.set_type(kind);
+            for (k, v) in [("length", "30"), ("stickout", "45")].iter().chain(extra) {
+                t.p.insert((*k).into(), (*v).into());
+            }
+            t.p.insert("machines".into(), machine.id.clone());
+            a.doc.tools.push(t);
+        }
+        a.doc.machines.push(machine);
+        a.doc.add_manual_setup().expect("a manual setup");
+        a.doc.setups[0].operations.clear();
+        a.doc.active = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::AddThreading);
+        eprintln!("status: {}", a.status);
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1600., 1000.),
+            &out.join("8-manual-threading-added.png"),
+        );
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        if let Some((_, Err(e))) = &a.guide {
+            panic!("no guide: {e}");
+        }
+        let (shown, _) = a.guide_at().expect("a guide");
+        let ops = &a.doc.setups[0].operations;
+        let tap = shown
+            .guide
+            .steps
+            .iter()
+            .position(|s| matches!(s, Step::Holes { op, .. } if ops[*op].tapping()))
+            .expect("a Tap step");
+        let _ = a.update(Message::Guide(crate::GuideAction::Go(tap)));
+        let _ = a.view();
+        render_png(
+            &a,
+            iced::Size::new(1280., 800.),
+            &out.join("9-manual-tap-step.png"),
+        );
+    }
     /// Pictures of a hole's outline under the pointer seen from above, on
     /// the outline and in the opening, and of the hole picked by a click.
     #[test]

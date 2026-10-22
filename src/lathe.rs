@@ -4,7 +4,9 @@
 
 use crate::{
     manual,
-    model::{Machine, get, num},
+    mesh::Mesh,
+    model::{Machine, Setup, Tool, get, num},
+    thread::Spec,
 };
 
 /// What the guide says in place of a cross-slide number while the dial check
@@ -51,13 +53,15 @@ impl Reads {
     }
 }
 
-/// The tool types a lathe uses besides drills (held in the tailstock).
-pub const TOOLS: [&str; 5] = [
+/// The tool types a lathe uses besides drills and taps (held in the
+/// tailstock). A die cuts an outside thread by hand, with no gearbox.
+pub const TOOLS: [&str; 6] = [
     "Turning tool",
     "Boring bar",
     "Grooving tool",
     "Parting blade",
     "Threading tool",
+    "Die",
 ];
 
 /// Why a strategy other than Turn and Drill is dimmed on a lathe setup.
@@ -107,6 +111,19 @@ pub fn tool_for(kind: &str) -> Option<&'static str> {
         "Thread" => "Threading tool",
         _ => return None,
     })
+}
+
+/// Whether a Turn of `kind` cuts with a tool of type `tool`: the type
+/// `tool_for` names, and for a Thread also a die.
+pub fn takes(kind: &str, tool: &str) -> bool {
+    tool_for(kind) == Some(tool) || (kind == "Thread" && tool == "Die")
+}
+/// The thread size of a die (its `thread`), None for another tool or a size
+/// off the table.
+pub fn die_spec(tool: &Tool) -> Option<&'static Spec> {
+    (get(&tool.p, "type") == "Die")
+        .then(|| crate::thread::spec(get(&tool.p, "thread")))
+        .flatten()
 }
 
 /// The settings a Turn of `kind` starts with (lathe work coordinates: Z 0 at
@@ -172,6 +189,7 @@ pub fn tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)] {
         "Grooving tool" => &[("width", "3"), ("reach", "15")],
         "Parting blade" => &[("width", "3"), ("reach", "25")],
         "Threading tool" => &[("thread_angle", "60"), ("pitches", "0.5-3")],
+        "Die" => &[("thread", "M6×1"), ("od", "20")],
         _ => &[],
     }
 }
@@ -210,6 +228,42 @@ pub fn defaults() -> Machine {
     }
     manual::settle(&mut m);
     m
+}
+
+/// How far a thread's axis may be from the spindle axis, mm, to be the one
+/// a lathe cuts.
+const ON_AXIS: f32 = 0.2;
+
+/// The fields of a Thread turn that cut the thread the part has on the
+/// lathe axis of `setup`: `thread_side`, `diameter` (the size's major),
+/// `pitch` and `z_end` (lathe work Z of the thread's end toward the chuck),
+/// as text for the operation's fields. Of several, the one nearest the free
+/// end (the longer when they start together). None when the part has no
+/// straight thread on the axis, or none that ends below the free end.
+pub fn thread_from_part(setup: &Setup, mesh: &Mesh) -> Option<Vec<(&'static str, String)>> {
+    let stock = crate::stock::resolve(setup, Some(mesh)).ok()?.stock;
+    let found = crate::thread::in_setup(setup, mesh)
+        .into_iter()
+        .filter(|t| t.axis == 2 && !t.tapered && t.centre[0].hypot(t.centre[1]) <= ON_AXIS)
+        .filter(|t| crate::turn::work_z(stock, t.from) < -1e-3)
+        .max_by(|a, b| {
+            a.to.total_cmp(&b.to)
+                .then(a.length().total_cmp(&b.length()))
+        })?;
+    // A size on the table is exact; one off it is as measured.
+    let (diameter, pitch) = found
+        .spec
+        .map_or((found.major, found.pitch), |s| (s.major, s.pitch));
+    let text = |v: f32| ((v * 1000.).round() / 1000.).to_string();
+    Some(vec![
+        (
+            "thread_side",
+            if found.internal { "Inside" } else { "Outside" }.into(),
+        ),
+        ("diameter", text(diameter)),
+        ("pitch", text(pitch)),
+        ("z_end", text(crate::turn::work_z(stock, found.from))),
+    ])
 }
 
 /// The carriage's power feeds, mm per revolution, lowest first. Empty when
@@ -342,6 +396,21 @@ mod tests {
             .filter(|k| !matches!(*k, "rpm" | "allowance"))
             .collect();
         assert_eq!(all, TURN_KEYS.into_iter().collect());
+    }
+    #[test]
+    fn a_die_is_a_lathe_tool_that_cuts_a_thread_turn_only() {
+        assert!(is_tool("Die") && TOOLS.contains(&"Die"));
+        assert_eq!(tool_defaults("Die"), [("thread", "M6×1"), ("od", "20")]);
+        assert!(takes("Thread", "Threading tool") && takes("Thread", "Die"));
+        assert!(!takes("Outside", "Die") && !takes("Thread", "Boring bar"));
+        assert!(!takes("Knurl", "Die") && takes("Outside", "Turning tool"));
+        let die = Tool::lathe("Die", "Die");
+        assert!(die.is_lathe());
+        assert_eq!(die_spec(&die).map(|s| s.name), Some("M6×1"));
+        assert!(die_spec(&Tool::lathe("T", "Turning tool")).is_none());
+        let mut off = die;
+        off.p.insert("thread".into(), "M7×0.9".into());
+        assert!(die_spec(&off).is_none());
     }
     #[test]
     fn only_the_mill_is_manual_only_the_lathe_is_a_lathe_and_both_are_hand() {
@@ -514,5 +583,94 @@ mod tests {
         assert!(dial(&m, Slide::Carriage, 5.).is_err());
         with(&mut m, "top_div", "0");
         assert!(dial(&m, Slide::Top, 5.).is_err());
+    }
+
+    /// The part's thread as a Thread turn takes it, by key.
+    fn fields_of(doc: &crate::model::Document, mesh: &Mesh) -> Option<Vec<(&'static str, String)>> {
+        thread_from_part(&doc.setups[0], mesh)
+    }
+    /// A mesh of `a` then `b`, each moved up `dz` (mm).
+    fn lifted(parts: &[(Vec<[[f32; 3]; 3]>, f32)]) -> Vec<[[f32; 3]; 3]> {
+        parts
+            .iter()
+            .flat_map(|(t, dz)| t.iter().map(move |t| t.map(|p| [p[0], p[1], p[2] + dz])))
+            .collect()
+    }
+    fn value(fields: &[(&'static str, String)], key: &str) -> f32 {
+        fields
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("{key} in {fields:?}"))
+            .1
+            .parse()
+            .unwrap()
+    }
+    #[test]
+    fn the_thread_on_the_lathe_axis_fills_the_thread_turn() {
+        use crate::{
+            thread::tests::modeled,
+            turn::tests::{job, tube},
+        };
+        // A Ø30 body from Z -60 to -30 with an M16 × 2 stud on it to -10.
+        let part = lifted(&[
+            (tube(0., 15., 0., 30.), 0.),
+            (modeled([0., 0.], 16., 2., 60., true, false, 20., 0.), 30.),
+        ]);
+        let (doc, mesh) = job(50., 100., part, -60.);
+        let fields = fields_of(&doc, &mesh).expect("the stud is a thread on the axis");
+        let keys: Vec<&str> = fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["thread_side", "diameter", "pitch", "z_end"]);
+        assert_eq!(fields[0].1, "Outside");
+        // The table's size, not the measured one; the end toward the chuck
+        // is at the body's shoulder, Z -30 from the free end.
+        assert_eq!(fields[1].1, "16");
+        assert_eq!(fields[2].1, "2");
+        assert!((value(&fields, "z_end") + 30.).abs() < 0.6, "{fields:?}");
+        // They are what a Thread turn takes: set on one, it has no issues.
+        let mut ready = doc.clone();
+        crate::turn::tests::add(&mut ready, "Thread", &[]);
+        let mut op = ready.setups[0].operations.pop().unwrap();
+        for (k, v) in &fields {
+            op.p.insert((*k).into(), v.clone());
+        }
+        assert_eq!(
+            op.issues(&ready.setups[0].machine, &ready.tools, &[]),
+            Vec::<String>::new()
+        );
+    }
+    #[test]
+    fn a_threaded_hole_on_the_axis_reads_inside_with_its_size_and_end() {
+        use crate::{thread::tests::modeled, turn::tests::job};
+        // M8 × 1.25 from Z -40 to -20.
+        let part = modeled([0., 0.], 8., 1.25, 60., true, true, 20., 0.);
+        let (doc, mesh) = job(30., 100., part, -40.);
+        let fields = fields_of(&doc, &mesh).expect("the hole is a thread on the axis");
+        assert_eq!(fields[0].1, "Inside");
+        assert_eq!((fields[1].1.as_str(), fields[2].1.as_str()), ("8", "1.25"));
+        assert!((value(&fields, "z_end") + 40.).abs() < 0.6, "{fields:?}");
+    }
+    #[test]
+    fn a_part_with_no_thread_on_the_axis_gives_nothing() {
+        use crate::{
+            thread::tests::modeled,
+            turn::tests::{job, tube},
+        };
+        // A plain shaft.
+        let (doc, mesh) = job(50., 100., tube(0., 15., 0., 50.), -60.);
+        assert_eq!(fields_of(&doc, &mesh), None);
+        // Two threads either side of the axis, 20 mm out: not on it.
+        let part = lifted(&[
+            (modeled([-20., 0.], 8., 1.25, 60., true, true, 20., 0.), 0.),
+            (modeled([20., 0.], 8., 1.25, 60., true, true, 20., 0.), 0.),
+        ]);
+        let (doc, mesh) = job(70., 100., part, -40.);
+        assert_eq!(
+            crate::thread::in_setup(&doc.setups[0], &mesh)
+                .iter()
+                .filter(|t| t.axis == 2)
+                .count(),
+            2
+        );
+        assert_eq!(fields_of(&doc, &mesh), None);
     }
 }

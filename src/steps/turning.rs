@@ -146,6 +146,11 @@ enum Cutter {
     Blade(f32),
     /// A drill of this radius, from the tailstock.
     Drill(f32),
+    /// A tap of this radius in a wrench, guided by the tailstock.
+    Tap(f32),
+    /// A die in its holder, this radius across (its outside), pushed by the
+    /// tailstock quill.
+    Die(f32),
     Thread,
     /// A tool with a 45° edge up to its point (down to it, inside a hole).
     Chamfer(bool),
@@ -480,6 +485,28 @@ fn tool(f: &mut canvas::Frame, kind: Cutter, tip: Point, cy: f32, s: f32) {
             let r = (r * s).max(3.);
             draw(f, bar(x, cy - r, 70., 2. * r));
             draw(f, poly(&[(x, cy - r), (x - r * 0.6, cy), (x, cy + r)]));
+        }
+        Cutter::Tap(r) => {
+            // The tap with its chamfered lead, its square end in a wrench
+            // across it, the tailstock's centre behind.
+            let r = (r * s).max(3.);
+            draw(f, bar(x, cy - r, 54., 2. * r));
+            draw(
+                f,
+                poly(&[(x, cy - r * 0.7), (x - r * 0.6, cy), (x, cy + r * 0.7)]),
+            );
+            draw(f, bar(x + 54., cy - 5., 10., 10.));
+            draw(f, bar(x + 60., cy - 30., 8., 60.));
+            draw(f, bar(x + 68., cy - 3., 16., 6.));
+        }
+        Cutter::Die(r) => {
+            // The die's holder face on, with its two handles; the quill
+            // pushes the holder's back.
+            let r = (r * s).max(8.);
+            draw(f, bar(x, cy - r, 18., 2. * r));
+            draw(f, bar(x + 4., cy - r - 26., 8., 26.));
+            draw(f, bar(x + 4., cy + r, 8., 26.));
+            draw(f, bar(x + 18., cy - 7., 56., 14.));
         }
         Cutter::Thread => {
             draw(f, bar(x - 7., y - 42., 14., 26.));
@@ -1154,6 +1181,14 @@ pub(super) fn header<'a>(p: &Page<'a>, op: usize, s: &Section) -> Vec<Element<'a
                     .map_or("the drill", |t| t.name())
             )));
             out.push(chip("tailstock"));
+        }
+        Some(LatheStep::TailTap { .. }) => {
+            out.push(tool_chip(p, tool));
+            out.push(chip("tailstock"));
+        }
+        Some(LatheStep::DieThread { .. }) => {
+            out.push(tool_chip(p, tool));
+            out.push(chip("by hand"));
         }
         _ => out.push(tool_chip(p, tool)),
     }
@@ -1925,6 +1960,152 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 right,
             )
         }
+        LatheStep::TailTap {
+            op,
+            tool,
+            tap,
+            pitch,
+            depth,
+            lead,
+            turns,
+            quill,
+        } => {
+            let bar = bar_of(*op);
+            let pieces = all(*op);
+            let r = crate::thread::spec(tap).map_or(3., |s| s.major / 2.);
+            let e = extent(&pieces).unwrap_or([end_of(bar) - depth, end_of(bar), 0., r]);
+            let mut marks: Vec<Mark> = pieces.iter().map(|g| Mark::Cut(*g)).collect();
+            marks.push(Mark::Tool(Cutter::Tap(r), [e[1], 0.]));
+            marks.push(Mark::Word(
+                [e[1] - depth / 2., r + 5.],
+                format!("{tap} · {} deep", mm(*depth)),
+                ACCENT,
+                Align::Center,
+            ));
+            let q = reading(p, quill);
+            let right = column![
+                chips(vec![
+                    tool_chip(p, tool),
+                    warn_chip("spindle off"),
+                    chip("½ back every turn"),
+                    chip("oil"),
+                ]),
+                dials(vec![dial_box(
+                    p,
+                    quill,
+                    format!("{} deep + {} for the lead", mm(*depth), mm(*lead)),
+                    150.
+                )]),
+                line(
+                    Some(1),
+                    "tailstock",
+                    big("lock", lit(0, item)),
+                    vec![
+                        "tap in the chuck, or a wrench".into(),
+                        "on the centre; touch the hole".into(),
+                    ],
+                    lit(0, item),
+                    reached(0),
+                ),
+                line(
+                    Some(2),
+                    "quill",
+                    big(q.total.clone(), lit(1, item)),
+                    vec![
+                        format!("{} on the dial", q.long),
+                        "the way in, then out".into()
+                    ],
+                    lit(1, item),
+                    reached(1),
+                ),
+                line(
+                    Some(3),
+                    "tap",
+                    big(format!("{turns} turns"), lit(2, item)),
+                    vec![
+                        "turn the chuck or the wrench by hand".into(),
+                        format!("{} mm a turn", mm(*pitch)),
+                    ],
+                    lit(2, item),
+                    reached(2),
+                ),
+            ];
+            (
+                "Tap".into(),
+                "by hand, the spindle off",
+                view(bar, marks, 380.),
+                right,
+            )
+        }
+        LatheStep::DieThread {
+            op,
+            tool,
+            die,
+            pitch,
+            diameter,
+            od,
+            length,
+            turns,
+        } => {
+            let bar = bar_of(*op);
+            let end = end_of(bar);
+            let pieces = all(*op);
+            let r = outer_at(bar, end - length / 2.).max(diameter / 2.);
+            let mut marks: Vec<Mark> = pieces.iter().map(|g| Mark::Cut(*g)).collect();
+            marks.push(Mark::Tool(
+                Cutter::Die((*od / 2.).max(r + 3.)),
+                [end + 1., 0.],
+            ));
+            marks.push(Mark::Path([end + 1., r + 2.], [end - length, r + 2.]));
+            marks.push(Mark::Never(
+                [end - length, r - 1.5],
+                [end - length, (r + 4.).max(outer_of(bar) + 1.5)],
+                format!("thread stops {} from the end", mm(*length)),
+            ));
+            marks.push(Mark::Word(
+                [end - 2., -(r + 4.)],
+                format!("{die} · {} long", mm(*length)),
+                ACCENT,
+                Align::Right,
+            ));
+            let right = column![
+                chips(vec![
+                    tool_chip(p, tool),
+                    warn_chip("spindle off"),
+                    chip("½ back every turn"),
+                    chip("oil"),
+                ]),
+                line(
+                    Some(1),
+                    "die",
+                    big("square", lit(0, item)),
+                    vec![
+                        format!("{} die in its holder", dia(*diameter)),
+                        "quill against the holder".into(),
+                    ],
+                    lit(0, item),
+                    reached(0),
+                ),
+                line(
+                    Some(2),
+                    "holder",
+                    big(format!("{turns} turns"), lit(1, item)),
+                    vec![
+                        "turn the holder by hand".into(),
+                        format!("to {} from the end", mm(*length)),
+                        format!("{} mm a turn", mm(*pitch)),
+                    ],
+                    lit(1, item),
+                    reached(1),
+                ),
+            ];
+            (
+                "Die".into(),
+                "by hand, the spindle off",
+                view(bar, marks, 380.),
+                right,
+            )
+        }
         LatheStep::Chamfer {
             op,
             tool,
@@ -2356,4 +2537,116 @@ pub(super) fn hand_over<'a>(p: &Page<'a>, to: Option<usize>) -> Element<'a, Mess
         .push(space().height(iced::Length::Fill))
         .push(buttons(next));
     frame("Hand over".into(), "the part leaves the lathe", left, right)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        App, Message, Page,
+        guide::{LatheStep as L, Step},
+        mesh::Mesh,
+        model::Document,
+    };
+
+    /// The Steps page of `doc`'s lathe setup, its guide built.
+    fn app_of(mut doc: Document, mesh: Mesh) -> App {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
+        a.test_dir = Some(dir);
+        doc.file = Some(crate::model::ModelFile {
+            name: "part.stl".into(),
+            path: std::path::PathBuf::from("part.stl"),
+            format: "stl".into(),
+            bytes: 1,
+        });
+        doc.active = doc.setups[0].id.clone();
+        a.doc = doc;
+        a.imported_mesh = Some(mesh);
+        let _ = a.update(Message::Page(Page::Control));
+        crate::steps::tests::build(&mut a);
+        a
+    }
+    /// The page at the first step `pick` is true of, the readout `item`
+    /// lit: the texts it shows.
+    fn shown(a: &mut App, item: usize, pick: impl Fn(&L) -> bool) -> Vec<String> {
+        let at = (a.guide_at().unwrap().0.guide.steps.iter())
+            .position(|s| matches!(s, Step::Lathe(l) if pick(l)))
+            .unwrap();
+        let id = a.doc.setups[0].id.clone();
+        a.doc.guide.insert(id, at);
+        a.guide_item = item;
+        crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
+    }
+    fn has(texts: &[String], wants: &[&str]) {
+        for want in wants {
+            assert!(texts.iter().any(|t| t == want), "{want:?} in {texts:?}");
+        }
+    }
+
+    #[test]
+    fn the_tap_screen_shows_the_quill_the_turns_and_how_to_turn_it() {
+        let (mut doc, mesh, tap) = crate::turn::tests::m12_job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        crate::turn::tests::add(&mut doc, "Drill", &[("depth", "16")]);
+        crate::turn::tests::add_tap(&mut doc, &tap, "10");
+        let mut a = app_of(doc, mesh);
+        let Some(Step::Lathe(L::TailTap { lead, turns, .. })) = a
+            .guide_at()
+            .unwrap()
+            .0
+            .guide
+            .steps
+            .iter()
+            .find(|s| matches!(s, Step::Lathe(L::TailTap { .. })))
+            .cloned()
+        else {
+            panic!()
+        };
+        let t = shown(&mut a, 1, |l| matches!(l, L::TailTap { .. }));
+        has(
+            &t,
+            &[
+                "Tap",
+                "tailstock",
+                "spindle off",
+                "½ back every turn",
+                "oil",
+                &format!("10 deep + {lead:.2} for the lead"),
+                &format!("{turns} turns"),
+                "turn the chuck or the wrench by hand",
+                "1.75 mm a turn",
+            ],
+        );
+        // The quill's dial and its total are read off the Drill's way.
+        assert!(t.iter().any(|s| s.starts_with("quill · ")), "{t:?}");
+        assert!(t.iter().any(|s| s.ends_with(" on the dial")), "{t:?}");
+        // The Drill before it is the drill's screen, not a tap's.
+        let t = shown(&mut a, 1, |l| matches!(l, L::TailDrill { .. }));
+        assert!(!t.iter().any(|s| s == "oil"), "{t:?}");
+    }
+    #[test]
+    fn the_die_screen_is_one_screen_of_turns_not_thread_passes() {
+        let (doc, mesh) = crate::guide::tests::die_sample();
+        let mut a = app_of(doc, mesh);
+        let t = shown(&mut a, 1, |l| matches!(l, L::DieThread { .. }));
+        has(
+            &t,
+            &[
+                "Die",
+                "by hand",
+                "spindle off",
+                "½ back every turn",
+                "oil",
+                "square",
+                "quill against the holder",
+                "10 turns",
+                "turn the holder by hand",
+                "to 20 from the end",
+            ],
+        );
+        assert!(!t.iter().any(|s| s.starts_with("Thread pass")), "{t:?}");
+    }
 }

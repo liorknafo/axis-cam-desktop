@@ -102,8 +102,10 @@ pub const SPECS: &[Spec] = &[
     metric("M5×0.5", 5., 0.5),
     metric("M6×1", 6., 1.),
     metric("M6×0.75", 6., 0.75),
+    metric("M7×1", 7., 1.),
     metric("M8×1.25", 8., 1.25),
     metric("M8×1", 8., 1.),
+    metric("M9×1.25", 9., 1.25),
     metric("M10×1.5", 10., 1.5),
     metric("M10×1.25", 10., 1.25),
     metric("M10×1", 10., 1.),
@@ -387,9 +389,12 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
             }
             tried.push(at);
             // The axis: the point nearest the normal lines that pass close
-            // to it, by least squares, a few times over.
+            // to it, by least squares, a few times over. A helix's lead
+            // tilts each flank's normal off the radius: its line misses the
+            // axis by about 0.28 of the pitch, a millimetre at M30's 3.5,
+            // to either side round the thread, which the fit evens out.
             let mut members: Vec<&Flank> = vec![];
-            for _ in 0..3 {
+            for _ in 0..5 {
                 members = flanks
                     .iter()
                     .filter(|f| {
@@ -398,7 +403,7 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
                         let perp = (off[0] * f.toward[1] - off[1] * f.toward[0]).abs();
                         let radial =
                             (off[0] * f.toward[0] + off[1] * f.toward[1]).abs() / dist.max(1e-9);
-                        perp < 1. && dist > 0.3 && dist < REACH && radial > 0.97
+                        perp < 1.5 && dist > 0.3 && dist < REACH && radial > 0.97
                     })
                     .collect();
                 if members.len() < LEAST {
@@ -836,6 +841,29 @@ pub(crate) mod tests {
         .clone();
         assert!(t.tapered, "{t:?}");
         assert_eq!(t.spec.map(|s| s.name), Some("1/8-27 NPT"));
+    }
+    #[test]
+    fn coarse_large_threads_read_true() {
+        for (major, pitch, name) in [
+            (20., 2.5, "M20×2.5"),
+            (24., 3., "M24×3"),
+            (30., 3.5, "M30×3.5"),
+        ] {
+            for internal in [true, false] {
+                let found = detect(&modeled(
+                    [0., 0.],
+                    major,
+                    pitch,
+                    60.,
+                    true,
+                    internal,
+                    4. * pitch + 6.,
+                    0.,
+                ));
+                assert_eq!(found.len(), 1, "{name} {internal}: {found:#?}");
+                assert_eq!(found[0].spec.map(|s| s.name), Some(name), "{internal}");
+            }
+        }
     }
     #[test]
     fn plain_holes_and_cones_are_no_threads() {

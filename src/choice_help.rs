@@ -129,6 +129,20 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
                 "The Through and Breakthrough settings work as for drilling. A manual mill cannot mill a hole round.",
             )
         }
+        ("cycle", crate::model::THREAD_MILLING) => {
+            diagram = Some(Diagram::DrillCycle(5));
+            (
+                "Mill each hole's thread with a thread mill: down the middle of the drilled hole, an arc out to the wall, one pitch up a turn, then an arc back to the centre and out. The mill has one tooth, so one cuts any pitch in its range; its neck must fit down the hole.",
+                "Drill the hole first. Thread passes go round the thread more than once, each further out, the last to the full depth; a Spring pass goes round once more to true the size. From the model reads each hole's size from its modeled thread. A manual mill or a lathe cannot mill a thread: tap it.",
+            )
+        }
+        ("cycle", crate::model::TAPPING) => {
+            diagram = Some(Diagram::DrillCycle(6));
+            (
+                "Tap each drilled hole by hand: the tap goes in a turn at a time with a half turn back now and then to break the chip, then out. The spindle (off) or the tailstock holds the tap square. The CNC does not tap.",
+                "Drill the hole first, with the tap drill for the thread. A blind hole must go below the thread by the tap's lead.",
+            )
+        }
         ("on_pins", "Yes") => (
             "The part drops over the machine's fixture pins by holes in it, so its place and turn are known: the pins give this setup's X and Y work offset (Set X Y from the pins on the Control page), with no probing. Z is still touched off on the stock. The pins are kept clear of as workholding; the vise or clamps still hold the part down.",
             "Cycle Start waits until X and Y are referenced from pin 1 since the last E-stop and the work offset is the one the pins give. The check warns when no earlier setup drills the holes for the pins.",
@@ -143,6 +157,10 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ),
         ("holes", "Part's holes") => (
             "Drill the round holes of the part in the selected face.",
+            "",
+        ),
+        ("holes", "Threaded holes") => (
+            "Only the holes of the selected face with a thread modeled in them: drill their tap drills, or cut their threads, and leave the plain holes alone, even ones of the same size.",
             "",
         ),
         ("holes", "Pin holes") => (
@@ -436,6 +454,26 @@ pub fn selected(key: &str, label: &str, value: &str, target: Target, p: &Fields)
         ),
         ("type", "Chamfer mill") => (
             "A pointed cone of its tip angle. Drilling with it countersinks each detected opening: it plunges until the cone is as wide as the opening at its rim. A hole countersunk in the model takes only a chamfer mill of its countersink's angle. Chamfers along edges are not generated.",
+            "",
+        ),
+        ("type", "Thread mill") => (
+            "A single-tooth cutter on a neck that mills a thread inside a drilled hole, on a CNC. It cuts any pitch in its range, so one covers many sizes. The hole must be drilled first, and the mill must fit down it.",
+            "Its thread angle must match the thread's, and its Reach (neck) is how deep it can thread.",
+        ),
+        ("type", "Tap") => (
+            "A tool that cuts an internal thread of one size, turned by hand into a drilled hole on the manual mill or the lathe. The CNC cannot tap: use a thread mill. The hole must be drilled first.",
+            "",
+        ),
+        ("tap_kind", "Spiral flute") => (
+            "Its spiral flutes lift the chips out of the hole: the tap for blind holes.",
+            "",
+        ),
+        ("tap_kind", "Spiral point") => (
+            "Its angled point pushes the chips ahead of the tap: the tap for through holes.",
+            "",
+        ),
+        ("tap_kind", "Straight flute") => (
+            "Straight flutes make a hand tap, for either kind of hole. The chips stay in the flutes, so back it off often.",
             "",
         ),
         ("type", "Turning tool") => (

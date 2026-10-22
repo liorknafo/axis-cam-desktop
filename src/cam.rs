@@ -1010,6 +1010,18 @@ impl Hole {
             .map_or(bore, |t| bore.max(t.major - 0.9 * t.pitch))
     }
 }
+/// The surfaces facing up at height `z` in `setup`'s frame (mm): the
+/// plane a hole opening at `z` is picked by, as its rim.
+pub fn rim_surfaces(setup: &Setup, mesh: &Mesh, z: f32) -> Vec<usize> {
+    let placement = crate::stock::Placement::new(mesh, Some(setup));
+    let (angles, _) = placement.parts();
+    let scale = mesh.display_scale();
+    (mesh.surfaces.iter().enumerate())
+        .filter(|(_, s)| crate::mesh::rotation(s.normal, angles)[2] > 0.999)
+        .filter(|(_, s)| (placement.transform(s.center)[2] / scale - z).abs() < 0.02)
+        .map(|(id, _)| id)
+        .collect()
+}
 /// A countersink: a cone from a hole's opening, `Hole::opening` wide at the
 /// face, straight down to the wall or floor under it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1843,6 +1855,12 @@ fn drill_holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, 
     if filter > 0. {
         holes.retain(|h| (h.diameter - filter).abs() <= 0.1);
     }
+    if op.threaded_holes_only() {
+        holes.retain(|h| h.thread.is_some());
+        if holes.is_empty() {
+            return Err("None of the selected holes has a thread modeled in it. Set Holes to Part's holes to drill them.".into());
+        }
+    }
     if holes.is_empty() {
         return Err("No detected holes match the diameter filter.".into());
     }
@@ -2575,14 +2593,19 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
                 h.top - lowest
             ));
         }
-        if !bored(setup, &b, h.center, t.minor / 2. * 0.85, h.top, t.bottom) {
+        // Drilled to its full width down the thread, and below it as deep
+        // as the tap's narrow, chamfered tip goes: else the tap is forced
+        // into the stock and breaks.
+        if !bored(setup, &b, h.center, t.minor / 2. * 0.85, h.top, t.bottom)
+            || !bored(setup, &b, h.center, t.tap_drill / 4., t.bottom, lowest)
+        {
             return Err(format!(
                 "Drill the {at} first: Ø{:.1}, {:.1} deep. The tap cuts its thread in the drilled hole.",
                 t.tap_drill,
                 h.top - lowest
             ));
         }
-        let depth = if h.through { t.bottom - lead } else { lowest };
+        let depth = lowest;
         b.start_at([h.center[0], h.center[1], h.top], Some(h.top))?;
         // In one pitch a turn, then back out.
         let rate = b.feed;
@@ -2615,9 +2638,9 @@ fn bored(setup: &Setup, b: &Builder, centre: [f32; 2], radius: f32, top: f32, bo
 /// 2-3 threads, a spiral point or straight flute plug tap's 3.5-5.
 pub(crate) fn tap_lead(tool: &Tool) -> f32 {
     if get(&tool.p, "tap_kind") == crate::model::TAP_KINDS[0] {
-        3.
+        2.5
     } else {
-        5.
+        4.5
     }
 }
 /// Highest collision-free vertical tool tip against a triangle (flat or spherical end).
@@ -6112,7 +6135,14 @@ pub(crate) mod tests {
     }
     #[test]
     fn a_thread_milling_job_posts_and_replays_exactly() {
-        let (result, mesh, (mut doc, _)) = threaded_doc(Machine::new(3), "4.9", Some("5"), thread_mill_tool("4"), crate::model::THREAD_MILLING, |_| {});
+        let (result, mesh, (mut doc, _)) = threaded_doc(
+            Machine::new(3),
+            "4.9",
+            Some("5"),
+            thread_mill_tool("4"),
+            crate::model::THREAD_MILLING,
+            |_| {},
+        );
         result.unwrap();
         doc.file = Some(crate::model::ModelFile {
             name: "threaded-plate.3mf".into(),
@@ -6128,11 +6158,72 @@ pub(crate) mod tests {
             .errors
             .iter()
             .cloned()
-            .chain(job.setups.iter().filter_map(|s| s.result.as_ref().err()).flatten().cloned())
+            .chain(
+                job.setups
+                    .iter()
+                    .filter_map(|s| s.result.as_ref().err())
+                    .flatten()
+                    .cloned(),
+            )
             .collect();
         assert!(job.ready(), "{problems:?}");
         let program = &job.setups[0].result.as_ref().unwrap()[0];
-        assert!(program.text.contains("T2 M6") && program.text.contains("\nG1 "), "{}", &program.text[..500]);
+        assert!(
+            program.text.contains("T2 M6") && program.text.contains("\nG1 "),
+            "{}",
+            &program.text[..500]
+        );
+    }
+    /// Writes the M6 thread milling's moves and the plate, in the setup's
+    /// frame, to `$AXIS_RENDER_DIR` (default /tmp/threading) for a
+    /// picture. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn export_a_milled_thread() {
+        use std::io::Write;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let (result, mesh, (doc, _)) = threaded_doc(
+            Machine::new(3),
+            "4.9",
+            Some("5"),
+            thread_mill_tool("4"),
+            crate::model::THREAD_MILLING,
+            |_| {},
+        );
+        let plan = result.unwrap().plan;
+        let mut f = std::fs::File::create(out.join("m6_path.csv")).unwrap();
+        for m in &plan.moves {
+            writeln!(
+                f,
+                "{},{},{},{},{},{},{}",
+                m.from[0],
+                m.from[1],
+                m.from[2],
+                m.to[0],
+                m.to[1],
+                m.to[2],
+                u8::from(m.cutting_pass)
+            )
+            .unwrap();
+        }
+        let g = Geometry::new(&doc.setups[0], &mesh);
+        let mut f = std::fs::File::create(out.join("plate_setup.stl")).unwrap();
+        writeln!(f, "solid plate").unwrap();
+        for t in &g.triangles {
+            writeln!(f, "facet normal 0 0 0\nouter loop").unwrap();
+            for p in t.p {
+                writeln!(f, "vertex {} {} {}", p[0], p[1], p[2]).unwrap();
+            }
+            writeln!(f, "endloop\nendfacet").unwrap();
+        }
+        writeln!(f, "endsolid plate").unwrap();
+        eprintln!(
+            "radius {} levels {} duration {}",
+            plan.radius, plan.levels, plan.duration
+        );
     }
     /// The plate's bottom in a setup frame: placement puts it a fixed 4
     /// display units up, which `threaded_plate`'s 70 mm makes 2 mm.

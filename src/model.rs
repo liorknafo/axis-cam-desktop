@@ -491,13 +491,20 @@ impl Tool {
     /// Whether the tool is on machine `m`: one it lists, else, with no list,
     /// every CNC machine, or for a lathe tool every lathe.
     pub fn fits(&self, m: &Machine) -> bool {
+        // A tap is turned by hand: with no list, every manual mill and lathe.
+        if get(&self.p, "type") == "Tap" && get(&self.p, "machines").trim().is_empty() {
+            return manual::is_hand(m);
+        }
         manual::fits(get(&self.p, "machines"), self.is_lathe(), m)
     }
     /// Makes the tool of type `kind`, adding the keys that type needs and the
     /// tool lacks (a lathe tool's sizes); keys it already has are kept.
     pub fn set_type(&mut self, kind: &str) {
         self.p.insert("type".into(), kind.into());
-        for (k, v) in crate::lathe::tool_defaults(kind).iter().chain(mill_tool_defaults(kind)) {
+        for (k, v) in crate::lathe::tool_defaults(kind)
+            .iter()
+            .chain(mill_tool_defaults(kind))
+        {
             self.p.entry((*k).into()).or_insert_with(|| (*v).into());
         }
     }
@@ -536,7 +543,9 @@ impl Tool {
                 }
                 positive(&self.p, "reach", &mut e);
                 if num(&self.p, "reach") > num(&self.p, "stickout") {
-                    e.push("Reach (how deep the neck goes) cannot be more than the stickout.".into())
+                    e.push(
+                        "Reach (how deep the neck goes) cannot be more than the stickout.".into(),
+                    )
                 }
             }
             "Tap" => {
@@ -544,7 +553,10 @@ impl Tool {
                     e.push("Choose the tap's thread size.".into())
                 }
                 if !TAP_KINDS.contains(&get(&self.p, "tap_kind")) {
-                    e.push("Choose the tap's kind: spiral flute, spiral point or straight flute.".into())
+                    e.push(
+                        "Choose the tap's kind: spiral flute, spiral point or straight flute."
+                            .into(),
+                    )
                 }
             }
             _ => {}
@@ -561,7 +573,8 @@ impl Tool {
     /// `nose_radius` (0 or more) and `lead_angle` (1–179°, 93 when not
     /// saved); a boring bar's `nose_radius`, `min_bore` and `reach`; a
     /// grooving tool's or parting blade's `width` and `reach`; a threading
-    /// tool's `thread_angle` (55 or 60) and `pitches` range. No flutes, mill
+    /// tool's `thread_angle` (55 or 60) and `pitches` range; a die's `thread`
+    /// size and `od`. No flutes, mill
     /// diameter, flute length, stickout or holder.
     fn lathe_issues(&self, e: &mut Vec<String>) {
         let p = &self.p;
@@ -591,6 +604,12 @@ impl Tool {
                 if self.thread_pitches().is_none() {
                     e.push("Pitches must be a range of positive pitches, like 0.5-3.".into())
                 }
+            }
+            "Die" => {
+                if crate::lathe::die_spec(self).is_none() {
+                    e.push("Choose the die's thread size.".into())
+                }
+                positive(p, "od", e);
             }
             _ => {}
         }
@@ -694,10 +713,79 @@ pub const TAP_ON_CNC: &str = "The CNC cannot tap: its spindle and feed are not s
 /// keys' starting values (`Tool::set_type`).
 pub fn mill_tool_defaults(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
-        "Thread mill" => &[("thread_angle", "60"), ("pitches", "0.5-1.25"), ("reach", "12"), ("flutes", "4")],
-        "Tap" => &[("thread", "M6×1"), ("tap_kind", TAP_KINDS[0]), ("diameter", "6"), ("flutes", "3")],
+        "Thread mill" => &[
+            ("thread_angle", "60"),
+            ("pitches", "0.5-1.25"),
+            ("reach", "12"),
+            ("flutes", "4"),
+        ],
+        "Tap" => &[
+            ("thread", "M6×1"),
+            ("tap_kind", TAP_KINDS[0]),
+            ("diameter", "6"),
+            ("flutes", "3"),
+        ],
         _ => &[],
     }
+}
+/// The starter tool set `Document::adopt_tools` has given a library.
+pub const STARTER_TOOLS: u32 = 1;
+/// The sizes of the owner's SharCreatives 60-piece tap and die set (a tap
+/// and a die of each).
+const SET_SIZES: [&str; 27] = [
+    "M3×0.5",
+    "M4×0.7",
+    "M5×0.8",
+    "M6×1",
+    "M7×1",
+    "M8×1.25",
+    "M9×1.25",
+    "M10×1",
+    "M10×1.5",
+    "M12×1.75",
+    "#4-40 UNC",
+    "#6-32 UNC",
+    "#8-32 UNC",
+    "#10-24 UNC",
+    "#12-24 UNC",
+    "1/4-20 UNC",
+    "5/16-18 UNC",
+    "3/8-16 UNC",
+    "7/16-14 UNC",
+    "1/2-13 UNC",
+    "#10-32 UNF",
+    "1/4-28 UNF",
+    "5/16-24 UNF",
+    "3/8-24 UNF",
+    "7/16-20 UNF",
+    "1/2-20 UNF",
+    "1/8-27 NPT",
+];
+/// The owner's threading tools (`Document::adopt_tools`).
+pub fn starter_tools() -> Vec<Tool> {
+    let mut out = vec![];
+    for size in SET_SIZES {
+        let Some(spec) = crate::thread::spec(size) else {
+            continue;
+        };
+        let mut tap = Tool::new(&format!("{size} tap"), "Tap", "");
+        tap.set_type("Tap");
+        tap.p.insert("thread".into(), size.into());
+        tap.p.insert("diameter".into(), spec.major.to_string());
+        // A hand set's taps: straight flutes.
+        tap.p.insert("tap_kind".into(), TAP_KINDS[2].into());
+        out.push(tap);
+        let mut die = Tool::lathe(&format!("{size} die"), "Die");
+        die.p.insert("thread".into(), size.into());
+        // The set's dies are 1 inch round.
+        die.p.insert("od".into(), "25.4".into());
+        out.push(die);
+    }
+    let mut insert = Tool::lathe("16ER AG60 insert", "Threading tool");
+    insert.p.insert("thread_angle".into(), "60".into());
+    insert.p.insert("pitches".into(), "0.5-3".into());
+    out.push(insert);
+    out
 }
 /// A tap's kind: which way its flutes send the chips, and so the holes it
 /// suits.
@@ -723,7 +811,7 @@ pub const CONTOUR_TABS: [&str; 2] = ["No", "Yes"];
 /// What a Drill makes (`holes`): the round holes of the part's surfaces it
 /// selects, or the holes a later setup drops over the fixture pins by in
 /// the stock's leftover (`pin_points`), as its Work zero step placed them.
-pub const DRILL_HOLES: [&str; 2] = ["Part's holes", "Pin holes"];
+pub const DRILL_HOLES: [&str; 3] = ["Part's holes", "Pin holes", "Threaded holes"];
 /// The tab settings an operation starts with, and takes when tabs are
 /// turned on in a project saved before them: tabs on each outline, each
 /// one's width at its narrowest (mm) and its thickness (mm).
@@ -1096,6 +1184,12 @@ impl Operation {
     pub fn drills_pin_holes(&self) -> bool {
         self.strategy == Strategy::Drill && get(&self.p, "holes") == DRILL_HOLES[1]
     }
+    /// Whether this Drill keeps to the holes of the selection that have a
+    /// thread modeled in them (`DRILL_HOLES`): their tap drills, or their
+    /// threads, leaving plain holes of the same size alone.
+    pub fn threaded_holes_only(&self) -> bool {
+        self.strategy == Strategy::Drill && get(&self.p, "holes") == DRILL_HOLES[2]
+    }
     pub fn needs_surfaces(&self) -> bool {
         (self.strategy.needs_surfaces() && !self.drills_pin_holes())
             || (matches!(
@@ -1154,7 +1248,9 @@ impl Operation {
             )];
         };
         let right = tool.filter(|t| get(&t.p, "type") == needed);
-        if tool.is_some() && right.is_none() {
+        // A Thread is also cut by hand with a die.
+        let die = tool.filter(|t| lathe::takes(kind, get(&t.p, "type")) && right.is_none());
+        if tool.is_some() && right.is_none() && die.is_none() {
             e.push(format!(
                 "Choose a {} for the {kind} turn.",
                 needed.to_lowercase()
@@ -1239,7 +1335,28 @@ impl Operation {
                 above_zero(p, "diameter", &mut e);
                 above_zero(p, "pitch", &mut e);
                 at_most_zero(p, "z_end", &mut e);
-                if let Some(pitch) = num(p, "pitch").filter(|v| *v > 0.) {
+                if let Some(d) = die {
+                    if let Some(spec) = lathe::die_spec(d) {
+                        let size = |v: f32| ((v * 1000.).round() / 1000.).to_string();
+                        if num(p, "pitch").is_some_and(|v| (v - spec.pitch).abs() > 1e-3) {
+                            e.push(format!(
+                                "pitch must be the die's, {} mm ({}).",
+                                size(spec.pitch),
+                                spec.name
+                            ))
+                        }
+                        if num(p, "diameter").is_some_and(|v| (v - spec.major).abs() > 0.3) {
+                            e.push(format!(
+                                "diameter must be the die's, Ø{} ({}).",
+                                size(spec.major),
+                                spec.name
+                            ))
+                        }
+                    }
+                    if get(p, "thread_side") == "Inside" {
+                        e.push("thread side must be Outside: a die cuts an outside thread.".into())
+                    }
+                } else if let Some(pitch) = num(p, "pitch").filter(|v| *v > 0.) {
                     let cut = lathe::pitches(m);
                     if !cut.is_empty() && !cut.iter().any(|c| (c - pitch).abs() < 1e-4) {
                         e.push(format!(
@@ -1881,6 +1998,10 @@ pub struct Document {
     /// given; 0 for a library saved before sets were counted.
     #[serde(default)]
     pub starter_materials: u32,
+    /// The starter tools (`STARTER_TOOLS`) the library has been given: the
+    /// owner's tap and die set and lathe threading insert.
+    #[serde(default)]
+    pub starter_tools: u32,
     /// The workholding library: vises and clamps, carried to new projects
     /// like tools.
     #[serde(default)]
@@ -1909,6 +2030,7 @@ impl Default for Document {
             materials: vec![],
             material_id: String::new(),
             starter_materials: 0,
+            starter_tools: 0,
             workholding: vec![],
             file: None,
             sample_model: false,
@@ -2106,6 +2228,22 @@ impl Document {
             ));
         }
         said
+    }
+    /// Gives the library the owner's threading tools once (`STARTER_TOOLS`):
+    /// the taps and dies of the SharCreatives 60-piece set (taps for the
+    /// manual mill and the lathe's tailstock, dies for the lathe) and the
+    /// 16ER AG60 insert as the lathe's threading tool. A tool of the same
+    /// name already there is kept.
+    pub fn adopt_tools(&mut self) {
+        if self.starter_tools >= STARTER_TOOLS {
+            return;
+        }
+        for tool in starter_tools() {
+            if !self.tools.iter().any(|t| t.name() == tool.name()) {
+                self.tools.push(tool);
+            }
+        }
+        self.starter_tools = STARTER_TOOLS;
     }
     /// Gives a document with an empty library the starter materials, brings an
     /// older library up to the current starter set once, and links a legacy
@@ -2968,7 +3106,7 @@ fn label(k: &str) -> String {
 pub const BOX_FIELDS: [&str; 6] = ["x_min", "x_max", "y_min", "y_max", "z_top", "z_bottom"];
 /// The operation editor's text fields, by key: the ones a check's message
 /// names by its `label`.
-const OPERATION_FIELDS: [&str; 56] = [
+const OPERATION_FIELDS: [&str; 58] = [
     "name",
     "x_min",
     "x_max",
@@ -2994,6 +3132,8 @@ const OPERATION_FIELDS: [&str; 56] = [
     "lean_angle",
     "peck",
     "dwell",
+    "thread_depth",
+    "thread_passes",
     "direction",
     "stepover",
     "surface_stepover",
@@ -5851,6 +5991,55 @@ mod manual_setups {
         );
     }
     #[test]
+    fn a_die_cuts_an_outside_thread_of_its_own_size_with_no_gearbox_pitch() {
+        let (mut m, tools, mut op) = turn_of("Thread");
+        let die = tool_of(&tools, "Die").clone();
+        assert_eq!(die.issues(), Vec::<String>::new());
+        assert_eq!([get(&die.p, "thread"), get(&die.p, "od")], ["M6×1", "20"]);
+        op.tool = die.id.clone();
+        // The Thread's M40 × 1.5 is not the die's M6 × 1.
+        let pitch = "pitch must be the die's, 1 mm (M6×1).";
+        let diameter = "diameter must be the die's, Ø6 (M6×1).";
+        assert_eq!(op.issues(&m, &tools, &[]), vec![pitch, diameter]);
+        assert_eq!(issue_field(pitch), Some("pitch"));
+        assert_eq!(issue_field(diameter), Some("diameter"));
+        // Its own size passes, though the gearbox cuts no 1 mm here and the
+        // tool has no pitch range to keep.
+        m.p.insert("pitches".into(), "1.25,1.5".into());
+        for (d, p) in [("6", "1"), ("6.25", "1.0004"), ("5.75", "1")] {
+            op.p.insert("diameter".into(), d.into());
+            op.p.insert("pitch".into(), p.into());
+            assert!(op.issues(&m, &tools, &[]).is_empty(), "{d} {p}");
+        }
+        // A diameter 0.4 off, a pitch off, and the inside are refused.
+        op.p.insert("diameter".into(), "6.4".into());
+        assert_eq!(op.issues(&m, &tools, &[]), vec![diameter]);
+        op.p.insert("diameter".into(), "6".into());
+        op.p.insert("pitch".into(), "1.25".into());
+        assert_eq!(op.issues(&m, &tools, &[]), vec![pitch]);
+        op.p.insert("pitch".into(), "1".into());
+        op.p.insert("thread_side".into(), "Inside".into());
+        assert_eq!(
+            op.issues(&m, &tools, &[]),
+            vec!["thread side must be Outside: a die cuts an outside thread."]
+        );
+        // A die that is not on the table, or has no outside diameter.
+        let mut off = die.clone();
+        off.p.insert("thread".into(), "M7×0.9".into());
+        assert_eq!(off.issues(), vec!["Choose the die's thread size."]);
+        let mut thin = die;
+        thin.p.insert("od".into(), "0".into());
+        assert_eq!(thin.issues(), vec!["od must be greater than zero."]);
+        // The other kinds still want their own tool, not a die.
+        let (m, tools, mut turning) = turn_of("Outside");
+        turning.tool = tool_of(&tools, "Die").id.clone();
+        assert!(
+            turning
+                .issues(&m, &tools, &[])
+                .contains(&"Choose a turning tool for the Outside turn.".to_string())
+        );
+    }
+    #[test]
     fn a_turn_needs_the_tool_type_of_its_kind() {
         let tools = lathe_tools();
         let m = crate::lathe::defaults();
@@ -5864,7 +6053,7 @@ mod manual_setups {
                 let message = format!("Choose a {} for the {kind} turn.", needed.to_lowercase());
                 assert_eq!(
                     issues.contains(&message),
-                    get(&tool.p, "type") != needed,
+                    !crate::lathe::takes(kind, get(&tool.p, "type")),
                     "{kind} with {}: {issues:?}",
                     tool.name()
                 );
