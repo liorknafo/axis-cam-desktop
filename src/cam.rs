@@ -56,6 +56,9 @@ pub(crate) struct Triangle {
 pub(crate) struct Geometry {
     pub triangles: Vec<Triangle>,
     pub bounds: Bounds,
+    /// The threaded holes along Z (`thread::holes_in_setup`) that hole
+    /// reading knows of; none until `with_threads`.
+    pub threads: Vec<crate::thread::Thread>,
 }
 impl Geometry {
     pub(crate) fn new(setup: &Setup, mesh: &Mesh) -> Self {
@@ -72,7 +75,15 @@ impl Geometry {
                 })
                 .collect(),
             bounds: placement.bounds.scaled(1. / scale),
+            threads: vec![],
         }
+    }
+    /// The geometry, knowing the part's threaded holes along the setup's Z:
+    /// a modeled thread's rim is no circle, but it is a hole.
+    pub(crate) fn with_threads(setup: &Setup, mesh: &Mesh) -> Self {
+        let mut g = Self::new(setup, mesh);
+        g.threads = crate::thread::holes_in_setup(setup, mesh);
+        g
     }
     fn selected(&self, op: &Operation) -> Vec<&Triangle> {
         self.triangles
@@ -984,6 +995,8 @@ pub struct Hole {
     pub through: bool,
     /// The cone its opening narrows down in, when it is countersunk.
     pub countersink: Option<Countersink>,
+    /// The thread modeled in it.
+    pub thread: Option<crate::thread::Thread>,
 }
 /// A countersink: a cone from a hole's opening, `Hole::opening` wide at the
 /// face, straight down to the wall or floor under it.
@@ -999,7 +1012,7 @@ pub struct Countersink {
 /// picked by their walls, verified against mesh rays.
 /// Noncircular openings and boss outlines are rejected, never converted to drills.
 pub fn holes(setup: &Setup, op: &Operation, mesh: &Mesh) -> Result<Vec<Hole>, String> {
-    let g = Geometry::new(setup, mesh);
+    let g = Geometry::with_threads(setup, mesh);
     // The Drill geometry list and the part report ask without `simulation::generate`'s check.
     if crate::simulation::exceeds_coordinate_limit(&g.bounds) {
         return Err(crate::simulation::COORDINATE_LIMIT_MESSAGE.into());
@@ -1200,7 +1213,7 @@ pub fn drill_holes_of(
     mesh: &Mesh,
     holes: &[crate::pocket::Hole],
 ) -> Vec<Option<Hole>> {
-    let g = Geometry::new(setup, mesh);
+    let g = Geometry::with_threads(setup, mesh);
     let rims = rims(&g);
     holes.iter().map(|h| drill_hole(&g, h, &rims)).collect()
 }
@@ -1224,13 +1237,23 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
         ((p.0 as f32 - center[0]).powi(2) + (p.1 as f32 - center[1]).powi(2)).sqrt()
     };
     // The vertex radius: a regular polygon's vertices are all on its circle.
-    let radius = path.iter().map(distance).sum::<f32>() / path.len() as f32;
+    let mut radius = path.iter().map(distance).sum::<f32>() / path.len() as f32;
+    let mut center = center;
     if radius <= 0.
         || path
             .iter()
             .any(|p| (distance(p) - radius).abs() > 0.03f32.max(radius * 0.02))
     {
-        return None;
+        // A modeled thread cuts the face in a spiral, between its minor
+        // and major diameters round its axis: the hole is round about that.
+        let thread = g.threads.iter().find(|t| {
+            path.iter().all(|p| {
+                let d = (p.0 as f32 - t.centre[0]).hypot(p.1 as f32 - t.centre[1]);
+                d >= t.minor / 2. - 0.05 && d <= t.major / 2. + 0.05
+            })
+        })?;
+        center = thread.centre;
+        radius = thread.major / 2.;
     }
     // Its chords' midpoints lie this far inside the circle.
     let sagitta = radius * (1. - (std::f32::consts::PI / path.len() as f32).cos());
@@ -1277,6 +1300,16 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
         return None;
     }
     let diameter = bore * 2.;
+    // The thread it holds: one round this centre, inside the hole's depth.
+    let thread = g
+        .threads
+        .iter()
+        .find(|t| {
+            (t.centre[0] - center[0]).hypot(t.centre[1] - center[1]) < radius.min(0.5)
+                && t.from < top + 0.01
+                && t.to > bottom - 0.01
+        })
+        .cloned();
     Some(Hole {
         center,
         diameter,
@@ -1286,6 +1319,7 @@ fn round_hole(g: &Geometry, path: &Polygon, top: f32) -> Option<Hole> {
         bottom,
         through,
         countersink: countersink(g, center, top, radius, path.len()),
+        thread,
     })
 }
 /// The countersink of the opening of radius `radius` round `center` in the
@@ -5447,6 +5481,42 @@ pub(crate) mod tests {
         let found = holes(&setup, &op, mesh).unwrap();
         assert_eq!(found.len(), 1);
         found[0].clone()
+    }
+    #[test]
+    fn modeled_threads_are_holes_with_their_sizes() {
+        // Two M6×1 and an M8×1.25 tapped through, an M5×0.8 blind, and two
+        // plain Ø6.6 holes (scripts/make-threaded-plate.py).
+        let mesh = crate::mesh::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/threaded-plate.3mf"),
+        )
+        .unwrap();
+        let (setup, mut op, _) = fixture(Strategy::Drill);
+        select_top(&mut op, &mesh);
+        let found = holes(&setup, &op, &mesh).unwrap();
+        let mut names: Vec<(String, bool)> = found
+            .iter()
+            .map(|h| {
+                (
+                    h.thread.as_ref().map_or("plain".into(), |t| t.name()),
+                    h.through,
+                )
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ("M5×0.8".into(), false),
+                ("M6×1".into(), true),
+                ("M6×1".into(), true),
+                ("M8×1.25".into(), true),
+                ("plain".into(), true),
+                ("plain".into(), true),
+            ]
+        );
+        // A threaded hole's drill size is its minor diameter.
+        let m8 = found.iter().find(|h| h.thread.as_ref().is_some_and(|t| t.name() == "M8×1.25")).unwrap();
+        assert!((m8.diameter - 6.65).abs() < 0.1, "{m8:?}");
     }
     #[test]
     fn a_countersink_is_found_with_its_angle_and_depth() {

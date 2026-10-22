@@ -46,6 +46,7 @@ mod stock;
 mod stock_surface;
 mod storage;
 mod surface;
+mod thread;
 mod three_mf;
 mod turn;
 mod ui;
