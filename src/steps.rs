@@ -1994,12 +1994,18 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                 let depth = mouth - h[2];
                 // Rounded down: a turn more would go past the drilled hole.
                 let turns = (depth / pitch * 10.).floor() / 10.;
+                let mut said = vec![
+                    chip(p.tool_name(*op, 2. * r)),
+                    chip("by hand · spindle off"),
+                    warn_chip("oil"),
+                ];
+                // The tap's tip comes out under the stock: a parallel there
+                // stops it, or it cuts the vise.
+                if h[2] < stock.min[2] {
+                    said.push(warn_chip("nothing under the hole"));
+                }
                 let right = column![
-                    chips(vec![
-                        chip(p.tool_name(*op, 2. * r)),
-                        chip("by hand · spindle off"),
-                        warn_chip("oil")
-                    ]),
+                    chips(said),
                     label(format!("Hole {} of {}", i + 1, holes.len())),
                     readout(
                         Readout {

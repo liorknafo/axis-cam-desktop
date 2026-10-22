@@ -2814,6 +2814,21 @@ flood = { pin = 8 }
             );
         }
     }
+    #[test]
+    fn a_tap_coming_out_under_the_stock_says_so() {
+        let mut a = manual_threaded_app(false);
+        let texts = |a: &mut App| {
+            let at = m6_tap_step(a);
+            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+            crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
+        };
+        // 4 mm of stock under the plate: the tap's tip stays in it.
+        assert!(!texts(&mut a).iter().any(|t| t == "nothing under the hole"));
+        // None: the tip comes out under the plate.
+        a.doc.setups[0].p.insert("stock_bottom".into(), "0".into());
+        crate::steps::tests::build(&mut a);
+        assert!(texts(&mut a).iter().any(|t| t == "nothing under the hole"));
+    }
     /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default
     /// /tmp/threading): Add threading on a manual setup faced first, and
     /// the guide's Tap screen. Not a check: run it with --ignored.
