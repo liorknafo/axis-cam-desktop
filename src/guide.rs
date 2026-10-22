@@ -139,8 +139,13 @@ pub enum Step {
         down_to: f32,
     },
     /// The holes of a Drill in the order drilled: X and Y (centres) and the
-    /// Z each is drilled to.
-    Holes { op: usize, holes: Vec<[f32; 3]> },
+    /// Z each is drilled to; and, by hole, the Z its cut starts at: its
+    /// mouth, where a tap's turns are counted from.
+    Holes {
+        op: usize,
+        holes: Vec<[f32; 3]>,
+        mouths: Vec<f32>,
+    },
     /// The stock after the operation.
     Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
@@ -386,7 +391,8 @@ pub enum LatheStep {
         pitch: f32,
         depth: f32,
         lead: f32,
-        turns: u32,
+        /// To a tenth, rounded down: a turn more would go past the hole.
+        turns: f32,
         quill: Dial,
     },
     /// A thread cut with a die, by hand with the spindle off: the `die` of
@@ -401,7 +407,8 @@ pub enum LatheStep {
         diameter: f32,
         od: f32,
         length: f32,
-        turns: u32,
+        /// To a tenth, rounded down: a turn more would go past the end.
+        turns: f32,
     },
     /// A 45° chamfer of leg `size` on `edge` with a tool that has a 45°
     /// edge: the carriage at `carriage` (on a shoulder: the tool's point
@@ -652,6 +659,24 @@ fn passes(
     Ok(steps)
 }
 /// The holes of a Drill's `plan` in the order drilled: centre and depth.
+/// The Z, from `zero`, each hole's cut starts at, in `holes`' order: the
+/// top of its first cutting move.
+fn mouths(plan: &Plan, zero: [f32; 3]) -> Vec<f32> {
+    let mut out: Vec<([f32; 2], f32)> = vec![];
+    for m in plan.moves.iter().filter(|m| m.cutting_pass) {
+        let at = [m.to[0] - zero[0], m.to[1] - zero[1]];
+        let top = m.from[2].max(m.to[2]) - zero[2];
+        match out.last_mut() {
+            Some((xy, z)) if *xy == at => *z = z.max(top),
+            _ => out.push((at, top)),
+        }
+    }
+    out.into_iter().map(|(_, z)| z).collect()
+}
+/// `turns` to a tenth, rounded down, a hair over a whole tenth kept.
+fn tenths_down(turns: f32) -> f32 {
+    (turns * 10. + 1e-3).floor() / 10.
+}
 fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
     let mut holes: Vec<[f32; 3]> = vec![];
     for m in plan.moves.iter().filter(|m| m.cutting_pass) {
@@ -907,7 +932,12 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 sides([0; 2], &mut steps);
                 let holes = holes(&plan, zero);
                 count = holes.len();
-                steps.push(Step::Holes { op: oi, holes });
+                let mouths = mouths(&plan, zero);
+                steps.push(Step::Holes {
+                    op: oi,
+                    holes,
+                    mouths,
+                });
                 steps.push(Step::Check { op: oi });
             }
             other => return Err(format!("{} does not run on a manual mill.", other.name())),
@@ -1264,7 +1294,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     pitch: mm(spec.pitch),
                     depth: mm(quill - lead),
                     lead,
-                    turns: (quill / spec.pitch - 1e-3).ceil() as u32,
+                    turns: tenths_down(quill / spec.pitch),
                     quill: zeroes.dial(Slide::Quill, quill),
                 }));
                 1
@@ -1360,7 +1390,7 @@ fn lathe_guide(doc: &Document, mesh: &Mesh, si: usize, walked: Walked) -> Result
                     diameter: num(&op.p, "diameter").unwrap_or(spec.major),
                     od: tool_of(tool).and_then(|t| num(&t.p, "od")).unwrap_or(0.),
                     length,
-                    turns: (length / spec.pitch - 1e-3).ceil() as u32,
+                    turns: tenths_down(length / spec.pitch),
                 }));
                 1
             }
@@ -1994,7 +2024,7 @@ pub(crate) mod tests {
     fn the_holes_are_centres_and_depths_in_work_coordinates() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Holes { op, holes } = &guide.steps[10] else {
+        let Step::Holes { op, holes, .. } = &guide.steps[10] else {
             panic!()
         };
         assert_eq!((*op, holes.len()), (2, 4));
@@ -2947,7 +2977,9 @@ pub(crate) mod tests {
         close(*pitch, 1.75);
         close(*depth, 10.);
         close(*lead, want - 10.);
-        assert_eq!(*turns, (want / 1.75 - 1e-3).ceil() as u32);
+        // Rounded down: not a turn past the quill's depth.
+        assert_eq!(*turns, (want / 1.75 * 10. + 1e-3).floor() / 10.);
+        assert!(*turns * 1.75 <= want + 1e-3);
         close(quill.distance, want);
         let (t, r) = lathe::dial(&doc.setups[0].machine, Slide::Quill, want).unwrap();
         reads(quill, t, r);
@@ -3028,7 +3060,7 @@ pub(crate) mod tests {
         close(*diameter, 16.);
         close(*od, 20.);
         close(*length, 20.);
-        assert_eq!(*turns, 10);
+        assert_eq!(*turns, 10.);
         // The same thread with the threading tool has its passes.
         let mut tool = doc.clone();
         let threading = tool

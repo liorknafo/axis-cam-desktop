@@ -137,6 +137,14 @@ fn extent(pieces: &[[f32; 4]]) -> Option<[f32; 4]> {
     }))
 }
 
+/// Turns of a tap or a die to a tenth, a whole number without its ".0".
+fn trim_turns(turns: f32) -> String {
+    if turns.fract() == 0. {
+        format!("{turns:.0}")
+    } else {
+        format!("{turns:.1}")
+    }
+}
 /// The shape of the tool drawn at its tip.
 #[derive(Debug, Clone, Copy)]
 enum Cutter {
@@ -2021,7 +2029,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 line(
                     Some(3),
                     "tap",
-                    big(format!("{turns} turns"), lit(2, item)),
+                    big(format!("{} turns", trim_turns(*turns)), lit(2, item)),
                     vec![
                         "turn the chuck or the wrench by hand".into(),
                         format!("{} mm a turn", mm(*pitch)),
@@ -2089,7 +2097,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                 line(
                     Some(2),
                     "holder",
-                    big(format!("{turns} turns"), lit(1, item)),
+                    big(format!("{} turns", trim_turns(*turns)), lit(1, item)),
                     vec![
                         "turn the holder by hand".into(),
                         format!("to {} from the end", mm(*length)),

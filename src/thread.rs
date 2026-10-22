@@ -435,16 +435,45 @@ pub fn detect(triangles: &[[[f32; 3]; 3]]) -> Vec<Thread> {
             {
                 continue;
             }
-            if let Some(thread) = read(
-                axis,
-                at,
-                &members
-                    .iter()
-                    .map(|f| (f.index, f.up, f.lean))
-                    .collect::<Vec<_>>(),
-                triangles,
-                &pitches,
-            ) {
+            // A thread's flanks lie in a ring within its depth (under 2.2 mm
+            // to M30) and wrap round its axis: other faces whose normals
+            // pass the axis lie in other rings, or only to one side. Each
+            // ring, split off at a gap in radius, is read on its own.
+            let dist = |f: &Flank| (f.at[0] - at[0]).hypot(f.at[1] - at[1]);
+            members.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+            let mut rings: Vec<Vec<&Flank>> = vec![];
+            for f in members {
+                match rings.last_mut() {
+                    Some(ring) if dist(f) - dist(ring.last().unwrap()) < 0.5 => ring.push(f),
+                    _ => rings.push(vec![f]),
+                }
+            }
+            let around = |ring: &[&Flank]| {
+                let mut sectors = [false; 24];
+                for f in ring {
+                    let a = (f.at[1] - at[1]).atan2(f.at[0] - at[0]);
+                    let k = ((a + std::f32::consts::PI) / std::f32::consts::TAU * 24.) as usize;
+                    sectors[k.min(23)] = true;
+                }
+                sectors.iter().filter(|s| **s).count() >= 18
+            };
+            if let Some(thread) = rings
+                .iter()
+                .filter(|ring| ring.len() >= LEAST && around(ring))
+                .filter_map(|ring| {
+                    read(
+                        axis,
+                        at,
+                        &ring
+                            .iter()
+                            .map(|f| (f.index, f.up, f.lean))
+                            .collect::<Vec<_>>(),
+                        triangles,
+                        &pitches,
+                    )
+                })
+                .next()
+            {
                 found.push(thread);
             }
         }
@@ -864,6 +893,28 @@ pub(crate) mod tests {
                 assert_eq!(found[0].spec.map(|s| s.name), Some(name), "{internal}");
             }
         }
+    }
+    #[test]
+    fn a_cone_round_a_thread_does_not_hide_it() {
+        // An M4 thread inside a coaxial 120° cone 4 to 8 mm out, as on a
+        // part whose other faces' normals also pass the thread's axis.
+        let mut part = modeled([0., 0.], 4., 0.7, 60., true, true, 14., 0.);
+        let steps = 96;
+        let at = |i: usize, r: f32, z: f32| {
+            let th = i as f32 / steps as f32 * std::f32::consts::TAU;
+            [r * th.cos(), r * th.sin(), z]
+        };
+        for i in 0..steps {
+            for k in 0..20 {
+                let (r0, r1) = (4. + k as f32 * 0.2, 4. + (k + 1) as f32 * 0.2);
+                let (z0, z1) = (2. + (r0 - 4.) / 3f32.sqrt(), 2. + (r1 - 4.) / 3f32.sqrt());
+                part.push([at(i, r0, z0), at(i + 1, r1, z1), at(i + 1, r0, z0)]);
+                part.push([at(i, r0, z0), at(i, r1, z1), at(i + 1, r1, z1)]);
+            }
+        }
+        let t = one(&detect(&part)).clone();
+        assert_eq!(t.spec.map(|s| s.name), Some("M4×0.7"));
+        assert!(t.centre[0].hypot(t.centre[1]) < 0.05, "{t:?}");
     }
     #[test]
     fn plain_holes_and_cones_are_no_threads() {

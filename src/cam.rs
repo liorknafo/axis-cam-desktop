@@ -2606,11 +2606,23 @@ fn tap(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<Plan, 
             ));
         }
         let depth = lowest;
-        b.start_at([h.center[0], h.center[1], h.top], Some(h.top))?;
+        // The tap starts to cut where the material over the hole is: the
+        // stock's top when nothing has cut it, the hole's mouth when
+        // something has. The guide counts its turns from there.
+        let top = b.plan.stock.max[2] + number(op, "top")?.max(0.);
+        let mouth = crate::rest::start_over(
+            setup,
+            &crate::rest::Reach::disc(h.center, spec.major / 2.),
+            depth,
+            top,
+            number(op, "top")?,
+        )
+        .max(h.top);
+        b.start_at([h.center[0], h.center[1], mouth], Some(mouth))?;
         // In one pitch a turn, then back out.
         let rate = b.feed;
         b.push([h.center[0], h.center[1], depth], Motion::Feed, true, rate)?;
-        b.push([h.center[0], h.center[1], h.top], Motion::Feed, false, rate)?;
+        b.push([h.center[0], h.center[1], mouth], Motion::Feed, false, rate)?;
         b.plan.target = b.plan.target.min(depth);
         b.plan.levels += 1;
         b.retract()?;

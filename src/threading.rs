@@ -80,10 +80,19 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
         // Through the part far enough that the drill's 118° point is past
         // what follows it: the thread mill's tooth, half a pitch past the
         // thread, or a tap's lead, up to five pitches past it.
+        // Under the stock is air: the drill needs to go no further than
+        // its point past the stock's bottom, nor into what holds it.
         let past = if hand { 5. * t.pitch } else { t.pitch };
+        let below = crate::stock::resolve(setup, Some(mesh))
+            .map_or(f32::INFINITY, |r| first.bottom - r.stock.min[2]);
         hole.p.insert(
             "breakthrough".into(),
-            format!("{:.1}", (0.3 * tap_drill + past + 0.05).max(1.)),
+            format!(
+                "{:.1}",
+                (0.3 * tap_drill + past + 0.05)
+                    .min(below + 0.3 * tap_drill + 0.5)
+                    .max(1.)
+            ),
         );
         if mill.is_some() {
             hole.p.insert("cycle".into(), HELICAL_MILLING.into());

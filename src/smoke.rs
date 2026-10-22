@@ -2722,17 +2722,12 @@ flood = { pin = 8 }
         let _ = a.view();
         render_png(&a, size, &out.join("5-from-above.png"));
     }
-    /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default
-    /// /tmp/threading): Add threading on a manual setup, and the guide's
-    /// Tap screen. Not a check: run it with --ignored.
-    #[test]
-    #[ignore]
-    fn render_tapping_on_the_manual_mill() {
-        use crate::guide::Step;
-        let out = std::path::PathBuf::from(
-            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
-        );
-        std::fs::create_dir_all(&out).unwrap();
+    /// The threaded plate on the manual mill with the owner's kind of taps
+    /// and drills, after Add threading; when `faced`, a Box first faces the
+    /// stock down to the plate's top (8 mm under the stock's), so the holes'
+    /// mouths are below the stock's top. Its guide built.
+    fn manual_threaded_app(faced: bool) -> App {
+        use crate::model::{BOX_FIELDS, Operation, Strategy, Tool};
         let mut a = threaded_app();
         let machine = crate::manual::defaults();
         for (name, kind, d, extra) in [
@@ -2742,8 +2737,9 @@ flood = { pin = 8 }
             ("Drill Ø5", "Drill", "5", &[][..]),
             ("Drill Ø6.8", "Drill", "6.8", &[][..]),
             ("Drill Ø4.2", "Drill", "4.2", &[][..]),
+            ("End mill 25", "Flat end mill", "25", &[][..]),
         ] {
-            let mut t = crate::model::Tool::new(name, kind, d);
+            let mut t = Tool::new(name, kind, d);
             t.set_type(kind);
             for (k, v) in [("length", "30"), ("stickout", "45")].iter().chain(extra) {
                 t.p.insert((*k).into(), (*v).into());
@@ -2751,32 +2747,86 @@ flood = { pin = 8 }
             t.p.insert("machines".into(), machine.id.clone());
             a.doc.tools.push(t);
         }
-        a.doc.machines.push(machine);
+        a.doc.machines.push(machine.clone());
         a.doc.add_manual_setup().expect("a manual setup");
         a.doc.setups[0].operations.clear();
         a.doc.active = a.doc.setups[0].id.clone();
         let _ = a.update(Message::AddThreading);
-        eprintln!("status: {}", a.status);
-        let _ = a.view();
-        render_png(
-            &a,
-            iced::Size::new(1600., 1000.),
-            &out.join("8-manual-threading-added.png"),
-        );
+        if faced {
+            let mill = a
+                .doc
+                .tools
+                .iter()
+                .find(|t| t.name() == "End mill 25")
+                .unwrap();
+            let mut face = Operation::new(Strategy::Box, mill.id.clone());
+            face.p.insert("name".into(), "Face".into());
+            for (k, v) in BOX_FIELDS
+                .iter()
+                .zip(["-500", "500", "-500", "500", "0", "-8"])
+            {
+                face.p.insert((*k).into(), v.into());
+            }
+            face.p.insert("allowance".into(), "0".into());
+            crate::manual::snap(&machine, &mut face.p);
+            a.doc.setups[0].operations.insert(0, face);
+        }
         let _ = a.update(Message::Page(Page::Control));
         crate::steps::tests::build(&mut a);
         if let Some((_, Err(e))) = &a.guide {
             panic!("no guide: {e}");
         }
+        a
+    }
+    /// The guide's step of the M6 tapping.
+    fn m6_tap_step(a: &App) -> usize {
+        use crate::guide::Step;
         let (shown, _) = a.guide_at().expect("a guide");
         let ops = &a.doc.setups[0].operations;
-        let tap = shown
+        shown
             .guide
             .steps
             .iter()
-            .position(|s| matches!(s, Step::Holes { op, .. } if ops[*op].tapping()))
-            .expect("a Tap step");
-        let _ = a.update(Message::Guide(crate::GuideAction::Go(tap)));
+            .position(|s| {
+                matches!(s, Step::Holes { op, .. } if ops[*op].tapping() && ops[*op].name().starts_with("M6"))
+            })
+            .expect("a Tap step")
+    }
+    #[test]
+    fn a_taps_turns_are_counted_from_the_holes_mouth() {
+        use crate::guide::Step;
+        for (faced, mouth, turns) in [(false, 0., "22.4"), (true, -8., "14.4")] {
+            let mut a = manual_threaded_app(faced);
+            let at = m6_tap_step(&a);
+            let (shown, _) = a.guide_at().unwrap();
+            let Step::Holes { holes, mouths, .. } = &shown.guide.steps[at] else {
+                panic!()
+            };
+            // The plate's top is 8 under the stock's, its bottom 20; the
+            // spiral flute tap's tip goes 2.5 pitches past it.
+            assert!((mouths[0] - mouth).abs() < 0.05, "{faced}: {mouths:?}");
+            assert!((holes[0][2] + 22.44).abs() < 0.05, "{faced}: {holes:?}");
+            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
+            let texts = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
+            assert!(
+                texts.iter().any(|t| t == turns),
+                "{faced}: {turns} in {texts:?}"
+            );
+        }
+    }
+    /// Renders tapping on the manual mill to `$AXIS_RENDER_DIR` (default
+    /// /tmp/threading): Add threading on a manual setup faced first, and
+    /// the guide's Tap screen. Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_tapping_on_the_manual_mill() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let mut a = manual_threaded_app(true);
+        let at = m6_tap_step(&a);
+        let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
         let _ = a.view();
         render_png(
             &a,

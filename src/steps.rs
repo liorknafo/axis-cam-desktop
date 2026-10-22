@@ -1938,7 +1938,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             )
         }
         step @ Step::Pass { .. } => pass(p, step),
-        Step::Holes { op, holes } => {
+        Step::Holes { op, holes, mouths } => {
             let stock = p.before(*op);
             let i = p.item.min(holes.len().saturating_sub(1));
             let r = p
@@ -1954,9 +1954,17 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                     .map(|(n, h)| Shape::Hole([h[0], h[1], stock.max[2]], r, n + 1, lit(n, i))),
             );
             let h = holes.get(i).copied().unwrap_or([0.; 3]);
+            let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
+            // A tap cuts from the hole's mouth: the stock above it may be
+            // gone already.
+            let mouth = if tapping {
+                mouths.get(i).copied().unwrap_or(stock.max[2])
+            } else {
+                stock.max[2]
+            };
             let drilled = Bounds {
                 min: [h[0] - r, h[1] - r, h[2]],
-                max: [h[0] + r, h[1] + r, stock.max[2]],
+                max: [h[0] + r, h[1] + r, mouth],
             };
             let side = vec![
                 Shape::Hatch(drilled, Hatch::Cut),
@@ -1981,10 +1989,11 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
             let depth = stock.max[2] - h[2];
             // Tapping: by hand, the spindle holding the tap square; the
             // depth is how many turns the tap goes in.
-            let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
             let pitch = p.tool(*op).and_then(|t| t.tap_spec()).map(|s| s.pitch);
             if let (true, Some(pitch)) = (tapping, pitch) {
-                let turns = depth / pitch;
+                let depth = mouth - h[2];
+                // Rounded down: a turn more would go past the drilled hole.
+                let turns = (depth / pitch * 10.).floor() / 10.;
                 let right = column![
                     chips(vec![
                         chip(p.tool_name(*op, 2. * r)),
@@ -2025,10 +2034,7 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
                             axis: "turns".into(),
                             value: format!("{:.1}", turns),
                             lock: None,
-                            tags: vec![
-                                format!("{} deep", mm(depth)),
-                                "½ back every turn".into(),
-                            ],
+                            tags: vec![format!("{} deep", mm(depth)), "½ back every turn".into(),],
                             lit: Lit::Next,
                             big: true
                         },
