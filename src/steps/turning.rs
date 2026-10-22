@@ -2080,7 +2080,7 @@ pub(super) fn screen<'a>(p: &Page<'a>, step: &'a LatheStep) -> Screen<'a> {
                     "die",
                     big("square", lit(0, item)),
                     vec![
-                        format!("{} die in its holder", dia(*diameter)),
+                        format!("{die} die in its holder"),
                         "quill against the holder".into(),
                     ],
                     lit(0, item),
@@ -2626,6 +2626,31 @@ mod tests {
         // The Drill before it is the drill's screen, not a tap's.
         let t = shown(&mut a, 1, |l| matches!(l, L::TailDrill { .. }));
         assert!(!t.iter().any(|s| s == "oil"), "{t:?}");
+    }
+    /// Renders the lathe's Tap and Die screens to `$AXIS_RENDER_DIR`
+    /// (default /tmp/threading). Not a check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_tap_and_die_screens() {
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/threading".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let size = iced::Size::new(1280., 800.);
+        let (mut doc, mesh, tap) = crate::turn::tests::m12_job();
+        doc.setups[0]
+            .machine
+            .p
+            .insert("cross_reads".into(), "Diameter".into());
+        crate::turn::tests::add(&mut doc, "Drill", &[("depth", "16")]);
+        crate::turn::tests::add_tap(&mut doc, &tap, "10");
+        let mut a = app_of(doc, mesh);
+        shown(&mut a, 1, |l| matches!(l, L::TailTap { .. }));
+        crate::smoke::tests::render_png(&a, size, &out.join("10-lathe-tap.png"));
+        let (doc, mesh) = crate::guide::tests::die_sample();
+        let mut a = app_of(doc, mesh);
+        shown(&mut a, 1, |l| matches!(l, L::DieThread { .. }));
+        crate::smoke::tests::render_png(&a, size, &out.join("11-lathe-die.png"));
     }
     #[test]
     fn the_die_screen_is_one_screen_of_turns_not_thread_passes() {

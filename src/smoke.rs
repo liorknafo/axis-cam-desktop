@@ -1763,7 +1763,7 @@ impl App {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::*;
     #[test]
@@ -4476,7 +4476,7 @@ flood = { pin = 8 }
     }
 
     /// Draws `a`'s whole window, `size` px, headless (tiny-skia) to `path`.
-    fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
+    pub(crate) fn render_png(a: &App, size: iced::Size, path: &std::path::Path) {
         render_png_at(a, size, path, iced::mouse::Cursor::Unavailable);
     }
     /// `render_png` with the pointer at `cursor` (hover marks drawn).
